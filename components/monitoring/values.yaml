@@ -20,6 +20,14 @@ grafana:
     limits:
       cpu: 250m
       memory: 256Mi
+  sidecar:
+    resources:
+      requests:
+        cpu: 10m
+        memory: 64Mi
+      limits:
+        cpu: 50m
+        memory: 128Mi
   service:
     type: ClusterIP
   # Keep this PoC credential-free.  Operators can still inspect dashboards
@@ -63,6 +71,23 @@ prometheusOperator:
     limits:
       cpu: 200m
       memory: 192Mi
+  prometheusConfigReloader:
+    resources:
+      requests:
+        cpu: 10m
+        memory: 32Mi
+      limits:
+        cpu: 50m
+        memory: 64Mi
+  admissionWebhooks:
+    patch:
+      resources:
+        requests:
+          cpu: 10m
+          memory: 32Mi
+        limits:
+          cpu: 50m
+          memory: 64Mi
 
 prometheus-node-exporter:
   resources:

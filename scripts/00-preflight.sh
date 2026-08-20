@@ -11,7 +11,7 @@ source "$SCRIPT_DIR/lib/ssh.sh"
 # shellcheck source=lib/host.sh
 source "$SCRIPT_DIR/lib/host.sh"
 
-oc_require_commands ssh awk sed base64 seq
+oc_require_commands ssh awk sed base64 seq kubectl helm curl openssl
 oc_validate_config
 for key in "$DEV_SSH_KEY" "$TEST_SSH_KEY" "$VM_SSH_KEY"; do
   [[ -z $key || -r $key ]] || oc_die "SSH key is not readable: $key"

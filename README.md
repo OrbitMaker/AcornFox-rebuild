@@ -23,6 +23,8 @@
 preflight -> VMs/k3s -> storage -> OpenKruise -> Higress -> Demo -> PostgreSQL -> monitoring -> drills
 ```
 
+管理机前置命令：`ssh`、`kubectl`、`helm`、`curl`、`openssl`。两台 Linux 宿主需要 KVM/libvirt、`virt-install`、`qemu-img` 与 `cloud-localds`；预检会一次性核对这些条件。
+
 完整安装：
 
 ```bash
@@ -65,6 +67,24 @@ make drills
 - 故障演练报告：[docs/fault-drill-report.md](docs/fault-drill-report.md)
 - 已知问题：[docs/known-issues.md](docs/known-issues.md)
 - 下一阶段建议：[docs/next-phase.md](docs/next-phase.md)
+
+## 当前现场状态（2026-08-21）
+
+第一阶段已全部通过。局域网入口：
+
+```bash
+curl -H 'Host: open-card.local' http://192.168.31.71:30080/
+curl -k --resolve open-card.local:30443:192.168.31.71 https://open-card.local:30443/
+```
+
+管理集群：
+
+```bash
+KUBECONFIG="$PWD/artifacts/kubeconfig" kubectl get nodes -o wide
+make verify
+```
+
+Grafana 与 Prometheus 保持 ClusterIP，仅通过 `kubectl port-forward` 在管理机本地查看，未暴露公网。
 
 ## 安全边界
 

@@ -42,7 +42,7 @@ mirrors:
       - "https://quay.m.daocloud.io"
 REGISTRIES
 cat > /etc/rancher/k3s/config.yaml <<CONFIG
-write-kubeconfig-mode: "0644"
+write-kubeconfig-mode: "0600"
 node-ip: "$node_ip"
 advertise-address: "$node_ip"
 pause-image: "registry.cn-hangzhou.aliyuncs.com/google_containers/pause:3.10"
@@ -131,6 +131,19 @@ REMOTE
 done <<EOF
 $(oc_node_records)
 EOF
+
+oc_ssh_root_script "$DEV_NODE_IP" <<'REMOTE'
+set -Eeuo pipefail
+k3s kubectl -n kube-system patch deployment/local-path-provisioner --type=strategic -p \
+  '{"spec":{"template":{"spec":{"containers":[{"name":"local-path-provisioner","resources":{"requests":{"cpu":"25m","memory":"32Mi"},"limits":{"cpu":"100m","memory":"128Mi"}}}]}}}}'
+k3s kubectl -n kube-system patch deployment/metrics-server --type=strategic -p \
+  '{"spec":{"template":{"spec":{"containers":[{"name":"metrics-server","resources":{"requests":{"cpu":"100m","memory":"70Mi"},"limits":{"cpu":"200m","memory":"256Mi"}}}]}}}}'
+k3s kubectl -n kube-system patch deployment/coredns --type=strategic -p \
+  '{"spec":{"template":{"spec":{"containers":[{"name":"coredns","resources":{"requests":{"cpu":"100m","memory":"70Mi"},"limits":{"cpu":"200m","memory":"170Mi"}}}]}}}}'
+k3s kubectl -n kube-system rollout status deployment/local-path-provisioner --timeout=180s
+k3s kubectl -n kube-system rollout status deployment/metrics-server --timeout=180s
+k3s kubectl -n kube-system rollout status deployment/coredns --timeout=180s
+REMOTE
 
 mkdir -p "$OC_REPO_ROOT/artifacts/kubernetes"
 oc_ssh_root "$DEV_NODE_IP" cat /etc/rancher/k3s/k3s.yaml |
