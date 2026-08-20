@@ -1,0 +1,78 @@
+global:
+  local: false
+  kind: false
+  ingressClass: higress
+  gatewayClass: higress
+  enableGatewayAPI: true
+  enableIstioAPI: true
+  enableRedis: false
+  enablePluginServer: false
+  imagePullPolicy: IfNotPresent
+  defaultResources:
+    requests:
+      cpu: 10m
+      memory: 16Mi
+    limits:
+      cpu: 50m
+      memory: 64Mi
+
+higress-core:
+  controller:
+    replicas: 1
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        cpu: 200m
+        memory: 256Mi
+  pilot:
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        cpu: 200m
+        memory: 256Mi
+  gateway:
+    kind: Deployment
+    replicas: 1
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+    service:
+      type: NodePort
+      ports:
+        - name: http2
+          port: 80
+          protocol: TCP
+          targetPort: 80
+          nodePort: 30080
+        - name: https
+          port: 443
+          protocol: TCP
+          targetPort: 443
+          nodePort: 30443
+  pluginServer:
+    replicas: 0
+    resources:
+      requests:
+        cpu: 10m
+        memory: 32Mi
+      limits:
+        cpu: 20m
+        memory: 64Mi
+
+higress-console:
+  replicaCount: 0
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      cpu: 20m
+      memory: 64Mi
