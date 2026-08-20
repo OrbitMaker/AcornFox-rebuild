@@ -26,10 +26,26 @@ if command -v k3s >/dev/null 2>&1; then
   [[ $installed == "$version" ]] || { printf 'k3s version mismatch: %s != %s\n' "$installed" "$version" >&2; exit 1; }
 fi
 install -d -m 0700 /etc/rancher/k3s
+cat > /etc/rancher/k3s/registries.yaml <<'REGISTRIES'
+mirrors:
+  docker.io:
+    endpoint:
+      - "https://docker.m.daocloud.io"
+  registry.k8s.io:
+    endpoint:
+      - "https://k8s.m.daocloud.io"
+  ghcr.io:
+    endpoint:
+      - "https://ghcr.m.daocloud.io"
+  quay.io:
+    endpoint:
+      - "https://quay.m.daocloud.io"
+REGISTRIES
 cat > /etc/rancher/k3s/config.yaml <<CONFIG
 write-kubeconfig-mode: "0644"
 node-ip: "$node_ip"
 advertise-address: "$node_ip"
+pause-image: "registry.cn-hangzhou.aliyuncs.com/google_containers/pause:3.10"
 tls-san:
   - "$node_ip"
 disable:
@@ -43,7 +59,8 @@ if ! command -v k3s >/dev/null 2>&1; then
   curl --fail --location --retry 3 https://get.k3s.io | \
     INSTALL_K3S_VERSION="$version" INSTALL_K3S_EXEC=server sh -
 fi
-systemctl enable --now k3s
+systemctl enable k3s
+systemctl restart k3s
 for attempt in $(seq 1 60); do
   if k3s kubectl get nodes >/dev/null 2>&1; then
     exit 0
@@ -73,18 +90,32 @@ if command -v k3s >/dev/null 2>&1; then
   [[ $installed == "$version" ]] || { printf 'k3s version mismatch: %s != %s\n' "$installed" "$version" >&2; exit 1; }
 fi
 install -d -m 0700 /etc/rancher/k3s
-if [[ ! -s /etc/rancher/k3s/config.yaml ]]; then
-  umask 077
-  cat > /etc/rancher/k3s/config.yaml <<CONFIG
+cat > /etc/rancher/k3s/registries.yaml <<'REGISTRIES'
+mirrors:
+  docker.io:
+    endpoint:
+      - "https://docker.m.daocloud.io"
+  registry.k8s.io:
+    endpoint:
+      - "https://k8s.m.daocloud.io"
+  ghcr.io:
+    endpoint:
+      - "https://ghcr.m.daocloud.io"
+  quay.io:
+    endpoint:
+      - "https://quay.m.daocloud.io"
+REGISTRIES
+umask 077
+cat > /etc/rancher/k3s/config.yaml <<CONFIG
 server: "https://$server_ip:6443"
 token: "$token"
 node-ip: "$node_ip"
+pause-image: "registry.cn-hangzhou.aliyuncs.com/google_containers/pause:3.10"
 kubelet-arg:
   - "system-reserved=cpu=100m,memory=256Mi"
   - "kube-reserved=cpu=100m,memory=256Mi"
   - "eviction-hard=memory.available<256Mi,nodefs.available<10%"
 CONFIG
-fi
 unset token
 if ! command -v k3s >/dev/null 2>&1; then
   curl --fail --location --retry 3 https://get.k3s.io | \
@@ -94,7 +125,8 @@ elif ! systemctl cat k3s-agent.service >/dev/null 2>&1; then
     INSTALL_K3S_VERSION="$version" INSTALL_K3S_EXEC=agent \
     INSTALL_K3S_SKIP_DOWNLOAD=true sh -
 fi
-systemctl enable --now k3s-agent
+systemctl enable k3s-agent
+systemctl restart k3s-agent
 REMOTE
 done <<EOF
 $(oc_node_records)

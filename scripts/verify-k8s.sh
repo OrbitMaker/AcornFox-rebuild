@@ -41,6 +41,8 @@ if k3s kubectl -n kube-system get service traefik >/dev/null 2>&1; then
   printf 'Traefik service must be disabled\n' >&2
   exit 1
 fi
+not_ready="$(k3s kubectl get pods -n kube-system --no-headers | awk '$3 != "Running" && $3 != "Completed" {print}')"
+[[ -z $not_ready ]] || { printf 'kube-system has non-ready Pods:\n%s\n' "$not_ready" >&2; exit 1; }
 dev_taints="$(k3s kubectl get node "$1" -o jsonpath='{.spec.taints}')"
 [[ -z $dev_taints || $dev_taints == '[]' ]] || { printf 'dev node is tainted and not schedulable: %s\n' "$dev_taints" >&2; exit 1; }
 k3s kubectl get nodes -o wide
