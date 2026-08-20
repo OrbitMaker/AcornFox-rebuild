@@ -1,4 +1,5 @@
 SHELL := /usr/bin/env bash
+export KUBECONFIG ?= $(CURDIR)/artifacts/kubeconfig
 
 .PHONY: help preflight provision kubernetes storage openkruise higress demo postgres monitoring drills install verify
 
@@ -64,4 +65,3 @@ verify:
 	./scripts/verify-demo.sh
 	./scripts/verify-postgres.sh
 	./scripts/verify-monitoring.sh
-

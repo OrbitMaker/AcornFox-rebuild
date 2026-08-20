@@ -1,0 +1,58 @@
+name: open-local
+namespace: kube-system
+driver: local.csi.aliyun.com
+
+customLabels:
+  open-card.io/component: storage
+
+images:
+  local:
+    image: openlocal/open-local
+    tag: v0.7.1
+  registrar:
+    image: sig-storage/csi-node-driver-registrar
+    tag: v2.3.0
+  provisioner:
+    image: sig-storage/csi-provisioner
+    tag: v2.2.2
+  resizer:
+    image: sig-storage/csi-resizer
+    tag: v1.3.0
+  snapshotter:
+    image: sig-storage/csi-snapshotter
+    tag: v4.2.1
+  snapshot_controller:
+    image: sig-storage/snapshot-controller
+    tag: v4.2.1
+
+agent:
+  device: /dev/vdb
+  kubelet_dir: /var/lib/kubelet
+  volume_name_prefix: local
+  spdk: false
+  driverMode: node
+
+extender:
+  strategy: spread
+  port: 23000
+  init_job: false
+
+controller:
+  update_nls: "true"
+
+storageclass:
+  lvm:
+    name: open-local-lvm
+  lvm_xfs:
+    name: open-local-lvm-xfs
+  device_ssd:
+    name: open-local-device-ssd
+  device_hdd:
+    name: open-local-device-hdd
+
+monitor:
+  enabled: false
+
+global:
+  RegistryURL: k8s.m.daocloud.io
+  NumOfMasters: 1
