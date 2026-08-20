@@ -42,6 +42,7 @@ higress:
 demo:
 	./scripts/06-install-demo.sh
 	./scripts/verify-demo.sh
+	HIGRESS_BACKEND_MODE=require ./scripts/verify-higress.sh
 
 postgres:
 	./scripts/07-install-postgres.sh

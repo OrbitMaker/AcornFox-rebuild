@@ -151,21 +151,24 @@ if [[ $BACKEND_MODE != skip && $endpoint_count -gt 0 ]]; then
     local body="$ARTIFACT_DIR/${label}-body.txt"
     local headers="$ARTIFACT_DIR/${label}-headers.txt"
     local url status
-    local -a curl_args
 
     if [[ $protocol == https ]]; then
       url="https://${HOSTNAME}:${port}${path}"
-      curl_args=(--insecure --resolve "$HOSTNAME:$port:$GATEWAY_ADDRESS")
     else
       url="http://${URL_HOST}:${port}${path}"
-      curl_args=()
     fi
 
     for _ in $(seq 1 "${HIGRESS_REQUEST_ATTEMPTS:-15}"); do
-      status="$("$CURL" --silent --show-error --connect-timeout "${HIGRESS_CONNECT_TIMEOUT:-5}" \
-        --max-time "${HIGRESS_REQUEST_TIMEOUT:-15}" \
-        -H "Host: $HOSTNAME" "${curl_args[@]}" \
-        -D "$headers" -o "$body" -w '%{http_code}' "$url" 2>/dev/null || true)"
+      if [[ $protocol == https ]]; then
+        status="$("$CURL" --silent --show-error --connect-timeout "${HIGRESS_CONNECT_TIMEOUT:-5}" \
+          --max-time "${HIGRESS_REQUEST_TIMEOUT:-15}" --insecure \
+          --resolve "$HOSTNAME:$port:$GATEWAY_ADDRESS" -H "Host: $HOSTNAME" \
+          -D "$headers" -o "$body" -w '%{http_code}' "$url" 2>/dev/null || true)"
+      else
+        status="$("$CURL" --silent --show-error --connect-timeout "${HIGRESS_CONNECT_TIMEOUT:-5}" \
+          --max-time "${HIGRESS_REQUEST_TIMEOUT:-15}" -H "Host: $HOSTNAME" \
+          -D "$headers" -o "$body" -w '%{http_code}' "$url" 2>/dev/null || true)"
+      fi
       printf '%s\n' "$status" >"$ARTIFACT_DIR/${label}-status.txt"
       if [[ $status == 200 ]] && grep -Eq 'pod=' "$body"; then
         return 0
@@ -180,6 +183,20 @@ if [[ $BACKEND_MODE != skip && $endpoint_count -gt 0 ]]; then
   request http /api "$HTTP_NODEPORT" http-api
   request https / "$HTTPS_NODEPORT" https-root
   request https /api "$HTTPS_NODEPORT" https-api
+
+  : >"$ARTIFACT_DIR/load-balancing-pods.txt"
+  for _ in $(seq 1 30); do
+    "$CURL" --silent --show-error --connect-timeout 5 --max-time 15 \
+      -H "Host: $HOSTNAME" "http://${URL_HOST}:${HTTP_NODEPORT}/" \
+      | sed -n 's/.*pod=\([^<]*\).*/\1/p' >>"$ARTIFACT_DIR/load-balancing-pods.txt"
+  done
+  sort -u "$ARTIFACT_DIR/load-balancing-pods.txt" \
+    >"$ARTIFACT_DIR/load-balancing-unique-pods.txt"
+  unique_pods="$(awk 'NF {count++} END {print count + 0}' "$ARTIFACT_DIR/load-balancing-unique-pods.txt")"
+  [[ $unique_pods -eq 3 ]] || {
+    printf 'Higress load-balancing reached %s unique Pods, expected 3\n' "$unique_pods" >&2
+    return 1
+  }
   printf 'ready\n' >"$ARTIFACT_DIR/backend-route-state.txt"
   route_state=ready
 else
