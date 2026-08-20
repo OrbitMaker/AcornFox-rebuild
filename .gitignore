@@ -1,0 +1,14 @@
+# Local operator configuration. The checked-in example contains no credentials.
+config/cluster.env
+config/*.local
+
+# Generated artifacts and temporary files.
+.cache/
+artifacts/
+*.log
+.omx/
+
+# Local macOS/editor noise.
+.DS_Store
+.idea/
+.vscode/
