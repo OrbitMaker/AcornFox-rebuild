@@ -1,0 +1,101 @@
+# Values for prometheus-community/kube-prometheus-stack 88.5.2.
+# The 4C/4Gi nodes require a single Prometheus and a single Grafana replica.
+defaultRules:
+  create: false
+
+alertmanager:
+  enabled: false
+
+grafana:
+  enabled: true
+  replicas: 1
+  persistence:
+    enabled: false
+  initChownData:
+    enabled: false
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi
+  service:
+    type: ClusterIP
+  # Keep this PoC credential-free.  Operators can still inspect dashboards
+  # anonymously; production deployments must configure external auth.
+  grafana.ini:
+    auth.anonymous:
+      enabled: true
+      org_role: Viewer
+    users:
+      allow_sign_up: false
+
+prometheus:
+  enabled: true
+  service:
+    type: ClusterIP
+  prometheusSpec:
+    replicas: 1
+    retention: 2d
+    retentionSize: 1GB
+    scrapeInterval: 30s
+    evaluationInterval: 30s
+    resources:
+      requests:
+        cpu: 200m
+        memory: 384Mi
+      limits:
+        cpu: 500m
+        memory: 768Mi
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    probeSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+    scrapeConfigSelectorNilUsesHelmValues: false
+
+prometheusOperator:
+  enabled: true
+  resources:
+    requests:
+      cpu: 50m
+      memory: 96Mi
+    limits:
+      cpu: 200m
+      memory: 192Mi
+
+prometheus-node-exporter:
+  resources:
+    requests:
+      cpu: 25m
+      memory: 48Mi
+    limits:
+      cpu: 100m
+      memory: 96Mi
+
+kube-state-metrics:
+  resources:
+    requests:
+      cpu: 25m
+      memory: 64Mi
+    limits:
+      cpu: 100m
+      memory: 128Mi
+
+kubeStateMetrics:
+  enabled: true
+
+nodeExporter:
+  enabled: true
+
+# These control-plane scrapers are not reachable on every k3s/kubeadm layout
+# and add load.  kube-state-metrics and node-exporter cover the PoC health
+# checks required here.
+kubeControllerManager:
+  enabled: false
+kubeEtcd:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeProxy:
+  enabled: false
