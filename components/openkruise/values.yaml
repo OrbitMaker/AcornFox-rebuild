@@ -1,0 +1,36 @@
+crds:
+  managed: true
+
+installation:
+  namespace: kruise-system
+  createNamespace: true
+
+# Image pre-download is unnecessary for this one-pod smoke test and would add
+# another controller workload to the 4Gi nodes.
+featureGates: "ImagePullJobGate=false"
+
+manager:
+  replicas: 1
+  image:
+    repository: openkruise/kruise-manager
+    tag: v1.9.1
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+
+daemon:
+  # k3s keeps containerd under /run/k3s/containerd. With socketFile empty,
+  # OpenKruise auto-detects containerd/containerd.sock below this hostPath.
+  socketLocation: /run/k3s
+  socketFile: ""
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      cpu: 50m
+      memory: 128Mi
