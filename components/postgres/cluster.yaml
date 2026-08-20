@@ -1,0 +1,61 @@
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: poc-postgres
+  namespace: poc-data
+  labels:
+    app.kubernetes.io/part-of: local-cloud-poc
+    app.kubernetes.io/component: database
+spec:
+  instances: 3
+  imageName: ghcr.io/cloudnative-pg/postgresql:17.5
+
+  # Keep a controlled update path for a PoC.  A primary is never updated
+  # before a replica is available.
+  primaryUpdateStrategy: unsupervised
+
+  storage:
+    size: 5Gi
+    storageClass: open-local-lvm
+  walStorage:
+    size: 2Gi
+    storageClass: open-local-lvm
+
+  bootstrap:
+    initdb:
+      database: appdb
+      owner: app
+
+  affinity:
+    enablePodAntiAffinity: true
+    topologyKey: kubernetes.io/hostname
+    podAntiAffinityType: required
+
+  resources:
+    requests:
+      cpu: 200m
+      memory: 512Mi
+    limits:
+      cpu: 500m
+      memory: 768Mi
+
+  # The metrics endpoint is exposed by the CNPG instance manager.  The
+  # PodMonitor is installed with the monitoring stack in stage 08, after the
+  # monitoring.coreos.com CRDs are present.
+  monitoring:
+    enablePodMonitor: false
+
+  postgresql:
+    synchronous:
+      method: any
+      number: 1
+      dataDurability: required
+      failoverQuorum: true
+    parameters:
+      # Keep memory bounded on 4 GiB nodes while retaining enough headroom for
+      # replication and the demo workload.
+      shared_buffers: 128MB
+      work_mem: 4MB
+      maintenance_work_mem: 64MB
+      max_connections: "50"
+      wal_compression: lz4
