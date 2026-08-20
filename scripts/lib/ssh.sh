@@ -26,9 +26,9 @@ oc_ssh() {
     user=$VM_SSH_USER
   fi
   if [[ -n $key ]]; then
-    ssh "${OC_SSH_ARGS[@]}" -i "$key" "${user}@${host}" "$@"
+    ssh -n "${OC_SSH_ARGS[@]}" -i "$key" "${user}@${host}" "$@"
   else
-    ssh "${OC_SSH_ARGS[@]}" "${user}@${host}" "$@"
+    ssh -n "${OC_SSH_ARGS[@]}" "${user}@${host}" "$@"
   fi
 }
 
@@ -41,7 +41,17 @@ oc_ssh_root() {
 oc_ssh_root_script() {
   local host=${1:?host required}
   shift
-  oc_ssh "$host" sudo -n bash -s -- "$@"
+  local key
+  local user=$SSH_USER
+  key="$(oc_ssh_key_for_host "$host")"
+  if [[ $host != "$DEV_HOST" && $host != "$TEST_HOST" ]]; then
+    user=$VM_SSH_USER
+  fi
+  if [[ -n $key ]]; then
+    ssh "${OC_SSH_ARGS[@]}" -i "$key" "${user}@${host}" sudo -n bash -s -- "$@"
+  else
+    ssh "${OC_SSH_ARGS[@]}" "${user}@${host}" sudo -n bash -s -- "$@"
+  fi
 }
 
 oc_wait_ssh() {

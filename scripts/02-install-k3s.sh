@@ -89,6 +89,10 @@ unset token
 if ! command -v k3s >/dev/null 2>&1; then
   curl --fail --location --retry 3 https://get.k3s.io | \
     INSTALL_K3S_VERSION="$version" INSTALL_K3S_EXEC=agent sh -
+elif ! systemctl cat k3s-agent.service >/dev/null 2>&1; then
+  curl --fail --location --retry 3 https://get.k3s.io | \
+    INSTALL_K3S_VERSION="$version" INSTALL_K3S_EXEC=agent \
+    INSTALL_K3S_SKIP_DOWNLOAD=true sh -
 fi
 systemctl enable --now k3s-agent
 REMOTE

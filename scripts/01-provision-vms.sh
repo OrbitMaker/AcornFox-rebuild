@@ -62,7 +62,7 @@ write_files:
       net.bridge.bridge-nf-call-iptables = 1
       net.bridge.bridge-nf-call-ip6tables = 1
 runcmd:
-  - [ bash, -c, "swapoff -a || true; sed -ri '/\\sswap\\s/s/^/#/' /etc/fstab" ]
+  - [ bash, -c, "swapoff -a || true; sed -ri '/[[:space:]]swap[[:space:]]/s/^/#/' /etc/fstab" ]
   - [ modprobe, overlay ]
   - [ modprobe, br_netfilter ]
   - [ sysctl, --system ]
@@ -73,7 +73,7 @@ version: 2
 ethernets:
   eth0:
     match:
-      driver: virtio_net
+      macaddress: $mac
     set-name: eth0
     dhcp4: false
     addresses:
@@ -96,7 +96,7 @@ local-hostname: $name
   oc_info "provisioning $name on $host ($ip, $mac, parent $nic)"
   oc_ssh_root_script "$host" \
     "$name" "$ip" "$mac" "$nic" "$VM_IMAGE_DIR" "$VM_IMAGE_URL" \
-    "$VM_IMAGE_SHA256" "$VM_ROOT_SIZE_GB" "$VM_DATA_SIZE_GB" "$VM_MEMORY_MB" \
+    "${VM_IMAGE_SHA256:--}" "$VM_ROOT_SIZE_GB" "$VM_DATA_SIZE_GB" "$VM_MEMORY_MB" \
     "$VM_VCPUS" "$VM_OS_VARIANT" "$user_b64" "$net_b64" "$meta_b64" <<'REMOTE'
 set -Eeuo pipefail
 name=$1
@@ -106,6 +106,7 @@ parent_nic=$4
 image_dir=$5
 image_url=$6
 image_sha256=$7
+[[ $image_sha256 == - ]] && image_sha256=
 root_size=$8
 data_size=$9
 memory_mb=${10}
