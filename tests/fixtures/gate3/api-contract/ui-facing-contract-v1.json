@@ -1,0 +1,36 @@
+{
+  "fixture_id": "gate3-ui-facing-openapi-contract-v1",
+  "handler_status": "not_implemented",
+  "session_security_scheme": "AdministratorSession",
+  "csrf_header": "X-Open-Card-CSRF",
+  "ui_operations": {
+    "GET /api/v1/settings/platform-domain": "getPlatformDomainSettings",
+    "PUT /api/v1/settings/platform-domain": "putPlatformDomainSettings",
+    "GET /api/v1/applications/{applicationId}/domains": "listApplicationDomains",
+    "POST /api/v1/applications/{applicationId}/domains": "bindApplicationCustomDomain",
+    "POST /api/v1/applications/{applicationId}/domains/{domainId}/verify": "verifyApplicationDomain",
+    "DELETE /api/v1/applications/{applicationId}/domains/{domainId}": "unbindApplicationDomain",
+    "GET /api/v1/applications/{applicationId}/access": "getApplicationAccess",
+    "POST /api/v1/source-uploads": "createSourceUpload",
+    "GET /api/v1/source-uploads/{uploadId}": "getSourceUpload"
+  },
+  "write_operations": [
+    "putPlatformDomainSettings",
+    "bindApplicationCustomDomain",
+    "verifyApplicationDomain",
+    "unbindApplicationDomain",
+    "createSourceUpload"
+  ],
+  "error_responses": {
+    "401": "AuthenticationRequired",
+    "409": "StateConflict",
+    "413": "PayloadTooLarge",
+    "415": "UnsupportedMediaType",
+    "422": "ValidationFailed",
+    "429": "RateLimited",
+    "503": "DependencyUnavailable"
+  },
+  "invalid_relative_paths": ["/absolute", "foo//bar", "foo/./bar", "foo/../bar", "foo/"],
+  "multipart_modes": ["archive", "directory"],
+  "forbidden_cloud_terms": ["dnspod", "tccli", "secretid", "secretkey", "accesskey"]
+}

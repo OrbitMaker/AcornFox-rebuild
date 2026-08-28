@@ -114,6 +114,7 @@ paths:
       operationId: createApplication
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CSRFHeader'
       requestBody:
         required: true
         content:
@@ -150,6 +151,10 @@ paths:
       - $ref: '#/components/parameters/APIMaxVersion'
     get:
       operationId: getApplication
+      x-open-card-handler-status: partial_contract
+      description: >-
+        UI-facing application detail contract. The current handler returns the legacy application
+        projection until G3 access/source detail composition is implemented.
       responses:
         '200':
           description: Application
@@ -159,7 +164,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Application'
+                $ref: '#/components/schemas/ApplicationDetail'
         '404':
           description: Not found
           headers:
@@ -167,6 +172,198 @@ paths:
               $ref: '#/components/headers/APINegotiatedVersion'
         '426':
           $ref: '#/components/responses/APIUpgradeRequired'
+  # G3 UI-facing access contracts. These endpoints deliberately do not expose
+  # M3 workflow inputs; handler implementation is deferred to later G3 work.
+  /api/v1/settings/platform-domain:
+    get:
+      operationId: getPlatformDomainSettings
+      x-open-card-handler-status: not_implemented
+      description: >-
+        UI-facing platform-domain state. A failed domain or certificate never changes an
+        application's runtime or IP fallback address.
+      responses:
+        '200':
+          description: Current platform-domain configuration and convergence state.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PlatformDomainSettingsResponse'}
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '503': {$ref: '#/components/responses/DependencyUnavailable'}
+    put:
+      operationId: putPlatformDomainSettings
+      x-open-card-handler-status: not_implemented
+      description: >-
+        Idempotently configures one platform base domain. The controller derives platform
+        addresses as <slug>-<short>.apps.<base_domain>; root domains, CDN and WAF are outside MVP.
+      parameters:
+        - $ref: '#/components/parameters/RequiredIdempotencyKey'
+        - $ref: '#/components/parameters/CSRFHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/PlatformDomainSettingsRequest'}
+      responses:
+        '200':
+          description: Existing identical configuration returned.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PlatformDomainSettingsResponse'}
+        '202':
+          description: Domain verification or certificate convergence is pending.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PlatformDomainSettingsResponse'}
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '409': {$ref: '#/components/responses/StateConflict'}
+        '422': {$ref: '#/components/responses/ValidationFailed'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '503': {$ref: '#/components/responses/DependencyUnavailable'}
+  /api/v1/applications/{applicationId}/domains:
+    parameters:
+      - $ref: '#/components/parameters/ApplicationID'
+    get:
+      operationId: listApplicationDomains
+      x-open-card-handler-status: not_implemented
+      responses:
+        '200':
+          description: Platform and customer CNAME-only domain bindings for one application.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ApplicationDomainsResponse'}
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/DependencyUnavailable'}
+    post:
+      operationId: bindApplicationCustomDomain
+      x-open-card-handler-status: not_implemented
+      description: >-
+        Binds only a customer hostname. The response supplies the CNAME target; this endpoint
+        never writes a customer DNS zone and failures preserve platform/IP access.
+      parameters:
+        - $ref: '#/components/parameters/RequiredIdempotencyKey'
+        - $ref: '#/components/parameters/CSRFHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CustomDomainBindRequest'}
+      responses:
+        '202':
+          description: CNAME binding recorded and awaiting public DNS/certificate convergence.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ApplicationDomainResponse'}
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '409': {$ref: '#/components/responses/StateConflict'}
+        '422': {$ref: '#/components/responses/ValidationFailed'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '503': {$ref: '#/components/responses/DependencyUnavailable'}
+  /api/v1/applications/{applicationId}/domains/{domainId}/verify:
+    parameters:
+      - $ref: '#/components/parameters/ApplicationID'
+      - $ref: '#/components/parameters/DomainID'
+    post:
+      operationId: verifyApplicationDomain
+      x-open-card-handler-status: not_implemented
+      description: >-
+        Triggers only public DNS read verification and state convergence. It never creates,
+        updates or deletes a DNS record.
+      parameters:
+        - $ref: '#/components/parameters/RequiredIdempotencyKey'
+        - $ref: '#/components/parameters/CSRFHeader'
+      responses:
+        '202':
+          description: Verification state was refreshed or remains pending.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ApplicationDomainResponse'}
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/StateConflict'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '503': {$ref: '#/components/responses/DependencyUnavailable'}
+  /api/v1/applications/{applicationId}/domains/{domainId}:
+    parameters:
+      - $ref: '#/components/parameters/ApplicationID'
+      - $ref: '#/components/parameters/DomainID'
+    delete:
+      operationId: unbindApplicationDomain
+      x-open-card-handler-status: not_implemented
+      description: Unbinds only the selected custom domain; runtime, IP fallback and platform address remain available.
+      parameters:
+        - $ref: '#/components/parameters/RequiredIdempotencyKey'
+        - $ref: '#/components/parameters/CSRFHeader'
+      responses:
+        '204': {description: Custom domain binding removed without altering fallback access.}
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/StateConflict'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '503': {$ref: '#/components/responses/DependencyUnavailable'}
+  /api/v1/applications/{applicationId}/access:
+    parameters:
+      - $ref: '#/components/parameters/ApplicationID'
+    get:
+      operationId: getApplicationAccess
+      x-open-card-handler-status: not_implemented
+      description: Unified serving, route and certificate projection. Domain/certificate failure never removes IP fallback.
+      responses:
+        '200':
+          description: Application access facts.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ApplicationAccessResponse'}
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/DependencyUnavailable'}
+  /api/v1/source-uploads:
+    post:
+      operationId: createSourceUpload
+      x-open-card-handler-status: not_implemented
+      description: >-
+        Creates a short-lived source upload. archive accepts exactly one .zip, .tar.gz or .tgz
+        file. directory accepts repeated files parts whose filenames are normalized relative paths
+        and a JSON manifest cross-check; absolute client paths are rejected.
+      parameters:
+        - $ref: '#/components/parameters/RequiredIdempotencyKey'
+        - $ref: '#/components/parameters/CSRFHeader'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema: {$ref: '#/components/schemas/SourceUploadRequest'}
+            encoding:
+              manifest: {contentType: application/json}
+      responses:
+        '201':
+          description: Upload received and content-addressed facts are available.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/SourceUploadResponse'}
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '409': {$ref: '#/components/responses/StateConflict'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedMediaType'}
+        '422': {$ref: '#/components/responses/ValidationFailed'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '503': {$ref: '#/components/responses/DependencyUnavailable'}
+  /api/v1/source-uploads/{uploadId}:
+    parameters:
+      - $ref: '#/components/parameters/UploadID'
+    get:
+      operationId: getSourceUpload
+      x-open-card-handler-status: not_implemented
+      description: Read-only upload state for an application-creation reference.
+      responses:
+        '200':
+          description: Source upload facts.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/SourceUploadResponse'}
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/DependencyUnavailable'}
   /api/v1/applications/{applicationId}/operations:
     parameters:
       - $ref: '#/components/parameters/ApplicationID'
@@ -184,6 +381,7 @@ paths:
       operationId: requestApplicationOperationsAction
       parameters:
         - $ref: '#/components/parameters/RequiredIdempotencyKey'
+        - $ref: '#/components/parameters/CSRFHeader'
       requestBody:
         required: true
         content:
@@ -260,6 +458,7 @@ paths:
       description: Explicitly requests controlled fallback after a rule miss/conflict/failure. Production changes are never executed here.
       parameters:
         - $ref: '#/components/parameters/RequiredIdempotencyKey'
+        - $ref: '#/components/parameters/CSRFHeader'
       requestBody:
         required: true
         content:
@@ -283,6 +482,7 @@ paths:
       operationId: updateAIServiceSettings
       parameters:
         - $ref: '#/components/parameters/RequiredIdempotencyKey'
+        - $ref: '#/components/parameters/CSRFHeader'
       requestBody:
         required: true
         content:
@@ -301,6 +501,7 @@ paths:
       description: Stores a canonical HTTPS endpoint and opaque SecretReference only; no signing material is accepted or returned.
       parameters:
         - $ref: '#/components/parameters/RequiredIdempotencyKey'
+        - $ref: '#/components/parameters/CSRFHeader'
       requestBody:
         required: true
         content:
@@ -342,6 +543,7 @@ paths:
       description: Queues a signed, redacted occurrence test through the durable ledger; it does not synchronously disclose secret material or receiver response bodies.
       parameters:
         - $ref: '#/components/parameters/RequiredIdempotencyKey'
+        - $ref: '#/components/parameters/CSRFHeader'
       responses:
         '202':
           description: Test delivery reserved for the durable worker.
@@ -365,6 +567,7 @@ paths:
         this request is rejected.
       parameters:
         - $ref: '#/components/parameters/RequiredIdempotencyKey'
+        - $ref: '#/components/parameters/CSRFHeader'
       requestBody:
         required: true
         content:
@@ -405,7 +608,10 @@ paths:
       - $ref: '#/components/parameters/APIMaxVersion'
     get:
       operationId: streamEvents
-      description: Server-sent events stream with stable event IDs and a 24-hour persistent replay window.
+      description: >-
+        Server-sent events stream with stable event IDs and a 24-hour persistent replay window.
+        Clients reconnect with Last-Event-ID; the server replays events after that ID before
+        continuing the live stream.
       parameters:
         - in: header
           name: Last-Event-ID
@@ -435,7 +641,9 @@ paths:
       - $ref: '#/components/parameters/APIMaxVersion'
     get:
       operationId: streamOperationEvents
-      description: Server-sent events for one operation with Last-Event-ID replay.
+      description: >-
+        Server-sent events for one operation. Clients reconnect with Last-Event-ID and receive
+        persistent replay after that ID before live events continue.
       parameters:
         - in: header
           name: Last-Event-ID
@@ -456,7 +664,7 @@ paths:
   /api/v1/access/ip-fallback:
     post:
       operationId: createIPFallback
-      parameters: [{$ref: '#/components/parameters/RequiredIdempotencyKey'}]
+      parameters: [{$ref: '#/components/parameters/RequiredIdempotencyKey'}, {$ref: '#/components/parameters/CSRFHeader'}]
       requestBody:
         required: true
         content:
@@ -473,7 +681,7 @@ paths:
   /api/v1/access/platform-domains:
     post:
       operationId: bindPlatformDomain
-      parameters: [{$ref: '#/components/parameters/RequiredIdempotencyKey'}]
+      parameters: [{$ref: '#/components/parameters/RequiredIdempotencyKey'}, {$ref: '#/components/parameters/CSRFHeader'}]
       requestBody:
         required: true
         content:
@@ -495,7 +703,7 @@ paths:
   /api/v1/access/application-domains:
     post:
       operationId: bindApplicationDomain
-      parameters: [{$ref: '#/components/parameters/RequiredIdempotencyKey'}]
+      parameters: [{$ref: '#/components/parameters/RequiredIdempotencyKey'}, {$ref: '#/components/parameters/CSRFHeader'}]
       requestBody:
         required: true
         content:
@@ -518,7 +726,7 @@ paths:
   /api/v1/access/domain-routes:
     post:
       operationId: applyDomainRoutes
-      parameters: [{$ref: '#/components/parameters/RequiredIdempotencyKey'}]
+      parameters: [{$ref: '#/components/parameters/RequiredIdempotencyKey'}, {$ref: '#/components/parameters/CSRFHeader'}]
       requestBody:
         required: true
         content:
@@ -535,7 +743,7 @@ paths:
   /api/v1/access/platform-application-domains:
     post:
       operationId: createPlatformApplicationDomain
-      parameters: [{$ref: '#/components/parameters/RequiredIdempotencyKey'}]
+      parameters: [{$ref: '#/components/parameters/RequiredIdempotencyKey'}, {$ref: '#/components/parameters/CSRFHeader'}]
       requestBody:
         required: true
         content:
@@ -554,7 +762,7 @@ paths:
   /api/v1/access/certificates/renew:
     post:
       operationId: renewCertificate
-      parameters: [{$ref: '#/components/parameters/RequiredIdempotencyKey'}]
+      parameters: [{$ref: '#/components/parameters/RequiredIdempotencyKey'}, {$ref: '#/components/parameters/CSRFHeader'}]
       requestBody:
         required: true
         content:
@@ -572,7 +780,7 @@ paths:
   /api/v1/access/traffic-switches:
     post:
       operationId: switchTraffic
-      parameters: [{$ref: '#/components/parameters/RequiredIdempotencyKey'}]
+      parameters: [{$ref: '#/components/parameters/RequiredIdempotencyKey'}, {$ref: '#/components/parameters/CSRFHeader'}]
       requestBody:
         required: true
         content:
@@ -613,6 +821,7 @@ paths:
       parameters:
         - {name: action, in: path, required: true, schema: {type: string, enum: [restart, redeploy, rollback]}}
         - $ref: '#/components/parameters/RequiredIdempotencyKey'
+        - $ref: '#/components/parameters/CSRFHeader'
       requestBody:
         required: true
         content:
@@ -672,6 +881,22 @@ components:
       required: true
       schema:
         type: string
+    DomainID:
+      name: domainId
+      in: path
+      required: true
+      schema: {type: string, minLength: 1}
+    UploadID:
+      name: uploadId
+      in: path
+      required: true
+      schema: {type: string, minLength: 1}
+    CSRFHeader:
+      name: X-Open-Card-CSRF
+      in: header
+      required: true
+      description: Double-submit CSRF value matching the non-HttpOnly administrator CSRF cookie.
+      schema: {type: string, minLength: 1}
     ServiceGroupID:
       name: serviceGroupId
       in: path
@@ -706,6 +931,30 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/APIError'
+    AuthenticationRequired:
+      description: Valid administrator session and, for writes, CSRF proof are required.
+      content: {application/json: {schema: {$ref: '#/components/schemas/APIError'}}}
+    StateConflict:
+      description: State, version or idempotency conflict.
+      content: {application/json: {schema: {$ref: '#/components/schemas/APIError'}}}
+    PayloadTooLarge:
+      description: Upload exceeds the negotiated size, file-count or expanded-content limit.
+      content: {application/json: {schema: {$ref: '#/components/schemas/APIError'}}}
+    UnsupportedMediaType:
+      description: Upload media type is unsupported.
+      content: {application/json: {schema: {$ref: '#/components/schemas/APIError'}}}
+    ValidationFailed:
+      description: Input violates the API contract.
+      content: {application/json: {schema: {$ref: '#/components/schemas/APIError'}}}
+    RateLimited:
+      description: Request is rate limited.
+      content: {application/json: {schema: {$ref: '#/components/schemas/APIError'}}}
+    DependencyUnavailable:
+      description: Required local controller or dependency is unavailable.
+      content: {application/json: {schema: {$ref: '#/components/schemas/APIError'}}}
+    NotFound:
+      description: Requested durable resource was not found.
+      content: {application/json: {schema: {$ref: '#/components/schemas/APIError'}}}
   schemas:
     APIError:
       type: object
@@ -759,6 +1008,165 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/Application'
+    ApplicationDetail:
+      type: object
+      additionalProperties: false
+      required: [id, name, created_at, updated_at, source_upload_id, access]
+      properties:
+        id: {type: string}
+        name: {type: string}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+        source_upload_id: {type: string, nullable: true, description: Future source upload reference; null until G3 source binding is implemented.}
+        access: {$ref: '#/components/schemas/ApplicationAccessSummary'}
+    DomainLifecycleStatus:
+      type: string
+      enum: [pending, verifying, certificate_pending, ready, failed]
+    DomainVerification:
+      type: object
+      additionalProperties: false
+      required: [method, status]
+      properties:
+        method: {type: string, enum: [dns_txt, cname, public_dns_read_only]}
+        status: {$ref: '#/components/schemas/DomainLifecycleStatus'}
+        name: {type: string, nullable: true}
+        value: {type: string, nullable: true}
+        observed_at: {type: string, format: date-time, nullable: true}
+    CertificateStatus:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status: {type: string, enum: [pending, issuing, ready, failed]}
+        subject: {type: string, nullable: true}
+        not_after: {type: string, format: date-time, nullable: true}
+    FailureState:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code: {type: string}
+        message: {type: string}
+        retryable: {type: boolean}
+    PlatformDomainSettingsRequest:
+      type: object
+      additionalProperties: false
+      required: [base_domain]
+      properties:
+        base_domain: {type: string, minLength: 1, description: Registrable platform base domain, not a customer root domain.}
+    PlatformDomainSettingsResponse:
+      type: object
+      additionalProperties: false
+      required: [status, base_domain, console_domain, wildcard_pattern, verification, certificate, failure, next_action]
+      properties:
+        status: {$ref: '#/components/schemas/DomainLifecycleStatus'}
+        base_domain: {type: string, nullable: true}
+        console_domain: {type: string, nullable: true}
+        wildcard_pattern: {type: string, nullable: true, description: "*.apps.<base_domain> when configured."}
+        verification: {$ref: '#/components/schemas/DomainVerification'}
+        certificate: {$ref: '#/components/schemas/CertificateStatus'}
+        failure: {$ref: '#/components/schemas/FailureState', nullable: true}
+        next_action: {type: string, enum: [configure_base_domain, publish_verification_record, wait_for_verification, wait_for_certificate, ready, retry]}
+    CustomDomainBindRequest:
+      type: object
+      additionalProperties: false
+      required: [hostname]
+      properties:
+        hostname: {type: string, minLength: 1, description: Customer hostname only; client never supplies a CNAME target or DNS provider data.}
+    ApplicationDomain:
+      type: object
+      additionalProperties: false
+      required: [id, hostname, kind, status, cname_target, verification, certificate, failure, serving]
+      properties:
+        id: {type: string}
+        hostname: {type: string}
+        kind: {type: string, enum: [platform, custom]}
+        status: {$ref: '#/components/schemas/DomainLifecycleStatus'}
+        cname_target: {type: string, nullable: true}
+        verification: {$ref: '#/components/schemas/DomainVerification'}
+        certificate: {$ref: '#/components/schemas/CertificateStatus'}
+        failure: {$ref: '#/components/schemas/FailureState', nullable: true}
+        serving: {type: boolean}
+    ApplicationDomainsResponse:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/ApplicationDomain'}}
+    ApplicationDomainResponse:
+      type: object
+      additionalProperties: false
+      required: [domain]
+      properties:
+        domain: {$ref: '#/components/schemas/ApplicationDomain'}
+    AccessRouteStatus:
+      type: object
+      additionalProperties: false
+      required: [desired, serving]
+      properties:
+        desired: {type: boolean}
+        serving: {type: boolean}
+        route_id: {type: string, nullable: true}
+    ApplicationAccessSummary:
+      type: object
+      additionalProperties: false
+      required: [runtimeReady, ipFallback, platformAddress, customDomains, route, certificate, serving]
+      properties:
+        runtimeReady: {type: boolean}
+        ipFallback: {type: string, nullable: true}
+        platformAddress: {$ref: '#/components/schemas/ApplicationDomain', nullable: true}
+        customDomains: {type: array, items: {$ref: '#/components/schemas/ApplicationDomain'}}
+        route: {$ref: '#/components/schemas/AccessRouteStatus'}
+        certificate: {$ref: '#/components/schemas/CertificateStatus'}
+        serving: {type: boolean}
+    ApplicationAccessResponse:
+      allOf:
+        - $ref: '#/components/schemas/ApplicationAccessSummary'
+    SourceUploadManifestEntry:
+      type: object
+      additionalProperties: false
+      required: [path, bytes]
+      properties:
+        path: {type: string, pattern: '^(?!/)(?!.*//)(?!.*(?:^|/)\.(?:/|$))(?!.*(?:^|/)\.\.(?:/|$))(?!.*\/$)[A-Za-z0-9][A-Za-z0-9._/@+ -]*$', description: Normalized relative path with no empty, dot, parent or trailing-slash segment.}
+        bytes: {type: integer, format: int64, minimum: 0}
+        digest: {type: string, pattern: '^sha256:[0-9a-f]{64}$'}
+    SourceUploadManifest:
+      type: object
+      additionalProperties: false
+      required: [files]
+      properties:
+        files: {type: array, minItems: 1, items: {$ref: '#/components/schemas/SourceUploadManifestEntry'}}
+    SourceUploadRequest:
+      oneOf:
+        - $ref: '#/components/schemas/SourceUploadArchiveRequest'
+        - $ref: '#/components/schemas/SourceUploadDirectoryRequest'
+      discriminator: {propertyName: mode}
+    SourceUploadArchiveRequest:
+      type: object
+      additionalProperties: false
+      required: [mode, archive]
+      properties:
+        mode: {type: string, enum: [archive]}
+        archive: {type: string, format: binary, description: Required exactly once; accepted filename extensions are .zip, .tar.gz and .tgz only.}
+    SourceUploadDirectoryRequest:
+      type: object
+      additionalProperties: false
+      required: [mode, files, manifest]
+      properties:
+        mode: {type: string, enum: [directory]}
+        files: {type: array, minItems: 1, items: {type: string, format: binary}, description: Required as repeated multipart parts. Each part filename is a normalized relative path cross-checked against manifest.files.}
+        manifest: {$ref: '#/components/schemas/SourceUploadManifest'}
+    SourceUploadResponse:
+      type: object
+      additionalProperties: false
+      required: [upload_id, kind, digest, bytes, file_count, expires_at]
+      properties:
+        upload_id: {type: string}
+        kind: {type: string, enum: [archive, directory]}
+        digest: {type: string, pattern: '^sha256:[0-9a-f]{64}$'}
+        bytes: {type: integer, format: int64, minimum: 0}
+        file_count: {type: integer, minimum: 1}
+        expires_at: {type: string, format: date-time}
     CreateApplicationResponse:
       type: object
       required: [application, operation_id]
