@@ -24,7 +24,8 @@ function currentIndex(status: PublishingStatus): number {
 }
 
 export function PublishingStatusTag({ snapshot, compact = false }: PublishingStatusProps) {
-  const status = snapshot?.status ?? 'preparing';
+  if (!snapshot) return <Tag color="grey" size={compact ? 'small' : 'default'}>未发布</Tag>;
+  const status = snapshot.status;
   return (
     <Tag color={statusTone[status]} size={compact ? 'small' : 'default'}>
       {PUBLISHING_STATUS_LABELS[status]}
@@ -33,7 +34,8 @@ export function PublishingStatusTag({ snapshot, compact = false }: PublishingSta
 }
 
 export function PublishingStatusTrack({ snapshot }: PublishingStatusProps) {
-  const status = snapshot?.status ?? 'preparing';
+  if (!snapshot) return <div className="status-track status-track--unpublished" aria-label="发布状态：尚未发起发布"><span className="status-track__unpublished-label">尚未发起发布</span></div>;
+  const status = snapshot.status;
   const activeIndex = currentIndex(status);
   return (
     <div className="status-track" aria-label={`发布状态：${PUBLISHING_STATUS_LABELS[status]}`}>

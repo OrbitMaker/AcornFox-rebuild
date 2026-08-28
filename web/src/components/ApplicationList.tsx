@@ -20,7 +20,14 @@ const sourceLabels = {
   git: 'Git 来源',
   folder: '文件夹上传',
   archive: '归档上传',
+  unknown: '来源未记录',
 } as const;
+
+function sourceLocatorLabel(source: ApplicationSummary['source']): string {
+  if (source.kind === 'unknown') return '来源未记录';
+  if (source.kind === 'archive' || source.kind === 'folder') return source.uploadId ? `upload:${source.uploadId}` : '上传 ID 未记录';
+  return source.locator ?? '来源地址未记录';
+}
 
 function formatUpdatedAt(value: string): string {
   const date = new Date(value);
@@ -51,7 +58,7 @@ export function ApplicationList({ applications, loading, error, selectedApplicat
       render: (source: ApplicationSummary['source']) => (
         <div className="source-cell">
           <span>{sourceLabels[source.kind]}</span>
-          <small title={source.locator}>{source.locator ?? '待接入来源'}</small>
+          <small title={sourceLocatorLabel(source)}>{sourceLocatorLabel(source)}</small>
         </div>
       ),
     },

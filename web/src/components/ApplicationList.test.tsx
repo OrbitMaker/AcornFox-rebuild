@@ -65,4 +65,16 @@ describe('ApplicationList', () => {
     expect(markup).toContain('接入第一个应用');
     expect(markup).not.toContain('aria-pressed="true"');
   });
+
+  it('renders upload IDs and unknown sources without falling back to Git', () => {
+    const archive = { ...application('app-archive', 'Archive'), source: { kind: 'archive' as const, uploadId: 'upload-1' } };
+    const folder = { ...application('app-folder', 'Folder'), source: { kind: 'folder' as const } };
+    const unknown = { ...application('app-unknown', 'Unknown'), source: { kind: 'unknown' as const } };
+    const markup = renderToStaticMarkup(<ApplicationList applications={[archive, folder, unknown]} loading={false} {...callbacks} />);
+
+    expect(markup).toContain('upload:upload-1');
+    expect(markup).toContain('上传 ID 未记录');
+    expect(markup).toContain('来源未记录');
+    expect(markup).not.toContain('待接入来源');
+  });
 });

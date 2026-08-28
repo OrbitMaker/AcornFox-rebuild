@@ -3,7 +3,7 @@ import { IconArrowLeft, IconArrowRight, IconCheckCircleStroked } from '@douyinfe
 import { Button, Card, Input, Steps, Toast } from '@douyinfe/semi-ui';
 import type { ApiClient, CreateApplicationInput, CreateApplicationSource, SourceUploadResponse } from '../api/types';
 import { SourceUploadField } from './SourceUploadField';
-import { buildCreateApplicationSource, gitUnavailableMessage } from './createApplicationSource';
+import { buildCreateApplicationSource } from './createApplicationSource';
 
 interface CreateApplicationWizardProps {
   client: ApiClient;
@@ -12,7 +12,7 @@ interface CreateApplicationWizardProps {
 }
 
 const sourceOptions: Array<{ value: CreateApplicationSource['kind']; label: string; description: string }> = [
-  { value: 'git', label: 'Git 仓库', description: '公开 Git HTTPS 接入处理中；暂不承诺已可用。' },
+  { value: 'git', label: 'Git 仓库', description: '仅支持公开 Git HTTPS 与显式 ref；私有仓库、SSH 和凭据暂不支持。' },
   { value: 'upload', label: '文件上传', description: '浏览器直接上传归档或目录，生成不可变来源。' },
 ];
 
@@ -55,12 +55,10 @@ export function CreateApplicationWizard({ client, onCancel, onCreated }: CreateA
     const input: CreateApplicationInput = { name: name.trim(), source };
     try {
       const result = await client.createApplication(input);
-      Toast.success('应用已创建，发布任务开始准备');
+      Toast.success('应用与来源已创建；下一步进入发布流程');
       onCreated(result.operationId);
     } catch (error) {
-      const unavailable = sourceKind === 'git' ? gitUnavailableMessage(error) : undefined;
-      if (unavailable) setSourceError(unavailable);
-      else Toast.error(error instanceof Error ? error.message : '创建应用失败');
+      Toast.error(error instanceof Error ? error.message : '创建应用失败');
     } finally {
       setSubmitting(false);
     }
@@ -82,7 +80,7 @@ export function CreateApplicationWizard({ client, onCancel, onCreated }: CreateA
           <Steps current={step} direction="vertical">
             <Steps.Step title="基本信息" description="给应用一个清晰的名称" />
             <Steps.Step title="代码来源" description="Git 或安全上传" />
-            <Steps.Step title="确认摘要" description="创建后进入发布状态流" />
+            <Steps.Step title="确认摘要" description="创建后可进入发布流程" />
           </Steps>
           <div className="boundary-note">
             <span className="boundary-note__mark"><IconCheckCircleStroked /></span>
@@ -111,7 +109,7 @@ export function CreateApplicationWizard({ client, onCancel, onCreated }: CreateA
               </div>
               {sourceKind === 'git' ? (
                 <>
-                  <div className="wizard-source-boundary" role="status">公开 Git HTTPS 接入处理中/不可用；不会阻塞文件上传路径。</div>
+                  <div className="wizard-source-boundary" role="status">当前仅支持公开 Git HTTPS 与显式 ref；私有仓库、SSH 和凭据暂不支持。</div>
                   <label className="plain-field"><span>公开 Git HTTPS 仓库地址</span><Input type="url" placeholder="https://git.example.com/team/app.git" value={gitRepositoryUrl} onChange={(value) => setGitRepositoryUrl(String(value))} showClear /></label>
                   <label className="plain-field"><span>分支或 ref</span><Input placeholder="main" value={branch} onChange={(value) => setBranch(String(value))} /></label>
                 </>
@@ -124,19 +122,19 @@ export function CreateApplicationWizard({ client, onCancel, onCreated }: CreateA
           )}
           {step === 2 && (
             <div className="wizard-panel">
-              <div className="wizard-panel__intro"><span className="step-number">03</span><div><h2>确认创建</h2><p>确认后会创建应用和一次发布 Operation，状态由事件推进。</p></div></div>
+              <div className="wizard-panel__intro"><span className="step-number">03</span><div><h2>确认创建</h2><p>确认后会创建应用与来源；发布流程需要后续单独进入。</p></div></div>
               <dl className="review-list">
                 <div><dt>应用名称</dt><dd>{name}</dd></div>
                 <div><dt>代码来源</dt><dd>{selectedSource.label}</dd></div>
                 {sourceKind === 'git' ? <><div><dt>仓库地址</dt><dd>{gitRepositoryUrl}</dd></div><div><dt>分支 / ref</dt><dd>{branch || 'main'}</dd></div></> : <><div><dt>上传 ID</dt><dd>{sourceUpload?.uploadId}</dd></div><div><dt>上传摘要</dt><dd>{sourceUpload?.digest}</dd></div><div><dt>文件 / 大小</dt><dd>{sourceUpload?.fileCount} / {sourceUpload?.bytes} bytes</dd></div></>}
                 <div><dt>部署位置</dt><dd>当前实例预设单机</dd></div>
               </dl>
-              <div className="review-note"><strong>接下来会发生什么</strong><p>控制面会依次显示准备中、构建中、部署中、部署成功或部署失败。每次成功都需要独立验证和证据。</p></div>
+              <div className="review-note"><strong>接下来会发生什么</strong><p>创建后会回到应用页检查发布设置并单独提交；只有提交发布后，控制面才会显示准备中、构建中、部署中、部署成功或部署失败。</p></div>
             </div>
           )}
           <footer className="wizard-actions">
             <Button theme="borderless" onClick={step === 0 ? onCancel : () => setStep((value) => value - 1)} icon={step === 0 ? undefined : <IconArrowLeft />}> {step === 0 ? '取消' : '上一步'}</Button>
-            {step < 2 ? <Button theme="solid" type="primary" disabled={!canAdvance} onClick={() => setStep((value) => value + 1)} icon={<IconArrowRight />}>下一步</Button> : <Button theme="solid" type="primary" loading={submitting} onClick={() => void submit()}>创建并开始发布</Button>}
+            {step < 2 ? <Button theme="solid" type="primary" disabled={!canAdvance} onClick={() => setStep((value) => value + 1)} icon={<IconArrowRight />}>下一步</Button> : <Button theme="solid" type="primary" loading={submitting} onClick={() => void submit()}>创建应用与来源</Button>}
           </footer>
         </Card>
       </div>

@@ -21,6 +21,8 @@ import type {
   PublishEventListener,
   AccessRouteStatus,
   ApplicationAccessResponse,
+  ApplicationPublishInput,
+  ApplicationPublishResponse,
   ApplicationDetail,
   ApplicationDomain,
   ApplicationDomainResponse,
@@ -35,6 +37,9 @@ import type {
   SourceUploadManifest,
   SourceUploadManifestEntry,
   SourceUploadResponse,
+  SystemStatusFact,
+  SystemStatusResult,
+  PublishConnectionState,
 } from './types';
 import { CSRF_COOKIE_NAME, CSRF_HEADER_NAME, type AuthLoginInput, type AuthSession, type PasswordChangeInput } from '../features/auth/auth';
 import type { ApplicationUsageFact, UsageAnomaly, UsageMeasurement, UsageResourceMeasurements, UsageServiceFact, UsageTrendPoint } from '../features/usage/usageFacts';
@@ -241,6 +246,18 @@ function asApplicationAccess(value: unknown): ApplicationAccessResponse {
   };
 }
 
+function asApplicationPublishResponse(value: unknown): ApplicationPublishResponse {
+  if (!isRecord(value) || value.status !== 'deploying') throw new Error('Application publish response is invalid');
+  return {
+    status: 'deploying',
+    operationId: requireString(value.operation_id, 'publish.operation_id'),
+    releaseId: requireString(value.release_id, 'publish.release_id'),
+    deploymentId: requireString(value.deployment_id, 'publish.deployment_id'),
+    taskId: requireString(value.task_id, 'publish.task_id'),
+    sourceRevisionId: requireString(value.source_revision_id, 'publish.source_revision_id'),
+  };
+}
+
 function asApplicationDetail(value: unknown): ApplicationDetail {
   if (!isRecord(value)) throw new Error('Application detail is invalid');
   return {
@@ -396,13 +413,14 @@ function normalizeApplication(value: unknown): ApplicationSummary {
   if (!isRecord(value) || typeof value.id !== 'string' || typeof value.name !== 'string') {
     throw new Error('OpenAPI response contained an invalid application');
   }
-  const source = isRecord(value.source) && (value.source.kind === 'git' || value.source.kind === 'folder' || value.source.kind === 'archive')
+  const source = isRecord(value.source) && (value.source.kind === 'git' || value.source.kind === 'folder' || value.source.kind === 'archive' || value.source.kind === 'unknown')
     ? {
       kind: value.source.kind as ApplicationSource['kind'],
+      uploadId: typeof value.source.source_upload_id === 'string' ? value.source.source_upload_id : undefined,
       locator: typeof value.source.locator === 'string' ? value.source.locator : undefined,
       ref: typeof value.source.ref === 'string' ? value.source.ref : undefined,
     }
-    : { kind: 'git' as const };
+    : { kind: 'unknown' as const };
   const updatedAt = typeof value.updated_at === 'string' ? value.updated_at : new Date().toISOString();
   const publishing = isRecord(value.publishing) && isPublishingStatus(value.publishing.status)
     ? {
@@ -665,6 +683,26 @@ function asAIPlan(value: unknown): AIPlanFact | undefined { if (value === undefi
 function asAIIntervention(value: unknown): AIInterventionFact { if (!isRecord(value) || typeof value.id !== 'string' || typeof value.application_id !== 'string' || typeof value.task_type !== 'string' || !isAIStatus(value.status) || typeof value.reason !== 'string' || typeof value.summary !== 'string' || typeof value.suggestion !== 'string' || typeof value.requires_user_action !== 'boolean' || typeof value.controller_handoff !== 'boolean' || typeof value.rolled_back !== 'boolean' || typeof value.created_at !== 'string') throw new Error('AI intervention fact is invalid'); return { id: value.id, applicationId: value.application_id, taskType: value.task_type, status: value.status, reason: value.reason, summary: value.summary, suggestion: value.suggestion, requiresUserAction: value.requires_user_action, controllerHandoff: value.controller_handoff, provider: typeof value.provider === 'string' ? value.provider : undefined, model: typeof value.model === 'string' ? value.model : undefined, profile: typeof value.profile === 'string' ? value.profile : undefined, contextManifestDigest: typeof value.context_manifest_digest === 'string' ? value.context_manifest_digest : undefined, plan: asAIPlan(value.plan), evidence: Array.isArray(value.evidence) ? value.evidence.map((item) => isRecord(item) && typeof item.id === 'string' ? item.id : '').filter(Boolean) : [], tokens: finiteNonNegative(value.tokens) ? value.tokens : 0, durationMs: finiteNonNegative(value.duration_ms) ? value.duration_ms : 0, rolledBack: value.rolled_back, ruleCandidateId: typeof value.rule_candidate_id === 'string' ? value.rule_candidate_id : undefined, createdAt: value.created_at }; }
 function asAIInterventionView(value: unknown): AIInterventionViewFact { if (!isRecord(value) || typeof value.version !== 'string' || (value.mode !== 'ordinary' && value.mode !== 'operator') || (value.ai_status !== 'disabled' && value.ai_status !== 'unavailable' && value.ai_status !== 'available') || !Array.isArray(value.items)) throw new Error('AI intervention view is invalid'); const count = (name: string) => finiteNonNegative(value[name]) ? value[name] as number : 0; return { version: value.version, mode: value.mode, aiStatus: value.ai_status, items: value.items.map(asAIIntervention), successCount: count('success_count'), failureCount: count('failure_count'), rollbackCount: count('rollback_count'), candidateCount: count('candidate_count'), totalTokens: count('total_tokens'), totalDurationMs: count('total_duration_ms') }; }
 function asAISettings(value: unknown): AIServiceSettingsFact { if (!isRecord(value) || typeof value.version !== 'string' || typeof value.enabled !== 'boolean' || (value.status !== 'disabled' && value.status !== 'unavailable' && value.status !== 'available') || (value.profile !== 'china' && value.profile !== 'global' && value.profile !== 'local' && value.profile !== 'disabled') || typeof value.provider !== 'string' || typeof value.model !== 'string' || !Array.isArray(value.data_scopes) || !finiteNonNegative(value.max_tokens) || !finiteNonNegative(value.max_duration_ms) || !finiteNonNegative(value.cooldown_seconds) || typeof value.cache_enabled !== 'boolean' || typeof value.external_calls !== 'boolean') throw new Error('AI service settings are invalid'); return { version: value.version, enabled: value.enabled, status: value.status, profile: value.profile, provider: value.provider, model: value.model, dataScopes: value.data_scopes.filter((item): item is string => typeof item === 'string'), maxTokens: value.max_tokens, maxDurationMs: value.max_duration_ms, cooldownSeconds: value.cooldown_seconds, cacheEnabled: value.cache_enabled, externalCalls: value.external_calls }; }
+function asSystemStatus(value: unknown): SystemStatusFact {
+  if (!isRecord(value) || !isRecord(value.node) || !isRecord(value.platform_domain) || !isRecord(value.webhooks) || !isRecord(value.backup) || !isRecord(value.alerts)) throw new Error('System status response is invalid');
+  const node = value.node;
+  const platformDomain = value.platform_domain;
+  const webhooks = value.webhooks;
+  const nullableString = (candidate: unknown, field: string): string | null => candidate === null ? null : requireString(candidate, field);
+  if (node.single_node !== true || (node.readiness !== 'ready' && node.readiness !== 'not_ready' && node.readiness !== 'unconfigured')) throw new Error('System node status is invalid');
+  const platformStatus = platformDomain.status;
+  if (platformStatus !== 'unconfigured' && platformStatus !== 'pending' && platformStatus !== 'failed' && platformStatus !== 'ready') throw new Error('System platform domain status is invalid');
+  if ((webhooks.status !== 'configured' && webhooks.status !== 'unconfigured') || typeof webhooks.enabled_count !== 'number' || !Number.isInteger(webhooks.enabled_count) || webhooks.enabled_count < 0) throw new Error('System webhook status is invalid');
+  if (!isRecord(value.backup) || value.backup.status !== 'not_installed' || value.alerts.status !== 'not_installed') throw new Error('System capability status is invalid');
+  return {
+    version: requireString(value.version, 'system.version'),
+    node: { singleNode: true, instanceId: nullableString(node.instance_id, 'system.node.instance_id'), nodeId: nullableString(node.node_id, 'system.node.node_id'), readiness: node.readiness },
+    platformDomain: { status: platformStatus, baseDomain: nullableString(platformDomain.base_domain, 'system.platform_domain.base_domain') },
+    webhooks: { status: webhooks.status, enabledCount: webhooks.enabled_count },
+    backup: { status: 'not_installed' },
+    alerts: { status: 'not_installed' },
+  };
+}
 function aiUnavailable(): AIInterventionResult { return { status: 'unavailable', message: 'AI 已关闭或尚未组合；标准发布与运维继续使用确定性流程。' }; }
 function aiSettingsUnavailable(): AISettingsResult { return { status: 'unavailable', message: 'AI 服务设置尚未由控制面组合。' }; }
 
@@ -709,7 +747,7 @@ export class RestApiClient implements ApiClient {
 
   constructor(options: RestApiClientOptions = {}) {
     this.baseUrl = (options.baseUrl ?? API_BASE_URL).replace(/\/$/, '');
-    this.fetchImpl = options.fetchImpl ?? fetch;
+    this.fetchImpl = options.fetchImpl ?? fetch.bind(globalThis);
     this.eventSourceFactory = options.eventSourceFactory;
     this.eventsUrl = options.eventsUrl ?? ((operationId, baseUrl) => `${baseUrl}/operations/${encodeURIComponent(operationId)}/events`);
     this.onUnauthorized = options.onUnauthorized;
@@ -779,7 +817,7 @@ export class RestApiClient implements ApiClient {
     const response = await this.request('/auth/login', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(input),
+      body: JSON.stringify({ password: input.password }),
       signal,
     });
     return asAuthSession(await this.json(response, 'Administrator login was not accepted'), this.authMode);
@@ -873,6 +911,22 @@ export class RestApiClient implements ApiClient {
     return asApplicationAccess(await this.json(response, 'Unable to load application access'));
   }
 
+  async publishApplication(applicationId: string, input: ApplicationPublishInput, signal?: AbortSignal): Promise<ApplicationPublishResponse> {
+    const response = await this.request(`/applications/${encodeURIComponent(applicationId)}/publishes`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        build_kind: input.buildKind,
+        context_path: input.contextPath,
+        ...(input.dockerfilePath ? { dockerfile_path: input.dockerfilePath } : {}),
+        service_name: input.serviceName,
+        container_port: input.containerPort,
+      }),
+      signal,
+    }, true, 10 * 60 * 1000);
+    return asApplicationPublishResponse(await this.json(response, 'Unable to publish application'));
+  }
+
   async createSourceUpload(input: SourceUploadInput, signal?: AbortSignal): Promise<SourceUploadResponse> {
     const form = await sourceUploadForm(input);
     const response = await this.request('/source-uploads', { method: 'POST', body: form, signal });
@@ -884,7 +938,7 @@ export class RestApiClient implements ApiClient {
     return asSourceUpload(await this.json(response, 'Unable to load source upload'));
   }
 
-  private subscribeWithEventSource(operationId: string, listener: PublishEventListener): () => void {
+  private subscribeWithEventSource(operationId: string, listener: PublishEventListener, onStateChange?: (state: PublishConnectionState) => void): () => void {
     const seenIds = new Set<string>();
     let lastEventId: string | undefined;
     let retryIndex = 0;
@@ -915,11 +969,15 @@ export class RestApiClient implements ApiClient {
 
     const connect = () => {
       if (closed || source) return;
+      onStateChange?.('connecting');
       const currentSource = this.eventSourceFactory?.(this.eventsUrl(operationId, this.baseUrl), {
         withCredentials: true,
         ...(lastEventId ? { lastEventId } : {}),
       });
-      if (!currentSource) return;
+      if (!currentSource) {
+        onStateChange?.('offline');
+        return;
+      }
       source = currentSource;
       const onMessage: EventListener = (raw) => {
         try {
@@ -932,16 +990,19 @@ export class RestApiClient implements ApiClient {
           // Ignore malformed events; the next valid event remains authoritative.
         }
       };
-      const onOpen = () => { retryIndex = 0; };
+      const onOpen = () => { retryIndex = 0; onStateChange?.('connected'); };
       const onError = (event: Event) => {
         if (closed) return;
         const status = (event as Event & { status?: unknown }).status;
         closeSource();
         if (status === 401) {
           closed = true;
+          onStateChange?.('auth_required');
           this.onUnauthorized?.();
           return;
         }
+        onStateChange?.('offline');
+        onStateChange?.('retrying');
         scheduleReconnect();
       };
       currentSource.addEventListener('message', onMessage);
@@ -956,10 +1017,11 @@ export class RestApiClient implements ApiClient {
       if (retryTimer) clearTimeout(retryTimer);
       retryTimer = undefined;
       closeSource();
+      onStateChange?.('closed');
     };
   }
 
-  private subscribeWithFetch(operationId: string, listener: PublishEventListener): () => void {
+  private subscribeWithFetch(operationId: string, listener: PublishEventListener, onStateChange?: (state: PublishConnectionState) => void): () => void {
     const seenIds = new Set<string>();
     let lastEventId: string | undefined;
     let retryIndex = 0;
@@ -985,7 +1047,7 @@ export class RestApiClient implements ApiClient {
           ...(lastEventId ? { 'Last-Event-ID': lastEventId } : {}),
         },
         signal: controller.signal,
-      }, true, 0);
+      }, false, 0);
       if (!response.ok) {
         let body: unknown;
         try {
@@ -997,6 +1059,7 @@ export class RestApiClient implements ApiClient {
       }
       if (!response.body) throw createNetworkError();
       retryIndex = 0;
+      onStateChange?.('connected');
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = '';
@@ -1022,17 +1085,25 @@ export class RestApiClient implements ApiClient {
         blocks.forEach(emitBlock);
       }
       if (buffer) emitBlock(buffer);
-      if (!closed) scheduleReconnect();
+      if (!closed) {
+        onStateChange?.('retrying');
+        scheduleReconnect();
+      }
     };
 
     const connect = () => {
       if (closed) return;
+      onStateChange?.('connecting');
       void readStream().catch((error: unknown) => {
         if (closed) return;
         if (error instanceof ApiRequestError && error.kind === 'auth') {
           closed = true;
+          onStateChange?.('auth_required');
+          this.onUnauthorized?.();
           return;
         }
+        onStateChange?.('offline');
+        onStateChange?.('retrying');
         scheduleReconnect();
       });
     };
@@ -1043,13 +1114,14 @@ export class RestApiClient implements ApiClient {
       if (retryTimer) clearTimeout(retryTimer);
       retryTimer = undefined;
       controller?.abort();
+      onStateChange?.('closed');
     };
   }
 
-  subscribeToPublishEvents(operationId: string, listener: PublishEventListener): () => void {
+  subscribeToPublishEvents(operationId: string, listener: PublishEventListener, onStateChange?: (state: PublishConnectionState) => void): () => void {
     return this.eventSourceFactory
-      ? this.subscribeWithEventSource(operationId, listener)
-      : this.subscribeWithFetch(operationId, listener);
+      ? this.subscribeWithEventSource(operationId, listener, onStateChange)
+      : this.subscribeWithFetch(operationId, listener, onStateChange);
   }
 
   async getApplicationOperations(applicationId: string, signal?: AbortSignal): Promise<ApplicationOperationsResult> {
@@ -1074,6 +1146,11 @@ export class RestApiClient implements ApiClient {
     const response = await this.request('/settings/ai', { signal });
     if (response.status === 404 || response.status === 501 || response.status === 503) return aiSettingsUnavailable();
     return { status: 'available', settings: asAISettings(await this.json(response, 'Unable to load AI service settings')) };
+  }
+
+  async getSystemStatus(signal?: AbortSignal): Promise<SystemStatusResult> {
+    const response = await this.request('/settings/system-status', { signal });
+    return { status: 'available', facts: asSystemStatus(await this.json(response, 'Unable to load system status')) };
   }
 
   async requestApplicationOperation(applicationId: string, request: OperationRequest, signal?: AbortSignal): Promise<OperationRequestResult> {
@@ -1289,6 +1366,11 @@ export class StubApiClient implements ApiClient {
     return this.domainAndUploadUnavailable();
   }
 
+  async publishApplication(): Promise<ApplicationPublishResponse> {
+    this.requireAuthentication();
+    throw new ApiRequestError(undefined, '本地演示模式不连接真实发布 API。', 'unavailable', 'stub_unavailable');
+  }
+
   async createSourceUpload(_input: SourceUploadInput, _signal?: AbortSignal): Promise<SourceUploadResponse> {
     this.requireAuthentication();
     return this.domainAndUploadUnavailable();
@@ -1299,13 +1381,16 @@ export class StubApiClient implements ApiClient {
     return this.domainAndUploadUnavailable();
   }
 
-  subscribeToPublishEvents(operationId: string, listener: PublishEventListener): () => void {
+  subscribeToPublishEvents(operationId: string, listener: PublishEventListener, onStateChange?: (state: PublishConnectionState) => void): () => void {
+    onStateChange?.('connecting');
     const listeners = this.listeners.get(operationId) ?? new Set<PublishEventListener>();
     listeners.add(listener);
     this.listeners.set(operationId, listeners);
+    onStateChange?.('connected');
     return () => {
       listeners.delete(listener);
       if (listeners.size === 0) this.listeners.delete(operationId);
+      onStateChange?.('closed');
     };
   }
 
@@ -1322,6 +1407,11 @@ export class StubApiClient implements ApiClient {
   async getAIInterventions(): Promise<AIInterventionResult> { this.requireAuthentication(); return aiUnavailable(); }
 
   async getAISettings(): Promise<AISettingsResult> { this.requireAuthentication(); return aiSettingsUnavailable(); }
+
+  async getSystemStatus(): Promise<SystemStatusResult> {
+    this.requireAuthentication();
+    return { status: 'unavailable', message: '本地演示模式不连接真实系统状态 API。' };
+  }
 
   async requestApplicationOperation(): Promise<OperationRequestResult> {
     this.requireAuthentication();

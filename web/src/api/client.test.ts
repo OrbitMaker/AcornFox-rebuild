@@ -183,13 +183,28 @@ describe('RestApiClient', () => {
     eventSource.emit(JSON.stringify({ id: 'bad', operation_id: created.operationId, application_id: 'app-live', sequence: 2, occurred_at: '2026-08-24T00:00:02.000Z', kind: 'unknown', status: 'preparing' }));
     unsubscribe();
 
-    expect(list.items[0]?.source.kind).toBe('git');
+    expect(list.items[0]?.source.kind).toBe('unknown');
     expect(created.operationId).toBe('application:app-live');
     expect(events).toEqual(['preparing']);
     expect(eventSource.closed).toBe(true);
     expect(eventSource.options?.withCredentials).toBe(true);
     expect(requested.map((request) => request.url)).toEqual(['/api/v1/applications', '/api/v1/applications']);
     expect(requested.every((request) => request.credentials === 'same-origin')).toBe(true);
+  });
+
+  it('preserves the G3E upload source ID and does not infer a missing source as Git', async () => {
+    const client = new RestApiClient({
+      baseUrl: '/api/v1',
+      fetchImpl: async () => new Response(JSON.stringify({ items: [
+        { id: 'app-upload', name: 'Uploaded', source: { kind: 'archive', source_upload_id: 'upload-1', locator: 'upload://private' }, created_at: '2026-08-28T00:00:00Z', updated_at: '2026-08-28T00:00:00Z' },
+        { id: 'app-unknown', name: 'Unknown', created_at: '2026-08-28T00:00:00Z', updated_at: '2026-08-28T00:00:00Z' },
+      ] }), { status: 200 }),
+    });
+
+    await expect(client.listApplications()).resolves.toMatchObject({ items: [
+      { source: { kind: 'archive', uploadId: 'upload-1' } },
+      { source: { kind: 'unknown' } },
+    ] });
   });
 
   it('sends the upload source union without a folder or archive locator', async () => {
@@ -213,6 +228,22 @@ describe('RestApiClient', () => {
     expect(JSON.stringify(request?.body)).not.toContain('locator');
     expect(JSON.stringify(request?.body)).not.toContain('folder');
     expect(JSON.stringify(request?.body)).not.toContain('archive');
+  });
+
+  it('sends the publish facade contract with the bounded request timeout', async () => {
+    let request: RequestInit | undefined;
+    const client = new RestApiClient({
+      baseUrl: '/api/v1',
+      fetchImpl: async (_input, init) => {
+        request = init;
+        return jsonResponse({ status: 'deploying', operation_id: 'op-1', release_id: 'rel-1', deployment_id: 'dep-1', task_id: 'task-1', source_revision_id: 'src-1' }, 202);
+      },
+    });
+
+    await expect(client.publishApplication('app-1', { buildKind: 'dockerfile', contextPath: '.', dockerfilePath: 'Dockerfile', serviceName: 'web', containerPort: 8080 })).resolves.toMatchObject({ operationId: 'op-1', status: 'deploying' });
+    expect(JSON.parse(String(request?.body))).toEqual({ build_kind: 'dockerfile', context_path: '.', dockerfile_path: 'Dockerfile', service_name: 'web', container_port: 8080 });
+    expect(request?.credentials).toBe('same-origin');
+    expect(request?.signal).toBeInstanceOf(AbortSignal);
   });
 
   it('returns an explicit unavailable M4 facade until the control plane composes operations facts', async () => {
@@ -448,6 +479,7 @@ describe('RestApiClient', () => {
     vi.useFakeTimers();
     try {
       const sources: FakeEventSource[] = [];
+      const states: string[] = [];
       let unauthorized = 0;
       const client = new RestApiClient({
         baseUrl: '/api/v1',
@@ -460,7 +492,8 @@ describe('RestApiClient', () => {
         onUnauthorized: () => { unauthorized += 1; },
       });
       const received: string[] = [];
-      const unsubscribe = client.subscribeToPublishEvents('op-live', (event) => received.push(event.id));
+      const unsubscribe = client.subscribeToPublishEvents('op-live', (event) => received.push(event.id), (state) => states.push(state));
+      sources[0]?.emitOpen();
       sources[0]?.emit(JSON.stringify(publishEvent('evt-1', 1)));
       sources[0]?.emit(JSON.stringify(publishEvent('evt-1', 1)));
       sources[0]?.emitError();
@@ -469,6 +502,7 @@ describe('RestApiClient', () => {
       await vi.advanceTimersByTimeAsync(1);
       expect(sources).toHaveLength(2);
       expect(sources[1]?.options?.lastEventId).toBe('evt-1');
+      sources[1]?.emitOpen();
       sources[1]?.emitError();
       await vi.advanceTimersByTimeAsync(2_000);
       expect(sources).toHaveLength(3);
@@ -481,8 +515,14 @@ describe('RestApiClient', () => {
       expect(sources).toHaveLength(countAfterClose);
       expect(received).toEqual(['evt-1']);
       expect(unauthorized).toBe(0);
+      expect(states[0]).toBe('connecting');
+      expect(states).toContain('connected');
+      expect(states).toContain('offline');
+      expect(states).toContain('retrying');
+      expect(states.at(-1)).toBe('closed');
 
       const authSources: FakeEventSource[] = [];
+      const authStates: string[] = [];
       const authClient = new RestApiClient({
         eventSourceFactory: (_url, init) => {
           const source = new FakeEventSource();
@@ -492,11 +532,12 @@ describe('RestApiClient', () => {
         },
         onUnauthorized: () => { unauthorized += 1; },
       });
-      authClient.subscribeToPublishEvents('op-auth', () => undefined);
+      authClient.subscribeToPublishEvents('op-auth', () => undefined, (state) => authStates.push(state));
       authSources[0]?.emitError(401);
       await vi.advanceTimersByTimeAsync(30_000);
       expect(authSources).toHaveLength(1);
       expect(unauthorized).toBe(1);
+      expect(authStates).toEqual(['connecting', 'auth_required']);
     } finally {
       vi.useRealTimers();
     }
@@ -516,7 +557,8 @@ describe('RestApiClient', () => {
         },
       });
       const received: string[] = [];
-      const unsubscribe = client.subscribeToPublishEvents('op-live', (event) => received.push(event.id));
+      const states: string[] = [];
+      const unsubscribe = client.subscribeToPublishEvents('op-live', (event) => received.push(event.id), (state) => states.push(state));
       for (let index = 0; index < 8; index += 1) await Promise.resolve();
       await vi.advanceTimersByTimeAsync(1_000);
       for (let index = 0; index < 8; index += 1) await Promise.resolve();
@@ -525,6 +567,10 @@ describe('RestApiClient', () => {
       expect(requests.every((request) => request.credentials === 'same-origin')).toBe(true);
       expect(requests[1]?.headers.get('Last-Event-ID')).toBe('evt-1');
       expect(received).toEqual(['evt-1', 'evt-2']);
+      expect(states).toContain('connecting');
+      expect(states).toContain('connected');
+      expect(states).toContain('retrying');
+      expect(states.at(-1)).toBe('closed');
     } finally {
       vi.useRealTimers();
     }
@@ -551,6 +597,7 @@ describe('Authentication client', () => {
 
     await expect(client.getSession()).resolves.toMatchObject({ authenticated: false, mode: 'live' });
     await expect(client.login({ username: 'admin', password: 'not-a-real-password' })).resolves.toMatchObject({ authenticated: true, username: 'admin' });
+    expect(JSON.parse(String(requests.find((request) => request.url.endsWith('/auth/login'))?.body))).toEqual({ password: 'not-a-real-password' });
     await expect(client.logout()).resolves.toBeUndefined();
     await expect(client.changePassword({ currentPassword: 'old-password', newPassword: 'new-password' })).resolves.toMatchObject({ authenticated: false, mode: 'live' });
 
@@ -591,5 +638,46 @@ describe('Authentication client', () => {
     await expect(client.listApplications()).resolves.toHaveProperty('items');
     await expect(client.changePassword({ currentPassword: 'local-demo-password', newPassword: 'another-local-password' })).resolves.toMatchObject({ authenticated: false, mode: 'stub' });
     await expect(client.listApplications()).rejects.toBeInstanceOf(ApiRequestError);
+  });
+
+  it('normalizes the authenticated system status contract without inventing provider health', async () => {
+    const client = new RestApiClient({
+      baseUrl: '/api/v1',
+      fetchImpl: async () => new Response(JSON.stringify({
+        version: '1.1',
+        node: { single_node: true, instance_id: null, node_id: 'node-1', readiness: 'ready' },
+        platform_domain: { status: 'unconfigured', base_domain: null },
+        webhooks: { status: 'unconfigured', enabled_count: 0 },
+        backup: { status: 'not_installed' },
+        alerts: { status: 'not_installed' },
+      }), { status: 200 }),
+    });
+    await expect(client.getSystemStatus()).resolves.toEqual({
+      status: 'available',
+      facts: {
+        version: '1.1',
+        node: { singleNode: true, instanceId: null, nodeId: 'node-1', readiness: 'ready' },
+        platformDomain: { status: 'unconfigured', baseDomain: null },
+        webhooks: { status: 'unconfigured', enabledCount: 0 },
+        backup: { status: 'not_installed' },
+        alerts: { status: 'not_installed' },
+      },
+    });
+  });
+
+  it('binds the browser fetch implementation before calling it as a client member', async () => {
+    const originalFetch = globalThis.fetch;
+    const calls: string[] = [];
+    globalThis.fetch = function (input, init) {
+      calls.push(String(input));
+      return originalFetch(input, init);
+    };
+    try {
+      const client = new RestApiClient({ baseUrl: 'https://example.test/api/v1' });
+      await expect(client.getSession()).rejects.toMatchObject({ kind: 'network' });
+      expect(calls).toEqual(['https://example.test/api/v1/auth/session']);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });

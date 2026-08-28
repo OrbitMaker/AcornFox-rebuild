@@ -1,6 +1,6 @@
 import { ApiRequestError } from '../api/errors';
 import type { SourceUploadResponse } from '../api/types';
-import { buildCreateApplicationSource, gitUnavailableMessage } from './createApplicationSource';
+import { buildCreateApplicationSource } from './createApplicationSource';
 
 const upload: SourceUploadResponse = {
   uploadId: 'upload-1',
@@ -25,8 +25,4 @@ describe('create application source contract', () => {
     expect(buildCreateApplicationSource('git', undefined, ' https://git.example.test/app.git ', ' ')).toEqual({ kind: 'git', repositoryUrl: 'https://git.example.test/app.git', ref: 'main' });
   });
 
-  it('labels a backend Git 501 as unavailable without blocking upload', () => {
-    expect(gitUnavailableMessage(new ApiRequestError(501, 'not implemented'))).toContain('公开 Git HTTPS');
-    expect(gitUnavailableMessage(new ApiRequestError(503, 'unavailable'))).toBeUndefined();
-  });
 });

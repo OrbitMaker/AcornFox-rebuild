@@ -13,9 +13,3 @@ export function buildCreateApplicationSource(
   }
   return { kind: 'git', repositoryUrl: repositoryUrl.trim(), ref: ref.trim() || 'main' };
 }
-
-export function gitUnavailableMessage(error: unknown): string | undefined {
-  return error instanceof ApiRequestError && error.status === 501
-    ? '公开 Git HTTPS 接入处理中/不可用；可切换到文件上传，上传路径不受影响。'
-    : undefined;
-}

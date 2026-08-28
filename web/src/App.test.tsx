@@ -1,5 +1,7 @@
 import type { ApplicationSummary } from './api/types';
+import type { PublishEvent } from './domain/publishing';
 import { vi } from 'vitest';
+import { updateFromPublishEvent } from './domain/applicationEvents';
 import { applicationIdFromLocation, resolveSelectedApplicationId, setApplicationQuery } from './components/applicationSelection';
 
 const applications: ApplicationSummary[] = [
@@ -35,5 +37,12 @@ describe('application selection routing', () => {
 
     expect(String(replaceState.mock.calls[0]?.[2])).toBe('https://console.example.test/console?application=app-2');
     Reflect.deleteProperty(globalThis, 'window');
+  });
+
+  it('does not infer runtime readiness from a succeeded publish event', () => {
+    const event: PublishEvent = { id: 'evt-succeeded', operationId: 'op-1', applicationId: 'app-2', sequence: 4, occurredAt: '2026-08-28T00:00:01Z', kind: 'operation.succeeded', status: 'succeeded' };
+    const result = updateFromPublishEvent([{ ...applications[1]!, publishing: { status: 'deploying', sequence: 3, evidenceIds: [] } }], event);
+
+    expect(result[0]).toMatchObject({ runtimeStatus: 'stopped', runtimeReady: false, publishing: { status: 'succeeded' } });
   });
 });

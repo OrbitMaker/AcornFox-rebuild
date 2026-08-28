@@ -1,0 +1,5 @@
+{"check":"live_build","status":"PASS","contract":"VITE_API_MODE=live,VITE_API_BASE_URL=/api/v1"}
+{"check":"live_web_origin","status":"PASS","origin":"https://127.0.0.1:58084"}
+{"check":"backend_health","status":"PASS","api_origin":"http://127.0.0.1:58083"}
+{"check":"unauthenticated_session","status":"PASS","http_status":401}
+{"check":"browser_upload_fixture","status":"PASS","bytes":2267,"sha256":"380263507dfbaa494d6d4ce578e292410e88229d78f7e7a0cc58ba92adb70b22","lifecycle":"temporary_task_directory"}

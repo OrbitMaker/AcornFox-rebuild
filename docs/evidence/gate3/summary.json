@@ -1,0 +1,43 @@
+{
+  "gate": "G3-08",
+  "mode": "live",
+  "web_origin": "https://127.0.0.1:58084",
+  "api_base": "/api/v1",
+  "api_origin": "http://127.0.0.1:58083",
+  "status": "pass_limited_external_linux_required",
+  "checks": {
+    "unauthenticated_entry": "pass",
+    "login": "pass",
+    "session_refresh": "pass",
+    "application_deep_link_validation": "pass",
+    "browser_archive_upload": "pass",
+    "upload_application_detail": "pass_upload_source_and_access",
+    "git_boundary": "pass",
+    "domain_unconfigured_or_failure": "pass",
+    "logout": "pass",
+    "publish_submission": "pass_limited_safe_503_not_accepted_runtime_not_ready",
+    "sse_disconnect_reconnect": "pass_limited_persisted_replay_and_deterministic_state_tests",
+    "system_settings_status": "pass",
+    "http_409": "unknown",
+    "http_422": "unknown",
+    "http_429": "unknown",
+    "http_5xx": "pass_limited_503_safe_error"
+  },
+  "artifacts": [
+    "01-unauthenticated.png",
+    "02-authenticated-overview.png",
+    "03-session-refresh.png",
+    "04-applications-empty.png",
+    "05-upload-ready.png",
+    "06-domains-unavailable.png",
+    "07-system-settings-blocked.png",
+    "08-git-boundary.png",
+    "09-logout.png",
+    "10-system-settings-live.png",
+    "11-list-upload-unpublished.png",
+    "12-publish-not-accepted.png",
+    "gate3-live-browser.md",
+    "preflight.ndjson"
+  ],
+  "external_operations": "none"
+}

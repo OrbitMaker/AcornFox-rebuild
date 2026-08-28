@@ -1,6 +1,7 @@
 import './SseConnectionStatus.css';
+import type { PublishConnectionState } from '../../api/types';
 
-export type SseConnectionState = 'connecting' | 'connected' | 'retrying' | 'offline' | 'auth_required' | 'closed';
+export type SseConnectionState = PublishConnectionState;
 
 const definitions: Record<SseConnectionState, { label: string; detail: string }> = {
   connecting: { label: '事件流连接中', detail: '正在建立当前应用的事件流。' },

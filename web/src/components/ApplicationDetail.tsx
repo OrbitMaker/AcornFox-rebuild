@@ -1,5 +1,6 @@
-import type { ApplicationDetail as ApplicationDetailFact, ApplicationSummary } from '../api/types';
+import type { ApiClient, ApplicationDetail as ApplicationDetailFact, ApplicationPublishResponse, ApplicationSummary } from '../api/types';
 import { RequestState } from './RequestState';
+import { PublishApplicationPanel } from './PublishApplicationPanel';
 import './ApplicationDetail.css';
 
 export interface ApplicationDetailProps {
@@ -8,9 +9,12 @@ export interface ApplicationDetailProps {
   loading: boolean;
   error?: unknown;
   onRefresh: () => void;
+  client?: Pick<ApiClient, 'publishApplication'>;
+  onPublishAccepted?: (response: ApplicationPublishResponse) => void;
+  onPublishSettled?: () => void;
 }
 
-export function ApplicationDetail({ application, detail, loading, error, onRefresh }: ApplicationDetailProps) {
+export function ApplicationDetail({ application, detail, loading, error, onRefresh, client, onPublishAccepted, onPublishSettled }: ApplicationDetailProps) {
   if (!application) {
     return <section className="application-detail application-detail--empty" aria-labelledby="application-detail-heading"><h2 id="application-detail-heading">应用详情</h2><p>请先从应用列表选择一个应用。</p></section>;
   }
@@ -37,6 +41,7 @@ export function ApplicationDetail({ application, detail, loading, error, onRefre
             <h3>应用域名</h3>
             {detail.access.customDomains.length === 0 ? <p>暂无客户域名。</p> : <ul>{detail.access.customDomains.map((domain) => <li key={domain.id}><span>{domain.hostname}</span><small>{domain.status}{domain.serving ? ' · 正在服务' : ''}</small></li>)}</ul>}
           </div>
+          {client && <PublishApplicationPanel applicationId={application.id} client={client} onPublished={onPublishAccepted} onSettled={onPublishSettled} />}
         </>
       )}
     </section>

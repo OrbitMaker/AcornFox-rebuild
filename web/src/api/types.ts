@@ -6,11 +6,12 @@ import type { AIInterventionViewFact } from '../features/ai-interventions/aiInte
 import type { AIServiceSettingsFact } from '../features/settings/ai/AIServiceSettings';
 import type { AuthClient } from '../features/auth/auth';
 
-export type SourceKind = 'git' | 'folder' | 'archive';
+export type SourceKind = 'git' | 'folder' | 'archive' | 'unknown';
 export type RuntimeStatus = 'running' | 'attention' | 'partial' | 'stopped' | 'unknown';
 
 export interface ApplicationSource {
   kind: SourceKind;
+  uploadId?: string;
   locator?: string;
   ref?: string;
 }
@@ -140,6 +141,25 @@ export interface ApplicationAccessResponse {
   serving: boolean;
 }
 
+export type ApplicationPublishBuildKind = 'static' | 'dockerfile';
+
+export interface ApplicationPublishInput {
+  buildKind: ApplicationPublishBuildKind;
+  contextPath: string;
+  dockerfilePath?: string;
+  serviceName: string;
+  containerPort: number;
+}
+
+export interface ApplicationPublishResponse {
+  status: 'deploying';
+  operationId: string;
+  releaseId: string;
+  deploymentId: string;
+  taskId: string;
+  sourceRevisionId: string;
+}
+
 export interface ApplicationDetail {
   id: string;
   name: string;
@@ -174,6 +194,7 @@ export interface SourceUploadResponse {
 }
 
 export type PublishEventListener = (event: PublishEvent) => void;
+export type PublishConnectionState = 'connecting' | 'connected' | 'retrying' | 'offline' | 'auth_required' | 'closed';
 
 export type ApplicationOperationsResult =
   | { status: 'available'; facts: ApplicationOperationsFact }
@@ -185,6 +206,34 @@ export type ApplicationUsageResult =
 
 export type AIInterventionResult = { status: 'available'; facts: AIInterventionViewFact } | { status: 'unavailable'; message: string };
 export type AISettingsResult = { status: 'available'; settings: AIServiceSettingsFact } | { status: 'unavailable'; message: string };
+
+export type SystemStatusNodeReadiness = 'ready' | 'not_ready' | 'unconfigured';
+export type SystemStatusPlatformDomain = 'unconfigured' | 'pending' | 'failed' | 'ready';
+export type SystemStatusWebhooks = 'configured' | 'unconfigured';
+
+export interface SystemStatusFact {
+  version: string;
+  node: {
+    singleNode: true;
+    instanceId: string | null;
+    nodeId: string | null;
+    readiness: SystemStatusNodeReadiness;
+  };
+  platformDomain: {
+    status: SystemStatusPlatformDomain;
+    baseDomain: string | null;
+  };
+  webhooks: {
+    status: SystemStatusWebhooks;
+    enabledCount: number;
+  };
+  backup: { status: 'not_installed' };
+  alerts: { status: 'not_installed' };
+}
+
+export type SystemStatusResult =
+  | { status: 'available'; facts: SystemStatusFact }
+  | { status: 'unavailable'; message: string };
 
 /** Accepted means queued only. A newer facts version is required to show completion. */
 export type OperationRequestResult =
@@ -202,12 +251,14 @@ export interface ApiClient extends AuthClient {
   verifyApplicationDomain(applicationId: string, domainId: string, signal?: AbortSignal): Promise<ApplicationDomainResponse>;
   unbindApplicationDomain(applicationId: string, domainId: string, signal?: AbortSignal): Promise<void>;
   getApplicationAccess(applicationId: string, signal?: AbortSignal): Promise<ApplicationAccessResponse>;
+  publishApplication(applicationId: string, input: ApplicationPublishInput, signal?: AbortSignal): Promise<ApplicationPublishResponse>;
   createSourceUpload(input: SourceUploadInput, signal?: AbortSignal): Promise<SourceUploadResponse>;
   getSourceUpload(uploadId: string, signal?: AbortSignal): Promise<SourceUploadResponse>;
-  subscribeToPublishEvents(operationId: string, listener: PublishEventListener): () => void;
+  subscribeToPublishEvents(operationId: string, listener: PublishEventListener, onStateChange?: (state: PublishConnectionState) => void): () => void;
   getApplicationOperations(applicationId: string, signal?: AbortSignal): Promise<ApplicationOperationsResult>;
   getApplicationUsage(applicationId: string, mode: 'normal' | 'operations', signal?: AbortSignal): Promise<ApplicationUsageResult>;
   getAIInterventions(applicationId: string, mode: 'ordinary' | 'operator', signal?: AbortSignal): Promise<AIInterventionResult>;
   getAISettings(signal?: AbortSignal): Promise<AISettingsResult>;
+  getSystemStatus(signal?: AbortSignal): Promise<SystemStatusResult>;
   requestApplicationOperation(applicationId: string, request: OperationRequest, signal?: AbortSignal): Promise<OperationRequestResult>;
 }
