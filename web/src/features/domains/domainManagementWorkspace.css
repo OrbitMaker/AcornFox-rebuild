@@ -1,0 +1,199 @@
+.domain-management {
+  display: grid;
+  gap: 1.25rem;
+  max-width: 980px;
+  margin: 0 auto;
+}
+
+.domain-management__header,
+.domain-management__card-header,
+.domain-management__domain > header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.domain-management__header h1,
+.domain-management__card h2,
+.domain-management__domain h3 {
+  margin: 0;
+}
+
+.domain-management__header p:not(.eyebrow),
+.domain-management__card-header p:not(.eyebrow),
+.domain-management__domain header p,
+.domain-management__subtle,
+.domain-management__hint,
+.domain-management__loading,
+.domain-management__empty {
+  color: var(--text-muted, #667085);
+}
+
+.domain-management__card {
+  display: grid;
+  gap: 1rem;
+  padding: 1.25rem;
+  border: 1px solid var(--border-subtle, #e4e7ec);
+  border-radius: 16px;
+  background: var(--surface, #fff);
+}
+
+.domain-management__status {
+  display: inline-flex;
+  align-items: center;
+  min-height: 1.75rem;
+  padding: 0.25rem 0.65rem;
+  border-radius: 999px;
+  background: #f2f4f7;
+  color: #475467;
+  font-size: 0.8125rem;
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.domain-management__status--ready { background: #ecfdf3; color: #027a48; }
+.domain-management__status--failed { background: #fef3f2; color: #b42318; }
+.domain-management__status--verifying,
+.domain-management__status--certificate_pending { background: #fffaeb; color: #b54708; }
+.domain-management__status--unavailable { background: #fef3f2; color: #b42318; }
+.domain-management__status--loading { background: #f2f4f7; color: #667085; }
+
+.domain-management__facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem 1rem;
+  margin: 0;
+}
+
+.domain-management__facts div {
+  min-width: 0;
+  padding: 0.75rem;
+  border-radius: 10px;
+  background: #f8fafc;
+}
+
+.domain-management__facts dt {
+  color: var(--text-muted, #667085);
+  font-size: 0.75rem;
+}
+
+.domain-management__facts dd {
+  margin: 0.25rem 0 0;
+  overflow-wrap: anywhere;
+  font-size: 0.9rem;
+}
+
+.domain-management__form {
+  display: grid;
+  gap: 0.5rem;
+  max-width: 620px;
+}
+
+.domain-management__form label {
+  font-weight: 650;
+}
+
+.domain-management__form input {
+  width: 100%;
+  min-height: 2.5rem;
+  padding: 0.55rem 0.7rem;
+  border: 1px solid var(--border-subtle, #d0d5dd);
+  border-radius: 8px;
+  font: inherit;
+}
+
+.domain-management__form input:focus-visible,
+.domain-management button:focus-visible {
+  outline: 3px solid #84caff;
+  outline-offset: 2px;
+}
+
+.domain-management__form button,
+.domain-management__actions button,
+.domain-management__refresh {
+  width: fit-content;
+  min-height: 2.25rem;
+  padding: 0.45rem 0.8rem;
+  border: 0;
+  border-radius: 8px;
+  background: #175cd3;
+  color: #fff;
+  font: inherit;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.domain-management button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.domain-management__secondary {
+  background: #eff8ff !important;
+  color: #175cd3 !important;
+}
+
+.domain-management__danger {
+  background: #b42318 !important;
+}
+
+.domain-management__error,
+.domain-management__failure,
+.domain-management__fallback,
+.domain-management__notice {
+  margin: 0;
+  padding: 0.75rem 0.9rem;
+  border-radius: 8px;
+}
+
+.domain-management__error,
+.domain-management__failure {
+  background: #fef3f2;
+  color: #b42318;
+}
+
+.domain-management__error--global {
+  border: 1px solid #fecdca;
+}
+
+.domain-management__fallback {
+  background: #eff8ff;
+  color: #175cd3;
+}
+
+.domain-management__notice {
+  background: #fffaeb;
+  color: #b54708;
+}
+
+.domain-management__domain-list {
+  display: grid;
+  gap: 0.85rem;
+}
+
+.domain-management__domain {
+  display: grid;
+  gap: 0.8rem;
+  padding: 1rem;
+  border: 1px solid var(--border-subtle, #e4e7ec);
+  border-radius: 12px;
+}
+
+.domain-management__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.55rem;
+}
+
+@media (max-width: 720px) {
+  .domain-management__header,
+  .domain-management__card-header,
+  .domain-management__domain > header {
+    flex-direction: column;
+  }
+
+  .domain-management__facts {
+    grid-template-columns: 1fr;
+  }
+}
