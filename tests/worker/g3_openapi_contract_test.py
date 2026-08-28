@@ -31,7 +31,7 @@ class Gate3OpenAPIContractTests(unittest.TestCase):
         for label, operation_id in self.fixture["ui_operations"].items():
             operation = self.operation(label)
             self.assertEqual(operation["operationId"], operation_id)
-            self.assertEqual(operation["x-open-card-handler-status"], self.fixture["handler_status"])
+            self.assertEqual(operation["x-open-card-handler-status"], self.fixture["handler_status"][label])
         self.assertIn("/api/v1/access/platform-domains", self.paths, "M3 internal compatibility path must remain declared")
         self.assertIn("ApplicationDetail", self.components["schemas"])
         detail = self.paths["/api/v1/applications/{applicationId}"]["get"]
@@ -66,6 +66,7 @@ class Gate3OpenAPIContractTests(unittest.TestCase):
     def test_domain_and_upload_safety_constraints_are_explicit(self) -> None:
         platform = self.components["schemas"]["PlatformDomainSettingsResponse"]
         self.assertEqual(platform["properties"]["status"]["$ref"], "#/components/schemas/DomainLifecycleStatus")
+        self.assertIn("unconfigured", self.components["schemas"]["DomainLifecycleStatus"]["enum"])
         self.assertIn("<slug>-<short>.apps.<base_domain>", self.operation("PUT /api/v1/settings/platform-domain")["description"])
         custom = self.operation("POST /api/v1/applications/{applicationId}/domains")
         self.assertIn("never writes a customer DNS zone", custom["description"])

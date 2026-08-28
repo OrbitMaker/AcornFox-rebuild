@@ -1,6 +1,16 @@
 {
   "fixture_id": "gate3-ui-facing-openapi-contract-v1",
-  "handler_status": "not_implemented",
+  "handler_status": {
+    "GET /api/v1/settings/platform-domain": "partial",
+    "PUT /api/v1/settings/platform-domain": "partial",
+    "GET /api/v1/applications/{applicationId}/domains": "partial",
+    "POST /api/v1/applications/{applicationId}/domains": "partial",
+    "POST /api/v1/applications/{applicationId}/domains/{domainId}/verify": "partial",
+    "DELETE /api/v1/applications/{applicationId}/domains/{domainId}": "partial",
+    "GET /api/v1/applications/{applicationId}/access": "partial",
+    "POST /api/v1/source-uploads": "not_implemented",
+    "GET /api/v1/source-uploads/{uploadId}": "not_implemented"
+  },
   "session_security_scheme": "AdministratorSession",
   "csrf_header": "X-Open-Card-CSRF",
   "ui_operations": {

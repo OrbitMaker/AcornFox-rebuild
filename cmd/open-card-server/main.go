@@ -71,6 +71,7 @@ func main() {
 		} else {
 			log.Print("administrator HTTP authentication is not activated; OPEN_CARD_AUTH_ORIGIN is unset")
 		}
+		server.SetG3Access(newG3AccessHTTPHandler(store))
 		server.AgentGateway().SetEventSink(&controllers.DurableAgentSink{Store: store})
 		applicationWorker := &controllers.Worker{
 			Store: store, Handler: applicationTaskHandler{}, Owner: "control-plane-application",

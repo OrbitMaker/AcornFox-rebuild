@@ -178,10 +178,11 @@ paths:
   /api/v1/settings/platform-domain:
     get:
       operationId: getPlatformDomainSettings
-      x-open-card-handler-status: not_implemented
+      x-open-card-handler-status: partial
       description: >-
         UI-facing platform-domain state. A failed domain or certificate never changes an
-        application's runtime or IP fallback address.
+        application's runtime or IP fallback address. Without explicit public-DNS resolvers,
+        expected public IP, and ingress rules the response is unconfigured and writes fail closed.
       responses:
         '200':
           description: Current platform-domain configuration and convergence state.
@@ -192,7 +193,7 @@ paths:
         '503': {$ref: '#/components/responses/DependencyUnavailable'}
     put:
       operationId: putPlatformDomainSettings
-      x-open-card-handler-status: not_implemented
+      x-open-card-handler-status: partial
       description: >-
         Idempotently configures one platform base domain. The controller derives platform
         addresses as <slug>-<short>.apps.<base_domain>; root domains, CDN and WAF are outside MVP.
@@ -226,7 +227,7 @@ paths:
       - $ref: '#/components/parameters/ApplicationID'
     get:
       operationId: listApplicationDomains
-      x-open-card-handler-status: not_implemented
+      x-open-card-handler-status: partial
       responses:
         '200':
           description: Platform and customer CNAME-only domain bindings for one application.
@@ -238,7 +239,7 @@ paths:
         '503': {$ref: '#/components/responses/DependencyUnavailable'}
     post:
       operationId: bindApplicationCustomDomain
-      x-open-card-handler-status: not_implemented
+      x-open-card-handler-status: partial
       description: >-
         Binds only a customer hostname. The response supplies the CNAME target; this endpoint
         never writes a customer DNS zone and failures preserve platform/IP access.
@@ -268,7 +269,7 @@ paths:
       - $ref: '#/components/parameters/DomainID'
     post:
       operationId: verifyApplicationDomain
-      x-open-card-handler-status: not_implemented
+      x-open-card-handler-status: partial
       description: >-
         Triggers only public DNS read verification and state convergence. It never creates,
         updates or deletes a DNS record.
@@ -293,7 +294,7 @@ paths:
       - $ref: '#/components/parameters/DomainID'
     delete:
       operationId: unbindApplicationDomain
-      x-open-card-handler-status: not_implemented
+      x-open-card-handler-status: partial
       description: Unbinds only the selected custom domain; runtime, IP fallback and platform address remain available.
       parameters:
         - $ref: '#/components/parameters/RequiredIdempotencyKey'
@@ -311,8 +312,11 @@ paths:
       - $ref: '#/components/parameters/ApplicationID'
     get:
       operationId: getApplicationAccess
-      x-open-card-handler-status: not_implemented
-      description: Unified serving, route and certificate projection. Domain/certificate failure never removes IP fallback.
+      x-open-card-handler-status: partial
+      description: >-
+        Unified serving, route and certificate projection. Domain/certificate failure never removes
+        IP fallback. This facade intentionally reports certificate_pending until a future Caddy
+        certificate observation adapter can prove the live edge is serving the certificate.
       responses:
         '200':
           description: Application access facts.
@@ -1040,7 +1044,7 @@ components:
         access: {$ref: '#/components/schemas/ApplicationAccessSummary'}
     DomainLifecycleStatus:
       type: string
-      enum: [pending, verifying, certificate_pending, ready, failed]
+      enum: [unconfigured, pending, verifying, certificate_pending, ready, failed]
     DomainVerification:
       type: object
       additionalProperties: false
