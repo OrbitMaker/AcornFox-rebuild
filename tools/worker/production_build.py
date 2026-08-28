@@ -692,6 +692,20 @@ def ensure_non_aliases(output: Path, inputs: dict[str, Path]) -> None:
                 raise ProductionBuildError(f"{left_label} and {right_label} must differ")
 
 
+def require_ignored_output_if_in_repository(output: Path, repository: Path) -> None:
+    try:
+        relative = output.resolve(strict=False).relative_to(repository.resolve())
+    except ValueError:
+        return
+    result = subprocess.run(
+        ["git", "-C", str(repository), "check-ignore", "--quiet", "--no-index", "--", relative.as_posix()],
+        check=False,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        raise ProductionBuildError("candidate output inside the build-tool repository must be Git ignored")
+
+
 def _darwin_rename_no_replace(candidate: Path, output: Path) -> None:
     try:
         renamex_np = ctypes.CDLL(None, use_errno=True).renamex_np
@@ -835,9 +849,9 @@ def build_candidate(
             "runtime input directory": runtime_dir,
             "production build driver": driver_path,
             "production bundle tool": bundle_tool,
-            "build-tool repository": driver_repo,
         },
     )
+    require_ignored_output_if_in_repository(output, driver_repo)
 
     commands: list[list[str]] = []
     with tempfile.TemporaryDirectory(prefix=f".{output.name}.build-", dir=output.parent) as raw:
