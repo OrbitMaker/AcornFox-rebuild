@@ -185,6 +185,7 @@ func main() {
 					}
 					accessController := &controllers.M3AccessController{Routes: caddyProvider, Store: &m3PostgresAdapter{store: store}, DNS: &m3DNSAdapter{provider: dnsProvider}, Certificates: &m3CertificateAdapter{provider: certificateProvider}}
 					server.SetM3Access(&M3AccessHTTPHandler{Controller: accessController})
+					server.SetTLSAllow(&TLSAllowHTTPHandler{Controller: &controllers.TLSAllowController{Store: store}})
 					if _, rebuildErr := accessController.RebuildRoutes(context.Background(), "m3-startup-rebuild", "control-plane"); rebuildErr != nil {
 						log.Printf("M3 route rebuild deferred: %v", rebuildErr)
 					}

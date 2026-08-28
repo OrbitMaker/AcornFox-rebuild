@@ -59,6 +59,19 @@ func (s *m3HTTPStore) PutDesiredRoute(_ context.Context, route domain.Route, por
 	return nil
 }
 
+func (s *m3HTTPStore) PutPreparedDesiredRoute(_ context.Context, _ domain.DomainBinding, route domain.Route, port int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for index := range s.routes {
+		if s.routes[index].Route.ID == route.ID {
+			s.routes[index] = domain.DesiredRoute{Route: route, Port: port}
+			return nil
+		}
+	}
+	s.routes = append(s.routes, domain.DesiredRoute{Route: route, Port: port})
+	return nil
+}
+
 func (s *m3HTTPStore) ListDesiredRoutes(context.Context) ([]domain.DesiredRoute, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -195,6 +208,19 @@ func TestM3AccessHTTPPlatformDomainAndVerifiedRoutesReturnAccessState(t *testing
 	}
 	if len(routes.applied) != 2 {
 		t.Fatalf("verified routes applied=%#v", routes.applied)
+	}
+}
+
+func TestM3AccessHTTPPrepareRoutesDoesNotCallCaddy(t *testing.T) {
+	handler, routes := newM3HTTPHandler()
+	recorder := httptest.NewRecorder()
+	handler.Handle(recorder, m3HTTPRequest(http.MethodPost, "/api/v1/access/domain-routes/prepare", `{
+		"binding":{"id":"domain_1","kind":"application","application_id":"app_test","host":"app.example.test","expected_cname":"target.apps.example.test","status":"ready"},
+		"runtime_ready":true,
+		"targets":[{"application_id":"app_test","deployment_id":"dep_test","service_name":"frontend","port":31001,"path":"/","routable":true}]
+	}`))
+	if recorder.Code != http.StatusAccepted || !strings.Contains(recorder.Body.String(), `"https_ready":false`) || len(routes.applied) != 0 {
+		t.Fatalf("prepare response=%d caddy=%#v body=%s", recorder.Code, routes.applied, recorder.Body.String())
 	}
 }
 

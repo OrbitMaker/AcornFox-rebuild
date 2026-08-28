@@ -59,18 +59,24 @@ type m3DomainRoutesInput struct {
 	RuntimeReady bool                        `json:"runtime_ready"`
 }
 
+type m3PrepareDomainRoutesInput struct {
+	Binding      domain.DomainBinding `json:"binding"`
+	Targets      []m3RouteTargetInput `json:"targets"`
+	RuntimeReady bool                 `json:"runtime_ready"`
+}
+
 type m3CertificateRenewInput struct {
 	ApplicationID domain.ID                   `json:"application_id"`
 	Certificate   domain.CertificateReference `json:"certificate"`
 }
 
 type m3TrafficSwitchInput struct {
-	ApplicationID domain.ID             `json:"application_id"`
-	Old           []domain.DesiredRoute `json:"old"`
-	Candidate     []domain.DesiredRoute `json:"candidate"`
-	HealthURL     string                `json:"health_url"`
-	ObservationURL string               `json:"observation_url"`
-	WindowMS      int                   `json:"window_ms"`
+	ApplicationID  domain.ID             `json:"application_id"`
+	Old            []domain.DesiredRoute `json:"old"`
+	Candidate      []domain.DesiredRoute `json:"candidate"`
+	HealthURL      string                `json:"health_url"`
+	ObservationURL string                `json:"observation_url"`
+	WindowMS       int                   `json:"window_ms"`
 }
 
 type m3RouteTargetInput struct {
@@ -115,6 +121,8 @@ func (h *M3AccessHTTPHandler) Handle(writer http.ResponseWriter, request *http.R
 		h.handlePlatformApplicationDomain(writer, request)
 	case m3AccessAPIBase + "domain-routes":
 		h.handleDomainRoutes(writer, request)
+	case m3AccessAPIBase + "domain-routes/prepare":
+		h.handlePrepareDomainRoutes(writer, request)
 	case m3AccessAPIBase + "certificates/renew":
 		h.handleCertificateRenew(writer, request)
 	case m3AccessAPIBase + "traffic-switches":
@@ -126,31 +134,82 @@ func (h *M3AccessHTTPHandler) Handle(writer http.ResponseWriter, request *http.R
 }
 
 func (h *M3AccessHTTPHandler) handleTrafficSwitch(writer http.ResponseWriter, request *http.Request) {
-	key, ok := m3MutationRequest(writer, request); if !ok { return }
-	var input m3TrafficSwitchInput; if !m3DecodeJSON(writer, request, &input) { return }
-	if input.WindowMS < 0 || input.WindowMS > 10_000 { writeJSONError(writer,http.StatusBadRequest,"invalid_argument","window_ms is outside the allowed range"); return }
-	health, err := m3LoopbackHTTPCheck(input.HealthURL); if err != nil { writeJSONError(writer,http.StatusBadRequest,"invalid_argument",err.Error()); return }
-	observe, err := m3LoopbackHTTPCheck(input.ObservationURL); if err != nil { writeJSONError(writer,http.StatusBadRequest,"invalid_argument",err.Error()); return }
-	err = h.Controller.Switch(request.Context(), controllers.M3SwitchRequest{ApplicationID:input.ApplicationID,Old:input.Old,Candidate:input.Candidate,IdempotencyKey:key,Actor:m3Actor(request),Window:time.Duration(input.WindowMS)*time.Millisecond,Healthy:func(ctx context.Context,_ domain.ID)error{return health(ctx)},Observe:func(ctx context.Context,_ domain.ID)error{return observe(ctx)}})
-	if err != nil { writeDomainError(writer,err); return }
-	writeJSON(writer,http.StatusAccepted,map[string]any{"status":"stable","serving_deployment_id":input.Candidate[0].Route.DeploymentID})
+	key, ok := m3MutationRequest(writer, request)
+	if !ok {
+		return
+	}
+	var input m3TrafficSwitchInput
+	if !m3DecodeJSON(writer, request, &input) {
+		return
+	}
+	if input.WindowMS < 0 || input.WindowMS > 10_000 {
+		writeJSONError(writer, http.StatusBadRequest, "invalid_argument", "window_ms is outside the allowed range")
+		return
+	}
+	health, err := m3LoopbackHTTPCheck(input.HealthURL)
+	if err != nil {
+		writeJSONError(writer, http.StatusBadRequest, "invalid_argument", err.Error())
+		return
+	}
+	observe, err := m3LoopbackHTTPCheck(input.ObservationURL)
+	if err != nil {
+		writeJSONError(writer, http.StatusBadRequest, "invalid_argument", err.Error())
+		return
+	}
+	err = h.Controller.Switch(request.Context(), controllers.M3SwitchRequest{ApplicationID: input.ApplicationID, Old: input.Old, Candidate: input.Candidate, IdempotencyKey: key, Actor: m3Actor(request), Window: time.Duration(input.WindowMS) * time.Millisecond, Healthy: func(ctx context.Context, _ domain.ID) error { return health(ctx) }, Observe: func(ctx context.Context, _ domain.ID) error { return observe(ctx) }})
+	if err != nil {
+		writeDomainError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusAccepted, map[string]any{"status": "stable", "serving_deployment_id": input.Candidate[0].Route.DeploymentID})
 }
 
 func m3LoopbackHTTPCheck(raw string) (func(context.Context) error, error) {
 	parsed, err := url.Parse(strings.TrimSpace(raw))
-	if err != nil || parsed.Scheme != "http" || parsed.User != nil || parsed.Host == "" || parsed.Fragment != "" { return nil, errors.New("health URL must be a plain loopback HTTP URL") }
-	host:=parsed.Hostname()
-	if !strings.EqualFold(host,"localhost") { ip:=net.ParseIP(host); if ip==nil||!ip.IsLoopback(){return nil,errors.New("health URL must use loopback")}}
-	client:=&http.Client{Timeout:2*time.Second,CheckRedirect:func(*http.Request,[]*http.Request)error{return http.ErrUseLastResponse}}
-	return func(ctx context.Context) error { req,err:=http.NewRequestWithContext(ctx,http.MethodGet,parsed.String(),nil); if err!=nil{return err}; response,err:=client.Do(req); if err!=nil{return err}; defer response.Body.Close(); _,_=io.Copy(io.Discard,io.LimitReader(response.Body,1<<20)); if response.StatusCode<200||response.StatusCode>=300{return errors.New("health observation was not successful")}; return nil },nil
+	if err != nil || parsed.Scheme != "http" || parsed.User != nil || parsed.Host == "" || parsed.Fragment != "" {
+		return nil, errors.New("health URL must be a plain loopback HTTP URL")
+	}
+	host := parsed.Hostname()
+	if !strings.EqualFold(host, "localhost") {
+		ip := net.ParseIP(host)
+		if ip == nil || !ip.IsLoopback() {
+			return nil, errors.New("health URL must use loopback")
+		}
+	}
+	client := &http.Client{Timeout: 2 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	return func(ctx context.Context) error {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
+		if err != nil {
+			return err
+		}
+		response, err := client.Do(req)
+		if err != nil {
+			return err
+		}
+		defer response.Body.Close()
+		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 1<<20))
+		if response.StatusCode < 200 || response.StatusCode >= 300 {
+			return errors.New("health observation was not successful")
+		}
+		return nil
+	}, nil
 }
 
 func (h *M3AccessHTTPHandler) handleCertificateRenew(writer http.ResponseWriter, request *http.Request) {
-	key, ok := m3MutationRequest(writer, request); if !ok { return }
-	var input m3CertificateRenewInput; if !m3DecodeJSON(writer, request, &input) { return }
+	key, ok := m3MutationRequest(writer, request)
+	if !ok {
+		return
+	}
+	var input m3CertificateRenewInput
+	if !m3DecodeJSON(writer, request, &input) {
+		return
+	}
 	certificate, err := h.Controller.RenewCertificate(request.Context(), input.ApplicationID, input.Certificate, key, m3Actor(request))
-	if err != nil { writeDomainError(writer, err); return }
-	writeJSON(writer, http.StatusCreated, map[string]any{"certificate":certificate})
+	if err != nil {
+		writeDomainError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusCreated, map[string]any{"certificate": certificate})
 }
 
 func (h *M3AccessHTTPHandler) handlePlatformApplicationDomain(writer http.ResponseWriter, request *http.Request) {
@@ -261,6 +320,33 @@ func (h *M3AccessHTTPHandler) handleDomainRoutes(writer http.ResponseWriter, req
 		return
 	}
 	writeJSON(writer, http.StatusCreated, map[string]any{"routes": routes, "access_state": state})
+}
+
+func (h *M3AccessHTTPHandler) handlePrepareDomainRoutes(writer http.ResponseWriter, request *http.Request) {
+	key, ok := m3MutationRequest(writer, request)
+	if !ok {
+		return
+	}
+	var input m3PrepareDomainRoutesInput
+	if !m3DecodeJSON(writer, request, &input) {
+		return
+	}
+	targets := make([]controllers.M3RouteTarget, 0, len(input.Targets))
+	for _, target := range input.Targets {
+		targets = append(targets, target.target())
+	}
+	routes, state, err := h.Controller.PrepareDomainRoutes(request.Context(), controllers.M3PrepareDomainRouteRequest{
+		Binding:        input.Binding,
+		Targets:        targets,
+		RuntimeReady:   input.RuntimeReady,
+		IdempotencyKey: key,
+		Actor:          m3Actor(request),
+	})
+	if err != nil {
+		writeDomainError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusAccepted, map[string]any{"routes": routes, "access_state": state})
 }
 
 func m3MutationRequest(writer http.ResponseWriter, request *http.Request) (string, bool) {

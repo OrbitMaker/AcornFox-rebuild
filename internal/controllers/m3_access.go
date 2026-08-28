@@ -29,6 +29,7 @@ type M3AccessStore interface {
 	PutDomainBinding(context.Context, domain.DomainBinding) error
 	PutCertificateReference(context.Context, domain.CertificateReference) error
 	PutDesiredRoute(context.Context, domain.Route, int) error
+	PutPreparedDesiredRoute(context.Context, domain.DomainBinding, domain.Route, int) error
 	ListDesiredRoutes(context.Context) ([]domain.DesiredRoute, error)
 	SetRoutePointer(context.Context, domain.ID, domain.ID, string) error
 	RecordTrafficSwitch(context.Context, domain.TrafficSwitch) error
@@ -55,6 +56,14 @@ type M3IPFallbackRequest struct {
 type M3DomainRouteRequest struct {
 	Binding        domain.DomainBinding
 	Certificate    domain.CertificateReference
+	Targets        []M3RouteTarget
+	RuntimeReady   bool
+	IdempotencyKey string
+	Actor          string
+}
+
+type M3PrepareDomainRouteRequest struct {
+	Binding        domain.DomainBinding
 	Targets        []M3RouteTarget
 	RuntimeReady   bool
 	IdempotencyKey string
@@ -257,6 +266,7 @@ func (c *M3AccessController) ApplyDomainRoutes(ctx context.Context, request M3Do
 		}
 		route.ApplicationID = target.ApplicationID
 		route.ServiceName = target.ServiceName
+		route.ID = m3DesiredRouteID(request.Binding.Host, target.Path)
 		route.Verified, route.Serving = true, true
 		if err := c.Store.PutDesiredRoute(ctx, route, target.Port); err != nil {
 			c.rollbackApplied(append(applied, route), targets[:index+1], request.IdempotencyKey, request.Actor)
@@ -273,6 +283,63 @@ func (c *M3AccessController) ApplyDomainRoutes(ctx context.Context, request M3Do
 		return nil, domain.AccessState{}, err
 	}
 	return applied, state, nil
+}
+
+// PrepareDomainRoutes records ROUTE_DESIRED before certificate issuance. It
+// must not call Caddy or move traffic; the IP fallback and any old serving
+// route remain untouched until ApplyDomainRoutes receives a ready certificate.
+func (c *M3AccessController) PrepareDomainRoutes(ctx context.Context, request M3PrepareDomainRouteRequest) ([]domain.Route, domain.AccessState, error) {
+	if err := c.validate(); err != nil {
+		return nil, domain.AccessState{}, err
+	}
+	if !request.RuntimeReady || request.Binding.Kind != domain.DomainBindingApplication || request.Binding.Status != domain.DomainReady {
+		return nil, domain.AccessState{}, domain.NewError(domain.ErrInvalidTransition, "DNS-verified ready domain and runtime-ready deployment are required before TLS allow preparation")
+	}
+	if err := domain.RequireID(request.Binding.ID, "prepared route domain id"); err != nil {
+		return nil, domain.AccessState{}, err
+	}
+	if err := domain.RequireID(request.Binding.ApplicationID, "prepared route application id"); err != nil {
+		return nil, domain.AccessState{}, err
+	}
+	host, err := domain.NormalizeTLSAllowDomain(request.Binding.Host)
+	if err != nil || host != request.Binding.Host {
+		if err != nil {
+			return nil, domain.AccessState{}, err
+		}
+		return nil, domain.AccessState{}, domain.ValidationError("prepared route domain must be normalized")
+	}
+	if len(request.Targets) == 0 {
+		return nil, domain.AccessState{}, domain.ValidationError("at least one prepared route target is required")
+	}
+	targets := append([]M3RouteTarget(nil), request.Targets...)
+	for index := range targets {
+		if err := validateM3Target(targets[index]); err != nil {
+			return nil, domain.AccessState{}, err
+		}
+		if targets[index].ApplicationID != request.Binding.ApplicationID {
+			return nil, domain.AccessState{}, domain.ValidationError("prepared route target must belong to the domain application")
+		}
+		path, _ := domain.NormalizeRoutePath(targets[index].Path)
+		targets[index].Path = path
+	}
+	if err := rejectM3RouteConflicts(targets); err != nil {
+		return nil, domain.AccessState{}, err
+	}
+	sort.Slice(targets, func(i, j int) bool { return len(targets[i].Path) > len(targets[j].Path) })
+	prepared := make([]domain.Route, 0, len(targets))
+	for _, target := range targets {
+		route := domain.Route{ID: m3DesiredRouteID(host, target.Path), ApplicationID: target.ApplicationID, DeploymentID: target.DeploymentID, ServiceName: target.ServiceName, Host: host, Path: target.Path, Verified: true, Serving: false, CreatedAt: c.now()}
+		if err := c.Store.PutPreparedDesiredRoute(ctx, request.Binding, route, target.Port); err != nil {
+			return nil, domain.AccessState{}, err
+		}
+		prepared = append(prepared, route)
+	}
+	first := targets[0]
+	state := domain.AccessState{ApplicationID: first.ApplicationID, DeploymentID: first.DeploymentID, RuntimeReady: true, IPAvailable: true, DomainStatus: domain.DomainReady, Domain: host, HTTPSReady: false, Serving: false, Message: "route is desired; TLS issuance may be allowed while IP fallback and old serving remain available"}
+	if err := c.Store.AppendAccessEvent(ctx, first.ApplicationID, request.IdempotencyKey, "route.desired", state.Message, true); err != nil {
+		return nil, domain.AccessState{}, err
+	}
+	return prepared, state, nil
 }
 
 func (c *M3AccessController) RebuildRoutes(ctx context.Context, key, actor string) (contracts.Evidence, error) {
@@ -402,6 +469,15 @@ func rejectM3RouteConflicts(targets []M3RouteTarget) error {
 
 func routeSpecFrom(route domain.Route, port int) contracts.RouteSpec {
 	return contracts.RouteSpec{Host: route.Host, Path: route.Path, DeploymentID: route.DeploymentID, ServiceName: route.ServiceName, Port: port, CertificateRef: route.CertificateRef, Verified: route.Verified}
+}
+
+func m3DesiredRouteID(host, path string) domain.ID {
+	canonicalHost, _ := domain.NormalizeRouteHost(host)
+	canonicalPath, _ := domain.NormalizeRoutePath(path)
+	hash := sha256.New()
+	_, _ = hash.Write([]byte{0})
+	_, _ = hash.Write([]byte(canonicalHost + "\x00" + canonicalPath))
+	return domain.ID("route_" + hex.EncodeToString(hash.Sum(nil))[:32])
 }
 
 func (c *M3AccessController) rollbackApplied(routes []domain.Route, targets []M3RouteTarget, key, actor string) {

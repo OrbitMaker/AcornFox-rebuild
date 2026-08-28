@@ -37,6 +37,24 @@ func (s *m3MemoryStore) PutCertificateReference(_ context.Context, value domain.
 func (s *m3MemoryStore) PutDesiredRoute(_ context.Context, value domain.Route, port int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	for index := range s.routes {
+		if s.routes[index].Route.ID == value.ID {
+			s.routes[index] = domain.DesiredRoute{Route: value, Port: port}
+			return nil
+		}
+	}
+	s.routes = append(s.routes, domain.DesiredRoute{Route: value, Port: port})
+	return nil
+}
+func (s *m3MemoryStore) PutPreparedDesiredRoute(_ context.Context, _ domain.DomainBinding, value domain.Route, port int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for index := range s.routes {
+		if s.routes[index].Route.ID == value.ID {
+			s.routes[index] = domain.DesiredRoute{Route: value, Port: port}
+			return nil
+		}
+	}
 	s.routes = append(s.routes, domain.DesiredRoute{Route: value, Port: port})
 	return nil
 }
@@ -191,6 +209,38 @@ func TestM3RootAndAPIPathApplyAndRebuild(t *testing.T) {
 	}
 	if len(routes.routes) != 2 {
 		t.Fatalf("rebuilt routes=%d", len(routes.routes))
+	}
+}
+
+func TestM3PrepareRoutesUnblocksFirstTLSIssuanceWithoutCallingCaddy(t *testing.T) {
+	routes, store := &m3RouteProvider{}, &m3MemoryStore{}
+	controller := newM3Controller(routes, store)
+	now := time.Unix(1, 0).UTC()
+	binding := domain.DomainBinding{ID: "domain_app", Kind: domain.DomainBindingApplication, ApplicationID: "app_test", Host: "app.example.test", ExpectedCNAME: "target.apps.example.test", Status: domain.DomainReady, CreatedAt: now, UpdatedAt: now}
+	targets := []M3RouteTarget{{ApplicationID: "app_test", DeploymentID: "dep_test", ServiceName: "frontend", Port: 31001, Path: "/", Routable: true}, {ApplicationID: "app_test", DeploymentID: "dep_test", ServiceName: "api", Port: 31002, Path: "/api", Routable: true}}
+	prepared, state, err := controller.PrepareDomainRoutes(context.Background(), M3PrepareDomainRouteRequest{Binding: binding, Targets: targets, RuntimeReady: true, IdempotencyKey: "prepare", Actor: "test"})
+	if err != nil || len(prepared) != 2 || state.HTTPSReady || state.Serving || len(routes.routes) != 0 {
+		t.Fatalf("prepare=%#v state=%#v caddy=%#v err=%v", prepared, state, routes.routes, err)
+	}
+	for _, route := range store.routes {
+		if !route.Route.Verified || route.Route.Serving || route.Route.CertificateRef != "" {
+			t.Fatalf("prepared route leaked certificate or serving state: %#v", route)
+		}
+	}
+	preparedAgain, _, err := controller.PrepareDomainRoutes(context.Background(), M3PrepareDomainRouteRequest{Binding: binding, Targets: targets, RuntimeReady: true, IdempotencyKey: "prepare-retry", Actor: "test"})
+	if err != nil || len(preparedAgain) != 2 || len(store.routes) != 2 {
+		t.Fatalf("prepared retry duplicated route facts: routes=%#v err=%v", store.routes, err)
+	}
+	certificate := domain.CertificateReference{ID: "certificate_1", DomainBindingID: binding.ID, Host: binding.Host, SecretRef: domain.SecretReference{ID: "secret_cert", Name: "tls", Provider: "test", Version: "1"}, Status: domain.CertificateReady, Fingerprint: "sha256:test", NotBefore: now, NotAfter: now.Add(time.Hour), UpdatedAt: now}
+	binding.CertificateRef = certificate.ID.String()
+	applied, serving, err := controller.ApplyDomainRoutes(context.Background(), M3DomainRouteRequest{Binding: binding, Certificate: certificate, Targets: targets, RuntimeReady: true, IdempotencyKey: "activate", Actor: "test"})
+	if err != nil || len(applied) != 2 || !serving.HTTPSReady || !serving.Serving || len(routes.routes) != 2 {
+		t.Fatalf("activate=%#v state=%#v caddy=%#v err=%v", applied, serving, routes.routes, err)
+	}
+	for _, route := range store.routes {
+		if !route.Route.Serving || route.Route.CertificateRef != certificate.ID.String() {
+			t.Fatalf("same route was not promoted to serving: %#v", route)
+		}
 	}
 }
 

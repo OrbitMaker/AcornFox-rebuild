@@ -90,6 +90,7 @@ type Server struct {
 	m2AgentNode      string
 	m2Lifecycle      *M2LifecycleHandler
 	m3Access         *M3AccessHTTPHandler
+	tlsAllow         *TLSAllowHTTPHandler
 	m4Operations     *M4OperationsHTTPHandler
 	m4Webhooks       *M4WebhookHTTPHandler
 	m4Logs           *M4LogsHTTPHandler
@@ -130,6 +131,7 @@ func (s *Server) SetM2(controller *controllers.M2ReleaseController, store *postg
 }
 func (s *Server) SetM2Lifecycle(handler *M2LifecycleHandler)       { s.m2Lifecycle = handler }
 func (s *Server) SetM3Access(handler *M3AccessHTTPHandler)         { s.m3Access = handler }
+func (s *Server) SetTLSAllow(handler *TLSAllowHTTPHandler)         { s.tlsAllow = handler }
 func (s *Server) SetM4Operations(handler *M4OperationsHTTPHandler) { s.m4Operations = handler }
 func (s *Server) SetM4Webhooks(handler *M4WebhookHTTPHandler)      { s.m4Webhooks = handler }
 func (s *Server) SetM4Logs(handler *M4LogsHTTPHandler)             { s.m4Logs = handler }
@@ -142,6 +144,9 @@ func (s *Server) HTTPServer(addr string) *http.Server {
 }
 
 func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
+	if s.tlsAllow != nil && s.tlsAllow.Handle(writer, request) {
+		return
+	}
 	if request.Method == http.MethodOptions {
 		writer.Header().Set("Allow", "GET, POST, OPTIONS")
 		writer.WriteHeader(http.StatusNoContent)

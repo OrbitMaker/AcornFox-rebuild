@@ -355,8 +355,8 @@ func (r DesiredRouteRecord) Validate() error {
 	if r.State != DesiredRoutePending && r.State != DesiredRouteActive && r.State != DesiredRouteDisabled && r.State != DesiredRouteFailed {
 		return domain.ValidationError("desired route state is unsupported")
 	}
-	if r.Route.Verified && r.State == DesiredRoutePending {
-		return domain.ValidationError("verified route cannot remain pending")
+	if r.Route.Verified && r.State == DesiredRoutePending && (r.Route.Serving || !r.CertificateID.Empty() || r.Route.CertificateRef != "") {
+		return domain.ValidationError("TLS allow desired route must be verified, non-serving, and certificate-free")
 	}
 	if r.Route.Serving && (!r.Route.Verified || r.State != DesiredRouteActive) {
 		return domain.ValidationError("serving route must be verified and active")

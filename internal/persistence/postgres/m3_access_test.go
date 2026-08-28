@@ -79,6 +79,10 @@ func TestM3DesiredRouteUsesCanonicalHostPathAndCertificateReference(t *testing.T
 	if err := ipFallback.Validate(); err != nil {
 		t.Fatalf("IP+port fallback route fact rejected: %v", err)
 	}
+	prepared := DesiredRouteRecord{Route: domain.Route{ID: "route_tls_allow", ApplicationID: "app_1", DeploymentID: "dep_1", ServiceName: "frontend", Host: "app.example.test", Path: "/tls", Verified: true, Serving: false, CreatedAt: now}, ApplicationDomainID: "domain_1", State: DesiredRoutePending}
+	if err := prepared.Validate(); err != nil {
+		t.Fatalf("TLS allow desired route rejected: %v", err)
+	}
 	for _, path := range []string{"/api/", "api", "/api//v1", "/api?x=1", "/../api"} {
 		if _, err := NormalizeM3PathPrefix(path); err == nil {
 			t.Errorf("noncanonical path %q accepted", path)
