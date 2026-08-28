@@ -3,13 +3,17 @@ import { Button, Empty, Table, Tag } from '@douyinfe/semi-ui';
 import type { ApplicationSummary } from '../api/types';
 import { PublishingStatusTag } from './PublishingStatus';
 import { DomainAccessStatus } from '../features/domains/DomainAccessStatus';
+import { RequestState } from './RequestState';
+import './ApplicationList.css';
 
-interface ApplicationListProps {
+export interface ApplicationListProps {
   applications: ApplicationSummary[];
   loading: boolean;
-  error?: string;
+  error?: unknown;
+  selectedApplicationId?: string;
   onCreate: () => void;
   onRefresh: () => void;
+  onSelect: (applicationId: string) => void;
 }
 
 const sourceLabels = {
@@ -24,20 +28,20 @@ function formatUpdatedAt(value: string): string {
   return new Intl.DateTimeFormat('zh-CN', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }).format(date);
 }
 
-export function ApplicationList({ applications, loading, error, onCreate, onRefresh }: ApplicationListProps) {
+export function ApplicationList({ applications, loading, error, selectedApplicationId, onCreate, onRefresh, onSelect }: ApplicationListProps) {
   const columns = [
     {
       title: '应用',
       dataIndex: 'name',
       key: 'name',
       render: (_name: string, application: ApplicationSummary) => (
-        <div className="application-cell">
+        <button className={`application-select ${selectedApplicationId === application.id ? 'is-selected' : ''}`} type="button" aria-pressed={selectedApplicationId === application.id} onClick={() => onSelect(application.id)}>
           <span className="application-avatar" aria-hidden="true">{application.name.slice(0, 1).toUpperCase()}</span>
           <span>
             <strong>{application.name}</strong>
             <small>{application.slug}</small>
           </span>
-        </div>
+        </button>
       ),
     },
     {
@@ -93,7 +97,7 @@ export function ApplicationList({ applications, loading, error, onCreate, onRefr
           <Button icon={<IconPlus />} theme="solid" type="primary" onClick={onCreate}>创建应用</Button>
         </div>
       </header>
-      {error && <div className="inline-alert" role="alert">{error}<Button theme="borderless" onClick={onRefresh}>重新加载</Button></div>}
+      <RequestState error={error} title="应用列表加载失败" onRetry={onRefresh} />
       {applications.length === 0 && !loading ? (
         <div className="empty-card">
           <Empty description="还没有应用" />

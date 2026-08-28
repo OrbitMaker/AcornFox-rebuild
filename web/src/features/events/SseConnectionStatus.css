@@ -1,0 +1,9 @@
+.sse-connection-status { display: grid; gap: 3px; margin: 0 0 14px; padding: 10px 12px; border: 1px solid #e4e7ec; border-radius: 9px; color: #667085; background: #f8fafc; font-size: 11px; }
+.sse-connection-status strong { color: #344054; }
+.sse-connection-status span, .sse-connection-status small { color: #667085; }
+.sse-connection-status--connected { border-color: #abefc6; background: #ecfdf3; }
+.sse-connection-status--connected strong { color: #027a48; }
+.sse-connection-status--retrying { border-color: #fedf89; background: #fffaeb; }
+.sse-connection-status--retrying strong { color: #b54708; }
+.sse-connection-status--offline, .sse-connection-status--auth_required { border-color: #fecdca; background: #fef3f2; }
+.sse-connection-status--offline strong, .sse-connection-status--auth_required strong { color: #b42318; }

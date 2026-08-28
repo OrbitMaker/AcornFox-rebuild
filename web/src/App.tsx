@@ -3,9 +3,11 @@ import { IconApps, IconBell, IconGlobe, IconHistogram, IconSetting } from '@douy
 import { Avatar, Button, Spin } from '@douyinfe/semi-ui';
 import type { ReactNode } from 'react';
 import { createConfiguredApiClient } from './api/client';
-import type { AIInterventionResult, AISettingsResult, ApplicationOperationsResult, ApplicationSummary, ApplicationUsageResult, ApiClient } from './api/types';
+import type { AIInterventionResult, AISettingsResult, ApplicationDetail as ApplicationDetailFact, ApplicationOperationsResult, ApplicationSummary, ApplicationUsageResult, ApiClient } from './api/types';
 import { applyPublishingEvent, createPublishingSnapshot, type PublishEvent } from './domain/publishing';
 import { ApplicationList } from './components/ApplicationList';
+import { ApplicationDetail } from './components/ApplicationDetail';
+import { RequestState } from './components/RequestState';
 import { CreateApplicationWizard } from './components/CreateApplicationWizard';
 import { ApplicationOperationsView } from './features/operations/ApplicationOperationsView';
 import type { OperationRequest, OperationsViewMode } from './features/operations/operationsView';
@@ -16,6 +18,9 @@ import { AIServiceSettings } from './features/settings/ai/AIServiceSettings';
 import { LoginView } from './features/auth/LoginView';
 import { PasswordRotation } from './features/auth/PasswordRotation';
 import { authErrorMessage, type AuthSession } from './features/auth/auth';
+import { DomainManagementWorkspace } from './features/domains/DomainManagementWorkspace';
+import { SseConnectionStatus, type SseConnectionState } from './features/events/SseConnectionStatus';
+import { applicationIdFromLocation, resolveSelectedApplicationId, setApplicationQuery } from './components/applicationSelection';
 
 type View = 'overview' | 'applications' | 'create' | 'domains' | 'operations' | 'usage' | 'settings';
 
@@ -116,16 +121,6 @@ function Overview({ applications, onOpenApplications, onCreate }: { applications
   );
 }
 
-function PlaceholderView({ view, onCreate }: { view: View; onCreate: () => void }) {
-  const item = navItems.find((navItem) => navItem.id === view) ?? navItems[0];
-  return (
-    <section className="page-section placeholder-page" aria-labelledby="placeholder-heading">
-      <p className="eyebrow">{item.label}</p><h1 id="placeholder-heading">{item.label}</h1><p className="section-subtitle">{item.description}</p>
-      <div className="placeholder-card"><div className="placeholder-icon">{item.icon}</div><h2>这个模块将接入控制面事实</h2><p>M0 只提供导航和边界。后续门禁会接入真实 API、事件、审计和证据，不在前端虚构状态。</p>{view === 'operations' && <Button theme="solid" type="primary" onClick={onCreate}>先创建一个应用</Button>}</div>
-    </section>
-  );
-}
-
 interface OperationsWorkspaceProps {
   application?: ApplicationSummary;
   result?: ApplicationOperationsResult;
@@ -136,26 +131,29 @@ interface OperationsWorkspaceProps {
   onRequestOperation: (request: OperationRequest) => void;
   aiResult?: AIInterventionResult;
   aiLoading: boolean;
+  sseState: SseConnectionState;
+  sseLastEventId?: string;
 }
 
-function OperationsWorkspace({ application, result, loading, message, mode, onModeChange, onRequestOperation, aiResult, aiLoading }: OperationsWorkspaceProps) {
+function OperationsWorkspace({ application, result, loading, message, mode, onModeChange, onRequestOperation, aiResult, aiLoading, sseState, sseLastEventId }: OperationsWorkspaceProps) {
   if (!application) {
-    return <section className="page-section placeholder-page"><h1>运行与运维</h1><p>创建或接入应用后，才能读取该应用的控制面事实。</p><AIInterventionPlaceholder availability="disabled" /></section>;
+    return <section className="page-section placeholder-page"><h1>运行与运维</h1><RequestState message="请先从应用列表选择一个应用，才能读取该应用的控制面事实。" /><AIInterventionPlaceholder availability="disabled" /></section>;
   }
   if (loading) {
-    return <section className="page-section placeholder-page"><h1>运行与运维</h1><Spin tip="正在读取控制面事实" /><AIInterventionPlaceholder availability="disabled" /></section>;
+    return <section className="page-section placeholder-page"><h1>运行与运维</h1><RequestState loading /><AIInterventionPlaceholder availability="disabled" /></section>;
   }
   if (result?.status !== 'available') {
     return (
       <section className="page-section placeholder-page">
         <p className="eyebrow">运行与运维 · {application.name}</p><h1>运维事实未就绪</h1>
-        <p>{message ?? result?.message ?? '控制面尚未提供该应用的运维事实。'}</p>
+        <RequestState message={message ?? result?.message ?? '控制面尚未提供该应用的运维事实。'} />
         <AIInterventionPlaceholder availability="disabled" />
       </section>
     );
   }
   return (
     <section className="page-section">
+      <SseConnectionStatus state={sseState} lastEventId={sseLastEventId} />
       {message && <div className="inline-alert" role="status">{message}</div>}
       <ApplicationOperationsView facts={result.facts} mode={mode} onModeChange={onModeChange} onRequestOperation={onRequestOperation} />
       {aiLoading ? <Spin tip="正在读取 AI 介入账本" /> : aiResult?.status === 'available' ? <AIInterventionPanel facts={aiResult.facts} mode={mode === 'operations' ? 'operator' : 'ordinary'} /> : <AIInterventionPlaceholder availability="disabled" />}
@@ -170,10 +168,14 @@ function AISettingsWorkspace({ result, loading, client, onSessionExpired }: { re
 }
 
 function UsageWorkspace({ application, result, loading, mode, onModeChange }: { application?: ApplicationSummary; result?: ApplicationUsageResult; loading: boolean; mode: 'normal' | 'operations'; onModeChange: (mode: 'normal' | 'operations') => void }) {
-  if (!application) return <section className="page-section placeholder-page"><h1>用量与分析</h1><p>创建或接入应用后，才能读取本地用量事实。</p></section>;
-  if (loading) return <section className="page-section placeholder-page"><h1>用量与分析</h1><Spin tip="正在读取本地用量事实" /></section>;
-  if (result?.status !== 'available') return <section className="page-section placeholder-page"><p className="eyebrow">用量与分析 · {application.name}</p><h1>用量事实未就绪</h1><p>{result?.message ?? '控制面尚未提供该应用的聚合用量事实。'}</p></section>;
+  if (!application) return <section className="page-section placeholder-page"><h1>用量与分析</h1><RequestState message="请先从应用列表选择一个应用，才能读取本地用量事实。" /></section>;
+  if (loading) return <section className="page-section placeholder-page"><h1>用量与分析</h1><RequestState loading /></section>;
+  if (result?.status !== 'available') return <section className="page-section placeholder-page"><p className="eyebrow">用量与分析 · {application.name}</p><h1>用量事实未就绪</h1><RequestState message={result?.message ?? '控制面尚未提供该应用的聚合用量事实。'} /></section>;
   return <section className="page-section"><div className="usage-mode-switch" role="group" aria-label="用量视图"><Button theme={mode === 'normal' ? 'solid' : 'borderless'} onClick={() => onModeChange('normal')}>普通视图</Button><Button theme={mode === 'operations' ? 'solid' : 'borderless'} onClick={() => onModeChange('operations')}>运维视图</Button></div><UsageView facts={result.facts} mode={mode} /></section>;
+}
+
+function isAbortError(reason: unknown): boolean {
+  return reason instanceof DOMException && reason.name === 'AbortError';
 }
 
 export default function App() {
@@ -181,7 +183,12 @@ export default function App() {
   const [view, setView] = useState<View>('overview');
   const [applications, setApplications] = useState<ApplicationSummary[]>([]);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string>();
+  const [error, setError] = useState<unknown>();
+  const [selectedApplicationId, setSelectedApplicationId] = useState<string | undefined>(() => applicationIdFromLocation(typeof window === 'undefined' ? undefined : window.location));
+  const [detail, setDetail] = useState<ApplicationDetailFact>();
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError, setDetailError] = useState<unknown>();
+  const [detailReload, setDetailReload] = useState(0);
   const [operationsResult, setOperationsResult] = useState<ApplicationOperationsResult>();
   const [operationsLoading, setOperationsLoading] = useState(false);
   const [operationsMessage, setOperationsMessage] = useState<string>();
@@ -193,58 +200,106 @@ export default function App() {
   const [aiLoading, setAILoading] = useState(false);
   const [aiSettingsResult, setAISettingsResult] = useState<AISettingsResult>();
   const [aiSettingsLoading, setAISettingsLoading] = useState(false);
-  const subscriptions = useRef(new Map<string, () => void>());
+  const [sseState, setSseState] = useState<SseConnectionState>('closed');
+  const [sseLastEventId, setSseLastEventId] = useState<string>();
+  const subscriptions = useRef<(() => void) | undefined>();
+  const requestControllers = useRef(new Set<AbortController>());
+  const selectedApplicationIdRef = useRef<string>();
+  selectedApplicationIdRef.current = selectedApplicationId;
+
+  const trackController = useCallback(() => {
+    const controller = new AbortController();
+    requestControllers.current.add(controller);
+    return controller;
+  }, []);
+
+  const cancelSelectedWork = useCallback(() => {
+    requestControllers.current.forEach((controller) => controller.abort());
+    requestControllers.current.clear();
+    subscriptions.current?.();
+    subscriptions.current = undefined;
+    setSseLastEventId(undefined);
+    setSseState('closed');
+  }, []);
 
   const resetProtectedState = useCallback((message?: string) => {
-    subscriptions.current.forEach((unsubscribe) => unsubscribe());
-    subscriptions.current.clear();
+    cancelSelectedWork();
     setApplications([]);
+    setError(undefined);
+    setSelectedApplicationId(undefined);
+    setApplicationQuery(undefined);
+    setDetail(undefined);
+    setDetailError(undefined);
     setOperationsResult(undefined);
     setUsageResult(undefined);
     setAIResult(undefined);
     setAISettingsResult(undefined);
     setLoading(false);
+    setDetailLoading(false);
     setOperationsLoading(false);
     setUsageLoading(false);
     setAILoading(false);
     setAISettingsLoading(false);
     setAuthState({ status: 'unauthenticated', message });
-  }, []);
+  }, [cancelSelectedWork]);
 
   const [client] = useState<ApiClient>(() => createConfiguredApiClient({ onUnauthorized: () => resetProtectedState('管理员会话已失效，请重新登录。') }));
 
-  const loadApplications = useCallback(async () => {
+  const loadApplications = useCallback(async (signal?: AbortSignal) => {
     setLoading(true);
     setError(undefined);
     try {
-      const response = await client.listApplications();
+      const response = await client.listApplications(signal);
       setApplications(response.items);
+      setSelectedApplicationId((current) => {
+        const resolved = resolveSelectedApplicationId(current, response.items);
+        if (current && !resolved) setApplicationQuery(undefined);
+        return resolved;
+      });
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : '应用列表加载失败');
+      if (!isAbortError(reason)) setError(reason);
     } finally {
-      setLoading(false);
+      if (!signal?.aborted) setLoading(false);
     }
   }, [client]);
 
   useEffect(() => {
-    let active = true;
-    void client.getSession()
+    const controller = trackController();
+    void client.getSession(controller.signal)
       .then((session) => {
-        if (!active) return;
+        if (controller.signal.aborted) return;
         if (session.authenticated) setAuthState({ status: 'authenticated', session });
         else setAuthState({ status: 'unauthenticated' });
       })
       .catch((reason) => {
-        if (active) setAuthState({ status: 'unauthenticated', message: authErrorMessage(reason, '无法验证管理员会话，请稍后重试。') });
-      });
-    return () => { active = false; };
-  }, [client]);
+        if (!controller.signal.aborted) setAuthState({ status: 'unauthenticated', message: authErrorMessage(reason, '无法验证管理员会话，请稍后重试。') });
+      })
+      .finally(() => requestControllers.current.delete(controller));
+    return () => { controller.abort(); requestControllers.current.delete(controller); };
+  }, [client, trackController]);
 
   useEffect(() => {
     if (authState.status !== 'authenticated') return undefined;
-    void loadApplications();
-    return () => subscriptions.current.forEach((unsubscribe) => unsubscribe());
-  }, [authState.status, loadApplications]);
+    const controller = trackController();
+    void loadApplications(controller.signal).finally(() => requestControllers.current.delete(controller));
+    return () => { controller.abort(); requestControllers.current.delete(controller); };
+  }, [authState.status, loadApplications, trackController]);
+
+  const selectedApplication = applications.find((application) => application.id === selectedApplicationId);
+
+  const handleSelectApplication = useCallback((applicationId: string) => {
+    if (applicationId === selectedApplicationIdRef.current) return;
+    cancelSelectedWork();
+    setSelectedApplicationId(applicationId);
+    setApplicationQuery(applicationId);
+    setDetail(undefined);
+    setDetailError(undefined);
+    setOperationsResult(undefined);
+    setUsageResult(undefined);
+    setAIResult(undefined);
+    setOperationsMessage(undefined);
+    setView('applications');
+  }, [cancelSelectedWork]);
 
   const handleAuthenticated = useCallback((session: AuthSession) => {
     if (!session.authenticated) {
@@ -269,88 +324,165 @@ export default function App() {
     resetProtectedState('密码已更新，请使用新密码重新登录。');
   }, [resetProtectedState]);
 
-  const subscribe = useCallback((operationId: string) => {
-    subscriptions.current.get(operationId)?.();
-    const unsubscribe = client.subscribeToPublishEvents(operationId, (event) => setApplications((current) => updateFromPublishEvent(current, event)));
-    subscriptions.current.set(operationId, unsubscribe);
-  }, [client]);
-
-  const handleCreated = useCallback((operationId: string) => {
-    subscribe(operationId);
+  const handleCreated = useCallback((_operationId: string) => {
     setView('applications');
     void loadApplications();
-  }, [loadApplications, subscribe]);
+  }, [loadApplications]);
 
-  const operationsApplication = applications[0];
-  const loadOperations = useCallback(async () => {
-    if (!operationsApplication) {
-      setOperationsResult(undefined);
-      return;
+  useEffect(() => {
+    if (!selectedApplicationId || !selectedApplication) {
+      setDetail(undefined);
+      setDetailError(undefined);
+      setDetailLoading(false);
+      return undefined;
     }
+    const applicationId = selectedApplicationId;
+    const controller = trackController();
+    setDetail(undefined);
+    setDetailError(undefined);
+    setDetailLoading(true);
+    void client.getApplication(applicationId, controller.signal)
+      .then((result) => { if (selectedApplicationIdRef.current === applicationId) setDetail(result); })
+      .catch((reason) => { if (!controller.signal.aborted && selectedApplicationIdRef.current === applicationId) setDetailError(reason); })
+      .finally(() => {
+        requestControllers.current.delete(controller);
+        if (!controller.signal.aborted && selectedApplicationIdRef.current === applicationId) setDetailLoading(false);
+      });
+    return () => { controller.abort(); requestControllers.current.delete(controller); };
+  }, [client, detailReload, selectedApplication?.id, selectedApplicationId, trackController]);
+
+  const loadOperations = useCallback(async (applicationId: string, signal?: AbortSignal) => {
     setOperationsLoading(true);
     setOperationsMessage(undefined);
     try {
-      setOperationsResult(await client.getApplicationOperations(operationsApplication.id));
+      const result = await client.getApplicationOperations(applicationId, signal);
+      if (selectedApplicationIdRef.current === applicationId) setOperationsResult(result);
     } catch (reason) {
-      setOperationsResult({ status: 'unavailable', message: reason instanceof Error ? reason.message : '运维事实加载失败' });
+      if (!isAbortError(reason) && selectedApplicationIdRef.current === applicationId) setOperationsResult({ status: 'unavailable', message: reason instanceof Error ? reason.message : '运维事实加载失败' });
     } finally {
-      setOperationsLoading(false);
+      if (!signal?.aborted && selectedApplicationIdRef.current === applicationId) setOperationsLoading(false);
     }
-  }, [client, operationsApplication]);
-
-  useEffect(() => {
-    if (view === 'operations') void loadOperations();
-  }, [loadOperations, view]);
-
-  const loadAIInterventions = useCallback(async () => {
-    if (!operationsApplication) { setAIResult(undefined); return; }
-    setAILoading(true);
-    try { setAIResult(await client.getAIInterventions(operationsApplication.id, operationsMode === 'operations' ? 'operator' : 'ordinary')); }
-    catch (reason) { setAIResult({ status: 'unavailable', message: reason instanceof Error ? reason.message : 'AI 介入账本加载失败' }); }
-    finally { setAILoading(false); }
-  }, [client, operationsApplication, operationsMode]);
-
-  useEffect(() => { if (view === 'operations') void loadAIInterventions(); }, [loadAIInterventions, view]);
-
-  const loadAISettings = useCallback(async () => {
-    setAISettingsLoading(true);
-    try { setAISettingsResult(await client.getAISettings()); }
-    catch (reason) { setAISettingsResult({ status: 'unavailable', message: reason instanceof Error ? reason.message : 'AI 服务设置加载失败' }); }
-    finally { setAISettingsLoading(false); }
   }, [client]);
 
-  useEffect(() => { if (view === 'settings') void loadAISettings(); }, [loadAISettings, view]);
+  useEffect(() => {
+    if (view !== 'operations' || !selectedApplicationId || !selectedApplication) {
+      setOperationsResult(undefined);
+      setOperationsLoading(false);
+      return undefined;
+    }
+    const controller = trackController();
+    void loadOperations(selectedApplicationId, controller.signal).finally(() => requestControllers.current.delete(controller));
+    return () => { controller.abort(); requestControllers.current.delete(controller); };
+  }, [loadOperations, selectedApplication?.id, selectedApplicationId, trackController, view]);
 
-  const loadUsage = useCallback(async () => {
-    if (!operationsApplication) {
-      setUsageResult(undefined);
-      return;
-    }
-    setUsageLoading(true);
+  const loadAIInterventions = useCallback(async (applicationId: string, mode: 'ordinary' | 'operator', signal?: AbortSignal) => {
+    setAILoading(true);
     try {
-      setUsageResult(await client.getApplicationUsage(operationsApplication.id, usageMode));
+      const result = await client.getAIInterventions(applicationId, mode, signal);
+      if (selectedApplicationIdRef.current === applicationId) setAIResult(result);
     } catch (reason) {
-      setUsageResult({ status: 'unavailable', message: reason instanceof Error ? reason.message : '用量事实加载失败' });
+      if (!isAbortError(reason) && selectedApplicationIdRef.current === applicationId) setAIResult({ status: 'unavailable', message: reason instanceof Error ? reason.message : 'AI 介入账本加载失败' });
     } finally {
-      setUsageLoading(false);
+      if (!signal?.aborted && selectedApplicationIdRef.current === applicationId) setAILoading(false);
     }
-  }, [client, operationsApplication, usageMode]);
+  }, [client]);
 
   useEffect(() => {
-    if (view === 'usage') void loadUsage();
-  }, [loadUsage, view]);
+    if (view !== 'operations' || !selectedApplicationId || !selectedApplication) {
+      setAIResult(undefined);
+      setAILoading(false);
+      return undefined;
+    }
+    const controller = trackController();
+    void loadAIInterventions(selectedApplicationId, operationsMode === 'operations' ? 'operator' : 'ordinary', controller.signal).finally(() => requestControllers.current.delete(controller));
+    return () => { controller.abort(); requestControllers.current.delete(controller); };
+  }, [loadAIInterventions, operationsMode, selectedApplication?.id, selectedApplicationId, trackController, view]);
+
+  const loadAISettings = useCallback(async (signal?: AbortSignal) => {
+    setAISettingsLoading(true);
+    try { setAISettingsResult(await client.getAISettings(signal)); }
+    catch (reason) { if (!isAbortError(reason)) setAISettingsResult({ status: 'unavailable', message: reason instanceof Error ? reason.message : 'AI 服务设置加载失败' }); }
+    finally { if (!signal?.aborted) setAISettingsLoading(false); }
+  }, [client]);
+
+  useEffect(() => {
+    if (view !== 'settings') return undefined;
+    const controller = trackController();
+    void loadAISettings(controller.signal).finally(() => requestControllers.current.delete(controller));
+    return () => { controller.abort(); requestControllers.current.delete(controller); };
+  }, [loadAISettings, trackController, view]);
+
+  const loadUsage = useCallback(async (applicationId: string, mode: 'normal' | 'operations', signal?: AbortSignal) => {
+    setUsageLoading(true);
+    try {
+      const result = await client.getApplicationUsage(applicationId, mode, signal);
+      if (selectedApplicationIdRef.current === applicationId) setUsageResult(result);
+    } catch (reason) {
+      if (!isAbortError(reason) && selectedApplicationIdRef.current === applicationId) setUsageResult({ status: 'unavailable', message: reason instanceof Error ? reason.message : '用量事实加载失败' });
+    } finally {
+      if (!signal?.aborted && selectedApplicationIdRef.current === applicationId) setUsageLoading(false);
+    }
+  }, [client]);
+
+  useEffect(() => {
+    if (view !== 'usage' || !selectedApplicationId || !selectedApplication) {
+      setUsageResult(undefined);
+      setUsageLoading(false);
+      return undefined;
+    }
+    const controller = trackController();
+    void loadUsage(selectedApplicationId, usageMode, controller.signal).finally(() => requestControllers.current.delete(controller));
+    return () => { controller.abort(); requestControllers.current.delete(controller); };
+  }, [loadUsage, selectedApplication?.id, selectedApplicationId, trackController, usageMode, view]);
+
+  useEffect(() => {
+    subscriptions.current?.();
+    subscriptions.current = undefined;
+    setSseLastEventId(undefined);
+    if (!selectedApplication?.operationId) {
+      setSseState('closed');
+      return undefined;
+    }
+    const applicationId = selectedApplication.id;
+    const operationId = selectedApplication.operationId;
+    setSseState('connecting');
+    try {
+      const unsubscribe = client.subscribeToPublishEvents(operationId, (event) => {
+        if (selectedApplicationIdRef.current !== applicationId) return;
+        setSseState('connected');
+        setSseLastEventId(event.id);
+        setApplications((current) => updateFromPublishEvent(current, event));
+      });
+      subscriptions.current = unsubscribe;
+      setSseState('connected');
+      return () => {
+        unsubscribe();
+        if (subscriptions.current === unsubscribe) subscriptions.current = undefined;
+        setSseState('closed');
+      };
+    } catch {
+      setSseState('offline');
+      return undefined;
+    }
+  }, [client, selectedApplication?.id, selectedApplication?.operationId]);
 
   const requestOperation = useCallback((request: OperationRequest) => {
-    if (!operationsApplication) return;
+    const applicationId = selectedApplicationIdRef.current;
+    if (!applicationId) return;
+    const controller = trackController();
     setOperationsMessage(undefined);
-    void client.requestApplicationOperation(operationsApplication.id, request)
+    void client.requestApplicationOperation(applicationId, request, controller.signal)
       .then((result) => {
+        if (selectedApplicationIdRef.current !== applicationId) return;
         setOperationsMessage(result.message);
-        if (result.status === 'accepted') void loadOperations();
+        if (result.status === 'accepted') void loadOperations(applicationId);
       })
-      .catch((reason) => setOperationsMessage(reason instanceof Error ? reason.message : '运维操作请求失败'));
-  }, [client, loadOperations, operationsApplication]);
+      .catch((reason) => { if (!isAbortError(reason) && selectedApplicationIdRef.current === applicationId) setOperationsMessage(reason instanceof Error ? reason.message : '运维操作请求失败'); })
+      .finally(() => requestControllers.current.delete(controller));
+  }, [client, loadOperations, trackController]);
 
+  const refreshDetail = useCallback(() => setDetailReload((value) => value + 1), []);
+  const handleDomainError = useCallback((reason: unknown) => setError(reason), []);
   const stats = useMemo(() => ({ running: applications.filter((application) => application.runtimeStatus === 'running').length }), [applications]);
 
   if (authState.status === 'checking') {
@@ -367,12 +499,12 @@ export default function App() {
         <Header view={view} username={authState.session.username} demoMode={client.authMode === 'stub'} onLogout={() => void handleLogout()} />
         <main className="content">
           {view === 'overview' && <Overview applications={applications} onOpenApplications={() => setView('applications')} onCreate={() => setView('create')} />}
-          {view === 'applications' && <ApplicationList applications={applications} loading={loading} error={error} onCreate={() => setView('create')} onRefresh={() => void loadApplications()} />}
+          {view === 'applications' && <><ApplicationList applications={applications} loading={loading} error={error} selectedApplicationId={selectedApplicationId} onSelect={handleSelectApplication} onCreate={() => setView('create')} onRefresh={() => void loadApplications()} /><ApplicationDetail application={selectedApplication} detail={detail} loading={detailLoading} error={detailError} onRefresh={refreshDetail} /></>}
           {view === 'create' && <CreateApplicationWizard client={client} onCancel={() => setView('applications')} onCreated={handleCreated} />}
-          {view === 'operations' && <OperationsWorkspace application={operationsApplication} result={operationsResult} loading={operationsLoading} message={operationsMessage} mode={operationsMode} onModeChange={setOperationsMode} onRequestOperation={requestOperation} aiResult={aiResult} aiLoading={aiLoading} />}
-          {view === 'usage' && <UsageWorkspace application={operationsApplication} result={usageResult} loading={usageLoading} mode={usageMode} onModeChange={setUsageMode} />}
+          {view === 'domains' && (selectedApplication ? <DomainManagementWorkspace client={client} applicationId={selectedApplication.id} onRefresh={() => void loadApplications()} onError={handleDomainError} /> : <section className="page-section placeholder-page"><h1>域名管理</h1><RequestState message="请先从应用列表选择一个应用，才能管理其平台和应用域名。" /></section>)}
+          {view === 'operations' && <OperationsWorkspace application={selectedApplication} result={operationsResult} loading={operationsLoading} message={operationsMessage} mode={operationsMode} onModeChange={setOperationsMode} onRequestOperation={requestOperation} aiResult={aiResult} aiLoading={aiLoading} sseState={sseState} sseLastEventId={sseLastEventId} />}
+          {view === 'usage' && <UsageWorkspace application={selectedApplication} result={usageResult} loading={usageLoading} mode={usageMode} onModeChange={setUsageMode} />}
           {view === 'settings' && <AISettingsWorkspace result={aiSettingsResult} loading={aiSettingsLoading} client={client} onSessionExpired={handlePasswordRotated} />}
-          {view !== 'overview' && view !== 'applications' && view !== 'create' && view !== 'operations' && view !== 'usage' && view !== 'settings' && <PlaceholderView view={view} onCreate={() => setView('create')} />}
         </main>
         <footer className="app-footer"><span>Open Card MVP · Golden Path 在 AI 关闭时可独立运行</span><span>{loading ? <Spin size="small" /> : <><i className="footer-status" /> {stats.running} 个应用运行正常</>}</span></footer>
       </div>

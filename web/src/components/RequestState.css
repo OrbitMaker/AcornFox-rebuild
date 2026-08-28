@@ -1,0 +1,5 @@
+.request-state { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin: 0 0 14px; padding: 11px 13px; border: 1px solid #e4e7ec; border-radius: 8px; color: #667085; background: #f8fafc; font-size: 11px; }
+.request-state strong, .request-state p { margin: 0; }
+.request-state p { margin-top: 4px; }
+.request-state--error { border-color: #fecdca; color: #b42318; background: #fef3f2; }
+.request-state button { min-height: 30px; padding: 0 10px; border: 1px solid #fda29b; border-radius: 7px; color: #b42318; background: #fff; }

@@ -1,0 +1,4 @@
+.application-select { display: flex; align-items: center; gap: 10px; width: 100%; padding: 0; border: 0; color: inherit; background: transparent; text-align: left; }
+.application-select:hover strong, .application-select:focus-visible strong { color: #285c4a; }
+.application-select.is-selected { color: #285c4a; }
+.application-select:focus-visible { outline: 2px solid #84caff; outline-offset: 4px; border-radius: 8px; }
