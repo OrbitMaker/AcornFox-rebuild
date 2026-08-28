@@ -187,3 +187,10 @@ func TestBackupMetadataChecksumValidation(t *testing.T) {
 		t.Fatalf("expected backup checksum rejection, got %v", err)
 	}
 }
+
+func TestCurrentMigrationMatchesControlPlaneDirectory(t *testing.T) {
+	directory := filepath.Join("..", "..", "migrations", "control-plane")
+	if err := RequireCurrentMigration(directory); err != nil {
+		t.Fatal(err)
+	}
+}

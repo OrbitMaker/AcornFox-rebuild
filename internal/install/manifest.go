@@ -26,7 +26,7 @@ const (
 	AgentProtocolVersion    = "1.1"
 	PreviousAgentProtocol   = "1.0"
 	LegacyAgentProtocol     = "v1"
-	CurrentMigrationVersion = "0021"
+	CurrentMigrationVersion = "0022"
 	DefaultInstallPrefix    = "/opt/open-card"
 	DefaultConfigDir        = "/etc/open-card"
 	DefaultDataDir          = "/var/lib/open-card"
@@ -215,7 +215,7 @@ func CheckArchitecture(manifest Manifest, target string) error {
 }
 
 // ValidateMigrationVersion checks the four-digit migration identity used by
-// RC artifacts. The current application schema is migration 0021.
+// RC artifacts. The current application schema is migration 0022.
 func ValidateMigrationVersion(value string) error {
 	value = strings.TrimSpace(value)
 	if !migrationVersionPattern.MatchString(value) {
@@ -235,7 +235,7 @@ func CheckCurrentMigration(value string) error {
 }
 
 // LatestMigrationVersion returns the highest ordered migration filename in a
-// directory, e.g. 0021 for 0021_m6_controlled_ai.sql. It rejects malformed
+// directory, e.g. 0022 for 0022_admin_auth.sql. It rejects malformed
 // migration names instead of silently skipping a file that could change the
 // schema contract.
 func LatestMigrationVersion(directory string) (string, error) {

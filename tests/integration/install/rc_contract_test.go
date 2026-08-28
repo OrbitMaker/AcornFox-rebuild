@@ -33,7 +33,7 @@ func TestRCArchitectureAndMigrationContracts(t *testing.T) {
 
 func TestRCLatestMigrationRejectsMissingOrStaleDirectory(t *testing.T) {
 	directory := t.TempDir()
-	for _, name := range []string{"0001_foundation.sql", "0020_m5_usage.sql", "0021_m6_controlled_ai.sql"} {
+	for _, name := range []string{"0001_foundation.sql", "0020_m5_usage.sql", "0021_m6_controlled_ai.sql", "0022_admin_auth.sql"} {
 		if err := os.WriteFile(filepath.Join(directory, name), []byte("-- fixture\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -45,7 +45,7 @@ func TestRCLatestMigrationRejectsMissingOrStaleDirectory(t *testing.T) {
 	if err := install.RequireCurrentMigration(directory); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Remove(filepath.Join(directory, "0021_m6_controlled_ai.sql")); err != nil {
+	if err := os.Remove(filepath.Join(directory, "0022_admin_auth.sql")); err != nil {
 		t.Fatal(err)
 	}
 	if err := install.RequireCurrentMigration(directory); err == nil {
@@ -237,9 +237,9 @@ func TestUpgradeMigrationAndHealthFailureRestorePointerDataAndConfig(t *testing.
 	if err := os.WriteFile(filepath.Join(configDir, "tls-reference"), []byte("old-cert-ref\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	newBundle := writeRCBundle(t, directory, "1.1.0", "release-1.1.0", "0021")
+	newBundle := writeRCBundle(t, directory, "1.1.0", "release-1.1.0", "0022")
 	migrate := filepath.Join(directory, "migrate.sh")
-	writeExecutable(t, migrate, `printf '0021_m6_controlled_ai.sql\tfixture\n'; printf 'new-db\n' > "$OPEN_CARD_DATA_DIR/control-plane.db"; printf '0021\n' > "$OPEN_CARD_DATA_DIR/migration.version"`)
+	writeExecutable(t, migrate, `printf '0022_admin_auth.sql\tfixture\n'; printf 'new-db\n' > "$OPEN_CARD_DATA_DIR/control-plane.db"; printf '0022\n' > "$OPEN_CARD_DATA_DIR/migration.version"`)
 	health := filepath.Join(directory, "health-fail.sh")
 	writeExecutable(t, health, "exit 42")
 	dump := filepath.Join(directory, "dump.sh")
@@ -278,7 +278,7 @@ func TestUpgradeMigrationAndHealthFailureRestorePointerDataAndConfig(t *testing.
 	if current, readErr := os.Readlink(filepath.Join(root, "opt", "open-card", "current")); readErr != nil || current != "releases/release-1.1.0" {
 		t.Fatalf("current pointer after successful upgrade: %q %v", current, readErr)
 	}
-	for path, want := range map[string]string{filepath.Join(dataDir, "migration.version"): "0021\n", filepath.Join(dataDir, "schema.version"): "21\n"} {
+	for path, want := range map[string]string{filepath.Join(dataDir, "migration.version"): "0022\n", filepath.Join(dataDir, "schema.version"): "22\n"} {
 		value, readErr := os.ReadFile(path)
 		if readErr != nil || string(value) != want {
 			t.Fatalf("persisted %s = %q, %v", path, value, readErr)
@@ -301,9 +301,9 @@ func TestUpgradeRestoreFailureCreatesFailClosedRecoveryMarker(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dataDir, "control-plane.db"), []byte("old\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	newBundle := writeRCBundle(t, directory, "1.1.0", "release-1.1.0", "0021")
+	newBundle := writeRCBundle(t, directory, "1.1.0", "release-1.1.0", "0022")
 	migrate := filepath.Join(directory, "migrate.sh")
-	writeExecutable(t, migrate, `printf '0021_m6_controlled_ai.sql\tfixture\n'; printf 'new\n' > "$OPEN_CARD_DATA_DIR/control-plane.db"; printf '0021\n' > "$OPEN_CARD_DATA_DIR/schema.version"`)
+	writeExecutable(t, migrate, `printf '0022_admin_auth.sql\tfixture\n'; printf 'new\n' > "$OPEN_CARD_DATA_DIR/control-plane.db"; printf '0022\n' > "$OPEN_CARD_DATA_DIR/schema.version"`)
 	dump := filepath.Join(directory, "dump.sh")
 	writeExecutable(t, dump, "printf 'dump\\n'")
 	restore := filepath.Join(directory, "restore-fail.sh")
@@ -332,7 +332,7 @@ func TestUpgradeRestoreFailureCreatesFailClosedRecoveryMarker(t *testing.T) {
 
 func TestManifestDigestIsRequiredForURLAndHostEntryPoint(t *testing.T) {
 	directory := t.TempDir()
-	bundle := writeRCBundle(t, directory, "1.0.0", "digest-bundle", "0021")
+	bundle := writeRCBundle(t, directory, "1.0.0", "digest-bundle", "0022")
 	_, sourceFile, _, _ := runtime.Caller(0)
 	repoRoot := filepath.Clean(filepath.Join(filepath.Dir(sourceFile), "..", "..", ".."))
 	installScript := filepath.Join(repoRoot, "scripts", "mvp", "install.sh")
