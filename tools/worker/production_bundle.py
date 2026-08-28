@@ -207,6 +207,7 @@ def copy_file(source: Path, target: Path, mode: int) -> None:
                 f"required input must be a regular non-symlink file: {source}"
             )
         target.parent.mkdir(parents=True, exist_ok=True)
+        target.parent.chmod(0o755)
         with os.fdopen(descriptor, "rb", closefd=False) as input_stream, target.open("xb") as output_stream:
             shutil.copyfileobj(input_stream, output_stream)
     except FileExistsError as error:
@@ -224,12 +225,17 @@ def copy_tree(
     preserve_mode: bool = False,
 ) -> None:
     directory(source)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.parent.chmod(0o755)
+    target.mkdir(parents=True, exist_ok=True)
+    target.chmod(0o755)
     for item in sorted(source.rglob("*")):
         relative = item.relative_to(source)
         if item.is_symlink():
             raise ProductionBundleError(f"symlink is forbidden in production input: {item}")
         if item.is_dir():
             (target / relative).mkdir(parents=True, exist_ok=True)
+            (target / relative).chmod(0o755)
         elif item.is_file():
             copy_file(
                 item,
@@ -636,6 +642,7 @@ def assemble(
         ) as raw_build:
             build_root = Path(raw_build)
             release = build_root / "release"
+            release.mkdir(mode=0o755)
             for binary in BINARIES:
                 copy_file(
                     stage_snapshot / "binaries" / arch / binary,
@@ -679,7 +686,7 @@ def assemble(
                     release / "scripts/mvp" / script,
                     0o755,
                 )
-            copy_tree(web_snapshot, release / "web/dist")
+            copy_tree(web_snapshot, release / "web/dist", mode=0o644)
             live_attestation_digest: str | None = None
             if attestation_snapshot is not None:
                 copy_file(

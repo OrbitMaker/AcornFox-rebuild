@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 import tempfile
 import subprocess
 import sys
@@ -136,7 +137,11 @@ class ProductionBundleTests(unittest.TestCase):
             repo, commit = minimal_repo(root, "0023")
             dist, attestation = self.live_web(root, tool, commit)
             output = root / "production"
-            metadata = tool.assemble(self.stage(root), repo, output, "amd64", None, None, dist, version="0.8.0-rc.0", migration_version="0023", source_commit=commit, live_attestation=attestation, live_attestation_sha256=self.attestation_digest(attestation))
+            previous_umask = os.umask(0o077)
+            try:
+                metadata = tool.assemble(self.stage(root), repo, output, "amd64", None, None, dist, version="0.8.0-rc.0", migration_version="0023", source_commit=commit, live_attestation=attestation, live_attestation_sha256=self.attestation_digest(attestation))
+            finally:
+                os.umask(previous_umask)
             manifest = json.loads((output / "release/manifest.json").read_text(encoding="utf-8"))
             self.assertEqual((manifest["version"], manifest["migration_version"], manifest["compatibility"]["max_data_version"], manifest["source_commit"]), ("0.8.0-rc.0", "0023", 23, commit))
             self.assertEqual(metadata["live_web"]["public_domain_verified"], False)
@@ -146,6 +151,10 @@ class ProductionBundleTests(unittest.TestCase):
             self.assertTrue((output / "release/source-commit.txt").is_file())
             names = {item["path"] for item in manifest["files"]}
             self.assertFalse(any("dns-dry-run" in name or "fixture" in name for name in names))
+            web_entry = next(item for item in manifest["files"] if item["path"] == "web/dist/index.html")
+            self.assertEqual(web_entry["mode"], 0o644)
+            self.assertEqual((output / "release/web").stat().st_mode & 0o777, 0o755)
+            self.assertEqual((output / "release/web/dist").stat().st_mode & 0o777, 0o755)
 
     def test_rc0_bootstrap_archive_is_reproducible(self) -> None:
         tool = load_tool()

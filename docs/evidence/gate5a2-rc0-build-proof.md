@@ -18,11 +18,12 @@ The build record confirms `GOOS=linux`, `GOARCH=amd64`, `CGO_ENABLED=0`,
 
 ## Two independent builds
 
-The primary ignored candidate was built at
-`output/production/0.8.0-rc.0/amd64`. A second independently cached build was
-produced in a task-specific `/tmp` directory, compared, then moved to the
-local Trash as recoverable cleanup. Both builds produced exactly these SHA-256
-values:
+The historical non-installable candidate was built from source `58a3475` at
+`output/production/0.8.0-rc.0/amd64`, then preserved without modification at
+`output/production/0.8.0-rc.0/amd64-58a-noninstallable` before Gate5A-3. A
+second independently cached build was produced in a task-specific `/tmp`
+directory, compared, then moved to the local Trash as recoverable cleanup.
+Both historical builds produced exactly these SHA-256 values:
 
 | Artifact | SHA-256 |
 | --- | --- |
@@ -41,7 +42,7 @@ root, the local release directory, `--offline`, and the exact manifest hash:
 
 ```text
 bash scripts/mvp/install.sh --root /tmp/open-card-g7-g5a2.<task> \
-  --bundle output/production/0.8.0-rc.0/amd64/release --offline --dry-run \
+  --bundle output/production/0.8.0-rc.0/amd64-58a-noninstallable/release --offline --dry-run \
   --expected-manifest-sha256 608fefe6c73999d2e552476f7a32bfc70dd339ab502a6f7b08cc2f75c6069ab4
 ```
 
@@ -55,5 +56,5 @@ was attempted.
 
 - The temporary 58a detached source worktree was removed with `git worktree
   remove`, then `git worktree prune` was run.
-- The second build output was moved to local Trash; only the ignored primary
-  candidate remains under `output/production/0.8.0-rc.0/amd64`.
+- The second build output was moved to local Trash; the ignored historical
+  candidate remains under `output/production/0.8.0-rc.0/amd64-58a-noninstallable`.

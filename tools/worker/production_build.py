@@ -5,7 +5,7 @@ This driver deliberately has no download path. A caller supplies a clean,
 detached source worktree and a local runtime-input directory; every runtime
 asset is selected by the checked-in runtime-input manifest and matched by
 filename plus SHA-256 before it is read. The only accepted RC0 source commit is
-the frozen Gate 3 terminal commit.
+the frozen installable bootstrap baseline.
 """
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ from pathlib import Path, PurePosixPath
 VERSION = "0.8.0-rc.0"
 MIGRATION_VERSION = "0023"
 ARCHITECTURE = "amd64"
-RC0_SOURCE_COMMIT = "58a347536fab29515622432651dff48849f3e251"
+RC0_SOURCE_COMMIT = "35a2b198ac52949af3477475d89d4813b46a9490"
 GATE3_STATUS = "pass_limited_external_linux_required"
 LIVE_METADATA = {
     "mode": "live",
@@ -447,7 +447,7 @@ def isolated_build_environments(root: Path) -> tuple[dict[str, str], dict[str, s
 def verify_clean_detached_worktree(worktree: Path, source_commit: str) -> None:
     directory(worktree, "source worktree")
     if source_commit != RC0_SOURCE_COMMIT:
-        raise ProductionBuildError("RC0 build must use the frozen Gate 3 terminal source commit")
+        raise ProductionBuildError("RC0 build must use the frozen installable bootstrap source commit")
     try:
         head = subprocess.run(
             ["git", "-C", str(worktree), "rev-parse", "HEAD"],
