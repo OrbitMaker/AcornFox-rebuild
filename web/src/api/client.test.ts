@@ -1,8 +1,10 @@
-import { RestApiClient, StubApiClient } from './client';
+import { ApiRequestError, RestApiClient, StubApiClient } from './client';
+import { CSRF_COOKIE_NAME, CSRF_HEADER_NAME } from '../features/auth/auth';
 
 class FakeEventSource {
   private listener?: EventListener;
   closed = false;
+  options?: EventSourceInit;
 
   addEventListener(_type: string, listener: EventListener): void {
     this.listener = listener;
@@ -24,6 +26,7 @@ class FakeEventSource {
 describe('StubApiClient', () => {
   it('uses the same typed create and event contract as the live client', async () => {
     const client = new StubApiClient();
+    await client.login({ username: 'admin', password: 'local-demo-password' });
     const created = await client.createApplication({
       name: 'Release Demo',
       source: { kind: 'git', locator: 'https://git.example.invalid/demo.git', ref: 'main' },
@@ -43,17 +46,17 @@ describe('StubApiClient', () => {
 describe('RestApiClient', () => {
   it('normalizes the current OpenAPI Application response and validates SSE events', async () => {
     const eventSource = new FakeEventSource();
-    const requested: Array<{ url: string; method?: string }> = [];
+    const requested: Array<{ url: string; method?: string; credentials?: RequestCredentials }> = [];
     const client = new RestApiClient({
       baseUrl: '/api/v1',
       fetchImpl: async (input, init) => {
-        requested.push({ url: String(input), method: init?.method });
+        requested.push({ url: String(input), method: init?.method, credentials: init?.credentials });
         if (init?.method === 'POST') {
           return new Response(JSON.stringify({ id: 'app-live', name: 'Live App', created_at: '2026-08-24T00:00:00.000Z', updated_at: '2026-08-24T00:00:00.000Z' }), { status: 201, headers: { 'content-type': 'application/json' } });
         }
         return new Response(JSON.stringify([{ id: 'app-live', name: 'Live App', created_at: '2026-08-24T00:00:00.000Z', updated_at: '2026-08-24T00:00:00.000Z' }]), { status: 200, headers: { 'content-type': 'application/json' } });
       },
-      eventSourceFactory: () => eventSource as unknown as EventSource,
+      eventSourceFactory: (_url, init) => { eventSource.options = init; return eventSource as unknown as EventSource; },
     });
 
     const list = await client.listApplications();
@@ -68,7 +71,9 @@ describe('RestApiClient', () => {
     expect(created.operationId).toBe('application:app-live');
     expect(events).toEqual(['preparing']);
     expect(eventSource.closed).toBe(true);
+    expect(eventSource.options?.withCredentials).toBe(true);
     expect(requested.map((request) => request.url)).toEqual(['/api/v1/applications', '/api/v1/applications']);
+    expect(requested.every((request) => request.credentials === 'same-origin')).toBe(true);
   });
 
   it('returns an explicit unavailable M4 facade until the control plane composes operations facts', async () => {
@@ -81,13 +86,13 @@ describe('RestApiClient', () => {
       status: 'unavailable',
       message: '运行与运维事实 API 尚未由控制面组合，无法展示或执行 M4 操作。',
     });
-    await expect(client.requestApplicationOperation('app-live', { action: 'restart', expectedVersion: 'ops-v1' }, { actor: 'operator-1', role: 'operator' })).resolves.toEqual({
+    await expect(client.requestApplicationOperation('app-live', { action: 'restart', expectedVersion: 'ops-v1' })).resolves.toEqual({
       status: 'unavailable',
       message: '运行与运维操作 API 尚未由控制面组合，未发送操作。',
     });
   });
 
-  it('passes fact version, actor, role and idempotency headers without claiming action success', async () => {
+  it('passes fact version and idempotency headers without claiming action success', async () => {
     let request: RequestInit | undefined;
     const client = new RestApiClient({
       baseUrl: '/api/v1',
@@ -97,17 +102,16 @@ describe('RestApiClient', () => {
       },
     });
 
-    const result = await client.requestApplicationOperation('app-live', { action: 'restart', targetServiceId: 'api', expectedVersion: 'ops-v9' }, { actor: 'operator-1', role: 'operator' });
+    const result = await client.requestApplicationOperation('app-live', { action: 'restart', targetServiceId: 'api', expectedVersion: 'ops-v9' });
     const headers = new Headers(request?.headers);
 
     expect(result).toEqual({ status: 'accepted', operationId: 'op-queued', message: '控制面已接受操作请求，正在等待新的事实版本。' });
-    expect(headers.get('open-card-actor')).toBe('operator-1');
-    expect(headers.get('open-card-role')).toBe('operator');
+    expect([...headers.keys()].sort()).toEqual(['content-type', 'idempotency-key']);
     expect(headers.get('idempotency-key')).toMatch(/^m4-operation:app-live:/);
     expect(request?.body).toBe(JSON.stringify({ action: 'restart', target_service_id: 'api', expected_version: 'ops-v9', reason: 'operator requested restart after reviewing facts ops-v9' }));
   });
 
-  it('normalizes M5 usage facts and only claims operator detail with an operator header', async () => {
+  it('normalizes M5 usage facts without client-side identity claims', async () => {
     let request: RequestInit | undefined;
     const client = new RestApiClient({
       baseUrl: '/api/v1',
@@ -123,7 +127,7 @@ describe('RestApiClient', () => {
     const result = await client.getApplicationUsage('app-live', 'operations');
     expect(result.status).toBe('available');
     expect(result.status === 'available' && result.facts.services[0]?.actual.cpu.actual).toBe(250);
-    expect(new Headers(request?.headers).get('open-card-role')).toBe('operator');
+    expect([...new Headers(request?.headers).keys()]).toEqual([]);
   });
 
   it('keeps M6 intervention and settings facts explicit without claiming external AI', async () => {
@@ -137,7 +141,69 @@ describe('RestApiClient', () => {
     const settings = await client.getAISettings();
     expect(interventions.status === 'available' && interventions.facts.items[0]?.status).toBe('rolled_back');
     expect(settings.status === 'available' && settings.settings.externalCalls).toBe(false);
-    expect(requests[0]?.headers.get('open-card-role')).toBe('operator');
-    expect(requests[1]?.headers.get('open-card-role')).toBe('operator');
+    expect([...requests[0].headers.keys()]).toEqual([]);
+    expect([...requests[1].headers.keys()]).toEqual([]);
+  });
+});
+
+describe('Authentication client', () => {
+  afterEach(() => {
+    Reflect.deleteProperty(globalThis, 'document');
+  });
+
+  it('uses same-origin credentials and double-submit CSRF on every auth write', async () => {
+    Object.defineProperty(globalThis, 'document', { configurable: true, value: { cookie: `${CSRF_COOKIE_NAME}=csrf-value` } });
+    const requests: Array<{ url: string; method: string; credentials?: RequestCredentials; headers: Headers; body?: BodyInit | null }> = [];
+    const client = new RestApiClient({
+      baseUrl: '/api/v1',
+      fetchImpl: async (input, init) => {
+        requests.push({ url: String(input), method: init?.method ?? 'GET', credentials: init?.credentials, headers: new Headers(init?.headers), body: init?.body });
+        if (String(input).endsWith('/auth/session')) return new Response(JSON.stringify({ authenticated: false }), { status: 200 });
+        if (String(input).endsWith('/auth/login')) return new Response(JSON.stringify({ authenticated: true, username: 'admin' }), { status: 200 });
+        return new Response(null, { status: 204 });
+      },
+    });
+
+    await expect(client.getSession()).resolves.toMatchObject({ authenticated: false, mode: 'live' });
+    await expect(client.login({ username: 'admin', password: 'not-a-real-password' })).resolves.toMatchObject({ authenticated: true, username: 'admin' });
+    await expect(client.logout()).resolves.toBeUndefined();
+    await expect(client.changePassword({ currentPassword: 'old-password', newPassword: 'new-password' })).resolves.toMatchObject({ authenticated: false, mode: 'live' });
+
+    expect(requests.every((request) => request.credentials === 'same-origin')).toBe(true);
+    expect(requests.filter((request) => request.method === 'POST')).toHaveLength(3);
+    expect(requests.filter((request) => request.method === 'POST').every((request) => request.headers.get(CSRF_HEADER_NAME) === 'csrf-value')).toBe(true);
+    expect(requests.find((request) => request.url.endsWith('/auth/password'))?.body).toBe(JSON.stringify({ current_password: 'old-password', new_password: 'new-password' }));
+  });
+
+  it('handles an unauthenticated session without leaking an error', async () => {
+    const client = new RestApiClient({
+      fetchImpl: async (_input, init) => {
+        expect(init?.credentials).toBe('same-origin');
+        return new Response(JSON.stringify({ code: 'unauthorized' }), { status: 401 });
+      },
+    });
+    await expect(client.getSession()).resolves.toEqual({ authenticated: false, mode: 'live' });
+  });
+
+  it('notifies the app on 401 and maps 429/503 to safe errors', async () => {
+    let invalidations = 0;
+    const unauthorized = new RestApiClient({ fetchImpl: async () => new Response('{}', { status: 401 }), onUnauthorized: () => { invalidations += 1; } });
+    await expect(unauthorized.listApplications()).rejects.toMatchObject({ status: 401, message: '管理员会话已失效，请重新登录。' });
+    expect(invalidations).toBe(1);
+
+    const tooMany = new RestApiClient({ fetchImpl: async () => new Response('{}', { status: 429 }) });
+    await expect(tooMany.login({ username: 'admin', password: 'not-a-real-password' })).rejects.toMatchObject({ status: 429, message: '请求过于频繁，请稍后再试。' });
+    const unavailable = new RestApiClient({ fetchImpl: async () => new Response('{}', { status: 503 }) });
+    await expect(unavailable.login({ username: 'admin', password: 'not-a-real-password' })).rejects.toMatchObject({ status: 503, message: '控制面暂时不可用，请稍后重试。' });
+  });
+
+  it('keeps stub authentication in memory and requires login before protected data', async () => {
+    const client = new StubApiClient();
+    expect(client.authMode).toBe('stub');
+    await expect(client.listApplications()).rejects.toBeInstanceOf(ApiRequestError);
+    await expect(client.login({ username: 'admin', password: 'local-demo-password' })).resolves.toMatchObject({ authenticated: true, mode: 'stub' });
+    await expect(client.listApplications()).resolves.toHaveProperty('items');
+    await expect(client.changePassword({ currentPassword: 'local-demo-password', newPassword: 'another-local-password' })).resolves.toMatchObject({ authenticated: false, mode: 'stub' });
+    await expect(client.listApplications()).rejects.toBeInstanceOf(ApiRequestError);
   });
 });

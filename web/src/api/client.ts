@@ -16,10 +16,10 @@ import type {
   AISettingsResult,
   CreateApplicationInput,
   CreateApplicationResponse,
-  OperationActor,
   OperationRequestResult,
   PublishEventListener,
 } from './types';
+import { CSRF_COOKIE_NAME, CSRF_HEADER_NAME, type AuthLoginInput, type AuthSession, type PasswordChangeInput } from '../features/auth/auth';
 import type { ApplicationUsageFact, UsageAnomaly, UsageMeasurement, UsageResourceMeasurements, UsageServiceFact, UsageTrendPoint } from '../features/usage/usageFacts';
 import type { AIActionFact, AIInterventionFact, AIInterventionStatus, AIInterventionViewFact, AIPlanFact, AIRisk } from '../features/ai-interventions/aiInterventions';
 import type { AIServiceSettingsFact } from '../features/settings/ai/AIServiceSettings';
@@ -35,6 +35,59 @@ import type {
 } from '../features/operations/operationsView';
 
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL as string | undefined) ?? '/api/v1';
+
+export class ApiRequestError extends Error {
+  constructor(public readonly status: number, message: string) {
+    super(message);
+    this.name = 'ApiRequestError';
+  }
+}
+
+function isWriteMethod(method: string | undefined): boolean {
+  return ['POST', 'PUT', 'PATCH', 'DELETE'].includes((method ?? 'GET').toUpperCase());
+}
+
+export function readCookie(name: string): string | undefined {
+  if (typeof document === 'undefined') return undefined;
+  const entry = document.cookie.split(';').map((item) => item.trim()).find((item) => item.startsWith(`${name}=`));
+  if (!entry) return undefined;
+  const value = entry.slice(name.length + 1);
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+function requestError(status: number, fallback: string): ApiRequestError {
+  if (status === 401) return new ApiRequestError(status, '管理员会话已失效，请重新登录。');
+  if (status === 429) return new ApiRequestError(status, '请求过于频繁，请稍后再试。');
+  if (status === 503) return new ApiRequestError(status, '控制面暂时不可用，请稍后重试。');
+  return new ApiRequestError(status, fallback);
+}
+
+function withRequestDefaults(init: RequestInit = {}): RequestInit {
+  const headers = new Headers(init.headers);
+  if (isWriteMethod(init.method)) {
+    const csrf = readCookie(CSRF_COOKIE_NAME);
+    if (csrf) headers.set(CSRF_HEADER_NAME, csrf);
+  }
+  return { ...init, credentials: 'same-origin', headers };
+}
+
+function asAuthSession(value: unknown, mode: AuthSession['mode']): AuthSession {
+  const candidate = isRecord(value) && isRecord(value.session) ? value.session : value;
+  if (!isRecord(candidate) || typeof candidate.authenticated !== 'boolean') {
+    throw new Error('Authentication response did not match the session contract');
+  }
+  if (!candidate.authenticated) return { authenticated: false, mode };
+  return {
+    authenticated: true,
+    mode,
+    username: typeof candidate.username === 'string' ? candidate.username : undefined,
+    expiresAt: typeof candidate.expires_at === 'string' ? candidate.expires_at : undefined,
+  };
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
@@ -319,42 +372,87 @@ function operationIdempotencyKey(applicationId: string): string {
 export interface RestApiClientOptions {
   baseUrl?: string;
   fetchImpl?: typeof fetch;
-  eventSourceFactory?: (url: string) => EventSource;
+  eventSourceFactory?: (url: string, init?: EventSourceInit) => EventSource;
   eventsUrl?: (operationId: string, baseUrl: string) => string;
+  onUnauthorized?: () => void;
 }
 
 export class RestApiClient implements ApiClient {
+  readonly authMode = 'live' as const;
   private readonly baseUrl: string;
   private readonly fetchImpl: typeof fetch;
-  private readonly eventSourceFactory: (url: string) => EventSource;
+  private readonly eventSourceFactory: (url: string, init?: EventSourceInit) => EventSource;
   private readonly eventsUrl: (operationId: string, baseUrl: string) => string;
+  private readonly onUnauthorized?: () => void;
 
   constructor(options: RestApiClientOptions = {}) {
     this.baseUrl = (options.baseUrl ?? API_BASE_URL).replace(/\/$/, '');
     this.fetchImpl = options.fetchImpl ?? fetch;
-    this.eventSourceFactory = options.eventSourceFactory ?? ((url) => new EventSource(url));
+    this.eventSourceFactory = options.eventSourceFactory ?? ((url, init) => new EventSource(url, init));
     this.eventsUrl = options.eventsUrl ?? ((operationId, baseUrl) => `${baseUrl}/events?operation_id=${encodeURIComponent(operationId)}`);
+    this.onUnauthorized = options.onUnauthorized;
   }
 
-  async listApplications(signal?: AbortSignal): Promise<ApplicationListResponse> {
-    const response = await this.fetchImpl(`${this.baseUrl}/applications`, { signal });
-    if (!response.ok) throw new Error(`Unable to list applications (${response.status})`);
-    return asApplicationList(await response.json());
+  private async request(path: string, init: RequestInit = {}, notifyUnauthorized = true): Promise<Response> {
+    const response = await this.fetchImpl(`${this.baseUrl}${path}`, withRequestDefaults(init));
+    if (response.status === 401 && notifyUnauthorized) this.onUnauthorized?.();
+    return response;
   }
 
-  async createApplication(input: CreateApplicationInput, signal?: AbortSignal): Promise<CreateApplicationResponse> {
-    const response = await this.fetchImpl(`${this.baseUrl}/applications`, {
+  async getSession(signal?: AbortSignal): Promise<AuthSession> {
+    const response = await this.request('/auth/session', { signal }, false);
+    if (response.status === 401) return { authenticated: false, mode: this.authMode };
+    if (!response.ok) throw requestError(response.status, 'Unable to load administrator session');
+    return asAuthSession(await response.json(), this.authMode);
+  }
+
+  async login(input: AuthLoginInput, signal?: AbortSignal): Promise<AuthSession> {
+    const response = await this.request('/auth/login', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(input),
       signal,
     });
-    if (!response.ok) throw new Error(`Unable to create application (${response.status})`);
+    if (!response.ok) throw requestError(response.status, 'Administrator login was not accepted');
+    return asAuthSession(await response.json(), this.authMode);
+  }
+
+  async logout(signal?: AbortSignal): Promise<void> {
+    const response = await this.request('/auth/logout', { method: 'POST', signal });
+    if (!response.ok && response.status !== 401) throw requestError(response.status, 'Logout was not completed');
+  }
+
+  async changePassword(input: PasswordChangeInput, signal?: AbortSignal): Promise<AuthSession> {
+    const response = await this.request('/auth/password', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ current_password: input.currentPassword, new_password: input.newPassword }),
+      signal,
+    });
+    if (response.status === 204) return { authenticated: false, mode: this.authMode };
+    if (!response.ok) throw requestError(response.status, 'Password rotation was not completed');
+    return asAuthSession(await response.json(), this.authMode);
+  }
+
+  async listApplications(signal?: AbortSignal): Promise<ApplicationListResponse> {
+    const response = await this.request('/applications', { signal });
+    if (!response.ok) throw requestError(response.status, 'Unable to list applications');
+    return asApplicationList(await response.json());
+  }
+
+  async createApplication(input: CreateApplicationInput, signal?: AbortSignal): Promise<CreateApplicationResponse> {
+    const response = await this.request('/applications', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(input),
+      signal,
+    });
+    if (!response.ok) throw requestError(response.status, 'Unable to create application');
     return asCreateApplicationResponse(await response.json());
   }
 
   subscribeToPublishEvents(operationId: string, listener: PublishEventListener): () => void {
-    const source = this.eventSourceFactory(this.eventsUrl(operationId, this.baseUrl));
+    const source = this.eventSourceFactory(this.eventsUrl(operationId, this.baseUrl), { withCredentials: true });
     const onMessage = (message: MessageEvent<string>) => {
       try {
         listener(asPublishEvent(JSON.parse(message.data) as unknown));
@@ -371,44 +469,39 @@ export class RestApiClient implements ApiClient {
   }
 
   async getApplicationOperations(applicationId: string, signal?: AbortSignal): Promise<ApplicationOperationsResult> {
-    const response = await this.fetchImpl(`${this.baseUrl}/applications/${encodeURIComponent(applicationId)}/operations`, { signal });
+    const response = await this.request(`/applications/${encodeURIComponent(applicationId)}/operations`, { signal });
     if (response.status === 404 || response.status === 501 || response.status === 503) return operationsUnavailable();
-    if (!response.ok) throw new Error(`Unable to load operations facts (${response.status})`);
+    if (!response.ok) throw requestError(response.status, 'Unable to load operations facts');
     return { status: 'available', facts: asApplicationOperationsFact(await response.json()) };
   }
 
   async getApplicationUsage(applicationId: string, mode: 'normal' | 'operations', signal?: AbortSignal): Promise<ApplicationUsageResult> {
-    const response = await this.fetchImpl(`${this.baseUrl}/applications/${encodeURIComponent(applicationId)}/usage?mode=${encodeURIComponent(mode)}`, {
-      headers: mode === 'operations' ? { 'open-card-role': 'operator' } : undefined,
-      signal,
-    });
+    const response = await this.request(`/applications/${encodeURIComponent(applicationId)}/usage?mode=${encodeURIComponent(mode)}`, { signal });
     if (response.status === 404 || response.status === 501 || response.status === 503) return usageUnavailable();
-    if (!response.ok) throw new Error(`Unable to load usage facts (${response.status})`);
+    if (!response.ok) throw requestError(response.status, 'Unable to load usage facts');
     return { status: 'available', facts: asApplicationUsageFact(await response.json()) };
   }
 
   async getAIInterventions(applicationId: string, mode: 'ordinary' | 'operator', signal?: AbortSignal): Promise<AIInterventionResult> {
-    const response = await this.fetchImpl(`${this.baseUrl}/applications/${encodeURIComponent(applicationId)}/ai/interventions?mode=${encodeURIComponent(mode)}`, { headers: mode === 'operator' ? { 'open-card-role': 'operator' } : undefined, signal });
+    const response = await this.request(`/applications/${encodeURIComponent(applicationId)}/ai/interventions?mode=${encodeURIComponent(mode)}`, { signal });
     if (response.status === 404 || response.status === 501 || response.status === 503) return aiUnavailable();
-    if (!response.ok) throw new Error(`Unable to load AI intervention facts (${response.status})`);
+    if (!response.ok) throw requestError(response.status, 'Unable to load AI intervention facts');
     return { status: 'available', facts: asAIInterventionView(await response.json()) };
   }
 
   async getAISettings(signal?: AbortSignal): Promise<AISettingsResult> {
-    const response = await this.fetchImpl(`${this.baseUrl}/settings/ai`, { headers: { 'open-card-role': 'operator' }, signal });
+    const response = await this.request('/settings/ai', { signal });
     if (response.status === 404 || response.status === 501 || response.status === 503) return aiSettingsUnavailable();
-    if (!response.ok) throw new Error(`Unable to load AI service settings (${response.status})`);
+    if (!response.ok) throw requestError(response.status, 'Unable to load AI service settings');
     return { status: 'available', settings: asAISettings(await response.json()) };
   }
 
-  async requestApplicationOperation(applicationId: string, request: OperationRequest, actor: OperationActor, signal?: AbortSignal): Promise<OperationRequestResult> {
-    const response = await this.fetchImpl(`${this.baseUrl}/applications/${encodeURIComponent(applicationId)}/operations`, {
+  async requestApplicationOperation(applicationId: string, request: OperationRequest, signal?: AbortSignal): Promise<OperationRequestResult> {
+    const response = await this.request(`/applications/${encodeURIComponent(applicationId)}/operations`, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
         'idempotency-key': operationIdempotencyKey(applicationId),
-        'open-card-actor': actor.actor,
-        'open-card-role': actor.role,
       },
       body: JSON.stringify({
         action: request.action,
@@ -419,7 +512,7 @@ export class RestApiClient implements ApiClient {
       signal,
     });
     if (response.status === 404 || response.status === 501 || response.status === 503) return requestUnavailable();
-    if (!response.ok) throw new Error(`Unable to request ${request.action} (${response.status})`);
+    if (!response.ok) throw requestError(response.status, `Unable to request ${request.action}`);
     const body: unknown = await response.json();
     const operationId = isRecord(body) && typeof body.operation_id === 'string' ? body.operation_id : undefined;
     return { status: 'accepted', operationId, message: '控制面已接受操作请求，正在等待新的事实版本。' };
@@ -476,14 +569,46 @@ function randomId(prefix: string): string {
  * VITE_API_MODE=stub (the default while the control-plane API is not present).
  */
 export class StubApiClient implements ApiClient {
+  readonly authMode = 'stub' as const;
+  private authenticated = false;
   private applications = stubApplications.map(cloneApplication);
   private listeners = new Map<string, Set<PublishEventListener>>();
 
+  async getSession(): Promise<AuthSession> {
+    return this.authenticated ? { authenticated: true, mode: this.authMode, username: 'admin' } : { authenticated: false, mode: this.authMode };
+  }
+
+  async login(input: AuthLoginInput): Promise<AuthSession> {
+    if (input.username.trim() !== 'admin' || input.password.length === 0) {
+      throw new ApiRequestError(401, 'Administrator login was not accepted');
+    }
+    this.authenticated = true;
+    return { authenticated: true, mode: this.authMode, username: 'admin' };
+  }
+
+  async logout(): Promise<void> {
+    this.authenticated = false;
+  }
+
+  async changePassword(input: PasswordChangeInput): Promise<AuthSession> {
+    if (!this.authenticated || !input.currentPassword || !input.newPassword) {
+      throw new ApiRequestError(401, 'Administrator session is not authenticated');
+    }
+    this.authenticated = false;
+    return { authenticated: false, mode: this.authMode };
+  }
+
+  private requireAuthentication(): void {
+    if (!this.authenticated) throw new ApiRequestError(401, 'Administrator session is not authenticated');
+  }
+
   async listApplications(): Promise<ApplicationListResponse> {
+    this.requireAuthentication();
     return { items: this.applications.map(cloneApplication) };
   }
 
   async createApplication(input: CreateApplicationInput): Promise<CreateApplicationResponse> {
+    this.requireAuthentication();
     const id = randomId('app');
     const operationId = randomId('op');
     const now = new Date().toISOString();
@@ -533,18 +658,21 @@ export class StubApiClient implements ApiClient {
   }
 
   async getApplicationOperations(): Promise<ApplicationOperationsResult> {
+    this.requireAuthentication();
     return operationsUnavailable();
   }
 
   async getApplicationUsage(): Promise<ApplicationUsageResult> {
+    this.requireAuthentication();
     return usageUnavailable();
   }
 
-  async getAIInterventions(): Promise<AIInterventionResult> { return aiUnavailable(); }
+  async getAIInterventions(): Promise<AIInterventionResult> { this.requireAuthentication(); return aiUnavailable(); }
 
-  async getAISettings(): Promise<AISettingsResult> { return aiSettingsUnavailable(); }
+  async getAISettings(): Promise<AISettingsResult> { this.requireAuthentication(); return aiSettingsUnavailable(); }
 
   async requestApplicationOperation(): Promise<OperationRequestResult> {
+    this.requireAuthentication();
     return requestUnavailable();
   }
 
@@ -563,6 +691,6 @@ export class StubApiClient implements ApiClient {
   }
 }
 
-export function createConfiguredApiClient(): ApiClient {
-  return import.meta.env.VITE_API_MODE === 'live' ? new RestApiClient() : new StubApiClient();
+export function createConfiguredApiClient(options: Pick<RestApiClientOptions, 'onUnauthorized'> = {}): ApiClient {
+  return import.meta.env.VITE_API_MODE === 'live' ? new RestApiClient(options) : new StubApiClient();
 }

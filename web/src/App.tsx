@@ -3,7 +3,7 @@ import { IconApps, IconBell, IconGlobe, IconHistogram, IconSetting } from '@douy
 import { Avatar, Button, Spin } from '@douyinfe/semi-ui';
 import type { ReactNode } from 'react';
 import { createConfiguredApiClient } from './api/client';
-import type { AIInterventionResult, AISettingsResult, ApplicationOperationsResult, ApplicationSummary, ApplicationUsageResult, ApiClient, OperationActor } from './api/types';
+import type { AIInterventionResult, AISettingsResult, ApplicationOperationsResult, ApplicationSummary, ApplicationUsageResult, ApiClient } from './api/types';
 import { applyPublishingEvent, createPublishingSnapshot, type PublishEvent } from './domain/publishing';
 import { ApplicationList } from './components/ApplicationList';
 import { CreateApplicationWizard } from './components/CreateApplicationWizard';
@@ -13,6 +13,9 @@ import { AIInterventionPlaceholder } from './features/ai-interventions/AIInterve
 import { UsageView } from './features/usage/UsageView';
 import { AIInterventionPanel } from './features/ai-interventions/AIInterventionPanel';
 import { AIServiceSettings } from './features/settings/ai/AIServiceSettings';
+import { LoginView } from './features/auth/LoginView';
+import { PasswordRotation } from './features/auth/PasswordRotation';
+import { authErrorMessage, type AuthSession } from './features/auth/auth';
 
 type View = 'overview' | 'applications' | 'create' | 'domains' | 'operations' | 'usage' | 'settings';
 
@@ -32,7 +35,10 @@ const navItems: NavItem[] = [
   { id: 'settings', label: '系统设置', icon: <IconSetting />, description: '节点和控制面设置' },
 ];
 
-const webConsoleActor: OperationActor = { actor: 'web-console', role: 'operator' };
+type AuthState =
+  | { status: 'checking' }
+  | { status: 'unauthenticated'; message?: string }
+  | { status: 'authenticated'; session: AuthSession & { authenticated: true } };
 
 function updateFromPublishEvent(applications: ApplicationSummary[], event: PublishEvent): ApplicationSummary[] {
   return applications.map((application) => {
@@ -48,15 +54,17 @@ function updateFromPublishEvent(applications: ApplicationSummary[], event: Publi
   });
 }
 
-function Header({ view }: { view: View }) {
+function Header({ view, username, demoMode, onLogout }: { view: View; username?: string; demoMode: boolean; onLogout: () => void }) {
   const title = navItems.find((item) => item.id === view)?.label ?? '应用';
   return (
     <header className="topbar">
       <div className="topbar__breadcrumb"><span>Open Card</span><span className="breadcrumb-separator">/</span><strong>{view === 'create' ? '创建应用' : title}</strong></div>
       <div className="topbar__actions">
-        <span className="instance-chip"><i /> 单机实例 · 本地控制面</span>
+        <span className="instance-chip"><i /> {demoMode ? '本地演示模式' : '单机实例 · 本地控制面'}</span>
         <Button theme="borderless" icon={<IconBell />} aria-label="通知" />
+        <span className="topbar-user">{username ?? '管理员'}</span>
         <Avatar color="light-green" size="small">OC</Avatar>
+        <Button theme="borderless" onClick={onLogout}>退出登录</Button>
       </div>
     </header>
   );
@@ -155,10 +163,10 @@ function OperationsWorkspace({ application, result, loading, message, mode, onMo
   );
 }
 
-function AISettingsWorkspace({ result, loading }: { result?: AISettingsResult; loading: boolean }) {
+function AISettingsWorkspace({ result, loading, client, onSessionExpired }: { result?: AISettingsResult; loading: boolean; client: ApiClient; onSessionExpired: () => void }) {
   if (loading) return <section className="page-section placeholder-page"><h1>系统设置</h1><Spin tip="正在读取 AI 服务设置" /></section>;
   if (result?.status !== 'available') return <section className="page-section placeholder-page"><h1>AI 服务</h1><p>{result?.message ?? 'AI 服务设置未就绪。'}</p><AIInterventionPlaceholder availability="disabled" /></section>;
-  return <section className="page-section"><AIServiceSettings settings={result.settings} /></section>;
+  return <section className="page-section"><AIServiceSettings settings={result.settings} /><PasswordRotation client={client} onCompleted={onSessionExpired} /></section>;
 }
 
 function UsageWorkspace({ application, result, loading, mode, onModeChange }: { application?: ApplicationSummary; result?: ApplicationUsageResult; loading: boolean; mode: 'normal' | 'operations'; onModeChange: (mode: 'normal' | 'operations') => void }) {
@@ -169,7 +177,7 @@ function UsageWorkspace({ application, result, loading, mode, onModeChange }: { 
 }
 
 export default function App() {
-  const [client] = useState<ApiClient>(() => createConfiguredApiClient());
+  const [authState, setAuthState] = useState<AuthState>({ status: 'checking' });
   const [view, setView] = useState<View>('overview');
   const [applications, setApplications] = useState<ApplicationSummary[]>([]);
   const [loading, setLoading] = useState(true);
@@ -187,6 +195,24 @@ export default function App() {
   const [aiSettingsLoading, setAISettingsLoading] = useState(false);
   const subscriptions = useRef(new Map<string, () => void>());
 
+  const resetProtectedState = useCallback((message?: string) => {
+    subscriptions.current.forEach((unsubscribe) => unsubscribe());
+    subscriptions.current.clear();
+    setApplications([]);
+    setOperationsResult(undefined);
+    setUsageResult(undefined);
+    setAIResult(undefined);
+    setAISettingsResult(undefined);
+    setLoading(false);
+    setOperationsLoading(false);
+    setUsageLoading(false);
+    setAILoading(false);
+    setAISettingsLoading(false);
+    setAuthState({ status: 'unauthenticated', message });
+  }, []);
+
+  const [client] = useState<ApiClient>(() => createConfiguredApiClient({ onUnauthorized: () => resetProtectedState('管理员会话已失效，请重新登录。') }));
+
   const loadApplications = useCallback(async () => {
     setLoading(true);
     setError(undefined);
@@ -201,9 +227,47 @@ export default function App() {
   }, [client]);
 
   useEffect(() => {
+    let active = true;
+    void client.getSession()
+      .then((session) => {
+        if (!active) return;
+        if (session.authenticated) setAuthState({ status: 'authenticated', session });
+        else setAuthState({ status: 'unauthenticated' });
+      })
+      .catch((reason) => {
+        if (active) setAuthState({ status: 'unauthenticated', message: authErrorMessage(reason, '无法验证管理员会话，请稍后重试。') });
+      });
+    return () => { active = false; };
+  }, [client]);
+
+  useEffect(() => {
+    if (authState.status !== 'authenticated') return undefined;
     void loadApplications();
     return () => subscriptions.current.forEach((unsubscribe) => unsubscribe());
-  }, [loadApplications]);
+  }, [authState.status, loadApplications]);
+
+  const handleAuthenticated = useCallback((session: AuthSession) => {
+    if (!session.authenticated) {
+      setAuthState({ status: 'unauthenticated', message: '管理员会话未建立，请重试。' });
+      return;
+    }
+    setAuthState({ status: 'authenticated', session });
+    setView('overview');
+  }, []);
+
+  const handleLogout = useCallback(async () => {
+    try {
+      await client.logout();
+    } catch {
+      // Local state is cleared even if the remote logout response is unavailable.
+    } finally {
+      resetProtectedState('已退出管理员会话。');
+    }
+  }, [client, resetProtectedState]);
+
+  const handlePasswordRotated = useCallback(() => {
+    resetProtectedState('密码已更新，请使用新密码重新登录。');
+  }, [resetProtectedState]);
 
   const subscribe = useCallback((operationId: string) => {
     subscriptions.current.get(operationId)?.();
@@ -279,7 +343,7 @@ export default function App() {
   const requestOperation = useCallback((request: OperationRequest) => {
     if (!operationsApplication) return;
     setOperationsMessage(undefined);
-    void client.requestApplicationOperation(operationsApplication.id, request, webConsoleActor)
+    void client.requestApplicationOperation(operationsApplication.id, request)
       .then((result) => {
         setOperationsMessage(result.message);
         if (result.status === 'accepted') void loadOperations();
@@ -289,18 +353,25 @@ export default function App() {
 
   const stats = useMemo(() => ({ running: applications.filter((application) => application.runtimeStatus === 'running').length }), [applications]);
 
+  if (authState.status === 'checking') {
+    return <main className="auth-shell auth-shell--checking"><section className="auth-card"><span className="brand-mark">OC</span><h1>正在验证管理员会话</h1><Spin tip="请稍候" /></section></main>;
+  }
+  if (authState.status === 'unauthenticated') {
+    return <LoginView client={client} message={authState.message} onAuthenticated={handleAuthenticated} />;
+  }
+
   return (
     <div className="app-shell">
       <Sidebar view={view} onNavigate={setView} />
       <div className="app-main">
-        <Header view={view} />
+        <Header view={view} username={authState.session.username} demoMode={client.authMode === 'stub'} onLogout={() => void handleLogout()} />
         <main className="content">
           {view === 'overview' && <Overview applications={applications} onOpenApplications={() => setView('applications')} onCreate={() => setView('create')} />}
           {view === 'applications' && <ApplicationList applications={applications} loading={loading} error={error} onCreate={() => setView('create')} onRefresh={() => void loadApplications()} />}
           {view === 'create' && <CreateApplicationWizard client={client} onCancel={() => setView('applications')} onCreated={handleCreated} />}
           {view === 'operations' && <OperationsWorkspace application={operationsApplication} result={operationsResult} loading={operationsLoading} message={operationsMessage} mode={operationsMode} onModeChange={setOperationsMode} onRequestOperation={requestOperation} aiResult={aiResult} aiLoading={aiLoading} />}
           {view === 'usage' && <UsageWorkspace application={operationsApplication} result={usageResult} loading={usageLoading} mode={usageMode} onModeChange={setUsageMode} />}
-          {view === 'settings' && <AISettingsWorkspace result={aiSettingsResult} loading={aiSettingsLoading} />}
+          {view === 'settings' && <AISettingsWorkspace result={aiSettingsResult} loading={aiSettingsLoading} client={client} onSessionExpired={handlePasswordRotated} />}
           {view !== 'overview' && view !== 'applications' && view !== 'create' && view !== 'operations' && view !== 'usage' && view !== 'settings' && <PlaceholderView view={view} onCreate={() => setView('create')} />}
         </main>
         <footer className="app-footer"><span>Open Card MVP · Golden Path 在 AI 关闭时可独立运行</span><span>{loading ? <Spin size="small" /> : <><i className="footer-status" /> {stats.running} 个应用运行正常</>}</span></footer>

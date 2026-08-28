@@ -4,6 +4,7 @@ import type { ApplicationOperationsFact, OperationRequest } from '../features/op
 import type { ApplicationUsageFact } from '../features/usage/usageFacts';
 import type { AIInterventionViewFact } from '../features/ai-interventions/aiInterventions';
 import type { AIServiceSettingsFact } from '../features/settings/ai/AIServiceSettings';
+import type { AuthClient } from '../features/auth/auth';
 
 export type SourceKind = 'git' | 'folder' | 'archive';
 export type RuntimeStatus = 'running' | 'attention' | 'partial' | 'stopped' | 'unknown';
@@ -56,12 +57,6 @@ export interface ApplicationListResponse {
 
 export type PublishEventListener = (event: PublishEvent) => void;
 
-/** The actor context is a request claim; the control plane must authorize it. */
-export interface OperationActor {
-  actor: string;
-  role: 'operator' | 'viewer';
-}
-
 export type ApplicationOperationsResult =
   | { status: 'available'; facts: ApplicationOperationsFact }
   | { status: 'unavailable'; message: string };
@@ -78,7 +73,7 @@ export type OperationRequestResult =
   | { status: 'accepted'; operationId?: string; message: string }
   | { status: 'unavailable'; message: string };
 
-export interface ApiClient {
+export interface ApiClient extends AuthClient {
   listApplications(signal?: AbortSignal): Promise<ApplicationListResponse>;
   createApplication(input: CreateApplicationInput, signal?: AbortSignal): Promise<CreateApplicationResponse>;
   subscribeToPublishEvents(operationId: string, listener: PublishEventListener): () => void;
@@ -86,5 +81,5 @@ export interface ApiClient {
   getApplicationUsage(applicationId: string, mode: 'normal' | 'operations', signal?: AbortSignal): Promise<ApplicationUsageResult>;
   getAIInterventions(applicationId: string, mode: 'ordinary' | 'operator', signal?: AbortSignal): Promise<AIInterventionResult>;
   getAISettings(signal?: AbortSignal): Promise<AISettingsResult>;
-  requestApplicationOperation(applicationId: string, request: OperationRequest, actor: OperationActor, signal?: AbortSignal): Promise<OperationRequestResult>;
+  requestApplicationOperation(applicationId: string, request: OperationRequest, signal?: AbortSignal): Promise<OperationRequestResult>;
 }
