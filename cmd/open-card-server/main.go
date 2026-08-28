@@ -149,7 +149,9 @@ func main() {
 			if err != nil {
 				log.Fatal(err)
 			}
-			server.SetReleaseController(&controllers.ReleaseController{Store: store, Source: sourceProvider, Build: buildProvider, Capacity: capacityProvider, StaticRuntimeDigest: os.Getenv("OPEN_CARD_STATIC_RUNTIME_DIGEST")})
+			releaseController := &controllers.ReleaseController{Store: store, Source: sourceProvider, Build: buildProvider, Capacity: capacityProvider, StaticRuntimeDigest: os.Getenv("OPEN_CARD_STATIC_RUNTIME_DIGEST")}
+			server.SetReleaseController(releaseController)
+			server.SetApplicationPublisher(store, releaseController)
 			if os.Getenv("OPEN_CARD_M2_ENABLED") == "true" {
 				registryTemp := buildWorkRoot + "/registry-config"
 				if err := os.MkdirAll(registryTemp, 0o700); err != nil {

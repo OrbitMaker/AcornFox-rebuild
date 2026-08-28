@@ -105,6 +105,8 @@ type Server struct {
 	systemStatusNodeID         string
 	applicationProjectionStore applicationProjectionStore
 	applicationAccessProvider  applicationAccessProvider
+	publishInputStore          publishInputStore
+	applicationPublisher       applicationPublisher
 	broker                     *eventBroker
 	agentGateway               *agenttransport.Gateway
 	repositoryHealth           interface {
@@ -161,6 +163,9 @@ func (s *Server) SetApplicationProjectionStore(store applicationProjectionStore)
 }
 func (s *Server) SetApplicationAccessProvider(provider applicationAccessProvider) {
 	s.applicationAccessProvider = provider
+}
+func (s *Server) SetApplicationPublisher(store publishInputStore, publisher applicationPublisher) {
+	s.publishInputStore, s.applicationPublisher = store, publisher
 }
 func (s *Server) Handler() http.Handler                 { return http.HandlerFunc(s.serveHTTP) }
 func (s *Server) AgentGateway() *agenttransport.Gateway { return s.agentGateway }
@@ -235,7 +240,7 @@ func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
 		s.handleApplications(writer, request)
 		return
 	case "/api/v1/publishes", "/api/v1/publishes/":
-		s.handlePublish(writer, request)
+		writeJSONError(writer, http.StatusGone, "publish_endpoint_replaced", "use the application publish endpoint")
 		return
 	}
 	if strings.HasPrefix(request.URL.Path, apiPrefix+"operations/") && strings.HasSuffix(request.URL.Path, "/events") {
@@ -254,6 +259,11 @@ func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 	if strings.HasPrefix(request.URL.Path, apiPrefix+"applications/") {
+		parts := strings.Split(strings.TrimPrefix(request.URL.Path, apiPrefix+"applications/"), "/")
+		if len(parts) == 2 && parts[0] != "" && parts[1] == "publishes" {
+			handleApplicationPublish(writer, request, domain.ID(parts[0]), s.publishInputStore, s.applicationPublisher, controlPlaneActor(request), time.Now)
+			return
+		}
 		identifier := strings.Trim(strings.TrimPrefix(request.URL.Path, apiPrefix+"applications/"), "/")
 		if request.Method == http.MethodGet && identifier != "" && !strings.Contains(identifier, "/") {
 			s.handleApplicationProjectionDetail(writer, request, domain.ID(identifier))

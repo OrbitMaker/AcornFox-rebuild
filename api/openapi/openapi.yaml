@@ -118,7 +118,7 @@ paths:
         repository. Git requires an explicit two-resolver public-DNS policy;
         missing or unavailable resolver configuration fails closed with 503.
       parameters:
-        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequiredIdempotencyKey'
         - $ref: '#/components/parameters/CSRFHeader'
         - $ref: '#/components/parameters/OriginHeader'
       requestBody:
@@ -180,6 +180,23 @@ paths:
               $ref: '#/components/headers/APINegotiatedVersion'
         '426':
           $ref: '#/components/responses/APIUpgradeRequired'
+  /api/v1/applications/{applicationId}/publishes:
+    post:
+      operationId: publishApplication
+      parameters:
+        - $ref: '#/components/parameters/ApplicationID'
+        - $ref: '#/components/parameters/RequiredIdempotencyKey'
+        - $ref: '#/components/parameters/CSRFHeader'
+        - $ref: '#/components/parameters/OriginHeader'
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/ApplicationPublishRequest'}}}
+      responses:
+        '202': {description: Deployment queued, content: {application/json: {schema: {$ref: '#/components/schemas/ApplicationPublishResponse'}}}}
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '409': {$ref: '#/components/responses/StateConflict'}
+        '422': {$ref: '#/components/responses/ValidationFailed'}
+        '503': {$ref: '#/components/responses/DependencyUnavailable'}
   /api/v1/settings/system-status:
     get:
       operationId: getSystemStatus
@@ -1071,6 +1088,27 @@ components:
         last_event_id: {type: string}
         message: {type: string}
         evidence_ids: {type: array, items: {type: string}}
+    ApplicationPublishRequest:
+      type: object
+      additionalProperties: false
+      required: [build_kind, context_path, service_name, container_port]
+      properties:
+        build_kind: {type: string, enum: [static, dockerfile]}
+        context_path: {type: string}
+        dockerfile_path: {type: string, nullable: true}
+        service_name: {type: string}
+        container_port: {type: integer, minimum: 1, maximum: 65535}
+    ApplicationPublishResponse:
+      type: object
+      additionalProperties: false
+      required: [status, operation_id, release_id, deployment_id, task_id, source_revision_id]
+      properties:
+        status: {type: string, enum: [deploying]}
+        operation_id: {type: string}
+        release_id: {type: string}
+        deployment_id: {type: string}
+        task_id: {type: string}
+        source_revision_id: {type: string}
     ApplicationList:
       type: object
       required: [items]
