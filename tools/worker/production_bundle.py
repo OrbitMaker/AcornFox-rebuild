@@ -1,39 +1,87 @@
 #!/usr/bin/env python3
-"""Assemble the post-RC production candidate without rewriting M7 history.
+"""Assemble a locally verified, non-production-accepted release candidate.
 
-This helper is intentionally local-only: it copies only prebuilt, checksum-able
-inputs into a 0.8.0-rc.1 release. It does not synthesize an N-1 binary. An
-operator upgrading from 0.7.0-rc.1 must supply an authentic prior artifact.
+The only supported candidates are the 0.8.0-rc.0/0023 bootstrap baseline and
+the 0.8.0-rc.1/0024 upgrade candidate. The latter accepts a separately
+supplied, manifest-pinned rc.0 artifact; neither path manufactures an N-1
+artifact or asserts a verified public-domain deployment.
 """
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
+import io
 import json
 import os
+import re
 import shutil
 import stat
+import subprocess
 import tarfile
+import tempfile
 from pathlib import Path
 
-VERSION = "0.8.0-rc.1"
-N_MINUS_ONE = "0.7.0-rc.1"
-CURRENT_MIGRATION = "0023"
 ARCHES = ("amd64", "arm64")
 BINARIES = (
-    "open-card-server", "open-card-agent", "open-card-static-server",
-    "open-card-secretctl", "open-card-security-probe", "open-card-imagegc",
+    "open-card-server",
+    "open-card-agent",
+    "open-card-static-server",
+    "open-card-secretctl",
+    "open-card-security-probe",
+    "open-card-imagegc",
     "open-card-admin",
 )
-RUNTIME = ("buildkitd", "buildctl", "buildkit-runc", "rootlesskit", "docker-buildx", "caddy")
+RUNTIME = (
+    "buildkitd",
+    "buildctl",
+    "buildkit-runc",
+    "rootlesskit",
+    "docker-buildx",
+    "caddy",
+)
 UNITS = (
-    "open-card-server.service", "open-card-agent.service", "open-card-buildkit.service",
-    "open-card-caddy.service", "open-card-edge.service",
+    "open-card-server.service",
+    "open-card-agent.service",
+    "open-card-buildkit.service",
+    "open-card-caddy.service",
+    "open-card-edge.service",
+)
+INSTALLER_SCRIPTS = (
+    "install.sh",
+    "install-host.sh",
+    "upgrade.sh",
+    "uninstall.sh",
+    "backup-control-plane.sh",
+    "restore-control-plane.sh",
+    "control-plane-migrate.sh",
 )
 
 
 class ProductionBundleError(RuntimeError):
     pass
+
+
+def lowercase_hex(value: object, length: int) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == length
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def test_only_payload(relative: Path) -> bool:
+    normalized = relative.as_posix().lower()
+    parts = tuple(part.lower() for part in relative.parts)
+    name = relative.name.lower()
+    return (
+        any(part in {"test", "tests", "testdata", "fixtures", "__tests__"} for part in parts)
+        or "fixture" in normalized
+        or name.endswith(".test")
+        or ".test." in name
+        or name.endswith(".spec")
+        or ".spec." in name
+    )
 
 
 def regular(path: Path) -> None:
@@ -54,11 +102,90 @@ def directory(path: Path) -> None:
         raise ProductionBundleError(f"required path must be a directory: {path}")
 
 
+def verify_repo(repo: Path, source_commit: str, migration_version: str) -> tuple[str, ...]:
+    directory(repo)
+    try:
+        head = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.strip()
+        dirty = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--ignore-submodules=none",
+            ],
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout
+        tracked = tuple(
+            path
+            for path in subprocess.run(
+                ["git", "-C", str(repo), "ls-tree", "-r", "--name-only", "-z", source_commit],
+                check=True,
+                capture_output=True,
+            )
+            .stdout.decode("utf-8", "surrogateescape")
+            .split("\0")
+            if path
+        )
+    except subprocess.CalledProcessError as error:
+        raise ProductionBundleError("repository Git verification failed") from error
+    if head != source_commit or dirty:
+        raise ProductionBundleError("repository HEAD or working tree does not match the declared source commit")
+    if not tracked:
+        raise ProductionBundleError("declared source commit has no tracked files")
+    return tuple(sorted(tracked))
+
+
+def verify_migrations(
+    source_snapshot: Path,
+    tracked: tuple[str, ...],
+    migration_version: str,
+) -> None:
+    migrations_root = source_snapshot / "migrations/control-plane"
+    directory(migrations_root)
+    migrations = []
+    for path in sorted(migrations_root.iterdir()):
+        if path.is_symlink() or not path.is_file() or not re.fullmatch(r"[0-9]{4}_[a-z0-9_]+\.sql", path.name):
+            raise ProductionBundleError("migration input is unsafe or malformed")
+        relative = path.relative_to(source_snapshot).as_posix()
+        if relative not in tracked:
+            raise ProductionBundleError("migration input is not Git tracked")
+        regular(path)
+        migrations.append(path.name[:4])
+    if migrations != [f"{number:04d}" for number in range(1, int(migration_version) + 1)]:
+        raise ProductionBundleError("migration inputs are not contiguous through the declared version")
+
+
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         for block in iter(lambda: stream.read(1 << 20), b""):
             digest.update(block)
+    return digest.hexdigest()
+
+
+def tree_digest(root: Path) -> str:
+    directory(root)
+    digest = hashlib.sha256()
+    entries = sorted(root.rglob("*"))
+    for path in entries:
+        if path.is_symlink() or (not path.is_dir() and not path.is_file()):
+            raise ProductionBundleError("Live dist contains an unsafe entry")
+    for path in (item for item in entries if item.is_file()):
+        relative = path.relative_to(root).as_posix().encode()
+        digest.update(len(relative).to_bytes(8, "big"))
+        digest.update(relative)
+        value = sha256(path).encode()
+        digest.update(value)
     return digest.hexdigest()
 
 
@@ -69,13 +196,33 @@ def write_json(path: Path, value: object, mode: int = 0o640) -> None:
 
 
 def copy_file(source: Path, target: Path, mode: int) -> None:
-    regular(source)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(source, target)
+    try:
+        descriptor = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as error:
+        raise ProductionBundleError(f"required input cannot be opened safely: {source}") from error
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise ProductionBundleError(
+                f"required input must be a regular non-symlink file: {source}"
+            )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with os.fdopen(descriptor, "rb", closefd=False) as input_stream, target.open("xb") as output_stream:
+            shutil.copyfileobj(input_stream, output_stream)
+    except FileExistsError as error:
+        raise ProductionBundleError(f"bundle destination already exists: {target}") from error
+    finally:
+        os.close(descriptor)
     target.chmod(mode)
 
 
-def copy_tree(source: Path, target: Path, *, mode: int = 0o640) -> None:
+def copy_tree(
+    source: Path,
+    target: Path,
+    *,
+    mode: int = 0o640,
+    preserve_mode: bool = False,
+) -> None:
     directory(source)
     for item in sorted(source.rglob("*")):
         relative = item.relative_to(source)
@@ -84,9 +231,69 @@ def copy_tree(source: Path, target: Path, *, mode: int = 0o640) -> None:
         if item.is_dir():
             (target / relative).mkdir(parents=True, exist_ok=True)
         elif item.is_file():
-            copy_file(item, target / relative, mode)
+            copy_file(
+                item,
+                target / relative,
+                stat.S_IMODE(item.stat().st_mode) if preserve_mode else mode,
+            )
         else:
             raise ProductionBundleError(f"unsupported production input type: {item}")
+
+
+def preflight_tree(source: Path, *, payload: bool) -> None:
+    directory(source)
+    for item in sorted(source.rglob("*")):
+        relative = item.relative_to(source)
+        if item.is_symlink():
+            raise ProductionBundleError(f"symlink is forbidden in production input: {item}")
+        if item.is_dir():
+            if payload and test_only_payload(relative):
+                raise ProductionBundleError(
+                    f"test-only payload is forbidden in production input: {relative}"
+                )
+            continue
+        regular(item)
+        if payload and test_only_payload(relative):
+            raise ProductionBundleError(
+                f"test-only payload is forbidden in production input: {relative}"
+            )
+
+
+def snapshot_repo(repo: Path, source_commit: str, target: Path) -> None:
+    try:
+        archive = subprocess.run(
+            ["git", "-C", str(repo), "archive", "--format=tar", source_commit],
+            check=True,
+            capture_output=True,
+        ).stdout
+    except subprocess.CalledProcessError as error:
+        raise ProductionBundleError("repository source snapshot failed") from error
+    directory(target)
+    try:
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as source_archive:
+            for member in source_archive.getmembers():
+                path = Path(member.name)
+                if (
+                    not member.name
+                    or "\\" in member.name
+                    or path.is_absolute()
+                    or ".." in path.parts
+                    or not (member.isdir() or member.isfile())
+                ):
+                    raise ProductionBundleError("repository source snapshot contains an unsafe entry")
+                destination = target.joinpath(*path.parts)
+                if member.isdir():
+                    destination.mkdir(parents=True, exist_ok=True)
+                    continue
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                stream = source_archive.extractfile(member)
+                if stream is None:
+                    raise ProductionBundleError("repository source snapshot cannot read an entry")
+                with stream, destination.open("xb") as output_stream:
+                    shutil.copyfileobj(stream, output_stream)
+                destination.chmod(member.mode & 0o777)
+    except (tarfile.TarError, OSError) as error:
+        raise ProductionBundleError("repository source snapshot cannot be extracted safely") from error
 
 
 def release_files(release: Path) -> list[dict[str, object]]:
@@ -94,32 +301,91 @@ def release_files(release: Path) -> list[dict[str, object]]:
     for item in sorted(release.rglob("*")):
         if item.is_file() and item.name != "manifest.json":
             relative = item.relative_to(release).as_posix()
-            if "/tests/" in f"/{relative}" or "fixture" in relative.lower() or relative.endswith(".test"):
+            if test_only_payload(Path(relative)):
                 raise ProductionBundleError(f"test-only payload is forbidden in production release: {relative}")
             entries.append({"path": relative, "sha256": sha256(item), "mode": stat.S_IMODE(item.stat().st_mode)})
     return entries
 
 
-def make_source_manifest(repo: Path, release: Path) -> None:
-    candidates = [repo / "go.mod", repo / "go.sum", repo / "api/openapi/openapi.yaml"]
-    for root in (repo / "cmd", repo / "internal"):
-        candidates.extend(sorted(path for path in root.rglob("*.go") if not path.name.endswith("_test.go")))
-    lines = [f"{sha256(path)}  {path.relative_to(repo).as_posix()}" for path in candidates if path.is_file()]
+def make_source_manifest(
+    source_snapshot: Path,
+    release: Path,
+    source_commit: str,
+    tracked: tuple[str, ...],
+) -> None:
+    installers = {f"scripts/mvp/{script}" for script in INSTALLER_SCRIPTS}
+
+    def allowed(path: str) -> bool:
+        if (
+            path
+            in {
+                "go.mod",
+                "go.sum",
+                "web/package.json",
+                "web/package-lock.json",
+                "web/index.html",
+                "web/vite.config.ts",
+                "web/eslint.config.js",
+                "web/.env.example",
+            }
+            or path in installers
+            or (path.startswith("web/tsconfig") and path.endswith(".json"))
+        ):
+            return True
+        if path.startswith(("api/", "migrations/", "deploy/", "web/src/", "web/scripts/", "web/config/", "web/public/")):
+            return True
+        if path.startswith(("cmd/", "internal/")) and path.endswith(".go") and not path.endswith("_test.go") and "caddy-fixture" not in path:
+            return True
+        return False
+    candidates: list[Path] = []
+    for relative in sorted(path for path in tracked if allowed(path)):
+        path = source_snapshot / relative
+        regular(path)
+        candidates.append(path)
+    lines = [
+        f"{sha256(path)}  {path.relative_to(source_snapshot).as_posix()}"
+        for path in candidates
+    ]
     target = release / "source-manifest.sha256"
     target.write_text("\n".join(lines) + "\n", encoding="utf-8")
     target.chmod(0o640)
+    (release / "source-commit.txt").write_text(source_commit + "\n", encoding="utf-8")
+    (release / "source-commit.txt").chmod(0o640)
 
 
-def make_sbom(release: Path) -> None:
+def make_sbom(release: Path, version: str) -> None:
     packages = []
     for entry in release_files(release):
-        packages.append({"name": entry["path"], "versionInfo": VERSION, "checksums": [{"algorithm": "SHA256", "checksumValue": entry["sha256"]}]})
-    write_json(release / "sbom.spdx.json", {"spdxVersion": "SPDX-2.3", "name": f"open-card-{VERSION}", "packages": packages})
+        packages.append(
+            {
+                "name": entry["path"],
+                "versionInfo": version,
+                "checksums": [
+                    {"algorithm": "SHA256", "checksumValue": entry["sha256"]}
+                ],
+            }
+        )
+    write_json(
+        release / "sbom.spdx.json",
+        {
+            "spdxVersion": "SPDX-2.3",
+            "name": f"open-card-{version}",
+            "packages": packages,
+        },
+    )
 
 
-def write_tar(root: Path, release: Path) -> Path:
-    archive = root / f"open-card-{VERSION}-production.tar.gz"
-    with tarfile.open(archive, "w:gz", format=tarfile.PAX_FORMAT) as output:
+def write_tar(root: Path, release: Path, version: str) -> Path:
+    archive = root / f"open-card-{version}-production.tar.gz"
+    with (
+        archive.open("wb") as raw,
+        gzip.GzipFile(fileobj=raw, mode="wb", mtime=0, filename="") as compressed,
+        tarfile.open(
+            fileobj=compressed,
+            mode="w",
+            format=tarfile.PAX_FORMAT,
+        ) as output,
+    ):
         for item in sorted(release.rglob("*")):
             if item.is_file():
                 info = output.gettarinfo(str(item), arcname=f"release/{item.relative_to(release).as_posix()}")
@@ -131,111 +397,405 @@ def write_tar(root: Path, release: Path) -> Path:
     return archive
 
 
-def verify_n_minus_one(release: Path, expected_manifest_sha256: str, arch: str) -> dict[str, object]:
+def release_spec(version: str, migration_version: str) -> dict[str, str | None]:
+    if (version, migration_version) == ("0.8.0-rc.0", "0023"):
+        return {"expected_n_minus_one_version": None, "expected_n_minus_one_migration": None}
+    if (version, migration_version) == ("0.8.0-rc.1", "0024"):
+        return {"expected_n_minus_one_version": "0.8.0-rc.0", "expected_n_minus_one_migration": "0023"}
+    raise ProductionBundleError("unsupported release specification")
+
+
+def verify_n_minus_one(
+    release: Path,
+    expected_manifest_sha256: str,
+    arch: str,
+    expected_version: str,
+    expected_migration: str,
+) -> dict[str, object]:
     directory(release)
     manifest_path = release / "manifest.json"
     regular(manifest_path)
-    if expected_manifest_sha256 != sha256(manifest_path):
+    manifest_bytes = manifest_path.read_bytes()
+    if expected_manifest_sha256 != hashlib.sha256(manifest_bytes).hexdigest():
         raise ProductionBundleError("N-1 manifest checksum does not match the supplied expectation")
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
     except json.JSONDecodeError as error:
         raise ProductionBundleError("N-1 manifest is not valid JSON") from error
-    if not isinstance(manifest, dict) or manifest.get("version") != N_MINUS_ONE or manifest.get("migration_version") != "0021" or manifest.get("architecture") != arch:
-        raise ProductionBundleError("N-1 release must be an authentic 0.7.0-rc.1/0021 manifest for the selected architecture")
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("version") != expected_version
+        or manifest.get("migration_version") != expected_migration
+        or manifest.get("architecture") != arch
+    ):
+        raise ProductionBundleError("N-1 release manifest does not match the expected version/migration/architecture")
+    source_commit = manifest.get("source_commit")
+    if not lowercase_hex(source_commit, 40):
+        raise ProductionBundleError("N-1 release manifest has an invalid source commit")
     files = manifest.get("files")
     if not isinstance(files, list) or not files:
         raise ProductionBundleError("N-1 manifest has no release files")
+    declared_paths: set[str] = set()
     for entry in files:
-        if not isinstance(entry, dict) or not isinstance(entry.get("path"), str) or not isinstance(entry.get("sha256"), str):
+        if not isinstance(entry, dict) or set(entry) != {"path", "sha256", "mode"}:
             raise ProductionBundleError("N-1 manifest file entry is invalid")
-        path = Path(entry["path"])
-        if path.is_absolute() or ".." in path.parts:
+        relative, digest, mode = entry["path"], entry["sha256"], entry["mode"]
+        if (
+            not isinstance(relative, str)
+            or not isinstance(digest, str)
+            or not isinstance(mode, int)
+            or isinstance(mode, bool)
+        ):
+            raise ProductionBundleError("N-1 manifest file entry is invalid")
+        path = Path(relative)
+        if (
+            not relative
+            or relative == "."
+            or "\\" in relative
+            or path.is_absolute()
+            or ".." in path.parts
+        ):
             raise ProductionBundleError("N-1 manifest has an unsafe file path")
+        normalized = path.as_posix()
+        if normalized in declared_paths:
+            raise ProductionBundleError("N-1 manifest has duplicate release files")
+        if not lowercase_hex(digest, 64):
+            raise ProductionBundleError("N-1 manifest has an invalid file checksum")
+        if mode < 0 or mode > 0o777 or mode & 0o022 or not mode & 0o400:
+            raise ProductionBundleError("N-1 manifest has an unsafe file mode")
         target = release.joinpath(*path.parts)
         regular(target)
-        if sha256(target) != entry["sha256"]:
+        target_mode = stat.S_IMODE(target.stat().st_mode)
+        if (
+            target.stat().st_mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX)
+            or target_mode != mode
+        ):
+            raise ProductionBundleError("N-1 release file mode mismatch")
+        if sha256(target) != digest:
             raise ProductionBundleError("N-1 release file checksum mismatch")
-    raise ProductionBundleError("authentic N-1 provenance is not pinned by this repository; production publication is blocked")
+        declared_paths.add(normalized)
+    actual_paths: set[str] = set()
+    for item in release.rglob("*"):
+        if item.is_symlink():
+            raise ProductionBundleError("N-1 release contains a symlink")
+        if item.is_dir():
+            continue
+        regular(item)
+        if item != manifest_path:
+            actual_paths.add(item.relative_to(release).as_posix())
+    if actual_paths != declared_paths:
+        raise ProductionBundleError("N-1 release files do not exactly match its manifest")
+    return manifest
 
 
-def verify_live_web(dist: Path) -> None:
+def verify_live_web(
+    dist: Path,
+    attestation_path: Path,
+    source_commit: str,
+    expected_attestation_sha256: str,
+) -> None:
     directory(dist)
     regular(dist / "index.html")
-    marker = dist / ".open-card-live-build.json"
+    marker = dist / "build-metadata.json"
     regular(marker)
+    regular(attestation_path)
+    if not lowercase_hex(expected_attestation_sha256, 64):
+        raise ProductionBundleError("Live attestation checksum must be lowercase SHA-256")
+    if sha256(attestation_path) != expected_attestation_sha256:
+        raise ProductionBundleError("Live attestation does not match the pinned evidence digest")
     try:
         value = json.loads(marker.read_text(encoding="utf-8"))
     except json.JSONDecodeError as error:
         raise ProductionBundleError("Live web build marker is invalid") from error
-    if value != {"api_mode": "live"}:
+    if value != {"mode": "live", "apiBaseUrl": "/api/v1", "schemaVersion": "open-card-build-attestation.v1"}:
         raise ProductionBundleError("web/dist was not built with the required Live API mode")
-    raise ProductionBundleError("Gate 3 has not supplied a verified Live web build attestation; production publication is blocked")
+    try:
+        attestation = json.loads(attestation_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise ProductionBundleError("Live web attestation is invalid") from error
+    expected = {
+        "schema_version": "open-card-live-attestation.v1",
+        "source_commit": source_commit,
+        "build_metadata_sha256": sha256(marker),
+        "dist_tree_sha256": tree_digest(dist),
+        "gate3_status": "pass_limited_external_linux_required",
+    }
+    if attestation != expected:
+        raise ProductionBundleError("Live web attestation does not match dist/source evidence")
 
 
-def assemble(stage: Path, repo: Path, output: Path, arch: str, n_minus_one_release: Path | None, n_minus_one_manifest_sha256: str | None, web_dist: Path, *, structure_only: bool = False) -> dict[str, object]:
+def assemble(
+    stage: Path,
+    repo: Path,
+    output: Path,
+    arch: str,
+    n_minus_one_release: Path | None,
+    n_minus_one_manifest_sha256: str | None,
+    web_dist: Path,
+    *,
+    version: str,
+    migration_version: str,
+    source_commit: str,
+    live_attestation: Path | None = None,
+    live_attestation_sha256: str | None = None,
+    structure_only: bool = False,
+) -> dict[str, object]:
+    if not lowercase_hex(source_commit, 40):
+        raise ProductionBundleError("version, migration version, or source commit is invalid")
     if arch not in ARCHES:
         raise ProductionBundleError(f"unsupported release architecture: {arch}")
     directory(stage)
     directory(repo)
-    n_minus_one: dict[str, object] | None = None
-    if not structure_only:
-        if n_minus_one_release is None or not isinstance(n_minus_one_manifest_sha256, str) or len(n_minus_one_manifest_sha256) != 64 or any(character not in "0123456789abcdef" for character in n_minus_one_manifest_sha256):
-            raise ProductionBundleError("N-1 manifest checksum must be lowercase SHA-256")
-        n_minus_one = verify_n_minus_one(n_minus_one_release, n_minus_one_manifest_sha256, arch)
-        verify_live_web(web_dist)
+    directory(output.parent)
     if output.exists():
         raise ProductionBundleError("refusing to overwrite production bundle output")
-    release = output / "release"
-    output.mkdir(parents=True)
-    for binary in BINARIES:
-        copy_file(stage / "binaries" / arch / binary, release / "bin" / binary, 0o755)
-    for binary in RUNTIME:
-        copy_file(stage / "runtime" / arch / binary, release / "bin" / binary, 0o755)
-    for unit in UNITS:
-        copy_file(repo / "deploy/systemd" / unit, release / "systemd" / unit, 0o644)
-    copy_file(repo / "deploy/caddy/open-card-edge.Caddyfile.example", release / "caddy/open-card-edge.Caddyfile.example", 0o644)
-    copy_file(repo / "deploy/caddy/open-card-edge.env.example", release / "caddy/open-card-edge.env.example", 0o640)
-    copy_tree(repo / "migrations/control-plane", release / "migrations/control-plane")
-    if not (release / "migrations/control-plane/0023_source_uploads.sql").is_file():
-        raise ProductionBundleError("production release is missing migration 0023")
-    copy_tree(repo / "docs/licenses", release / "docs/licenses")
-    copy_tree(web_dist, release / "web/dist")
-    make_source_manifest(repo, release)
-    make_sbom(release)
-    if structure_only:
-        metadata = {
-            "schema_version": 1, "product": "open-card", "version": VERSION,
-            "production_ready": False,
-            "n_minus_one": {"version": N_MINUS_ONE, "status": "blocked_no_pinned_provenance"},
-            "live_web": {"status": "blocked_gate3_unverified_live_input"},
-            "structure_only": True,
-        }
-        write_json(output / "production-bundle.json", metadata)
-        (output / "STRUCTURE-ONLY-NOT-INSTALLABLE").write_text("No release manifest or archive is emitted until authentic N-1 and Gate 3 Live attestations are supplied.\n", encoding="utf-8")
-        return metadata
-    manifest = {
-        "schema_version": 1, "product": "open-card", "version": VERSION,
-        "release_id": f"release-{VERSION}", "architecture": arch,
-        "migration_version": CURRENT_MIGRATION, "protocol": "1.1",
-        "config_dir": "/etc/open-card", "data_dir": "/var/lib/open-card",
-        "compatibility": {"min_data_version": 1, "max_data_version": 22, "min_agent_protocol": "1.0", "max_agent_protocol": "1.1", "requires_data_backup": True},
-        "files": release_files(release),
-    }
-    write_json(release / "manifest.json", manifest, 0o644)
-    archive = write_tar(output, release)
-    bundle_checksum = output / "bundle-manifest.sha256"
-    bundle_checksum.write_text(f"{sha256(archive)}  {archive.name}\n{sha256(release / 'manifest.json')}  release/manifest.json\n", encoding="utf-8")
-    bundle_checksum.chmod(0o640)
-    metadata = {
-        "schema_version": 1, "product": "open-card", "version": VERSION,
-        "n_minus_one": {"version": N_MINUS_ONE, "status": "external_authentic_release_verified", "release_embedded": False, "manifest_sha256": n_minus_one_manifest_sha256, "release_id": n_minus_one.get("release_id") if n_minus_one else None},
-        "migration_version": CURRENT_MIGRATION,
-        "live_web": {"status": "verified_input", "bundle_structure_verified": True, "live_domain_verified": True},
-        "production_binaries": list(BINARIES), "excluded": ["open-card-caddy-fixture", "integration test binaries", "fixture archives"],
-    }
-    write_json(output / "production-bundle.json", metadata)
-    return metadata
+
+    spec = release_spec(version, migration_version)
+    tracked = verify_repo(repo, source_commit, migration_version)
+    needs_n_minus_one = spec["expected_n_minus_one_version"] is not None
+    if not needs_n_minus_one and (
+        n_minus_one_release is not None or n_minus_one_manifest_sha256 is not None
+    ):
+        raise ProductionBundleError("bootstrap release must not accept an N-1 artifact")
+
+    n_minus_one: dict[str, object] | None = None
+    if not structure_only and needs_n_minus_one:
+        if n_minus_one_release is None or not lowercase_hex(n_minus_one_manifest_sha256, 64):
+            raise ProductionBundleError("N-1 manifest checksum must be lowercase SHA-256")
+    if not structure_only and (
+        live_attestation is None
+        or not lowercase_hex(live_attestation_sha256, 64)
+    ):
+        raise ProductionBundleError("Live attestation and its pinned SHA-256 are required")
+
+    with tempfile.TemporaryDirectory(
+        prefix=f".{output.name}.inputs-", dir=output.parent
+    ) as raw_inputs:
+        inputs = Path(raw_inputs)
+        repo_snapshot = inputs / "repository"
+        repo_snapshot.mkdir(mode=0o700)
+        snapshot_repo(repo, source_commit, repo_snapshot)
+        verify_migrations(repo_snapshot, tracked, migration_version)
+
+        if not structure_only and needs_n_minus_one:
+            assert n_minus_one_release is not None
+            assert n_minus_one_manifest_sha256 is not None
+            n_minus_one_snapshot = inputs / "n-minus-one"
+            copy_tree(n_minus_one_release, n_minus_one_snapshot, preserve_mode=True)
+            n_minus_one = verify_n_minus_one(
+                n_minus_one_snapshot,
+                n_minus_one_manifest_sha256,
+                arch,
+                str(spec["expected_n_minus_one_version"]),
+                str(spec["expected_n_minus_one_migration"]),
+            )
+
+        stage_snapshot = inputs / "stage"
+        for binary in BINARIES:
+            copy_file(
+                stage / "binaries" / arch / binary,
+                stage_snapshot / "binaries" / arch / binary,
+                0o755,
+            )
+        for binary in RUNTIME:
+            copy_file(
+                stage / "runtime" / arch / binary,
+                stage_snapshot / "runtime" / arch / binary,
+                0o755,
+            )
+
+        web_snapshot = inputs / "web-dist"
+        preflight_tree(web_dist, payload=True)
+        copy_tree(web_dist, web_snapshot)
+        preflight_tree(web_snapshot, payload=True)
+
+        for unit in UNITS:
+            regular(repo_snapshot / "deploy/systemd" / unit)
+        for script in INSTALLER_SCRIPTS:
+            regular(repo_snapshot / "scripts/mvp" / script)
+        regular(repo_snapshot / "deploy/caddy/open-card-edge.Caddyfile.example")
+        regular(repo_snapshot / "deploy/caddy/open-card-edge.env.example")
+        preflight_tree(repo_snapshot / "migrations/control-plane", payload=True)
+        preflight_tree(repo_snapshot / "docs/licenses", payload=True)
+
+        attestation_snapshot: Path | None = None
+        if not structure_only:
+            assert live_attestation is not None
+            assert live_attestation_sha256 is not None
+            attestation_snapshot = inputs / "live-attestation.json"
+            copy_file(live_attestation, attestation_snapshot, 0o640)
+            verify_live_web(
+                web_snapshot,
+                attestation_snapshot,
+                source_commit,
+                live_attestation_sha256,
+            )
+
+        with tempfile.TemporaryDirectory(
+            prefix=f".{output.name}.build-", dir=output.parent
+        ) as raw_build:
+            build_root = Path(raw_build)
+            release = build_root / "release"
+            for binary in BINARIES:
+                copy_file(
+                    stage_snapshot / "binaries" / arch / binary,
+                    release / "bin" / binary,
+                    0o755,
+                )
+            for binary in RUNTIME:
+                copy_file(
+                    stage_snapshot / "runtime" / arch / binary,
+                    release / "bin" / binary,
+                    0o755,
+                )
+            for unit in UNITS:
+                copy_file(
+                    repo_snapshot / "deploy/systemd" / unit,
+                    release / "systemd" / unit,
+                    0o644,
+                )
+            copy_file(
+                repo_snapshot / "deploy/caddy/open-card-edge.Caddyfile.example",
+                release / "caddy/open-card-edge.Caddyfile.example",
+                0o644,
+            )
+            copy_file(
+                repo_snapshot / "deploy/caddy/open-card-edge.env.example",
+                release / "caddy/open-card-edge.env.example",
+                0o640,
+            )
+            copy_tree(
+                repo_snapshot / "migrations/control-plane",
+                release / "migrations/control-plane",
+            )
+            if not any(
+                (release / "migrations/control-plane").glob(f"{migration_version}_*.sql")
+            ):
+                raise ProductionBundleError("production release is missing the declared migration")
+            copy_tree(repo_snapshot / "docs/licenses", release / "docs/licenses")
+            for script in INSTALLER_SCRIPTS:
+                copy_file(
+                    repo_snapshot / "scripts/mvp" / script,
+                    release / "scripts/mvp" / script,
+                    0o755,
+                )
+            copy_tree(web_snapshot, release / "web/dist")
+            live_attestation_digest: str | None = None
+            if attestation_snapshot is not None:
+                copy_file(
+                    attestation_snapshot,
+                    release / "attestations/live-web.json",
+                    0o640,
+                )
+                live_attestation_digest = sha256(release / "attestations/live-web.json")
+            make_source_manifest(repo_snapshot, release, source_commit, tracked)
+            make_sbom(release, version)
+
+            candidate_status = (
+                "bootstrap_baseline" if not needs_n_minus_one else "upgrade_candidate"
+            )
+            if structure_only:
+                metadata = {
+                    "schema_version": 1,
+                    "product": "open-card",
+                    "version": version,
+                    "migration_version": migration_version,
+                    "source_commit": source_commit,
+                    "production_ready": False,
+                    "production_accepted": False,
+                    "candidate_status": candidate_status,
+                    "n_minus_one": {
+                        "version": spec["expected_n_minus_one_version"],
+                        "status": (
+                            "not_required_bootstrap"
+                            if not needs_n_minus_one
+                            else "blocked_no_pinned_provenance"
+                        ),
+                    },
+                    "live_web": {"status": "blocked_gate3_unverified_live_input"},
+                    "structure_only": True,
+                }
+                write_json(build_root / "production-bundle.json", metadata)
+                structure_blocker = (
+                    "Gate 3 Live attestation is supplied."
+                    if not needs_n_minus_one
+                    else "pinned N-1 provenance and Gate 3 Live attestations are supplied."
+                )
+                (build_root / "STRUCTURE-ONLY-NOT-INSTALLABLE").write_text(
+                    "No release manifest or archive is emitted until "
+                    f"{structure_blocker}\n",
+                    encoding="utf-8",
+                )
+            else:
+                manifest = {
+                    "schema_version": 1,
+                    "product": "open-card",
+                    "version": version,
+                    "release_id": f"release-{version}",
+                    "architecture": arch,
+                    "migration_version": migration_version,
+                    "source_commit": source_commit,
+                    "protocol": "1.1",
+                    "config_dir": "/etc/open-card",
+                    "data_dir": "/var/lib/open-card",
+                    "compatibility": {
+                        "min_data_version": 1,
+                        "max_data_version": int(migration_version),
+                        "min_agent_protocol": "1.0",
+                        "max_agent_protocol": "1.1",
+                        "requires_data_backup": True,
+                    },
+                    "files": release_files(release),
+                }
+                write_json(release / "manifest.json", manifest, 0o644)
+                archive = write_tar(build_root, release, version)
+                bundle_checksum = build_root / "bundle-manifest.sha256"
+                bundle_checksum.write_text(
+                    f"{sha256(archive)}  {archive.name}\n"
+                    f"{sha256(release / 'manifest.json')}  release/manifest.json\n",
+                    encoding="utf-8",
+                )
+                bundle_checksum.chmod(0o640)
+                metadata = {
+                    "schema_version": 1,
+                    "product": "open-card",
+                    "version": version,
+                    "source_commit": source_commit,
+                    "production_accepted": False,
+                    "candidate_status": candidate_status,
+                    "n_minus_one": {
+                        "version": spec["expected_n_minus_one_version"],
+                        "status": (
+                            "not_required_bootstrap"
+                            if not needs_n_minus_one
+                            else "external_manifest_digest_pinned"
+                        ),
+                        "release_embedded": False,
+                        "manifest_sha256": (
+                            n_minus_one_manifest_sha256 if n_minus_one else None
+                        ),
+                        "release_id": n_minus_one.get("release_id") if n_minus_one else None,
+                    },
+                    "migration_version": migration_version,
+                    "live_web": {
+                        "status": "caller_evidence_digest_pinned",
+                        "bundle_structure_verified": True,
+                        "public_domain_verified": False,
+                        "attestation_sha256": live_attestation_digest,
+                    },
+                    "production_binaries": list(BINARIES),
+                    "excluded": [
+                        "open-card-caddy-fixture",
+                        "integration test binaries",
+                        "fixture archives",
+                    ],
+                }
+                write_json(build_root / "production-bundle.json", metadata)
+
+            if output.exists():
+                raise ProductionBundleError("refusing to overwrite production bundle output")
+            os.replace(build_root, output)
+            return metadata
 
 
 def main() -> int:
@@ -248,11 +808,31 @@ def main() -> int:
     parser.add_argument("--n-minus-one-manifest-sha256")
     parser.add_argument("--web-dist", required=True, type=Path)
     parser.add_argument("--arch", default="amd64")
+    parser.add_argument("--version", required=True)
+    parser.add_argument("--migration-version", required=True)
+    parser.add_argument("--source-commit", required=True)
+    parser.add_argument("--live-attestation", type=Path)
+    parser.add_argument("--live-attestation-sha256")
     parser.add_argument("--structure-only", action="store_true")
     args = parser.parse_args()
     try:
         n_minus_one_release = args.n_minus_one_release.resolve() if args.n_minus_one_release else None
-        value = assemble(args.stage_root.resolve(), args.repo_root.resolve(), args.output_root.resolve(), args.arch, n_minus_one_release, args.n_minus_one_manifest_sha256, args.web_dist.resolve(), structure_only=args.structure_only)
+        live_attestation = args.live_attestation.resolve() if args.live_attestation else None
+        value = assemble(
+            args.stage_root.resolve(),
+            args.repo_root.resolve(),
+            args.output_root.resolve(),
+            args.arch,
+            n_minus_one_release,
+            args.n_minus_one_manifest_sha256,
+            args.web_dist.resolve(),
+            version=args.version,
+            migration_version=args.migration_version,
+            source_commit=args.source_commit,
+            live_attestation=live_attestation,
+            live_attestation_sha256=args.live_attestation_sha256,
+            structure_only=args.structure_only,
+        )
     except ProductionBundleError as error:
         print(f"production bundle: {error}")
         return 1
