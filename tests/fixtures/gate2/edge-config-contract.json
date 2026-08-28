@@ -1,0 +1,28 @@
+{
+  "fixture_id": "gate2-edge-config-contract-v1",
+  "edge": {
+    "listen": ["tcp:80", "tcp:443"],
+    "protocols": ["h1", "h2"],
+    "admin": "127.0.0.1:2020",
+    "state_dir": "/var/lib/open-card-edge",
+    "log_dir": "/var/log/open-card-edge",
+    "grace_period_seconds": 30,
+    "stop_timeout_seconds": 45,
+    "keepalive_seconds": 30,
+    "dial_timeout_seconds": 3,
+    "response_header_timeout_seconds": 30
+  },
+  "internal_route_provider": {
+    "listen": "127.0.0.1:18481",
+    "admin": "127.0.0.1:2019"
+  },
+  "routes": {
+    "console_host": "console.example.invalid",
+    "api_before_spa": true,
+    "api_upstream": "127.0.0.1:8080",
+    "app_upstream": "127.0.0.1:18481",
+    "tls_allow": "http://127.0.0.1:8080/internal/tls/allow",
+    "strip_identity_headers": ["Open-Card-*", "X-Open-Card-*"]
+  },
+  "forbidden": ["h3", "udp:443", "real domain", "certificate", "token", "password"]
+}

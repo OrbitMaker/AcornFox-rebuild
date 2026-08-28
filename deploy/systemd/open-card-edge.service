@@ -1,0 +1,46 @@
+[Unit]
+Description=Open Card public Edge Caddy
+Wants=network-online.target
+After=network-online.target open-card-server.service
+
+[Service]
+Type=notify
+User=opencard-edge
+Group=opencard-edge
+WorkingDirectory=/var/lib/open-card-edge
+StateDirectory=open-card-edge
+StateDirectoryMode=0750
+LogsDirectory=open-card-edge
+LogsDirectoryMode=0750
+EnvironmentFile=-/etc/open-card/open-card-edge.env
+Environment=HOME=/var/lib/open-card-edge/home
+Environment=XDG_DATA_HOME=/var/lib/open-card-edge/data
+Environment=XDG_CONFIG_HOME=/var/lib/open-card-edge/config
+ExecStartPre=/opt/open-card/current/bin/caddy validate --config /etc/open-card/open-card-edge.Caddyfile --adapter caddyfile
+ExecStartPre=/opt/open-card/current/bin/caddy adapt --config /etc/open-card/open-card-edge.Caddyfile --adapter caddyfile --validate
+ExecStart=/opt/open-card/current/bin/caddy run --environ --config /etc/open-card/open-card-edge.Caddyfile --adapter caddyfile
+ExecReload=/bin/sh -ec '/opt/open-card/current/bin/caddy validate --config /etc/open-card/open-card-edge.Caddyfile --adapter caddyfile && /opt/open-card/current/bin/caddy adapt --config /etc/open-card/open-card-edge.Caddyfile --adapter caddyfile --validate && /opt/open-card/current/bin/caddy reload --config /etc/open-card/open-card-edge.Caddyfile --adapter caddyfile'
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=45s
+LimitNOFILE=1048576
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectClock=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+ReadWritePaths=/var/lib/open-card-edge /var/log/open-card-edge
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

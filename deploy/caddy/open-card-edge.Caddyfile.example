@@ -1,0 +1,70 @@
+{
+	admin 127.0.0.1:2020
+	grace_period 30s
+	servers {
+		protocols h1 h2
+		timeouts {
+			read_body 30s
+			read_header 30s
+			write 0
+			idle 30s
+		}
+	}
+	on_demand_tls {
+		ask http://127.0.0.1:8080/internal/tls/allow
+	}
+}
+
+(identity_headers) {
+	header_up -Open-Card-*
+	header_up -X-Open-Card-*
+}
+
+(control_plane_transport) {
+	transport http {
+		dial_timeout 3s
+		response_header_timeout 30s
+		keepalive 30s
+	}
+}
+
+# Replace only this documentation hostname during an approved deployment.
+# API/SSE must match before the SPA fallback so a deep link never consumes it.
+console.example.invalid {
+	log {
+		output file {$OPEN_CARD_EDGE_LOG_DIR}/console-access.log
+		format json
+	}
+	@control_plane path /api*
+	handle @control_plane {
+		reverse_proxy 127.0.0.1:8080 {
+			import identity_headers
+			import control_plane_transport
+			flush_interval -1
+		}
+	}
+
+	handle {
+		root * /opt/open-card/current/web/dist
+		try_files {path} /index.html
+		file_server
+	}
+}
+
+# Application hosts retain the original Host header. On-demand TLS is gated by
+# the loopback-only allow endpoint above; this template makes no DNS or ACME
+# request until an approved Edge is actually started with real domain facts.
+https:// {
+	log {
+		output file {$OPEN_CARD_EDGE_LOG_DIR}/application-access.log
+		format json
+	}
+	tls {
+		on_demand
+	}
+	reverse_proxy 127.0.0.1:18481 {
+		header_up Host {host}
+		import identity_headers
+		import control_plane_transport
+	}
+}
