@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "product": "open-card",
+  "policy": "recorded-provenance-only",
+  "entries": [
+    {
+      "component": "open-card-source",
+      "license": "repository-license",
+      "source": "repository"
+    },
+    {
+      "component": "go-modules",
+      "license": "NOASSERTION",
+      "source": "go.mod + go.sum"
+    },
+    {
+      "component": "frontend-packages",
+      "license": "NOASSERTION",
+      "source": "web/package-lock.json"
+    },
+    {
+      "component": "fixed-runtime-assets",
+      "license": "NOASSERTION",
+      "source": "caller-supplied assets.sha256"
+    },
+    {
+      "component": "debian-inputs",
+      "license": "NOASSERTION",
+      "source": "caller-supplied packages.txt + debs.sha256"
+    }
+  ]
+}

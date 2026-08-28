@@ -1,0 +1,15 @@
+#cloud-config
+write_files:
+  - path: /etc/opencard-mvp-fa8f8eab-clean-worker
+    owner: root:root
+    permissions: "0644"
+    content: |
+      opencard-mvp-fa8f8eab-build-worker-01
+runcmd:
+  - [bash, -lc, "for n in $(seq 1 60); do test -b /dev/sr1 && exit 0; sleep 1; done; exit 1"]
+  - [install, -d, -m, "0750", /mnt/opencard-bundle, /opt/opencard-offline/outer]
+  - [mount, -o, "ro,nodev,nosuid,noexec", /dev/sr1, /mnt/opencard-bundle]
+  - [bash, -lc, "cd /mnt/opencard-bundle && sha256sum -c offline-bundle.sha256"]
+  - [tar, -xf, /mnt/opencard-bundle/offline-bundle.tar, -C, /opt/opencard-offline/outer]
+  - [python3, /mnt/opencard-bundle/offline_bundle.py, validate, --archive, /mnt/opencard-bundle/offline-bundle.tar]
+  - [env, OPEN_CARD_M4_ROUTE_FAILURE_FIXTURE=enabled, bash, /mnt/opencard-bundle/clean-worker-bootstrap.sh, /opt/opencard-offline/outer/payload]

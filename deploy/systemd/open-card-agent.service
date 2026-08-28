@@ -1,0 +1,46 @@
+[Unit]
+Description=Open Card node Agent
+Wants=network-online.target
+Requires=docker.service
+After=network-online.target docker.service
+
+[Service]
+Type=simple
+User=opencard-agent
+Group=opencard-agent
+SupplementaryGroups=docker opencard
+WorkingDirectory=/opt/open-card/current
+EnvironmentFile=-/etc/open-card/agent.env
+Environment=OPEN_CARD_DOCKER_SOCKET=/var/run/docker.sock
+ExecStart=/opt/open-card/current/bin/open-card-agent
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+PrivateDevices=yes
+DevicePolicy=closed
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RemoveIPC=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+ReadWritePaths=/var/lib/open-card-agent /var/log/open-card-agent
+ReadOnlyPaths=/var/lib/open-card/oci
+UMask=0077
+BindPaths=/var/run/docker.sock
+
+[Install]
+WantedBy=multi-user.target

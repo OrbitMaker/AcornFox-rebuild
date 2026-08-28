@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "provisioning_status": "BLOCKED_PENDING_IMAGE_AND_AUTHORIZATION",
+  "task_id": "opencard-mvp-fa8f8eab",
+  "domain_name": "opencard-mvp-fa8f8eab-build-worker-01",
+  "domain_uuid": "fce4e26d-93b0-5128-a090-969ef73835d4",
+  "pool_name": "opencard-mvp-fa8f8eab-build-workers",
+  "pool_uuid": "72a914c5-b6c7-5f22-a3bd-88f9b43f1619",
+  "pool_path": "/var/lib/libvirt/images/opencard-mvp-fa8f8eab",
+  "volume_name": "opencard-mvp-fa8f8eab-build-worker-01.qcow2",
+  "network_name": "opencard-mvp-fa8f8eab-build-isolated",
+  "network_uuid": "03f91824-e5c9-5655-ac06-fec291e81c93",
+  "image_path": "REQUIRED_BEFORE_PROVISIONING",
+  "image_sha256": "REQUIRED_BEFORE_PROVISIONING",
+  "offline_bundle_path": "REQUIRED_BEFORE_PROVISIONING",
+  "offline_bundle_sha256": "REQUIRED_BEFORE_PROVISIONING",
+  "resources": {
+    "vcpus": 2,
+    "memory_mib": 4096,
+    "disk_gib": 40,
+    "build_memory_mib": 512,
+    "build_cpu_quota": 50000,
+    "build_cpu_period": 100000,
+    "build_timeout_seconds": 300,
+    "max_concurrent_builds": 1
+  },
+  "isolation": {
+    "network_mode": "isolated-no-forward",
+    "network_forward": false,
+    "autostart": false,
+    "metadata_endpoint_denied": true,
+    "host_mounts": [],
+    "host_devices": [],
+    "host_docker_socket": false,
+    "privileged": false,
+    "user_namespace": "guest-local-rootless",
+    "management": "qemu-guest-agent-console"
+  },
+  "acceptance": {
+    "expected_memory_max_bytes": 536870912,
+    "expected_cpu_max": "50000 100000",
+    "require_timeout_cleanup": true,
+    "require_workspace_cleanup": true,
+    "require_socket_absence": true
+  }
+}

@@ -1,0 +1,45 @@
+[Unit]
+Description=Open Card rootless BuildKit worker
+After=local-fs.target
+
+[Service]
+Type=simple
+User=opencard-buildkit
+Group=opencard-buildkit
+Environment=XDG_RUNTIME_DIR=/run/open-card-buildkit
+Environment=HOME=/var/lib/open-card-buildkit
+Environment=PATH=/opt/open-card/current/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+RuntimeDirectory=open-card-buildkit
+RuntimeDirectoryMode=0750
+WorkingDirectory=/var/lib/open-card-buildkit
+ExecStart=/opt/open-card/current/bin/rootlesskit --state-dir=/var/lib/open-card-buildkit/rootlesskit --net=none --disable-host-loopback --copy-up=/etc /opt/open-card/current/bin/buildkitd --config /etc/buildkit/buildkitd.toml --root /var/lib/open-card-buildkit/buildkitd --addr unix:///run/open-card-buildkit/buildkitd.sock --group opencard-buildkit
+ExecStartPost=/bin/sh -c 'until test -S /run/open-card-buildkit/buildkitd.sock; do sleep 0.1; done; chgrp opencard-buildkit /run/open-card-buildkit/buildkitd.sock; chmod 0660 /run/open-card-buildkit/buildkitd.sock'
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+NoNewPrivileges=no
+Delegate=yes
+PrivateTmp=yes
+PrivateDevices=yes
+DevicePolicy=closed
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectClock=yes
+LockPersonality=yes
+RestrictSUIDSGID=yes
+ProtectProc=invisible
+RestrictRealtime=yes
+RemoveIPC=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+SystemCallArchitectures=native
+SystemCallFilter=@system-service @mount
+ReadWritePaths=/var/lib/open-card-buildkit /run/open-card-buildkit
+MemoryMax=512M
+CPUQuota=50%
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
