@@ -1034,7 +1034,7 @@ components:
         absolute_expires_at: {type: string, format: date-time}
     Application:
       type: object
-      required: [id, name, created_at, updated_at]
+      required: [id, name, created_at, updated_at, source, operation_id, runtime_ready, serving, runtime_status]
       properties:
         id:
           type: string
@@ -1046,6 +1046,20 @@ components:
         updated_at:
           type: string
           format: date-time
+        source: {$ref: '#/components/schemas/ApplicationSource'}
+        operation_id: {type: string, nullable: true}
+        runtime_ready: {type: boolean}
+        serving: {type: boolean}
+        runtime_status: {type: string, enum: [unknown, partial, running]}
+    ApplicationSource:
+      type: object
+      additionalProperties: false
+      required: [kind]
+      properties:
+        kind: {type: string, enum: [archive, folder, git, unknown]}
+        source_upload_id: {type: string, nullable: true}
+        locator: {type: string, nullable: true, description: Public Git HTTPS locator only; null for uploads or unknown legacy sources.}
+        ref: {type: string, nullable: true}
     ApplicationList:
       type: object
       required: [items]
@@ -1057,13 +1071,18 @@ components:
     ApplicationDetail:
       type: object
       additionalProperties: false
-      required: [id, name, created_at, updated_at, source_upload_id, access]
+      required: [id, name, created_at, updated_at, source, operation_id, runtime_ready, serving, runtime_status, source_upload_id, access]
       properties:
         id: {type: string}
         name: {type: string}
         created_at: {type: string, format: date-time}
         updated_at: {type: string, format: date-time}
-        source_upload_id: {type: string, nullable: true, description: Future source upload reference; null until G3 source binding is implemented.}
+        source: {$ref: '#/components/schemas/ApplicationSource'}
+        operation_id: {type: string, nullable: true}
+        runtime_ready: {type: boolean}
+        serving: {type: boolean}
+        runtime_status: {type: string, enum: [unknown, partial, running]}
+        source_upload_id: {type: string, nullable: true, description: Claimed source upload ID when the immutable source was created from a browser upload; null for Git or unknown legacy sources.}
         access: {$ref: '#/components/schemas/ApplicationAccessSummary'}
     DomainLifecycleStatus:
       type: string

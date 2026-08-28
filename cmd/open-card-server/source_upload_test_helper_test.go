@@ -8,6 +8,7 @@ import (
 
 	"github.com/open-card/open-card/internal/application"
 	"github.com/open-card/open-card/internal/contracts"
+	"github.com/open-card/open-card/internal/controllers"
 	"github.com/open-card/open-card/internal/domain"
 )
 
@@ -18,8 +19,15 @@ func newServerWithReadySourceUpload(t *testing.T) *Server {
 	repository := application.NewMemoryRepository()
 	registerReadySourceUpload(t, repository)
 	server := NewServerWithRepository(repository)
+	server.SetApplicationAccessProvider(testApplicationAccessProvider{})
 	configureTestSourcePreparer(server)
 	return server
+}
+
+type testApplicationAccessProvider struct{}
+
+func (testApplicationAccessProvider) ApplicationAccess(context.Context, domain.ID) (controllers.G3ApplicationAccess, error) {
+	return controllers.G3ApplicationAccess{CustomDomains: []controllers.G3ApplicationDomain{}, Certificate: controllers.G3CertificateStatus{Status: "pending"}}, nil
 }
 
 // testSourcePreparer models only the prepared immutable fact that HTTP server
@@ -47,6 +55,9 @@ func (testSourcePreparer) Release(context.Context, contracts.ReleaseSourceReques
 
 func configureTestSourcePreparer(server *Server) {
 	server.controller.SetSourcePreparer(testSourcePreparer{})
+}
+func configureTestApplicationProjection(server *Server) {
+	server.SetApplicationAccessProvider(testApplicationAccessProvider{})
 }
 
 func registerReadySourceUpload(t *testing.T, repository *application.MemoryRepository) {

@@ -84,28 +84,30 @@ type Server struct {
 		GetDeploymentOperationID(context.Context, domain.ID) (domain.ID, error)
 		ListM2ReleaseVolumeClaims(context.Context, domain.ID) ([]postgres.M2ServiceGroupVolumeClaim, error)
 	}
-	m2Registry             contracts.RegistryImageProvider
-	m2UploadRoot           string
-	m2TaskPrefix           string
-	m2AgentInstance        string
-	m2AgentNode            string
-	m2Lifecycle            *M2LifecycleHandler
-	auth                   *AuthHTTPHandler
-	m3Access               *M3AccessHTTPHandler
-	g3Access               *G3AccessHTTPHandler
-	g3SourceUpload         *G3SourceUploadHTTPHandler
-	tlsAllow               *TLSAllowHTTPHandler
-	m4Operations           *M4OperationsHTTPHandler
-	m4Webhooks             *M4WebhookHTTPHandler
-	m4Logs                 *M4LogsHTTPHandler
-	m5Usage                *M5UsageHTTPHandler
-	m6AI                   *M6AIHTTPHandler
-	systemStatusStore      systemStatusStore
-	systemStatusInstanceID string
-	systemStatusNodeID     string
-	broker                 *eventBroker
-	agentGateway           *agenttransport.Gateway
-	repositoryHealth       interface {
+	m2Registry                 contracts.RegistryImageProvider
+	m2UploadRoot               string
+	m2TaskPrefix               string
+	m2AgentInstance            string
+	m2AgentNode                string
+	m2Lifecycle                *M2LifecycleHandler
+	auth                       *AuthHTTPHandler
+	m3Access                   *M3AccessHTTPHandler
+	g3Access                   *G3AccessHTTPHandler
+	g3SourceUpload             *G3SourceUploadHTTPHandler
+	tlsAllow                   *TLSAllowHTTPHandler
+	m4Operations               *M4OperationsHTTPHandler
+	m4Webhooks                 *M4WebhookHTTPHandler
+	m4Logs                     *M4LogsHTTPHandler
+	m5Usage                    *M5UsageHTTPHandler
+	m6AI                       *M6AIHTTPHandler
+	systemStatusStore          systemStatusStore
+	systemStatusInstanceID     string
+	systemStatusNodeID         string
+	applicationProjectionStore applicationProjectionStore
+	applicationAccessProvider  applicationAccessProvider
+	broker                     *eventBroker
+	agentGateway               *agenttransport.Gateway
+	repositoryHealth           interface {
 		PingContext(context.Context) error
 	}
 	ready  atomic.Bool
@@ -124,6 +126,9 @@ func NewServerWithRepository(repository application.Repository) *Server {
 		server.repositoryHealth = health
 	}
 	server.ready.Store(true)
+	if memory, ok := repository.(*application.MemoryRepository); ok {
+		server.applicationProjectionStore = memoryApplicationProjectionStore{repository: memory}
+	}
 	return server
 }
 
@@ -150,6 +155,12 @@ func (s *Server) SetM6AI(handler *M6AIHTTPHandler)                     { s.m6AI 
 func (s *Server) SetSystemStatusStore(store systemStatusStore)         { s.systemStatusStore = store }
 func (s *Server) SetSystemStatusNode(instanceID, nodeID string) {
 	s.systemStatusInstanceID, s.systemStatusNodeID = instanceID, nodeID
+}
+func (s *Server) SetApplicationProjectionStore(store applicationProjectionStore) {
+	s.applicationProjectionStore = store
+}
+func (s *Server) SetApplicationAccessProvider(provider applicationAccessProvider) {
+	s.applicationAccessProvider = provider
 }
 func (s *Server) Handler() http.Handler                 { return http.HandlerFunc(s.serveHTTP) }
 func (s *Server) AgentGateway() *agenttransport.Gateway { return s.agentGateway }
@@ -217,6 +228,10 @@ func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
 		s.handleEvents(writer, request, "")
 		return
 	case "/api/v1/applications", "/api/v1/applications/":
+		if request.Method == http.MethodGet {
+			s.handleApplicationProjectionList(writer, request)
+			return
+		}
 		s.handleApplications(writer, request)
 		return
 	case "/api/v1/publishes", "/api/v1/publishes/":
@@ -239,6 +254,11 @@ func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 	if strings.HasPrefix(request.URL.Path, apiPrefix+"applications/") {
+		identifier := strings.Trim(strings.TrimPrefix(request.URL.Path, apiPrefix+"applications/"), "/")
+		if request.Method == http.MethodGet && identifier != "" && !strings.Contains(identifier, "/") {
+			s.handleApplicationProjectionDetail(writer, request, domain.ID(identifier))
+			return
+		}
 		if s.g3Access != nil && s.g3Access.Handle(writer, request) {
 			return
 		}
@@ -357,7 +377,21 @@ func (s *Server) handleApplications(writer http.ResponseWriter, request *http.Re
 			return
 		}
 		s.broker.publish(result.Event)
-		response := map[string]any{"application": result.Application, "environment_id": result.EnvironmentID.String(), "operation_id": result.OperationID.String(), "source_revision_id": result.SourceRevisionID.String()}
+		if s.applicationProjectionStore == nil {
+			writeJSONError(writer, http.StatusServiceUnavailable, "application_projection_unavailable", "application projection is unavailable")
+			return
+		}
+		projection, projectionErr := s.applicationProjectionStore.ApplicationProjection(request.Context(), result.Application.ID)
+		if projectionErr != nil {
+			writeJSONError(writer, http.StatusServiceUnavailable, "application_projection_unavailable", "application projection is unavailable")
+			return
+		}
+		summary, summaryErr := s.applicationSummary(request.Context(), projection)
+		if summaryErr != nil {
+			writeJSONError(writer, http.StatusServiceUnavailable, "application_projection_unavailable", "application projection is unavailable")
+			return
+		}
+		response := map[string]any{"application": summary, "environment_id": result.EnvironmentID.String(), "operation_id": result.OperationID.String(), "source_revision_id": result.SourceRevisionID.String()}
 		writeJSON(writer, http.StatusCreated, response)
 	default:
 		writer.Header().Set("Allow", "GET, POST, OPTIONS")

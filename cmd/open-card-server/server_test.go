@@ -241,6 +241,7 @@ func TestAPI_CONTRACT_002_SSEReplaysFromRepositoryAfterServerRestart(t *testing.
 	registerReadySourceUpload(t, repository)
 	firstState := NewServerWithRepository(repository)
 	configureTestSourcePreparer(firstState)
+	configureTestApplicationProjection(firstState)
 	now := time.Unix(1_700_000_000, 0).UTC()
 	_, firstSession, firstCSRF := attachTestAdministratorTokens(t, firstState, &now)
 	firstServer := httptest.NewServer(firstState.Handler())
@@ -268,6 +269,7 @@ func TestAPI_CONTRACT_002_SSEReplaysFromRepositoryAfterServerRestart(t *testing.
 
 	restartedState := NewServerWithRepository(repository)
 	configureTestSourcePreparer(restartedState)
+	configureTestApplicationProjection(restartedState)
 	_, restartedSession := attachTestAdministrator(t, restartedState, &now)
 	restarted := httptest.NewServer(restartedState.Handler())
 	defer restarted.Close()
