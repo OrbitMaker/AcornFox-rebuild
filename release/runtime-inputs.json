@@ -6,12 +6,12 @@
       "architectures": {
         "amd64": {
           "url": "https://github.com/moby/buildkit/releases/download/v0.32.2/buildkit-v0.32.2.linux-amd64.tar.gz",
-          "filename": "buildkit-v0.32.2.linux-amd64.tar.gz",
+          "filename": "buildkit.tar.gz",
           "sha256": "2975d0f651ad96ba8b80b9992ae1f9a964f4408569af5b6dc36544165c3926af"
         },
         "arm64": {
           "url": "https://github.com/moby/buildkit/releases/download/v0.32.2/buildkit-v0.32.2.linux-arm64.tar.gz",
-          "filename": "buildkit-v0.32.2.linux-arm64.tar.gz",
+          "filename": "buildkit.tar.gz",
           "sha256": "9e8f46bf309ec0ab262967be5538a4dbe06be756a82621f98253933bac5dcf92"
         }
       }
@@ -21,12 +21,12 @@
       "architectures": {
         "amd64": {
           "url": "https://github.com/rootless-containers/rootlesskit/releases/download/v3.1.0/rootlesskit-x86_64.tar.gz",
-          "filename": "rootlesskit-x86_64.tar.gz",
+          "filename": "rootlesskit.tar.gz",
           "sha256": "b1302b7395918266d561b9e3053771253f20761807e042ae80a1868d6e86b71c"
         },
         "arm64": {
           "url": "https://github.com/rootless-containers/rootlesskit/releases/download/v3.1.0/rootlesskit-aarch64.tar.gz",
-          "filename": "rootlesskit-aarch64.tar.gz",
+          "filename": "rootlesskit.tar.gz",
           "sha256": "42d1c22a34be7bb458f9ae7363d68dd05d553422d95392b44d0be7fa1fd76bf0"
         }
       }
@@ -36,12 +36,12 @@
       "architectures": {
         "amd64": {
           "url": "https://github.com/docker/buildx/releases/download/v0.36.1/buildx-v0.36.1.linux-amd64",
-          "filename": "buildx-v0.36.1.linux-amd64",
+          "filename": "docker-buildx",
           "sha256": "48af8a397ebd60178778bf63611dbcebe5f5e7a9be90eb9147b24b9587455778"
         },
         "arm64": {
           "url": "https://github.com/docker/buildx/releases/download/v0.36.1/buildx-v0.36.1.linux-arm64",
-          "filename": "buildx-v0.36.1.linux-arm64",
+          "filename": "docker-buildx",
           "sha256": "5d0cafd9d16afe1a0f0d9529885344ace2cc99efdd531b6c783c5455a6001569"
         }
       }
@@ -51,12 +51,12 @@
       "architectures": {
         "amd64": {
           "url": "https://github.com/caddyserver/caddy/releases/download/v2.11.4/caddy_2.11.4_linux_amd64.tar.gz",
-          "filename": "caddy_2.11.4_linux_amd64.tar.gz",
+          "filename": "caddy.tar.gz",
           "sha256": "527fbf917c39189a1e3b31d34fa955601680b2d5c8055d2a87b8b9588dec7bb9"
         },
         "arm64": {
           "url": "https://github.com/caddyserver/caddy/releases/download/v2.11.4/caddy_2.11.4_linux_arm64.tar.gz",
-          "filename": "caddy_2.11.4_linux_arm64.tar.gz",
+          "filename": "caddy.tar.gz",
           "sha256": "52d42ae12b3462097e9868da6dfed3c9648ae12edd3b3638102312af84cb6904"
         }
       }

@@ -35,9 +35,11 @@ OFFICIAL_PATH_PREFIXES = {
     "buildx": "/docker/buildx/releases/download/v0.36.1/",
     "caddy": "/caddyserver/caddy/releases/download/v2.11.4/",
 }
-FILENAME_ARCHITECTURE_MARKERS = {
-    "amd64": ("amd64", "x86_64"),
-    "arm64": ("arm64", "aarch64"),
+LOCAL_FILENAMES = {
+    "buildkit": "buildkit.tar.gz",
+    "rootlesskit": "rootlesskit.tar.gz",
+    "buildx": "docker-buildx",
+    "caddy": "caddy.tar.gz",
 }
 FORBIDDEN_FIELD_NAMES = {
     "credential",
@@ -91,9 +93,8 @@ class G5RuntimeInputsTests(unittest.TestCase):
                 self.assertEqual(parsed.scheme, "https")
                 self.assertEqual(parsed.netloc, OFFICIAL_HOSTS[tool])
                 self.assertTrue(parsed.path.startswith(OFFICIAL_PATH_PREFIXES[tool]))
-                self.assertEqual(Path(parsed.path).name, asset["filename"])
+                self.assertEqual(asset["filename"], LOCAL_FILENAMES[tool])
                 self.assertRegex(asset["sha256"], r"^[0-9a-f]{64}$")
-                self.assertTrue(any(marker in asset["filename"] for marker in FILENAME_ARCHITECTURE_MARKERS[architecture]))
 
     def test_architecture_records_are_not_interchangeable(self) -> None:
         document = load_inputs()["runtime_inputs"]
@@ -119,7 +120,7 @@ class G5RuntimeInputsTests(unittest.TestCase):
             for architecture, asset in document[tool]["architectures"].items():
                 source = evidence[(architecture, evidence_name)]
                 self.assertEqual(asset["url"], source["url"])
-                self.assertEqual(asset["filename"], Path(source["url"].split("?", 1)[0]).name)
+                self.assertEqual(asset["filename"], LOCAL_FILENAMES[tool])
                 self.assertEqual(asset["sha256"], source["sha256"])
                 self.assertEqual(source["version"], EXPECTED_VERSIONS[tool])
 
