@@ -401,11 +401,13 @@ def isolated_build_environments(root: Path) -> tuple[dict[str, str], dict[str, s
     go_cache = root / "go-cache"
     go_mod_cache = root / "go-mod-cache"
     npm_cache = root / "npm-cache"
-    npm_config = root / "npmrc"
+    npm_user_config = root / "npm-userrc"
+    npm_global_config = root / "npm-globalrc"
     for directory_path in (home, go_cache, go_mod_cache, npm_cache):
         directory_path.mkdir(mode=0o700)
-    npm_config.write_text("audit=false\nfund=false\n", encoding="utf-8")
-    npm_config.chmod(0o600)
+    for config in (npm_user_config, npm_global_config):
+        config.write_text("audit=false\nfund=false\n", encoding="utf-8")
+        config.chmod(0o600)
     base = {
         "HOME": str(home),
         "LANG": os.environ.get("LANG", "C.UTF-8"),
@@ -433,8 +435,8 @@ def isolated_build_environments(root: Path) -> tuple[dict[str, str], dict[str, s
         "NPM_CONFIG_AUDIT": "false",
         "NPM_CONFIG_CACHE": str(npm_cache),
         "NPM_CONFIG_FUND": "false",
-        "NPM_CONFIG_GLOBALCONFIG": str(npm_config),
-        "NPM_CONFIG_USERCONFIG": str(npm_config),
+        "NPM_CONFIG_GLOBALCONFIG": str(npm_global_config),
+        "NPM_CONFIG_USERCONFIG": str(npm_user_config),
         "VITE_API_BASE_URL": "/api/v1",
         "VITE_API_MODE": "live",
     }
