@@ -5,6 +5,11 @@ config/*.local
 # Generated artifacts and temporary files.
 .cache/
 artifacts/
+.playwright-cli/
+output/
+.pytest_cache/
+__pycache__/
+*.pyc
 *.log
 .omx/
 
@@ -12,3 +17,7 @@ artifacts/
 .DS_Store
 .idea/
 .vscode/
+
+# Frontend prototype dependencies and build output.
+node_modules/
+dist/

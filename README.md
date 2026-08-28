@@ -62,11 +62,16 @@ make drills
 
 ## 验收入口
 
+- MVP 产品说明与菜单树（派生文档，非实现证明）：[docs/mvp-product-spec.md](docs/mvp-product-spec.md)
+- MVP AI 能力架构（派生文档，非实现证明）：[docs/mvp-ai-architecture.md](docs/mvp-ai-architecture.md)
 - 架构和边界：[docs/architecture.md](docs/architecture.md)
 - 验收矩阵：[docs/acceptance-matrix.md](docs/acceptance-matrix.md)
 - 故障演练报告：[docs/fault-drill-report.md](docs/fault-drill-report.md)
 - 已知问题：[docs/known-issues.md](docs/known-issues.md)
 - 下一阶段建议：[docs/next-phase.md](docs/next-phase.md)
+- 云上自建 K8S 三云成本与抢占策略：[docs/cloud-k8s-pricing-and-spot-strategy.md](docs/cloud-k8s-pricing-and-spot-strategy.md)
+- 动态容量采购模型：[docs/dynamic-capacity-procurement-model.md](docs/dynamic-capacity-procurement-model.md)
+- 云服务器运维与 SSH 入口：[docs/cloud-server-operations.md](docs/cloud-server-operations.md)
 
 ## 当前现场状态（2026-08-21）
 
