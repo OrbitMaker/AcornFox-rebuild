@@ -1,0 +1,5 @@
+import { renderToStaticMarkup } from 'react-dom/server';
+import { AIServiceSettings, type AIServiceSettingsFact } from './AIServiceSettings';
+
+const settings: AIServiceSettingsFact = { version: 'ai-v1', enabled: false, status: 'disabled', profile: 'disabled', provider: '', model: '', dataScopes: [], maxTokens: 128, maxDurationMs: 1000, cooldownSeconds: 60, cacheEnabled: true, externalCalls: false };
+describe('M6 AI settings', () => { it('does not optimistically report provider health', () => { const html = renderToStaticMarkup(<AIServiceSettings settings={settings} />); expect(html).toContain('已关闭'); expect(html).toContain('外部调用'); expect(html).toContain('关闭'); expect(html).not.toContain('连接成功'); }); it('shows unavailable separately from disabled', () => { const html = renderToStaticMarkup(<AIServiceSettings settings={{ ...settings, enabled: true, status: 'unavailable', profile: 'local', provider: 'fixture' }} />); expect(html).toContain('不可用'); expect(html).toContain('fixture'); }); });

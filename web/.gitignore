@@ -1,0 +1,4 @@
+node_modules/
+dist/
+.env.local
+src/api/generated-schema.ts
