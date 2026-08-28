@@ -18,6 +18,7 @@ import io
 import json
 import os
 import re
+import secrets
 import shutil
 import stat
 import subprocess
@@ -708,6 +709,22 @@ def require_ignored_output_if_in_repository(output: Path, repository: Path) -> N
         raise ProductionBuildError("candidate output inside the build-tool repository must be Git ignored")
 
 
+def reserve_private_candidate_path(output: Path) -> Path:
+    parent = output.parent
+    for _ in range(32):
+        candidate = parent / f".{output.name}.candidate-{secrets.token_hex(16)}"
+        try:
+            os.mkdir(candidate, 0o700)
+        except FileExistsError:
+            continue
+        try:
+            candidate.rmdir()
+        except OSError as error:
+            raise ProductionBuildError("cannot reserve a private candidate path") from error
+        return candidate
+    raise ProductionBuildError("cannot allocate a private candidate path")
+
+
 def _darwin_rename_no_replace(candidate: Path, output: Path) -> None:
     try:
         renamex_np = ctypes.CDLL(None, use_errno=True).renamex_np
@@ -939,7 +956,7 @@ def build_candidate(
         attestation_path.chmod(0o640)
         attestation_digest = sha256(attestation_path)
 
-        candidate = build_root / "candidate"
+        candidate = reserve_private_candidate_path(output)
         run_command(
             [
                 sys.executable,

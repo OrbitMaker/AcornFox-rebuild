@@ -197,6 +197,16 @@ class ProductionBuildTests(unittest.TestCase):
             self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep")
             self.assertTrue((candidate / "payload").is_file())
 
+    def test_private_candidate_path_is_same_parent_and_absent(self) -> None:
+        tool = load_tool()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            output = root / "amd64"
+            candidate = tool.reserve_private_candidate_path(output)
+            self.assertEqual(candidate.parent, output.parent)
+            self.assertFalse(candidate.exists())
+            self.assertTrue(candidate.name.startswith(".amd64.candidate-"))
+
     def test_publish_no_replace_moves_only_a_complete_candidate_directory(self) -> None:
         tool = load_tool()
         with tempfile.TemporaryDirectory() as raw:
