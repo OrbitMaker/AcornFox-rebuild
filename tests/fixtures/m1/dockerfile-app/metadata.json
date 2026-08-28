@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "fixture_id": "dockerfile-app",
+  "kind": "dockerfile",
+  "dockerfile": "Dockerfile",
+  "context_files": ["Dockerfile", "app.txt", "metadata.json"]
+}

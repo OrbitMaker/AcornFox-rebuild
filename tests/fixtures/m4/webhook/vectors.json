@@ -1,0 +1,35 @@
+{
+  "fixture_id": "m4-webhook-vectors-v1",
+  "algorithm": "HMAC-SHA256",
+  "signing_secret_ref": "secretprovider://m4/webhook-fixture-signing-key",
+  "test_key_is_fixture_only": true,
+  "vectors": [
+    {
+      "event_id": "evt-m4-001",
+      "timestamp": "2026-08-25T00:00:00Z",
+      "kind": "incident",
+      "canonical_payload": "event_id=evt-m4-001&timestamp=2026-08-25T00:00:00Z&kind=incident",
+      "signature": "2c1b82e28a0d07abc8d19c36e493d460dfdde89ea174f90675dd22bf9c0f39e5",
+      "expected": "accepted"
+    },
+    {
+      "event_id": "evt-m4-002",
+      "timestamp": "2026-08-25T00:01:00Z",
+      "kind": "recovery",
+      "canonical_payload": "event_id=evt-m4-002&timestamp=2026-08-25T00:01:00Z&kind=recovery",
+      "signature": "7148047045a807ff048c0aa5f5e37a1284a1adabc92c6d3bcd0bae1edefbe54c",
+      "expected": "accepted"
+    }
+  ],
+  "negative_cases": [
+    {"case_id": "bad-signature", "event_id": "evt-m4-001", "signature": "0000000000000000000000000000000000000000000000000000000000000000", "expected": "rejected"},
+    {"case_id": "expired-timestamp", "event_id": "evt-m4-expired", "timestamp": "2020-01-01T00:00:00Z", "expected": "rejected"},
+    {"case_id": "replay", "event_id": "evt-m4-001", "attempt": 2, "expected": "deduplicated_no_action"}
+  ],
+  "lifecycle": [
+    {"event_id": "evt-m4-incident-01", "severity": "urgent", "kind": "fault", "expected": "send_once"},
+    {"event_id": "evt-m4-incident-01", "severity": "urgent", "kind": "escalation", "expected": "send_once"},
+    {"event_id": "evt-m4-recovery-01", "severity": "normal", "kind": "recovery", "expected": "send_once"}
+  ],
+  "expected": {"event_id_stable": true, "duplicate_updates_count_only": true, "plaintext_key_in_payload": false}
+}

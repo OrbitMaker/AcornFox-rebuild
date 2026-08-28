@@ -1,0 +1,15 @@
+{
+  "fixture_id": "m4-active-operation-conflict-v1",
+  "environment_id": "env_m4_fixture",
+  "operations": [
+    {"operation_id": "op_m4_active_a", "kind": "restart", "status": "running", "idempotency_key": "m4-active-a"},
+    {"operation_id": "op_m4_active_b", "kind": "rollback", "status": "pending", "idempotency_key": "m4-active-b"}
+  ],
+  "expected": {
+    "accepted_operation": "op_m4_active_a",
+    "rejected_operation": "op_m4_active_b",
+    "error_code": "active_operation_conflict",
+    "database_unique_constraint": true,
+    "transaction_is_atomic": true
+  }
+}

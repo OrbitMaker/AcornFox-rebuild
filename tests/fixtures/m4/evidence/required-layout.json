@@ -1,0 +1,20 @@
+{
+  "fixture_id": "m4-evidence-layout-v1",
+  "root_template": "artifacts/mvp/m4/<test-id>/",
+  "required_files": [
+    "result.json",
+    "inputs.redacted.json",
+    "objects-before.json",
+    "objects-after.json",
+    "events.ndjson",
+    "manifest.sha256"
+  ],
+  "optional_evidence": ["logs/", "metrics/", "receiver-capture.ndjson", "containers.json", "database-query.json", "audit-hash.txt"],
+  "negative_cases": [
+    {"case_id": "missing-required-result", "missing": ["result.json"], "expected": "gate_failed"},
+    {"case_id": "http-only", "present": ["http-200.txt"], "expected": "evidence_insufficient"},
+    {"case_id": "container-only", "present": ["container-exists.txt"], "expected": "evidence_insufficient"}
+  ],
+  "result_contract": {"test_id": true, "version": true, "started_at": true, "ended_at": true, "exit_code": true, "conclusion": true, "failure_reason": true},
+  "expected": {"junit_required": true, "strict_m0_m4_merge": true, "sensitive_evidence_access_level_required": true, "not_run_is_not_pass": true}
+}

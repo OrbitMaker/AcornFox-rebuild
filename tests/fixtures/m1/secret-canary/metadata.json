@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "fixture_id": "secret-canary",
+  "kind": "redaction-metadata",
+  "expected_result": "redacted",
+  "canary_placeholder": "fixture-canary-m1-not-a-secret",
+  "source_field": "TOKEN",
+  "must_not_contain": ["real credential", "private key"]
+}

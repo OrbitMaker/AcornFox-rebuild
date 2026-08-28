@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "test_id": "HOST-RECLAIM-001",
+  "task_prefix": "opencard-mvp-fa8f8eab",
+  "domain": "opencard-mvp-fa8f8eab-build-worker-01",
+  "pool": "opencard-mvp-fa8f8eab-build-worker-pool",
+  "disk": "opencard-mvp-fa8f8eab-build-worker-01.qcow2",
+  "network": "opencard-mvp-fa8f8eab-build-worker-net",
+  "limits": {
+    "vcpus": 2,
+    "memory_mib": 4096,
+    "disk_gib": 40,
+    "forwarding": false,
+    "autostart": false,
+    "host_mounts": false,
+    "host_devices": false
+  },
+  "required_markers": [
+    "task_id=opencard-mvp-fa8f8eab",
+    "domain=opencard-mvp-fa8f8eab-build-worker-01"
+  ],
+  "before_after_invariants": [
+    "non_task_domains_equal",
+    "non_task_pools_equal",
+    "non_task_networks_equal",
+    "default_route_equal",
+    "apparmor_profile_equal",
+    "docker_container_inventory_equal",
+    "containerd_status_equal",
+    "frpc_status_equal",
+    "libvirtd_status_equal"
+  ],
+  "reclaim_sequence": [
+    "dry_run_identity_check",
+    "guest_shutdown_graceful",
+    "domain_absent",
+    "disk_absent",
+    "pool_absent",
+    "network_absent",
+    "bundle_and_payload_absent",
+    "host_diff_zero"
+  ]
+}

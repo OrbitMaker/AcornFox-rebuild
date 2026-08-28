@@ -1,0 +1,10 @@
+{
+  "allowed": [
+    {"tool_id": "workspace.read", "version": "v1", "risk": "R0", "network": "none"},
+    {"tool_id": "workspace.build_test", "version": "v1", "risk": "R1", "network": "none"},
+    {"tool_id": "workspace.draft_edit", "version": "v1", "risk": "R2", "network": "none"},
+    {"tool_id": "workspace.patch_candidate", "version": "v1", "risk": "R2", "network": "none"}
+  ],
+  "denied": ["shell.exec", "ssh.run", "docker.socket", "kubernetes.production", "host.mount", "device.attach", "production.restart", "production.route", "core.hot_update", "secret.plaintext"],
+  "production_behavior": "controller_handoff_only"
+}

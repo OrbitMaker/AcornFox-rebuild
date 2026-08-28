@@ -1,0 +1,23 @@
+{
+  "protocol": "open-card-agent",
+  "version": "1.1",
+  "message_id": "msg-current-1",
+  "instance_id": "instance-1",
+  "node_id": "node-1",
+  "kind": "observation",
+  "sent_at": "2026-08-24T00:00:00Z",
+  "idempotency_key": "idem-task-1",
+  "agent_sequence": 9,
+  "payload": {
+    "task_id": "task-1",
+    "sequence": 3,
+    "target_ref": "deployment/1",
+    "status": "healthy",
+    "healthy": true,
+    "at": "2026-08-24T00:00:00Z",
+    "evidence_refs": ["evidence-1"],
+    "details": {
+      "server_version": "29.1.3"
+    }
+  }
+}

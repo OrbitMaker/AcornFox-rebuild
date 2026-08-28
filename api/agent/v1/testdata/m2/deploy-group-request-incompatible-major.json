@@ -1,0 +1,25 @@
+{
+  "protocol": "open-card-agent",
+  "version": "2.0",
+  "message_id": "msg-m2-deploy-group-major-2",
+  "instance_id": "instance-m2-fixture",
+  "node_id": "node-m2-fixture",
+  "kind": "task_request",
+  "sent_at": "2026-08-24T00:06:00Z",
+  "idempotency_key": "idem-m2-deploy-group-major-2",
+  "agent_sequence": 1,
+  "capabilities": ["mtls", "typed_tasks", "runtime.deploy_group"],
+  "payload": {
+    "task_id": "task-m2-deploy-group-major-2",
+    "instance_id": "instance-m2-fixture",
+    "node_id": "node-m2-fixture",
+    "kind": "deploy_group",
+    "idempotency_key": "idem-m2-deploy-group-major-2",
+    "lease_id": "lease-m2-deploy-group-major-2-1",
+    "deadline": "2026-08-24T00:11:00Z",
+    "parameters": {
+      "deployment_id": "dep_m2_major_2",
+      "required_capabilities": ["runtime.deploy_group"]
+    }
+  }
+}

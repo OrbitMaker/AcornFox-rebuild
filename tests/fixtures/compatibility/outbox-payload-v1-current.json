@@ -1,0 +1,12 @@
+{
+  "schema_version": "1.1",
+  "id": "evt-000002",
+  "operation_id": "op-1",
+  "application_id": "app-1",
+  "sequence": 2,
+  "occurred_at": "2026-08-24T00:00:01Z",
+  "kind": "operation.running",
+  "status": "running",
+  "message": "operation started",
+  "evidence_ids": ["evidence-1"]
+}

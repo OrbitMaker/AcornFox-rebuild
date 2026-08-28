@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "fixture_root": "tests/fixtures/m1",
+  "fixtures": [
+    {
+      "fixture_id": "static-site",
+      "kind": "static",
+      "path": "static-site",
+      "files": [
+        {"path": "index.html", "size": 393, "sha256": "a58d87c3a7c0a4fad1506ede84cc7f77794929d278ca6732955f330b87844adc"},
+        {"path": "metadata.json", "size": 173, "sha256": "ea591ae4153ddaf2fbb452c266927e996816a1e2c7ff0aced6261ecb90479e41"},
+        {"path": "style.css", "size": 127, "sha256": "1cf83f278b2fb58e4b717c7c63def4b0d0f582d440507fab5ec8a852e7891580"}
+      ]
+    },
+    {
+      "fixture_id": "dockerfile-app",
+      "kind": "dockerfile",
+      "path": "dockerfile-app",
+      "files": [
+        {"path": "Dockerfile", "size": 120, "sha256": "2516906b624381c6444919acbf27cdac1276d7e3d7e22a5e03c4252ee60904df"},
+        {"path": "app.txt", "size": 32, "sha256": "faeab6c5389514520f37ef0c6170574cf7f52c8d12bc822fd443994d7ac3ac2d"},
+        {"path": "metadata.json", "size": 177, "sha256": "827225d8a7401c4cfb6f11eb57168c18ca18ee4c874b8c5116c98eb623f9ddf7"}
+      ]
+    },
+    {
+      "fixture_id": "malicious-traversal",
+      "kind": "archive-metadata",
+      "path": "malicious-traversal",
+      "files": [
+        {"path": "metadata.json", "size": 347, "sha256": "1341fb3cd2df348fa981034875555b3e095a910173499b9e8bba5c637676eaf8"}
+      ]
+    },
+    {
+      "fixture_id": "malicious-symlink",
+      "kind": "archive-metadata",
+      "path": "malicious-symlink",
+      "files": [
+        {"path": "metadata.json", "size": 293, "sha256": "4eed91fd1d3a374326d958971db4809ce915082a3b9119552326a30ab58dae47"}
+      ]
+    },
+    {
+      "fixture_id": "timeout",
+      "kind": "dockerfile",
+      "path": "timeout",
+      "files": [
+        {"path": "Dockerfile", "size": 121, "sha256": "efb557896f12010950d8ecb882df4d981bb0a39eb3e5dedcae02bae3c05a5a3f"},
+        {"path": "metadata.json", "size": 215, "sha256": "896e63338b122611bacca0a78542d14c8ccc04040a691948f6fbd2ad6c2a27b2"}
+      ]
+    },
+    {
+      "fixture_id": "secret-canary",
+      "kind": "redaction-metadata",
+      "path": "secret-canary",
+      "files": [
+        {"path": "metadata.json", "size": 267, "sha256": "05fa61826f7213f87be9d6076e04e2b877edc696c8c99b31271da5f24d57f67f"}
+      ]
+    }
+  ]
+}

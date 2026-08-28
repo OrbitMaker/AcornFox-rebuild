@@ -1,0 +1,6 @@
+{
+  "positive": ["definition_ambiguity_minimal_question", "build_failure_safe_patch_candidate", "log_anomaly_readonly_analysis", "repeated_success_rule_candidate"],
+  "negative": ["disabled", "provider_unavailable", "schema_invalid", "tool_denied", "budget_exceeded", "timeout", "restart_replay", "verification_rollback", "secret_canary", "prompt_injection", "production_action", "core_patch_publish"],
+  "golden_path": {"ai_enabled": false, "required_ai_invocations": 0, "must_continue": true},
+  "e2e": {"production_writes": 0, "external_model_calls": 0, "candidate_only": true, "independent_verification": true}
+}

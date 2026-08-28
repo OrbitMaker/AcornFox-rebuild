@@ -1,0 +1,9 @@
+{
+  "fixture_id": "m3-caddy-routes-invalid-worker-db-v1",
+  "admin": {"listen": "127.0.0.1:2019", "loopback_only": true},
+  "routes": [
+    {"route_id": "route_worker_public", "host": "worker.apps.opencard.test", "path_prefix": "/", "service": "worker", "upstream": "127.0.0.1:18083"},
+    {"route_id": "route_db_public", "host": "db.apps.opencard.test", "path_prefix": "/", "service": "db", "upstream": "127.0.0.1:15432"}
+  ],
+  "expected": {"accepted": false, "error_code": "service_not_entry", "worker_public": false, "db_public": false, "old_routes_preserved": true}
+}

@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "UPGRADE-002",
+      "injection": "migration_transaction_failure",
+      "before": ["current_pointer", "schema_version", "serving_route"],
+      "after": ["current_pointer", "schema_version", "serving_route"],
+      "expected": "candidate_rejected_old_release_startable"
+    },
+    {
+      "id": "UPGRADE-005",
+      "injection": "database_checksum_mismatch",
+      "expected": "restore_rejected_before_replace"
+    },
+    {
+      "id": "INSTALL-002",
+      "injection": "bundle_checksum_mismatch",
+      "expected": "install_rejected_without_activation"
+    },
+    {
+      "id": "REBOOT-RECOVERY-001",
+      "injection": "control_plane_and_agent_restart",
+      "expected": "durable_operations_reconciled_without_duplicate_side_effect"
+    },
+    {
+      "id": "FAULT-RC-001",
+      "injection": "service_restart_or_outbox_replay_interruption",
+      "expected": "bounded_retry_and_single_terminal_side_effect"
+    },
+    {
+      "id": "E2E-RC-001",
+      "injection": "health_command_failure",
+      "expected": "previous_release_and_route_remain_available"
+    },
+    {
+      "id": "REGRESSION-RC-001",
+      "injection": "m0_to_m6_shared_contract_regression",
+      "expected": "prior_gate_contracts_remain_green_without_m7_scope_expansion"
+    },
+    {
+      "id": "HOST-RECLAIM-001",
+      "injection": "reclaim_preflight_mismatch",
+      "expected": "fail_closed_without_host_mutation"
+    }
+  ]
+}

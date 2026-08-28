@@ -1,0 +1,1273 @@
+openapi: 3.0.3
+info:
+  title: Open Card Control Plane API
+  version: 1.1
+  description: >-
+    REST JSON and persistent SSE control-plane endpoints. Product state remains owned by the
+    control plane; provider and agent endpoints are versioned contracts. API clients may send
+    an exact Open-Card-API-Version header or an Open-Card-API-Min-Version and
+    Open-Card-API-Max-Version range. All version headers are optional for backwards
+    compatibility: clients that omit them negotiate the legacy 1.0 contract. Requests with
+    no common supported version receive 426 Upgrade Required.
+servers:
+  - url: /
+paths:
+  /healthz:
+    get:
+      operationId: health
+      responses:
+        '200':
+          description: Process is alive
+  /readyz:
+    get:
+      operationId: readiness
+      responses:
+        '200':
+          description: Process is ready
+        '503':
+          description: Process is not ready
+  /api/v1/applications:
+    parameters:
+      - $ref: '#/components/parameters/APIVersion'
+      - $ref: '#/components/parameters/APIMinVersion'
+      - $ref: '#/components/parameters/APIMaxVersion'
+    get:
+      operationId: listApplications
+      responses:
+        '200':
+          description: Applications
+          headers:
+            Open-Card-API-Version:
+              $ref: '#/components/headers/APINegotiatedVersion'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApplicationList'
+        '426':
+          $ref: '#/components/responses/APIUpgradeRequired'
+    post:
+      operationId: createApplication
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateApplicationRequest'
+      responses:
+        '201':
+          description: Created
+          headers:
+            Open-Card-API-Version:
+              $ref: '#/components/headers/APINegotiatedVersion'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateApplicationResponse'
+        '400':
+          description: Invalid request
+          headers:
+            Open-Card-API-Version:
+              $ref: '#/components/headers/APINegotiatedVersion'
+        '409':
+          description: Idempotency key was reused with different input
+          headers:
+            Open-Card-API-Version:
+              $ref: '#/components/headers/APINegotiatedVersion'
+        '426':
+          $ref: '#/components/responses/APIUpgradeRequired'
+  /api/v1/applications/{applicationId}:
+    parameters:
+      - $ref: '#/components/parameters/ApplicationID'
+      - $ref: '#/components/parameters/APIVersion'
+      - $ref: '#/components/parameters/APIMinVersion'
+      - $ref: '#/components/parameters/APIMaxVersion'
+    get:
+      operationId: getApplication
+      responses:
+        '200':
+          description: Application
+          headers:
+            Open-Card-API-Version:
+              $ref: '#/components/headers/APINegotiatedVersion'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Application'
+        '404':
+          description: Not found
+          headers:
+            Open-Card-API-Version:
+              $ref: '#/components/headers/APINegotiatedVersion'
+        '426':
+          $ref: '#/components/responses/APIUpgradeRequired'
+  /api/v1/applications/{applicationId}/operations:
+    parameters:
+      - $ref: '#/components/parameters/ApplicationID'
+    get:
+      operationId: getApplicationOperations
+      responses:
+        '200':
+          description: Canonical M4 operations facts for this application's default environment.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ApplicationOperationsBrowserFact'}
+        '404': {description: Application or default environment not found}
+        '503': {description: Operations facts are not composed or unavailable}
+    post:
+      operationId: requestApplicationOperationsAction
+      parameters:
+        - $ref: '#/components/parameters/RequiredIdempotencyKey'
+        - {name: Open-Card-Actor, in: header, required: true, schema: {type: string, minLength: 1}}
+        - {name: Open-Card-Role, in: header, required: true, schema: {type: string, enum: [operator]}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ApplicationOperationsActionRequest'}
+      responses:
+        '202':
+          description: Request accepted; UI must await a newer operations fact version.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OperationsActionResponse'}
+        '400': {description: Invalid or incomplete audit request}
+        '403': {description: Operator role required}
+        '409': {description: Stale fact version, active operation, or idempotency conflict}
+        '503': {description: Typed operation not available}
+  /api/v1/applications/{applicationId}/usage:
+    parameters:
+      - $ref: '#/components/parameters/ApplicationID'
+      - $ref: '#/components/parameters/APIVersion'
+      - $ref: '#/components/parameters/APIMinVersion'
+      - $ref: '#/components/parameters/APIMaxVersion'
+    get:
+      operationId: getApplicationUsage
+      description: >-
+        Reads local aggregate usage facts from independent runtime observations. The interval is
+        UTC and half-open [from,to). Ordinary mode is a comprehensible summary; operations mode
+        includes service/release/time trends, actual values, configured limits, and evidence-linked
+        anomalies. No price, plan, order, payment, balance, invoice, or regional claim is returned.
+      parameters:
+        - {name: mode, in: query, schema: {type: string, enum: [normal, operations], default: normal}}
+        - {name: from, in: query, schema: {type: string, format: date-time}}
+        - {name: to, in: query, schema: {type: string, format: date-time}}
+        - {name: service, in: query, schema: {type: string, maxLength: 128}}
+        - {name: release, in: query, schema: {type: string}}
+        - {name: Open-Card-Role, in: header, required: false, schema: {type: string, enum: [operator]}}
+      responses:
+        '200':
+          description: Application-scoped M5 usage facts. AI remains disabled.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ApplicationUsageFact'}
+        '400': {description: Invalid filter or a window longer than 31 days}
+        '403': {description: Operations detail requires operator role}
+        '404': {description: Application not found}
+        '503': {description: Local meter or usage persistence unavailable}
+  /api/v1/applications/{applicationId}/usage/context:
+    parameters:
+      - $ref: '#/components/parameters/ApplicationID'
+    get:
+      operationId: getAuthorizedUsageSummaryContext
+      description: >-
+        Optional aggregate-only query surface for a future controlled AI caller. It is disabled by
+        default, requires operator authorization, and never returns raw observations.
+      parameters:
+        - {name: Open-Card-Role, in: header, required: true, schema: {type: string, enum: [operator]}}
+        - {name: from, in: query, schema: {type: string, format: date-time}}
+        - {name: to, in: query, schema: {type: string, format: date-time}}
+      responses:
+        '200': {description: Authorized aggregate-only usage context}
+        '403': {description: Disabled by default or operator role missing}
+        '503': {description: Local usage facts unavailable}
+  /api/v1/applications/{applicationId}/ai/interventions:
+    parameters:
+      - $ref: '#/components/parameters/ApplicationID'
+    get:
+      operationId: listApplicationAIInterventions
+      description: AI intervention analysis embedded in operations. It is not a release or runtime success source.
+      parameters:
+        - {name: mode, in: query, schema: {type: string, enum: [ordinary, operator], default: ordinary}}
+        - {name: Open-Card-Role, in: header, required: false, schema: {type: string, enum: [operator]}}
+      responses:
+        '200': {description: Ordinary summary or redacted operator ledger, content: {application/json: {schema: {$ref: '#/components/schemas/AIInterventionView'}}}}
+        '403': {description: Operator detail requires operator role}
+        '503': {description: Controlled AI composition unavailable}
+    post:
+      operationId: requestApplicationAIIntervention
+      description: Explicitly requests controlled fallback after a rule miss/conflict/failure. Production changes are never executed here.
+      parameters:
+        - $ref: '#/components/parameters/RequiredIdempotencyKey'
+        - {name: Open-Card-Actor, in: header, required: true, schema: {type: string, minLength: 1}}
+        - {name: Open-Card-Role, in: header, required: true, schema: {type: string, enum: [operator]}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AIInterventionRequest'}
+      responses:
+        '202': {description: Bounded intervention accepted; completion still requires independent verification}
+        '200': {description: Disabled/manual/confirmation/controller-handoff response; no action claimed successful}
+        '400': {description: Invalid task, expected version, or audit reason}
+        '403': {description: Operator role required or policy denied}
+        '409': {description: Stale fact version or idempotency conflict}
+        '503': {description: Controlled AI unavailable; deterministic/manual paths remain available}
+  /api/v1/settings/ai:
+    get:
+      operationId: getAIServiceSettings
+      parameters:
+        - {name: Open-Card-Role, in: header, required: true, schema: {type: string, enum: [operator]}}
+      responses:
+        '200': {description: Versioned controlled AI service settings, content: {application/json: {schema: {$ref: '#/components/schemas/AIServiceSettings'}}}}
+        '403': {description: Operator role required}
+        '503': {description: AI settings persistence unavailable}
+    put:
+      operationId: updateAIServiceSettings
+      parameters:
+        - $ref: '#/components/parameters/RequiredIdempotencyKey'
+        - {name: Open-Card-Actor, in: header, required: true, schema: {type: string, minLength: 1}}
+        - {name: Open-Card-Role, in: header, required: true, schema: {type: string, enum: [operator]}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AIServiceSettingsUpdate'}
+      responses:
+        '200': {description: Persisted settings fact; provider health is not optimistically inferred, content: {application/json: {schema: {$ref: '#/components/schemas/AIServiceSettings'}}}}
+        '400': {description: Invalid profile, scope, or budget}
+        '403': {description: Operator role required}
+        '409': {description: Stale version or idempotency conflict}
+  /api/v1/applications/{applicationId}/webhooks:
+    parameters:
+      - $ref: '#/components/parameters/ApplicationID'
+    post:
+      operationId: configureApplicationWebhook
+      description: Stores a canonical HTTPS endpoint and opaque SecretReference only; no signing material is accepted or returned.
+      parameters:
+        - $ref: '#/components/parameters/RequiredIdempotencyKey'
+        - {name: Open-Card-Actor, in: header, required: true, schema: {type: string, minLength: 1}}
+        - {name: Open-Card-Role, in: header, required: true, schema: {type: string, enum: [operator]}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/WebhookConfigurationRequest'}
+      responses:
+        '201':
+          description: Endpoint configured. Delivery remains asynchronous and durable.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/WebhookConfigurationResponse'}
+        '400': {description: Unsafe URL, unsupported event type, or invalid opaque secret reference}
+        '403': {description: Operator role required}
+        '503': {description: M4 webhook composition unavailable}
+  /api/v1/applications/{applicationId}/logs:
+    parameters:
+      - $ref: '#/components/parameters/ApplicationID'
+    get:
+      operationId: queryApplicationLogs
+      description: Ordinary callers receive summaries only. Operators may query persisted redacted build/runtime/audit logs.
+      parameters:
+        - {name: Open-Card-Role, in: header, required: false, schema: {type: string, enum: [operator]}}
+        - {name: category, in: query, schema: {type: string, enum: [build, runtime, audit]}}
+        - {name: service, in: query, schema: {type: string}}
+        - {name: release_id, in: query, schema: {type: string}}
+        - {name: level, in: query, schema: {type: string, enum: [debug, info, warn, error]}}
+        - {name: since, in: query, schema: {type: string, format: date-time}}
+        - {name: until, in: query, schema: {type: string, format: date-time}}
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 100}}
+      responses:
+        '200': {description: Summary or operator log query result}
+        '400': {description: Invalid query}
+        '503': {description: M4 log composition unavailable}
+  /api/v1/applications/{applicationId}/webhooks/{webhookId}/test:
+    parameters:
+      - $ref: '#/components/parameters/ApplicationID'
+      - {name: webhookId, in: path, required: true, schema: {type: string, minLength: 1}}
+    post:
+      operationId: testApplicationWebhook
+      description: Queues a signed, redacted occurrence test through the durable ledger; it does not synchronously disclose secret material or receiver response bodies.
+      parameters:
+        - $ref: '#/components/parameters/RequiredIdempotencyKey'
+        - {name: Open-Card-Actor, in: header, required: true, schema: {type: string, minLength: 1}}
+        - {name: Open-Card-Role, in: header, required: true, schema: {type: string, enum: [operator]}}
+      responses:
+        '202':
+          description: Test delivery reserved for the durable worker.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/WebhookTestResponse'}
+        '400': {description: Invalid endpoint ID or request identity}
+        '403': {description: Operator role required}
+        '404': {description: Webhook endpoint or default environment not found}
+        '503': {description: M4 webhook composition unavailable}
+  /api/v1/service-groups/{serviceGroupId}/releases:
+    parameters:
+      - $ref: '#/components/parameters/ServiceGroupID'
+    post:
+      operationId: createServiceGroupRelease
+      description: >-
+        Creates one immutable, digest-only ServiceGroup Release from a persisted SourceRevision.
+        A prebuilt image that already contains a registry authority must use exactly the
+        same authority as its supplied registry endpoint; authorities are never rewritten
+        or redirected. Build, registry, Release, and runtime side effects are absent when
+        this request is rejected.
+      parameters:
+        - $ref: '#/components/parameters/RequiredIdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ServiceGroupReleaseRequest'}
+      responses:
+        '201':
+          description: Immutable Release persisted with a canonical digest.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ServiceGroupReleaseResponse'}
+        '400':
+          description: >-
+            Invalid source, immutable identity, registry endpoint, or mismatched prebuilt
+            image authority. The response is structured and side-effect free.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/APIError'}
+        '403':
+          description: Registry credential or provider boundary denied the request.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/APIError'}
+        '409':
+          description: Capacity or idempotency conflict.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/APIError'}
+        '503':
+          description: Required provider is unavailable or timed out.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/APIError'}
+  /api/v1/events:
+    parameters:
+      - $ref: '#/components/parameters/APIVersion'
+      - $ref: '#/components/parameters/APIMinVersion'
+      - $ref: '#/components/parameters/APIMaxVersion'
+    get:
+      operationId: streamEvents
+      description: Server-sent events stream with stable event IDs and a 24-hour persistent replay window.
+      parameters:
+        - in: header
+          name: Last-Event-ID
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Event stream
+          headers:
+            Open-Card-API-Version:
+              $ref: '#/components/headers/APINegotiatedVersion'
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        '426':
+          $ref: '#/components/responses/APIUpgradeRequired'
+  /api/v1/operations/{operationId}/events:
+    parameters:
+      - name: operationId
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/APIVersion'
+      - $ref: '#/components/parameters/APIMinVersion'
+      - $ref: '#/components/parameters/APIMaxVersion'
+    get:
+      operationId: streamOperationEvents
+      description: Server-sent events for one operation with Last-Event-ID replay.
+      parameters:
+        - in: header
+          name: Last-Event-ID
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Operation event stream
+          headers:
+            Open-Card-API-Version:
+              $ref: '#/components/headers/APINegotiatedVersion'
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        '426':
+          $ref: '#/components/responses/APIUpgradeRequired'
+  /api/v1/access/ip-fallback:
+    post:
+      operationId: createIPFallback
+      parameters: [{$ref: '#/components/parameters/RequiredIdempotencyKey'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/IPFallbackRequest'}
+      responses:
+        '201':
+          description: System-assigned IP and port fallback is available without claiming HTTPS.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AccessStateResponse'}
+        '400': {description: Invalid or non-runtime-ready target}
+        '403': {description: Service is not an explicit route target}
+  /api/v1/access/platform-domains:
+    post:
+      operationId: bindPlatformDomain
+      parameters: [{$ref: '#/components/parameters/RequiredIdempotencyKey'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [base_domain, dns_target]
+              properties:
+                base_domain: {type: string}
+                dns_target: {type: string}
+      responses:
+        '201':
+          description: Platform DNS and isolated wildcard certificate are verified.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DomainBindingResponse'}
+        '409': {description: DNS or certificate verification failed; IP fallback remains available}
+  /api/v1/access/application-domains:
+    post:
+      operationId: bindApplicationDomain
+      parameters: [{$ref: '#/components/parameters/RequiredIdempotencyKey'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [application_id, host, cname_target]
+              properties:
+                application_id: {type: string}
+                host: {type: string}
+                cname_target: {type: string}
+      responses:
+        '201':
+          description: CNAME and isolated application certificate are verified.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DomainBindingResponse'}
+        '409': {description: CNAME or certificate failed; no route was enabled}
+  /api/v1/access/domain-routes:
+    post:
+      operationId: applyDomainRoutes
+      parameters: [{$ref: '#/components/parameters/RequiredIdempotencyKey'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DomainRoutesRequest'}
+      responses:
+        '201':
+          description: Verified longest-prefix routes were atomically loaded.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AccessStateResponse'}
+        '403': {description: Worker or database target is not routable}
+        '409': {description: Domain/path conflict or unverified domain/certificate}
+  /api/v1/access/platform-application-domains:
+    post:
+      operationId: createPlatformApplicationDomain
+      parameters: [{$ref: '#/components/parameters/RequiredIdempotencyKey'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [application_id, application_name, platform]
+              properties:
+                application_id: {type: string}
+                application_name: {type: string}
+                platform: {$ref: '#/components/schemas/DomainBinding'}
+      responses:
+        '201': {description: Stable slug plus short-ID platform hostname was created}
+        '409': {description: Platform domain or wildcard certificate is not ready}
+  /api/v1/access/certificates/renew:
+    post:
+      operationId: renewCertificate
+      parameters: [{$ref: '#/components/parameters/RequiredIdempotencyKey'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [application_id, certificate]
+              properties:
+                application_id: {type: string}
+                certificate: {$ref: '#/components/schemas/CertificateReference'}
+      responses:
+        '201': {description: Replacement certificate reference is ready}
+        '503': {description: Renewal failed; current route and IP fallback remain active}
+  /api/v1/access/traffic-switches:
+    post:
+      operationId: switchTraffic
+      parameters: [{$ref: '#/components/parameters/RequiredIdempotencyKey'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [application_id, old, candidate, health_url, observation_url, window_ms]
+              properties:
+                application_id: {type: string}
+                old: {type: array, minItems: 1, items: {$ref: '#/components/schemas/DesiredRoute'}}
+                candidate: {type: array, minItems: 1, items: {$ref: '#/components/schemas/DesiredRoute'}}
+                health_url: {type: string, description: Loopback HTTP URL only}
+                observation_url: {type: string, description: Loopback HTTP URL only}
+                window_ms: {type: integer, minimum: 0, maximum: 10000}
+      responses:
+        '202': {description: Candidate remained healthy through the observation window}
+        '400': {description: Non-loopback probe or invalid request}
+        '503': {description: Candidate failed; old routes remain serving}
+  /api/v1/operations/views/{applicationId}:
+    get:
+      operationId: getApplicationOperationsView
+      parameters:
+        - $ref: '#/components/parameters/ApplicationID'
+        - {name: environment_id, in: query, required: true, schema: {type: string}}
+        - {name: mode, in: query, required: false, schema: {type: string, enum: [ordinary, operator], default: ordinary}}
+        - {name: X-Open-Card-Role, in: header, required: false, schema: {type: string, enum: [operator]}}
+      responses:
+        '200':
+          description: Both projections carry one control-plane fact version and observation time.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OperationsViewResponse'}
+        '403': {description: Operator projection requires operator role}
+        '503': {description: Stored operation facts are unavailable or invalid}
+  /api/v1/operations/{action}:
+    post:
+      operationId: requestApplicationOperation
+      parameters:
+        - {name: action, in: path, required: true, schema: {type: string, enum: [restart, redeploy, rollback]}}
+        - $ref: '#/components/parameters/RequiredIdempotencyKey'
+        - {name: X-Open-Card-Actor, in: header, required: true, schema: {type: string, minLength: 1}}
+        - {name: X-Open-Card-Role, in: header, required: true, schema: {type: string, enum: [operator]}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/OperationsActionRequest'}
+      responses:
+        '202':
+          description: Typed operation completed through durable audit and outbox boundaries.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OperationsActionResponse'}
+        '400': {description: Invalid operation request}
+        '403': {description: Operator role is required}
+        '409': {description: Active operation, stale fact version, or idempotency conflict}
+        '503': {description: Runtime operation failed; latest usable deployment remains the recovery target}
+components:
+  parameters:
+    APIVersion:
+      name: Open-Card-API-Version
+      in: header
+      required: false
+      description: >-
+        Request an exact API version. This header is mutually exclusive with the minimum and
+        maximum version range headers. If all version headers are omitted, API version 1.0 is
+        negotiated for legacy clients.
+      schema:
+        type: string
+        pattern: '^v?[0-9]+(\.[0-9]+)?$'
+    APIMinVersion:
+      name: Open-Card-API-Min-Version
+      in: header
+      required: false
+      description: Lowest API version accepted by the client. Use with Open-Card-API-Max-Version.
+      schema:
+        type: string
+        pattern: '^v?[0-9]+(\.[0-9]+)?$'
+    APIMaxVersion:
+      name: Open-Card-API-Max-Version
+      in: header
+      required: false
+      description: Highest API version accepted by the client. Use with Open-Card-API-Min-Version.
+      schema:
+        type: string
+        pattern: '^v?[0-9]+(\.[0-9]+)?$'
+    ApplicationID:
+      name: applicationId
+      in: path
+      required: true
+      schema:
+        type: string
+    ServiceGroupID:
+      name: serviceGroupId
+      in: path
+      required: true
+      schema:
+        type: string
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: Stable retry key. Reuse with different input is rejected.
+      schema:
+        type: string
+        minLength: 1
+    RequiredIdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema:
+        type: string
+        minLength: 1
+  headers:
+    APINegotiatedVersion:
+      description: API version selected for this request and response.
+      schema:
+        type: string
+        pattern: '^[0-9]+\.[0-9]+$'
+  responses:
+    APIUpgradeRequired:
+      description: No common API version is available for the requested range.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/APIError'
+  schemas:
+    APIError:
+      type: object
+      required: [code, message]
+      additionalProperties: false
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+    Application:
+      type: object
+      required: [id, name, created_at, updated_at]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    ApplicationList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Application'
+    CreateApplicationResponse:
+      type: object
+      required: [application, operation_id]
+      properties:
+        application:
+          $ref: '#/components/schemas/Application'
+        operation_id:
+          type: string
+    CreateApplicationRequest:
+      type: object
+      required: [name]
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          minLength: 1
+    ServiceGroupRegistryInput:
+      type: object
+      additionalProperties: false
+      required: [endpoint]
+      properties:
+        endpoint:
+          type: string
+          format: uri
+          description: >-
+            HTTPS registry endpoint, or a loopback-only HTTP fixture endpoint. For an
+            already-qualified prebuilt image, its registry authority must exactly match.
+        secret_ref:
+          $ref: '#/components/schemas/OpaqueSecretReference'
+    ServiceGroupReleaseRequest:
+      type: object
+      additionalProperties: false
+      required: [source_revision_id, version]
+      properties:
+        source_revision_id: {type: string, minLength: 1}
+        version: {type: integer, minimum: 1}
+        registries:
+          type: array
+          maxItems: 1
+          items: {$ref: '#/components/schemas/ServiceGroupRegistryInput'}
+    ServiceGroupRelease:
+      type: object
+      additionalProperties: false
+      required: [id, application_id, service_group_id, version, config_digest, service_digests, status, immutable, created_at]
+      properties:
+        id: {type: string}
+        application_id: {type: string}
+        service_group_id: {type: string}
+        version: {type: integer, minimum: 1}
+        config_digest: {type: string, pattern: '^sha256:[0-9a-f]{64}$'}
+        service_digests:
+          type: object
+          additionalProperties:
+            type: object
+            additionalProperties: false
+            required: [repository, digest]
+            properties:
+              repository: {type: string, minLength: 1}
+              digest: {type: string, pattern: '^sha256:[0-9a-f]{64}$'}
+              resolved_tag: {type: string}
+        status: {type: string, enum: [ready]}
+        immutable: {type: boolean, enum: [true]}
+        created_at: {type: string, format: date-time}
+    ServiceGroupReleaseResponse:
+      type: object
+      additionalProperties: false
+      required: [release, canonical_digest]
+      properties:
+        release: {$ref: '#/components/schemas/ServiceGroupRelease'}
+        canonical_digest: {type: string, pattern: '^sha256:[0-9a-f]{64}$'}
+    RouteTarget:
+      type: object
+      additionalProperties: false
+      required: [application_id, deployment_id, service_name, port, path, routable]
+      properties:
+        application_id: {type: string}
+        deployment_id: {type: string}
+        service_name: {type: string}
+        port: {type: integer, minimum: 1, maximum: 65535}
+        path: {type: string, pattern: '^/'}
+        routable: {type: boolean}
+    RouteFact:
+      type: object
+      additionalProperties: false
+      required: [id, application_id, deployment_id, service_name, host, path, verified, serving, created_at]
+      properties:
+        id: {type: string}
+        application_id: {type: string}
+        deployment_id: {type: string}
+        service_name: {type: string}
+        host: {type: string}
+        path: {type: string}
+        certificate_ref: {type: string}
+        verified: {type: boolean}
+        serving: {type: boolean}
+        created_at: {type: string, format: date-time}
+    DesiredRoute:
+      type: object
+      additionalProperties: false
+      required: [route, port]
+      properties:
+        route: {$ref: '#/components/schemas/RouteFact'}
+        port: {type: integer, minimum: 1, maximum: 65535}
+    IPFallbackRequest:
+      allOf:
+        - {$ref: '#/components/schemas/RouteTarget'}
+        - type: object
+          required: [server_ip, runtime_ready]
+          properties:
+            server_ip: {type: string}
+            runtime_ready: {type: boolean}
+    DomainBinding:
+      type: object
+      additionalProperties: false
+      required: [id, kind, host, status, created_at, updated_at]
+      properties:
+        id: {type: string}
+        kind: {type: string, enum: [platform, application]}
+        application_id: {type: string}
+        platform_domain_id: {type: string}
+        managed: {type: boolean}
+        host: {type: string}
+        expected_cname: {type: string}
+        status: {type: string, enum: [pending, verifying, verified, certificate_pending, ready, failed]}
+        certificate_ref: {type: string}
+        failure_reason: {type: string}
+        verified_at: {type: string, format: date-time}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+    CertificateReference:
+      type: object
+      additionalProperties: false
+      required: [id, domain_binding_id, host, secret_ref, status, updated_at]
+      properties:
+        id: {type: string}
+        domain_binding_id: {type: string}
+        host: {type: string}
+        secret_ref:
+          type: object
+          description: Opaque reference only; private material is never returned.
+        status: {type: string, enum: [pending, ready, renewing, failed]}
+        fingerprint: {type: string}
+        not_before: {type: string, format: date-time}
+        not_after: {type: string, format: date-time}
+        renew_after: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+    AccessState:
+      type: object
+      required: [runtime_ready, ip_available, https_ready, serving, serving_old_release, message]
+      properties:
+        application_id: {type: string}
+        deployment_id: {type: string}
+        runtime_ready: {type: boolean}
+        ip_available: {type: boolean}
+        ip_address: {type: string}
+        domain_status: {type: string}
+        domain: {type: string}
+        https_ready: {type: boolean}
+        serving: {type: boolean}
+        serving_old_release: {type: boolean}
+        message: {type: string}
+    AccessStateResponse:
+      type: object
+      required: [access_state]
+      properties:
+        access_state: {$ref: '#/components/schemas/AccessState'}
+    DomainBindingResponse:
+      type: object
+      required: [binding, certificate, access_state]
+      properties:
+        binding: {$ref: '#/components/schemas/DomainBinding'}
+        certificate: {$ref: '#/components/schemas/CertificateReference'}
+        access_state: {$ref: '#/components/schemas/AccessState'}
+    DomainRoutesRequest:
+      type: object
+      additionalProperties: false
+      required: [binding, certificate, targets, runtime_ready]
+      properties:
+        binding: {$ref: '#/components/schemas/DomainBinding'}
+        certificate: {$ref: '#/components/schemas/CertificateReference'}
+        targets:
+          type: array
+          minItems: 1
+          items: {$ref: '#/components/schemas/RouteTarget'}
+        runtime_ready: {type: boolean}
+    ResourceObservation:
+      type: object
+      additionalProperties: false
+      required: [cpu_cores, memory_bytes, disk_bytes, network_rx_bytes, network_tx_bytes, restart_count, pids_current, applied_cpu_millicores, applied_memory_bytes, applied_pids, changed_path_count, cgroup_verified, metrics_known]
+      properties:
+        container_id: {type: string}
+        cpu_cores: {type: number, minimum: 0}
+        memory_bytes: {type: integer, format: int64, minimum: 0}
+        disk_bytes: {type: integer, format: int64, minimum: 0}
+        network_rx_bytes: {type: integer, format: int64, minimum: 0}
+        network_tx_bytes: {type: integer, format: int64, minimum: 0}
+        restart_count: {type: integer, format: int64, minimum: 0}
+        pids_current: {type: integer, format: int64, minimum: 0}
+        applied_cpu_millicores: {type: integer, format: int64, minimum: 0}
+        applied_memory_bytes: {type: integer, format: int64, minimum: 0}
+        applied_pids: {type: integer, format: int64, minimum: 0}
+        changed_path_count: {type: integer, format: int64, minimum: 0}
+        cgroup_verified: {type: boolean}
+        metrics_known: {type: boolean}
+        host_port: {type: integer, minimum: 0, maximum: 65535}
+    ServiceOperationsFact:
+      type: object
+      additionalProperties: false
+      required: [name, role, deployment_id, release_id, status, healthy, required, impact, actual, observed_at]
+      properties:
+        name: {type: string}
+        role: {type: string, enum: [ingress, worker, stateful, one_shot]}
+        deployment_id: {type: string}
+        release_id: {type: string}
+        status: {type: string}
+        healthy: {type: boolean}
+        required: {type: boolean}
+        impact: {type: string}
+        next_action: {type: string}
+        actual: {$ref: '#/components/schemas/ResourceObservation'}
+        observed_at: {type: string, format: date-time}
+    ApplicationOperationsView:
+      type: object
+      additionalProperties: false
+      required: [version, application_id, environment_id, release_id, state, summary, services, allowed_actions, data_notice, ai_status, observed_at]
+      properties:
+        version: {type: string}
+        application_id: {type: string}
+        environment_id: {type: string}
+        release_id: {type: string}
+        state: {type: string, enum: [healthy, attention, partial, stopped]}
+        summary: {type: string}
+        services: {type: array, items: {$ref: '#/components/schemas/ServiceOperationsFact'}}
+        allowed_actions:
+          type: object
+          required: [restart_services, redeploy, rollback, rollback_data]
+          properties:
+            restart_services: {type: array, items: {type: string}}
+            redeploy: {type: boolean}
+            rollback: {type: boolean}
+            rollback_data: {type: boolean, enum: [false]}
+        data_notice: {type: string}
+        ai_status: {type: string, enum: [disabled, unavailable]}
+        observed_at: {type: string, format: date-time}
+    OrdinaryOperationsView:
+      type: object
+      additionalProperties: false
+      required: [version, application_id, state, summary, impacts, next_actions, observed_at]
+      properties:
+        version: {type: string}
+        application_id: {type: string}
+        state: {type: string, enum: [healthy, attention, partial, stopped]}
+        summary: {type: string}
+        impacts: {type: array, items: {type: string}}
+        next_actions: {type: array, items: {type: string}}
+        observed_at: {type: string, format: date-time}
+    OperationsViewResponse:
+      type: object
+      required: [mode, facts]
+      properties:
+        mode: {type: string, enum: [ordinary, operator]}
+        facts:
+          oneOf:
+            - {$ref: '#/components/schemas/OrdinaryOperationsView'}
+            - {$ref: '#/components/schemas/ApplicationOperationsView'}
+    OperationsActionRequest:
+      type: object
+      additionalProperties: false
+      required: [application_id, environment_id, expected_version, reason]
+      properties:
+        application_id: {type: string}
+        environment_id: {type: string}
+        expected_version: {type: string, minLength: 1}
+        reason: {type: string, minLength: 1}
+    OperationsActionResult:
+      type: object
+      required: [operation, action, scope, deployment, rollback_data, data_notice, kept_last_usable]
+      properties:
+        operation: {type: object}
+        action: {type: string, enum: [service_restart, application_restart, redeploy, rollback]}
+        scope: {type: string, enum: [service, application]}
+        service_name: {type: string}
+        release_id: {type: string}
+        deployment: {type: object}
+        rollback_data: {type: boolean, enum: [false]}
+        data_notice: {type: string}
+        kept_last_usable: {type: boolean}
+        evidence: {type: array, items: {type: object}}
+    OperationsActionResponse:
+      type: object
+      required: [operation]
+      properties:
+        operation: {$ref: '#/components/schemas/OperationsActionResult'}
+    ApplicationOperationsService:
+      type: object
+      additionalProperties: false
+      required: [id, name, health, required, resources]
+      properties:
+        id: {type: string}
+        name: {type: string}
+        health: {type: string, enum: [healthy, degraded, unhealthy, unknown]}
+        required: {type: boolean}
+        release_id: {type: string}
+        exit_reason: {type: string}
+        resources:
+          type: object
+          required: [cpu_millicores, memory_bytes, disk_bytes, network_rx_bytes, network_tx_bytes, restart_count, pids_current, applied_cpu_millicores, applied_memory_bytes, applied_pids, changed_path_count, cgroup_verified, metrics_known]
+          properties:
+            cpu_millicores: {type: integer, minimum: 0}
+            memory_bytes: {type: integer, format: int64, minimum: 0}
+            disk_bytes: {type: integer, format: int64, minimum: 0}
+            network_rx_bytes: {type: integer, format: int64, minimum: 0}
+            network_tx_bytes: {type: integer, format: int64, minimum: 0}
+            restart_count: {type: integer, format: int64, minimum: 0}
+            pids_current: {type: integer, format: int64, minimum: 0}
+            applied_cpu_millicores: {type: integer, format: int64, minimum: 0}
+            applied_memory_bytes: {type: integer, format: int64, minimum: 0}
+            applied_pids: {type: integer, format: int64, minimum: 0}
+            changed_path_count: {type: integer, format: int64, minimum: 0}
+            cgroup_verified: {type: boolean}
+            metrics_known: {type: boolean}
+    ApplicationOperationsBrowserFact:
+      type: object
+      additionalProperties: false
+      required: [version, observed_at, application_id, application_name, serving, impact, next_step, services, actions, data_rollback_supported]
+      properties:
+        version: {type: string}
+        observed_at: {type: string, format: date-time}
+        application_id: {type: string}
+        application_name: {type: string}
+        serving: {type: boolean}
+        impact: {type: string}
+        next_step: {type: string}
+        services: {type: array, items: {$ref: '#/components/schemas/ApplicationOperationsService'}}
+        actions:
+          type: array
+          items:
+            type: object
+            required: [action, status, enabled]
+            properties:
+              action: {type: string, enum: [restart, redeploy, rollback]}
+              status: {type: string, enum: [idle, pending, running, succeeded, failed, blocked]}
+              target_service_id: {type: string}
+              operation_id: {type: string}
+              message: {type: string}
+              enabled: {type: boolean}
+        data_rollback_supported: {type: boolean, enum: [false]}
+    ApplicationOperationsActionRequest:
+      type: object
+      additionalProperties: false
+      required: [action, expected_version, reason]
+      properties:
+        action: {type: string, enum: [restart, redeploy, rollback]}
+        target_service_id: {type: string}
+        expected_version: {type: string, minLength: 1}
+        reason: {type: string, minLength: 1}
+    UsageMeasurement:
+      type: object
+      additionalProperties: false
+      required: [actual, limit, unit]
+      properties:
+        actual: {type: number, minimum: 0}
+        limit: {type: number, minimum: 0, description: Zero means no configured limit fact is available.}
+        unit: {type: string, enum: [mCPU, B]}
+    UsageResourceMeasurements:
+      type: object
+      additionalProperties: false
+      required: [cpu, memory, disk, network]
+      properties:
+        cpu: {$ref: '#/components/schemas/UsageMeasurement'}
+        memory: {$ref: '#/components/schemas/UsageMeasurement'}
+        disk: {$ref: '#/components/schemas/UsageMeasurement'}
+        network: {$ref: '#/components/schemas/UsageMeasurement'}
+    UsageTrendPoint:
+      allOf:
+        - {$ref: '#/components/schemas/UsageResourceMeasurements'}
+        - type: object
+          required: [observed_at]
+          properties:
+            observed_at: {type: string, format: date-time}
+    UsageAnomaly:
+      type: object
+      additionalProperties: false
+      required: [id, observed_at, severity, summary]
+      properties:
+        id: {type: string}
+        observed_at: {type: string, format: date-time}
+        severity: {type: string, enum: [info, warning, critical]}
+        summary: {type: string}
+        related_service_id: {type: string}
+        related_release_id: {type: string}
+    UsageServiceFact:
+      type: object
+      additionalProperties: false
+      required: [id, name, release_id, runtime, started_at, actual, average, peak, configured, trend, anomalies]
+      properties:
+        id: {type: string}
+        name: {type: string}
+        release_id: {type: string}
+        runtime: {type: string}
+        started_at: {type: string, format: date-time}
+        actual: {$ref: '#/components/schemas/UsageResourceMeasurements'}
+        average: {$ref: '#/components/schemas/UsageResourceMeasurements'}
+        peak: {$ref: '#/components/schemas/UsageResourceMeasurements'}
+        configured: {$ref: '#/components/schemas/UsageResourceMeasurements'}
+        trend: {type: array, items: {$ref: '#/components/schemas/UsageTrendPoint'}}
+        anomalies: {type: array, items: {$ref: '#/components/schemas/UsageAnomaly'}}
+    ApplicationUsageFact:
+      type: object
+      additionalProperties: false
+      required: [version, observed_at, application_id, application_name, services, anomalies, ai]
+      properties:
+        version: {type: string, pattern: '^usage-v1:[0-9a-f]{24}$'}
+        observed_at: {type: string, format: date-time}
+        application_id: {type: string}
+        application_name: {type: string}
+        services: {type: array, items: {$ref: '#/components/schemas/UsageServiceFact'}}
+        anomalies: {type: array, items: {$ref: '#/components/schemas/UsageAnomaly'}}
+        ai: {type: string, enum: [disabled]}
+    AIPlanBudget:
+      type: object
+      additionalProperties: false
+      required: [max_tokens, max_duration_ms, max_actions]
+      properties:
+        max_tokens: {type: integer, minimum: 1}
+        max_duration_ms: {type: integer, format: int64, minimum: 1}
+        max_actions: {type: integer, minimum: 1}
+    AIAction:
+      type: object
+      additionalProperties: false
+      required: [tool_id, tool_version, risk, expected_result, validation_id]
+      properties:
+        tool_id: {type: string}
+        tool_version: {type: string}
+        parameters: {type: object, description: Redacted parameters accepted only after catalog schema validation}
+        risk: {type: string, enum: [R0, R1, R2, R3]}
+        expected_result: {type: string}
+        validation_id: {type: string}
+    AIActionPlan:
+      type: object
+      additionalProperties: false
+      required: [id, schema_version, policy_version, task_type, target_refs, sources, evidence_refs, actions, budget, confidence, requires_user_confirmation]
+      properties:
+        id: {type: string}
+        schema_version: {type: string, enum: ['1.0']}
+        policy_version: {type: string}
+        task_type: {type: string}
+        target_refs: {type: object, additionalProperties: {type: string}}
+        sources: {type: array, minItems: 1, items: {type: string}}
+        assumptions: {type: array, items: {type: string}}
+        evidence_refs: {type: array, minItems: 1, items: {type: object}}
+        actions: {type: array, minItems: 1, items: {$ref: '#/components/schemas/AIAction'}}
+        budget: {$ref: '#/components/schemas/AIPlanBudget'}
+        rollback_id: {type: string}
+        confidence: {type: number, minimum: 0, maximum: 1}
+        requires_user_confirmation: {type: boolean}
+    AIInterventionFact:
+      type: object
+      additionalProperties: false
+      required: [id, application_id, task_type, status, reason, summary, suggestion, requires_user_action, controller_handoff, rolled_back, created_at]
+      properties:
+        id: {type: string}
+        application_id: {type: string}
+        task_type: {type: string}
+        status: {type: string, enum: [manual_fallback, awaiting_confirmation, controller_handoff, running, succeeded, failed, rolled_back]}
+        reason: {type: string}
+        summary: {type: string}
+        suggestion: {type: string}
+        requires_user_action: {type: boolean}
+        controller_handoff: {type: boolean}
+        provider: {type: string}
+        model: {type: string}
+        profile: {type: string, enum: [china, global, local, disabled]}
+        context_manifest_digest: {type: string}
+        plan: {$ref: '#/components/schemas/AIActionPlan'}
+        evidence: {type: array, items: {type: object}}
+        tokens: {type: integer, format: int64, minimum: 0}
+        duration_ms: {type: integer, format: int64, minimum: 0}
+        rolled_back: {type: boolean}
+        rule_candidate_id: {type: string}
+        created_at: {type: string, format: date-time}
+    AIInterventionView:
+      type: object
+      additionalProperties: false
+      required: [version, mode, ai_status, items, success_count, failure_count, rollback_count, candidate_count, total_tokens, total_duration_ms]
+      properties:
+        version: {type: string}
+        mode: {type: string, enum: [ordinary, operator]}
+        ai_status: {type: string, enum: [disabled, unavailable, available]}
+        items: {type: array, items: {$ref: '#/components/schemas/AIInterventionFact'}}
+        success_count: {type: integer, minimum: 0}
+        failure_count: {type: integer, minimum: 0}
+        rollback_count: {type: integer, minimum: 0}
+        candidate_count: {type: integer, minimum: 0}
+        total_tokens: {type: integer, format: int64, minimum: 0}
+        total_duration_ms: {type: integer, format: int64, minimum: 0}
+    AIInterventionRequest:
+      type: object
+      additionalProperties: false
+      required: [task_type, reason, expected_version, confirmed]
+      properties:
+        task_type: {type: string, enum: [definition_ambiguity, build_failure_diagnosis, log_anomaly_analysis, usage_analysis]}
+        reason: {type: string, minLength: 1}
+        expected_version: {type: string, minLength: 1}
+        confirmed: {type: boolean}
+    AIServiceSettings:
+      type: object
+      additionalProperties: false
+      required: [version, enabled, status, profile, provider, model, data_scopes, max_tokens, max_duration_ms, cooldown_seconds, cache_enabled, external_calls]
+      properties:
+        version: {type: string}
+        enabled: {type: boolean}
+        status: {type: string, enum: [disabled, unavailable, available]}
+        profile: {type: string, enum: [china, global, local, disabled]}
+        provider: {type: string}
+        model: {type: string}
+        data_scopes: {type: array, items: {type: string, enum: [definition_summary, source_excerpt, build_log_summary, operations_summary, usage_aggregate]}}
+        max_tokens: {type: integer, minimum: 1}
+        max_duration_ms: {type: integer, format: int64, minimum: 1}
+        cooldown_seconds: {type: integer, format: int64, minimum: 0}
+        cache_enabled: {type: boolean}
+        external_calls: {type: boolean, description: False for the deterministic M6 acceptance provider.}
+    AIServiceSettingsUpdate:
+      type: object
+      additionalProperties: false
+      required: [expected_version, enabled, profile, provider, model, data_scopes, max_tokens, max_duration_ms, cooldown_seconds, cache_enabled]
+      properties:
+        expected_version: {type: string, minLength: 1}
+        enabled: {type: boolean}
+        profile: {type: string, enum: [china, global, local, disabled]}
+        provider: {type: string}
+        model: {type: string}
+        data_scopes: {type: array, items: {type: string}}
+        max_tokens: {type: integer, minimum: 1}
+        max_duration_ms: {type: integer, format: int64, minimum: 1}
+        cooldown_seconds: {type: integer, format: int64, minimum: 0}
+        cache_enabled: {type: boolean}
+    OpaqueSecretReference:
+      type: object
+      additionalProperties: false
+      required: [id, name, provider]
+      properties:
+        id: {type: string, minLength: 1}
+        name: {type: string, minLength: 1}
+        provider: {type: string, minLength: 1}
+        version: {type: string}
+    WebhookConfigurationRequest:
+      type: object
+      additionalProperties: false
+      required: [url, secret_ref, event_types]
+      properties:
+        url: {type: string, format: uri, pattern: '^https://'}
+        secret_ref: {$ref: '#/components/schemas/OpaqueSecretReference'}
+        event_types:
+          type: array
+          minItems: 1
+          maxItems: 3
+          uniqueItems: true
+          items: {type: string, enum: [notification.occurrence, notification.escalation, notification.recovery]}
+    WebhookEndpoint:
+      type: object
+      additionalProperties: false
+      required: [id, url, enabled, secret_ref]
+      properties:
+        id: {type: string}
+        url: {type: string, format: uri}
+        enabled: {type: boolean}
+        secret_ref: {$ref: '#/components/schemas/OpaqueSecretReference'}
+    WebhookConfigurationResponse:
+      type: object
+      required: [endpoint]
+      properties:
+        endpoint: {$ref: '#/components/schemas/WebhookEndpoint'}
+    WebhookTestResponse:
+      type: object
+      required: [delivery]
+      properties:
+        delivery:
+          type: object
+          additionalProperties: false
+          required: [delivery_id, event_id, status, attempts, delivered, payload_digest]
+          properties:
+            delivery_id: {type: string}
+            event_id: {type: string}
+            status: {type: string, enum: [pending, delivered, failed]}
+            attempts: {type: integer, minimum: 0}
+            delivered: {type: boolean}
+            payload_digest: {type: string, pattern: '^sha256:[0-9a-f]{64}$'}

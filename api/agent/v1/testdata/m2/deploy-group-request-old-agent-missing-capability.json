@@ -1,0 +1,73 @@
+{
+  "protocol": "open-card-agent",
+  "version": "1.0",
+  "message_id": "msg-m2-deploy-group-old-agent",
+  "instance_id": "instance-m2-old-agent",
+  "node_id": "node-m2-fixture",
+  "kind": "task_request",
+  "sent_at": "2026-08-24T00:07:00Z",
+  "idempotency_key": "idem-m2-deploy-group-old-agent",
+  "capabilities": ["mtls", "typed_tasks", "heartbeat"],
+  "payload": {
+    "task_id": "task-m2-deploy-group-old-agent",
+    "instance_id": "instance-m2-old-agent",
+    "node_id": "node-m2-fixture",
+    "kind": "deploy_group",
+    "idempotency_key": "idem-m2-deploy-group-old-agent",
+    "lease_id": "lease-m2-deploy-group-old-agent-1",
+    "deadline": "2026-08-24T00:12:00Z",
+    "parameters": {
+      "deployment_id": "dep_m2_old_agent",
+      "required_capabilities": ["runtime.deploy_group"],
+      "spec": {
+        "schema_version": "1",
+        "application_id": "app_m2_fixture",
+        "environment_id": "env_m2_fixture",
+        "release_id": "rel_m2_old_agent_v1",
+        "service_group_id": "group_m2_old_agent",
+        "config_digest": "sha256:abababababababababababababababababababababababababababababababab",
+        "entry_service": "web",
+        "services": [
+          {
+            "name": "web",
+            "role": "ingress",
+            "required": true,
+            "image": {
+              "repository": "registry.example.test/opencard/web",
+              "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            },
+            "resources": {
+              "cpu_millis": 100,
+              "memory_bytes": 33554432,
+              "disk_bytes": 67108864,
+              "pids": 32
+            },
+            "container_ports": [8080]
+          },
+          {
+            "name": "worker",
+            "role": "worker",
+            "required": false,
+            "image": {
+              "repository": "registry.example.test/opencard/worker",
+              "digest": "sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+            },
+            "resources": {
+              "cpu_millis": 100,
+              "memory_bytes": 33554432,
+              "disk_bytes": 67108864,
+              "pids": 32
+            }
+          }
+        ],
+        "rollout": {
+          "mode": "initial"
+        }
+      },
+      "operation": {
+        "idempotency_key": "idem-m2-deploy-group-old-agent",
+        "actor": "fixture"
+      }
+    }
+  }
+}

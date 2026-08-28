@@ -1,0 +1,8 @@
+{
+  "schema_version": "1.1",
+  "kind": "observe",
+  "parameters": {
+    "scope": "node_docker_facts",
+    "include_observation_details": true
+  }
+}

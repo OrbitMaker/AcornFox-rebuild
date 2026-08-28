@@ -1,0 +1,12 @@
+{
+  "fixture_id": "m3-backend-frontend-v1",
+  "service": "frontend",
+  "role": "entry",
+  "listen": "127.0.0.1:18081",
+  "request": {"method": "GET", "path": "/"},
+  "response": {
+    "status": 200,
+    "headers": {"content-type": "text/plain; charset=utf-8", "x-opencard-fixture": "frontend-v1"},
+    "body": "open-card-m3-frontend-v1\n"
+  }
+}

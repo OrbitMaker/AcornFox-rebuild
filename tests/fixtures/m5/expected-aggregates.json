@@ -1,0 +1,118 @@
+{
+  "schema_version": 1,
+  "bucket_width_seconds": 300,
+  "aggregates": [
+    {
+      "application_id": "app-alpha",
+      "service_name": "web",
+      "release_id": "rel-alpha-r1",
+      "window_start": "2026-08-25T00:00:00Z",
+      "window_end": "2026-08-25T00:05:00Z",
+      "sample_count": 3,
+      "average_cpu_millicores": 200,
+      "peak_cpu_millicores": 300,
+      "cpu_seconds": 33,
+      "average_memory_bytes": 2000,
+      "peak_memory_bytes": 3000,
+      "memory_byte_seconds": 330000,
+      "peak_disk_bytes": 800,
+      "network_rx_bytes": 120,
+      "network_tx_bytes": 50,
+      "restart_count": 1,
+      "exception_count": 1,
+      "runtime_seconds": 240,
+      "configured_limits": {
+        "cpu_millicores": 200,
+        "memory_bytes": 4000,
+        "disk_bytes": 10000,
+        "pids": 64
+      },
+      "actual": {
+        "peak_cpu_millicores": 300,
+        "peak_memory_bytes": 3000,
+        "peak_disk_bytes": 800,
+        "cpu_limit_exceeded": true,
+        "memory_limit_exceeded": false,
+        "disk_limit_exceeded": false
+      }
+    },
+    {
+      "application_id": "app-alpha",
+      "service_name": "worker",
+      "release_id": "rel-alpha-r1",
+      "window_start": "2026-08-25T00:05:00Z",
+      "window_end": "2026-08-25T00:10:00Z",
+      "sample_count": 1,
+      "average_cpu_millicores": 50,
+      "peak_cpu_millicores": 50,
+      "cpu_seconds": 0,
+      "average_memory_bytes": 500,
+      "peak_memory_bytes": 500,
+      "memory_byte_seconds": 0,
+      "peak_disk_bytes": 250,
+      "network_rx_bytes": 0,
+      "network_tx_bytes": 0,
+      "restart_count": 0,
+      "exception_count": 0,
+      "runtime_seconds": 300,
+      "configured_limits": {
+        "cpu_millicores": 100,
+        "memory_bytes": 2000,
+        "disk_bytes": 5000,
+        "pids": 32
+      },
+      "actual": {
+        "peak_cpu_millicores": 50,
+        "peak_memory_bytes": 500,
+        "peak_disk_bytes": 250,
+        "cpu_limit_exceeded": false,
+        "memory_limit_exceeded": false,
+        "disk_limit_exceeded": false
+      }
+    },
+    {
+      "application_id": "app-beta",
+      "service_name": "web",
+      "release_id": "rel-beta-r1",
+      "window_start": "2026-08-25T00:00:00Z",
+      "window_end": "2026-08-25T00:05:00Z",
+      "sample_count": 2,
+      "average_cpu_millicores": 800,
+      "peak_cpu_millicores": 900,
+      "cpu_seconds": 108,
+      "average_memory_bytes": 8000,
+      "peak_memory_bytes": 9000,
+      "memory_byte_seconds": 1080000,
+      "peak_disk_bytes": 1000,
+      "network_rx_bytes": 400,
+      "network_tx_bytes": 400,
+      "restart_count": 2,
+      "exception_count": 0,
+      "runtime_seconds": 150,
+      "configured_limits": {
+        "cpu_millicores": 1000,
+        "memory_bytes": 12000,
+        "disk_bytes": 20000,
+        "pids": 64
+      },
+      "actual": {
+        "peak_cpu_millicores": 900,
+        "peak_memory_bytes": 9000,
+        "peak_disk_bytes": 1000,
+        "cpu_limit_exceeded": false,
+        "memory_limit_exceeded": false,
+        "disk_limit_exceeded": false
+      }
+    }
+  ],
+  "application_isolation": {
+    "app-alpha": {
+      "allowed_services": ["web", "worker"],
+      "must_not_include_application_ids": ["app-beta"]
+    },
+    "app-beta": {
+      "allowed_services": ["web"],
+      "must_not_include_application_ids": ["app-alpha"]
+    }
+  }
+}

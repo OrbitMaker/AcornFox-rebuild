@@ -1,0 +1,11 @@
+[Unit]
+Description=Open Card loopback Caddy fixture unit
+
+[Service]
+User=opencard-caddy
+WorkingDirectory=/var/lib/open-card-caddy
+ExecStart=/opt/open-card/current/bin/caddy run --config /etc/open-card/Caddyfile
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

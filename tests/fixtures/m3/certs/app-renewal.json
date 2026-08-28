@@ -1,0 +1,34 @@
+{
+  "fixture_id": "m3-app-cert-renewal-v1",
+  "hostname": "demo.customer.test",
+  "issuer": {"kind": "internal_test_ca", "name": "Open Card M3 Fixture CA"},
+  "issuance": {
+    "certificate_id": "cert_m3_demo_01",
+    "serial": "2001",
+    "sha256_fingerprint": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "san": ["demo.customer.test"],
+    "not_before": "2026-08-24T00:02:00Z",
+    "not_after": "2026-09-23T00:02:00Z",
+    "status": "active"
+  },
+  "renewal": {
+    "certificate_id": "cert_m3_demo_02",
+    "serial": "2002",
+    "sha256_fingerprint": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+    "not_before": "2026-09-16T00:02:00Z",
+    "not_after": "2026-10-16T00:02:00Z",
+    "status": "ready"
+  },
+  "secret_storage": {
+    "certificate_storage": "restricted_fixture_store/cert_m3_demo_01",
+    "private_key_ref": "secretprovider://m3/cert_m3_demo_01/key",
+    "private_key_material_present": false,
+    "logs_or_database_plaintext": false,
+    "ai_context_exposed": false
+  },
+  "expected": {
+    "renewal_replaces_certificate_atomically": true,
+    "old_certificate_serves_until_new_ready": true,
+    "application_rebuild": false
+  }
+}

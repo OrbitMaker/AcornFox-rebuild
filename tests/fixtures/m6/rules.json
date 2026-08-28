@@ -1,0 +1,10 @@
+{
+  "fingerprint": "sha256:repeated-build-failure",
+  "success_count": 3,
+  "application_count": 2,
+  "states": ["proposed", "testing", "reviewed", "shadow", "approved", "promoted"],
+  "required_for_promotion": ["regression_passed", "reviewed_by", "review_decision_approved", "shadow_passed", "version"],
+  "forbidden": ["candidate_active", "self_review", "automatic_core_update"],
+  "versions": ["rule-v1", "rule-v2"],
+  "rollback_target": "rule-v1"
+}

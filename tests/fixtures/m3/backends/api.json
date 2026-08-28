@@ -1,0 +1,12 @@
+{
+  "fixture_id": "m3-backend-api-v1",
+  "service": "api",
+  "role": "entry",
+  "listen": "127.0.0.1:18082",
+  "request": {"method": "GET", "path": "/api/health"},
+  "response": {
+    "status": 200,
+    "headers": {"content-type": "application/json", "x-opencard-fixture": "api-v1"},
+    "body": "{\"service\":\"api\",\"status\":\"ok\",\"fixture\":\"m3-api-v1\"}\n"
+  }
+}

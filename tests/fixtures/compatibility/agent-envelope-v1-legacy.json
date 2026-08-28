@@ -1,0 +1,14 @@
+{
+  "protocol": "open-card-agent",
+  "version": "v1",
+  "message_id": "msg-legacy-1",
+  "instance_id": "instance-1",
+  "node_id": "node-1",
+  "kind": "task_ack",
+  "sent_at": "2026-08-24T00:00:00Z",
+  "idempotency_key": "idem-task-1",
+  "payload": {
+    "task_id": "task-1",
+    "status": "accepted"
+  }
+}

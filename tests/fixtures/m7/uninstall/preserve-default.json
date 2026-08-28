@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "test_id": "INSTALL-003",
+  "default_mode": "preserve-data",
+  "removed": [
+    "/opt/open-card",
+    "/etc/open-card",
+    "/etc/systemd/system/open-card-server.service",
+    "/etc/systemd/system/open-card-agent.service",
+    "/etc/systemd/system/open-card-buildkit.service",
+    "/etc/systemd/system/open-card-caddy.service"
+  ],
+  "preserved": [
+    "/var/lib/open-card",
+    "/var/lib/open-card/backups",
+    "/var/lib/open-card/evidence",
+    "application_volume_facts"
+  ],
+  "dangerous_mode": {
+    "requires_flag": "--purge",
+    "requires_exact_confirmation": "OPEN-CARD-PURGE",
+    "default_enabled": false
+  },
+  "expected": {
+    "systemd_daemon_reload_after_unit_removal": true,
+    "preserved_data_is_reinstallable": true,
+    "unconfirmed_purge_is_rejected": true
+  }
+}

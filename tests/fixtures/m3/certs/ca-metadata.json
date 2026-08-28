@@ -1,0 +1,13 @@
+{
+  "fixture_id": "m3-internal-test-ca-v1",
+  "kind": "internal_test_ca",
+  "subject": "CN=Open Card M3 Fixture CA",
+  "certificate_id": "ca_m3_fixture_01",
+  "serial": "9001",
+  "sha256_fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "validity": {"not_before": "2026-08-01T00:00:00Z", "not_after": "2027-08-01T00:00:00Z"},
+  "public_certificate_metadata_only": true,
+  "private_key_material_present": false,
+  "secret_provider_ref": "secretprovider://m3/ca_m3_fixture_01/key",
+  "expected": {"trust_scope": "fixture_only", "public_ca_submission": false, "production_certificate": false}
+}

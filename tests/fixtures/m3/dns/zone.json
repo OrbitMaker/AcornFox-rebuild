@@ -1,0 +1,42 @@
+{
+  "fixture_id": "m3-loopback-zone-v1",
+  "resolver": {
+    "bind_address": "127.0.0.1",
+    "port": 15353,
+    "transport": "udp",
+    "public_network": false
+  },
+  "zone": "opencard.test",
+  "records": [
+    {
+      "name": "@",
+      "type": "A",
+      "ttl": 60,
+      "values": ["127.0.0.1"]
+    },
+    {
+      "name": "apps",
+      "type": "A",
+      "ttl": 60,
+      "values": ["127.0.0.1"]
+    },
+    {
+      "name": "*.apps",
+      "type": "A",
+      "ttl": 60,
+      "values": ["127.0.0.1"]
+    },
+    {
+      "name": "_acme-challenge.apps",
+      "type": "TXT",
+      "ttl": 60,
+      "values": ["m3-dns01-challenge-platform"]
+    }
+  ],
+  "expected": {
+    "platform_domain": "apps.opencard.test",
+    "wildcard_domain": "*.apps.opencard.test",
+    "all_addresses_loopback": true,
+    "public_dns_calls": 0
+  }
+}

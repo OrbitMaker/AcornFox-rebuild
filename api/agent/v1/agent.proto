@@ -1,0 +1,104 @@
+syntax = "proto3";
+
+package opencard.agent.v1;
+
+// This schema is the transport-neutral contract. The M0 implementation uses
+// the equivalent JSON structs in agent.go so no runtime protobuf dependency is
+// required before the mTLS streaming transport spike is complete.
+option go_package = "github.com/open-card/open-card/api/agent/v1;v1";
+
+service NodeAgent {
+  rpc Connect(stream Envelope) returns (stream Envelope);
+}
+
+message Envelope {
+  string protocol = 1;
+  string version = 2;
+  string message_id = 3;
+  string instance_id = 4;
+  string node_id = 5;
+  string kind = 6;
+  int64 sent_at_unix_nano = 7;
+  string idempotency_key = 8;
+  bytes payload = 9;
+  uint64 agent_sequence = 10;
+}
+
+message TaskRequest {
+  string task_id = 1;
+  string instance_id = 2;
+  string node_id = 3;
+  string kind = 4;
+  string idempotency_key = 5;
+  string lease_id = 6;
+  bytes parameters = 7;
+  int64 deadline_unix_nano = 8;
+}
+
+message Load {
+  int64 cpu_millis = 1;
+  int64 memory_bytes = 2;
+  int64 memory_available = 3;
+  int64 disk_bytes = 4;
+  int64 disk_available = 5;
+}
+
+message Heartbeat {
+  string instance_id = 1;
+  string node_id = 2;
+  uint64 sequence = 3;
+  int64 at_unix_nano = 4;
+  Load load = 5;
+}
+
+message TaskAck {
+  string task_id = 1;
+  string status = 2;
+  string reason = 3;
+}
+
+message TaskResult {
+  string task_id = 1;
+  string idempotency_key = 2;
+  bool succeeded = 3;
+  string status = 4;
+  string error_code = 5;
+  string error_message = 6;
+  repeated string evidence_refs = 7;
+}
+
+message CancelTask {
+  string task_id = 1;
+  string idempotency_key = 2;
+  string reason = 3;
+}
+
+message LogChunk {
+  string task_id = 1;
+  uint64 sequence = 2;
+  string stream = 3;
+  string data = 4;
+  bool final = 5;
+}
+
+message Observation {
+  string task_id = 1;
+  uint64 sequence = 2;
+  string target_ref = 3;
+  string status = 4;
+  bool healthy = 5;
+  int64 at_unix_nano = 6;
+  repeated string evidence_refs = 7;
+  bytes details = 8;
+}
+
+message TaskSnapshot {
+  string task_id = 1;
+  string idempotency_key = 2;
+  string kind = 3;
+  string state = 4;
+  int64 accepted_at_unix_nano = 5;
+  int64 started_at_unix_nano = 6;
+  int64 finished_at_unix_nano = 7;
+  TaskResult result = 8;
+}

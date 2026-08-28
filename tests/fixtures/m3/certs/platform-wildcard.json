@@ -1,0 +1,28 @@
+{
+  "fixture_id": "m3-platform-wildcard-cert-v1",
+  "issuer": {
+    "kind": "internal_test_ca",
+    "name": "Open Card M3 Fixture CA",
+    "certificate_id": "cert_m3_platform_wildcard_01",
+    "serial": "1001",
+    "sha256_fingerprint": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+  },
+  "subject": "CN=*.apps.opencard.test",
+  "san": ["*.apps.opencard.test", "apps.opencard.test"],
+  "validity": {"not_before": "2026-08-24T00:00:00Z", "not_after": "2026-09-23T00:00:00Z"},
+  "challenge": {
+    "type": "dns-01",
+    "provider": "loopback-dns-fixture",
+    "record_name": "_acme-challenge.apps.opencard.test",
+    "record_value": "m3-dns01-challenge-platform",
+    "verified": true
+  },
+  "secret_storage": {
+    "certificate_storage": "restricted_fixture_store/cert_m3_platform_wildcard_01",
+    "private_key_ref": "secretprovider://m3/cert_m3_platform_wildcard_01/key",
+    "private_key_material_present": false,
+    "logs_or_database_plaintext": false,
+    "ai_context_exposed": false
+  },
+  "expected": {"https_ready": true, "route_enabled": true, "public_acme_calls": 0}
+}

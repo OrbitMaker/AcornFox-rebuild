@@ -1,0 +1,1 @@
+{"version":"3.9","services":{"web":{"image":"127.0.0.1:45532/opencard/m2/public:stable","ports":[{"target":8080,"published":45533,"protocol":"tcp"}]}}}

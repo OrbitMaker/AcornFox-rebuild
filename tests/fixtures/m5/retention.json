@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "now": "2026-08-25T00:00:00Z",
+  "raw_retention_seconds": 604800,
+  "aggregate_retention_seconds": 7776000,
+  "storage": {
+    "total_bytes": 1000000,
+    "used_bytes_before_cleanup": 940000,
+    "hard_watermark_bytes": 50000,
+    "used_bytes_after_cleanup": 520000,
+    "low_priority_raw_sampling_paused": true
+  },
+  "raw_samples": {
+    "eligible_sample_ids": ["m5-old-raw-001", "m5-old-raw-002"],
+    "retained_sample_ids": ["m5-latest-raw-001"],
+    "deleted_sample_ids": ["m5-old-raw-001", "m5-old-raw-002"]
+  },
+  "must_retain": [
+    "latest_aggregate",
+    "audit_evidence",
+    "current_observation"
+  ],
+  "recovery": {
+    "recompute_aggregates_from_raw_window": true,
+    "restart_safe_cursor": "m5-retention-cursor-001",
+    "partial_cleanup_is_retryable": true
+  }
+}

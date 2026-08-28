@@ -1,0 +1,20 @@
+{
+  "version": "3.9",
+  "services": {
+    "api": {
+      "image": "127.0.0.1:45532/opencard/m2/private:stable",
+      "healthcheck": {"test": ["CMD", "/open-card-static-server", "-healthcheck"], "interval": "2s", "timeout": "1s", "retries": 3},
+      "networks": ["private"],
+      "resources": {"cpus": "250m", "memory": "64MiB"}
+    },
+    "frontend": {
+      "image": "127.0.0.1:45532/opencard/m2/public:stable",
+      "ports": [{"target": 8080, "protocol": "tcp"}],
+      "depends_on": {"api": {"condition": "service_healthy"}},
+      "healthcheck": {"test": ["CMD", "/open-card-static-server", "-healthcheck"], "interval": "2s", "timeout": "1s", "retries": 3},
+      "networks": ["private"],
+      "resources": {"cpus": "500m", "memory": "128MiB"}
+    }
+  },
+  "networks": {"private": {"internal": true}}
+}

@@ -1,0 +1,20 @@
+{
+  "fixture_id": "m3-platform-domain-binding-v1",
+  "application_id": "app_fixture_m3",
+  "platform_domain": {
+    "name": "apps.opencard.test",
+    "verification_method": "dns_txt",
+    "verification_status": "verified",
+    "verification_record": {"name": "_opencard-verification.apps.opencard.test", "type": "TXT", "value": "m3-platform-verification"}
+  },
+  "slug": {
+    "source_name": "Demo API / Frontend",
+    "normalized": "demo-api-frontend",
+    "stable_suffix": "a13f",
+    "value": "demo-api-frontend-a13f",
+    "hostname": "demo-api-frontend-a13f.apps.opencard.test",
+    "stable_for_same_application": true
+  },
+  "fallback": {"ip": "127.0.0.1", "port": 18080, "available": true},
+  "expected": {"wildcard_certificate_allowed": true, "temporary_domain_substituted": false, "https_ready": true}
+}

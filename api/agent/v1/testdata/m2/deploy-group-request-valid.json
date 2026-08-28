@@ -1,0 +1,137 @@
+{
+  "protocol": "open-card-agent",
+  "version": "1.1",
+  "message_id": "msg-m2-deploy-group-valid",
+  "instance_id": "instance-m2-fixture",
+  "node_id": "node-m2-fixture",
+  "kind": "task_request",
+  "sent_at": "2026-08-24T00:00:00Z",
+  "idempotency_key": "idem-m2-deploy-group-valid",
+  "agent_sequence": 1,
+  "capabilities": [
+    "mtls",
+    "typed_tasks",
+    "heartbeat",
+    "runtime.deploy_group",
+    "runtime.observe_group",
+    "runtime.rollback_group",
+    "runtime.destroy_group"
+  ],
+  "payload": {
+    "task_id": "task-m2-deploy-group-valid",
+    "instance_id": "instance-m2-fixture",
+    "node_id": "node-m2-fixture",
+    "kind": "deploy_group",
+    "idempotency_key": "idem-m2-deploy-group-valid",
+    "lease_id": "lease-m2-deploy-group-valid-1",
+    "deadline": "2026-08-24T00:05:00Z",
+    "parameters": {
+      "deployment_id": "dep_m2_fixture",
+      "spec": {
+        "schema_version": "1",
+        "application_id": "app_m2_fixture",
+        "environment_id": "env_m2_fixture",
+        "release_id": "rel_m2_fixture_v1",
+        "service_group_id": "group_m2_fixture",
+        "config_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "entry_service": "web",
+        "services": [
+          {
+            "name": "db",
+            "role": "stateful",
+            "required": true,
+            "image": {
+              "repository": "registry.example.test/opencard/db",
+              "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            "resources": {
+              "cpu_millis": 250,
+              "memory_bytes": 67108864,
+              "disk_bytes": 134217728,
+              "pids": 64
+            },
+            "volumes": [
+              {
+                "name": "db-data",
+                "mount_path": "/var/lib/opencard/db"
+              }
+            ],
+            "healthcheck": {
+              "test": ["CMD", "/bin/health"],
+              "interval_seconds": 5,
+              "timeout_seconds": 2,
+              "retries": 3
+            },
+            "restart": "unless-stopped"
+          },
+          {
+            "name": "web",
+            "role": "ingress",
+            "required": true,
+            "image": {
+              "repository": "registry.example.test/opencard/web",
+              "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            },
+            "resources": {
+              "cpu_millis": 500,
+              "memory_bytes": 134217728,
+              "disk_bytes": 134217728,
+              "pids": 64
+            },
+            "dependencies": [
+              {
+                "service": "db",
+                "condition": "healthy"
+              }
+            ],
+            "entrypoint": ["/bin/opencard-web"],
+            "command": ["serve"],
+            "environment": [
+              {
+                "name": "APP_MODE",
+                "kind": "literal",
+                "value": "fixture"
+              },
+              {
+                "name": "DATABASE_PASSWORD",
+                "kind": "secret_ref",
+                "secret_ref": {
+                  "id": "secret_m2_database_password",
+                  "name": "database_password",
+                  "provider": "filesystem-secret",
+                  "version": "v1"
+                }
+              }
+            ],
+            "container_ports": [8080],
+            "healthcheck": {
+              "test": ["CMD", "/bin/ready"],
+              "interval_seconds": 5,
+              "timeout_seconds": 2,
+              "retries": 3
+            },
+            "restart": "always"
+          }
+        ],
+        "volume_claims": [
+          {
+            "id": "volume_m2_db_data",
+            "name": "db-data",
+            "size_bytes": 1073741824,
+            "retain": true
+          }
+        ],
+        "rollout": {
+          "mode": "initial",
+          "preserve_old_until_healthy": false,
+          "downtime_approved": false
+        }
+      },
+      "operation": {
+        "idempotency_key": "idem-m2-deploy-group-valid",
+        "deadline": "2026-08-24T00:05:00Z",
+        "actor": "fixture"
+      }
+    }
+  }
+}

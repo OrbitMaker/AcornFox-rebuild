@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "fixture_id": "timeout",
+  "kind": "dockerfile",
+  "dockerfile": "Dockerfile",
+  "expected_result": "timeout",
+  "timeout_seconds": 1,
+  "context_files": ["Dockerfile", "metadata.json"]
+}

@@ -1,0 +1,13 @@
+{
+  "fixture_id": "m3-safe-cutover-health-failure-v1",
+  "application_id": "app_fixture_m3",
+  "old_release": "rel_m3_v1",
+  "new_release": "rel_m3_v2-broken",
+  "observation_window_seconds": 30,
+  "timeline": [
+    {"at": "2026-08-24T00:11:00Z", "event": "new_started", "release": "rel_m3_v2-broken", "healthy": false, "traffic": "old_only"},
+    {"at": "2026-08-24T00:11:05Z", "event": "new_health_failed", "release": "rel_m3_v2-broken", "healthy": false, "traffic": "old_only"},
+    {"at": "2026-08-24T00:11:06Z", "event": "cutover_aborted", "release": "rel_m3_v1", "healthy": true, "traffic": "old_only"}
+  ],
+  "expected": {"new_health_before_cutover": true, "cutover_performed": false, "old_release_serving": true, "ip_fallback": true, "application_rebuilt": false, "status": "cutover_failed_old_release_serving"}
+}

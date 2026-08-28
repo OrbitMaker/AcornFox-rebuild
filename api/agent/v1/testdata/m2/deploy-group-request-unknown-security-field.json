@@ -1,0 +1,59 @@
+{
+  "protocol": "open-card-agent",
+  "version": "1.1",
+  "message_id": "msg-m2-deploy-group-unknown-security",
+  "instance_id": "instance-m2-fixture",
+  "node_id": "node-m2-fixture",
+  "kind": "task_request",
+  "sent_at": "2026-08-24T00:05:00Z",
+  "idempotency_key": "idem-m2-deploy-group-unknown-security",
+  "agent_sequence": 8,
+  "capability_grant": "deploy-production",
+  "capabilities": ["mtls", "typed_tasks", "heartbeat", "runtime.deploy_group"],
+  "payload": {
+    "task_id": "task-m2-deploy-group-unknown-security",
+    "instance_id": "instance-m2-fixture",
+    "node_id": "node-m2-fixture",
+    "kind": "deploy_group",
+    "idempotency_key": "idem-m2-deploy-group-unknown-security",
+    "lease_id": "lease-m2-deploy-group-unknown-security-1",
+    "deadline": "2026-08-24T00:10:00Z",
+    "parameters": {
+      "deployment_id": "dep_m2_unknown_security",
+      "spec": {
+        "schema_version": "1",
+        "application_id": "app_m2_fixture",
+        "environment_id": "env_m2_fixture",
+        "release_id": "rel_m2_unknown_security_v1",
+        "service_group_id": "group_m2_unknown_security",
+        "config_digest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "entry_service": "web",
+        "services": [
+          {
+            "name": "web",
+            "role": "ingress",
+            "required": true,
+            "image": {
+              "repository": "registry.example.test/opencard/web",
+              "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            },
+            "resources": {
+              "cpu_millis": 100,
+              "memory_bytes": 33554432,
+              "disk_bytes": 67108864,
+              "pids": 32
+            },
+            "container_ports": [8080]
+          }
+        ],
+        "rollout": {
+          "mode": "initial"
+        }
+      },
+      "operation": {
+        "idempotency_key": "idem-m2-deploy-group-unknown-security",
+        "actor": "fixture"
+      }
+    }
+  }
+}

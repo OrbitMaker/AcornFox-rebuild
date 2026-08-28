@@ -1,0 +1,16 @@
+{
+  "version": "3.9",
+  "services": {
+    "app": {
+      "image": "registry.example.test/opencard/negative@sha256:7777777777777777777777777777777777777777777777777777777777777777",
+      "volumes": [
+        {
+          "source": "/srv/opencard-host-data",
+          "target": "/mnt/host-data",
+          "type": "bind",
+          "read_only": true
+        }
+      ]
+    }
+  }
+}

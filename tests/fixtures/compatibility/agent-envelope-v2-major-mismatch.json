@@ -1,0 +1,22 @@
+{
+  "protocol": "open-card-agent",
+  "version": "2.0",
+  "message_id": "msg-major-2",
+  "instance_id": "instance-1",
+  "node_id": "node-1",
+  "kind": "heartbeat",
+  "sent_at": "2026-08-24T00:00:00Z",
+  "payload": {
+    "instance_id": "instance-1",
+    "node_id": "node-1",
+    "sequence": 1,
+    "at": "2026-08-24T00:00:00Z",
+    "load": {
+      "cpu_millis": 120,
+      "memory_bytes": 1073741824,
+      "memory_available": 536870912,
+      "disk_bytes": 10737418240,
+      "disk_available": 5368709120
+    }
+  }
+}

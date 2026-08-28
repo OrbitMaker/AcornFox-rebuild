@@ -1,0 +1,61 @@
+{
+  "protocol": "open-card-agent",
+  "version": "1.1",
+  "message_id": "msg-m2-deploy-group-tag-drift",
+  "instance_id": "instance-m2-fixture",
+  "node_id": "node-m2-fixture",
+  "kind": "task_request",
+  "sent_at": "2026-08-24T00:03:00Z",
+  "idempotency_key": "idem-m2-deploy-group-tag-drift",
+  "agent_sequence": 6,
+  "capabilities": ["mtls", "typed_tasks", "heartbeat", "runtime.deploy_group"],
+  "registry_reference": "registry.example.test/opencard/web:stable",
+  "registry_digest_after_tag_update": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "payload": {
+    "task_id": "task-m2-deploy-group-tag-drift",
+    "instance_id": "instance-m2-fixture",
+    "node_id": "node-m2-fixture",
+    "kind": "deploy_group",
+    "idempotency_key": "idem-m2-deploy-group-tag-drift",
+    "lease_id": "lease-m2-deploy-group-tag-drift-1",
+    "deadline": "2026-08-24T00:08:00Z",
+    "parameters": {
+      "deployment_id": "dep_m2_tag_drift",
+      "spec": {
+        "schema_version": "1",
+        "application_id": "app_m2_fixture",
+        "environment_id": "env_m2_fixture",
+        "release_id": "rel_m2_tag_drift_v1",
+        "service_group_id": "group_m2_tag_drift",
+        "config_digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "entry_service": "web",
+        "services": [
+          {
+            "name": "web",
+            "role": "ingress",
+            "required": true,
+            "image": {
+              "repository": "registry.example.test/opencard/web",
+              "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "resolved_tag": "stable"
+            },
+            "resources": {
+              "cpu_millis": 100,
+              "memory_bytes": 33554432,
+              "disk_bytes": 67108864,
+              "pids": 32
+            },
+            "container_ports": [8080]
+          }
+        ],
+        "rollout": {
+          "mode": "initial"
+        }
+      },
+      "operation": {
+        "idempotency_key": "idem-m2-deploy-group-tag-drift",
+        "actor": "fixture"
+      }
+    }
+  }
+}

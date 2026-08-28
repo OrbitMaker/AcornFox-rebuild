@@ -1,0 +1,24 @@
+{
+  "fixture_id": "m3-cname-valid-v1",
+  "resolver": "loopback-zone",
+  "custom_hostname": "demo.customer.test",
+  "record": {
+    "type": "CNAME",
+    "name": "demo.customer.test",
+    "target": "demo.apps.opencard.test",
+    "ttl": 60
+  },
+  "lookup": {
+    "cname": "demo.apps.opencard.test",
+    "a": ["127.0.0.1"]
+  },
+  "verification": {
+    "status": "verified",
+    "enabled_at": "2026-08-24T00:01:00Z",
+    "route_enabled": true
+  },
+  "expected": {
+    "certificate_request_allowed": true,
+    "ip_fallback": true
+  }
+}

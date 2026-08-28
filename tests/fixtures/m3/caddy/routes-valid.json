@@ -1,0 +1,43 @@
+{
+  "fixture_id": "m3-caddy-routes-valid-v1",
+  "schema_version": 1,
+  "admin": {"listen": "127.0.0.1:2019", "loopback_only": true, "publicly_exposed": false},
+  "source_of_truth": "open_card_route_facts",
+  "generated_config": {
+    "generation": 7,
+    "canonical_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+    "atomic_write": true,
+    "rollback_generation": 6,
+    "restart_rebuild_allowed": true
+  },
+  "defaults": {"exposure": "deny", "https_redirect": true},
+  "routes": [
+    {
+      "route_id": "route_demo_root",
+      "host": "demo.apps.opencard.test",
+      "path_prefix": "/",
+      "service": "frontend",
+      "upstream": "127.0.0.1:18081",
+      "certificate_ref": "cert_m3_platform_wildcard_01",
+      "entry_service": true,
+      "enabled": true
+    },
+    {
+      "route_id": "route_demo_api",
+      "host": "demo.apps.opencard.test",
+      "path_prefix": "/api",
+      "service": "api",
+      "upstream": "127.0.0.1:18082",
+      "certificate_ref": "cert_m3_platform_wildcard_01",
+      "entry_service": true,
+      "enabled": true
+    }
+  ],
+  "expected": {
+    "admin_non_loopback_rejected": true,
+    "worker_public": false,
+    "db_public": false,
+    "root_response_fixture": "backends/frontend.json",
+    "api_response_fixture": "backends/api.json"
+  }
+}

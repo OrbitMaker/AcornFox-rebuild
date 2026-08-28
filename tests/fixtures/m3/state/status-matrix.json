@@ -1,0 +1,12 @@
+{
+  "fixture_id": "m3-user-state-matrix-v1",
+  "states": [
+    {"code": "application_running", "label": "应用已运行", "terminal": false, "address": null, "https_ready": false},
+    {"code": "address_not_ready", "label": "地址未就绪", "terminal": false, "address": null, "https_ready": false},
+    {"code": "ip_available", "label": "IP 可用", "terminal": false, "address": "http://127.0.0.1:18080/", "https_ready": false},
+    {"code": "domain_verifying", "label": "域名验证中", "terminal": false, "address": "http://127.0.0.1:18080/", "https_ready": false},
+    {"code": "https_ready", "label": "HTTPS 就绪", "terminal": true, "address": "https://demo.apps.opencard.test/", "https_ready": true},
+    {"code": "cutover_failed_old_release_serving", "label": "切流失败，旧版服务中", "terminal": false, "address": "http://127.0.0.1:18080/", "https_ready": false}
+  ],
+  "ui_contract": {"percentage_field_present": false, "show_only_known_state": true, "fallback_visible_when_domain_unready": true}
+}

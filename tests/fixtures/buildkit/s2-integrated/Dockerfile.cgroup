@@ -1,0 +1,4 @@
+FROM alpine:3.23.5
+
+RUN printf 'memory.max=' && cat /sys/fs/cgroup/memory.max && printf 'cpu.max=' && cat /sys/fs/cgroup/cpu.max
+RUN test "$(cat /sys/fs/cgroup/memory.max)" = "67108864" && test "$(cat /sys/fs/cgroup/cpu.max)" = "50000 100000"

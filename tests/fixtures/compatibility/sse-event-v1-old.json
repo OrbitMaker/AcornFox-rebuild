@@ -1,0 +1,10 @@
+{
+  "id": "evt-000001",
+  "operation_id": "op-1",
+  "application_id": "app-1",
+  "sequence": 1,
+  "occurred_at": "2026-08-24T00:00:00Z",
+  "kind": "operation.queued",
+  "status": "preparing",
+  "message": "operation queued"
+}

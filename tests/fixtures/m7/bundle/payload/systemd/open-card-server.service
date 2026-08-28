@@ -1,0 +1,12 @@
+[Unit]
+Description=Open Card control-plane fixture unit
+Requires=open-card-buildkit.service
+
+[Service]
+User=opencard
+WorkingDirectory=/opt/open-card/current
+ExecStart=/opt/open-card/current/bin/open-card-server
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

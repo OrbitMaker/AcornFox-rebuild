@@ -1,0 +1,17 @@
+{
+  "fixture_id": "m4-webhook-receiver-responses-v1",
+  "receiver": {"bind_address": "127.0.0.1", "port": 19190, "public_network": false},
+  "responses": [
+    {"case_id": "test-success", "status": 200, "body": "accepted", "expected_attempts": 1, "expected_delivery": "once"},
+    {"case_id": "timeout", "status": null, "body": null, "expected_attempts": 3, "expected_delivery": "none_before_recovery"},
+    {"case_id": "server-error", "status": 500, "body": "fixture failure", "expected_attempts": 3, "expected_delivery": "none_before_recovery"},
+    {"case_id": "recovered", "status": 200, "body": "accepted", "expected_attempts": 1, "expected_delivery": "once_after_recovery"}
+  ],
+  "event_delivery": {
+    "event_id": "evt-m4-incident-01",
+    "attempts_before_recovery": 3,
+    "attempts_after_recovery": 1,
+    "dedupe_count": 1
+  },
+  "expected": {"finite_retry": true, "recovery_delivery_once": true, "application_operation_unblocked_by_notification_failure": true}
+}

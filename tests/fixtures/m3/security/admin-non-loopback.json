@@ -1,0 +1,6 @@
+{
+  "fixture_id": "m3-security-admin-non-loopback-v1",
+  "candidate": {"admin_listen": "0.0.0.0:2019", "control_plane_management": "tcp"},
+  "policy": {"required_admin_address": "127.0.0.1:2019", "allow_ipv6_loopback": "[::1]:2019", "reject_non_loopback": true},
+  "expected": {"accepted": false, "error_code": "admin_must_be_loopback", "listener_created": false, "control_plane_publicly_reachable": false}
+}

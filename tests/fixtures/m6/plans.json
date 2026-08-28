@@ -1,0 +1,21 @@
+{
+  "valid": {
+    "id": "plan-fixture",
+    "schema_version": "1.0",
+    "policy_version": "m6-policy-v1",
+    "task_type": "build_failure_diagnosis",
+    "target_refs": {"application": "app-fixture", "source_revision": "v3"},
+    "sources": ["context:sha256:context-fixture"],
+    "assumptions": ["failure is reproducible in the sandbox"],
+    "evidence_refs": [{"id": "ev-build", "kind": "redacted_build_log", "digest": "sha256:build"}],
+    "actions": [
+      {"tool_id": "workspace.build_test", "tool_version": "v1", "risk": "R1", "expected_result": "bounded build evidence", "validation_id": "build.exit_and_artifact.v1"},
+      {"tool_id": "workspace.patch_candidate", "tool_version": "v1", "risk": "R2", "expected_result": "unpublished candidate diff", "validation_id": "patch.diff_and_no_write.v1"}
+    ],
+    "budget": {"max_tokens": 256, "max_duration_ms": 5000, "max_actions": 2},
+    "rollback_id": "workspace.discard_changes.v1",
+    "confidence": 0.75,
+    "requires_user_confirmation": true
+  },
+  "invalid_cases": ["missing_schema_version", "missing_tool_version", "unknown_risk", "missing_validation", "missing_budget", "free_text_only", "R2_without_confirmation"]
+}

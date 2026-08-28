@@ -1,0 +1,4 @@
+OPEN_CARD_RC_FIXTURE_BINARY
+name=open-card-server
+version=0.5.0-rc1
+build=fixture-only

@@ -1,0 +1,6 @@
+{
+  "kind": "observe",
+  "parameters": {
+    "scope": "node_docker_facts"
+  }
+}

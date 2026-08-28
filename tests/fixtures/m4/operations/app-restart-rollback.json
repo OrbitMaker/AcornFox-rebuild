@@ -1,0 +1,43 @@
+{
+  "fixture_id": "m4-operations-restart-rollback-v1",
+  "application_id": "app_m4_fixture",
+  "environment_id": "env_m4_fixture",
+  "routes": ["route_m4_frontend", "route_m4_api"],
+  "releases": {
+    "previous_success": {"release_id": "rel_m4_success_01", "status": "succeeded", "volume_checksum": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+    "candidate": {"release_id": "rel_m4_candidate_02", "status": "failed", "volume_checksum": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+  },
+  "services_before": [
+    {"name": "frontend", "role": "entry", "status": "healthy", "container_id": "ctr_m4_frontend_01"},
+    {"name": "api", "role": "entry", "status": "healthy", "container_id": "ctr_m4_api_01"},
+    {"name": "worker", "role": "worker", "status": "crashed", "container_id": "ctr_m4_worker_01"}
+  ],
+  "operations": [
+    {
+      "operation_id": "op_m4_restart_01",
+      "kind": "restart",
+      "idempotency_key": "m4-restart-env-fixture-01",
+      "trigger": "ordinary_user",
+      "expected": {"restart_scope": ["worker"], "healthy_services_untouched": true, "application_available": true, "audited": true}
+    },
+    {
+      "operation_id": "op_m4_redeploy_01",
+      "kind": "redeploy",
+      "idempotency_key": "m4-redeploy-env-fixture-01",
+      "trigger": "ordinary_user",
+      "expected": {"release_id": "rel_m4_candidate_02", "status": "failed", "last_available_release": "rel_m4_success_01", "application_available": true}
+    },
+    {
+      "operation_id": "op_m4_rollback_01",
+      "kind": "rollback",
+      "idempotency_key": "m4-rollback-env-fixture-01",
+      "trigger": "ordinary_user",
+      "expected": {"target_release": "rel_m4_success_01", "only_previous_successful": true, "volume_checksum_unchanged": true, "data_rollback": false, "warning_required": true, "audited": true}
+    }
+  ],
+  "expected": {
+    "same_environment_single_active_operation": true,
+    "duplicate_click_has_one_side_effect": true,
+    "failed_operation_keeps_or_restores_last_available": true
+  }
+}

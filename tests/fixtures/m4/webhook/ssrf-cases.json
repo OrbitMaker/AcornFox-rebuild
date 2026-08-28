@@ -1,0 +1,12 @@
+{
+  "fixture_id": "m4-webhook-ssrf-cases-v1",
+  "cases": [
+    {"case_id": "localhost", "url": "http://localhost:2375/events", "expected": "rejected", "error_code": "webhook_target_not_allowed"},
+    {"case_id": "loopback-ip", "url": "http://127.0.0.1:2375/events", "expected": "rejected", "error_code": "webhook_target_not_allowed"},
+    {"case_id": "cloud-metadata", "url": "http://169.254.169.254/latest/meta-data/", "expected": "rejected", "error_code": "webhook_target_not_allowed"},
+    {"case_id": "private-rfc1918", "url": "http://10.0.0.8:8080/hook", "expected": "rejected", "error_code": "webhook_target_not_allowed"},
+    {"case_id": "private-link-local", "url": "http://[::1]:2375/events", "expected": "rejected", "error_code": "webhook_target_not_allowed"}
+  ],
+  "test_receiver": {"injected_by_harness": true, "bind_address": "127.0.0.1", "port": 19190, "not_user_configurable": true},
+  "expected": {"no_network_request_for_rejected_targets": true, "audit_rejection": true}
+}
