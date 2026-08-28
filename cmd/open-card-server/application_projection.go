@@ -26,6 +26,7 @@ type applicationSummary struct {
 	UpdatedAt     string                      `json:"updated_at"`
 	Source        applicationProjectionSource `json:"source"`
 	OperationID   *domain.ID                  `json:"operation_id"`
+	Publishing    *applicationPublishing      `json:"publishing"`
 	RuntimeReady  bool                        `json:"runtime_ready"`
 	Serving       bool                        `json:"serving"`
 	RuntimeStatus string                      `json:"runtime_status"`
@@ -35,6 +36,13 @@ type applicationProjectionSource struct {
 	UploadID *domain.ID `json:"source_upload_id,omitempty"`
 	Locator  *string    `json:"locator,omitempty"`
 	Ref      *string    `json:"ref,omitempty"`
+}
+type applicationPublishing struct {
+	Status      string   `json:"status"`
+	Sequence    int64    `json:"sequence"`
+	LastEventID string   `json:"last_event_id"`
+	Message     string   `json:"message"`
+	EvidenceIDs []string `json:"evidence_ids"`
 }
 type applicationDetail struct {
 	applicationSummary
@@ -64,7 +72,10 @@ func (s memoryApplicationProjectionStore) ApplicationProjection(ctx context.Cont
 }
 
 func (s *Server) applicationSummary(ctx context.Context, item postgres.ApplicationProjection) (applicationSummary, error) {
-	summary := applicationSummary{ID: item.ID, Name: item.Name, CreatedAt: item.CreatedAt.UTC().Format(time.RFC3339), UpdatedAt: item.UpdatedAt.UTC().Format(time.RFC3339), Source: applicationProjectionSource{Kind: item.Source.Kind, UploadID: item.Source.UploadID, Locator: item.Source.RepositoryURL, Ref: item.Source.Ref}, OperationID: item.OperationID, RuntimeReady: item.RuntimeReady, Serving: item.Serving, RuntimeStatus: item.RuntimeStatus}
+	summary := applicationSummary{ID: item.ID, Name: item.Name, CreatedAt: item.CreatedAt.UTC().Format(time.RFC3339), UpdatedAt: item.UpdatedAt.UTC().Format(time.RFC3339), Source: applicationProjectionSource{Kind: item.Source.Kind, UploadID: item.Source.UploadID, Locator: item.Source.RepositoryURL, Ref: item.Source.Ref}, OperationID: item.OperationID, RuntimeReady: item.RuntimeReady, Serving: item.Serving, RuntimeStatus: "unknown"}
+	if item.Publishing != nil {
+		summary.Publishing = &applicationPublishing{Status: item.Publishing.Status, Sequence: item.Publishing.Sequence, LastEventID: item.Publishing.LastEventID, Message: item.Publishing.Message, EvidenceIDs: append([]string(nil), item.Publishing.EvidenceIDs...)}
+	}
 	access, err := s.applicationAccess(ctx, item.ID)
 	if err != nil {
 		return applicationSummary{}, err

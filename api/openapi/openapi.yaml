@@ -1047,7 +1047,8 @@ components:
           type: string
           format: date-time
         source: {$ref: '#/components/schemas/ApplicationSource'}
-        operation_id: {type: string, nullable: true}
+        operation_id: {type: string, nullable: true, description: Latest durable publish operation only; null when the application has not been published.}
+        publishing: {$ref: '#/components/schemas/ApplicationPublishing', nullable: true}
         runtime_ready: {type: boolean}
         serving: {type: boolean}
         runtime_status: {type: string, enum: [unknown, partial, running]}
@@ -1060,6 +1061,16 @@ components:
         source_upload_id: {type: string, nullable: true}
         locator: {type: string, nullable: true, description: Public Git HTTPS locator only; null for uploads or unknown legacy sources.}
         ref: {type: string, nullable: true}
+    ApplicationPublishing:
+      type: object
+      additionalProperties: false
+      required: [status, sequence, last_event_id, message, evidence_ids]
+      properties:
+        status: {type: string, enum: [preparing, building, deploying, succeeded, failed]}
+        sequence: {type: integer, format: int64, minimum: 1}
+        last_event_id: {type: string}
+        message: {type: string}
+        evidence_ids: {type: array, items: {type: string}}
     ApplicationList:
       type: object
       required: [items]
@@ -1078,7 +1089,8 @@ components:
         created_at: {type: string, format: date-time}
         updated_at: {type: string, format: date-time}
         source: {$ref: '#/components/schemas/ApplicationSource'}
-        operation_id: {type: string, nullable: true}
+        operation_id: {type: string, nullable: true, description: Latest durable publish operation only; null when the application has not been published.}
+        publishing: {$ref: '#/components/schemas/ApplicationPublishing', nullable: true}
         runtime_ready: {type: boolean}
         serving: {type: boolean}
         runtime_status: {type: string, enum: [unknown, partial, running]}
