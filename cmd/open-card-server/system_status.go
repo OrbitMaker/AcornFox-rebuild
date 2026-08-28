@@ -83,11 +83,10 @@ func (s *Server) systemStatus(ctx context.Context) (systemStatusResponse, error)
 		case postgres.G3VerificationFailed:
 			response.PlatformDomain.Status = "failed"
 		case postgres.G3VerificationVerified:
-			if fact.Certificate != nil && strings.EqualFold(fact.Certificate.Status, "ready") {
-				response.PlatformDomain.Status = "ready"
-			} else {
-				response.PlatformDomain.Status = "pending"
-			}
+			// DNS verification is only the prerequisite for Gate4B-2. Neither an
+			// isolated certificate record nor an internal route proves public
+			// Edge TLS/SNI serving, so system status remains pending.
+			response.PlatformDomain.Status = "pending"
 		default:
 			response.PlatformDomain.Status = "pending"
 		}

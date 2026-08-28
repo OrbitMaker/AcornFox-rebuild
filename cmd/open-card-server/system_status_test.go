@@ -28,7 +28,7 @@ func (s systemStatusFixtureStore) CountEnabledWebhookEndpoints(context.Context) 
 func TestSystemStatusRequiresSessionAndReturnsOnlyAggregateFacts(t *testing.T) {
 	server := NewServer()
 	server.SetSystemStatusNode("instance_fixture", "node_fixture")
-	server.SetSystemStatusStore(systemStatusFixtureStore{fact: postgres.G3PlatformDomainFact{BaseDomain: "apps.example.test", VerificationStatus: postgres.G3VerificationVerified, Certificate: &postgres.G3CertificateFact{Status: "ready"}}, found: true, count: 1})
+	server.SetSystemStatusStore(systemStatusFixtureStore{fact: postgres.G3PlatformDomainFact{BaseDomain: "apps.example.test", VerificationRef: "public-dns-read-only/v2-console-ingress-wildcard", VerificationStatus: postgres.G3VerificationVerified, Certificate: &postgres.G3CertificateFact{Status: "ready"}}, found: true, count: 1})
 	now := time.Unix(1_700_000_000, 0).UTC()
 	_, session, csrf := attachTestAdministratorTokens(t, server, &now)
 	anonymous := httptest.NewRecorder()
@@ -38,7 +38,7 @@ func TestSystemStatusRequiresSessionAndReturnsOnlyAggregateFacts(t *testing.T) {
 	}
 	allowed := httptest.NewRecorder()
 	server.Handler().ServeHTTP(allowed, controlPlaneRequest(http.MethodGet, "/api/v1/settings/system-status", nil, session))
-	if allowed.Code != http.StatusOK || strings.Contains(strings.ToLower(allowed.Body.String()), "secret") || strings.Contains(strings.ToLower(allowed.Body.String()), "url") || !strings.Contains(allowed.Body.String(), `"enabled_count":1`) || !strings.Contains(allowed.Body.String(), `"status":"ready"`) || !strings.Contains(allowed.Body.String(), `"webhooks":{"enabled_count":1,"status":"configured"}`) {
+	if allowed.Code != http.StatusOK || strings.Contains(strings.ToLower(allowed.Body.String()), "secret") || strings.Contains(strings.ToLower(allowed.Body.String()), "url") || !strings.Contains(allowed.Body.String(), `"enabled_count":1`) || strings.Contains(allowed.Body.String(), `"status":"ready"`) || !strings.Contains(allowed.Body.String(), `"platform_domain":{"status":"pending"`) || !strings.Contains(allowed.Body.String(), `"webhooks":{"enabled_count":1,"status":"configured"}`) {
 		t.Fatalf("status=%d body=%s", allowed.Code, allowed.Body.String())
 	}
 	missingCSRF := httptest.NewRecorder()
@@ -53,6 +53,18 @@ func TestSystemStatusRequiresSessionAndReturnsOnlyAggregateFacts(t *testing.T) {
 	server.Handler().ServeHTTP(method, post)
 	if method.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("method=%d", method.Code)
+	}
+}
+
+func TestSystemStatusNeverPromotesLegacyPlatformEvidenceToReady(t *testing.T) {
+	server := NewServer()
+	server.SetSystemStatusStore(systemStatusFixtureStore{fact: postgres.G3PlatformDomainFact{BaseDomain: "apps.example.test", VerificationStatus: postgres.G3VerificationVerified, Certificate: &postgres.G3CertificateFact{Status: "ready"}}, found: true})
+	now := time.Unix(1_700_000_000, 0).UTC()
+	_, session := attachTestAdministrator(t, server, &now)
+	recorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(recorder, controlPlaneRequest(http.MethodGet, "/api/v1/settings/system-status", nil, session))
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"platform_domain":{"status":"pending"`) || strings.Contains(recorder.Body.String(), `"platform_domain":{"status":"ready"`) {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
 }
 
