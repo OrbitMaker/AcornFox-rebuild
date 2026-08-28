@@ -206,7 +206,41 @@ class M4PayloadContractTests(unittest.TestCase):
         self.assertIn('restart_prefix=${6:-}', guest_runner)
         self.assertIn('"$evidence/redeploy.json" "" redeploy', guest_runner)
         self.assertIn("m4_authenticate", guest_runner)
-        self.assertIn('Cookie: __Host-open_card_session=$m4_admin_session', guest_runner)
+        self.assertIn('m4_test_admin_password=${OPEN_CARD_M4_TEST_ADMIN_PASSWORD:-}', guest_runner)
+        self.assertIn('export -n OPEN_CARD_M4_TEST_ADMIN_PASSWORD', guest_runner)
+        self.assertLess(
+            guest_runner.index('m4_test_admin_password=${OPEN_CARD_M4_TEST_ADMIN_PASSWORD:-}'),
+            guest_runner.index('export -n OPEN_CARD_M4_TEST_ADMIN_PASSWORD'),
+        )
+        self.assertIn('m4_auth_tmp_dir=$(mktemp -d "/tmp/${task_prefix}-m4-auth.XXXXXX")', guest_runner)
+        self.assertIn('chmod 0700 "$m4_auth_tmp_dir"', guest_runner)
+        self.assertIn('m4_auth_curl_config=$(mktemp "$m4_auth_tmp_dir/auth-control-plane.XXXXXX")', guest_runner)
+        self.assertIn('(umask 077; {', guest_runner)
+        self.assertIn('} >"$m4_auth_curl_config")', guest_runner)
+        self.assertIn('command curl --config "$m4_auth_curl_config"', guest_runner)
+        for line in guest_runner.splitlines():
+            if re.search(r"\bcurl\b", line):
+                self.assertNotIn("__Host-open_card_session=", line)
+                self.assertNotIn("__Host-open_card_csrf=", line)
+                self.assertNotIn("X-Open-Card-CSRF:", line)
+        self.assertNotRegex(guest_runner, r"export\s+(?:password|session|csrf|m4_test_admin_password)")
+        child_env_blocks = re.findall(
+            r"env \\\n(.*?)\n  bash \"\$runner_dir/clean_worker_m4_(?:log_gate|webhook_lifecycle)_guest\.sh\"",
+            guest_runner,
+            flags=re.DOTALL,
+        )
+        self.assertEqual(len(child_env_blocks), 2)
+        for block in child_env_blocks:
+            self.assertIn('M4_AUTH_PASSWORD_FILE="$m4_auth_password_file"', block)
+            self.assertNotRegex(
+                block,
+                r"OPEN_CARD_M4_TEST_ADMIN_PASSWORD|m4_test_admin_password|__Host-open_card_session|__Host-open_card_csrf|X-Open-Card-CSRF",
+            )
+        self.assertIn('trap m4_auth_cleanup EXIT INT TERM', guest_runner)
+        self.assertIn('trap cleanup EXIT INT TERM', guest_runner)
+        self.assertIn('rm -rf -- "$m4_auth_tmp_dir"', guest_runner)
+        self.assertIn('rm -rf -- "$work"', guest_runner)
+        self.assertIn('unset m4_auth_curl_config m4_auth_password_file m4_auth_tmp_dir', guest_runner)
         self.assertNotIn("Open-Card-Role", guest_runner)
         self.assertNotIn("Open-Card-Actor", guest_runner)
         self.assertLess(guest_runner.index('phase_watcher_pid=$!'), guest_runner.index('curl -fsS -H \'Content-Type: application/json\' -H "Idempotency-Key: $key"'))
