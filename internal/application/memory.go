@@ -3,7 +3,9 @@ package application
 import (
 	"context"
 	"sort"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/open-card/open-card/internal/domain"
 )
@@ -19,6 +21,8 @@ type MemoryRepository struct {
 	mu           sync.RWMutex
 	applications map[domain.ID]domain.Application
 	idempotency  map[string]memoryIdempotency
+	uploads      map[domain.ID]domain.SourceUploadRecord
+	workspaces   map[string]domain.ID
 	events       []Event
 	nextSequence uint64
 }
@@ -27,7 +31,45 @@ func NewMemoryRepository() *MemoryRepository {
 	return &MemoryRepository{
 		applications: make(map[domain.ID]domain.Application),
 		idempotency:  make(map[string]memoryIdempotency),
+		uploads:      make(map[domain.ID]domain.SourceUploadRecord),
+		workspaces:   make(map[string]domain.ID),
 	}
+}
+
+func (r *MemoryRepository) PreflightCreateApplication(_ context.Context, input CreateApplicationPreflight) (CreateApplicationResult, bool, error) {
+	if strings.TrimSpace(input.IdempotencyKey) == "" || strings.TrimSpace(input.RequestDigest) == "" {
+		return CreateApplicationResult{}, false, domain.ValidationError("application idempotency preflight is incomplete")
+	}
+	if input.Source != nil {
+		if err := input.Source.Validate(); err != nil {
+			return CreateApplicationResult{}, false, err
+		}
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if previous, ok := r.idempotency[input.IdempotencyKey]; ok {
+		if previous.digest != input.RequestDigest {
+			return CreateApplicationResult{}, false, ErrIdempotencyConflict
+		}
+		return cloneCreateResult(previous.result), true, nil
+	}
+	if input.Source != nil && input.Source.Kind == CreateApplicationSourceUpload {
+		upload, found := r.uploads[input.Source.UploadID]
+		if !found {
+			return CreateApplicationResult{}, false, ErrNotFound
+		}
+		if upload.Status == domain.SourceUploadClaimed {
+			return CreateApplicationResult{}, false, domain.WrapError(domain.ErrConflict, "source upload is already claimed", domain.ErrSourceUploadClaimed)
+		}
+		now := input.Now
+		if now.IsZero() {
+			now = time.Now().UTC()
+		}
+		if upload.Status != domain.SourceUploadReady || !now.Before(upload.ExpiresAt) {
+			return CreateApplicationResult{}, false, domain.NewError(domain.ErrConflict, "source upload is not ready")
+		}
+	}
+	return CreateApplicationResult{}, false, nil
 }
 
 func (r *MemoryRepository) CreateApplication(_ context.Context, record CreateApplicationRecord) (CreateApplicationResult, error) {
@@ -39,14 +81,74 @@ func (r *MemoryRepository) CreateApplication(_ context.Context, record CreateApp
 		}
 		return cloneCreateResult(previous.result), nil
 	}
+	if record.Source != nil {
+		switch record.Source.Kind {
+		case CreateApplicationSourceUpload:
+			if record.PreparedSource == nil || record.PreparedSource.ID.Empty() || record.PreparedSource.ApplicationID != record.Application.ID || record.PreparedSource.Kind != domain.SourceUpload || record.PreparedSource.Locator != "upload://"+record.Source.UploadID.String() {
+				return CreateApplicationResult{}, domain.ValidationError("upload source requires a prepared immutable source revision")
+			}
+			if err := record.PreparedSource.Validate(); err != nil {
+				return CreateApplicationResult{}, err
+			}
+			upload, found := r.uploads[record.Source.UploadID]
+			if !found {
+				return CreateApplicationResult{}, ErrNotFound
+			}
+			if upload.Status == domain.SourceUploadClaimed {
+				return CreateApplicationResult{}, domain.WrapError(domain.ErrConflict, "source upload is already claimed", domain.ErrSourceUploadClaimed)
+			}
+			if upload.Status != domain.SourceUploadReady || !record.Application.CreatedAt.Before(upload.ExpiresAt) {
+				return CreateApplicationResult{}, domain.NewError(domain.ErrConflict, "source upload is not ready")
+			}
+			upload.Status, upload.ClaimedApplicationID, upload.ClaimedSourceID, upload.UpdatedAt = domain.SourceUploadClaimed, record.Application.ID, record.PreparedSource.ID, record.Application.CreatedAt
+			r.uploads[upload.ID] = upload
+		case CreateApplicationSourceGit:
+			return CreateApplicationResult{}, domain.NewError(domain.ErrUnsupportedCapability, "git application creation is not implemented")
+		}
+	}
 	r.nextSequence++
 	record.Event.Sequence = r.nextSequence
 	record.Event.ID = eventID(record.Event.Sequence)
 	r.applications[record.Application.ID] = record.Application
-	result := CreateApplicationResult{Application: record.Application, EnvironmentID: record.EnvironmentID, OperationID: record.OperationID, Event: cloneEvent(record.Event)}
+	if record.PreparedSource != nil {
+		r.workspaces[record.PreparedSource.WorkspaceRef] = record.PreparedSource.ID
+	}
+	result := CreateApplicationResult{Application: record.Application, EnvironmentID: record.EnvironmentID, OperationID: record.OperationID, SourceRevisionID: preparedSourceID(record.PreparedSource), Event: cloneEvent(record.Event)}
 	r.events = append(r.events, cloneEvent(record.Event))
 	r.idempotency[record.IdempotencyKey] = memoryIdempotency{digest: record.RequestDigest, result: cloneCreateResult(result)}
 	return result, nil
+}
+
+func (r *MemoryRepository) HasSourceWorkspaceReference(_ context.Context, workspace string) (bool, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	_, found := r.workspaces[workspace]
+	return found, nil
+}
+
+func preparedSourceID(source *domain.SourceRevision) domain.ID {
+	if source == nil {
+		return ""
+	}
+	return source.ID
+}
+
+// RegisterSourceUpload is a deterministic test/development helper. Production
+// upload facts are written by the PostgreSQL upload store instead.
+func (r *MemoryRepository) RegisterSourceUpload(upload domain.SourceUploadRecord) error {
+	if err := upload.Validate(); err != nil {
+		return err
+	}
+	if upload.Status != domain.SourceUploadReady {
+		return domain.ValidationError("memory source upload must start ready")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, exists := r.uploads[upload.ID]; exists {
+		return ErrIdempotencyConflict
+	}
+	r.uploads[upload.ID] = upload
+	return nil
 }
 
 func (r *MemoryRepository) ListApplications(context.Context) ([]domain.Application, error) {

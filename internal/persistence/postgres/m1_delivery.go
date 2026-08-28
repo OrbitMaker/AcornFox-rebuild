@@ -241,6 +241,27 @@ const (
 	WorkspaceFailed   WorkspaceLifecycle = "failed"
 )
 
+func (s *Store) GetSourceWorkspaceLifecycle(ctx context.Context, sourceID domain.ID) (WorkspaceLifecycle, error) {
+	if err := s.requireDB(); err != nil {
+		return "", err
+	}
+	if err := domain.RequireID(sourceID, "source revision id"); err != nil {
+		return "", err
+	}
+	var state WorkspaceLifecycle
+	err := s.db.QueryRowContext(ctx, `SELECT workspace_lifecycle FROM source_revisions WHERE id=$1 AND source_kind IS NOT NULL`, sourceID.String()).Scan(&state)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", err
+	}
+	if state != WorkspacePrepared && state != WorkspaceReleased && state != WorkspaceFailed {
+		return "", ErrIdempotencyCorrupt
+	}
+	return state, nil
+}
+
 type WorkspaceLifecycleEvent struct {
 	SourceRevisionID domain.ID          `json:"source_revision_id"`
 	WorkspaceRef     string             `json:"workspace_ref"`

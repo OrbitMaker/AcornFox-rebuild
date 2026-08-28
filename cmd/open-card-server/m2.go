@@ -10,7 +10,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"sort"
 	"strings"
 	"time"
@@ -21,8 +20,6 @@ import (
 	composeimport "github.com/open-card/open-card/internal/importers/compose"
 	"github.com/open-card/open-card/internal/persistence/postgres"
 )
-
-const maxM2UploadBytes = 128 << 20
 
 func (s *Server) handleM2(writer http.ResponseWriter, request *http.Request) bool {
 	path := strings.Trim(request.URL.Path, "/")
@@ -128,47 +125,7 @@ func (s *Server) handleM2Source(writer http.ResponseWriter, request *http.Reques
 		writeJSONError(writer, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 		return
 	}
-	if strings.TrimSpace(s.m2UploadRoot) == "" {
-		writeJSONError(writer, http.StatusServiceUnavailable, "source_unavailable", "M2 upload root is unavailable")
-		return
-	}
-	request.Body = http.MaxBytesReader(writer, request.Body, maxM2UploadBytes+1<<20)
-	if err := request.ParseMultipartForm(1 << 20); err != nil {
-		writeJSONError(writer, http.StatusBadRequest, "invalid_source", "multipart source is invalid")
-		return
-	}
-	applicationID := domain.ID(strings.TrimSpace(request.FormValue("application_id")))
-	if request.FormValue("kind") != "upload" || applicationID.Empty() {
-		writeJSONError(writer, http.StatusBadRequest, "invalid_source", "M2 source requires upload kind and application_id")
-		return
-	}
-	input, _, err := request.FormFile("archive")
-	if err != nil {
-		writeJSONError(writer, http.StatusBadRequest, "invalid_source", "source archive is required")
-		return
-	}
-	defer input.Close()
-	temporary, err := os.CreateTemp(s.m2UploadRoot, ".m2-upload-*.tar")
-	if err != nil {
-		writeJSONError(writer, http.StatusServiceUnavailable, "source_unavailable", "source staging is unavailable")
-		return
-	}
-	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
-	written, copyErr := io.Copy(temporary, io.LimitReader(input, maxM2UploadBytes+1))
-	closeErr := temporary.Close()
-	if copyErr != nil || closeErr != nil || written <= 0 || written > maxM2UploadBytes {
-		writeJSONError(writer, http.StatusBadRequest, "invalid_source", "source archive exceeds the accepted boundary")
-		return
-	}
-	_ = os.Chmod(temporaryPath, 0o600)
-	idempotencyKey := strings.TrimSpace(request.Header.Get("Idempotency-Key"))
-	revision, err := s.m2Controller.PrepareSource(request.Context(), contracts.PrepareSourceRequest{ApplicationID: applicationID, Kind: domain.SourceUpload, Locator: temporaryPath, Operation: contracts.OperationContext{IdempotencyKey: idempotencyKey, Actor: "m2-api"}})
-	if err != nil {
-		writeDomainError(writer, err)
-		return
-	}
-	writeJSON(writer, http.StatusCreated, map[string]any{"source_revision": revision})
+	writeJSONError(writer, http.StatusGone, "source_upload_migration_required", "use the G3 source upload and application source APIs")
 }
 
 func (s *Server) handleM2Import(writer http.ResponseWriter, request *http.Request) {
@@ -287,6 +244,15 @@ func (s *Server) handleM2Release(writer http.ResponseWriter, request *http.Reque
 	sourceRevision, err := s.m2Store.GetSourceRevision(request.Context(), input.SourceRevisionID)
 	if err != nil {
 		writeDomainError(writer, err)
+		return
+	}
+	workspaceState, err := s.m2Store.GetSourceWorkspaceLifecycle(request.Context(), input.SourceRevisionID)
+	if err != nil {
+		writeDomainError(writer, err)
+		return
+	}
+	if workspaceState != postgres.WorkspacePrepared {
+		writeJSONError(writer, http.StatusServiceUnavailable, "source_preparation_pending", "source upload has not been prepared into a buildable workspace")
 		return
 	}
 	environmentID, err := s.m2Store.GetDefaultEnvironmentID(request.Context(), record.Group.ApplicationID)

@@ -25,6 +25,7 @@ type m2ReleaseHTTPRegressionStore struct {
 	identity     postgres.M2ServiceGroupIdentity
 	source       domain.SourceRevision
 	environment  domain.ID
+	workspace    postgres.WorkspaceLifecycle
 	releaseCalls int
 	buildCalls   int
 }
@@ -99,6 +100,12 @@ func (s *m2ReleaseHTTPRegressionStore) GetSourceRevision(_ context.Context, id d
 		return domain.SourceRevision{}, errors.New("source revision not found")
 	}
 	return s.source, nil
+}
+func (s *m2ReleaseHTTPRegressionStore) GetSourceWorkspaceLifecycle(_ context.Context, id domain.ID) (postgres.WorkspaceLifecycle, error) {
+	if id != s.source.ID {
+		return "", errors.New("source workspace not found")
+	}
+	return s.workspace, nil
 }
 func (s *m2ReleaseHTTPRegressionStore) CreateDeliveryDefinition(_ context.Context, definition domain.ApplicationDeliveryDefinition) (domain.ApplicationDeliveryDefinition, error) {
 	return definition, nil
@@ -175,6 +182,7 @@ func m2ReleaseHTTPRegressionFixture() (*m2ReleaseHTTPRegressionStore, *controlle
 			Immutable:     true,
 		},
 		environment: "env_m4_http_regression",
+		workspace:   postgres.WorkspacePrepared,
 	}
 	controller := &controllers.M2ReleaseController{
 		Store:               store,
@@ -193,6 +201,22 @@ func m2ReleaseHTTPRegressionServer(store *m2ReleaseHTTPRegressionStore, controll
 	server.m2Store = store
 	server.m2Controller = controller
 	return server
+}
+
+func TestM2ReleaseRejectsNonPreparedUploadBeforeBuildProvider(t *testing.T) {
+	store, controller := m2ReleaseHTTPRegressionFixture()
+	store.workspace = postgres.WorkspaceReleased
+	server := m2ReleaseHTTPRegressionServer(store, controller)
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/service-groups/"+store.record.Group.ID.String()+"/releases", strings.NewReader(`{"source_revision_id":"src_m4_http_regression","version":1}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Idempotency-Key", "m2-pending-source")
+	recorder := httptest.NewRecorder()
+	if !server.handleM2(recorder, request) {
+		t.Fatal("M2 release route was not handled")
+	}
+	if recorder.Code != http.StatusServiceUnavailable || !strings.Contains(recorder.Body.String(), "source_preparation_pending") || store.buildCalls != 0 || store.releaseCalls != 0 {
+		t.Fatalf("non-prepared source status=%d body=%s builds=%d releases=%d", recorder.Code, recorder.Body.String(), store.buildCalls, store.releaseCalls)
+	}
 }
 
 func decodeM2ReleaseHTTPBody(t *testing.T, recorder *httptest.ResponseRecorder) map[string]any {

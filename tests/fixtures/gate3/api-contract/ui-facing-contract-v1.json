@@ -8,8 +8,8 @@
     "POST /api/v1/applications/{applicationId}/domains/{domainId}/verify": "partial",
     "DELETE /api/v1/applications/{applicationId}/domains/{domainId}": "partial",
     "GET /api/v1/applications/{applicationId}/access": "partial",
-    "POST /api/v1/source-uploads": "not_implemented",
-    "GET /api/v1/source-uploads/{uploadId}": "not_implemented"
+    "POST /api/v1/source-uploads": "implemented",
+    "GET /api/v1/source-uploads/{uploadId}": "implemented"
   },
   "session_security_scheme": "AdministratorSession",
   "csrf_header": "X-Open-Card-CSRF",

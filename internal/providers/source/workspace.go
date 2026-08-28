@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/open-card/open-card/internal/foundation"
 )
@@ -45,7 +46,7 @@ func copyDirectory(source, destination string, limits foundation.ArchiveLimits) 
 		if info.IsDir() {
 			return makeDestinationDir(destination, rel)
 		}
-		if !info.Mode().IsRegular() {
+		if !sourceSingleLinkedRegular(info) {
 			return errUploadRejected
 		}
 		files++
@@ -67,7 +68,7 @@ func copyLocalFile(source, destination, relative string, expected fs.FileInfo, m
 	}
 	defer input.Close()
 	actual, err := input.Stat()
-	if err != nil || !actual.Mode().IsRegular() || !os.SameFile(expected, actual) || actual.Size() != expected.Size() {
+	if err != nil || !sourceSingleLinkedRegular(actual) || !os.SameFile(expected, actual) || actual.Size() != expected.Size() {
 		return errUploadRejected
 	}
 	output, err := createDestinationFile(destination, relative)
@@ -79,6 +80,14 @@ func copyLocalFile(source, destination, relative string, expected fs.FileInfo, m
 		return err
 	}
 	return nil
+}
+
+func sourceSingleLinkedRegular(info fs.FileInfo) bool {
+	if !info.Mode().IsRegular() || info.Mode()&fs.ModeSymlink != 0 {
+		return false
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	return !ok || stat.Nlink == 1
 }
 
 func extractArchive(source, destination string, limits foundation.ArchiveLimits) error {

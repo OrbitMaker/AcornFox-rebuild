@@ -48,7 +48,7 @@ class ProductionBundleTests(unittest.TestCase):
         (dist / ".open-card-live-build.json").write_text('{"api_mode":"live"}', encoding="utf-8")
         return dist
 
-    def test_current_candidate_requires_0022_and_never_embeds_fake_n_minus_one(self) -> None:
+    def test_current_candidate_requires_0023_and_never_embeds_fake_n_minus_one(self) -> None:
         tool = load_tool()
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -62,7 +62,7 @@ class ProductionBundleTests(unittest.TestCase):
             self.assertFalse((output / "release-0.7.0-rc.1").exists())
             self.assertFalse((output / "release/manifest.json").exists())
             paths = {path.relative_to(output / "release").as_posix() for path in (output / "release").rglob("*") if path.is_file()}
-            for required in ("bin/open-card-admin", "systemd/open-card-edge.service", "caddy/open-card-edge.Caddyfile.example", "migrations/control-plane/0022_admin_auth.sql", "web/dist/index.html", "docs/licenses/licenses-manifest.json", "sbom.spdx.json", "source-manifest.sha256"):
+            for required in ("bin/open-card-admin", "systemd/open-card-edge.service", "caddy/open-card-edge.Caddyfile.example", "migrations/control-plane/0023_source_uploads.sql", "web/dist/index.html", "docs/licenses/licenses-manifest.json", "sbom.spdx.json", "source-manifest.sha256"):
                 self.assertIn(required, paths)
             self.assertFalse(any("fixture" in path or path.endswith(".test") for path in paths))
             self.assertTrue((output / "STRUCTURE-ONLY-NOT-INSTALLABLE").is_file())

@@ -86,6 +86,14 @@ class Gate3OpenAPIContractTests(unittest.TestCase):
         for value in self.fixture["invalid_relative_paths"]:
             self.assertIsNone(pattern.fullmatch(value), value)
         self.assertIn("absolute", self.text.lower())
+        response = self.components["schemas"]["SourceUploadResponse"]
+        self.assertIn("status", response["required"])
+        self.assertNotIn("storage_ref", response["properties"])
+        create = self.components["schemas"]["CreateApplicationRequest"]
+        self.assertEqual(set(create["required"]), {"name", "source"})
+        variants = [self.components["schemas"][item["$ref"].rsplit("/", 1)[1]] for item in create["properties"]["source"]["oneOf"]]
+        self.assertEqual({variant["properties"]["kind"]["enum"][0] for variant in variants}, {"git", "upload"})
+        self.assertIn("501", self.paths["/api/v1/applications"]["post"]["responses"])
 
     def test_sse_reconnect_and_cloud_credential_exclusion_are_declared(self) -> None:
         for path in ("/api/v1/events", "/api/v1/operations/{operationId}/events"):

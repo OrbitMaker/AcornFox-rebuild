@@ -56,7 +56,7 @@ func addControlPlaneWriteProof(request *http.Request, csrf *http.Cookie) {
 
 func TestControlPlaneAuthRejectsAnonymousAndForgedIdentityHeaders(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
-	server := NewServer()
+	server := newServerWithReadySourceUpload(t)
 	_, session, _ := attachTestAdministratorTokens(t, server, &now)
 
 	forged := controlPlaneRequest(http.MethodGet, "/api/v1/applications", nil, nil)
@@ -86,7 +86,7 @@ func TestControlPlaneAuthRejectsAnonymousAndForgedIdentityHeaders(t *testing.T) 
 
 func TestControlPlaneAuthProtectsReadinessWritesAndSSE(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
-	server := NewServer()
+	server := newServerWithReadySourceUpload(t)
 	_, session, csrf := attachTestAdministratorTokens(t, server, &now)
 
 	protected := []string{
@@ -119,7 +119,7 @@ func TestControlPlaneAuthProtectsReadinessWritesAndSSE(t *testing.T) {
 	}
 
 	created := httptest.NewRecorder()
-	create := controlPlaneRequest(http.MethodPost, "/api/v1/applications", strings.NewReader(`{"name":"authenticated"}`), session)
+	create := controlPlaneRequest(http.MethodPost, "/api/v1/applications", strings.NewReader(`{"name":"authenticated","source":`+readySourceUploadJSON+`}`), session)
 	create.Header.Set("Content-Type", "application/json")
 	create.Header.Set("Idempotency-Key", "authenticated-create")
 	addControlPlaneWriteProof(create, csrf)
@@ -140,7 +140,7 @@ func TestControlPlaneAuthProtectsReadinessWritesAndSSE(t *testing.T) {
 
 func TestControlPlaneAuthExpiresSessionsAndReportsStoreFailure(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
-	server := NewServer()
+	server := newServerWithReadySourceUpload(t)
 	store, session := attachTestAdministrator(t, server, &now)
 
 	now = now.Add(domain.AdminSessionAbsoluteTimeout + time.Second)
@@ -161,7 +161,7 @@ func TestControlPlaneAuthExpiresSessionsAndReportsStoreFailure(t *testing.T) {
 
 func TestControlPlaneUnsafeRequestsRequireExactOriginAndSessionBoundCSRF(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
-	server := NewServer()
+	server := newServerWithReadySourceUpload(t)
 	_, session, csrf := attachTestAdministratorTokens(t, server, &now)
 	other, err := server.auth.Service.Login(context.Background(), "https://console.example.test", "control plane correct horse battery staple 123", "127.0.0.2")
 	if err != nil {
@@ -171,7 +171,7 @@ func TestControlPlaneUnsafeRequestsRequireExactOriginAndSessionBoundCSRF(t *test
 	otherCSRF := &http.Cookie{Name: authCSRFCookie, Value: other.CSRFTok, Path: "/"}
 
 	request := func(session, csrf *http.Cookie, origin, csrfHeader string) *http.Request {
-		value := controlPlaneRequest(http.MethodPost, "/api/v1/applications", strings.NewReader(`{"name":"csrf"}`), session)
+		value := controlPlaneRequest(http.MethodPost, "/api/v1/applications", strings.NewReader(`{"name":"csrf","source":`+readySourceUploadJSON+`}`), session)
 		value.Header.Set("Content-Type", "application/json")
 		value.Header.Set("Idempotency-Key", "csrf-contract")
 		if csrf != nil {

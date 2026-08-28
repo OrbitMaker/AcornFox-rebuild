@@ -6,7 +6,7 @@ usage() {
   cat >&2 <<'USAGE'
 usage: backup-control-plane.sh --root TASK_ROOT [--reason LABEL]
                                [--release-version VERSION]
-                               [--migration-version 0022]
+                               [--migration-version 0023]
                                [--database-dump-command EXECUTABLE]
                                [--confirm-installation-id BACKUP:ID]
                                [--test-safe-prefix PATH] [--dry-run]

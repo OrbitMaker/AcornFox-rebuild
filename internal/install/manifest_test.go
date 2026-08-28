@@ -47,13 +47,13 @@ func TestManifestValidateAndVerifyRelease(t *testing.T) {
 	}
 }
 
-func TestProductionCandidateRequires0022PayloadAndRejectsFixtures(t *testing.T) {
+func TestProductionCandidateRequires0023PayloadAndRejectsFixtures(t *testing.T) {
 	manifest, _ := testManifest(t, ProductionCandidateVersion, "bin/open-card-admin", []byte("admin"))
 	manifest.MigrationVersion = CurrentMigrationVersion
 	manifest.Files = append(manifest.Files,
 		FileDigest{Path: "systemd/open-card-edge.service", SHA256: strings.Repeat("a", 64), Mode: 0o644},
 		FileDigest{Path: "caddy/open-card-edge.Caddyfile.example", SHA256: strings.Repeat("b", 64), Mode: 0o644},
-		FileDigest{Path: "migrations/control-plane/0022_admin_auth.sql", SHA256: strings.Repeat("c", 64), Mode: 0o644},
+		FileDigest{Path: "migrations/control-plane/0023_source_uploads.sql", SHA256: strings.Repeat("c", 64), Mode: 0o644},
 		FileDigest{Path: "web/dist/index.html", SHA256: strings.Repeat("d", 64), Mode: 0o644},
 		FileDigest{Path: "docs/licenses/licenses-manifest.json", SHA256: strings.Repeat("e", 64), Mode: 0o644},
 		FileDigest{Path: "sbom.spdx.json", SHA256: strings.Repeat("f", 64), Mode: 0o644},

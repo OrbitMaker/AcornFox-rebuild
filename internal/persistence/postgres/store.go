@@ -133,6 +133,80 @@ func (s *Store) requireDB() error {
 	return nil
 }
 
+// PreflightCreateApplication is intentionally read-only. The controller calls
+// it before a SourceProvider may publish an immutable workspace, so completed
+// idempotent replays and known unusable uploads cannot create orphaned source
+// material. CreateApplication still rechecks and claims inside its transaction.
+func (s *Store) PreflightCreateApplication(ctx context.Context, input application.CreateApplicationPreflight) (application.CreateApplicationResult, bool, error) {
+	if err := s.requireDB(); err != nil {
+		return application.CreateApplicationResult{}, false, err
+	}
+	key, digest := strings.TrimSpace(input.IdempotencyKey), strings.TrimSpace(input.RequestDigest)
+	if key == "" || digest == "" {
+		return application.CreateApplicationResult{}, false, domain.ValidationError("application idempotency preflight is incomplete")
+	}
+	if input.Source != nil {
+		if err := input.Source.Validate(); err != nil {
+			return application.CreateApplicationResult{}, false, err
+		}
+	}
+	var storedDigest, status string
+	var response []byte
+	err := s.db.QueryRowContext(ctx, `SELECT request_digest,status,response FROM idempotency_records WHERE scope=$1 AND idempotency_key=$2`, createApplicationScope, key).Scan(&storedDigest, &status, &response)
+	if err == nil {
+		if storedDigest != digest {
+			return application.CreateApplicationResult{}, false, ErrIdempotencyConflict
+		}
+		switch status {
+		case "completed":
+			result, decodeErr := decodeCreateApplicationResult(response)
+			if decodeErr != nil {
+				return application.CreateApplicationResult{}, false, decodeErr
+			}
+			return result, true, nil
+		case "in_progress":
+			return application.CreateApplicationResult{}, false, ErrIdempotencyInProgress
+		default:
+			return application.CreateApplicationResult{}, false, fmt.Errorf("%w: unsupported status %q", ErrIdempotencyCorrupt, status)
+		}
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return application.CreateApplicationResult{}, false, err
+	}
+	if input.Source != nil && input.Source.Kind == application.CreateApplicationSourceUpload {
+		upload, getErr := s.GetSourceUpload(ctx, input.Source.UploadID)
+		if getErr != nil {
+			return application.CreateApplicationResult{}, false, getErr
+		}
+		if upload.Status == domain.SourceUploadClaimed {
+			return application.CreateApplicationResult{}, false, domain.WrapError(domain.ErrConflict, "source upload is already claimed", domain.ErrSourceUploadClaimed)
+		}
+		now := input.Now
+		if now.IsZero() {
+			now = s.now()
+		}
+		if upload.Status != domain.SourceUploadReady || !now.Before(upload.ExpiresAt) {
+			return application.CreateApplicationResult{}, false, domain.NewError(domain.ErrConflict, "source upload is not ready")
+		}
+	}
+	return application.CreateApplicationResult{}, false, nil
+}
+
+func (s *Store) HasSourceWorkspaceReference(ctx context.Context, workspace string) (bool, error) {
+	if err := s.requireDB(); err != nil {
+		return false, err
+	}
+	workspace = strings.TrimSpace(workspace)
+	if workspace == "" {
+		return false, domain.ValidationError("source workspace reference is required")
+	}
+	var referenced bool
+	if err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM source_revisions WHERE workspace_ref=$1 AND source_kind IS NOT NULL)`, workspace).Scan(&referenced); err != nil {
+		return false, err
+	}
+	return referenced, nil
+}
+
 // CreateApplication writes the application, its default environment, the
 // initial operation and task, the first outbox event, and the completed
 // idempotency response in one transaction. An existing request with a
@@ -247,6 +321,31 @@ func (s *Store) CreateApplication(ctx context.Context, record application.Create
 	`, record.EnvironmentID.String(), record.Application.ID.String(), defaultEnvironmentName, record.Application.CreatedAt.UTC()); err != nil {
 		return rollback(fmt.Errorf("insert default environment: %w", err))
 	}
+	if record.Source != nil {
+		switch record.Source.Kind {
+		case application.CreateApplicationSourceUpload:
+			upload, err := readySourceUploadTx(ctx, tx, record.Source.UploadID, createdAt)
+			if err != nil {
+				return rollback(fmt.Errorf("claim source upload: %w", err))
+			}
+			if _, err := tx.ExecContext(ctx, `
+				INSERT INTO source_revisions(id,application_id,provider,source_kind,locator,source_ref,content_digest,workspace_ref,workspace_lifecycle,immutable)
+				VALUES($1,$2,'upload','upload',$3,$4,$5,$6,'prepared',true)
+			`, record.PreparedSource.ID.String(), record.Application.ID.String(), record.PreparedSource.Locator, upload.ID.String(), record.PreparedSource.ContentDigest, record.PreparedSource.WorkspaceRef); err != nil {
+				return rollback(fmt.Errorf("insert upload source revision: %w", err))
+			}
+			if _, err := tx.ExecContext(ctx, `INSERT INTO source_workspace_events(source_revision_id,sequence,workspace_ref,state,created_at) VALUES($1,1,$2,'prepared',$3)`, record.PreparedSource.ID.String(), record.PreparedSource.WorkspaceRef, createdAt); err != nil {
+				return rollback(fmt.Errorf("record upload source preparation: %w", err))
+			}
+			if _, err := claimSourceUploadTx(ctx, tx, upload.ID, record.Application.ID, record.PreparedSource.ID, createdAt); err != nil {
+				return rollback(fmt.Errorf("finalize source upload claim: %w", err))
+			}
+		case application.CreateApplicationSourceGit:
+			return rollback(domain.NewError(domain.ErrUnsupportedCapability, "git application creation is not implemented"))
+		default:
+			return rollback(domain.ValidationError("application source kind is unsupported"))
+		}
+	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO operations
 			(id, application_id, environment_id, operation_type, idempotency_key,
@@ -256,9 +355,10 @@ func (s *Store) CreateApplication(ctx context.Context, record application.Create
 		return rollback(fmt.Errorf("insert application operation: %w", err))
 	}
 	taskPayload, err := json.Marshal(map[string]string{
-		"kind":           createApplicationTaskTag,
-		"application_id": record.Application.ID.String(),
-		"operation_id":   record.OperationID.String(),
+		"kind":               createApplicationTaskTag,
+		"application_id":     record.Application.ID.String(),
+		"operation_id":       record.OperationID.String(),
+		"source_revision_id": preparedSourceID(record.PreparedSource).String(),
 	})
 	if err != nil {
 		return rollback(fmt.Errorf("encode application task payload: %w", err))
@@ -296,7 +396,7 @@ func (s *Store) CreateApplication(ctx context.Context, record application.Create
 	`, event.ID, record.OperationID.String(), streamSequence, event.Kind, eventPayload, event.OccurredAt.UTC(), event.SchemaVersion); err != nil {
 		return rollback(fmt.Errorf("insert application outbox event: %w", err))
 	}
-	result := application.CreateApplicationResult{Application: record.Application, EnvironmentID: record.EnvironmentID, OperationID: record.OperationID, Event: event}
+	result := application.CreateApplicationResult{Application: record.Application, EnvironmentID: record.EnvironmentID, OperationID: record.OperationID, SourceRevisionID: preparedSourceID(record.PreparedSource), Event: event}
 	resultPayload, err := json.Marshal(result)
 	if err != nil {
 		return rollback(fmt.Errorf("encode application idempotency response: %w", err))
@@ -338,6 +438,24 @@ func validateCreateRecord(record application.CreateApplicationRecord) error {
 	if strings.TrimSpace(record.IdempotencyKey) == "" {
 		return domain.ValidationError("idempotency key is required")
 	}
+	if record.Source != nil {
+		if err := record.Source.Validate(); err != nil {
+			return err
+		}
+		if record.Source.Kind == application.CreateApplicationSourceUpload {
+			if record.PreparedSource == nil || record.PreparedSource.ID.Empty() || record.PreparedSource.ApplicationID != record.Application.ID || record.PreparedSource.Kind != domain.SourceUpload || record.PreparedSource.Locator != "upload://"+record.Source.UploadID.String() {
+				return domain.ValidationError("upload source requires a prepared immutable source revision")
+			}
+			if err := record.PreparedSource.Validate(); err != nil {
+				return err
+			}
+		}
+		if record.Source.Kind == application.CreateApplicationSourceGit && record.PreparedSource != nil {
+			return domain.ValidationError("git source cannot claim an upload revision")
+		}
+	} else if record.PreparedSource != nil {
+		return domain.ValidationError("source revision requires a source input")
+	}
 	if record.Event.OperationID != "" && record.Event.OperationID != record.OperationID.String() {
 		return domain.ValidationError("event operation does not match operation id")
 	}
@@ -356,6 +474,24 @@ func validateCreateRecord(record application.CreateApplicationRecord) error {
 func applicationNameDigest(name string) string {
 	digest := sha256.Sum256([]byte(strings.TrimSpace(name)))
 	return "sha256:" + hex.EncodeToString(digest[:])
+}
+
+func decodeCreateApplicationResult(response []byte) (application.CreateApplicationResult, error) {
+	if len(response) == 0 {
+		return application.CreateApplicationResult{}, ErrIdempotencyCorrupt
+	}
+	var result application.CreateApplicationResult
+	if err := json.Unmarshal(response, &result); err != nil || result.Application.ID.Empty() || result.EnvironmentID.Empty() || result.OperationID.Empty() || result.Event.ID == "" || result.Event.Sequence == 0 {
+		return application.CreateApplicationResult{}, fmt.Errorf("%w: invalid stored response", ErrIdempotencyCorrupt)
+	}
+	return result, nil
+}
+
+func preparedSourceID(source *domain.SourceRevision) domain.ID {
+	if source == nil {
+		return ""
+	}
+	return source.ID
 }
 
 func (s *Store) now() time.Time {

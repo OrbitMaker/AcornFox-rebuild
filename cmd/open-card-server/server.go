@@ -71,6 +71,7 @@ type Server struct {
 	m2Controller      *controllers.M2ReleaseController
 	m2Store           interface {
 		GetSourceRevision(context.Context, domain.ID) (domain.SourceRevision, error)
+		GetSourceWorkspaceLifecycle(context.Context, domain.ID) (postgres.WorkspaceLifecycle, error)
 		CreateDeliveryDefinition(context.Context, domain.ApplicationDeliveryDefinition) (domain.ApplicationDeliveryDefinition, error)
 		GetDeliveryDefinition(context.Context, domain.ID) (domain.ApplicationDeliveryDefinition, error)
 		GetServiceGroupRecord(context.Context, domain.ID) (postgres.ServiceGroupRecord, error)
@@ -92,6 +93,7 @@ type Server struct {
 	auth             *AuthHTTPHandler
 	m3Access         *M3AccessHTTPHandler
 	g3Access         *G3AccessHTTPHandler
+	g3SourceUpload   *G3SourceUploadHTTPHandler
 	tlsAllow         *TLSAllowHTTPHandler
 	m4Operations     *M4OperationsHTTPHandler
 	m4Webhooks       *M4WebhookHTTPHandler
@@ -131,18 +133,19 @@ func (s *Server) SetM2(controller *controllers.M2ReleaseController, store *postg
 	s.m2UploadRoot, s.m2TaskPrefix = uploadRoot, taskPrefix
 	s.m2AgentInstance, s.m2AgentNode = agentInstance, agentNode
 }
-func (s *Server) SetM2Lifecycle(handler *M2LifecycleHandler)       { s.m2Lifecycle = handler }
-func (s *Server) SetAuth(handler *AuthHTTPHandler)                 { s.auth = handler }
-func (s *Server) SetM3Access(handler *M3AccessHTTPHandler)         { s.m3Access = handler }
-func (s *Server) SetG3Access(handler *G3AccessHTTPHandler)         { s.g3Access = handler }
-func (s *Server) SetTLSAllow(handler *TLSAllowHTTPHandler)         { s.tlsAllow = handler }
-func (s *Server) SetM4Operations(handler *M4OperationsHTTPHandler) { s.m4Operations = handler }
-func (s *Server) SetM4Webhooks(handler *M4WebhookHTTPHandler)      { s.m4Webhooks = handler }
-func (s *Server) SetM4Logs(handler *M4LogsHTTPHandler)             { s.m4Logs = handler }
-func (s *Server) SetM5Usage(handler *M5UsageHTTPHandler)           { s.m5Usage = handler }
-func (s *Server) SetM6AI(handler *M6AIHTTPHandler)                 { s.m6AI = handler }
-func (s *Server) Handler() http.Handler                            { return http.HandlerFunc(s.serveHTTP) }
-func (s *Server) AgentGateway() *agenttransport.Gateway            { return s.agentGateway }
+func (s *Server) SetM2Lifecycle(handler *M2LifecycleHandler)           { s.m2Lifecycle = handler }
+func (s *Server) SetAuth(handler *AuthHTTPHandler)                     { s.auth = handler }
+func (s *Server) SetM3Access(handler *M3AccessHTTPHandler)             { s.m3Access = handler }
+func (s *Server) SetG3Access(handler *G3AccessHTTPHandler)             { s.g3Access = handler }
+func (s *Server) SetG3SourceUpload(handler *G3SourceUploadHTTPHandler) { s.g3SourceUpload = handler }
+func (s *Server) SetTLSAllow(handler *TLSAllowHTTPHandler)             { s.tlsAllow = handler }
+func (s *Server) SetM4Operations(handler *M4OperationsHTTPHandler)     { s.m4Operations = handler }
+func (s *Server) SetM4Webhooks(handler *M4WebhookHTTPHandler)          { s.m4Webhooks = handler }
+func (s *Server) SetM4Logs(handler *M4LogsHTTPHandler)                 { s.m4Logs = handler }
+func (s *Server) SetM5Usage(handler *M5UsageHTTPHandler)               { s.m5Usage = handler }
+func (s *Server) SetM6AI(handler *M6AIHTTPHandler)                     { s.m6AI = handler }
+func (s *Server) Handler() http.Handler                                { return http.HandlerFunc(s.serveHTTP) }
+func (s *Server) AgentGateway() *agenttransport.Gateway                { return s.agentGateway }
 func (s *Server) HTTPServer(addr string) *http.Server {
 	return &http.Server{Addr: addr, Handler: s.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 0, IdleTimeout: 60 * time.Second}
 }
@@ -244,6 +247,9 @@ func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
 		s.handleApplication(writer, request)
 		return
 	}
+	if s.g3SourceUpload != nil && s.g3SourceUpload.Handle(writer, request) {
+		return
+	}
 	if s.m2Lifecycle != nil && s.m2Lifecycle.Handle(writer, request) {
 		return
 	}
@@ -316,19 +322,37 @@ func (s *Server) handleApplications(writer http.ResponseWriter, request *http.Re
 		writeJSON(writer, http.StatusOK, map[string]any{"items": items})
 	case http.MethodPost:
 		var input struct {
-			Name string `json:"name"`
+			Name   string `json:"name"`
+			Source *struct {
+				Kind          string `json:"kind"`
+				UploadID      string `json:"upload_id"`
+				RepositoryURL string `json:"repository_url"`
+				Ref           string `json:"ref"`
+			} `json:"source"`
 		}
 		if err := decodeJSON(request, &input); err != nil {
 			writeJSONError(writer, http.StatusBadRequest, "invalid_argument", err.Error())
 			return
 		}
-		result, err := s.controller.CreateApplication(request.Context(), input.Name, request.Header.Get("Idempotency-Key"))
+		var source *application.CreateApplicationSource
+		if input.Source != nil {
+			source = &application.CreateApplicationSource{Kind: application.CreateApplicationSourceKind(input.Source.Kind), UploadID: domain.ID(input.Source.UploadID), RepositoryURL: input.Source.RepositoryURL, Ref: input.Source.Ref}
+			if source.Kind == application.CreateApplicationSourceGit {
+				writeJSONError(writer, http.StatusNotImplemented, "source_git_not_implemented", "git application creation is not implemented")
+				return
+			}
+		} else {
+			writeJSONError(writer, http.StatusUnprocessableEntity, "validation_failed", "source is required")
+			return
+		}
+		result, err := s.controller.CreateApplicationWithSource(request.Context(), input.Name, source, request.Header.Get("Idempotency-Key"))
 		if err != nil {
 			writeApplicationError(writer, err)
 			return
 		}
 		s.broker.publish(result.Event)
-		writeJSON(writer, http.StatusCreated, map[string]any{"application": result.Application, "environment_id": result.EnvironmentID.String(), "operation_id": result.OperationID.String()})
+		response := map[string]any{"application": result.Application, "environment_id": result.EnvironmentID.String(), "operation_id": result.OperationID.String(), "source_revision_id": result.SourceRevisionID.String()}
+		writeJSON(writer, http.StatusCreated, response)
 	default:
 		writer.Header().Set("Allow", "GET, POST, OPTIONS")
 		writeJSONError(writer, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")

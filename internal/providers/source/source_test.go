@@ -8,6 +8,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -73,6 +75,26 @@ func TestPrepareUploadDirectoryPublishesImmutableIdempotentRevision(t *testing.T
 	}
 	if third.Revision.ContentDigest == first.Revision.ContentDigest || third.Revision.WorkspaceRef == first.Revision.WorkspaceRef {
 		t.Fatalf("changed upload did not create an independent immutable revision: %#v %#v", first.Revision, third.Revision)
+	}
+}
+
+func TestPrepareStoredG3UploadReferenceNeverAcceptsClientPath(t *testing.T) {
+	uploads := t.TempDir()
+	workspace := filepath.Join(t.TempDir(), "workspaces")
+	stored := filepath.Join(uploads, "upload_1", "files", "src")
+	if err := os.MkdirAll(stored, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stored, "main.go"), []byte("package main"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	provider := newTestProvider(t, uploads, workspace)
+	result, err := provider.Prepare(context.Background(), uploadRequest("upload://upload_1", "g3-upload-ref"))
+	if err != nil || result.Revision.Locator != "upload://upload_1" {
+		t.Fatalf("stored upload result=%+v err=%v", result, err)
+	}
+	if _, err := provider.Prepare(context.Background(), uploadRequest("upload://../outside", "g3-upload-bad")); err == nil {
+		t.Fatal("unsafe stored upload reference was accepted")
 	}
 }
 
@@ -423,7 +445,92 @@ func makeTreeWritable(t *testing.T, root string) {
 }
 
 func uploadRequest(locator, key string) contracts.PrepareSourceRequest {
-	return contracts.PrepareSourceRequest{ApplicationID: "app_1", Kind: domain.SourceUpload, Locator: locator, Operation: contracts.OperationContext{IdempotencyKey: key}}
+	if strings.HasPrefix(locator, "upload://") {
+		return contracts.PrepareSourceRequest{ApplicationID: "app_1", Kind: domain.SourceUpload, Locator: locator, Operation: contracts.OperationContext{IdempotencyKey: key}}
+	}
+	id := "upload_" + strings.NewReplacer("/", "_", "\\", "_", ".", "_").Replace(key)
+	root := filepath.Dir(locator)
+	final := filepath.Join(root, id)
+	if _, err := os.Lstat(final); errors.Is(err, os.ErrNotExist) {
+		if info, statErr := os.Lstat(locator); statErr == nil && info.Mode()&fs.ModeSymlink == 0 {
+			if info.IsDir() {
+				if err := copySourceUploadFixture(locator, filepath.Join(final, "files")); err != nil {
+					panic(err)
+				}
+			} else {
+				if err := os.MkdirAll(final, 0o700); err != nil {
+					panic(err)
+				}
+				name := "archive" + archiveFixtureExtension(locator)
+				input, openErr := os.Open(locator)
+				if openErr != nil {
+					panic(openErr)
+				}
+				output, createErr := os.OpenFile(filepath.Join(final, name), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+				if createErr != nil {
+					_ = input.Close()
+					panic(createErr)
+				}
+				_, copyErr := io.Copy(output, input)
+				_ = input.Close()
+				_ = output.Close()
+				if copyErr != nil {
+					panic(copyErr)
+				}
+			}
+		}
+	}
+	return contracts.PrepareSourceRequest{ApplicationID: "app_1", Kind: domain.SourceUpload, Locator: "upload://" + id, Operation: contracts.OperationContext{IdempotencyKey: key}}
+}
+
+func archiveFixtureExtension(path string) string {
+	switch {
+	case strings.HasSuffix(path, ".tar.gz"):
+		return ".tar.gz"
+	case strings.HasSuffix(path, ".tgz"):
+		return ".tgz"
+	case strings.HasSuffix(path, ".zip"):
+		return ".zip"
+	default:
+		return ".invalid"
+	}
+}
+
+func copySourceUploadFixture(source, target string) error {
+	return filepath.WalkDir(source, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(source, path)
+		if err != nil || rel == "." {
+			if rel == "." {
+				return os.MkdirAll(target, 0o700)
+			}
+			return err
+		}
+		if entry.Type()&fs.ModeSymlink != 0 {
+			return errors.New("test source upload fixture must not follow symlink")
+		}
+		destination := filepath.Join(target, rel)
+		if entry.IsDir() {
+			return os.MkdirAll(destination, 0o700)
+		}
+		input, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer input.Close()
+		output, err := os.OpenFile(destination, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err != nil {
+			return err
+		}
+		_, copyErr := io.Copy(output, input)
+		closeErr := output.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		return closeErr
+	})
 }
 
 func assertSafeProviderError(t *testing.T, err error, locator string) {

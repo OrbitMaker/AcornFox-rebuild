@@ -273,13 +273,13 @@ func (p *Provider) requestFingerprint(request contracts.PrepareSourceRequest) (s
 		parts[2] = git.Ref
 		parts = append(parts, git.Locator)
 	case domain.SourceUpload:
-		path, err := p.allowedUploadPath(request.Locator)
-		if err != nil {
+		if !strings.HasPrefix(request.Locator, "upload://") {
+			return "", errUploadRejected
+		}
+		if _, err := p.storedUploadPath(request.Locator); err != nil {
 			return "", err
 		}
-		// The path is hashed instead of persisted. The actual source content is
-		// checked again while materializing, so this only scopes idempotency.
-		parts = append(parts, digestString(path))
+		parts = append(parts, request.Locator)
 	default:
 		return "", errUnsupportedSource
 	}
@@ -360,43 +360,56 @@ func (p *Provider) extractGitArchive(ctx context.Context, gitDir, commit, stage 
 }
 
 func (p *Provider) materializeUpload(stage, locator string) (string, error) {
-	source, err := p.allowedUploadPath(locator)
-	if err != nil {
-		return "", err
-	}
-	info, err := os.Lstat(source)
-	if err != nil {
-		return "", errUploadRejected
-	}
-	if info.Mode()&fs.ModeSymlink != 0 {
-		return "", errUploadRejected
-	}
-	if info.IsDir() {
-		if err := copyDirectory(source, stage, p.limits); err != nil {
+	if strings.HasPrefix(locator, "upload://") {
+		stored, err := p.storedUploadPath(locator)
+		if err != nil {
 			return "", err
 		}
-		return "upload://directory/" + digestString(filepath.Base(source)), nil
+		files := filepath.Join(stored, "files")
+		if info, statErr := os.Lstat(files); statErr == nil && info.IsDir() && info.Mode()&fs.ModeSymlink == 0 {
+			if err := copyDirectory(files, stage, p.limits); err != nil {
+				return "", err
+			}
+			return locator, nil
+		}
+		entries, err := os.ReadDir(stored)
+		if err != nil {
+			return "", errUploadRejected
+		}
+		var archive string
+		for _, entry := range entries {
+			if entry.IsDir() || entry.Type()&fs.ModeSymlink != 0 {
+				continue
+			}
+			name := entry.Name()
+			if name == "archive.zip" || name == "archive.tar.gz" || name == "archive.tgz" {
+				if archive != "" {
+					return "", errUploadRejected
+				}
+				archive = filepath.Join(stored, name)
+			}
+		}
+		if archive == "" || extractArchive(archive, stage, p.limits) != nil {
+			return "", errUploadRejected
+		}
+		return locator, nil
 	}
-	if !info.Mode().IsRegular() {
-		return "", errUploadRejected
-	}
-	if err := extractArchive(source, stage, p.limits); err != nil {
-		return "", err
-	}
-	return "upload://archive/" + digestString(filepath.Base(source)), nil
+	return "", errUploadRejected
 }
 
-func (p *Provider) allowedUploadPath(locator string) (string, error) {
-	path, err := existingPath(locator)
-	if err != nil {
+func (p *Provider) storedUploadPath(locator string) (string, error) {
+	id := strings.TrimPrefix(locator, "upload://")
+	if id == "" || strings.ContainsAny(id, `/\\`) || domain.RequireID(domain.ID(id), "source upload id") != nil {
 		return "", errUploadRejected
 	}
-	rel, err := filepath.Rel(p.uploadRoot, path)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+	path := filepath.Join(p.uploadRoot, id)
+	info, err := os.Lstat(path)
+	if err != nil || !info.IsDir() || info.Mode()&fs.ModeSymlink != 0 {
 		return "", errUploadRejected
 	}
 	return path, nil
 }
+
 
 func (p *Provider) publish(stage, digest string) (string, error) {
 	final := filepath.Join(p.workspaceRoot, digest)

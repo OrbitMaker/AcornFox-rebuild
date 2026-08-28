@@ -72,6 +72,7 @@ func main() {
 			log.Print("administrator HTTP authentication is not activated; OPEN_CARD_AUTH_ORIGIN is unset")
 		}
 		server.SetG3Access(newG3AccessHTTPHandler(store))
+		server.SetG3SourceUpload(&G3SourceUploadHTTPHandler{Store: store})
 		server.AgentGateway().SetEventSink(&controllers.DurableAgentSink{Store: store})
 		applicationWorker := &controllers.Worker{
 			Store: store, Handler: applicationTaskHandler{}, Owner: "control-plane-application",
@@ -95,6 +96,7 @@ func main() {
 					log.Fatal(err)
 				}
 			}
+			server.SetG3SourceUpload(newG3SourceUploadHTTPHandler(store))
 			var m4LogStore *observability.LogStore
 			var buildLogSink buildkit.BuildLogSink
 			if os.Getenv("OPEN_CARD_M4_ENABLED") == "true" {
@@ -139,6 +141,7 @@ func main() {
 			if err != nil {
 				log.Fatal(err)
 			}
+			server.controller.SetSourcePreparer(sourceProvider)
 			buildProvider, err := buildkit.New(buildkit.Config{Command: os.Getenv("OPEN_CARD_BUILDKIT_COMMAND"), Builder: os.Getenv("OPEN_CARD_BUILDKIT_WORKER"), Address: os.Getenv("OPEN_CARD_BUILDKIT_ADDRESS"), WorkspaceRoot: workspaceRoot, WorkRoot: buildWorkRoot, StaticServerBinary: os.Getenv("OPEN_CARD_STATIC_SERVER_BINARY"), ImageStore: imageStore, Capacity: capacityProvider, SecretResolver: secretProvider, LogSink: buildLogSink})
 			if err != nil {
 				log.Fatal(err)

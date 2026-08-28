@@ -25,7 +25,7 @@ func TestM4ActiveOperationIsAConflictNotInternalError(t *testing.T) {
 }
 
 func TestAPI_CONTRACT_001_ServerApplicationRESTAndSSE(t *testing.T) {
-	server := NewServer()
+	server := newServerWithReadySourceUpload(t)
 	now := time.Unix(1_700_000_000, 0).UTC()
 	_, session, csrf := attachTestAdministratorTokens(t, server, &now)
 	testServer := httptest.NewServer(server.Handler())
@@ -60,7 +60,7 @@ func TestAPI_CONTRACT_001_ServerApplicationRESTAndSSE(t *testing.T) {
 		t.Fatalf("expected SSE connected comment, got %q", scanner.Text())
 	}
 
-	createRequest, err := http.NewRequest(http.MethodPost, testServer.URL+"/api/v1/applications", strings.NewReader(`{"name":"demo"}`))
+	createRequest, err := http.NewRequest(http.MethodPost, testServer.URL+"/api/v1/applications", strings.NewReader(`{"name":"demo","source":`+readySourceUploadJSON+`}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -238,11 +238,13 @@ func TestServerReadinessIsDistinctFromLiveness(t *testing.T) {
 
 func TestAPI_CONTRACT_002_SSEReplaysFromRepositoryAfterServerRestart(t *testing.T) {
 	repository := application.NewMemoryRepository()
+	registerReadySourceUpload(t, repository)
 	firstState := NewServerWithRepository(repository)
+	configureTestSourcePreparer(firstState)
 	now := time.Unix(1_700_000_000, 0).UTC()
 	_, firstSession, firstCSRF := attachTestAdministratorTokens(t, firstState, &now)
 	firstServer := httptest.NewServer(firstState.Handler())
-	request, err := http.NewRequest(http.MethodPost, firstServer.URL+"/api/v1/applications", strings.NewReader(`{"name":"persistent"}`))
+	request, err := http.NewRequest(http.MethodPost, firstServer.URL+"/api/v1/applications", strings.NewReader(`{"name":"persistent","source":`+readySourceUploadJSON+`}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -265,6 +267,7 @@ func TestAPI_CONTRACT_002_SSEReplaysFromRepositoryAfterServerRestart(t *testing.
 	firstServer.Close()
 
 	restartedState := NewServerWithRepository(repository)
+	configureTestSourcePreparer(restartedState)
 	_, restartedSession := attachTestAdministrator(t, restartedState, &now)
 	restarted := httptest.NewServer(restartedState.Handler())
 	defer restarted.Close()
@@ -298,14 +301,14 @@ func TestAPI_CONTRACT_002_SSEReplaysFromRepositoryAfterServerRestart(t *testing.
 }
 
 func TestAPI_IDEMPOTENCY_001_CreateReplayAndConflict(t *testing.T) {
-	serverState := NewServer()
+	serverState := newServerWithReadySourceUpload(t)
 	now := time.Unix(1_700_000_000, 0).UTC()
 	_, session, csrf := attachTestAdministratorTokens(t, serverState, &now)
 	server := httptest.NewServer(serverState.Handler())
 	defer server.Close()
 	create := func(name string) (*http.Response, map[string]any) {
 		t.Helper()
-		request, err := http.NewRequest(http.MethodPost, server.URL+"/api/v1/applications", strings.NewReader(`{"name":"`+name+`"}`))
+		request, err := http.NewRequest(http.MethodPost, server.URL+"/api/v1/applications", strings.NewReader(`{"name":"`+name+`","source":`+readySourceUploadJSON+`}`))
 		if err != nil {
 			t.Fatal(err)
 		}

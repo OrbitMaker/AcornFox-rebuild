@@ -142,6 +142,10 @@ paths:
           headers:
             Open-Card-API-Version:
               $ref: '#/components/headers/APINegotiatedVersion'
+        '422': {$ref: '#/components/responses/ValidationFailed'}
+        '503': {$ref: '#/components/responses/DependencyUnavailable'}
+        '501':
+          description: Git application creation is declared but not yet backed by a real preparation workflow.
         '426':
           $ref: '#/components/responses/APIUpgradeRequired'
   /api/v1/applications/{applicationId}:
@@ -329,11 +333,12 @@ paths:
   /api/v1/source-uploads:
     post:
       operationId: createSourceUpload
-      x-open-card-handler-status: not_implemented
+      x-open-card-handler-status: implemented
       description: >-
         Creates a short-lived source upload. archive accepts exactly one .zip, .tar.gz or .tgz
         file. directory accepts repeated files parts whose filenames are normalized relative paths
-        and a JSON manifest cross-check; absolute client paths are rejected.
+        and a JSON manifest cross-check; absolute client paths are rejected. File bytes remain in
+        private storage and are never returned by this API.
       parameters:
         - $ref: '#/components/parameters/RequiredIdempotencyKey'
         - $ref: '#/components/parameters/CSRFHeader'
@@ -363,8 +368,8 @@ paths:
       - $ref: '#/components/parameters/UploadID'
     get:
       operationId: getSourceUpload
-      x-open-card-handler-status: not_implemented
-      description: Read-only upload state for an application-creation reference.
+      x-open-card-handler-status: implemented
+      description: Read-only upload state for an application-creation reference; storage_ref is never returned.
       responses:
         '200':
           description: Source upload facts.
@@ -1182,30 +1187,55 @@ components:
     SourceUploadResponse:
       type: object
       additionalProperties: false
-      required: [upload_id, kind, digest, bytes, file_count, expires_at]
+      required: [id, kind, status, digest, bytes, file_count, expires_at]
       properties:
-        upload_id: {type: string}
+        id: {type: string}
         kind: {type: string, enum: [archive, directory]}
+        status: {type: string, enum: [ready, claimed, expired, failed]}
         digest: {type: string, pattern: '^sha256:[0-9a-f]{64}$'}
         bytes: {type: integer, format: int64, minimum: 0}
         file_count: {type: integer, minimum: 1}
         expires_at: {type: string, format: date-time}
     CreateApplicationResponse:
       type: object
-      required: [application, operation_id]
+      required: [application, environment_id, operation_id, source_revision_id]
       properties:
         application:
           $ref: '#/components/schemas/Application'
+        environment_id:
+          type: string
         operation_id:
+          type: string
+        source_revision_id:
           type: string
     CreateApplicationRequest:
       type: object
-      required: [name]
+      required: [name, source]
       additionalProperties: false
       properties:
         name:
           type: string
           minLength: 1
+        source:
+          oneOf:
+            - $ref: '#/components/schemas/CreateApplicationUploadSource'
+            - $ref: '#/components/schemas/CreateApplicationGitSource'
+          discriminator: {propertyName: kind}
+    CreateApplicationUploadSource:
+      type: object
+      additionalProperties: false
+      required: [kind, upload_id]
+      properties:
+        kind: {type: string, enum: [upload]}
+        upload_id: {type: string, minLength: 1}
+    CreateApplicationGitSource:
+      type: object
+      additionalProperties: false
+      required: [kind, repository_url, ref]
+      properties:
+        kind: {type: string, enum: [git]}
+        repository_url: {type: string, format: uri}
+        ref: {type: string, minLength: 1}
     ServiceGroupRegistryInput:
       type: object
       additionalProperties: false

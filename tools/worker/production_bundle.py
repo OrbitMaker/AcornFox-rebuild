@@ -18,7 +18,7 @@ from pathlib import Path
 
 VERSION = "0.8.0-rc.1"
 N_MINUS_ONE = "0.7.0-rc.1"
-CURRENT_MIGRATION = "0022"
+CURRENT_MIGRATION = "0023"
 ARCHES = ("amd64", "arm64")
 BINARIES = (
     "open-card-server", "open-card-agent", "open-card-static-server",
@@ -197,8 +197,8 @@ def assemble(stage: Path, repo: Path, output: Path, arch: str, n_minus_one_relea
     copy_file(repo / "deploy/caddy/open-card-edge.Caddyfile.example", release / "caddy/open-card-edge.Caddyfile.example", 0o644)
     copy_file(repo / "deploy/caddy/open-card-edge.env.example", release / "caddy/open-card-edge.env.example", 0o640)
     copy_tree(repo / "migrations/control-plane", release / "migrations/control-plane")
-    if not (release / "migrations/control-plane/0022_admin_auth.sql").is_file():
-        raise ProductionBundleError("production release is missing migration 0022")
+    if not (release / "migrations/control-plane/0023_source_uploads.sql").is_file():
+        raise ProductionBundleError("production release is missing migration 0023")
     copy_tree(repo / "docs/licenses", release / "docs/licenses")
     copy_tree(web_dist, release / "web/dist")
     make_source_manifest(repo, release)

@@ -26,7 +26,7 @@ const (
 	AgentProtocolVersion       = "1.1"
 	PreviousAgentProtocol      = "1.0"
 	LegacyAgentProtocol        = "v1"
-	CurrentMigrationVersion    = "0022"
+	CurrentMigrationVersion    = "0023"
 	ProductionCandidateVersion = "0.8.0-rc.1"
 	ProductionNMinusOneVersion = "0.7.0-rc.1"
 	DefaultInstallPrefix       = "/opt/open-card"
@@ -65,7 +65,7 @@ func ValidateProductionCandidate(manifest Manifest) error {
 		"bin/open-card-admin":                          false,
 		"systemd/open-card-edge.service":               false,
 		"caddy/open-card-edge.Caddyfile.example":       false,
-		"migrations/control-plane/0022_admin_auth.sql": false,
+		"migrations/control-plane/0023_source_uploads.sql": false,
 		"web/dist/index.html":                          false,
 		"docs/licenses/licenses-manifest.json":         false,
 		"sbom.spdx.json":                               false,
@@ -253,7 +253,7 @@ func CheckArchitecture(manifest Manifest, target string) error {
 }
 
 // ValidateMigrationVersion checks the four-digit migration identity used by
-// RC artifacts. The current application schema is migration 0022.
+// RC artifacts. The current development application schema is migration 0023.
 func ValidateMigrationVersion(value string) error {
 	value = strings.TrimSpace(value)
 	if !migrationVersionPattern.MatchString(value) {
@@ -273,7 +273,7 @@ func CheckCurrentMigration(value string) error {
 }
 
 // LatestMigrationVersion returns the highest ordered migration filename in a
-// directory, e.g. 0022 for 0022_admin_auth.sql. It rejects malformed
+// directory, e.g. 0023 for 0023_source_uploads.sql. It rejects malformed
 // migration names instead of silently skipping a file that could change the
 // schema contract.
 func LatestMigrationVersion(directory string) (string, error) {

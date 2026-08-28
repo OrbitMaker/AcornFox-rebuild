@@ -33,9 +33,9 @@ class InstallerSecurityContractTests(unittest.TestCase):
 
     def test_core_installer_stages_edge_but_does_not_activate_it_without_host_profile(self) -> None:
         text = (SCRIPTS / "install.sh").read_text(encoding="utf-8")
-        self.assertIn("required current migration 0022", text)
+        self.assertIn("required current migration 0023", text)
         self.assertIn("0.8.0-rc.1 production candidate is missing open-card-edge.service", text)
-        self.assertIn("0.8.0-rc.1 production candidate must declare migration 0022", text)
+        self.assertIn("0.8.0-rc.1 production candidate must declare migration 0023", text)
         self.assertIn("0.8.0-rc.1 production manifest contains test-only payload", text)
         self.assertIn("Edge stays disabled until install-host", text)
         self.assertIn("opencard-edge", text)

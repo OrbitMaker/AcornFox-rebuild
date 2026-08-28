@@ -271,12 +271,12 @@ files = value["files"]
 if not isinstance(files, list) or not files:
     raise SystemExit("manifest files are empty")
 if value["version"] == "0.8.0-rc.1":
-    if migration_version != "0022":
-        raise SystemExit("0.8.0-rc.1 production candidate must declare migration 0022")
+    if migration_version != "0023":
+        raise SystemExit("0.8.0-rc.1 production candidate must declare migration 0023")
     production_required = {
         "bin/open-card-admin", "systemd/open-card-edge.service",
         "caddy/open-card-edge.Caddyfile.example",
-        "migrations/control-plane/0022_admin_auth.sql", "web/dist/index.html",
+        "migrations/control-plane/0023_source_uploads.sql", "web/dist/index.html",
         "docs/licenses/licenses-manifest.json", "sbom.spdx.json", "source-manifest.sha256",
     }
     candidate_paths = {item.get("path") for item in files if isinstance(item, dict)}
@@ -353,7 +353,7 @@ if not versions:
 print(max(versions))
 PY
 ) || die "migration directory validation failed"
-  expected_migration=${manifest_migration_version:-0022}
+  expected_migration=${manifest_migration_version:-0023}
   [[ "$latest_migration" = "$expected_migration" ]] || die "migration directory does not match candidate migration $expected_migration (got $latest_migration)"
 fi
 
@@ -488,12 +488,12 @@ fi
 if (( dry_run )); then
   say "would atomically switch current from ${old_release:-none} to $release_name"
   [[ -z "$health_command" ]] || say "would run health command $health_command"
-  [[ -z "$migration_command" ]] || say "would run migration command $migration_command (required current migration 0022)"
+  [[ -z "$migration_command" ]] || say "would run migration command $migration_command (required current migration 0023)"
   exit 0
 fi
 
 if [[ -n "$migration_command" ]]; then
-  required_migration_version=${manifest_migration_version:-0022}
+  required_migration_version=${manifest_migration_version:-0023}
   if [[ -n "$migration_dir" ]]; then
     migration_output=$(OPEN_CARD_RELEASE_DIR="$release_dir" OPEN_CARD_CONFIG_DIR="$config_dir" OPEN_CARD_DATA_DIR="$data_dir" OPEN_CARD_REQUIRED_MIGRATION_VERSION="$required_migration_version" "$migration_command" "$migration_dir" 2>&1) || die "migration failed; current pointer was not changed: $migration_output"
   else
