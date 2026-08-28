@@ -11,10 +11,13 @@ info:
     no common supported version receive 426 Upgrade Required.
 servers:
   - url: /
+security:
+  - AdministratorSession: []
 paths:
   /healthz:
     get:
       operationId: health
+      security: []
       responses:
         '200':
           description: Process is alive
@@ -29,6 +32,7 @@ paths:
   /api/v1/auth/login:
     post:
       operationId: loginAdministrator
+      security: []
       description: >-
         Creates one cookie-bound administrator session. The password, session token, CSRF token,
         and source address are never returned in the JSON body or persisted as plaintext.
@@ -180,8 +184,6 @@ paths:
       operationId: requestApplicationOperationsAction
       parameters:
         - $ref: '#/components/parameters/RequiredIdempotencyKey'
-        - {name: Open-Card-Actor, in: header, required: true, schema: {type: string, minLength: 1}}
-        - {name: Open-Card-Role, in: header, required: true, schema: {type: string, enum: [operator]}}
       requestBody:
         required: true
         content:
@@ -194,7 +196,7 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/OperationsActionResponse'}
         '400': {description: Invalid or incomplete audit request}
-        '403': {description: Operator role required}
+        '401': {description: Administrator session required}
         '409': {description: Stale fact version, active operation, or idempotency conflict}
         '503': {description: Typed operation not available}
   /api/v1/applications/{applicationId}/usage:
@@ -216,7 +218,6 @@ paths:
         - {name: to, in: query, schema: {type: string, format: date-time}}
         - {name: service, in: query, schema: {type: string, maxLength: 128}}
         - {name: release, in: query, schema: {type: string}}
-        - {name: Open-Card-Role, in: header, required: false, schema: {type: string, enum: [operator]}}
       responses:
         '200':
           description: Application-scoped M5 usage facts. AI remains disabled.
@@ -224,7 +225,7 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/ApplicationUsageFact'}
         '400': {description: Invalid filter or a window longer than 31 days}
-        '403': {description: Operations detail requires operator role}
+        '401': {description: Administrator session required}
         '404': {description: Application not found}
         '503': {description: Local meter or usage persistence unavailable}
   /api/v1/applications/{applicationId}/usage/context:
@@ -234,14 +235,13 @@ paths:
       operationId: getAuthorizedUsageSummaryContext
       description: >-
         Optional aggregate-only query surface for a future controlled AI caller. It is disabled by
-        default, requires operator authorization, and never returns raw observations.
+        default, requires an administrator session, and never returns raw observations.
       parameters:
-        - {name: Open-Card-Role, in: header, required: true, schema: {type: string, enum: [operator]}}
         - {name: from, in: query, schema: {type: string, format: date-time}}
         - {name: to, in: query, schema: {type: string, format: date-time}}
       responses:
         '200': {description: Authorized aggregate-only usage context}
-        '403': {description: Disabled by default or operator role missing}
+        '401': {description: Administrator session required}
         '503': {description: Local usage facts unavailable}
   /api/v1/applications/{applicationId}/ai/interventions:
     parameters:
@@ -251,18 +251,15 @@ paths:
       description: AI intervention analysis embedded in operations. It is not a release or runtime success source.
       parameters:
         - {name: mode, in: query, schema: {type: string, enum: [ordinary, operator], default: ordinary}}
-        - {name: Open-Card-Role, in: header, required: false, schema: {type: string, enum: [operator]}}
       responses:
         '200': {description: Ordinary summary or redacted operator ledger, content: {application/json: {schema: {$ref: '#/components/schemas/AIInterventionView'}}}}
-        '403': {description: Operator detail requires operator role}
+        '401': {description: Administrator session required}
         '503': {description: Controlled AI composition unavailable}
     post:
       operationId: requestApplicationAIIntervention
       description: Explicitly requests controlled fallback after a rule miss/conflict/failure. Production changes are never executed here.
       parameters:
         - $ref: '#/components/parameters/RequiredIdempotencyKey'
-        - {name: Open-Card-Actor, in: header, required: true, schema: {type: string, minLength: 1}}
-        - {name: Open-Card-Role, in: header, required: true, schema: {type: string, enum: [operator]}}
       requestBody:
         required: true
         content:
@@ -272,24 +269,20 @@ paths:
         '202': {description: Bounded intervention accepted; completion still requires independent verification}
         '200': {description: Disabled/manual/confirmation/controller-handoff response; no action claimed successful}
         '400': {description: Invalid task, expected version, or audit reason}
-        '403': {description: Operator role required or policy denied}
+        '401': {description: Administrator session required}
         '409': {description: Stale fact version or idempotency conflict}
         '503': {description: Controlled AI unavailable; deterministic/manual paths remain available}
   /api/v1/settings/ai:
     get:
       operationId: getAIServiceSettings
-      parameters:
-        - {name: Open-Card-Role, in: header, required: true, schema: {type: string, enum: [operator]}}
       responses:
         '200': {description: Versioned controlled AI service settings, content: {application/json: {schema: {$ref: '#/components/schemas/AIServiceSettings'}}}}
-        '403': {description: Operator role required}
+        '401': {description: Administrator session required}
         '503': {description: AI settings persistence unavailable}
     put:
       operationId: updateAIServiceSettings
       parameters:
         - $ref: '#/components/parameters/RequiredIdempotencyKey'
-        - {name: Open-Card-Actor, in: header, required: true, schema: {type: string, minLength: 1}}
-        - {name: Open-Card-Role, in: header, required: true, schema: {type: string, enum: [operator]}}
       requestBody:
         required: true
         content:
@@ -298,7 +291,7 @@ paths:
       responses:
         '200': {description: Persisted settings fact; provider health is not optimistically inferred, content: {application/json: {schema: {$ref: '#/components/schemas/AIServiceSettings'}}}}
         '400': {description: Invalid profile, scope, or budget}
-        '403': {description: Operator role required}
+        '401': {description: Administrator session required}
         '409': {description: Stale version or idempotency conflict}
   /api/v1/applications/{applicationId}/webhooks:
     parameters:
@@ -308,8 +301,6 @@ paths:
       description: Stores a canonical HTTPS endpoint and opaque SecretReference only; no signing material is accepted or returned.
       parameters:
         - $ref: '#/components/parameters/RequiredIdempotencyKey'
-        - {name: Open-Card-Actor, in: header, required: true, schema: {type: string, minLength: 1}}
-        - {name: Open-Card-Role, in: header, required: true, schema: {type: string, enum: [operator]}}
       requestBody:
         required: true
         content:
@@ -322,16 +313,15 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/WebhookConfigurationResponse'}
         '400': {description: Unsafe URL, unsupported event type, or invalid opaque secret reference}
-        '403': {description: Operator role required}
+        '401': {description: Administrator session required}
         '503': {description: M4 webhook composition unavailable}
   /api/v1/applications/{applicationId}/logs:
     parameters:
       - $ref: '#/components/parameters/ApplicationID'
     get:
       operationId: queryApplicationLogs
-      description: Ordinary callers receive summaries only. Operators may query persisted redacted build/runtime/audit logs.
+      description: The normal projection is summarized; the administrator may query persisted redacted build/runtime/audit logs.
       parameters:
-        - {name: Open-Card-Role, in: header, required: false, schema: {type: string, enum: [operator]}}
         - {name: category, in: query, schema: {type: string, enum: [build, runtime, audit]}}
         - {name: service, in: query, schema: {type: string}}
         - {name: release_id, in: query, schema: {type: string}}
@@ -352,8 +342,6 @@ paths:
       description: Queues a signed, redacted occurrence test through the durable ledger; it does not synchronously disclose secret material or receiver response bodies.
       parameters:
         - $ref: '#/components/parameters/RequiredIdempotencyKey'
-        - {name: Open-Card-Actor, in: header, required: true, schema: {type: string, minLength: 1}}
-        - {name: Open-Card-Role, in: header, required: true, schema: {type: string, enum: [operator]}}
       responses:
         '202':
           description: Test delivery reserved for the durable worker.
@@ -361,7 +349,7 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/WebhookTestResponse'}
         '400': {description: Invalid endpoint ID or request identity}
-        '403': {description: Operator role required}
+        '401': {description: Administrator session required}
         '404': {description: Webhook endpoint or default environment not found}
         '503': {description: M4 webhook composition unavailable}
   /api/v1/service-groups/{serviceGroupId}/releases:
@@ -611,14 +599,13 @@ paths:
         - $ref: '#/components/parameters/ApplicationID'
         - {name: environment_id, in: query, required: true, schema: {type: string}}
         - {name: mode, in: query, required: false, schema: {type: string, enum: [ordinary, operator], default: ordinary}}
-        - {name: X-Open-Card-Role, in: header, required: false, schema: {type: string, enum: [operator]}}
       responses:
         '200':
           description: Both projections carry one control-plane fact version and observation time.
           content:
             application/json:
               schema: {$ref: '#/components/schemas/OperationsViewResponse'}
-        '403': {description: Operator projection requires operator role}
+        '401': {description: Administrator session required}
         '503': {description: Stored operation facts are unavailable or invalid}
   /api/v1/operations/{action}:
     post:
@@ -626,8 +613,6 @@ paths:
       parameters:
         - {name: action, in: path, required: true, schema: {type: string, enum: [restart, redeploy, rollback]}}
         - $ref: '#/components/parameters/RequiredIdempotencyKey'
-        - {name: X-Open-Card-Actor, in: header, required: true, schema: {type: string, minLength: 1}}
-        - {name: X-Open-Card-Role, in: header, required: true, schema: {type: string, enum: [operator]}}
       requestBody:
         required: true
         content:
@@ -640,10 +625,19 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/OperationsActionResponse'}
         '400': {description: Invalid operation request}
-        '403': {description: Operator role is required}
+        '401': {description: Administrator session required}
         '409': {description: Active operation, stale fact version, or idempotency conflict}
         '503': {description: Runtime operation failed; latest usable deployment remains the recovery target}
 components:
+  securitySchemes:
+    AdministratorSession:
+      type: apiKey
+      in: cookie
+      name: __Host-open_card_session
+      description: >-
+        Secure, HttpOnly, SameSite=Strict administrator session cookie. The server derives
+        audit actor identity from the session; Open-Card-Role and Open-Card-Actor headers
+        are never authorization inputs.
   parameters:
     APIVersion:
       name: Open-Card-API-Version

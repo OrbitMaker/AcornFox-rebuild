@@ -20,6 +20,14 @@
 	header_up -X-Open-Card-*
 }
 
+(control_plane_identity_headers) {
+	# Only the loopback control plane may treat this value as a client source.
+	# Delete any external input before deriving it from Caddy's connection peer.
+	header_up -Open-Card-*
+	header_up -X-Open-Card-*
+	header_up X-Open-Card-Client-IP {remote_host}
+}
+
 (control_plane_transport) {
 	transport http {
 		dial_timeout 3s
@@ -38,7 +46,7 @@ console.example.invalid {
 	@control_plane path /api*
 	handle @control_plane {
 		reverse_proxy 127.0.0.1:8080 {
-			import identity_headers
+			import control_plane_identity_headers
 			import control_plane_transport
 			flush_interval -1
 		}

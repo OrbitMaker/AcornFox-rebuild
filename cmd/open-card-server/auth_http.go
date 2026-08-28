@@ -94,6 +94,7 @@ func (h *AuthHTTPHandler) session(writer http.ResponseWriter, request *http.Requ
 	}
 	info, _, err := h.Service.Session(request.Context(), authCookie(request, authSessionCookie))
 	if err != nil {
+		clearAuthCookiesForInvalidSession(writer, err)
 		authServiceError(writer, err)
 		return
 	}
@@ -111,6 +112,7 @@ func (h *AuthHTTPHandler) password(writer http.ResponseWriter, request *http.Req
 	}
 	err := h.Service.ChangePassword(request.Context(), request.Header.Get("Origin"), authCookie(request, authSessionCookie), authCSRF(request), input.CurrentPassword, input.NewPassword)
 	if err != nil {
+		clearAuthCookiesForInvalidSession(writer, err)
 		authServiceError(writer, err)
 		return
 	}
@@ -155,15 +157,26 @@ func authCSRF(request *http.Request) string {
 }
 
 func authSource(request *http.Request) string {
-	host, _, err := net.SplitHostPort(strings.TrimSpace(request.RemoteAddr))
+	remote := authRemoteIP(request.RemoteAddr)
+	if remote == nil {
+		return ""
+	}
+	// The Edge is the only trusted proxy for the digest input. Direct callers
+	// (and all forwarded/Open-Card headers) remain unable to select a source.
+	if remote.IsLoopback() {
+		if edgeSource := net.ParseIP(strings.TrimSpace(request.Header.Get("X-Open-Card-Client-IP"))); edgeSource != nil {
+			return edgeSource.String()
+		}
+	}
+	return remote.String()
+}
+
+func authRemoteIP(remoteAddr string) net.IP {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(remoteAddr))
 	if err != nil {
-		return ""
+		return nil
 	}
-	ip := net.ParseIP(host)
-	if ip == nil {
-		return ""
-	}
-	return ip.String()
+	return net.ParseIP(host)
 }
 
 func setAuthCookies(writer http.ResponseWriter, session, csrf string, expires time.Time) {
@@ -177,6 +190,12 @@ func clearAuthCookies(writer http.ResponseWriter) {
 	http.SetCookie(writer, &http.Cookie{Name: authCSRFCookie, Value: "", Path: "/", Secure: true, HttpOnly: false, SameSite: http.SameSiteStrictMode, Expires: expires, MaxAge: -1})
 }
 
+func clearAuthCookiesForInvalidSession(writer http.ResponseWriter, err error) {
+	if errors.Is(err, auth.ErrAuthenticationFailed) {
+		clearAuthCookies(writer)
+	}
+}
+
 func authNoStore(writer http.ResponseWriter) {
 	writer.Header().Set("Cache-Control", "no-store")
 	writer.Header().Set("Pragma", "no-cache")
@@ -188,6 +207,10 @@ func authMethod(writer http.ResponseWriter, method string) {
 }
 
 func authServiceError(writer http.ResponseWriter, err error) {
+	if errors.Is(err, auth.ErrAuthenticationUnavailable) {
+		authHTTPError(writer, http.StatusServiceUnavailable, "authentication unavailable")
+		return
+	}
 	if errors.Is(err, auth.ErrPasswordPolicy) {
 		authHTTPError(writer, http.StatusBadRequest, "invalid request")
 		return

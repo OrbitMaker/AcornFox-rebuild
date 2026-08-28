@@ -222,11 +222,12 @@ func TestM3AccessHTTPPlatformDomainAndVerifiedRoutesReturnAccessState(t *testing
 func TestM3AccessHTTPPrepareRoutesDoesNotCallCaddy(t *testing.T) {
 	handler, routes := newM3HTTPHandler()
 	recorder := httptest.NewRecorder()
-	handler.Handle(recorder, m3HTTPRequest(http.MethodPost, "/api/v1/access/domain-routes/prepare", `{
+	request := m3HTTPRequest(http.MethodPost, "/api/v1/access/domain-routes/prepare", `{
 		"binding":{"id":"domain_1","kind":"application","application_id":"app_test","host":"app.example.test","expected_cname":"target.apps.example.test","status":"ready"},
 		"runtime_ready":true,
 		"targets":[{"application_id":"app_test","deployment_id":"dep_test","service_name":"frontend","port":31001,"path":"/","routable":true}]
-	}`))
+	}`)
+	handler.Handle(recorder, withControlPlaneIdentity(request, "admin_test"))
 	if recorder.Code != http.StatusAccepted || !strings.Contains(recorder.Body.String(), `"https_ready":false`) || len(routes.applied) != 0 {
 		t.Fatalf("prepare response=%d caddy=%#v body=%s", recorder.Code, routes.applied, recorder.Body.String())
 	}

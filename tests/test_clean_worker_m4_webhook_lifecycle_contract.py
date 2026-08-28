@@ -59,7 +59,8 @@ class M4WebhookLifecycleGuestContractTests(unittest.TestCase):
 
     def test_api_and_read_only_db_order_is_fail_fast(self) -> None:
         required = (
-            'curl -fsS -H \'Content-Type: application/json\' -H \'Open-Card-Role: operator\'',
+            "m4_authenticate",
+            'Cookie: __Host-open_card_session=$m4_admin_session',
             '"$api/api/v1/applications/$app/webhooks"',
             '"$api/api/v1/applications/$app/operations"',
             '"$fault_fixture/__fixture/fault"',
@@ -69,6 +70,8 @@ class M4WebhookLifecycleGuestContractTests(unittest.TestCase):
         )
         for fragment in required:
             self.assertIn(fragment, self.source)
+        self.assertNotIn("Open-Card-Role", self.source)
+        self.assertNotIn("Open-Card-Actor", self.source)
         self.assertLess(self.source.index("webhook_payload="), self.source.index("failure_key="))
         self.assertLess(self.source.index("failure_key="), self.source.index("fault_curl_config="))
         self.assertLess(self.source.index("fault_curl_config="), self.source.index("systemctl restart open-card-server"))

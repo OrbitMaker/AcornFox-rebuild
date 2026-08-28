@@ -164,9 +164,9 @@ func (h *M4OperationsHTTPHandler) handleAction(writer http.ResponseWriter, reque
 		return
 	}
 	key := strings.TrimSpace(request.Header.Get("Idempotency-Key"))
-	actor := strings.TrimSpace(request.Header.Get("X-Open-Card-Actor"))
+	actor := m4Actor(request)
 	if key == "" || actor == "" {
-		writeJSONError(writer, http.StatusBadRequest, "validation_failed", "Idempotency-Key and X-Open-Card-Actor are required")
+		writeJSONError(writer, http.StatusBadRequest, "validation_failed", "Idempotency-Key is required")
 		return
 	}
 	if !strings.HasPrefix(strings.ToLower(request.Header.Get("Content-Type")), "application/json") {
@@ -211,7 +211,7 @@ func (h *M4OperationsHTTPHandler) handleApplicationAction(writer http.ResponseWr
 	key := strings.TrimSpace(request.Header.Get("Idempotency-Key"))
 	actor := m4Actor(request)
 	if key == "" || actor == "" {
-		writeJSONError(writer, http.StatusBadRequest, "validation_failed", "Idempotency-Key and Open-Card-Actor are required")
+		writeJSONError(writer, http.StatusBadRequest, "validation_failed", "Idempotency-Key is required")
 		return
 	}
 	if !strings.HasPrefix(strings.ToLower(request.Header.Get("Content-Type")), "application/json") {
@@ -285,12 +285,9 @@ func firstM4RestartService(view domain.ApplicationOperationsView) string {
 }
 
 func m4Operator(request *http.Request) bool {
-	return strings.EqualFold(strings.TrimSpace(request.Header.Get("Open-Card-Role")), "operator") || strings.EqualFold(strings.TrimSpace(request.Header.Get("X-Open-Card-Role")), "operator")
+	return controlPlaneOperator(request)
 }
 
 func m4Actor(request *http.Request) string {
-	if actor := strings.TrimSpace(request.Header.Get("Open-Card-Actor")); actor != "" {
-		return actor
-	}
-	return strings.TrimSpace(request.Header.Get("X-Open-Card-Actor"))
+	return controlPlaneActor(request)
 }

@@ -26,6 +26,8 @@ func TestM4ActiveOperationIsAConflictNotInternalError(t *testing.T) {
 
 func TestAPI_CONTRACT_001_ServerApplicationRESTAndSSE(t *testing.T) {
 	server := NewServer()
+	now := time.Unix(1_700_000_000, 0).UTC()
+	_, session := attachTestAdministrator(t, server, &now)
 	testServer := httptest.NewServer(server.Handler())
 	defer testServer.Close()
 
@@ -44,6 +46,7 @@ func TestAPI_CONTRACT_001_ServerApplicationRESTAndSSE(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	request.AddCookie(session)
 	eventResponse, err := http.DefaultClient.Do(request)
 	if err != nil {
 		t.Fatal(err)
@@ -57,8 +60,13 @@ func TestAPI_CONTRACT_001_ServerApplicationRESTAndSSE(t *testing.T) {
 		t.Fatalf("expected SSE connected comment, got %q", scanner.Text())
 	}
 
-	createBody := strings.NewReader(`{"name":"demo"}`)
-	createResponse, err := http.Post(testServer.URL+"/api/v1/applications", "application/json", createBody)
+	createRequest, err := http.NewRequest(http.MethodPost, testServer.URL+"/api/v1/applications", strings.NewReader(`{"name":"demo"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	createRequest.Header.Set("Content-Type", "application/json")
+	createRequest.AddCookie(session)
+	createResponse, err := http.DefaultClient.Do(createRequest)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,7 +112,12 @@ func TestAPI_CONTRACT_001_ServerApplicationRESTAndSSE(t *testing.T) {
 		}
 	}
 
-	getResponse, err := http.Get(testServer.URL + "/api/v1/applications/" + application.ID)
+	getRequest, err := http.NewRequest(http.MethodGet, testServer.URL+"/api/v1/applications/"+application.ID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	getRequest.AddCookie(session)
+	getResponse, err := http.DefaultClient.Do(getRequest)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,7 +126,12 @@ func TestAPI_CONTRACT_001_ServerApplicationRESTAndSSE(t *testing.T) {
 		t.Fatalf("get status: %s", getResponse.Status)
 	}
 
-	listResponse, err := http.Get(testServer.URL + "/api/v1/applications")
+	listRequest, err := http.NewRequest(http.MethodGet, testServer.URL+"/api/v1/applications", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listRequest.AddCookie(session)
+	listResponse, err := http.DefaultClient.Do(listRequest)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,13 +155,23 @@ func (unhealthyRepository) PingContext(context.Context) error {
 
 func TestServerReadinessFailsWhenPersistentRepositoryIsUnavailable(t *testing.T) {
 	repository := unhealthyRepository{MemoryRepository: application.NewMemoryRepository()}
-	server := httptest.NewServer(NewServerWithRepository(repository).Handler())
+	serverState := NewServerWithRepository(repository)
+	now := time.Unix(1_700_000_000, 0).UTC()
+	_, session := attachTestAdministrator(t, serverState, &now)
+	server := httptest.NewServer(serverState.Handler())
 	defer server.Close()
 	for _, test := range []struct {
 		path string
 		want int
 	}{{path: "/healthz", want: http.StatusOK}, {path: "/readyz", want: http.StatusServiceUnavailable}} {
-		response, err := http.Get(server.URL + test.path)
+		request, err := http.NewRequest(http.MethodGet, server.URL+test.path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if test.path == "/readyz" {
+			request.AddCookie(session)
+		}
+		response, err := http.DefaultClient.Do(request)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -155,9 +183,18 @@ func TestServerReadinessFailsWhenPersistentRepositoryIsUnavailable(t *testing.T)
 }
 
 func TestAPI_SECURITY_001_ServerRejectsUnknownJSONFields(t *testing.T) {
-	server := httptest.NewServer(NewServer().Handler())
+	serverState := NewServer()
+	now := time.Unix(1_700_000_000, 0).UTC()
+	_, session := attachTestAdministrator(t, serverState, &now)
+	server := httptest.NewServer(serverState.Handler())
 	defer server.Close()
-	response, err := http.Post(server.URL+"/api/v1/applications", "application/json", strings.NewReader(`{"name":"demo","unexpected":true}`))
+	request, err := http.NewRequest(http.MethodPost, server.URL+"/api/v1/applications", strings.NewReader(`{"name":"demo","unexpected":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.AddCookie(session)
+	response, err := http.DefaultClient.Do(request)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,11 +207,20 @@ func TestAPI_SECURITY_001_ServerRejectsUnknownJSONFields(t *testing.T) {
 
 func TestServerReadinessIsDistinctFromLiveness(t *testing.T) {
 	serverState := NewServer()
+	now := time.Unix(1_700_000_000, 0).UTC()
+	_, session := attachTestAdministrator(t, serverState, &now)
 	serverState.SetReady(false)
 	server := httptest.NewServer(serverState.Handler())
 	defer server.Close()
 	for _, path := range []string{"/healthz", "/readyz"} {
-		response, err := http.Get(server.URL + path)
+		request, err := http.NewRequest(http.MethodGet, server.URL+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if path == "/readyz" {
+			request.AddCookie(session)
+		}
+		response, err := http.DefaultClient.Do(request)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -190,13 +236,17 @@ func TestServerReadinessIsDistinctFromLiveness(t *testing.T) {
 
 func TestAPI_CONTRACT_002_SSEReplaysFromRepositoryAfterServerRestart(t *testing.T) {
 	repository := application.NewMemoryRepository()
-	firstServer := httptest.NewServer(NewServerWithRepository(repository).Handler())
+	firstState := NewServerWithRepository(repository)
+	now := time.Unix(1_700_000_000, 0).UTC()
+	_, firstSession := attachTestAdministrator(t, firstState, &now)
+	firstServer := httptest.NewServer(firstState.Handler())
 	request, err := http.NewRequest(http.MethodPost, firstServer.URL+"/api/v1/applications", strings.NewReader(`{"name":"persistent"}`))
 	if err != nil {
 		t.Fatal(err)
 	}
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Idempotency-Key", "persistent-create")
+	request.AddCookie(firstSession)
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
 		t.Fatal(err)
@@ -211,7 +261,9 @@ func TestAPI_CONTRACT_002_SSEReplaysFromRepositoryAfterServerRestart(t *testing.
 	response.Body.Close()
 	firstServer.Close()
 
-	restarted := httptest.NewServer(NewServerWithRepository(repository).Handler())
+	restartedState := NewServerWithRepository(repository)
+	_, restartedSession := attachTestAdministrator(t, restartedState, &now)
+	restarted := httptest.NewServer(restartedState.Handler())
 	defer restarted.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -220,6 +272,7 @@ func TestAPI_CONTRACT_002_SSEReplaysFromRepositoryAfterServerRestart(t *testing.
 		t.Fatal(err)
 	}
 	replayRequest.Header.Set("Last-Event-ID", "evt-0")
+	replayRequest.AddCookie(restartedSession)
 	replayResponse, err := http.DefaultClient.Do(replayRequest)
 	if err != nil {
 		t.Fatal(err)
@@ -242,7 +295,10 @@ func TestAPI_CONTRACT_002_SSEReplaysFromRepositoryAfterServerRestart(t *testing.
 }
 
 func TestAPI_IDEMPOTENCY_001_CreateReplayAndConflict(t *testing.T) {
-	server := httptest.NewServer(NewServer().Handler())
+	serverState := NewServer()
+	now := time.Unix(1_700_000_000, 0).UTC()
+	_, session := attachTestAdministrator(t, serverState, &now)
+	server := httptest.NewServer(serverState.Handler())
 	defer server.Close()
 	create := func(name string) (*http.Response, map[string]any) {
 		t.Helper()
@@ -252,6 +308,7 @@ func TestAPI_IDEMPOTENCY_001_CreateReplayAndConflict(t *testing.T) {
 		}
 		request.Header.Set("Content-Type", "application/json")
 		request.Header.Set("Idempotency-Key", "same-create")
+		request.AddCookie(session)
 		response, err := http.DefaultClient.Do(request)
 		if err != nil {
 			t.Fatal(err)
@@ -279,7 +336,10 @@ func TestAPI_IDEMPOTENCY_001_CreateReplayAndConflict(t *testing.T) {
 }
 
 func TestAPI_COMPAT_001_NegotiatesNAndNMinusOneAndRejectsMajor(t *testing.T) {
-	server := httptest.NewServer(NewServer().Handler())
+	serverState := NewServer()
+	now := time.Unix(1_700_000_000, 0).UTC()
+	_, session := attachTestAdministrator(t, serverState, &now)
+	server := httptest.NewServer(serverState.Handler())
 	defer server.Close()
 	for _, test := range []struct {
 		name         string
@@ -301,6 +361,7 @@ func TestAPI_COMPAT_001_NegotiatesNAndNMinusOneAndRejectsMajor(t *testing.T) {
 			for name, value := range test.headers {
 				request.Header.Set(name, value)
 			}
+			request.AddCookie(session)
 			response, err := http.DefaultClient.Do(request)
 			if err != nil {
 				t.Fatal(err)
@@ -326,7 +387,10 @@ func TestAPI_COMPAT_002_CurrentSSEReplayIncludesSchemaVersionWhileLegacyOmitsIt(
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := httptest.NewServer(NewServerWithRepository(repository).Handler())
+	serverState := NewServerWithRepository(repository)
+	now := time.Unix(1_700_000_000, 0).UTC()
+	_, session := attachTestAdministrator(t, serverState, &now)
+	server := httptest.NewServer(serverState.Handler())
 	defer server.Close()
 	readReplay := func(version string) string {
 		t.Helper()
@@ -340,6 +404,7 @@ func TestAPI_COMPAT_002_CurrentSSEReplayIncludesSchemaVersionWhileLegacyOmitsIt(
 		if version != "" {
 			request.Header.Set(apiVersionHeader, version)
 		}
+		request.AddCookie(session)
 		response, err := http.DefaultClient.Do(request)
 		if err != nil {
 			t.Fatal(err)

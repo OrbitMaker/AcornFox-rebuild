@@ -38,10 +38,14 @@ const (
 
 var (
 	ErrAuthenticationFailed = errors.New("authentication failed")
-	ErrRateLimited          = errors.New("authentication rate limited")
-	ErrOriginDenied         = errors.New("request origin denied")
-	ErrCSRFInvalid          = errors.New("csrf validation failed")
-	ErrPasswordPolicy       = errors.New("password does not meet the required policy")
+	// ErrAuthenticationUnavailable is deliberately separate from an invalid
+	// credential or session. HTTP callers use it to return a retryable 503
+	// without clearing a browser's potentially still-valid cookies.
+	ErrAuthenticationUnavailable = errors.New("authentication persistence unavailable")
+	ErrRateLimited               = errors.New("authentication rate limited")
+	ErrOriginDenied              = errors.New("request origin denied")
+	ErrCSRFInvalid               = errors.New("csrf validation failed")
+	ErrPasswordPolicy            = errors.New("password does not meet the required policy")
 )
 
 type Store interface {
@@ -135,14 +139,14 @@ func (s *Service) Login(ctx context.Context, origin, password, source string) (L
 	}
 	credential, err := s.store.ActiveAdminCredential(ctx)
 	if err != nil {
-		return LoginResult{}, ErrAuthenticationFailed
+		return LoginResult{}, authenticationStoreError(err)
 	}
 	now := s.now()
 	sourceDigest := digestSource(source)
 	if limit, limitErr := s.store.AdminLoginRateLimit(ctx, credential.ID, sourceDigest); limitErr == nil && limit.LockedUntil != nil && now.Before(*limit.LockedUntil) {
 		return LoginResult{}, ErrRateLimited
 	} else if limitErr != nil && !errors.Is(limitErr, postgres.ErrNotFound) {
-		return LoginResult{}, limitErr
+		return LoginResult{}, ErrAuthenticationUnavailable
 	}
 	valid, verifyErr := verifyPassword(password, credential.PasswordHash, s.minIterations)
 	if verifyErr != nil || !valid {
@@ -167,7 +171,7 @@ func (s *Service) Login(ctx context.Context, origin, password, source string) (L
 	}
 	session := domain.AdminSession{ID: id, AdminID: credential.ID, SessionDigest: sessionDigest, CSRFDigest: csrfDigest, CredentialVersion: credential.CredentialVersion, CreatedAt: now, LastSeenAt: now, IdleExpiresAt: now.Add(domain.AdminSessionIdleTimeout), AbsoluteExpiresAt: now.Add(domain.AdminSessionAbsoluteTimeout)}
 	if err := s.store.CreateAdminSession(ctx, session); err != nil {
-		return LoginResult{}, err
+		return LoginResult{}, ErrAuthenticationUnavailable
 	}
 	return LoginResult{SessionToken: sessionToken, CSRFTok: csrfToken, Session: session}, nil
 }
@@ -186,13 +190,13 @@ func (s *Service) Logout(ctx context.Context, origin, sessionToken, csrfToken st
 	}
 	session, err := s.session(ctx, sessionToken)
 	if err != nil {
-		return ErrAuthenticationFailed
+		return err
 	}
 	if !validCSRF(session, csrfToken) {
 		return ErrCSRFInvalid
 	}
 	if err := s.store.RevokeAdminSession(ctx, session.ID, s.now()); err != nil {
-		return err
+		return ErrAuthenticationUnavailable
 	}
 	return nil
 }
@@ -203,13 +207,16 @@ func (s *Service) ChangePassword(ctx context.Context, origin, sessionToken, csrf
 	}
 	session, err := s.session(ctx, sessionToken)
 	if err != nil {
-		return ErrAuthenticationFailed
+		return err
 	}
 	if !validCSRF(session, csrfToken) {
 		return ErrCSRFInvalid
 	}
 	credential, err := s.store.ActiveAdminCredential(ctx)
-	if err != nil || credential.ID != session.AdminID {
+	if err != nil {
+		return authenticationStoreError(err)
+	}
+	if credential.ID != session.AdminID {
 		return ErrAuthenticationFailed
 	}
 	valid, verifyErr := verifyPassword(currentPassword, credential.PasswordHash, s.minIterations)
@@ -220,8 +227,10 @@ func (s *Service) ChangePassword(ctx context.Context, origin, sessionToken, csrf
 	if err != nil {
 		return err
 	}
-	_, err = s.store.RotateAdminCredential(ctx, credential.ID, credential.CredentialVersion, PasswordHashScheme, encoded, s.now())
-	return err
+	if _, err = s.store.RotateAdminCredential(ctx, credential.ID, credential.CredentialVersion, PasswordHashScheme, encoded, s.now()); err != nil {
+		return ErrAuthenticationUnavailable
+	}
+	return nil
 }
 
 func (s *Service) HashPassword(password string) (string, error) {
@@ -262,7 +271,7 @@ func (s *Service) recordLoginFailure(ctx context.Context, adminID domain.ID, sou
 		record.LockedAt, record.LockedUntil = nil, nil
 	}
 	if err := s.store.UpsertAdminLoginRateLimit(ctx, record); err != nil {
-		return err
+		return ErrAuthenticationUnavailable
 	}
 	if record.FailureCount == domain.AdminLoginMaxFailureAttempts {
 		return ErrRateLimited
@@ -277,13 +286,20 @@ func (s *Service) session(ctx context.Context, token string) (domain.AdminSessio
 	}
 	session, err := s.store.ActiveAdminSessionByDigest(ctx, digest, s.now())
 	if err != nil {
-		return domain.AdminSession{}, ErrAuthenticationFailed
+		return domain.AdminSession{}, authenticationStoreError(err)
 	}
 	touched, err := s.store.TouchAdminSession(ctx, session.ID, session.CredentialVersion, s.now())
 	if err != nil {
-		return domain.AdminSession{}, ErrAuthenticationFailed
+		return domain.AdminSession{}, authenticationStoreError(err)
 	}
 	return touched, nil
+}
+
+func authenticationStoreError(err error) error {
+	if errors.Is(err, postgres.ErrNotFound) {
+		return ErrAuthenticationFailed
+	}
+	return ErrAuthenticationUnavailable
 }
 
 func (s *Service) newToken() (string, domain.AuthDigest, error) {

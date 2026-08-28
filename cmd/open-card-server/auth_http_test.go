@@ -20,6 +20,7 @@ type authHTTPStore struct {
 	credential domain.AdminCredential
 	sessions   map[domain.AuthDigest]domain.AdminSession
 	rates      map[domain.AuthDigest]domain.AdminLoginRateLimit
+	sessionErr error
 }
 
 func (s *authHTTPStore) ActiveAdminCredential(context.Context) (domain.AdminCredential, error) {
@@ -45,6 +46,9 @@ func (s *authHTTPStore) CreateAdminSession(_ context.Context, session domain.Adm
 	return nil
 }
 func (s *authHTTPStore) ActiveAdminSessionByDigest(_ context.Context, digest domain.AuthDigest, now time.Time) (domain.AdminSession, error) {
+	if s.sessionErr != nil {
+		return domain.AdminSession{}, s.sessionErr
+	}
 	session, ok := s.sessions[digest]
 	if !ok || session.RevokedAt != nil || !now.Before(session.IdleExpiresAt) || !now.Before(session.AbsoluteExpiresAt) || session.CredentialVersion != s.credential.CredentialVersion {
 		return domain.AdminSession{}, postgres.ErrNotFound
@@ -179,8 +183,8 @@ func TestAuthHTTPLoginSessionCSRFLogoutAndRotation(t *testing.T) {
 	oldSession.AddCookie(sessionCookie)
 	oldRecorder := httptest.NewRecorder()
 	server.Handler().ServeHTTP(oldRecorder, oldSession)
-	if oldRecorder.Code != http.StatusUnauthorized {
-		t.Fatalf("old session status=%d", oldRecorder.Code)
+	if oldRecorder.Code != http.StatusUnauthorized || len(oldRecorder.Result().Cookies()) != 2 {
+		t.Fatalf("old session status=%d cookies=%#v", oldRecorder.Code, oldRecorder.Result().Cookies())
 	}
 }
 
@@ -227,8 +231,8 @@ func TestAuthHTTPLogoutClearsBothCookiesAndExpiredSessionFails(t *testing.T) {
 	expired.AddCookie(sessionCookie)
 	expiredRecorder := httptest.NewRecorder()
 	server.Handler().ServeHTTP(expiredRecorder, expired)
-	if expiredRecorder.Code != http.StatusUnauthorized {
-		t.Fatalf("expired session status=%d", expiredRecorder.Code)
+	if expiredRecorder.Code != http.StatusUnauthorized || len(expiredRecorder.Result().Cookies()) != 2 {
+		t.Fatalf("expired session status=%d cookies=%#v", expiredRecorder.Code, expiredRecorder.Result().Cookies())
 	}
 	now = now.Add(-9 * time.Hour)
 	logout := authRequest(http.MethodPost, "/api/v1/auth/logout", "")
@@ -256,6 +260,14 @@ func TestAuthOpenAPIStructureIsDeclared(t *testing.T) {
 	for _, path := range []string{"/api/v1/auth/login:", "/api/v1/auth/logout:", "/api/v1/auth/session:", "/api/v1/auth/password:", "AuthLoginRequest:", "AuthSessionResponse:"} {
 		if !strings.Contains(text, path) {
 			t.Fatalf("OpenAPI is missing %s", path)
+		}
+	}
+	if !strings.Contains(text, "AdministratorSession:\n      type: apiKey\n      in: cookie\n      name: __Host-open_card_session") {
+		t.Fatal("OpenAPI does not declare the administrator session cookie scheme")
+	}
+	for _, protected := range []string{"/api/v1/auth/logout:\n    post:\n      operationId: logoutAdministrator\n      security: []", "/api/v1/auth/session:\n    get:\n      operationId: getAdministratorSession\n      security: []", "/api/v1/auth/password:\n    post:\n      operationId: rotateAdministratorPassword\n      security: []"} {
+		if strings.Contains(text, protected) {
+			t.Fatalf("OpenAPI incorrectly marks a session-bound auth endpoint public: %q", protected)
 		}
 	}
 }

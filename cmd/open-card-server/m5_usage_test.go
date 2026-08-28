@@ -53,7 +53,7 @@ func TestM5UsageHandlerFailsClosedForOperatorAndAIContext(t *testing.T) {
 		t.Fatalf("operator view without role=%d %s", operator.Code, operator.Body.String())
 	}
 	contextRequest := httptest.NewRequest(http.MethodGet, "/api/v1/applications/app_1/usage/context", nil)
-	contextRequest.Header.Set("Open-Card-Role", "operator")
+	contextRequest = withControlPlaneIdentity(contextRequest, "admin_test")
 	contextResponse := httptest.NewRecorder()
 	h.HandleApplication(contextResponse, contextRequest)
 	if contextResponse.Code != http.StatusForbidden || !strings.Contains(contextResponse.Body.String(), "ai_summary_disabled") {

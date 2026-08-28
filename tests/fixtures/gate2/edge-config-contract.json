@@ -25,7 +25,12 @@
     "api_upstream": "127.0.0.1:8080",
     "app_upstream": "127.0.0.1:18481",
     "tls_allow": "http://127.0.0.1:8080/internal/tls/allow",
-    "strip_identity_headers": ["Open-Card-*", "X-Open-Card-*"]
+    "strip_identity_headers": ["Open-Card-*", "X-Open-Card-*"],
+    "trusted_client_source_header": {
+      "name": "X-Open-Card-Client-IP",
+      "value": "{remote_host}",
+      "scope": "console_api_only"
+    }
   },
   "forbidden": ["h3", "udp:443", "read_body", "public metrics", "pprof", "real domain", "certificate", "token", "password"]
 }

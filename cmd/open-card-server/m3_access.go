@@ -377,10 +377,7 @@ func m3DecodeJSON(writer http.ResponseWriter, request *http.Request, target any)
 }
 
 func m3Actor(request *http.Request) string {
-	if actor := strings.TrimSpace(request.Header.Get("Open-Card-Actor")); actor != "" {
-		return actor
-	}
-	return "m3-access-api"
+	return controlPlaneActor(request)
 }
 
 func m3DomainAccessState(binding domain.DomainBinding, certificate domain.CertificateReference) domain.AccessState {

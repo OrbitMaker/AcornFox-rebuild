@@ -68,7 +68,7 @@ func (h *M4WebhookHTTPHandler) HandleApplication(writer http.ResponseWriter, req
 	actor := m4Actor(request)
 	key := strings.TrimSpace(request.Header.Get("Idempotency-Key"))
 	if actor == "" || key == "" {
-		writeJSONError(writer, http.StatusBadRequest, "validation_failed", "Open-Card-Actor and Idempotency-Key are required")
+		writeJSONError(writer, http.StatusBadRequest, "validation_failed", "Idempotency-Key is required")
 		return true
 	}
 	if remainder == "" {

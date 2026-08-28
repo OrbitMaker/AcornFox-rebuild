@@ -53,7 +53,7 @@ PY
 m4_log_gate_wait_ready() {
   local api=$1
   for _ in $(seq 1 100); do
-    curl --fail --silent --show-error --connect-timeout 2 --max-time 3 "$api/readyz" >/dev/null 2>&1 && return 0
+    m4_log_gate_control_curl --fail --silent --show-error --connect-timeout 2 --max-time 3 "$api/readyz" >/dev/null 2>&1 && return 0
     sleep 0.1
   done
   m4_log_gate_die "control plane did not recover after the permitted restart"
@@ -62,6 +62,12 @@ m4_log_gate_wait_ready() {
 m4_log_gate_assert_loopback_url() {
   local url=$1
   [[ "$url" =~ ^http://127\.0\.0\.1:[0-9]{1,5}(/|$) ]] || m4_log_gate_die "only loopback API URLs are allowed"
+}
+
+m4_log_gate_control_curl() {
+  local session=${OPEN_CARD_M4_AUTH_SESSION:?OPEN_CARD_M4_AUTH_SESSION is required for M4 log-gate control-plane calls}
+  [[ "$session" =~ ^[A-Za-z0-9_-]{43}$ ]] || m4_log_gate_die "M4 log-gate session is malformed"
+  command curl -H "Cookie: __Host-open_card_session=$session" "$@"
 }
 
 m4_log_gate_assert_no_ai() {
@@ -114,14 +120,14 @@ json.dump({'version':value.get('version','3.9'),'services':{'api':api}},open(sys
 PY
   cp "$compose" "$tree/compose.json"
   tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner -cf "$archive" -C "$tree" compose.json services
-  curl --fail --silent --show-error -H "Idempotency-Key: ${M4_LOG_GATE_RUN_ID:-log-gate}-sec-log-source" -F "application_id=$M4_LOG_GATE_APP_ID" -F kind=upload -F "archive=@$archive;type=application/x-tar" "$M4_LOG_GATE_API/api/v1/sources" >"$M4_LOG_GATE_EVIDENCE/sec-log-sensitive-source.json"
+  m4_log_gate_control_curl --fail --silent --show-error -H "Idempotency-Key: ${M4_LOG_GATE_RUN_ID:-log-gate}-sec-log-source" -F "application_id=$M4_LOG_GATE_APP_ID" -F kind=upload -F "archive=@$archive;type=application/x-tar" "$M4_LOG_GATE_API/api/v1/sources" >"$M4_LOG_GATE_EVIDENCE/sec-log-sensitive-source.json"
   local source_id status
   source_id=$(m4_log_gate_json_get "$M4_LOG_GATE_EVIDENCE/sec-log-sensitive-source.json" source_revision.id)
   python3 - "$M4_LOG_GATE_APP_ID" "$M4_LOG_GATE_ENVIRONMENT_ID" "$source_id" "$compose" >"$M4_LOG_GATE_WORK/sec-log-sensitive-import.json" <<'PY'
 import json,sys
 print(json.dumps({'application_id':sys.argv[1],'environment_id':sys.argv[2],'source_revision_id':sys.argv[3],'name':'m4-sec-log-sensitive','version':1,'compose':json.load(open(sys.argv[4],encoding='utf-8'))},separators=(',',':')))
 PY
-  status=$(curl --silent --show-error -o "$response" -w '%{http_code}' -H 'Content-Type: application/json' -H "Idempotency-Key: ${M4_LOG_GATE_RUN_ID:-log-gate}-sec-log-group" --data @"$M4_LOG_GATE_WORK/sec-log-sensitive-import.json" "$M4_LOG_GATE_API/api/v1/service-groups/import")
+  status=$(m4_log_gate_control_curl --silent --show-error -o "$response" -w '%{http_code}' -H 'Content-Type: application/json' -H "Idempotency-Key: ${M4_LOG_GATE_RUN_ID:-log-gate}-sec-log-group" --data @"$M4_LOG_GATE_WORK/sec-log-sensitive-import.json" "$M4_LOG_GATE_API/api/v1/service-groups/import")
   [[ "$status" = 400 ]] || m4_log_gate_die "sensitive runtime literal was not rejected before ServiceGroup persistence"
   ! grep -a -Fq 'bare-runtime-canary' "$response"
   [[ $(psql "$M4_LOG_GATE_DATABASE_URL" -X -Aqt -c "SELECT count(*) FROM service_groups WHERE application_id='$M4_LOG_GATE_APP_ID' AND name='m4-sec-log-sensitive'") = 0 ]]
@@ -158,7 +164,7 @@ json.dump(value, open(target, "w", encoding="utf-8"), separators=(",", ":"), sor
 PY
     source_archive="$work/log-002-$number.tar"
     tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner -cf "$source_archive" -C "$tree" compose.json services
-    curl --fail --silent --show-error -H "Idempotency-Key: ${run_id}-log-002-source-${number}" -F "application_id=$app" -F kind=upload -F "archive=@$source_archive;type=application/x-tar" "$api/api/v1/sources" >"$evidence/log-002-source-$number.json"
+    m4_log_gate_control_curl --fail --silent --show-error -H "Idempotency-Key: ${run_id}-log-002-source-${number}" -F "application_id=$app" -F kind=upload -F "archive=@$source_archive;type=application/x-tar" "$api/api/v1/sources" >"$evidence/log-002-source-$number.json"
     source_id=$(m4_log_gate_json_get "$evidence/log-002-source-$number.json" source_revision.id)
     [[ -n "$source_id" ]] || m4_log_gate_die "source upload did not return an immutable revision"
     local import_payload
@@ -177,14 +183,14 @@ value = json.loads(sys.argv[1])
 value["compose"] = json.load(open(sys.argv[2], encoding="utf-8"))
 json.dump(value, sys.stdout, separators=(",", ":"))
 PY
-    curl --fail --silent --show-error -H 'Content-Type: application/json' -H "Idempotency-Key: ${run_id}-log-002-group-${number}" --data @"$work/log-002-import-$number.json" "$api/api/v1/service-groups/import" >"$evidence/log-002-group-$number.json"
+    m4_log_gate_control_curl --fail --silent --show-error -H 'Content-Type: application/json' -H "Idempotency-Key: ${run_id}-log-002-group-${number}" --data @"$work/log-002-import-$number.json" "$api/api/v1/service-groups/import" >"$evidence/log-002-group-$number.json"
     group=$(m4_log_gate_json_get "$evidence/log-002-group-$number.json" service_group.id)
     release_payload=$(python3 - "$source_id" "$number" <<'PY'
 import json, sys
 print(json.dumps({"source_revision_id": sys.argv[1], "version": int(sys.argv[2]) + 2}, separators=(",", ":")))
 PY
 )
-    status=$(curl --silent --show-error -o "$evidence/log-002-release-$number.json" -w '%{http_code}' -H 'Content-Type: application/json' -H "Idempotency-Key: ${run_id}-log-002-release-${number}" --data "$release_payload" "$api/api/v1/service-groups/$group/releases")
+    status=$(m4_log_gate_control_curl --silent --show-error -o "$evidence/log-002-release-$number.json" -w '%{http_code}' -H 'Content-Type: application/json' -H "Idempotency-Key: ${run_id}-log-002-release-${number}" --data "$release_payload" "$api/api/v1/service-groups/$group/releases")
     [[ "$status" = 201 ]] || m4_log_gate_die "BuildKit release $number returned HTTP $status"
     printf '%s|%s|%s\n' "$number" "$source_id" "$group" >>"$rows"
   done
@@ -213,7 +219,7 @@ m4_log_gate_restart_and_verify_build_recovery() {
   local api=$M4_LOG_GATE_API evidence=$M4_LOG_GATE_EVIDENCE
   systemctl restart open-card-server
   m4_log_gate_wait_ready "$api"
-  curl --fail --silent --show-error -H 'Open-Card-Role: operator' "$api/api/v1/applications/$M4_LOG_GATE_APP_ID/logs?category=build&limit=100" >"$evidence/log-002-build-operator-after-restart.json"
+  m4_log_gate_control_curl --fail --silent --show-error "$api/api/v1/applications/$M4_LOG_GATE_APP_ID/logs?category=build&limit=100" >"$evidence/log-002-build-operator-after-restart.json"
   python3 - "$evidence/log-002-build-operator-after-restart.json" <<'PY'
 import json, sys
 value = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -248,7 +254,7 @@ for name in files:
     content += open(path, "rb").read()
 assert marker.encode() in content, "cross-segment runtime content is incomplete"
 PY
-  curl --fail --silent --show-error -H 'Open-Card-Role: operator' "$M4_LOG_GATE_API/api/v1/applications/$M4_LOG_GATE_APP_ID/logs?category=runtime&limit=100" >"$evidence/log-001-runtime-operator.json"
+  m4_log_gate_control_curl --fail --silent --show-error "$M4_LOG_GATE_API/api/v1/applications/$M4_LOG_GATE_APP_ID/logs?category=runtime&limit=100" >"$evidence/log-001-runtime-operator.json"
   python3 - "$evidence/log-001-runtime-operator.json" "$marker" <<'PY'
 import json, sys
 value = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -272,7 +278,7 @@ m4_log_gate_assert_audit_survives_ordinary_gc() {
 
 m4_log_gate_assert_redaction() {
   local canary=${M4_LOG_GATE_REDACTION_CANARY:-m4-log-canary} evidence=$M4_LOG_GATE_EVIDENCE
-  curl --fail --silent --show-error -H 'Open-Card-Role: operator' "$M4_LOG_GATE_API/api/v1/applications/$M4_LOG_GATE_APP_ID/logs?limit=100" >"$evidence/log-gates-operator-redaction.json"
+  m4_log_gate_control_curl --fail --silent --show-error "$M4_LOG_GATE_API/api/v1/applications/$M4_LOG_GATE_APP_ID/logs?limit=100" >"$evidence/log-gates-operator-redaction.json"
   python3 - "$evidence/log-gates-operator-redaction.json" "$canary" <<'PY'
 import json, sys
 text = open(sys.argv[1], encoding="utf-8").read()

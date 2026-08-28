@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -60,13 +61,15 @@ func main() {
 		}()
 		server = NewServerWithRepository(store)
 		controllerStore = store
-		if origin := os.Getenv("OPEN_CARD_AUTH_ORIGIN"); origin != "" {
-			authService, authErr := auth.NewService(auth.Config{Store: store, Origin: origin})
-			if authErr != nil {
-				log.Fatal(authErr)
-			}
-			server.SetAuth(&AuthHTTPHandler{Service: authService})
+		origin := strings.TrimSpace(os.Getenv("OPEN_CARD_AUTH_ORIGIN"))
+		if origin == "" {
+			log.Fatal("OPEN_CARD_AUTH_ORIGIN is required whenever OPEN_CARD_DATABASE_URL is configured")
 		}
+		authService, authErr := auth.NewService(auth.Config{Store: store, Origin: origin})
+		if authErr != nil {
+			log.Fatal(authErr)
+		}
+		server.SetAuth(&AuthHTTPHandler{Service: authService})
 		server.AgentGateway().SetEventSink(&controllers.DurableAgentSink{Store: store})
 		applicationWorker := &controllers.Worker{
 			Store: store, Handler: applicationTaskHandler{}, Owner: "control-plane-application",

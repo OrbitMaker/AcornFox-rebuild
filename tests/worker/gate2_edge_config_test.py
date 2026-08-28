@@ -32,11 +32,18 @@ class EdgeConfigContractTests(unittest.TestCase):
         self.assertIn("OPEN_CARD_EDGE_LOG_DIR=/var/log/open-card-edge", self.environment)
         self.assertNotIn("admin 0.0.0.0", self.caddyfile)
 
-    def test_console_api_precedes_spa_and_strips_external_identity(self) -> None:
+    def test_console_api_precedes_spa_and_rebuilds_trusted_client_source(self) -> None:
         self.assertLess(self.caddyfile.index("@control_plane path /api*"), self.caddyfile.index("try_files {path} /index.html"))
         self.assertIn("reverse_proxy 127.0.0.1:8080", self.caddyfile)
         self.assertIn("header_up -Open-Card-*", self.caddyfile)
         self.assertIn("header_up -X-Open-Card-*", self.caddyfile)
+        self.assertIn("import control_plane_identity_headers", self.caddyfile)
+        self.assertIn("header_up X-Open-Card-Client-IP {remote_host}", self.caddyfile)
+        trusted_source = self.fixture["routes"]["trusted_client_source_header"]
+        self.assertEqual(trusted_source, {"name": "X-Open-Card-Client-IP", "value": "{remote_host}", "scope": "console_api_only"})
+        application_proxy = self.caddyfile.split("https:// {", 1)[1]
+        self.assertIn("import identity_headers", application_proxy)
+        self.assertNotIn("header_up X-Open-Card-Client-IP", application_proxy)
         self.assertIn("flush_interval -1", self.caddyfile)
 
     def test_tls_and_transport_contract_is_bounded(self) -> None:

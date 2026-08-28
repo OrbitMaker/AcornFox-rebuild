@@ -29,6 +29,7 @@ m4_gate=NOT_CLAIMED
 receiver_pid=
 host_entry_added=0
 request_pid=
+m4_admin_session=
 
 case "$api" in
   http://127.0.0.1:*|https://127.0.0.1:*) ;;
@@ -59,6 +60,40 @@ test -x "$secretctl"
 
 rm -rf -- "$work" "$evidence"
 install -d -m 0750 "$work" "$evidence"
+
+m4_authenticate() {
+  if [[ -n "${OPEN_CARD_M4_AUTH_SESSION:-}" ]]; then
+    m4_admin_session=$OPEN_CARD_M4_AUTH_SESSION
+  else
+    local origin=${OPEN_CARD_AUTH_ORIGIN:?OPEN_CARD_AUTH_ORIGIN is required for M4 control-plane authentication}
+    : "${OPEN_CARD_M4_TEST_ADMIN_PASSWORD:?OPEN_CARD_M4_TEST_ADMIN_PASSWORD is required when no task-local session is supplied}"
+    local login_headers="$work/auth-login.headers" login_payload
+    login_payload=$(python3 - <<'PY'
+import json, os
+print(json.dumps({"password": os.environ["OPEN_CARD_M4_TEST_ADMIN_PASSWORD"]}, separators=(",", ":")))
+PY
+)
+    (umask 077; command curl -fsS -D "$login_headers" -o "$work/auth-login.json" -H 'Content-Type: application/json' -H "Origin: $origin" --data "$login_payload" "$api/api/v1/auth/login")
+    m4_admin_session=$(awk 'BEGIN { IGNORECASE=1 } /^Set-Cookie: __Host-open_card_session=/ { value=$0; sub(/^[^=]*=/,"",value); sub(/;.*/,"",value); gsub(/\r/,"",value); print value; exit }' "$login_headers")
+    rm -f -- "$login_headers" "$work/auth-login.json"
+  fi
+  [[ "$m4_admin_session" =~ ^[A-Za-z0-9_-]{43}$ ]] || { echo "M4 control-plane session is missing or malformed" >&2; return 78; }
+  OPEN_CARD_M4_AUTH_SESSION=$m4_admin_session
+}
+
+curl() {
+  local argument
+  for argument in "$@"; do
+    if [[ "$argument" == "$api/"* ]]; then
+      [[ -n "$m4_admin_session" ]] || { echo "M4 control-plane call attempted before authentication" >&2; return 78; }
+      command curl -H "Cookie: __Host-open_card_session=$m4_admin_session" "$@"
+      return
+    fi
+  done
+  command curl "$@"
+}
+
+m4_authenticate
 
 cleanup() {
   set +e
@@ -205,7 +240,7 @@ import json,sys
 print(json.dumps({'url':'https://opencard-webhook-fixture.test:'+sys.argv[2]+'/events','secret_ref':json.load(open(sys.argv[1])),'event_types':['notification.occurrence','notification.escalation','notification.recovery']},separators=(',',':')))
 PY
 )
-curl -fsS -H 'Content-Type: application/json' -H 'Open-Card-Role: operator' -H 'Open-Card-Actor: m4-lifecycle-fixture' -H "Idempotency-Key: m4-webhook-lifecycle-config-$run_id" --data "$webhook_payload" "$api/api/v1/applications/$app/webhooks" >"$evidence/webhook-config.json"
+curl -fsS -H 'Content-Type: application/json' -H "Idempotency-Key: m4-webhook-lifecycle-config-$run_id" --data "$webhook_payload" "$api/api/v1/applications/$app/webhooks" >"$evidence/webhook-config.json"
 webhook_id=$(json_get "$evidence/webhook-config.json" endpoint.id)
 test -n "$webhook_id"
 psql "$database_url" -X -Aqt -c "SELECT event_types::text FROM m4_webhook_endpoints WHERE id='$webhook_id'" >"$evidence/webhook-event-types.txt"
@@ -229,7 +264,7 @@ PY
 )
   failure_response="$evidence/failure-operation-attempt-$failure_attempt.json"
   failure_status_file="$work/failure-operation-attempt-$failure_attempt.status"
-  curl -sS -o "$failure_response" -w '%{http_code}' -H 'Content-Type: application/json' -H 'Open-Card-Role: operator' -H 'Open-Card-Actor: m4-lifecycle-fixture' -H "Idempotency-Key: $failure_key" --data "$failure_body" "$api/api/v1/applications/$app/operations" >"$failure_status_file" &
+  curl -sS -o "$failure_response" -w '%{http_code}' -H 'Content-Type: application/json' -H "Idempotency-Key: $failure_key" --data "$failure_body" "$api/api/v1/applications/$app/operations" >"$failure_status_file" &
   request_pid=$!
   for _ in $(seq 1 40); do
     failure_operation=$(query_operation_id "$failure_key")
@@ -303,7 +338,7 @@ import json,sys
 print(json.dumps({'action':'redeploy','expected_version':sys.argv[1],'reason':'M4 webhook lifecycle recovery'},separators=(',',':')))
 PY
 )
-curl -fsS -H 'Content-Type: application/json' -H 'Open-Card-Role: operator' -H 'Open-Card-Actor: m4-lifecycle-fixture' -H "Idempotency-Key: $recovery_key" --data "$recovery_body" "$api/api/v1/applications/$app/operations" >"$evidence/recovery-operation.json"
+curl -fsS -H 'Content-Type: application/json' -H "Idempotency-Key: $recovery_key" --data "$recovery_body" "$api/api/v1/applications/$app/operations" >"$evidence/recovery-operation.json"
 recovery_operation=$(query_operation_id "$recovery_key")
 test -n "$recovery_operation"
 wait_operation "$recovery_operation" succeeded

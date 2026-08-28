@@ -50,8 +50,7 @@ func TestM6AIHandlerDoesNotOptimisticallyClaimDisabledFallback(t *testing.T) {
 	backend := &m6BackendFixture{}
 	h := &M6AIHTTPHandler{Backend: backend}
 	request := httptest.NewRequest(http.MethodPost, "/api/v1/applications/app_1/ai/interventions", strings.NewReader(`{"task_type":"build_failure_diagnosis","reason":"rule miss","expected_version":"ops-v1","confirmed":false}`))
-	request.Header.Set("Open-Card-Role", "operator")
-	request.Header.Set("Open-Card-Actor", "operator-1")
+	request = withControlPlaneIdentity(request, "admin_test")
 	request.Header.Set("Idempotency-Key", "ai-request-1")
 	response := httptest.NewRecorder()
 	h.Handle(response, request)
@@ -69,8 +68,7 @@ func TestM6AISettingsFailClosedAndNeverClaimExternalCalls(t *testing.T) {
 		t.Fatal(denied.Code)
 	}
 	request := httptest.NewRequest(http.MethodPut, "/api/v1/settings/ai", strings.NewReader(`{"expected_version":"ai-v1","enabled":true,"profile":"local","provider":"fixture","model":"deterministic","data_scopes":["summary"],"max_tokens":128,"max_duration_ms":1000,"cooldown_seconds":60,"cache_enabled":true}`))
-	request.Header.Set("Open-Card-Role", "operator")
-	request.Header.Set("Open-Card-Actor", "operator-1")
+	request = withControlPlaneIdentity(request, "admin_test")
 	request.Header.Set("Idempotency-Key", "ai-settings-1")
 	response := httptest.NewRecorder()
 	h.Handle(response, request)

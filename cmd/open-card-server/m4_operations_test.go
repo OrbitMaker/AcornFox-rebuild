@@ -62,7 +62,7 @@ func TestM4ViewsShareFactVersionAndProtectOperatorDetail(t *testing.T) {
 	ordinary := httptest.NewRecorder()
 	handler.Handle(ordinary, httptest.NewRequest(http.MethodGet, "/api/v1/operations/views/app_test?environment_id=env_test&mode=ordinary", nil))
 	operatorRequest := httptest.NewRequest(http.MethodGet, "/api/v1/operations/views/app_test?environment_id=env_test&mode=operator", nil)
-	operatorRequest.Header.Set("X-Open-Card-Role", "operator")
+	operatorRequest = withControlPlaneIdentity(operatorRequest, "admin_test")
 	operator := httptest.NewRecorder()
 	handler.Handle(operator, operatorRequest)
 	if ordinary.Code != http.StatusOK || operator.Code != http.StatusOK || !strings.Contains(ordinary.Body.String(), `"version":"facts-v1"`) || !strings.Contains(operator.Body.String(), `"version":"facts-v1"`) {
@@ -100,11 +100,10 @@ func TestM4MutationRequiresOperatorActorIdempotencyAndExpectedVersion(t *testing
 	request := httptest.NewRequest(http.MethodPost, "/api/v1/operations/restart", strings.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Idempotency-Key", "restart-api")
-	request.Header.Set("X-Open-Card-Actor", "user_test")
-	request.Header.Set("X-Open-Card-Role", "operator")
+	request = withControlPlaneIdentity(request, "admin_test")
 	recorder := httptest.NewRecorder()
 	handler.Handle(recorder, request)
-	if recorder.Code != http.StatusAccepted || len(fixture.requests) != 1 || fixture.requests[0].ExpectedVersion != "facts-v1" || !strings.Contains(recorder.Body.String(), `"rollback_data":false`) {
+	if recorder.Code != http.StatusAccepted || len(fixture.requests) != 1 || fixture.requests[0].ExpectedVersion != "facts-v1" || fixture.requests[0].Actor != "admin_test" || !strings.Contains(recorder.Body.String(), `"rollback_data":false`) {
 		t.Fatalf("mutation response=%d %s requests=%#v", recorder.Code, recorder.Body.String(), fixture.requests)
 	}
 	unauthorized := httptest.NewRecorder()
@@ -125,8 +124,7 @@ func TestM4BrowserApplicationOperationsContractUsesServerEnvironment(t *testing.
 	request := httptest.NewRequest(http.MethodPost, "/api/v1/applications/app_test/operations", strings.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Idempotency-Key", "browser-restart")
-	request.Header.Set("Open-Card-Actor", "web-console")
-	request.Header.Set("Open-Card-Role", "operator")
+	request = withControlPlaneIdentity(request, "admin_test")
 	post := httptest.NewRecorder()
 	handler.HandleApplication(post, request)
 	if post.Code != http.StatusAccepted || len(fixture.requests) != 1 || fixture.requests[0].EnvironmentID != "env_test" || !strings.Contains(post.Body.String(), `"operation_id":"op_restart"`) {
@@ -140,16 +138,14 @@ func TestM4WebhookConfigurationUsesOpaqueReferenceAndQueuesTest(t *testing.T) {
 	body := `{"url":"https://receiver.fixture.test/events","secret_ref":{"id":"secret_webhook","name":"webhook","provider":"filesystem-secret","version":"v1"},"event_types":["notification.occurrence","notification.recovery"]}`
 	request := httptest.NewRequest(http.MethodPost, "/api/v1/applications/app_test/webhooks", strings.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("Open-Card-Role", "operator")
-	request.Header.Set("Open-Card-Actor", "operator_test")
+	request = withControlPlaneIdentity(request, "admin_test")
 	request.Header.Set("Idempotency-Key", "webhook-config")
 	configured := httptest.NewRecorder()
 	if !handler.HandleApplication(configured, request) || configured.Code != http.StatusCreated || len(fixture.webhooks) != 1 || strings.Contains(configured.Body.String(), "ciphertext") {
 		t.Fatalf("webhook configuration response=%d %s endpoint=%#v", configured.Code, configured.Body.String(), fixture.webhooks)
 	}
 	testRequest := httptest.NewRequest(http.MethodPost, "/api/v1/applications/app_test/webhooks/webhook_test/test", nil)
-	testRequest.Header.Set("Open-Card-Role", "operator")
-	testRequest.Header.Set("Open-Card-Actor", "operator_test")
+	testRequest = withControlPlaneIdentity(testRequest, "admin_test")
 	testRequest.Header.Set("Idempotency-Key", "webhook-test")
 	tested := httptest.NewRecorder()
 	if !handler.HandleApplication(tested, testRequest) || tested.Code != http.StatusAccepted || len(fixture.notifies) != 1 || fixture.notifies[0].Event.Kind != controllers.M4NotificationOccurrence || fixture.notifies[0].Endpoint.SecretRef.ID != "secret_webhook" {
@@ -157,8 +153,7 @@ func TestM4WebhookConfigurationUsesOpaqueReferenceAndQueuesTest(t *testing.T) {
 	}
 	bad := httptest.NewRequest(http.MethodPost, "/api/v1/applications/app_test/webhooks", strings.NewReader(strings.Replace(body, "notification.recovery", "deployment.failed", 1)))
 	bad.Header.Set("Content-Type", "application/json")
-	bad.Header.Set("Open-Card-Role", "operator")
-	bad.Header.Set("Open-Card-Actor", "operator_test")
+	bad = withControlPlaneIdentity(bad, "admin_test")
 	bad.Header.Set("Idempotency-Key", "webhook-invalid")
 	invalid := httptest.NewRecorder()
 	if !handler.HandleApplication(invalid, bad) || invalid.Code != http.StatusBadRequest || len(fixture.webhooks) != 1 {
@@ -171,8 +166,7 @@ func TestM4WebhookTestUsesOpaquePerKeyIncidentIdentity(t *testing.T) {
 	handler := &M4WebhookHTTPHandler{Store: fixture, Notifications: fixture, Environments: fixture, Clock: func() time.Time { return time.Unix(1_700_000_000, 0).UTC() }}
 	post := func(key string) int {
 		request := httptest.NewRequest(http.MethodPost, "/api/v1/applications/app_test/webhooks/webhook_test/test", nil)
-		request.Header.Set("Open-Card-Role", "operator")
-		request.Header.Set("Open-Card-Actor", "operator_test")
+		request = withControlPlaneIdentity(request, "admin_test")
 		request.Header.Set("Idempotency-Key", key)
 		recorder := httptest.NewRecorder()
 		handler.HandleApplication(recorder, request)

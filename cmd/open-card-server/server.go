@@ -149,9 +149,32 @@ func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
 	if s.tlsAllow != nil && s.tlsAllow.Handle(writer, request) {
 		return
 	}
-	if request.Method == http.MethodOptions {
-		writer.Header().Set("Allow", "GET, POST, OPTIONS")
-		writer.WriteHeader(http.StatusNoContent)
+	if request.URL.Path == "/healthz" {
+		s.handleHealth(writer, request, false)
+		return
+	}
+	if isAuthRoute(request.URL.Path) && strings.HasPrefix(request.URL.Path, apiPrefix) {
+		version, disabled, err := negotiateAPIRequest(request)
+		if err != nil {
+			writeJSONError(writer, http.StatusUpgradeRequired, "api_version_incompatible", err.Error())
+			return
+		}
+		writer.Header().Set(apiVersionHeader, version)
+		if len(disabled) > 0 {
+			writer.Header().Set("Open-Card-Disabled-Capabilities", strings.Join(disabled, ","))
+		}
+		request = withAPIVersion(request, version)
+	}
+	if isAuthRoute(request.URL.Path) {
+		if s.auth != nil && s.auth.Handle(writer, request) {
+			return
+		}
+		authNoStore(writer)
+		authHTTPError(writer, http.StatusServiceUnavailable, "authentication unavailable")
+		return
+	}
+	var authenticated bool
+	if request, authenticated = s.authenticateControlPlane(writer, request); !authenticated {
 		return
 	}
 	if strings.HasPrefix(request.URL.Path, apiPrefix) {
@@ -166,18 +189,12 @@ func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
 		}
 		request = withAPIVersion(request, version)
 	}
-	if strings.HasPrefix(request.URL.Path, authAPIBase) {
-		if s.auth != nil && s.auth.Handle(writer, request) {
-			return
-		}
-		authNoStore(writer)
-		authHTTPError(writer, http.StatusServiceUnavailable, "authentication unavailable")
+	if request.Method == http.MethodOptions {
+		writer.Header().Set("Allow", "GET, POST, OPTIONS")
+		writer.WriteHeader(http.StatusNoContent)
 		return
 	}
 	switch request.URL.Path {
-	case "/healthz":
-		s.handleHealth(writer, request, false)
-		return
 	case "/readyz":
 		s.handleHealth(writer, request, true)
 		return

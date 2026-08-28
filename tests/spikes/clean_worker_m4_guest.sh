@@ -27,6 +27,7 @@ source_archive=
 host_entry_added=0
 registry_script=
 phase_restart_pids=()
+m4_admin_session=
 
 # This runner is the checked-in M4 contract surface.  A canonical VM run may
 # execute the helpers below, but this source revision deliberately never
@@ -50,10 +51,46 @@ static=${OPEN_CARD_STATIC_SERVER_BINARY:-/opt/open-card/current/bin/open-card-st
 registry_endpoint=${OPEN_CARD_M2_REGISTRY_BASE_URL:?OPEN_CARD_M2_REGISTRY_BASE_URL is required}
 test "$registry_endpoint" = "http://127.0.0.1:$registry_port"
 test -x "$secretctl" -a -x "$static"
+
+m4_authenticate() {
+  if [[ -n "${OPEN_CARD_M4_AUTH_SESSION:-}" ]]; then
+    m4_admin_session=$OPEN_CARD_M4_AUTH_SESSION
+  else
+    local origin=${OPEN_CARD_AUTH_ORIGIN:?OPEN_CARD_AUTH_ORIGIN is required for M4 control-plane authentication}
+    : "${OPEN_CARD_M4_TEST_ADMIN_PASSWORD:?OPEN_CARD_M4_TEST_ADMIN_PASSWORD is required when no task-local session is supplied}"
+    local login_headers="$work/auth-login.headers" login_payload
+    login_payload=$(python3 - <<'PY'
+import json, os
+print(json.dumps({"password": os.environ["OPEN_CARD_M4_TEST_ADMIN_PASSWORD"]}, separators=(",", ":")))
+PY
+)
+    (umask 077; command curl -fsS -D "$login_headers" -o "$work/auth-login.json" -H 'Content-Type: application/json' -H "Origin: $origin" --data "$login_payload" "$api/api/v1/auth/login")
+    m4_admin_session=$(awk 'BEGIN { IGNORECASE=1 } /^Set-Cookie: __Host-open_card_session=/ { value=$0; sub(/^[^=]*=/,"",value); sub(/;.*/,"",value); gsub(/\r/,"",value); print value; exit }' "$login_headers")
+    rm -f -- "$login_headers" "$work/auth-login.json"
+  fi
+  [[ "$m4_admin_session" =~ ^[A-Za-z0-9_-]{43}$ ]] || { echo "M4 control-plane session is missing or malformed" >&2; return 78; }
+  OPEN_CARD_M4_AUTH_SESSION=$m4_admin_session
+}
+
+# All task control-plane calls acquire identity from this single session. The
+# retired Open-Card role/actor headers are never used as an authorization shim.
+curl() {
+  local argument
+  for argument in "$@"; do
+    if [[ "$argument" == "$api/"* ]]; then
+      [[ -n "$m4_admin_session" ]] || { echo "M4 control-plane call attempted before authentication" >&2; return 78; }
+      command curl -H "Cookie: __Host-open_card_session=$m4_admin_session" "$@"
+      return
+    fi
+  done
+  command curl "$@"
+}
+
 for service in open-card-server open-card-agent docker postgresql; do test "$(systemctl is-active "$service")" = active; done
 rm -rf -- "$evidence" "$work"
 install -d -m 0750 "$evidence" "$work"
 chown opencard:opencard "$work"
+m4_authenticate
 
 cleanup() {
   set +e
@@ -477,7 +514,7 @@ PY
 		) &
 		phase_watcher_pid=$!
 	fi
-	curl -fsS -H 'Content-Type: application/json' -H 'Open-Card-Role: operator' -H 'Open-Card-Actor: m4-fixture' -H "Idempotency-Key: $key" --data "$body" "$api/api/v1/applications/$app/operations" >"$output" &
+	curl -fsS -H 'Content-Type: application/json' -H "Idempotency-Key: $key" --data "$body" "$api/api/v1/applications/$app/operations" >"$output" &
   request_pid=$!
   for _ in $(seq 1 240); do
     operation=$(operation_id_for_key "$key")
@@ -531,7 +568,7 @@ run_phase_restarts() {
 
 assert_rollout_replay_and_stale() {
   local action=$1 expected=$2 key=$3 operation=$4 stale_output=$5 replay_output=$6 stale_status replay_operation
-  stale_status=$(curl -sS -o "$stale_output" -w '%{http_code}' -H 'Content-Type: application/json' -H 'Open-Card-Role: operator' -H 'Open-Card-Actor: m4-fixture' -H "Idempotency-Key: $key-stale" --data "$(python3 - "$action" <<'PY'
+  stale_status=$(curl -sS -o "$stale_output" -w '%{http_code}' -H 'Content-Type: application/json' -H "Idempotency-Key: $key-stale" --data "$(python3 - "$action" <<'PY'
 import json,sys
 print(json.dumps({"action":sys.argv[1],"expected_version":"stale-facts-version","reason":"stale expected version"},separators=(',',':')))
 PY
@@ -785,7 +822,7 @@ import json,sys
 print(json.dumps({"action":"restart","expected_version":sys.argv[1],"reason":"restart exact unhealthy worker token=m4-log-canary"},separators=(',',':')))
 PY
 )
-  restart_status=$(curl -sS -o "$evidence/restart-attempt-$restart_attempt.json" -w '%{http_code}' -H 'Content-Type: application/json' -H 'Open-Card-Role: operator' -H 'Open-Card-Actor: m4-fixture' -H "Idempotency-Key: m4-restart-$run_id" --data "$restart_payload" "$api/api/v1/applications/$app/operations")
+  restart_status=$(curl -sS -o "$evidence/restart-attempt-$restart_attempt.json" -w '%{http_code}' -H 'Content-Type: application/json' -H "Idempotency-Key: m4-restart-$run_id" --data "$restart_payload" "$api/api/v1/applications/$app/operations")
   cp "$evidence/restart-attempt-$restart_attempt.json" "$evidence/restart.json"
   [[ "$restart_status" = 202 ]] && break
   [[ "$restart_status" = 409 ]] || { cat "$evidence/restart.json" >&2; exit 1; }
@@ -845,7 +882,7 @@ value=json.load(open(sys.argv[1]))
 assert value['mode']=='ordinary' and value['summary']['raw_logs_available'] is False
 assert 'items' not in value
 PY
-curl -fsS -H 'Open-Card-Role: operator' "$api/api/v1/applications/$app/logs?limit=100" >"$evidence/logs-operator.json"
+curl -fsS "$api/api/v1/applications/$app/logs?limit=100" >"$evidence/logs-operator.json"
 python3 - "$evidence/logs-operator.json" <<'PY'
 import json,sys
 value=json.load(open(sys.argv[1])); categories={item['category'] for item in value['items']}
@@ -875,6 +912,7 @@ runtime_stream=$(basename "$(dirname "$runtime_log_path")")
 test "$(find "$OPEN_CARD_LOG_ROOT/runtime/$runtime_stream" -maxdepth 1 -type f -name 'segment-*.log' | wc -l)" -ge 2
 env \
   M4_LOG_GATE_EXECUTE=1 \
+  OPEN_CARD_M4_AUTH_SESSION="$m4_admin_session" \
   M4_LOG_GATE_API="$api" \
   M4_LOG_GATE_EVIDENCE="$evidence/log-gates" \
   M4_LOG_GATE_WORK="$work/log-gates" \
@@ -949,7 +987,7 @@ import json,sys
 print(json.dumps({'url':'https://opencard-webhook-fixture.test:'+sys.argv[2]+'/events','secret_ref':json.load(open(sys.argv[1])),'event_types':['notification.occurrence','notification.escalation','notification.recovery']},separators=(',',':')))
 PY
 )
-curl -fsS -H 'Content-Type: application/json' -H 'Open-Card-Role: operator' -H 'Open-Card-Actor: m4-fixture' -H "Idempotency-Key: m4-webhook-$run_id" --data "$webhook_payload" "$api/api/v1/applications/$app/webhooks" >"$evidence/webhook-config.json"
+curl -fsS -H 'Content-Type: application/json' -H "Idempotency-Key: m4-webhook-$run_id" --data "$webhook_payload" "$api/api/v1/applications/$app/webhooks" >"$evidence/webhook-config.json"
 webhook_id=$(json_get "$evidence/webhook-config.json" endpoint.id)
 psql "$database_url" -X -Aqt -F '|' -c "SELECT event_types::text FROM m4_webhook_endpoints WHERE id='$webhook_id'" >"$evidence/webhook-event-types.txt"
 grep -Fq 'notification.occurrence' "$evidence/webhook-event-types.txt"
@@ -959,7 +997,7 @@ grep -Fq 'notification.recovery' "$evidence/webhook-event-types.txt"
 # distinct idempotency key and starts with a receiver-controlled one-shot 5xx;
 # the durable worker must persist retry_wait, replay the same event ID, and
 # finish delivered after the fixture has switched back to 204.
-curl -fsS -X POST -H 'Open-Card-Role: operator' -H 'Open-Card-Actor: m4-fixture' -H "Idempotency-Key: m4-webhook-test-initial-$run_id" "$api/api/v1/applications/$app/webhooks/$webhook_id/test" >"$evidence/webhook-test-initial.json"
+curl -fsS -X POST -H "Idempotency-Key: m4-webhook-test-initial-$run_id" "$api/api/v1/applications/$app/webhooks/$webhook_id/test" >"$evidence/webhook-test-initial.json"
 for _ in $(seq 1 100); do
   psql "$database_url" -X -Aqt -F '|' -c "SELECT delivery_status,attempt_count FROM m4_webhook_events WHERE endpoint_id='$webhook_id' ORDER BY created_at DESC LIMIT 1" >"$evidence/webhook-ledger-initial.txt"
   grep -Eq '^delivered\|1$' "$evidence/webhook-ledger-initial.txt" && break
@@ -967,7 +1005,7 @@ for _ in $(seq 1 100); do
 done
 grep -Eq '^delivered\|1$' "$evidence/webhook-ledger-initial.txt"
 printf '500-once\n' >"$receiver_status"
-curl -fsS -X POST -H 'Open-Card-Role: operator' -H 'Open-Card-Actor: m4-fixture' -H "Idempotency-Key: m4-webhook-test-retry-$run_id" "$api/api/v1/applications/$app/webhooks/$webhook_id/test" >"$evidence/webhook-test-retry.json"
+curl -fsS -X POST -H "Idempotency-Key: m4-webhook-test-retry-$run_id" "$api/api/v1/applications/$app/webhooks/$webhook_id/test" >"$evidence/webhook-test-retry.json"
 for _ in $(seq 1 160); do
   psql "$database_url" -X -Aqt -F '|' -c "SELECT delivery_status,attempt_count FROM m4_webhook_events WHERE endpoint_id='$webhook_id' ORDER BY created_at DESC LIMIT 1" >"$evidence/webhook-ledger-retry.txt"
   grep -Eq '^delivered\|2$' "$evidence/webhook-ledger-retry.txt" && break
