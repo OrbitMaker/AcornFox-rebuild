@@ -6,6 +6,9 @@ set -euo pipefail
 # never edits a domain outcome directly and it never creates an unscoped
 # container, volume, network, registry, or host listener.
 
+m2_test_admin_password=${OPEN_CARD_M2_TEST_ADMIN_PASSWORD:-}
+export -n OPEN_CARD_M2_TEST_ADMIN_PASSWORD
+
 task_prefix=opencard-mvp-fa8f8eab
 domain=opencard-mvp-fa8f8eab-build-worker-01
 evidence_root=/var/lib/opencard-mvp-fa8f8eab/evidence/m2-real
@@ -17,6 +20,8 @@ registry_host=${OPEN_CARD_M2_REGISTRY_HOST:-127.0.0.1}
 registry_port=${OPEN_CARD_M2_REGISTRY_PORT:-45532}
 registry_addr=$registry_host:$registry_port
 run_id=$(openssl rand -hex 8)
+m2_auth_tmp_dir=
+m2_auth_curl_config=
 
 test "$(id -u)" -eq 0
 test -f /etc/opencard-mvp-fa8f8eab-clean-worker
@@ -25,6 +30,7 @@ test -f /etc/open-card/server.env
 set -a
 source /etc/open-card/server.env
 set +a
+export -n OPEN_CARD_M2_TEST_ADMIN_PASSWORD
 
 server_addr=${OPEN_CARD_SERVER_ADDR:-127.0.0.1:8080}
 api_base=http://$server_addr
@@ -60,6 +66,55 @@ install -d -m 0750 "$evidence_root" "$work_root" "$registry_root"
 chmod 0750 "$evidence_root" "$work_root" "$registry_root"
 chown opencard:opencard "$registry_root"
 install -m 0555 -o opencard -g opencard "$fixture_root/registry_fixture.py" "$registry_script"
+
+m2_authenticate() {
+  local origin=${OPEN_CARD_AUTH_ORIGIN:?OPEN_CARD_AUTH_ORIGIN is required for M2 control-plane authentication}
+  local password=${m2_test_admin_password:?OPEN_CARD_M2_TEST_ADMIN_PASSWORD is required for task-local login}
+  unset m2_test_admin_password
+  m2_auth_tmp_dir=$(mktemp -d "/tmp/${task_prefix}-m2-auth.XXXXXX")
+  [[ ! -L "$m2_auth_tmp_dir" ]] || { echo "M2 authentication directory must not be a symlink" >&2; return 78; }
+  chmod 0700 "$m2_auth_tmp_dir"
+  local headers payload response session csrf
+  headers=$(mktemp "$m2_auth_tmp_dir/auth-login.headers.XXXXXX")
+  payload=$(mktemp "$m2_auth_tmp_dir/auth-login-request.XXXXXX")
+  response=$(mktemp "$m2_auth_tmp_dir/auth-login-response.XXXXXX")
+  printf '%s' "$password" | python3 -c 'import json, sys; print(json.dumps({"password": sys.stdin.read()}, separators=(",", ":")))' >"$payload"
+  unset password
+  chmod 0600 "$payload"
+  (umask 077; command curl -fsS -D "$headers" -o "$response" -H 'Content-Type: application/json' -H "Origin: $origin" --data-binary "@$payload" "$api_base/api/v1/auth/login")
+  session=$(awk 'BEGIN { IGNORECASE=1 } /^Set-Cookie: __Host-open_card_session=/ { value=$0; sub(/^[^=]*=/,"",value); sub(/;.*/,"",value); gsub(/\r/,"",value); print value; exit }' "$headers")
+  csrf=$(awk 'BEGIN { IGNORECASE=1 } /^Set-Cookie: __Host-open_card_csrf=/ { value=$0; sub(/^[^=]*=/,"",value); sub(/;.*/,"",value); gsub(/\r/,"",value); print value; exit }' "$headers")
+  [[ "$session" =~ ^[A-Za-z0-9_-]{43}$ && "$csrf" =~ ^[A-Za-z0-9_-]{43}$ ]] || { echo "M2 control-plane authentication is missing or malformed" >&2; return 78; }
+  m2_auth_curl_config=$(mktemp "$m2_auth_tmp_dir/auth-control-plane.XXXXXX")
+  (umask 077; {
+    printf 'header = "Cookie: __Host-open_card_session=%s; __Host-open_card_csrf=%s"\n' "$session" "$csrf"
+    printf 'header = "X-Open-Card-CSRF: %s"\n' "$csrf"
+  } >"$m2_auth_curl_config")
+  rm -f -- "$headers" "$payload" "$response"
+  unset session csrf
+}
+
+m2_auth_cleanup() {
+  if [[ -n "${m2_auth_tmp_dir:-}" && "$m2_auth_tmp_dir" == "/tmp/${task_prefix}-m2-auth."* && -d "$m2_auth_tmp_dir" && ! -L "$m2_auth_tmp_dir" ]]; then
+    rm -rf -- "$m2_auth_tmp_dir"
+  fi
+  unset m2_auth_curl_config m2_auth_tmp_dir
+}
+
+curl() {
+  local argument
+  for argument in "$@"; do
+    if [[ "$argument" == "$api_base/"* ]]; then
+      [[ -r "${m2_auth_curl_config:-}" ]] || { echo "M2 control-plane call attempted before authentication" >&2; return 78; }
+      command curl --config "$m2_auth_curl_config" -H "Origin: $OPEN_CARD_AUTH_ORIGIN" "$@"
+      return
+    fi
+  done
+  command curl "$@"
+}
+
+trap m2_auth_cleanup EXIT INT TERM
+m2_authenticate
 curl -fsS "$api_base/readyz" >/dev/null
 
 # Capability negotiation is a prerequisite, not a post-hoc observation. The
@@ -163,6 +218,7 @@ cleanup() {
   # Destruction goes through the public API first.  The exact Docker cleanup
   # below is a leak assertion, not a broad prune or a recovery shortcut.
   destroy_deployments_serially || true
+  m2_auth_cleanup
   if [[ -n "$registry_pid" ]]; then
     kill "$registry_pid" >/dev/null 2>&1 || true
     wait "$registry_pid" >/dev/null 2>&1 || true

@@ -184,6 +184,23 @@ func (s *Service) Session(ctx context.Context, sessionToken string) (SessionInfo
 	return SessionInfo{Authenticated: true, IdleExpiresAt: session.IdleExpiresAt, AbsoluteAt: session.AbsoluteExpiresAt}, session, nil
 }
 
+// AuthorizeControlPlaneWrite validates the session before origin and CSRF so
+// callers never reveal whether a rejected Origin or CSRF token belongs to a
+// valid session. The session-bound CSRF digest is compared in constant time.
+func (s *Service) AuthorizeControlPlaneWrite(ctx context.Context, origin, sessionToken, csrfToken string) (domain.AdminSession, error) {
+	session, err := s.session(ctx, sessionToken)
+	if err != nil {
+		return domain.AdminSession{}, err
+	}
+	if err := s.RequireOrigin(origin); err != nil {
+		return domain.AdminSession{}, err
+	}
+	if !validCSRF(session, csrfToken) {
+		return domain.AdminSession{}, ErrCSRFInvalid
+	}
+	return session, nil
+}
+
 func (s *Service) Logout(ctx context.Context, origin, sessionToken, csrfToken string) error {
 	if err := s.RequireOrigin(origin); err != nil {
 		return err

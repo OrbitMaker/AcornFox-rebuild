@@ -27,7 +27,7 @@ func TestM4ActiveOperationIsAConflictNotInternalError(t *testing.T) {
 func TestAPI_CONTRACT_001_ServerApplicationRESTAndSSE(t *testing.T) {
 	server := NewServer()
 	now := time.Unix(1_700_000_000, 0).UTC()
-	_, session := attachTestAdministrator(t, server, &now)
+	_, session, csrf := attachTestAdministratorTokens(t, server, &now)
 	testServer := httptest.NewServer(server.Handler())
 	defer testServer.Close()
 
@@ -66,6 +66,7 @@ func TestAPI_CONTRACT_001_ServerApplicationRESTAndSSE(t *testing.T) {
 	}
 	createRequest.Header.Set("Content-Type", "application/json")
 	createRequest.AddCookie(session)
+	addControlPlaneWriteProof(createRequest, csrf)
 	createResponse, err := http.DefaultClient.Do(createRequest)
 	if err != nil {
 		t.Fatal(err)
@@ -185,7 +186,7 @@ func TestServerReadinessFailsWhenPersistentRepositoryIsUnavailable(t *testing.T)
 func TestAPI_SECURITY_001_ServerRejectsUnknownJSONFields(t *testing.T) {
 	serverState := NewServer()
 	now := time.Unix(1_700_000_000, 0).UTC()
-	_, session := attachTestAdministrator(t, serverState, &now)
+	_, session, csrf := attachTestAdministratorTokens(t, serverState, &now)
 	server := httptest.NewServer(serverState.Handler())
 	defer server.Close()
 	request, err := http.NewRequest(http.MethodPost, server.URL+"/api/v1/applications", strings.NewReader(`{"name":"demo","unexpected":true}`))
@@ -194,6 +195,7 @@ func TestAPI_SECURITY_001_ServerRejectsUnknownJSONFields(t *testing.T) {
 	}
 	request.Header.Set("Content-Type", "application/json")
 	request.AddCookie(session)
+	addControlPlaneWriteProof(request, csrf)
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
 		t.Fatal(err)
@@ -238,7 +240,7 @@ func TestAPI_CONTRACT_002_SSEReplaysFromRepositoryAfterServerRestart(t *testing.
 	repository := application.NewMemoryRepository()
 	firstState := NewServerWithRepository(repository)
 	now := time.Unix(1_700_000_000, 0).UTC()
-	_, firstSession := attachTestAdministrator(t, firstState, &now)
+	_, firstSession, firstCSRF := attachTestAdministratorTokens(t, firstState, &now)
 	firstServer := httptest.NewServer(firstState.Handler())
 	request, err := http.NewRequest(http.MethodPost, firstServer.URL+"/api/v1/applications", strings.NewReader(`{"name":"persistent"}`))
 	if err != nil {
@@ -247,6 +249,7 @@ func TestAPI_CONTRACT_002_SSEReplaysFromRepositoryAfterServerRestart(t *testing.
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Idempotency-Key", "persistent-create")
 	request.AddCookie(firstSession)
+	addControlPlaneWriteProof(request, firstCSRF)
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
 		t.Fatal(err)
@@ -297,7 +300,7 @@ func TestAPI_CONTRACT_002_SSEReplaysFromRepositoryAfterServerRestart(t *testing.
 func TestAPI_IDEMPOTENCY_001_CreateReplayAndConflict(t *testing.T) {
 	serverState := NewServer()
 	now := time.Unix(1_700_000_000, 0).UTC()
-	_, session := attachTestAdministrator(t, serverState, &now)
+	_, session, csrf := attachTestAdministratorTokens(t, serverState, &now)
 	server := httptest.NewServer(serverState.Handler())
 	defer server.Close()
 	create := func(name string) (*http.Response, map[string]any) {
@@ -309,6 +312,7 @@ func TestAPI_IDEMPOTENCY_001_CreateReplayAndConflict(t *testing.T) {
 		request.Header.Set("Content-Type", "application/json")
 		request.Header.Set("Idempotency-Key", "same-create")
 		request.AddCookie(session)
+		addControlPlaneWriteProof(request, csrf)
 		response, err := http.DefaultClient.Do(request)
 		if err != nil {
 			t.Fatal(err)

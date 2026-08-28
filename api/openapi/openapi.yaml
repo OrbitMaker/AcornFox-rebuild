@@ -115,6 +115,7 @@ paths:
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
         - $ref: '#/components/parameters/CSRFHeader'
+        - $ref: '#/components/parameters/OriginHeader'
       requestBody:
         required: true
         content:
@@ -198,6 +199,7 @@ paths:
       parameters:
         - $ref: '#/components/parameters/RequiredIdempotencyKey'
         - $ref: '#/components/parameters/CSRFHeader'
+        - $ref: '#/components/parameters/OriginHeader'
       requestBody:
         required: true
         content:
@@ -243,6 +245,7 @@ paths:
       parameters:
         - $ref: '#/components/parameters/RequiredIdempotencyKey'
         - $ref: '#/components/parameters/CSRFHeader'
+        - $ref: '#/components/parameters/OriginHeader'
       requestBody:
         required: true
         content:
@@ -272,6 +275,7 @@ paths:
       parameters:
         - $ref: '#/components/parameters/RequiredIdempotencyKey'
         - $ref: '#/components/parameters/CSRFHeader'
+        - $ref: '#/components/parameters/OriginHeader'
       responses:
         '202':
           description: Verification state was refreshed or remains pending.
@@ -294,6 +298,7 @@ paths:
       parameters:
         - $ref: '#/components/parameters/RequiredIdempotencyKey'
         - $ref: '#/components/parameters/CSRFHeader'
+        - $ref: '#/components/parameters/OriginHeader'
       responses:
         '204': {description: Custom domain binding removed without altering fallback access.}
         '401': {$ref: '#/components/responses/AuthenticationRequired'}
@@ -328,6 +333,7 @@ paths:
       parameters:
         - $ref: '#/components/parameters/RequiredIdempotencyKey'
         - $ref: '#/components/parameters/CSRFHeader'
+        - $ref: '#/components/parameters/OriginHeader'
       requestBody:
         required: true
         content:
@@ -382,6 +388,7 @@ paths:
       parameters:
         - $ref: '#/components/parameters/RequiredIdempotencyKey'
         - $ref: '#/components/parameters/CSRFHeader'
+        - $ref: '#/components/parameters/OriginHeader'
       requestBody:
         required: true
         content:
@@ -459,6 +466,7 @@ paths:
       parameters:
         - $ref: '#/components/parameters/RequiredIdempotencyKey'
         - $ref: '#/components/parameters/CSRFHeader'
+        - $ref: '#/components/parameters/OriginHeader'
       requestBody:
         required: true
         content:
@@ -483,6 +491,7 @@ paths:
       parameters:
         - $ref: '#/components/parameters/RequiredIdempotencyKey'
         - $ref: '#/components/parameters/CSRFHeader'
+        - $ref: '#/components/parameters/OriginHeader'
       requestBody:
         required: true
         content:
@@ -502,6 +511,7 @@ paths:
       parameters:
         - $ref: '#/components/parameters/RequiredIdempotencyKey'
         - $ref: '#/components/parameters/CSRFHeader'
+        - $ref: '#/components/parameters/OriginHeader'
       requestBody:
         required: true
         content:
@@ -544,6 +554,7 @@ paths:
       parameters:
         - $ref: '#/components/parameters/RequiredIdempotencyKey'
         - $ref: '#/components/parameters/CSRFHeader'
+        - $ref: '#/components/parameters/OriginHeader'
       responses:
         '202':
           description: Test delivery reserved for the durable worker.
@@ -568,6 +579,7 @@ paths:
       parameters:
         - $ref: '#/components/parameters/RequiredIdempotencyKey'
         - $ref: '#/components/parameters/CSRFHeader'
+        - $ref: '#/components/parameters/OriginHeader'
       requestBody:
         required: true
         content:
@@ -664,7 +676,7 @@ paths:
   /api/v1/access/ip-fallback:
     post:
       operationId: createIPFallback
-      parameters: [{$ref: '#/components/parameters/RequiredIdempotencyKey'}, {$ref: '#/components/parameters/CSRFHeader'}]
+      parameters: [{$ref: '#/components/parameters/RequiredIdempotencyKey'}, {$ref: '#/components/parameters/CSRFHeader'}, {$ref: '#/components/parameters/OriginHeader'}]
       requestBody:
         required: true
         content:
@@ -681,7 +693,7 @@ paths:
   /api/v1/access/platform-domains:
     post:
       operationId: bindPlatformDomain
-      parameters: [{$ref: '#/components/parameters/RequiredIdempotencyKey'}, {$ref: '#/components/parameters/CSRFHeader'}]
+      parameters: [{$ref: '#/components/parameters/RequiredIdempotencyKey'}, {$ref: '#/components/parameters/CSRFHeader'}, {$ref: '#/components/parameters/OriginHeader'}]
       requestBody:
         required: true
         content:
@@ -703,7 +715,7 @@ paths:
   /api/v1/access/application-domains:
     post:
       operationId: bindApplicationDomain
-      parameters: [{$ref: '#/components/parameters/RequiredIdempotencyKey'}, {$ref: '#/components/parameters/CSRFHeader'}]
+      parameters: [{$ref: '#/components/parameters/RequiredIdempotencyKey'}, {$ref: '#/components/parameters/CSRFHeader'}, {$ref: '#/components/parameters/OriginHeader'}]
       requestBody:
         required: true
         content:
@@ -726,7 +738,7 @@ paths:
   /api/v1/access/domain-routes:
     post:
       operationId: applyDomainRoutes
-      parameters: [{$ref: '#/components/parameters/RequiredIdempotencyKey'}, {$ref: '#/components/parameters/CSRFHeader'}]
+      parameters: [{$ref: '#/components/parameters/RequiredIdempotencyKey'}, {$ref: '#/components/parameters/CSRFHeader'}, {$ref: '#/components/parameters/OriginHeader'}]
       requestBody:
         required: true
         content:
@@ -743,7 +755,7 @@ paths:
   /api/v1/access/platform-application-domains:
     post:
       operationId: createPlatformApplicationDomain
-      parameters: [{$ref: '#/components/parameters/RequiredIdempotencyKey'}, {$ref: '#/components/parameters/CSRFHeader'}]
+      parameters: [{$ref: '#/components/parameters/RequiredIdempotencyKey'}, {$ref: '#/components/parameters/CSRFHeader'}, {$ref: '#/components/parameters/OriginHeader'}]
       requestBody:
         required: true
         content:
@@ -762,7 +774,7 @@ paths:
   /api/v1/access/certificates/renew:
     post:
       operationId: renewCertificate
-      parameters: [{$ref: '#/components/parameters/RequiredIdempotencyKey'}, {$ref: '#/components/parameters/CSRFHeader'}]
+      parameters: [{$ref: '#/components/parameters/RequiredIdempotencyKey'}, {$ref: '#/components/parameters/CSRFHeader'}, {$ref: '#/components/parameters/OriginHeader'}]
       requestBody:
         required: true
         content:
@@ -780,7 +792,7 @@ paths:
   /api/v1/access/traffic-switches:
     post:
       operationId: switchTraffic
-      parameters: [{$ref: '#/components/parameters/RequiredIdempotencyKey'}, {$ref: '#/components/parameters/CSRFHeader'}]
+      parameters: [{$ref: '#/components/parameters/RequiredIdempotencyKey'}, {$ref: '#/components/parameters/CSRFHeader'}, {$ref: '#/components/parameters/OriginHeader'}]
       requestBody:
         required: true
         content:
@@ -822,6 +834,7 @@ paths:
         - {name: action, in: path, required: true, schema: {type: string, enum: [restart, redeploy, rollback]}}
         - $ref: '#/components/parameters/RequiredIdempotencyKey'
         - $ref: '#/components/parameters/CSRFHeader'
+        - $ref: '#/components/parameters/OriginHeader'
       requestBody:
         required: true
         content:
@@ -897,6 +910,12 @@ components:
       required: true
       description: Double-submit CSRF value matching the non-HttpOnly administrator CSRF cookie.
       schema: {type: string, minLength: 1}
+    OriginHeader:
+      name: Origin
+      in: header
+      required: true
+      description: Exact configured HTTPS administrator origin; cross-origin control-plane writes are rejected.
+      schema: {type: string, format: uri}
     ServiceGroupID:
       name: serviceGroupId
       in: path
@@ -932,7 +951,7 @@ components:
           schema:
             $ref: '#/components/schemas/APIError'
     AuthenticationRequired:
-      description: Valid administrator session and, for writes, CSRF proof are required.
+      description: Valid administrator session and, for writes, exact Origin plus CSRF proof are required. Rejections use the same 401 response.
       content: {application/json: {schema: {$ref: '#/components/schemas/APIError'}}}
     StateConflict:
       description: State, version or idempotency conflict.

@@ -15,6 +15,11 @@ import (
 )
 
 func attachTestAdministrator(t *testing.T, server *Server, now *time.Time) (*authHTTPStore, *http.Cookie) {
+	store, session, _ := attachTestAdministratorTokens(t, server, now)
+	return store, session
+}
+
+func attachTestAdministratorTokens(t *testing.T, server *Server, now *time.Time) (*authHTTPStore, *http.Cookie, *http.Cookie) {
 	t.Helper()
 	store := &authHTTPStore{}
 	service, err := auth.NewService(auth.Config{Store: store, Origin: "https://console.example.test", Clock: func() time.Time { return *now }})
@@ -32,7 +37,7 @@ func attachTestAdministrator(t *testing.T, server *Server, now *time.Time) (*aut
 		t.Fatal(err)
 	}
 	server.SetAuth(&AuthHTTPHandler{Service: service})
-	return store, &http.Cookie{Name: authSessionCookie, Value: login.SessionToken, Path: "/"}
+	return store, &http.Cookie{Name: authSessionCookie, Value: login.SessionToken, Path: "/"}, &http.Cookie{Name: authCSRFCookie, Value: login.CSRFTok, Path: "/"}
 }
 
 func controlPlaneRequest(method, target string, body io.Reader, session *http.Cookie) *http.Request {
@@ -43,10 +48,16 @@ func controlPlaneRequest(method, target string, body io.Reader, session *http.Co
 	return request
 }
 
+func addControlPlaneWriteProof(request *http.Request, csrf *http.Cookie) {
+	request.Header.Set("Origin", "https://console.example.test")
+	request.AddCookie(csrf)
+	request.Header.Set(authCSRFHeader, csrf.Value)
+}
+
 func TestControlPlaneAuthRejectsAnonymousAndForgedIdentityHeaders(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
 	server := NewServer()
-	_, session := attachTestAdministrator(t, server, &now)
+	_, session, _ := attachTestAdministratorTokens(t, server, &now)
 
 	forged := controlPlaneRequest(http.MethodGet, "/api/v1/applications", nil, nil)
 	forged.Header.Set("Open-Card-Role", "operator")
@@ -76,7 +87,7 @@ func TestControlPlaneAuthRejectsAnonymousAndForgedIdentityHeaders(t *testing.T) 
 func TestControlPlaneAuthProtectsReadinessWritesAndSSE(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
 	server := NewServer()
-	_, session := attachTestAdministrator(t, server, &now)
+	_, session, csrf := attachTestAdministratorTokens(t, server, &now)
 
 	protected := []string{
 		"/readyz",
@@ -111,6 +122,7 @@ func TestControlPlaneAuthProtectsReadinessWritesAndSSE(t *testing.T) {
 	create := controlPlaneRequest(http.MethodPost, "/api/v1/applications", strings.NewReader(`{"name":"authenticated"}`), session)
 	create.Header.Set("Content-Type", "application/json")
 	create.Header.Set("Idempotency-Key", "authenticated-create")
+	addControlPlaneWriteProof(create, csrf)
 	server.Handler().ServeHTTP(created, create)
 	if created.Code != http.StatusCreated {
 		t.Fatalf("authenticated create=%d %s", created.Code, created.Body.String())
@@ -144,6 +156,78 @@ func TestControlPlaneAuthExpiresSessionsAndReportsStoreFailure(t *testing.T) {
 	server.Handler().ServeHTTP(unavailable, controlPlaneRequest(http.MethodGet, "/api/v1/applications", nil, session))
 	if unavailable.Code != http.StatusServiceUnavailable || len(unavailable.Result().Cookies()) != 0 || strings.Contains(unavailable.Body.String(), "postgres") {
 		t.Fatalf("store failure status=%d cookies=%#v body=%s", unavailable.Code, unavailable.Result().Cookies(), unavailable.Body.String())
+	}
+}
+
+func TestControlPlaneUnsafeRequestsRequireExactOriginAndSessionBoundCSRF(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	server := NewServer()
+	_, session, csrf := attachTestAdministratorTokens(t, server, &now)
+	other, err := server.auth.Service.Login(context.Background(), "https://console.example.test", "control plane correct horse battery staple 123", "127.0.0.2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherSession := &http.Cookie{Name: authSessionCookie, Value: other.SessionToken, Path: "/"}
+	otherCSRF := &http.Cookie{Name: authCSRFCookie, Value: other.CSRFTok, Path: "/"}
+
+	request := func(session, csrf *http.Cookie, origin, csrfHeader string) *http.Request {
+		value := controlPlaneRequest(http.MethodPost, "/api/v1/applications", strings.NewReader(`{"name":"csrf"}`), session)
+		value.Header.Set("Content-Type", "application/json")
+		value.Header.Set("Idempotency-Key", "csrf-contract")
+		if csrf != nil {
+			value.AddCookie(csrf)
+			value.Header.Set(authCSRFHeader, csrf.Value)
+		}
+		if csrfHeader != "" {
+			value.Header.Set(authCSRFHeader, csrfHeader)
+		}
+		if origin != "" {
+			value.Header.Set("Origin", origin)
+		}
+		return value
+	}
+	for _, test := range []struct {
+		name    string
+		session *http.Cookie
+		csrf    *http.Cookie
+		origin  string
+		header  string
+		want    int
+	}{
+		{name: "missing session", origin: "https://other.example.test", want: http.StatusUnauthorized},
+		{name: "missing origin", session: session, csrf: csrf, want: http.StatusUnauthorized},
+		{name: "wrong origin", session: session, csrf: csrf, origin: "https://other.example.test", want: http.StatusUnauthorized},
+		{name: "missing csrf", session: session, origin: "https://console.example.test", want: http.StatusUnauthorized},
+		{name: "cross session csrf", session: session, csrf: otherCSRF, origin: "https://console.example.test", want: http.StatusUnauthorized},
+		{name: "wrong csrf cookie header pair", session: otherSession, csrf: csrf, origin: "https://console.example.test", header: "wrong-csrf", want: http.StatusUnauthorized},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			server.Handler().ServeHTTP(recorder, request(test.session, test.csrf, test.origin, test.header))
+			if recorder.Code != test.want || strings.Contains(recorder.Body.String(), "origin") || strings.Contains(recorder.Body.String(), "csrf") {
+				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+		})
+	}
+	accepted := httptest.NewRecorder()
+	server.Handler().ServeHTTP(accepted, request(session, csrf, "https://console.example.test", ""))
+	if accepted.Code != http.StatusCreated {
+		t.Fatalf("valid unsafe request=%d body=%s", accepted.Code, accepted.Body.String())
+	}
+	get := httptest.NewRecorder()
+	server.Handler().ServeHTTP(get, controlPlaneRequest(http.MethodGet, "/api/v1/applications", nil, session))
+	if get.Code != http.StatusOK {
+		t.Fatalf("GET unexpectedly requires origin or CSRF: %d %s", get.Code, get.Body.String())
+	}
+	options := httptest.NewRecorder()
+	server.Handler().ServeHTTP(options, controlPlaneRequest(http.MethodOptions, "/api/v1/applications", nil, session))
+	if options.Code != http.StatusNoContent {
+		t.Fatalf("authenticated OPTIONS status=%d body=%s", options.Code, options.Body.String())
+	}
+	anonymousOptions := httptest.NewRecorder()
+	server.Handler().ServeHTTP(anonymousOptions, controlPlaneRequest(http.MethodOptions, "/api/v1/applications", nil, nil))
+	if anonymousOptions.Code != http.StatusUnauthorized {
+		t.Fatalf("anonymous OPTIONS bypassed session: %d %s", anonymousOptions.Code, anonymousOptions.Body.String())
 	}
 }
 

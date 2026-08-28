@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+m3_test_admin_password=${OPEN_CARD_M3_TEST_ADMIN_PASSWORD:-}
+export -n OPEN_CARD_M3_TEST_ADMIN_PASSWORD
+
 task_prefix=opencard-mvp-fa8f8eab
 domain=opencard-mvp-fa8f8eab-build-worker-01
 evidence=/var/lib/opencard-mvp-fa8f8eab/evidence/m3-real
@@ -20,12 +23,15 @@ old_port=$port_base
 api_port=$((port_base + 1))
 new_port=$((port_base + 2))
 failed_observation_port=$((port_base + 3))
+m3_auth_tmp_dir=
+m3_auth_curl_config=
 
 test "$(id -u)" -eq 0
 test "$(cat /etc/opencard-mvp-fa8f8eab-clean-worker)" = "$domain"
 set -a
 source /etc/open-card/server.env
 set +a
+export -n OPEN_CARD_M3_TEST_ADMIN_PASSWORD
 database_url=${OPEN_CARD_DATABASE_URL:?}
 test "${OPEN_CARD_M3_ENABLED:-}" = true
 test "${OPEN_CARD_CADDY_ADMIN_URL:-}" = http://127.0.0.1:2019
@@ -38,6 +44,7 @@ chown opencard:opencard "$work"
 
 cleanup() {
   set +e
+  m3_auth_cleanup
   for pid in "${backend_pids[@]:-}"; do kill "$pid" >/dev/null 2>&1 || true; done
   wait >/dev/null 2>&1 || true
   if [[ -n "$negative_iface" ]]; then ip addr del "$negative_address" dev "$negative_iface" >/dev/null 2>&1 || true; fi
@@ -48,6 +55,52 @@ cleanup() {
   rm -rf -- "$work"
 }
 trap cleanup EXIT INT TERM
+
+m3_authenticate() {
+  local origin=${OPEN_CARD_AUTH_ORIGIN:?OPEN_CARD_AUTH_ORIGIN is required for M3 control-plane authentication}
+  local password=${m3_test_admin_password:?OPEN_CARD_M3_TEST_ADMIN_PASSWORD is required for task-local login}
+  unset m3_test_admin_password
+  m3_auth_tmp_dir=$(mktemp -d "/tmp/${task_prefix}-m3-auth.XXXXXX")
+  [[ ! -L "$m3_auth_tmp_dir" ]] || { echo "M3 authentication directory must not be a symlink" >&2; return 78; }
+  chmod 0700 "$m3_auth_tmp_dir"
+  local headers payload response session csrf
+  headers=$(mktemp "$m3_auth_tmp_dir/auth-login.headers.XXXXXX")
+  payload=$(mktemp "$m3_auth_tmp_dir/auth-login-request.XXXXXX")
+  response=$(mktemp "$m3_auth_tmp_dir/auth-login-response.XXXXXX")
+  printf '%s' "$password" | python3 -c 'import json, sys; print(json.dumps({"password": sys.stdin.read()}, separators=(",", ":")))' >"$payload"
+  unset password
+  chmod 0600 "$payload"
+  (umask 077; command curl -fsS -D "$headers" -o "$response" -H 'Content-Type: application/json' -H "Origin: $origin" --data-binary "@$payload" "$api/api/v1/auth/login")
+  session=$(awk 'BEGIN { IGNORECASE=1 } /^Set-Cookie: __Host-open_card_session=/ { value=$0; sub(/^[^=]*=/,"",value); sub(/;.*/,"",value); gsub(/\r/,"",value); print value; exit }' "$headers")
+  csrf=$(awk 'BEGIN { IGNORECASE=1 } /^Set-Cookie: __Host-open_card_csrf=/ { value=$0; sub(/^[^=]*=/,"",value); sub(/;.*/,"",value); gsub(/\r/,"",value); print value; exit }' "$headers")
+  [[ "$session" =~ ^[A-Za-z0-9_-]{43}$ && "$csrf" =~ ^[A-Za-z0-9_-]{43}$ ]] || { echo "M3 control-plane authentication is missing or malformed" >&2; return 78; }
+  m3_auth_curl_config=$(mktemp "$m3_auth_tmp_dir/auth-control-plane.XXXXXX")
+  (umask 077; {
+    printf 'header = "Cookie: __Host-open_card_session=%s; __Host-open_card_csrf=%s"\n' "$session" "$csrf"
+    printf 'header = "X-Open-Card-CSRF: %s"\n' "$csrf"
+  } >"$m3_auth_curl_config")
+  rm -f -- "$headers" "$payload" "$response"
+  unset session csrf
+}
+
+m3_auth_cleanup() {
+  if [[ -n "${m3_auth_tmp_dir:-}" && "$m3_auth_tmp_dir" == "/tmp/${task_prefix}-m3-auth."* && -d "$m3_auth_tmp_dir" && ! -L "$m3_auth_tmp_dir" ]]; then
+    rm -rf -- "$m3_auth_tmp_dir"
+  fi
+  unset m3_auth_curl_config m3_auth_tmp_dir
+}
+
+curl() {
+  local argument
+  for argument in "$@"; do
+    if [[ "$argument" == "$api/"* ]]; then
+      [[ -r "${m3_auth_curl_config:-}" ]] || { echo "M3 control-plane call attempted before authentication" >&2; return 78; }
+      command curl --config "$m3_auth_curl_config" -H "Origin: $OPEN_CARD_AUTH_ORIGIN" "$@"
+      return
+    fi
+  done
+  command curl "$@"
+}
 
 request_json() {
   local method=$1 path=$2 body=$3 output=$4 key=$5
@@ -104,6 +157,7 @@ json.dump({
 PY
 }
 
+m3_authenticate
 wait_ready
 for service in open-card-server open-card-caddy postgresql; do test "$(systemctl is-active "$service")" = active; done
 snapshot "$evidence/objects-before.json"

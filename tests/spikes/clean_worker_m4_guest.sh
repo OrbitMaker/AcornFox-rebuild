@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+m4_test_admin_password=${OPEN_CARD_M4_TEST_ADMIN_PASSWORD:-}
+export -n OPEN_CARD_M4_TEST_ADMIN_PASSWORD
+
 # M4 clean-worker acceptance starts a real M2 ServiceGroup through public API,
 # then exercises the M4 controller/Agent/observation/webhook path.  It is not
 # a synthetic DB-success fixture: SQL below is read-only except for the normal
@@ -27,7 +30,9 @@ source_archive=
 host_entry_added=0
 registry_script=
 phase_restart_pids=()
-m4_admin_session=
+m4_auth_tmp_dir=
+m4_auth_curl_config=
+m4_auth_password_file=
 
 # This runner is the checked-in M4 contract surface.  A canonical VM run may
 # execute the helpers below, but this source revision deliberately never
@@ -42,6 +47,7 @@ test "$(cat /etc/opencard-mvp-fa8f8eab-clean-worker)" = "$domain"
 set -a
 source /etc/open-card/server.env
 set +a
+export -n OPEN_CARD_M4_TEST_ADMIN_PASSWORD
 test "${OPEN_CARD_M4_ENABLED:-}" = true
 test "${OPEN_CARD_M4_ALLOW_LOOPBACK_WEBHOOK_FIXTURE:-}" = true
 test "$(readlink /opt/open-card/current)" = "releases/${OPEN_CARD_M4_EXPECTED_RELEASE:-release-0.4.0}"
@@ -53,23 +59,41 @@ test "$registry_endpoint" = "http://127.0.0.1:$registry_port"
 test -x "$secretctl" -a -x "$static"
 
 m4_authenticate() {
-  if [[ -n "${OPEN_CARD_M4_AUTH_SESSION:-}" ]]; then
-    m4_admin_session=$OPEN_CARD_M4_AUTH_SESSION
-  else
-    local origin=${OPEN_CARD_AUTH_ORIGIN:?OPEN_CARD_AUTH_ORIGIN is required for M4 control-plane authentication}
-    : "${OPEN_CARD_M4_TEST_ADMIN_PASSWORD:?OPEN_CARD_M4_TEST_ADMIN_PASSWORD is required when no task-local session is supplied}"
-    local login_headers="$work/auth-login.headers" login_payload
-    login_payload=$(python3 - <<'PY'
-import json, os
-print(json.dumps({"password": os.environ["OPEN_CARD_M4_TEST_ADMIN_PASSWORD"]}, separators=(",", ":")))
-PY
-)
-    (umask 077; command curl -fsS -D "$login_headers" -o "$work/auth-login.json" -H 'Content-Type: application/json' -H "Origin: $origin" --data "$login_payload" "$api/api/v1/auth/login")
-    m4_admin_session=$(awk 'BEGIN { IGNORECASE=1 } /^Set-Cookie: __Host-open_card_session=/ { value=$0; sub(/^[^=]*=/,"",value); sub(/;.*/,"",value); gsub(/\r/,"",value); print value; exit }' "$login_headers")
-    rm -f -- "$login_headers" "$work/auth-login.json"
+  local origin=${OPEN_CARD_AUTH_ORIGIN:?OPEN_CARD_AUTH_ORIGIN is required for M4 control-plane authentication}
+  local password=${m4_test_admin_password:?OPEN_CARD_M4_TEST_ADMIN_PASSWORD is required for task-local login}
+  unset m4_test_admin_password
+  m4_auth_tmp_dir=$(mktemp -d "/tmp/${task_prefix}-m4-auth.XXXXXX")
+  [[ ! -L "$m4_auth_tmp_dir" ]] || { echo "M4 authentication directory must not be a symlink" >&2; return 78; }
+  chmod 0700 "$m4_auth_tmp_dir"
+  local login_headers login_payload login_response session csrf
+  login_headers=$(mktemp "$m4_auth_tmp_dir/auth-login.headers.XXXXXX")
+  login_payload=$(mktemp "$m4_auth_tmp_dir/auth-login-request.XXXXXX")
+  login_response=$(mktemp "$m4_auth_tmp_dir/auth-login-response.XXXXXX")
+  m4_auth_password_file=$(mktemp "$m4_auth_tmp_dir/admin-password.XXXXXX")
+  chmod 0600 "$m4_auth_password_file"
+  printf '%s' "$password" >"$m4_auth_password_file"
+  unset password
+  printf '%s' "$(<"$m4_auth_password_file")" | python3 -c 'import json, sys; print(json.dumps({"password": sys.stdin.read()}, separators=(",", ":")))' >"$login_payload"
+  chmod 0600 "$login_payload"
+  (umask 077; command curl -fsS -D "$login_headers" -o "$login_response" -H 'Content-Type: application/json' -H "Origin: $origin" --data-binary "@$login_payload" "$api/api/v1/auth/login")
+  session=$(awk 'BEGIN { IGNORECASE=1 } /^Set-Cookie: __Host-open_card_session=/ { value=$0; sub(/^[^=]*=/,"",value); sub(/;.*/,"",value); gsub(/\r/,"",value); print value; exit }' "$login_headers")
+  csrf=$(awk 'BEGIN { IGNORECASE=1 } /^Set-Cookie: __Host-open_card_csrf=/ { value=$0; sub(/^[^=]*=/,"",value); sub(/;.*/,"",value); gsub(/\r/,"",value); print value; exit }' "$login_headers")
+  [[ "$session" =~ ^[A-Za-z0-9_-]{43}$ ]] || { rm -f -- "$login_headers" "$login_payload" "$login_response"; echo "M4 control-plane session is missing or malformed" >&2; return 78; }
+  [[ "$csrf" =~ ^[A-Za-z0-9_-]{43}$ ]] || { rm -f -- "$login_headers" "$login_payload" "$login_response"; echo "M4 control-plane CSRF value is missing or malformed" >&2; return 78; }
+  m4_auth_curl_config=$(mktemp "$m4_auth_tmp_dir/auth-control-plane.XXXXXX")
+  (umask 077; {
+    printf 'header = "Cookie: __Host-open_card_session=%s; __Host-open_card_csrf=%s"\n' "$session" "$csrf"
+    printf 'header = "X-Open-Card-CSRF: %s"\n' "$csrf"
+  } >"$m4_auth_curl_config")
+  rm -f -- "$login_headers" "$login_payload" "$login_response"
+  unset session csrf
+}
+
+m4_auth_cleanup() {
+  if [[ -n "${m4_auth_tmp_dir:-}" && "$m4_auth_tmp_dir" == "/tmp/${task_prefix}-m4-auth."* && -d "$m4_auth_tmp_dir" && ! -L "$m4_auth_tmp_dir" ]]; then
+    rm -rf -- "$m4_auth_tmp_dir"
   fi
-  [[ "$m4_admin_session" =~ ^[A-Za-z0-9_-]{43}$ ]] || { echo "M4 control-plane session is missing or malformed" >&2; return 78; }
-  OPEN_CARD_M4_AUTH_SESSION=$m4_admin_session
+  unset m4_auth_curl_config m4_auth_password_file m4_auth_tmp_dir
 }
 
 # All task control-plane calls acquire identity from this single session. The
@@ -78,8 +102,8 @@ curl() {
   local argument
   for argument in "$@"; do
     if [[ "$argument" == "$api/"* ]]; then
-      [[ -n "$m4_admin_session" ]] || { echo "M4 control-plane call attempted before authentication" >&2; return 78; }
-      command curl -H "Cookie: __Host-open_card_session=$m4_admin_session" "$@"
+      [[ -r "${m4_auth_curl_config:-}" ]] || { echo "M4 control-plane call attempted before authentication" >&2; return 78; }
+      command curl --config "$m4_auth_curl_config" -H "Origin: $OPEN_CARD_AUTH_ORIGIN" "$@"
       return
     fi
   done
@@ -90,10 +114,12 @@ for service in open-card-server open-card-agent docker postgresql; do test "$(sy
 rm -rf -- "$evidence" "$work"
 install -d -m 0750 "$evidence" "$work"
 chown opencard:opencard "$work"
+trap m4_auth_cleanup EXIT INT TERM
 m4_authenticate
 
 cleanup() {
   set +e
+  m4_auth_cleanup
   for watcher in "${phase_restart_pids[@]:-}"; do
     [[ -n "$watcher" ]] && kill "$watcher" >/dev/null 2>&1 || true
   done
@@ -912,7 +938,7 @@ runtime_stream=$(basename "$(dirname "$runtime_log_path")")
 test "$(find "$OPEN_CARD_LOG_ROOT/runtime/$runtime_stream" -maxdepth 1 -type f -name 'segment-*.log' | wc -l)" -ge 2
 env \
   M4_LOG_GATE_EXECUTE=1 \
-  OPEN_CARD_M4_AUTH_SESSION="$m4_admin_session" \
+  M4_AUTH_PASSWORD_FILE="$m4_auth_password_file" \
   M4_LOG_GATE_API="$api" \
   M4_LOG_GATE_EVIDENCE="$evidence/log-gates" \
   M4_LOG_GATE_WORK="$work/log-gates" \
@@ -1041,6 +1067,7 @@ cp "$evidence/webhook-ledger-retry.txt" "$evidence/webhook-ledger.txt"
 # including durable retry across the embedded worker/control-plane restart.
 env \
   OPEN_CARD_M4_WEBHOOK_LIFECYCLE_EXECUTE=1 \
+  M4_AUTH_PASSWORD_FILE="$m4_auth_password_file" \
   OPEN_CARD_M4_API_BASE_URL="$api" \
   OPEN_CARD_M4_WEBHOOK_APPLICATION_ID="$app" \
   OPEN_CARD_M4_WEBHOOK_EVIDENCE_DIR="$evidence/webhook-lifecycle" \

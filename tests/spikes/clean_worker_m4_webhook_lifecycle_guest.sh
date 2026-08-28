@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+m4_test_admin_password=${OPEN_CARD_M4_TEST_ADMIN_PASSWORD:-}
+export -n OPEN_CARD_M4_TEST_ADMIN_PASSWORD
+
 # M4 webhook lifecycle guest contract.  This helper is intentionally narrow:
 # it consumes an already-installed task VM, configures one task-local HTTPS
 # receiver, drives an existing operator redeploy API through the task-local
@@ -29,7 +32,8 @@ m4_gate=NOT_CLAIMED
 receiver_pid=
 host_entry_added=0
 request_pid=
-m4_admin_session=
+m4_auth_tmp_dir=
+m4_auth_curl_config=
 
 case "$api" in
   http://127.0.0.1:*|https://127.0.0.1:*) ;;
@@ -62,41 +66,63 @@ rm -rf -- "$work" "$evidence"
 install -d -m 0750 "$work" "$evidence"
 
 m4_authenticate() {
-  if [[ -n "${OPEN_CARD_M4_AUTH_SESSION:-}" ]]; then
-    m4_admin_session=$OPEN_CARD_M4_AUTH_SESSION
-  else
-    local origin=${OPEN_CARD_AUTH_ORIGIN:?OPEN_CARD_AUTH_ORIGIN is required for M4 control-plane authentication}
-    : "${OPEN_CARD_M4_TEST_ADMIN_PASSWORD:?OPEN_CARD_M4_TEST_ADMIN_PASSWORD is required when no task-local session is supplied}"
-    local login_headers="$work/auth-login.headers" login_payload
-    login_payload=$(python3 - <<'PY'
-import json, os
-print(json.dumps({"password": os.environ["OPEN_CARD_M4_TEST_ADMIN_PASSWORD"]}, separators=(",", ":")))
-PY
-)
-    (umask 077; command curl -fsS -D "$login_headers" -o "$work/auth-login.json" -H 'Content-Type: application/json' -H "Origin: $origin" --data "$login_payload" "$api/api/v1/auth/login")
-    m4_admin_session=$(awk 'BEGIN { IGNORECASE=1 } /^Set-Cookie: __Host-open_card_session=/ { value=$0; sub(/^[^=]*=/,"",value); sub(/;.*/,"",value); gsub(/\r/,"",value); print value; exit }' "$login_headers")
-    rm -f -- "$login_headers" "$work/auth-login.json"
+  local origin=${OPEN_CARD_AUTH_ORIGIN:?OPEN_CARD_AUTH_ORIGIN is required for M4 control-plane authentication}
+  local password=$m4_test_admin_password
+  unset m4_test_admin_password
+  if [[ -n "${M4_AUTH_PASSWORD_FILE:-}" ]]; then
+    [[ "$M4_AUTH_PASSWORD_FILE" == "/tmp/${task_prefix}-m4-auth."*/admin-password.* && -f "$M4_AUTH_PASSWORD_FILE" && ! -L "$M4_AUTH_PASSWORD_FILE" && "$(stat -c '%u:%a' "$M4_AUTH_PASSWORD_FILE")" = 0:600 ]] || { echo "M4 authentication password file is invalid" >&2; return 78; }
+    password=$(<"$M4_AUTH_PASSWORD_FILE")
   fi
-  [[ "$m4_admin_session" =~ ^[A-Za-z0-9_-]{43}$ ]] || { echo "M4 control-plane session is missing or malformed" >&2; return 78; }
-  OPEN_CARD_M4_AUTH_SESSION=$m4_admin_session
+  : "${password:?OPEN_CARD_M4_TEST_ADMIN_PASSWORD or M4_AUTH_PASSWORD_FILE is required for task-local login}"
+  m4_auth_tmp_dir=$(mktemp -d "/tmp/${task_prefix}-m4-webhook-auth.XXXXXX")
+  [[ ! -L "$m4_auth_tmp_dir" ]] || { echo "M4 webhook authentication directory must not be a symlink" >&2; return 78; }
+  chmod 0700 "$m4_auth_tmp_dir"
+  local login_headers login_payload login_response session csrf
+  login_headers=$(mktemp "$m4_auth_tmp_dir/auth-login.headers.XXXXXX")
+  login_payload=$(mktemp "$m4_auth_tmp_dir/auth-login-request.XXXXXX")
+  login_response=$(mktemp "$m4_auth_tmp_dir/auth-login-response.XXXXXX")
+  printf '%s' "$password" | python3 -c 'import json, sys; print(json.dumps({"password": sys.stdin.read()}, separators=(",", ":")))' >"$login_payload"
+  unset password
+  chmod 0600 "$login_payload"
+  (umask 077; command curl -fsS -D "$login_headers" -o "$login_response" -H 'Content-Type: application/json' -H "Origin: $origin" --data-binary "@$login_payload" "$api/api/v1/auth/login")
+  session=$(awk 'BEGIN { IGNORECASE=1 } /^Set-Cookie: __Host-open_card_session=/ { value=$0; sub(/^[^=]*=/,"",value); sub(/;.*/,"",value); gsub(/\r/,"",value); print value; exit }' "$login_headers")
+  csrf=$(awk 'BEGIN { IGNORECASE=1 } /^Set-Cookie: __Host-open_card_csrf=/ { value=$0; sub(/^[^=]*=/,"",value); sub(/;.*/,"",value); gsub(/\r/,"",value); print value; exit }' "$login_headers")
+  [[ "$session" =~ ^[A-Za-z0-9_-]{43}$ ]] || { rm -f -- "$login_headers" "$login_payload" "$login_response"; echo "M4 control-plane session is missing or malformed" >&2; return 78; }
+  [[ "$csrf" =~ ^[A-Za-z0-9_-]{43}$ ]] || { rm -f -- "$login_headers" "$login_payload" "$login_response"; echo "M4 control-plane CSRF value is missing or malformed" >&2; return 78; }
+  m4_auth_curl_config=$(mktemp "$m4_auth_tmp_dir/auth-control-plane.XXXXXX")
+  (umask 077; {
+    printf 'header = "Cookie: __Host-open_card_session=%s; __Host-open_card_csrf=%s"\n' "$session" "$csrf"
+    printf 'header = "X-Open-Card-CSRF: %s"\n' "$csrf"
+  } >"$m4_auth_curl_config")
+  rm -f -- "$login_headers" "$login_payload" "$login_response"
+  unset session csrf
+}
+
+m4_auth_cleanup() {
+  if [[ -n "${m4_auth_tmp_dir:-}" && "$m4_auth_tmp_dir" == "/tmp/${task_prefix}-m4-webhook-auth."* && -d "$m4_auth_tmp_dir" && ! -L "$m4_auth_tmp_dir" ]]; then
+    rm -rf -- "$m4_auth_tmp_dir"
+  fi
+  unset m4_auth_curl_config m4_auth_tmp_dir
 }
 
 curl() {
   local argument
   for argument in "$@"; do
     if [[ "$argument" == "$api/"* ]]; then
-      [[ -n "$m4_admin_session" ]] || { echo "M4 control-plane call attempted before authentication" >&2; return 78; }
-      command curl -H "Cookie: __Host-open_card_session=$m4_admin_session" "$@"
+      [[ -r "${m4_auth_curl_config:-}" ]] || { echo "M4 control-plane call attempted before authentication" >&2; return 78; }
+      command curl --config "$m4_auth_curl_config" -H "Origin: $OPEN_CARD_AUTH_ORIGIN" "$@"
       return
     fi
   done
   command curl "$@"
 }
 
+trap m4_auth_cleanup EXIT INT TERM
 m4_authenticate
 
 cleanup() {
   set +e
+  m4_auth_cleanup
   [[ -n "$request_pid" ]] && kill "$request_pid" >/dev/null 2>&1 || true
   [[ -n "$receiver_pid" ]] && kill "$receiver_pid" >/dev/null 2>&1 || true
   wait >/dev/null 2>&1 || true

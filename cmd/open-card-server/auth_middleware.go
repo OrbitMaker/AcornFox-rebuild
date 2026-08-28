@@ -44,10 +44,20 @@ func (s *Server) authenticateControlPlane(writer http.ResponseWriter, request *h
 		authHTTPError(writer, http.StatusServiceUnavailable, "authentication unavailable")
 		return nil, false
 	}
-	_, session, err := s.auth.Service.Session(request.Context(), authCookie(request, authSessionCookie))
+	var session domain.AdminSession
+	var err error
+	if controlPlaneUnsafeMethod(request.Method) {
+		session, err = s.auth.Service.AuthorizeControlPlaneWrite(request.Context(), request.Header.Get("Origin"), authCookie(request, authSessionCookie), authCSRF(request))
+	} else {
+		_, session, err = s.auth.Service.Session(request.Context(), authCookie(request, authSessionCookie))
+	}
 	if err != nil {
 		if errors.Is(err, auth.ErrAuthenticationUnavailable) {
 			authHTTPError(writer, http.StatusServiceUnavailable, "authentication unavailable")
+			return nil, false
+		}
+		if errors.Is(err, auth.ErrOriginDenied) || errors.Is(err, auth.ErrCSRFInvalid) {
+			authHTTPError(writer, http.StatusUnauthorized, "authentication failed")
 			return nil, false
 		}
 		clearAuthCookies(writer)
@@ -55,6 +65,15 @@ func (s *Server) authenticateControlPlane(writer http.ResponseWriter, request *h
 		return nil, false
 	}
 	return withControlPlaneIdentity(request, session.AdminID), true
+}
+
+func controlPlaneUnsafeMethod(method string) bool {
+	switch method {
+	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+		return true
+	default:
+		return false
+	}
 }
 
 func isAuthRoute(path string) bool { return strings.HasPrefix(path, authAPIBase) }

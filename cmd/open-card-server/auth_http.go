@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"io"
@@ -150,7 +151,7 @@ func authCookie(request *http.Request, name string) string {
 func authCSRF(request *http.Request) string {
 	cookie := authCookie(request, authCSRFCookie)
 	header := request.Header.Get(authCSRFHeader)
-	if cookie == "" || header == "" || cookie != header {
+	if cookie == "" || header == "" || subtle.ConstantTimeCompare([]byte(cookie), []byte(header)) != 1 {
 		return ""
 	}
 	return header

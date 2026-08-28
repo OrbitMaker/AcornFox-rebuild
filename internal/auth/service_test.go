@@ -181,6 +181,40 @@ func TestLoginRateLimitSessionCSRFAndPasswordRotation(t *testing.T) {
 	}
 }
 
+func TestAuthorizeControlPlaneWriteOrdersSessionBeforeOriginAndBindsCSRF(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	store := &memoryStore{}
+	service := newTestService(t, store, &now)
+	password := "correct horse battery staple 123"
+	seedCredential(t, service, store, password, now)
+	first, err := service.Login(context.Background(), "https://console.example.test", password, "127.0.0.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := service.Login(context.Background(), "https://console.example.test", password, "127.0.0.2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.AuthorizeControlPlaneWrite(context.Background(), "https://console.example.test", first.SessionToken, first.CSRFTok); err != nil {
+		t.Fatalf("valid write authorization failed: %v", err)
+	}
+	for _, input := range []struct {
+		name, origin, session, csrf string
+		want                        error
+	}{
+		{name: "missing session is not origin detail", origin: "https://other.example.test", want: ErrAuthenticationFailed},
+		{name: "wrong origin", origin: "https://other.example.test", session: first.SessionToken, csrf: first.CSRFTok, want: ErrOriginDenied},
+		{name: "missing csrf", origin: "https://console.example.test", session: first.SessionToken, want: ErrCSRFInvalid},
+		{name: "cross session csrf", origin: "https://console.example.test", session: first.SessionToken, csrf: second.CSRFTok, want: ErrCSRFInvalid},
+	} {
+		t.Run(input.name, func(t *testing.T) {
+			if _, err := service.AuthorizeControlPlaneWrite(context.Background(), input.origin, input.session, input.csrf); !errors.Is(err, input.want) {
+				t.Fatalf("error=%v want=%v", err, input.want)
+			}
+		})
+	}
+}
+
 func TestProductionPBKDF2FloorCompletesUnderOneSecond(t *testing.T) {
 	service, err := NewService(Config{Store: &memoryStore{}, Origin: "https://console.example.test"})
 	if err != nil {
@@ -242,6 +276,9 @@ func TestAuthServiceOnTaskScopedPostgres(t *testing.T) {
 	login, err := service.Login(ctx, "https://console.example.test", "postgres correct horse battery staple 123", "127.0.0.1")
 	if err != nil {
 		t.Fatal(err)
+	}
+	if _, err := service.AuthorizeControlPlaneWrite(ctx, "https://console.example.test", login.SessionToken, login.CSRFTok); err != nil {
+		t.Fatalf("persistent control-plane write authorization failed: %v", err)
 	}
 	if err := service.ChangePassword(ctx, "https://console.example.test", login.SessionToken, login.CSRFTok, "postgres correct horse battery staple 123", "postgres rotated correct horse battery 456"); err != nil {
 		t.Fatal(err)

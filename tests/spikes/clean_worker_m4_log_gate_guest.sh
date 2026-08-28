@@ -9,6 +9,9 @@
 
 set -euo pipefail
 
+m4_log_test_admin_password=${OPEN_CARD_M4_TEST_ADMIN_PASSWORD:-}
+export -n OPEN_CARD_M4_TEST_ADMIN_PASSWORD
+
 m4_log_gate_die() { echo "m4 log gate: $*" >&2; return 78; }
 
 m4_log_gate_require() {
@@ -65,9 +68,48 @@ m4_log_gate_assert_loopback_url() {
 }
 
 m4_log_gate_control_curl() {
-  local session=${OPEN_CARD_M4_AUTH_SESSION:?OPEN_CARD_M4_AUTH_SESSION is required for M4 log-gate control-plane calls}
-  [[ "$session" =~ ^[A-Za-z0-9_-]{43}$ ]] || m4_log_gate_die "M4 log-gate session is malformed"
-  command curl -H "Cookie: __Host-open_card_session=$session" "$@"
+  [[ -r "${m4_log_auth_curl_config:-}" ]] || m4_log_gate_die "M4 log-gate task-local authentication is unavailable"
+  command curl --config "$m4_log_auth_curl_config" -H "Origin: $OPEN_CARD_AUTH_ORIGIN" "$@"
+}
+
+m4_log_gate_authenticate() {
+  local origin=${OPEN_CARD_AUTH_ORIGIN:?OPEN_CARD_AUTH_ORIGIN is required for M4 log-gate authentication}
+  local password=$m4_log_test_admin_password
+  unset m4_log_test_admin_password
+  if [[ -n "${M4_AUTH_PASSWORD_FILE:-}" ]]; then
+    [[ "$M4_AUTH_PASSWORD_FILE" == "/tmp/${M4_LOG_GATE_TASK_PREFIX}-m4-auth."*/admin-password.* && -f "$M4_AUTH_PASSWORD_FILE" && ! -L "$M4_AUTH_PASSWORD_FILE" && "$(stat -c '%u:%a' "$M4_AUTH_PASSWORD_FILE")" = 0:600 ]] || { m4_log_gate_die "M4 log-gate authentication password file is invalid"; return; }
+    password=$(<"$M4_AUTH_PASSWORD_FILE")
+  fi
+  : "${password:?OPEN_CARD_M4_TEST_ADMIN_PASSWORD or M4_AUTH_PASSWORD_FILE is required for task-local login}"
+  m4_log_auth_tmp_dir=$(mktemp -d "/tmp/${M4_LOG_GATE_TASK_PREFIX}-m4-log-auth.XXXXXX")
+  [[ ! -L "$m4_log_auth_tmp_dir" ]] || m4_log_gate_die "M4 log-gate authentication directory must not be a symlink"
+  chmod 0700 "$m4_log_auth_tmp_dir"
+  local headers payload response session csrf
+  headers=$(mktemp "$m4_log_auth_tmp_dir/auth-login.headers.XXXXXX")
+  payload=$(mktemp "$m4_log_auth_tmp_dir/auth-login-request.XXXXXX")
+  response=$(mktemp "$m4_log_auth_tmp_dir/auth-login-response.XXXXXX")
+  printf '%s' "$password" | python3 -c 'import json, sys; print(json.dumps({"password": sys.stdin.read()}, separators=(",", ":")))' >"$payload"
+  unset password
+  chmod 0600 "$payload"
+  (umask 077; command curl -fsS -D "$headers" -o "$response" -H 'Content-Type: application/json' -H "Origin: $origin" --data-binary "@$payload" "$M4_LOG_GATE_API/api/v1/auth/login")
+  session=$(awk 'BEGIN { IGNORECASE=1 } /^Set-Cookie: __Host-open_card_session=/ { value=$0; sub(/^[^=]*=/,"",value); sub(/;.*/,"",value); gsub(/\r/,"",value); print value; exit }' "$headers")
+  csrf=$(awk 'BEGIN { IGNORECASE=1 } /^Set-Cookie: __Host-open_card_csrf=/ { value=$0; sub(/^[^=]*=/,"",value); sub(/;.*/,"",value); gsub(/\r/,"",value); print value; exit }' "$headers")
+  [[ "$session" =~ ^[A-Za-z0-9_-]{43}$ ]] || { rm -f -- "$headers" "$payload" "$response"; m4_log_gate_die "M4 log-gate session is missing or malformed"; return; }
+  [[ "$csrf" =~ ^[A-Za-z0-9_-]{43}$ ]] || { rm -f -- "$headers" "$payload" "$response"; m4_log_gate_die "M4 log-gate CSRF value is missing or malformed"; return; }
+  m4_log_auth_curl_config=$(mktemp "$m4_log_auth_tmp_dir/auth-control-plane.XXXXXX")
+  (umask 077; {
+    printf 'header = "Cookie: __Host-open_card_session=%s; __Host-open_card_csrf=%s"\n' "$session" "$csrf"
+    printf 'header = "X-Open-Card-CSRF: %s"\n' "$csrf"
+  } >"$m4_log_auth_curl_config")
+  rm -f -- "$headers" "$payload" "$response"
+  unset session csrf
+}
+
+m4_log_gate_clear_auth_material() {
+  if [[ -n "${m4_log_auth_tmp_dir:-}" && "$m4_log_auth_tmp_dir" == "/tmp/${M4_LOG_GATE_TASK_PREFIX:-}-m4-log-auth."* && -d "$m4_log_auth_tmp_dir" && ! -L "$m4_log_auth_tmp_dir" ]]; then
+    rm -rf -- "$m4_log_auth_tmp_dir"
+  fi
+  unset m4_log_auth_curl_config m4_log_auth_tmp_dir
 }
 
 m4_log_gate_assert_no_ai() {
@@ -93,6 +135,7 @@ m4_log_gate_require_context() {
   m4_log_gate_assert_no_ai
   m4_log_gate_safe_component "${M4_LOG_GATE_RUN_ID:-log-gate}"
   mkdir -p -m 0750 "$M4_LOG_GATE_EVIDENCE" "$M4_LOG_GATE_WORK"
+  m4_log_gate_authenticate
 }
 
 # LOG-002 is deliberately a public-API execution, not an INSERT fixture.  One
@@ -290,6 +333,7 @@ PY
 }
 
 run_m4_log_gate_guest() {
+  trap m4_log_gate_clear_auth_material EXIT INT TERM
   m4_log_gate_require_context
   m4_log_gate_capture_audit_before
   m4_log_gate_reject_sensitive_runtime_literal
