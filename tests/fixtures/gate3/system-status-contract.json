@@ -1,0 +1,7 @@
+{
+  "operation": "GET /api/v1/settings/system-status",
+  "handler_status": "implemented",
+  "required": ["version", "node", "platform_domain", "webhooks", "backup", "alerts"],
+  "forbidden": ["url", "secret", "credential", "backup_ready", "alerts_ready"],
+  "not_installed": ["backup", "alerts"]
+}

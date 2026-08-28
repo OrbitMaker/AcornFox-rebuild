@@ -61,6 +61,8 @@ func main() {
 		}()
 		server = NewServerWithRepository(store)
 		controllerStore = store
+		server.SetSystemStatusStore(store)
+		server.SetSystemStatusNode(os.Getenv("OPEN_CARD_AGENT_DISPATCH_INSTANCE_ID"), os.Getenv("OPEN_CARD_AGENT_DISPATCH_NODE_ID"))
 		origin := strings.TrimSpace(os.Getenv("OPEN_CARD_AUTH_ORIGIN"))
 		if origin != "" {
 			authService, authErr := auth.NewService(auth.Config{Store: store, Origin: origin})

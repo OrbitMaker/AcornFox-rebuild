@@ -180,6 +180,21 @@ paths:
               $ref: '#/components/headers/APINegotiatedVersion'
         '426':
           $ref: '#/components/responses/APIUpgradeRequired'
+  /api/v1/settings/system-status:
+    get:
+      operationId: getSystemStatus
+      x-open-card-handler-status: implemented
+      description: >-
+        Authenticated read-only system settings status. It exposes no provider
+        credentials, webhook URLs, secret references, or configuration writes.
+      responses:
+        '200':
+          description: Current system status.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/SystemStatus'}
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '503': {$ref: '#/components/responses/DependencyUnavailable'}
   # G3 UI-facing access contracts. These endpoints deliberately do not expose
   # M3 workflow inputs; handler implementation is deferred to later G3 work.
   /api/v1/settings/platform-domain:
@@ -1239,6 +1254,45 @@ components:
         kind: {type: string, enum: [git]}
         repository_url: {type: string, format: uri}
         ref: {type: string, minLength: 1}
+    SystemStatus:
+      type: object
+      additionalProperties: false
+      required: [version, node, platform_domain, webhooks, backup, alerts]
+      properties:
+        version: {type: string}
+        node:
+          type: object
+          additionalProperties: false
+          required: [single_node, instance_id, node_id, readiness]
+          properties:
+            single_node: {type: boolean, enum: [true]}
+            instance_id: {type: string, nullable: true}
+            node_id: {type: string, nullable: true}
+            readiness: {type: string, enum: [ready, not_ready, unconfigured]}
+        platform_domain:
+          type: object
+          additionalProperties: false
+          required: [status, base_domain]
+          properties:
+            status: {type: string, enum: [unconfigured, pending, failed, ready]}
+            base_domain: {type: string, nullable: true}
+        webhooks:
+          type: object
+          additionalProperties: false
+          required: [status, enabled_count]
+          properties:
+            status: {type: string, enum: [configured, unconfigured]}
+            enabled_count: {type: integer, minimum: 0}
+        backup:
+          type: object
+          additionalProperties: false
+          required: [status]
+          properties: {status: {type: string, enum: [not_installed]}}
+        alerts:
+          type: object
+          additionalProperties: false
+          required: [status]
+          properties: {status: {type: string, enum: [not_installed]}}
     ServiceGroupRegistryInput:
       type: object
       additionalProperties: false

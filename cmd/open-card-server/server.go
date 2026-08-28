@@ -84,25 +84,28 @@ type Server struct {
 		GetDeploymentOperationID(context.Context, domain.ID) (domain.ID, error)
 		ListM2ReleaseVolumeClaims(context.Context, domain.ID) ([]postgres.M2ServiceGroupVolumeClaim, error)
 	}
-	m2Registry       contracts.RegistryImageProvider
-	m2UploadRoot     string
-	m2TaskPrefix     string
-	m2AgentInstance  string
-	m2AgentNode      string
-	m2Lifecycle      *M2LifecycleHandler
-	auth             *AuthHTTPHandler
-	m3Access         *M3AccessHTTPHandler
-	g3Access         *G3AccessHTTPHandler
-	g3SourceUpload   *G3SourceUploadHTTPHandler
-	tlsAllow         *TLSAllowHTTPHandler
-	m4Operations     *M4OperationsHTTPHandler
-	m4Webhooks       *M4WebhookHTTPHandler
-	m4Logs           *M4LogsHTTPHandler
-	m5Usage          *M5UsageHTTPHandler
-	m6AI             *M6AIHTTPHandler
-	broker           *eventBroker
-	agentGateway     *agenttransport.Gateway
-	repositoryHealth interface {
+	m2Registry             contracts.RegistryImageProvider
+	m2UploadRoot           string
+	m2TaskPrefix           string
+	m2AgentInstance        string
+	m2AgentNode            string
+	m2Lifecycle            *M2LifecycleHandler
+	auth                   *AuthHTTPHandler
+	m3Access               *M3AccessHTTPHandler
+	g3Access               *G3AccessHTTPHandler
+	g3SourceUpload         *G3SourceUploadHTTPHandler
+	tlsAllow               *TLSAllowHTTPHandler
+	m4Operations           *M4OperationsHTTPHandler
+	m4Webhooks             *M4WebhookHTTPHandler
+	m4Logs                 *M4LogsHTTPHandler
+	m5Usage                *M5UsageHTTPHandler
+	m6AI                   *M6AIHTTPHandler
+	systemStatusStore      systemStatusStore
+	systemStatusInstanceID string
+	systemStatusNodeID     string
+	broker                 *eventBroker
+	agentGateway           *agenttransport.Gateway
+	repositoryHealth       interface {
 		PingContext(context.Context) error
 	}
 	ready  atomic.Bool
@@ -144,8 +147,12 @@ func (s *Server) SetM4Webhooks(handler *M4WebhookHTTPHandler)          { s.m4Web
 func (s *Server) SetM4Logs(handler *M4LogsHTTPHandler)                 { s.m4Logs = handler }
 func (s *Server) SetM5Usage(handler *M5UsageHTTPHandler)               { s.m5Usage = handler }
 func (s *Server) SetM6AI(handler *M6AIHTTPHandler)                     { s.m6AI = handler }
-func (s *Server) Handler() http.Handler                                { return http.HandlerFunc(s.serveHTTP) }
-func (s *Server) AgentGateway() *agenttransport.Gateway                { return s.agentGateway }
+func (s *Server) SetSystemStatusStore(store systemStatusStore)         { s.systemStatusStore = store }
+func (s *Server) SetSystemStatusNode(instanceID, nodeID string) {
+	s.systemStatusInstanceID, s.systemStatusNodeID = instanceID, nodeID
+}
+func (s *Server) Handler() http.Handler                 { return http.HandlerFunc(s.serveHTTP) }
+func (s *Server) AgentGateway() *agenttransport.Gateway { return s.agentGateway }
 func (s *Server) HTTPServer(addr string) *http.Server {
 	return &http.Server{Addr: addr, Handler: s.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 0, IdleTimeout: 60 * time.Second}
 }
@@ -202,6 +209,9 @@ func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
 	switch request.URL.Path {
 	case "/readyz":
 		s.handleHealth(writer, request, true)
+		return
+	case "/api/v1/settings/system-status":
+		s.handleSystemStatus(writer, request)
 		return
 	case "/api/v1/events":
 		s.handleEvents(writer, request, "")
