@@ -24,6 +24,12 @@
     "api_before_spa": true,
     "api_upstream": "127.0.0.1:8080",
     "app_upstream": "127.0.0.1:18481",
+    "application_http_redirect": {
+      "source": "http://",
+      "target": "https://{host}{uri}",
+      "status": 308,
+      "scope": "application_catch_all_only"
+    },
     "tls_allow": "http://127.0.0.1:8080/internal/tls/allow",
     "strip_identity_headers": ["Open-Card-*", "X-Open-Card-*"],
     "trusted_client_source_header": {

@@ -68,6 +68,27 @@ class EdgeConfigContractTests(unittest.TestCase):
         self.assertNotIn("h3", self.caddyfile.lower())
         self.assertNotIn("udp", self.caddyfile.lower())
 
+    def test_application_http_redirect_preserves_host_and_uri_without_proxying(self) -> None:
+        redirect = self.fixture["routes"]["application_http_redirect"]
+        self.assertEqual(
+            redirect,
+            {
+                "source": "http://",
+                "target": "https://{host}{uri}",
+                "status": 308,
+                "scope": "application_catch_all_only",
+            },
+        )
+        redirect_start = self.caddyfile.index("http:// {")
+        https_start = self.caddyfile.index("https:// {")
+        self.assertLess(self.caddyfile.index("console.example.invalid {"), redirect_start)
+        self.assertLess(redirect_start, https_start)
+        redirect_block = self.caddyfile[redirect_start:https_start]
+        self.assertIn("redir https://{host}{uri} permanent", redirect_block)
+        self.assertNotIn("reverse_proxy", redirect_block)
+        self.assertNotIn("tls", redirect_block)
+        self.assertNotIn("ask", redirect_block)
+
     def test_systemd_unit_hardens_edge_and_validates_before_reload(self) -> None:
         for expected in (
             "User=opencard-edge",

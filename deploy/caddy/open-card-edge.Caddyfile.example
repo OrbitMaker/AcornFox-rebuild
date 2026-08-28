@@ -62,6 +62,12 @@ console.example.invalid {
 # Application hosts retain the original Host header. On-demand TLS is gated by
 # the loopback-only allow endpoint above; this template makes no DNS or ACME
 # request until an approved Edge is actually started with real domain facts.
+# Plain HTTP for dynamic application hosts never reaches an application
+# upstream. The HTTPS catch-all below performs TLS admission before proxying.
+http:// {
+	redir https://{host}{uri} permanent
+}
+
 https:// {
 	log {
 		output file {$OPEN_CARD_EDGE_LOG_DIR}/application-access.log
