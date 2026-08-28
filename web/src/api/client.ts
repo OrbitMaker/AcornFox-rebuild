@@ -14,6 +14,7 @@ import type {
   ApplicationUsageResult,
   AIInterventionResult,
   AISettingsResult,
+  CreateApplicationSource,
   CreateApplicationInput,
   CreateApplicationResponse,
   OperationRequestResult,
@@ -256,13 +257,16 @@ function asSourceUpload(value: unknown): SourceUploadResponse {
   if (!isRecord(value)) throw new Error('Source upload response is invalid');
   const kind = value.kind;
   if (kind !== 'archive' && kind !== 'directory') throw new Error('Source upload kind is invalid');
+  const status = value.status;
+  if (status !== 'ready' && status !== 'claimed' && status !== 'expired' && status !== 'failed') throw new Error('Source upload status is invalid');
   if (typeof value.bytes !== 'number' || !Number.isFinite(value.bytes) || value.bytes < 0) throw new Error('Source upload bytes are invalid');
   if (typeof value.file_count !== 'number' || !Number.isInteger(value.file_count) || value.file_count < 1) throw new Error('Source upload file count is invalid');
   const digest = requireString(value.digest, 'upload.digest');
   if (!/^sha256:[0-9a-f]{64}$/.test(digest)) throw new Error('Source upload digest is invalid');
   return {
-    uploadId: requireString(value.upload_id, 'upload.upload_id'),
+    uploadId: requireString(value.id, 'upload.id'),
     kind,
+    status,
     digest,
     bytes: value.bytes,
     fileCount: value.file_count,
@@ -458,7 +462,14 @@ function asCreateApplicationResponse(value: unknown): CreateApplicationResponse 
     // later operation-aware responses can provide operation_id without
     // changing the UI contract.
     operationId: typeof value.operation_id === 'string' ? value.operation_id : `application:${application.id}`,
+    environmentId: typeof value.environment_id === 'string' ? value.environment_id : undefined,
+    sourceRevisionId: typeof value.source_revision_id === 'string' ? value.source_revision_id : undefined,
   };
+}
+
+function createApplicationSourcePayload(source: CreateApplicationSource): Record<string, string> {
+  if (source.kind === 'upload') return { kind: 'upload', upload_id: source.uploadId };
+  return { kind: 'git', repository_url: source.repositoryUrl, ref: source.ref };
 }
 
 function asPublishEvent(value: unknown): PublishEvent {
@@ -800,7 +811,7 @@ export class RestApiClient implements ApiClient {
     const response = await this.request('/applications', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ name: input.name }),
+      body: JSON.stringify({ name: input.name, source: createApplicationSourcePayload(input.source) }),
       signal,
     });
     return asCreateApplicationResponse(await this.json(response, 'Unable to create application'));
@@ -1184,7 +1195,9 @@ export class StubApiClient implements ApiClient {
       id,
       name: input.name,
       slug: input.name.toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || id,
-      source: { ...input.source },
+      source: input.source.kind === 'git'
+        ? { kind: 'git', locator: input.source.repositoryUrl, ref: input.source.ref }
+        : { kind: 'archive', locator: `upload:${input.source.uploadId}` },
       runtimeStatus: 'unknown',
       runtimeReady: false,
       serving: false,

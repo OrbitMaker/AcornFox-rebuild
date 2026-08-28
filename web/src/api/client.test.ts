@@ -84,8 +84,9 @@ function accessFixture() {
 
 function uploadFixture(kind: 'archive' | 'directory' = 'archive') {
   return {
-    upload_id: 'upload-1',
+    id: 'upload-1',
     kind,
+    status: 'ready',
     digest: 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
     bytes: 12,
     file_count: kind === 'archive' ? 1 : 2,
@@ -131,7 +132,7 @@ describe('StubApiClient', () => {
     await client.login({ username: 'admin', password: 'local-demo-password' });
     const created = await client.createApplication({
       name: 'Release Demo',
-      source: { kind: 'git', locator: 'https://git.example.invalid/demo.git', ref: 'main' },
+      source: { kind: 'git', repositoryUrl: 'https://git.example.invalid/demo.git', ref: 'main' },
     });
     const events: string[] = [];
     const unsubscribe = client.subscribeToPublishEvents(created.operationId, (event) => events.push(event.status));
@@ -175,7 +176,7 @@ describe('RestApiClient', () => {
     });
 
     const list = await client.listApplications();
-    const created = await client.createApplication({ name: 'Live App', source: { kind: 'git' } });
+    const created = await client.createApplication({ name: 'Live App', source: { kind: 'git', repositoryUrl: 'https://git.example.test/repo.git', ref: 'main' } });
     const events: string[] = [];
     const unsubscribe = client.subscribeToPublishEvents(created.operationId, (event) => events.push(event.status));
     eventSource.emit(JSON.stringify({ id: 'evt-1', operation_id: created.operationId, application_id: 'app-live', sequence: 1, occurred_at: '2026-08-24T00:00:01.000Z', kind: 'operation.created', status: 'preparing' }));
@@ -189,6 +190,29 @@ describe('RestApiClient', () => {
     expect(eventSource.options?.withCredentials).toBe(true);
     expect(requested.map((request) => request.url)).toEqual(['/api/v1/applications', '/api/v1/applications']);
     expect(requested.every((request) => request.credentials === 'same-origin')).toBe(true);
+  });
+
+  it('sends the upload source union without a folder or archive locator', async () => {
+    let request: RequestInit | undefined;
+    const client = new RestApiClient({
+      baseUrl: '/api/v1',
+      fetchImpl: async (_input, init) => {
+        request = init;
+        return jsonResponse({
+          application: { id: 'app-upload', name: 'Uploaded App', created_at: '2026-08-28T00:00:00Z', updated_at: '2026-08-28T00:00:00Z' },
+          environment_id: 'env-upload',
+          operation_id: 'op-upload',
+          source_revision_id: 'source-upload',
+        }, 201);
+      },
+    });
+
+    await client.createApplication({ name: 'Uploaded App', source: { kind: 'upload', uploadId: 'upload-1' } });
+
+    expect(JSON.parse(String(request?.body))).toEqual({ name: 'Uploaded App', source: { kind: 'upload', upload_id: 'upload-1' } });
+    expect(JSON.stringify(request?.body)).not.toContain('locator');
+    expect(JSON.stringify(request?.body)).not.toContain('folder');
+    expect(JSON.stringify(request?.body)).not.toContain('archive');
   });
 
   it('returns an explicit unavailable M4 facade until the control plane composes operations facts', async () => {

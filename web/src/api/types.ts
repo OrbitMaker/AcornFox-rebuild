@@ -15,6 +15,10 @@ export interface ApplicationSource {
   ref?: string;
 }
 
+export type CreateApplicationSource =
+  | { kind: 'upload'; uploadId: string }
+  | { kind: 'git'; repositoryUrl: string; ref: string };
+
 export interface ApplicationSummary {
   id: string;
   name: string;
@@ -37,7 +41,7 @@ export interface ApplicationSummary {
 
 export interface CreateApplicationInput {
   name: string;
-  source: ApplicationSource;
+  source: CreateApplicationSource;
   branch?: string;
   runtime?: {
     cpuMillicores: number;
@@ -48,6 +52,8 @@ export interface CreateApplicationInput {
 export interface CreateApplicationResponse {
   application: ApplicationSummary;
   operationId: string;
+  environmentId?: string;
+  sourceRevisionId?: string;
 }
 
 export interface ApplicationListResponse {
@@ -160,6 +166,7 @@ export type SourceUploadInput = SourceUploadArchiveInput | SourceUploadDirectory
 export interface SourceUploadResponse {
   uploadId: string;
   kind: 'archive' | 'directory';
+  status: 'ready' | 'claimed' | 'expired' | 'failed';
   digest: string;
   bytes: number;
   fileCount: number;
