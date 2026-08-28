@@ -1,0 +1,9 @@
+{
+  "fixture_id": "gate3-public-dns-verifier-status-matrix-v1",
+  "statuses": ["verified", "pending", "not_found", "mismatch", "timeout", "resolver_error", "conflict", "unknown"],
+  "platform_expected_address": "8.8.8.8",
+  "customer_expected_ingress": "ingress.apps.example.test",
+  "reserved_addresses": ["198.18.0.1", "192.0.2.1", "10.0.0.1", "127.0.0.1", "::1", "2001:db8::1"],
+  "invalid_cname_targets": ["127.0.0.1", "localhost", "éxample.test"],
+  "max_cname_hops": 8
+}
