@@ -13,13 +13,15 @@ import (
 )
 
 type m3MemoryStore struct {
-	mu       sync.Mutex
-	domains  []domain.DomainBinding
-	certs    []domain.CertificateReference
-	routes   []domain.DesiredRoute
-	pointers map[domain.ID]domain.ID
-	switches []domain.TrafficSwitch
-	events   []string
+	mu            sync.Mutex
+	domains       []domain.DomainBinding
+	certs         []domain.CertificateReference
+	routes        []domain.DesiredRoute
+	pointers      map[domain.ID]domain.ID
+	switches      []domain.TrafficSwitch
+	events        []string
+	prepareFailAt int
+	eventErr      error
 }
 
 func (s *m3MemoryStore) PutDomainBinding(_ context.Context, value domain.DomainBinding) error {
@@ -46,16 +48,27 @@ func (s *m3MemoryStore) PutDesiredRoute(_ context.Context, value domain.Route, p
 	s.routes = append(s.routes, domain.DesiredRoute{Route: value, Port: port})
 	return nil
 }
-func (s *m3MemoryStore) PutPreparedDesiredRoute(_ context.Context, _ domain.DomainBinding, value domain.Route, port int) error {
+func (s *m3MemoryStore) PutPreparedDesiredRoutes(_ context.Context, _ domain.DomainBinding, values []M3PreparedRoute) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for index := range s.routes {
-		if s.routes[index].Route.ID == value.ID {
-			s.routes[index] = domain.DesiredRoute{Route: value, Port: port}
-			return nil
+	candidate := append([]domain.DesiredRoute(nil), s.routes...)
+	for valueIndex, value := range values {
+		if s.prepareFailAt >= 0 && valueIndex == s.prepareFailAt {
+			return errors.New("prepared route persistence failed")
+		}
+		replaced := false
+		for index := range candidate {
+			if candidate[index].Route.ID == value.Route.ID {
+				candidate[index] = domain.DesiredRoute{Route: value.Route, Port: value.Port}
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			candidate = append(candidate, domain.DesiredRoute{Route: value.Route, Port: value.Port})
 		}
 	}
-	s.routes = append(s.routes, domain.DesiredRoute{Route: value, Port: port})
+	s.routes = candidate
 	return nil
 }
 func (s *m3MemoryStore) ListDesiredRoutes(context.Context) ([]domain.DesiredRoute, error) {
@@ -81,6 +94,9 @@ func (s *m3MemoryStore) RecordTrafficSwitch(_ context.Context, value domain.Traf
 func (s *m3MemoryStore) AppendAccessEvent(_ context.Context, _ domain.ID, _ string, kind, _ string, _ bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.eventErr != nil {
+		return s.eventErr
+	}
 	s.events = append(s.events, kind)
 	return nil
 }
@@ -161,6 +177,9 @@ func (p *m3RouteProvider) RebuildRoutes(_ context.Context, requests []contracts.
 }
 
 func newM3Controller(routes *m3RouteProvider, store *m3MemoryStore) *M3AccessController {
+	if store.prepareFailAt == 0 {
+		store.prepareFailAt = -1
+	}
 	return &M3AccessController{Routes: routes, Store: store, DNS: m3DNS{}, Certificates: m3Certificates{}, Clock: func() time.Time { return time.Unix(1, 0).UTC() }, Sleep: func(context.Context, time.Duration) error { return nil }}
 }
 
@@ -241,6 +260,26 @@ func TestM3PrepareRoutesUnblocksFirstTLSIssuanceWithoutCallingCaddy(t *testing.T
 		if !route.Route.Serving || route.Route.CertificateRef != certificate.ID.String() {
 			t.Fatalf("same route was not promoted to serving: %#v", route)
 		}
+	}
+}
+
+func TestM3PrepareRoutesIsAtomicAndRetainsFactsWhenAuditAppendFails(t *testing.T) {
+	routes, store := &m3RouteProvider{}, &m3MemoryStore{prepareFailAt: 1}
+	controller := newM3Controller(routes, store)
+	now := time.Unix(1, 0).UTC()
+	binding := domain.DomainBinding{ID: "domain_app", Kind: domain.DomainBindingApplication, ApplicationID: "app_test", Host: "app.example.test", ExpectedCNAME: "target.apps.example.test", Status: domain.DomainReady, CreatedAt: now, UpdatedAt: now}
+	targets := []M3RouteTarget{{ApplicationID: "app_test", DeploymentID: "dep_test", ServiceName: "frontend", Port: 31001, Path: "/", Routable: true}, {ApplicationID: "app_test", DeploymentID: "dep_test", ServiceName: "api", Port: 31002, Path: "/api", Routable: true}}
+	if _, _, err := controller.PrepareDomainRoutes(context.Background(), M3PrepareDomainRouteRequest{Binding: binding, Targets: targets, RuntimeReady: true, IdempotencyKey: "prepare-atomic", Actor: "test"}); err == nil || len(store.routes) != 0 || len(routes.routes) != 0 {
+		t.Fatalf("partial prepare leaked durable or Caddy state: routes=%#v caddy=%#v err=%v", store.routes, routes.routes, err)
+	}
+	store.prepareFailAt = -1
+	store.eventErr = errors.New("audit unavailable")
+	prepared, state, err := controller.PrepareDomainRoutes(context.Background(), M3PrepareDomainRouteRequest{Binding: binding, Targets: targets, RuntimeReady: true, IdempotencyKey: "prepare-audit", Actor: "test"})
+	if err == nil || !domain.IsCode(err, domain.ErrUnavailable) || len(prepared) != 2 || !state.RuntimeReady || len(store.routes) != 2 {
+		t.Fatalf("persisted route audit failure was not explicit: prepared=%#v state=%#v routes=%#v err=%v", prepared, state, store.routes, err)
+	}
+	if _, _, err := controller.PrepareDomainRoutes(context.Background(), M3PrepareDomainRouteRequest{Binding: binding, Targets: targets, RuntimeReady: true, IdempotencyKey: "", Actor: "test"}); err == nil || len(store.routes) != 2 {
+		t.Fatalf("missing idempotency key changed prepared routes: routes=%#v err=%v", store.routes, err)
 	}
 }
 

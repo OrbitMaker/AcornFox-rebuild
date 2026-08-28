@@ -1,13 +1,13 @@
 {
 	admin 127.0.0.1:2020
+	metrics
 	grace_period 30s
 	servers {
 		protocols h1 h2
 		timeouts {
-			read_body 30s
-			read_header 30s
+			read_header 5s
 			write 0
-			idle 30s
+			idle 2m
 		}
 	}
 	on_demand_tls {

@@ -69,10 +69,23 @@ func TestTLSAllowStateOnTaskScopedPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 	route := domain.Route{ID: "route_tls_allow", ApplicationID: app, DeploymentID: deployment, ServiceName: "web", Host: binding.Hostname, Path: "/", Verified: true, Serving: false, CreatedAt: now}
-	if err := store.UpsertTLSAllowDesiredRoute(ctx, binding.ID, route, now); err != nil {
+	occupied := PortLease{ID: "lease_tls_occupied", ApplicationID: app, DeploymentID: deployment, ServiceName: "occupied", BindHost: "127.0.0.1", Port: 18082, AcquiredAt: now}
+	if err := store.CreatePortLease(ctx, occupied, now); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.UpsertTLSAllowDesiredRoute(ctx, binding.ID, route, now.Add(time.Second)); err != nil {
+	conflicting := route
+	conflicting.ID, conflicting.Path, conflicting.ServiceName = "route_tls_conflict", "/api", "api"
+	if err := store.PrepareTLSAllowDesiredRoutes(ctx, binding.ID, []TLSAllowPreparedRoute{{Route: route, Port: 18081}, {Route: conflicting, Port: 18082}}, now); err == nil {
+		t.Fatal("second target port conflict was accepted")
+	}
+	var partialCount int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM m3_desired_routes WHERE id IN ($1,$2)`, route.ID.String(), conflicting.ID.String()).Scan(&partialCount); err != nil || partialCount != 0 {
+		t.Fatalf("conflicting batch left desired routes: count=%d err=%v", partialCount, err)
+	}
+	if err := store.PrepareTLSAllowDesiredRoutes(ctx, binding.ID, []TLSAllowPreparedRoute{{Route: route, Port: 18081}}, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PrepareTLSAllowDesiredRoutes(ctx, binding.ID, []TLSAllowPreparedRoute{{Route: route, Port: 18081}}, now.Add(time.Second)); err != nil {
 		t.Fatalf("repeat TLS allow preparation: %v", err)
 	}
 	state, err := store.TLSAllowState(ctx, binding.Hostname)

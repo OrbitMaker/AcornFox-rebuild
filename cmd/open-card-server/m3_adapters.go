@@ -157,25 +157,18 @@ func (a *m3PostgresAdapter) PutDesiredRoute(ctx context.Context, route domain.Ro
 	return a.store.UpsertDesiredRoute(ctx, postgres.DesiredRouteRecord{Route: route, ApplicationDomainID: applicationDomainID, CertificateID: certificateID, State: postgres.DesiredRouteActive, UpdatedAt: route.CreatedAt}, route.CreatedAt)
 }
 
-func (a *m3PostgresAdapter) PutPreparedDesiredRoute(ctx context.Context, binding domain.DomainBinding, route domain.Route, port int) error {
-	if binding.Kind != domain.DomainBindingApplication || binding.Status != domain.DomainReady || binding.ID.Empty() || binding.ApplicationID != route.ApplicationID {
-		return domain.ValidationError("prepared route requires a ready application domain owned by the target application")
+func (a *m3PostgresAdapter) PutPreparedDesiredRoutes(ctx context.Context, binding domain.DomainBinding, routes []controllers.M3PreparedRoute) error {
+	if binding.Kind != domain.DomainBindingApplication || binding.Status != domain.DomainReady || binding.ID.Empty() {
+		return domain.ValidationError("prepared routes require a ready application domain")
 	}
-	if route.CertificateRef != "" || !route.Verified || route.Serving {
-		return domain.ValidationError("prepared route must be verified, non-serving, and certificate-free")
+	prepared := make([]postgres.TLSAllowPreparedRoute, 0, len(routes))
+	for _, item := range routes {
+		if binding.ApplicationID != item.Route.ApplicationID || item.Route.CertificateRef != "" || !item.Route.Verified || item.Route.Serving {
+			return domain.ValidationError("prepared routes must be owned, verified, non-serving, and certificate-free")
+		}
+		prepared = append(prepared, postgres.TLSAllowPreparedRoute{Route: item.Route, Port: item.Port})
 	}
-	leaseID := m3AdapterID("lease", route.ID.String()+":"+route.DeploymentID.String()+":"+fmt.Sprint(port))
-	var existingPort int
-	err := a.store.DB().QueryRowContext(ctx, `SELECT port FROM m3_port_leases WHERE id=$1`, leaseID.String()).Scan(&existingPort)
-	if errors.Is(err, sql.ErrNoRows) {
-		err = a.store.CreatePortLease(ctx, postgres.PortLease{ID: leaseID, ApplicationID: route.ApplicationID, DeploymentID: route.DeploymentID, ServiceName: route.ServiceName, BindHost: "127.0.0.1", Port: port, AcquiredAt: route.CreatedAt}, route.CreatedAt)
-	} else if err == nil && existingPort != port {
-		return domain.NewError(domain.ErrConflict, "port lease identity conflicts")
-	}
-	if err != nil {
-		return err
-	}
-	return a.store.UpsertTLSAllowDesiredRoute(ctx, binding.ID, route, route.CreatedAt)
+	return a.store.PrepareTLSAllowDesiredRoutes(ctx, binding.ID, prepared, time.Now().UTC())
 }
 
 func (a *m3PostgresAdapter) ListDesiredRoutes(ctx context.Context) ([]domain.DesiredRoute, error) {

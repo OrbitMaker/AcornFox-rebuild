@@ -9,8 +9,11 @@
     "grace_period_seconds": 30,
     "stop_timeout_seconds": 45,
     "keepalive_seconds": 30,
+    "read_header_timeout_seconds": 5,
+    "idle_timeout_seconds": 120,
     "dial_timeout_seconds": 3,
-    "response_header_timeout_seconds": 30
+    "response_header_timeout_seconds": 30,
+    "metrics_admin_only": true
   },
   "internal_route_provider": {
     "listen": "127.0.0.1:18481",
@@ -24,5 +27,5 @@
     "tls_allow": "http://127.0.0.1:8080/internal/tls/allow",
     "strip_identity_headers": ["Open-Card-*", "X-Open-Card-*"]
   },
-  "forbidden": ["h3", "udp:443", "real domain", "certificate", "token", "password"]
+  "forbidden": ["h3", "udp:443", "read_body", "public metrics", "pprof", "real domain", "certificate", "token", "password"]
 }

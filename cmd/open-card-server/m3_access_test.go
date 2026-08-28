@@ -59,16 +59,24 @@ func (s *m3HTTPStore) PutDesiredRoute(_ context.Context, route domain.Route, por
 	return nil
 }
 
-func (s *m3HTTPStore) PutPreparedDesiredRoute(_ context.Context, _ domain.DomainBinding, route domain.Route, port int) error {
+func (s *m3HTTPStore) PutPreparedDesiredRoutes(_ context.Context, _ domain.DomainBinding, values []controllers.M3PreparedRoute) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for index := range s.routes {
-		if s.routes[index].Route.ID == route.ID {
-			s.routes[index] = domain.DesiredRoute{Route: route, Port: port}
-			return nil
+	candidate := append([]domain.DesiredRoute(nil), s.routes...)
+	for _, value := range values {
+		replaced := false
+		for index := range candidate {
+			if candidate[index].Route.ID == value.Route.ID {
+				candidate[index] = domain.DesiredRoute{Route: value.Route, Port: value.Port}
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			candidate = append(candidate, domain.DesiredRoute{Route: value.Route, Port: value.Port})
 		}
 	}
-	s.routes = append(s.routes, domain.DesiredRoute{Route: route, Port: port})
+	s.routes = candidate
 	return nil
 }
 

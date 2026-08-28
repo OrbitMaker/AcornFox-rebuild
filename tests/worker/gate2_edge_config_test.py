@@ -48,10 +48,16 @@ class EdgeConfigContractTests(unittest.TestCase):
             "response_header_timeout 30s",
             "keepalive 30s",
             "write 0",
-            "idle 30s",
+            "read_header 5s",
+            "idle 2m",
             "header_up Host {host}",
         ):
             self.assertIn(expected, self.caddyfile)
+        self.assertIn("\n\tmetrics\n", self.caddyfile)
+        self.assertNotIn("read_body", self.caddyfile)
+        self.assertNotIn("/metrics", self.caddyfile)
+        self.assertNotIn("pprof", self.caddyfile.lower())
+        self.assertTrue(self.fixture["edge"]["metrics_admin_only"])
         self.assertNotIn("h3", self.caddyfile.lower())
         self.assertNotIn("udp", self.caddyfile.lower())
 

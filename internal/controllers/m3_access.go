@@ -29,7 +29,7 @@ type M3AccessStore interface {
 	PutDomainBinding(context.Context, domain.DomainBinding) error
 	PutCertificateReference(context.Context, domain.CertificateReference) error
 	PutDesiredRoute(context.Context, domain.Route, int) error
-	PutPreparedDesiredRoute(context.Context, domain.DomainBinding, domain.Route, int) error
+	PutPreparedDesiredRoutes(context.Context, domain.DomainBinding, []M3PreparedRoute) error
 	ListDesiredRoutes(context.Context) ([]domain.DesiredRoute, error)
 	SetRoutePointer(context.Context, domain.ID, domain.ID, string) error
 	RecordTrafficSwitch(context.Context, domain.TrafficSwitch) error
@@ -68,6 +68,11 @@ type M3PrepareDomainRouteRequest struct {
 	RuntimeReady   bool
 	IdempotencyKey string
 	Actor          string
+}
+
+type M3PreparedRoute struct {
+	Route domain.Route
+	Port  int
 }
 
 type M3SwitchRequest struct {
@@ -295,6 +300,9 @@ func (c *M3AccessController) PrepareDomainRoutes(ctx context.Context, request M3
 	if !request.RuntimeReady || request.Binding.Kind != domain.DomainBindingApplication || request.Binding.Status != domain.DomainReady {
 		return nil, domain.AccessState{}, domain.NewError(domain.ErrInvalidTransition, "DNS-verified ready domain and runtime-ready deployment are required before TLS allow preparation")
 	}
+	if strings.TrimSpace(request.IdempotencyKey) == "" || strings.TrimSpace(request.Actor) == "" {
+		return nil, domain.AccessState{}, domain.ValidationError("TLS allow preparation requires idempotency key and actor")
+	}
 	if err := domain.RequireID(request.Binding.ID, "prepared route domain id"); err != nil {
 		return nil, domain.AccessState{}, err
 	}
@@ -327,17 +335,19 @@ func (c *M3AccessController) PrepareDomainRoutes(ctx context.Context, request M3
 	}
 	sort.Slice(targets, func(i, j int) bool { return len(targets[i].Path) > len(targets[j].Path) })
 	prepared := make([]domain.Route, 0, len(targets))
+	persistence := make([]M3PreparedRoute, 0, len(targets))
 	for _, target := range targets {
 		route := domain.Route{ID: m3DesiredRouteID(host, target.Path), ApplicationID: target.ApplicationID, DeploymentID: target.DeploymentID, ServiceName: target.ServiceName, Host: host, Path: target.Path, Verified: true, Serving: false, CreatedAt: c.now()}
-		if err := c.Store.PutPreparedDesiredRoute(ctx, request.Binding, route, target.Port); err != nil {
-			return nil, domain.AccessState{}, err
-		}
 		prepared = append(prepared, route)
+		persistence = append(persistence, M3PreparedRoute{Route: route, Port: target.Port})
+	}
+	if err := c.Store.PutPreparedDesiredRoutes(ctx, request.Binding, persistence); err != nil {
+		return nil, domain.AccessState{}, err
 	}
 	first := targets[0]
 	state := domain.AccessState{ApplicationID: first.ApplicationID, DeploymentID: first.DeploymentID, RuntimeReady: true, IPAvailable: true, DomainStatus: domain.DomainReady, Domain: host, HTTPSReady: false, Serving: false, Message: "route is desired; TLS issuance may be allowed while IP fallback and old serving remain available"}
 	if err := c.Store.AppendAccessEvent(ctx, first.ApplicationID, request.IdempotencyKey, "route.desired", state.Message, true); err != nil {
-		return nil, domain.AccessState{}, err
+		return prepared, state, domain.WrapError(domain.ErrUnavailable, "route preparation persisted but audit event append failed", err)
 	}
 	return prepared, state, nil
 }
