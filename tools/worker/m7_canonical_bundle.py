@@ -403,7 +403,10 @@ def write_tar(output: Path, root: Path, members: Iterable[Path]) -> None:
 
 
 def migration_files(repo: Path) -> list[Path]:
-    paths = sorted((repo / "migrations/control-plane").glob("*.sql"))
+    # M7 is retained historical 0.7.0-rc.1 evidence. Later production
+    # migrations are intentionally excluded so rebuilding its fixture tree
+    # cannot relabel 0022-era code as an old RC artifact.
+    paths = sorted(path for path in (repo / "migrations/control-plane").glob("*.sql") if path.name[:4].isdigit() and int(path.name[:4]) <= 21)
     numbers: list[int] = []
     for path in paths:
         match = MIGRATION.fullmatch(path.name)

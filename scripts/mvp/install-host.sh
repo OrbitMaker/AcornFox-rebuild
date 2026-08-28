@@ -16,8 +16,16 @@ computed manifest digest and the exact OPEN-CARD-INSTALL confirmation token.
 USAGE
 }
 die() { echo "open-card install-host: $*" >&2; exit 1; }
+set_env_line() {
+  local file=$1 key=$2 value=$3
+  if grep -q "^${key}=" "$file"; then
+    sed -i "s|^${key}=.*|${key}=${value}|" "$file"
+  else
+    printf '%s=%s\n' "$key" "$value" >>"$file"
+  fi
+}
 
-bundle= url= expected= debs_dir= debs_sha256= migration_command= migration_dir=
+bundle= url= expected= debs_dir= debs_sha256= migration_command= migration_dir= admin_password_file= auth_origin= edge_domain=
 offline=0 dry_run=0 skip_prerequisites=0
 forward=()
 while [[ $# -gt 0 ]]; do
@@ -27,6 +35,9 @@ while [[ $# -gt 0 ]]; do
     --expected-manifest-sha256) [[ $# -gt 1 ]] || die "--expected-manifest-sha256 requires a value"; expected=$2; shift 2 ;;
     --debs-dir) [[ $# -gt 1 ]] || die "--debs-dir requires a value"; debs_dir=$2; shift 2 ;;
     --debs-sha256) [[ $# -gt 1 ]] || die "--debs-sha256 requires a value"; debs_sha256=$2; shift 2 ;;
+    --admin-password-file) [[ $# -gt 1 ]] || die "--admin-password-file requires a value"; admin_password_file=$2; shift 2 ;;
+    --auth-origin) [[ $# -gt 1 ]] || die "--auth-origin requires a value"; auth_origin=$2; shift 2 ;;
+    --edge-domain) [[ $# -gt 1 ]] || die "--edge-domain requires a value"; edge_domain=$2; shift 2 ;;
     --root|--activate) die "$1 is managed by install-host.sh and must not be overridden" ;;
     --test-safe-prefix) die "--test-safe-prefix is not valid for production installation" ;;
     --offline) offline=1; forward+=(--offline); shift ;;
@@ -50,6 +61,26 @@ if [[ -n "$debs_sha256" ]]; then [[ "$debs_sha256" = /* && -f "$debs_sha256" && 
 [[ "${OPEN_CARD_M6_ENABLED:-false}" != "true" && "${OPEN_CARD_AI_ENABLED:-false}" != "true" ]] || die "production installer refuses AI-enabled environment"
 [[ "$EUID" -eq 0 ]] || die "production installation requires root"
 [[ -n "$migration_command" && -n "$migration_dir" ]] || die "production install requires --migration-command and --migration-dir"
+management_activation=0
+if [[ -n "$admin_password_file" || -n "$auth_origin" || -n "$edge_domain" ]]; then
+  [[ -n "$admin_password_file" && -n "$auth_origin" && -n "$edge_domain" ]] || die "Edge/auth activation requires --admin-password-file, --auth-origin, and --edge-domain together"
+  [[ "$admin_password_file" = /* && -f "$admin_password_file" && ! -L "$admin_password_file" ]] || die "--admin-password-file must be a regular absolute non-symlink file"
+  [[ "$(stat -c '%u:%a' "$admin_password_file")" = "0:600" ]] || die "--admin-password-file must be root-owned mode 0600"
+  origin_host=$(python3 - "$auth_origin" <<'PY'
+import sys
+from urllib.parse import urlsplit
+value = sys.argv[1]
+parsed = urlsplit(value)
+if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.path or parsed.query or parsed.fragment or value != f"https://{parsed.netloc}":
+    raise SystemExit("auth origin must be an exact HTTPS origin")
+print(parsed.hostname.lower())
+PY
+) || die "--auth-origin must be an exact HTTPS origin"
+  [[ "$edge_domain" =~ ^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$ ]] || die "--edge-domain must be a DNS hostname"
+  edge_domain=${edge_domain,,}
+  [[ "$edge_domain" = "$origin_host" ]] || die "--edge-domain must exactly match the HTTPS origin host"
+  management_activation=1
+fi
 runtime_task_prefix=${OPEN_CARD_RUNTIME_TASK_PREFIX:-opencard-host}
 runtime_network=${OPEN_CARD_RUNTIME_NETWORK:-${runtime_task_prefix}-runtime-network}
 runtime_group_network=${OPEN_CARD_RUNTIME_GROUP_NETWORK:-${runtime_task_prefix}-group-network}
@@ -61,6 +92,10 @@ export OPEN_CARD_INSTALL_CONFIRMATION=OPEN-CARD-INSTALL
 export OPEN_CARD_M6_ENABLED=false
 export OPEN_CARD_AI_ENABLED=false
 expected=$(tr '[:upper:]' '[:lower:]' <<< "$expected")
+
+if [[ -L /opt/open-card/current ]] && (( ! dry_run )); then
+  die "existing production installation requires upgrade.sh; root upgrades remain fail-closed pending atomic PostgreSQL restore support"
+fi
 
 installer=("$script_dir/install.sh" --root / --activate --expected-manifest-sha256 "$expected")
 installer+=("${forward[@]}")
@@ -123,7 +158,7 @@ PY
     fi
   fi
 
-  for account in opencard opencard-agent opencard-buildkit opencard-caddy; do
+  for account in opencard opencard-agent opencard-buildkit opencard-caddy opencard-edge; do
     if ! getent passwd "$account" >/dev/null; then
       useradd --system --user-group --home-dir "/var/lib/$account" --shell /usr/sbin/nologin --no-create-home "$account"
     fi
@@ -134,6 +169,8 @@ PY
   install -d -m 0750 -o opencard-agent -g opencard-agent /var/lib/open-card-agent /var/log/open-card-agent /var/lib/open-card-agent/runtime
   install -d -m 0700 -o opencard-buildkit -g opencard-buildkit /var/lib/open-card-buildkit /run/open-card-buildkit
   install -d -m 0750 -o opencard-caddy -g opencard-caddy /var/lib/open-card-caddy /var/log/open-card-caddy
+  install -d -m 0750 -o opencard-edge -g opencard-edge /var/lib/open-card-edge /var/log/open-card-edge
+  install -d -m 0700 -o opencard-edge -g opencard-edge /var/lib/open-card-edge/home /var/lib/open-card-edge/data /var/lib/open-card-edge/config
   install -d -m 0755 /etc/buildkit /etc/buildkit/cdi /etc/cdi /var/run/cdi
   if [[ ! -f /etc/buildkit/buildkitd.toml ]]; then
     cat >/etc/buildkit/buildkitd.toml <<'EOF'
@@ -160,6 +197,10 @@ EOF
   if command -v apparmor_parser >/dev/null 2>&1; then apparmor_parser -r /etc/apparmor.d/opencard-rootlesskit || die "failed to load Open Card AppArmor profile"; fi
 
   install -d -m 0750 /etc/open-card /var/lib/open-card/evidence
+  installation_id=/var/lib/open-card/installation-id
+  if [[ ! -e "$installation_id" ]]; then openssl rand -hex 24 >"$installation_id"; fi
+  [[ -f "$installation_id" && ! -L "$installation_id" ]] || die "installation id is unsafe"
+  chown root:root "$installation_id" && chmod 0600 "$installation_id"
   if [[ ! -f /etc/open-card/agent-ca.crt ]]; then
     openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 365 -subj "/CN=Open Card CA" -keyout /etc/open-card/agent-ca.key -out /etc/open-card/agent-ca.crt >/dev/null 2>&1
     cat >/etc/open-card/agent-cert.ext <<'EOF'
@@ -310,15 +351,59 @@ fi
 static_binary=/opt/open-card/current/bin/open-card-static-server
 if [[ -x "$static_binary" ]]; then
   if command -v sha256sum >/dev/null 2>&1; then static_digest="sha256:$(sha256sum -- "$static_binary" | awk '{print $1}')"; else static_digest="sha256:$(shasum -a 256 -- "$static_binary" | awk '{print $1}')"; fi
-  set_env_line() {
-    local file=$1 key=$2 value=$3
-    if grep -q "^${key}=" "$file"; then
-      sed -i "s|^${key}=.*|${key}=${value}|" "$file"
-    else
-      printf '%s=%s\n' "$key" "$value" >>"$file"
-    fi
-  }
   set_env_line /etc/open-card/server.env OPEN_CARD_STATIC_SERVER_BINARY "$static_binary"
   set_env_line /etc/open-card/server.env OPEN_CARD_STATIC_RUNTIME_DIGEST "$static_digest"
   systemctl restart open-card-server.service >/dev/null 2>&1 || die "server restart after static runtime digest failed"
+fi
+
+if (( management_activation )); then
+  edge_backup=/var/lib/open-card/backups/edge-preactivate-$(date -u +%Y%m%dT%H%M%SZ)
+  install -d -m 0700 "$edge_backup"
+  for path in /etc/open-card/server.env /etc/open-card/open-card-edge.Caddyfile /etc/open-card/open-card-edge.env /var/lib/open-card-edge; do
+    [[ ! -e "$path" && ! -L "$path" ]] || cp -a -- "$path" "$edge_backup/"
+  done
+  activation_committed=0
+  activation_rollback() {
+    local status=$?
+    if (( status != 0 && activation_committed == 0 )); then
+      set +e
+      systemctl disable --now open-card-edge.service >/dev/null 2>&1 || true
+      [[ ! -e "$edge_backup/server.env" ]] || cp -a -- "$edge_backup/server.env" /etc/open-card/server.env
+      for name in open-card-edge.Caddyfile open-card-edge.env; do
+        if [[ -e "$edge_backup/$name" ]]; then cp -a -- "$edge_backup/$name" "/etc/open-card/$name"; else rm -f -- "/etc/open-card/$name"; fi
+      done
+      if [[ -e "$edge_backup/open-card-edge" ]]; then
+        rm -rf -- /var/lib/open-card-edge
+        cp -a -- "$edge_backup/open-card-edge" /var/lib/open-card-edge
+      fi
+      systemctl restart open-card-server.service >/dev/null 2>&1 || true
+      echo "open-card install-host: activation failed; restored pre-activation Edge and server configuration" >&2
+    fi
+    return "$status"
+  }
+  trap activation_rollback EXIT
+  set_env_line /etc/open-card/server.env OPEN_CARD_AUTH_ORIGIN "$auth_origin"
+  python3 - "/opt/open-card/current/caddy/open-card-edge.Caddyfile.example" /etc/open-card/.open-card-edge.Caddyfile.next "$edge_domain" <<'PY'
+import pathlib, sys
+source, target, domain = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3]
+text = source.read_text(encoding="utf-8")
+if text.count("console.example.invalid") != 1:
+    raise SystemExit("Edge template console hostname is not unique")
+target.write_text(text.replace("console.example.invalid", domain), encoding="utf-8")
+PY
+  install -m 0640 -o root -g opencard-edge /etc/open-card/.open-card-edge.Caddyfile.next /etc/open-card/open-card-edge.Caddyfile
+  rm -f -- /etc/open-card/.open-card-edge.Caddyfile.next
+  install -m 0640 -o root -g opencard-edge /opt/open-card/current/caddy/open-card-edge.env.example /etc/open-card/open-card-edge.env
+  /opt/open-card/current/bin/caddy validate --config /etc/open-card/open-card-edge.Caddyfile --adapter caddyfile
+  /opt/open-card/current/bin/caddy adapt --config /etc/open-card/open-card-edge.Caddyfile --adapter caddyfile --validate >/dev/null
+  systemctl restart open-card-server.service
+  systemctl enable --now open-card-edge.service
+  # Bootstrap is intentionally last: earlier Edge/config/service failures can
+  # roll back without creating a credential that would block a retry.
+  /opt/open-card/current/bin/open-card-admin bootstrap --password-file "$admin_password_file"
+  activation_committed=1
+  trap - EXIT
+else
+  systemctl disable --now open-card-edge.service >/dev/null 2>&1 || true
+  echo "open-card install-host: core release staged; administrator HTTP and public Edge remain inactive until explicit password-file and HTTPS origin activation"
 fi

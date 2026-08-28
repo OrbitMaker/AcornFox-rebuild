@@ -9,14 +9,17 @@ usage: upgrade.sh --root TASK_ROOT --bundle BUNDLE [--url URL] [--offline]
                   [--migration-command EXECUTABLE] [--migration-dir DIRECTORY]
                   [--allow-downgrade]
                   [--expected-manifest-sha256 HEX]
+                  [--confirm-installation-id UPGRADE:ID]
                   [--test-safe-prefix PATH] [--activate] [--dry-run]
 
 The control-plane data backup is made before the release pointer changes.
 If the health command fails, install.sh atomically restores the old pointer.
+System-root PostgreSQL upgrades are fail-closed until temporary-database
+validation and atomic database swapping are implemented.
 USAGE
 }
 die() { echo "open-card upgrade: $*" >&2; exit 1; }
-root= bundle= bundle_url= health= database_dump_command= database_restore_command= migration_command= migration_dir= expected_manifest_sha256= safe_prefix=
+root= bundle= bundle_url= health= database_dump_command= database_restore_command= migration_command= migration_dir= expected_manifest_sha256= safe_prefix= confirmation=
 offline=0 dry_run=0 activate=0 allow_downgrade=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -30,6 +33,7 @@ while [[ $# -gt 0 ]]; do
     --migration-dir) [[ $# -gt 1 ]] || die "--migration-dir requires a value"; migration_dir=$2; shift 2 ;;
     --allow-downgrade) allow_downgrade=1; shift ;;
     --expected-manifest-sha256) [[ $# -gt 1 ]] || die "--expected-manifest-sha256 requires a value"; expected_manifest_sha256=$2; shift 2 ;;
+    --confirm-installation-id) [[ $# -gt 1 ]] || die "--confirm-installation-id requires a value"; confirmation=$2; shift 2 ;;
     --test-safe-prefix) [[ $# -gt 1 ]] || die "--test-safe-prefix requires a value"; safe_prefix=$2; shift 2 ;;
     --activate) activate=1; shift ;;
     --offline) offline=1; shift ;;
@@ -42,6 +46,18 @@ done
 [[ -n "$bundle" || -n "$bundle_url" ]] || die "--bundle or --url is required"
 [[ -z "$bundle" || -z "$bundle_url" ]] || die "use either --bundle or --url"
 [[ $offline -eq 0 || -z "$bundle_url" ]] || die "--offline refuses online bundle URLs"
+backup_confirmation= restore_confirmation=
+if [[ "$root" = "/" ]]; then
+  [[ "$EUID" -eq 0 ]] || die "--root / requires EUID 0"
+  [[ "${OPEN_CARD_ALLOW_SYSTEM_ROOT:-}" = "1" ]] || die "--root / requires OPEN_CARD_ALLOW_SYSTEM_ROOT=1"
+  installation_id=/var/lib/open-card/installation-id
+  [[ -f "$installation_id" && ! -L "$installation_id" && "$(stat -c '%u:%a' "$installation_id")" = "0:600" ]] || die "--root / requires root-owned installation-id"
+  installation_value=$(cat -- "$installation_id")
+  [[ "$confirmation" = "UPGRADE:$installation_value" ]] || die "--root / requires --confirm-installation-id UPGRADE:<installation-id>"
+  backup_confirmation="BACKUP:$installation_value"
+  restore_confirmation="RESTORE:$installation_value"
+  die "production upgrade is blocked: temporary PostgreSQL restore validation and atomic database swap are not implemented"
+fi
 if [[ -n "$migration_command" ]]; then
   [[ "$migration_command" = /* && -x "$migration_command" ]] || die "migration command must be an executable absolute path"
 fi
@@ -102,6 +118,10 @@ import json, sys
 print(json.load(open(sys.argv[1], encoding="utf-8"))["version"])
 PY
 )
+edge_was_active=0
+if [[ "$root" = "/" ]] && systemctl is-active --quiet open-card-edge.service; then
+  edge_was_active=1
+fi
 
 # A backup is the durable rollback point for control-plane data. The backup
 # script repeats root/path validation and is a no-op under --dry-run.
@@ -110,6 +130,7 @@ backup_args+=(--release-version "$current_release_version")
 (( dry_run )) && backup_args+=(--dry-run)
 [[ -n "$database_dump_command" ]] && backup_args+=(--database-dump-command "$database_dump_command")
 [[ -n "$safe_prefix" ]] && backup_args+=(--test-safe-prefix "$safe_prefix")
+[[ -n "$backup_confirmation" ]] && backup_args+=(--confirm-installation-id "$backup_confirmation")
 backup_output=$(OPEN_CARD_CURRENT_MIGRATION_VERSION="$current_migration_version" "$script_dir/backup-control-plane.sh" "${backup_args[@]}" 2>&1) || die "control-plane backup failed: $backup_output"
 backup_metadata=
 if (( ! dry_run )); then
@@ -121,7 +142,7 @@ mark_recovery_required() {
   local original_status=$1 restore_status=$2 restore_output=$3
   local stop_status=0 current_pointer recovery_dir marker evidence
   if [[ "$root" = "/" ]]; then
-    systemctl stop open-card-server.service open-card-agent.service open-card-buildkit.service open-card-caddy.service >/dev/null 2>&1 || stop_status=$?
+    systemctl stop open-card-server.service open-card-agent.service open-card-buildkit.service open-card-caddy.service open-card-edge.service >/dev/null 2>&1 || stop_status=$?
   fi
   current_pointer=$(readlink -- "$current" 2>/dev/null || printf '%s' "unknown")
   recovery_dir="$root/var/lib/open-card/evidence"
@@ -171,6 +192,7 @@ rollback_upgrade() {
     restore_args=(--root "$root" --backup "$backup_metadata")
     [[ -z "$database_restore_command" ]] || restore_args+=(--database-restore-command "$database_restore_command")
     [[ -z "$safe_prefix" ]] || restore_args+=(--test-safe-prefix "$safe_prefix")
+    [[ -z "$restore_confirmation" ]] || restore_args+=(--confirm-installation-id "$restore_confirmation")
     set +e
     restore_output=$("$script_dir/restore-control-plane.sh" "${restore_args[@]}" 2>&1)
     restore_status=$?
@@ -198,3 +220,8 @@ install_args=(--root "$root")
 [[ -n "$safe_prefix" ]] && install_args+=(--test-safe-prefix "$safe_prefix")
 (( activate )) && install_args+=(--activate)
 "$script_dir/install.sh" "${install_args[@]}"
+if [[ "$root" = "/" ]] && (( edge_was_active )); then
+  /opt/open-card/current/bin/caddy validate --config /etc/open-card/open-card-edge.Caddyfile --adapter caddyfile
+  /opt/open-card/current/bin/caddy adapt --config /etc/open-card/open-card-edge.Caddyfile --adapter caddyfile --validate >/dev/null
+  systemctl enable --now open-card-edge.service
+fi

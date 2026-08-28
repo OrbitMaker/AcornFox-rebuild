@@ -6,8 +6,9 @@ usage() {
   cat >&2 <<'USAGE'
 usage: backup-control-plane.sh --root TASK_ROOT [--reason LABEL]
                                [--release-version VERSION]
-                               [--migration-version 0021]
+                               [--migration-version 0022]
                                [--database-dump-command EXECUTABLE]
+                               [--confirm-installation-id BACKUP:ID]
                                [--test-safe-prefix PATH] [--dry-run]
 
 When OPEN_CARD_DATABASE_URL or DATABASE_URL is set, a direct pg_dump-compatible
@@ -16,7 +17,7 @@ filesystem-fixture and is not a PostgreSQL snapshot.
 USAGE
 }
 die() { echo "open-card backup: $*" >&2; exit 1; }
-root= reason= release_version= migration_version= database_dump_command= safe_prefix=
+root= reason= release_version= migration_version= database_dump_command= safe_prefix= confirmation=
 dry_run=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -25,6 +26,7 @@ while [[ $# -gt 0 ]]; do
     --release-version) [[ $# -gt 1 ]] || die "--release-version requires a value"; release_version=$2; shift 2 ;;
     --migration-version) [[ $# -gt 1 ]] || die "--migration-version requires a value"; migration_version=$2; shift 2 ;;
     --database-dump-command) [[ $# -gt 1 ]] || die "--database-dump-command requires a value"; database_dump_command=$2; shift 2 ;;
+    --confirm-installation-id) [[ $# -gt 1 ]] || die "--confirm-installation-id requires a value"; confirmation=$2; shift 2 ;;
     --test-safe-prefix) [[ $# -gt 1 ]] || die "--test-safe-prefix requires a value"; safe_prefix=$2; shift 2 ;;
     --dry-run) dry_run=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -38,10 +40,9 @@ if [[ "$root" = "/" ]]; then
   system_root=1
   [[ "$EUID" -eq 0 ]] || die "--root / requires EUID 0"
   [[ "${OPEN_CARD_ALLOW_SYSTEM_ROOT:-}" = "1" ]] || die "--root / requires OPEN_CARD_ALLOW_SYSTEM_ROOT=1"
-  [[ "${OPEN_CARD_SYSTEM_ROOT_CONFIRMATION:-}" = "opencard-mvp-fa8f8eab-build-worker-01" ]] || die "--root / requires the exact clean-worker confirmation"
-  marker=/etc/opencard-mvp-fa8f8eab-clean-worker
-  [[ -f "$marker" && ! -L "$marker" ]] || die "--root / requires clean-worker marker $marker"
-  [[ "$(cat -- "$marker")" = "opencard-mvp-fa8f8eab-build-worker-01" ]] || die "clean-worker marker contents do not match the authorized domain"
+  installation_id=/var/lib/open-card/installation-id
+  [[ -f "$installation_id" && ! -L "$installation_id" && "$(stat -c '%u:%a' "$installation_id")" = "0:600" ]] || die "--root / requires root-owned installation-id"
+  [[ "$confirmation" = "BACKUP:$(cat -- "$installation_id")" ]] || die "--root / requires --confirm-installation-id BACKUP:<installation-id>"
   [[ -z "$safe_prefix" ]] || die "--test-safe-prefix is not valid with --root /"
 else
   [[ "$root" != "$HOME" && "$root" != "$HOME"/* ]] || die "refusing HOME or a path below HOME"

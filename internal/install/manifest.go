@@ -21,17 +21,19 @@ import (
 )
 
 const (
-	ManifestSchemaVersion   = 1
-	ManifestProduct         = "open-card"
-	AgentProtocolVersion    = "1.1"
-	PreviousAgentProtocol   = "1.0"
-	LegacyAgentProtocol     = "v1"
-	CurrentMigrationVersion = "0022"
-	DefaultInstallPrefix    = "/opt/open-card"
-	DefaultConfigDir        = "/etc/open-card"
-	DefaultDataDir          = "/var/lib/open-card"
-	DefaultEvidenceDir      = "/var/lib/open-card/evidence"
-	DefaultBackupDir        = "/var/lib/open-card/backups"
+	ManifestSchemaVersion      = 1
+	ManifestProduct            = "open-card"
+	AgentProtocolVersion       = "1.1"
+	PreviousAgentProtocol      = "1.0"
+	LegacyAgentProtocol        = "v1"
+	CurrentMigrationVersion    = "0022"
+	ProductionCandidateVersion = "0.8.0-rc.1"
+	ProductionNMinusOneVersion = "0.7.0-rc.1"
+	DefaultInstallPrefix       = "/opt/open-card"
+	DefaultConfigDir           = "/etc/open-card"
+	DefaultDataDir             = "/var/lib/open-card"
+	DefaultEvidenceDir         = "/var/lib/open-card/evidence"
+	DefaultBackupDir           = "/var/lib/open-card/backups"
 )
 
 var semanticVersionPattern = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$`)
@@ -47,6 +49,42 @@ type FileDigest struct {
 	Path   string `json:"path"`
 	SHA256 string `json:"sha256"`
 	Mode   uint32 `json:"mode,omitempty"`
+}
+
+// ValidateProductionCandidate makes the 0.8 deployment contract explicit
+// without changing the retained 0.7 RC manifest semantics. It rejects a
+// test-only payload before the installer can switch a release pointer.
+func ValidateProductionCandidate(manifest Manifest) error {
+	if err := manifest.Validate(); err != nil {
+		return err
+	}
+	if manifest.Version != ProductionCandidateVersion || manifest.MigrationVersion != CurrentMigrationVersion {
+		return errors.New("manifest is not the 0.8.0-rc.1 production candidate")
+	}
+	required := map[string]bool{
+		"bin/open-card-admin":                          false,
+		"systemd/open-card-edge.service":               false,
+		"caddy/open-card-edge.Caddyfile.example":       false,
+		"migrations/control-plane/0022_admin_auth.sql": false,
+		"web/dist/index.html":                          false,
+		"docs/licenses/licenses-manifest.json":         false,
+		"sbom.spdx.json":                               false,
+		"source-manifest.sha256":                       false,
+	}
+	for _, file := range manifest.Files {
+		if strings.Contains(file.Path, "fixture") || strings.Contains(file.Path, "/tests/") || strings.HasSuffix(file.Path, ".test") || strings.Contains(file.Path, "open-card-caddy-fixture") {
+			return fmt.Errorf("test-only file is forbidden in production manifest: %s", file.Path)
+		}
+		if _, ok := required[file.Path]; ok {
+			required[file.Path] = true
+		}
+	}
+	for path, found := range required {
+		if !found {
+			return fmt.Errorf("production manifest is missing %s", path)
+		}
+	}
+	return nil
 }
 
 // Compatibility describes the oldest and newest data/protocol contracts that

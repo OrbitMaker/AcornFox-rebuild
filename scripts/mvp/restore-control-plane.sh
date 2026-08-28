@@ -6,17 +6,19 @@ usage() {
   cat >&2 <<'USAGE'
 usage: restore-control-plane.sh --root TASK_ROOT --backup ARCHIVE_OR_METADATA
                                 [--database-restore-command EXECUTABLE]
+                                [--confirm-installation-id RESTORE:ID]
                                 [--test-safe-prefix PATH] [--dry-run]
 USAGE
 }
 die() { echo "open-card restore: $*" >&2; exit 1; }
-root= backup= database_restore_command= safe_prefix=
+root= backup= database_restore_command= safe_prefix= confirmation=
 dry_run=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --root) [[ $# -gt 1 ]] || die "--root requires a value"; root=$2; shift 2 ;;
     --backup) [[ $# -gt 1 ]] || die "--backup requires a value"; backup=$2; shift 2 ;;
     --database-restore-command) [[ $# -gt 1 ]] || die "--database-restore-command requires a value"; database_restore_command=$2; shift 2 ;;
+    --confirm-installation-id) [[ $# -gt 1 ]] || die "--confirm-installation-id requires a value"; confirmation=$2; shift 2 ;;
     --test-safe-prefix) [[ $# -gt 1 ]] || die "--test-safe-prefix requires a value"; safe_prefix=$2; shift 2 ;;
     --dry-run) dry_run=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -34,10 +36,9 @@ if [[ "$root" = "/" ]]; then
   system_root=1
   [[ "$EUID" -eq 0 ]] || die "--root / requires EUID 0"
   [[ "${OPEN_CARD_ALLOW_SYSTEM_ROOT:-}" = "1" ]] || die "--root / requires OPEN_CARD_ALLOW_SYSTEM_ROOT=1"
-  [[ "${OPEN_CARD_SYSTEM_ROOT_CONFIRMATION:-}" = "opencard-mvp-fa8f8eab-build-worker-01" ]] || die "--root / requires the exact clean-worker confirmation"
-  marker=/etc/opencard-mvp-fa8f8eab-clean-worker
-  [[ -f "$marker" && ! -L "$marker" ]] || die "--root / requires clean-worker marker $marker"
-  [[ "$(cat -- "$marker")" = "opencard-mvp-fa8f8eab-build-worker-01" ]] || die "clean-worker marker contents do not match the authorized domain"
+  installation_id=/var/lib/open-card/installation-id
+  [[ -f "$installation_id" && ! -L "$installation_id" && "$(stat -c '%u:%a' "$installation_id")" = "0:600" ]] || die "--root / requires root-owned installation-id"
+  [[ "$confirmation" = "RESTORE:$(cat -- "$installation_id")" ]] || die "--root / requires --confirm-installation-id RESTORE:<installation-id>"
   [[ -z "$safe_prefix" ]] || die "--test-safe-prefix is not valid with --root /"
 else
   [[ "$root" != "$HOME" && "$root" != "$HOME"/* ]] || die "refusing HOME or a path below HOME"
@@ -139,6 +140,9 @@ database_url=${OPEN_CARD_DATABASE_URL:-${DATABASE_URL:-}}
 if [[ "$consistency" = pg-dump ]]; then
   [[ -n "$database_restore_command" ]] || die "pg-dump backup restore requires --database-restore-command"
   [[ -n "$database_url" ]] || die "database restore requires OPEN_CARD_DATABASE_URL or DATABASE_URL"
+  if (( system_root )); then
+    die "production PostgreSQL restore is blocked: restore into a temporary database and atomic database swap are not implemented"
+  fi
 elif [[ -n "$database_restore_command" ]]; then
   die "--database-restore-command requires a pg-dump backup"
 fi

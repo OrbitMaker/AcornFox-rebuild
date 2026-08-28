@@ -47,6 +47,27 @@ func TestManifestValidateAndVerifyRelease(t *testing.T) {
 	}
 }
 
+func TestProductionCandidateRequires0022PayloadAndRejectsFixtures(t *testing.T) {
+	manifest, _ := testManifest(t, ProductionCandidateVersion, "bin/open-card-admin", []byte("admin"))
+	manifest.MigrationVersion = CurrentMigrationVersion
+	manifest.Files = append(manifest.Files,
+		FileDigest{Path: "systemd/open-card-edge.service", SHA256: strings.Repeat("a", 64), Mode: 0o644},
+		FileDigest{Path: "caddy/open-card-edge.Caddyfile.example", SHA256: strings.Repeat("b", 64), Mode: 0o644},
+		FileDigest{Path: "migrations/control-plane/0022_admin_auth.sql", SHA256: strings.Repeat("c", 64), Mode: 0o644},
+		FileDigest{Path: "web/dist/index.html", SHA256: strings.Repeat("d", 64), Mode: 0o644},
+		FileDigest{Path: "docs/licenses/licenses-manifest.json", SHA256: strings.Repeat("e", 64), Mode: 0o644},
+		FileDigest{Path: "sbom.spdx.json", SHA256: strings.Repeat("f", 64), Mode: 0o644},
+		FileDigest{Path: "source-manifest.sha256", SHA256: strings.Repeat("1", 64), Mode: 0o644},
+	)
+	if err := ValidateProductionCandidate(manifest); err != nil {
+		t.Fatalf("production candidate rejected: %v", err)
+	}
+	manifest.Files = append(manifest.Files, FileDigest{Path: "tests/fixture.test", SHA256: strings.Repeat("2", 64), Mode: 0o644})
+	if err := ValidateProductionCandidate(manifest); err == nil {
+		t.Fatal("test-only production payload was accepted")
+	}
+}
+
 func TestManifestRejectsTraversalAndSymlinks(t *testing.T) {
 	manifest, release := testManifest(t, "1.0.0", "bin/open-card-agent", []byte("agent"))
 	manifest.Files[0].Path = "../outside"

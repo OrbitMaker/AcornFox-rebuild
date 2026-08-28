@@ -62,14 +62,15 @@ func main() {
 		server = NewServerWithRepository(store)
 		controllerStore = store
 		origin := strings.TrimSpace(os.Getenv("OPEN_CARD_AUTH_ORIGIN"))
-		if origin == "" {
-			log.Fatal("OPEN_CARD_AUTH_ORIGIN is required whenever OPEN_CARD_DATABASE_URL is configured")
+		if origin != "" {
+			authService, authErr := auth.NewService(auth.Config{Store: store, Origin: origin})
+			if authErr != nil {
+				log.Fatal(authErr)
+			}
+			server.SetAuth(&AuthHTTPHandler{Service: authService})
+		} else {
+			log.Print("administrator HTTP authentication is not activated; OPEN_CARD_AUTH_ORIGIN is unset")
 		}
-		authService, authErr := auth.NewService(auth.Config{Store: store, Origin: origin})
-		if authErr != nil {
-			log.Fatal(authErr)
-		}
-		server.SetAuth(&AuthHTTPHandler{Service: authService})
 		server.AgentGateway().SetEventSink(&controllers.DurableAgentSink{Store: store})
 		applicationWorker := &controllers.Worker{
 			Store: store, Handler: applicationTaskHandler{}, Owner: "control-plane-application",

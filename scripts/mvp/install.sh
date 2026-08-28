@@ -270,6 +270,22 @@ if tuple(map(int, minimum_protocol.split("."))) > tuple(map(int, maximum_protoco
 files = value["files"]
 if not isinstance(files, list) or not files:
     raise SystemExit("manifest files are empty")
+if value["version"] == "0.8.0-rc.1":
+    if migration_version != "0022":
+        raise SystemExit("0.8.0-rc.1 production candidate must declare migration 0022")
+    production_required = {
+        "bin/open-card-admin", "systemd/open-card-edge.service",
+        "caddy/open-card-edge.Caddyfile.example",
+        "migrations/control-plane/0022_admin_auth.sql", "web/dist/index.html",
+        "docs/licenses/licenses-manifest.json", "sbom.spdx.json", "source-manifest.sha256",
+    }
+    candidate_paths = {item.get("path") for item in files if isinstance(item, dict)}
+    missing = sorted(production_required - candidate_paths)
+    if missing:
+        raise SystemExit("0.8.0-rc.1 production manifest is missing " + ", ".join(missing))
+    forbidden = sorted(path for path in candidate_paths if isinstance(path, str) and ("fixture" in path.lower() or "/tests/" in "/" + path or path.endswith(".test") or "open-card-caddy-fixture" in path))
+    if forbidden:
+        raise SystemExit("0.8.0-rc.1 production manifest contains test-only payload")
 seen = set()
 print(value["version"]); print(value["release_id"]); print(protocol)
 print(compat["min_data_version"]); print(compat["max_data_version"])
@@ -337,7 +353,7 @@ if not versions:
 print(max(versions))
 PY
 ) || die "migration directory validation failed"
-  expected_migration=${manifest_migration_version:-0021}
+  expected_migration=${manifest_migration_version:-0022}
   [[ "$latest_migration" = "$expected_migration" ]] || die "migration directory does not match candidate migration $expected_migration (got $latest_migration)"
 fi
 
@@ -396,7 +412,13 @@ if (( ! dry_run )); then
   mkdir -p -- "$config_dir" "$data_dir" "$backups" "$evidence"
   chmod 0750 "$config_dir" "$data_dir" "$backups" "$evidence"
   mkdir -p -- "$systemd_dir"
-  for unit in open-card-server.service open-card-agent.service open-card-buildkit.service open-card-caddy.service; do
+  units=(open-card-server.service open-card-agent.service open-card-buildkit.service open-card-caddy.service)
+  if [[ -f "$bundle_dir/systemd/open-card-edge.service" && ! -L "$bundle_dir/systemd/open-card-edge.service" ]]; then
+    units+=(open-card-edge.service)
+  elif [[ "$version" = "0.8.0-rc.1" ]]; then
+    die "0.8.0-rc.1 production candidate is missing open-card-edge.service"
+  fi
+  for unit in "${units[@]}"; do
     [[ -f "$bundle_dir/systemd/$unit" && ! -L "$bundle_dir/systemd/$unit" ]] || die "bundle is missing $unit"
     cp -f -- "$bundle_dir/systemd/$unit" "$systemd_dir/$unit"
     chmod 0644 "$systemd_dir/$unit"
@@ -466,12 +488,12 @@ fi
 if (( dry_run )); then
   say "would atomically switch current from ${old_release:-none} to $release_name"
   [[ -z "$health_command" ]] || say "would run health command $health_command"
-  [[ -z "$migration_command" ]] || say "would run migration command $migration_command (required current migration 0021)"
+  [[ -z "$migration_command" ]] || say "would run migration command $migration_command (required current migration 0022)"
   exit 0
 fi
 
 if [[ -n "$migration_command" ]]; then
-  required_migration_version=${manifest_migration_version:-0021}
+  required_migration_version=${manifest_migration_version:-0022}
   if [[ -n "$migration_dir" ]]; then
     migration_output=$(OPEN_CARD_RELEASE_DIR="$release_dir" OPEN_CARD_CONFIG_DIR="$config_dir" OPEN_CARD_DATA_DIR="$data_dir" OPEN_CARD_REQUIRED_MIGRATION_VERSION="$required_migration_version" "$migration_command" "$migration_dir" 2>&1) || die "migration failed; current pointer was not changed: $migration_output"
   else
@@ -502,8 +524,9 @@ rollback_install() {
     fi
     if (( system_root && activate )); then
       if [[ -n "$old_release" ]]; then
-        systemctl reset-failed open-card-server.service open-card-agent.service open-card-buildkit.service open-card-caddy.service >/dev/null 2>&1 || true
+        systemctl reset-failed open-card-server.service open-card-agent.service open-card-buildkit.service open-card-caddy.service open-card-edge.service >/dev/null 2>&1 || true
         systemctl restart open-card-server.service open-card-agent.service open-card-buildkit.service open-card-caddy.service >/dev/null 2>&1 || true
+        systemctl try-restart open-card-edge.service >/dev/null 2>&1 || true
       else
         systemctl stop open-card-server.service open-card-agent.service open-card-buildkit.service open-card-caddy.service >/dev/null 2>&1 || true
       fi
@@ -533,7 +556,7 @@ if (( system_root && activate )); then
   command -v useradd >/dev/null 2>&1 || die "useradd is required for system-root activation"
   command -v install >/dev/null 2>&1 || die "install is required for system-root activation"
   command -v systemctl >/dev/null 2>&1 || die "systemctl is required for system-root activation"
-  for account in opencard opencard-agent opencard-buildkit opencard-caddy; do
+  for account in opencard opencard-agent opencard-buildkit opencard-caddy opencard-edge; do
     if ! getent passwd "$account" >/dev/null; then
       useradd --system --user-group --home-dir /nonexistent --shell /usr/sbin/nologin --no-create-home "$account"
     fi
@@ -544,10 +567,15 @@ if (( system_root && activate )); then
   install -d -m 0750 -o opencard-agent -g opencard-agent /var/lib/open-card-agent /var/log/open-card-agent
   install -d -m 0700 -o opencard-buildkit -g opencard-buildkit /var/lib/open-card-buildkit /run/open-card-buildkit
   install -d -m 0750 -o opencard-caddy -g opencard-caddy /var/lib/open-card-caddy /var/log/open-card-caddy
+  install -d -m 0750 -o opencard-edge -g opencard-edge /var/lib/open-card-edge /var/log/open-card-edge
+  install -d -m 0700 -o opencard-edge -g opencard-edge /var/lib/open-card-edge/home /var/lib/open-card-edge/data /var/lib/open-card-edge/config
   systemctl daemon-reload
   systemctl enable open-card-server.service open-card-agent.service open-card-buildkit.service open-card-caddy.service
   systemctl reset-failed open-card-server.service open-card-agent.service open-card-buildkit.service open-card-caddy.service >/dev/null 2>&1 || true
   systemctl restart open-card-server.service open-card-agent.service open-card-buildkit.service open-card-caddy.service
+  # Edge stays disabled until install-host has rendered a domain-bound config
+  # from explicit HTTPS origin and password-file activation inputs.
+  systemctl disable --now open-card-edge.service >/dev/null 2>&1 || true
 fi
 if [[ -n "$health_command" ]] && ! OPEN_CARD_RELEASE_DIR="$release_dir" OPEN_CARD_CONFIG_DIR="$config_dir" OPEN_CARD_DATA_DIR="$data_dir" "$health_command"; then
   die "health command failed"

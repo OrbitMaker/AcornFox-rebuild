@@ -43,6 +43,12 @@ if (( ${#migration_files[@]} == 0 )); then
   echo "no migration files found in $MIGRATIONS_DIR" >&2
   exit 65
 fi
+latest_file=$(basename "${migration_files[$((${#migration_files[@]} - 1))]}" .sql)
+latest_version=${latest_file%%_*}
+if [[ -n "${OPEN_CARD_REQUIRED_MIGRATION_VERSION:-}" ]]; then
+  [[ "$OPEN_CARD_REQUIRED_MIGRATION_VERSION" =~ ^[0-9]{4}$ ]] || { echo "OPEN_CARD_REQUIRED_MIGRATION_VERSION is invalid" >&2; exit 64; }
+  [[ "$latest_version" = "$OPEN_CARD_REQUIRED_MIGRATION_VERSION" ]] || { echo "migration directory latest version $latest_version does not match required $OPEN_CARD_REQUIRED_MIGRATION_VERSION" >&2; exit 65; }
+fi
 
 for migration in "${migration_files[@]}"; do
   version="$(basename "$migration" .sql)"
