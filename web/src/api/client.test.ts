@@ -63,10 +63,29 @@ function platformDomainFixture() {
     base_domain: 'example.test',
     console_domain: 'console.example.test',
     wildcard_pattern: '*.apps.example.test',
+    dns_records: [
+      { hostname: 'console.example.test', type: 'A', value: '203.0.113.77', purpose: 'console' },
+      { hostname: 'ingress.example.test', type: 'A', value: '203.0.113.77', purpose: 'ingress' },
+      { hostname: '*.apps.example.test', type: 'A', value: '203.0.113.77', purpose: 'platform_app_wildcard' },
+    ],
     verification: { method: 'cname', status: 'ready', name: null, value: null, observed_at: '2026-08-28T00:00:00Z' },
     certificate: { status: 'ready', subject: '*.apps.example.test', not_after: '2027-08-28T00:00:00Z' },
     failure: null,
     next_action: 'ready',
+  };
+}
+
+function unconfiguredPlatformDomainFixture() {
+  return {
+    status: 'unconfigured',
+    base_domain: null,
+    console_domain: null,
+    wildcard_pattern: null,
+    dns_records: [],
+    verification: { method: 'public_dns_read_only', status: 'unconfigured', name: null, value: null, observed_at: null },
+    certificate: { status: 'pending', subject: null, not_after: null },
+    failure: null,
+    next_action: 'configure_base_domain',
   };
 }
 
@@ -384,6 +403,14 @@ describe('RestApiClient', () => {
     expect((archiveBody as FormData).get('mode')).toBe('archive');
     expect((archiveBody as FormData).get('archive')).toBeInstanceOf(Blob);
     Reflect.deleteProperty(globalThis, 'document');
+  });
+
+  it('accepts the fail-closed unconfigured platform-domain response', async () => {
+    const client = new RestApiClient({ baseUrl: '/api/v1', fetchImpl: async () => jsonResponse(unconfiguredPlatformDomainFixture()) });
+    const platform = await client.getPlatformDomainSettings();
+    expect(platform.status).toBe('unconfigured');
+    expect(platform.dnsRecords).toEqual([]);
+    expect(platform.nextAction).toBe('configure_base_domain');
   });
 
   it('accepts only safe mutually exclusive archive or directory multipart inputs', async () => {

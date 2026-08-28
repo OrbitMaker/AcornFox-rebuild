@@ -25,6 +25,7 @@ describe('domain management helpers', () => {
   });
 
   it.each([
+    ['unconfigured', '未配置'],
     ['pending', '待处理'],
     ['verifying', '验证中'],
     ['certificate_pending', '证书处理中'],

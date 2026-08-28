@@ -8,6 +8,11 @@ const platform = (status: PlatformDomainSettingsResponse['status']): PlatformDom
   baseDomain: 'example.com',
   consoleDomain: 'console.example.com',
   wildcardPattern: '*.apps.example.com',
+  dnsRecords: [
+    { hostname: 'console.example.com', type: 'A', value: '203.0.113.77', purpose: 'console' },
+    { hostname: 'ingress.example.com', type: 'A', value: '203.0.113.77', purpose: 'ingress' },
+    { hostname: '*.apps.example.com', type: 'A', value: '203.0.113.77', purpose: 'platform_app_wildcard' },
+  ],
   verification: { method: 'cname', status, name: 'console.example.com', value: 'ingress.example.com', observedAt: '2026-08-28T00:00:00Z' },
   certificate: { status: status === 'ready' ? 'ready' : status === 'failed' ? 'failed' : status === 'certificate_pending' ? 'issuing' : 'pending', subject: '*.apps.example.com', notAfter: '2027-08-28T00:00:00Z' },
   failure: status === 'failed' ? { code: 'certificate_failed', message: '证书服务暂时失败', retryable: true } : null,
@@ -61,6 +66,8 @@ describe('DomainManagementPanel', () => {
     expect(markup).toContain('平台基础域名');
     expect(markup).toContain('example.com');
     expect(markup).toContain('*.apps.example.com');
+    expect(markup).toContain('需发布的 DNS 记录');
+    expect(markup).toContain('ingress.example.com A 203.0.113.77');
     expect(markup).toContain('CNAME');
   });
 

@@ -212,7 +212,7 @@ func (d *g3DNSVerifier) VerifyCustomerIngress(_ context.Context, hostname, zone 
 
 func newG3Controller(store *g3MemoryStore, dns contracts.PublicDNSVerifier) *G3AccessController {
 	now := time.Unix(1_700_000_000, 0).UTC()
-	return &G3AccessController{Store: store, Config: G3AccessConfig{PublicDNSVerifier: dns, ExpectedPublicIP: "203.0.113.77", IngressLabel: "ingress", AppsLabel: "apps", WildcardProbeLabel: "wildcard-probe"}, Clock: func() time.Time { return now }}
+	return &G3AccessController{Store: store, Config: G3AccessConfig{PublicDNSVerifier: dns, ExpectedPublicIP: "203.0.113.77", ConsoleLabel: "console", IngressLabel: "ingress", AppsLabel: "apps", WildcardProbeLabel: "wildcard-probe"}, Clock: func() time.Time { return now }}
 }
 
 func TestG3PlatformDomainIsUnconfiguredWithoutExplicitPublicDNS(t *testing.T) {
@@ -227,18 +227,49 @@ func TestG3PlatformDomainIsUnconfiguredWithoutExplicitPublicDNS(t *testing.T) {
 	}
 }
 
-func TestG3PlatformDomainRequiresBaseAndWildcardPublicDNS(t *testing.T) {
+func TestG3PlatformDomainRequiresAnExplicitConsoleLabel(t *testing.T) {
 	store := &g3MemoryStore{apps: map[domain.ID]string{"app_1": "Demo"}, domains: map[domain.ID]G3ApplicationDomainFact{}}
-	dns := &g3DNSVerifier{platform: map[string]contracts.PublicDNSStatus{"example.test": contracts.PublicDNSVerified, "wildcard-probe.apps.example.test": contracts.PublicDNSVerified}}
+	controller := newG3Controller(store, &g3DNSVerifier{})
+	controller.Config.ConsoleLabel = ""
+	settings, err := controller.GetPlatformSettings(context.Background())
+	if err != nil || settings.Status != "unconfigured" || len(settings.DNSRecords) != 0 {
+		t.Fatalf("settings=%+v err=%v", settings, err)
+	}
+	if _, _, err := controller.ConfigurePlatformDomain(context.Background(), "example.test", "put-1", "admin_1"); !domain.IsCode(err, domain.ErrUnavailable) {
+		t.Fatalf("missing console label write err=%v", err)
+	}
+}
+
+func TestG3PlatformDomainRequiresAnIPv4ARecordTarget(t *testing.T) {
+	for _, target := range []string{"2001:db8::1", "::ffff:203.0.113.77"} {
+		store := &g3MemoryStore{apps: map[domain.ID]string{"app_1": "Demo"}, domains: map[domain.ID]G3ApplicationDomainFact{}}
+		controller := newG3Controller(store, &g3DNSVerifier{})
+		controller.Config.ExpectedPublicIP = target
+		settings, err := controller.GetPlatformSettings(context.Background())
+		if err != nil || settings.Status != "unconfigured" || len(settings.DNSRecords) != 0 {
+			t.Fatalf("target=%q settings=%+v err=%v", target, settings, err)
+		}
+		if _, _, err := controller.ConfigurePlatformDomain(context.Background(), "example.test", "ipv6-a", "admin_1"); !domain.IsCode(err, domain.ErrUnavailable) {
+			t.Fatalf("target=%q configuration error=%v", target, err)
+		}
+	}
+}
+
+func TestG3PlatformDomainRequiresConsoleIngressAndWildcardPublicDNS(t *testing.T) {
+	store := &g3MemoryStore{apps: map[domain.ID]string{"app_1": "Demo"}, domains: map[domain.ID]G3ApplicationDomainFact{}}
+	dns := &g3DNSVerifier{platform: map[string]contracts.PublicDNSStatus{"console.example.test": contracts.PublicDNSVerified, "ingress.example.test": contracts.PublicDNSVerified, "wildcard-probe.apps.example.test": contracts.PublicDNSVerified}}
 	controller := newG3Controller(store, dns)
 	settings, replay, err := controller.ConfigurePlatformDomain(context.Background(), "example.test", "put-1", "admin_1")
-	if err != nil || replay || settings.Status != "certificate_pending" || settings.WildcardPattern == nil || *settings.WildcardPattern != "*.apps.example.test" {
+	if err != nil || replay || settings.Status != "certificate_pending" || settings.ConsoleDomain == nil || *settings.ConsoleDomain != "console.example.test" || settings.WildcardPattern == nil || *settings.WildcardPattern != "*.apps.example.test" || len(settings.DNSRecords) != 3 {
 		t.Fatalf("settings=%+v replay=%v err=%v", settings, replay, err)
 	}
-	if len(dns.calls) != 2 || dns.calls[0] != "platform:example.test" || dns.calls[1] != "platform:wildcard-probe.apps.example.test" {
+	if len(dns.calls) != 3 || dns.calls[0] != "platform:console.example.test" || dns.calls[1] != "platform:ingress.example.test" || dns.calls[2] != "platform:wildcard-probe.apps.example.test" {
 		t.Fatalf("DNS calls=%v", dns.calls)
 	}
-	if replaySettings, replay, err := controller.ConfigurePlatformDomain(context.Background(), "example.test", "put-1", "admin_1"); err != nil || !replay || replaySettings.Status != "certificate_pending" || len(dns.calls) != 2 {
+	if store.platform == nil || store.platform.VerificationRef != g3PlatformDNSVerificationRef {
+		t.Fatalf("platform verification ref=%+v", store.platform)
+	}
+	if replaySettings, replay, err := controller.ConfigurePlatformDomain(context.Background(), "example.test", "put-1", "admin_1"); err != nil || !replay || replaySettings.Status != "certificate_pending" || len(dns.calls) != 3 {
 		t.Fatalf("replay=%+v %v %v calls=%v", replaySettings, replay, err, dns.calls)
 	}
 	if _, _, err := controller.ConfigurePlatformDomain(context.Background(), "other.test", "put-1", "admin_1"); !domain.IsCode(err, domain.ErrConflict) {
@@ -246,9 +277,49 @@ func TestG3PlatformDomainRequiresBaseAndWildcardPublicDNS(t *testing.T) {
 	}
 }
 
+func TestG3PlatformDomainRechecksLegacyVerifiedFactsAgainstAllThreeRecords(t *testing.T) {
+	legacyVerifiedAt := time.Unix(1_600_000_000, 0).UTC()
+	store := &g3MemoryStore{
+		apps:    map[domain.ID]string{"app_1": "Demo"},
+		domains: map[domain.ID]G3ApplicationDomainFact{},
+		platform: &G3PlatformDomainFact{
+			ID:                 "platform_example",
+			BaseDomain:         "example.test",
+			VerificationStatus: G3VerificationVerified,
+			VerifiedAt:         &legacyVerifiedAt,
+			CreatedAt:          legacyVerifiedAt,
+			UpdatedAt:          legacyVerifiedAt,
+		},
+	}
+	dns := &g3DNSVerifier{platform: map[string]contracts.PublicDNSStatus{
+		"console.example.test":             contracts.PublicDNSVerified,
+		"ingress.example.test":             contracts.PublicDNSMismatch,
+		"wildcard-probe.apps.example.test": contracts.PublicDNSVerified,
+	}}
+	controller := newG3Controller(store, dns)
+	read, err := controller.GetPlatformSettings(context.Background())
+	if err != nil || read.Status != "pending" || read.Verification.Status != "pending" || read.Verification.ObservedAt != nil || len(dns.calls) != 0 {
+		t.Fatalf("legacy read=%+v err=%v calls=%v", read, err, dns.calls)
+	}
+	items, err := controller.ListApplicationDomains(context.Background(), "app_1")
+	if err != nil || len(items) != 1 || items[0].Status != "pending" || items[0].Serving {
+		t.Fatalf("legacy platform address=%+v err=%v", items, err)
+	}
+	settings, replay, err := controller.ConfigurePlatformDomain(context.Background(), "example.test", "new-three-record-key", "admin_1")
+	if err != nil || replay || settings.Status != "failed" || settings.Failure == nil {
+		t.Fatalf("settings=%+v replay=%v err=%v", settings, replay, err)
+	}
+	if len(dns.calls) != 3 || dns.calls[0] != "platform:console.example.test" || dns.calls[1] != "platform:ingress.example.test" || dns.calls[2] != "platform:wildcard-probe.apps.example.test" {
+		t.Fatalf("DNS calls=%v", dns.calls)
+	}
+	if store.platform == nil || store.platform.VerificationStatus != G3VerificationFailed {
+		t.Fatalf("legacy platform fact was not replaced: %+v", store.platform)
+	}
+}
+
 func TestG3CustomDomainDNSAndUnbindStateMachine(t *testing.T) {
 	store := &g3MemoryStore{apps: map[domain.ID]string{"app_1": "Demo", "app_2": "Other"}, domains: map[domain.ID]G3ApplicationDomainFact{}}
-	dns := &g3DNSVerifier{platform: map[string]contracts.PublicDNSStatus{"example.test": contracts.PublicDNSVerified, "wildcard-probe.apps.example.test": contracts.PublicDNSVerified}, custom: map[string]contracts.PublicDNSStatus{"www.customer.test": contracts.PublicDNSVerified}}
+	dns := &g3DNSVerifier{platform: map[string]contracts.PublicDNSStatus{"console.example.test": contracts.PublicDNSVerified, "ingress.example.test": contracts.PublicDNSVerified, "wildcard-probe.apps.example.test": contracts.PublicDNSVerified}, custom: map[string]contracts.PublicDNSStatus{"www.customer.test": contracts.PublicDNSVerified}}
 	controller := newG3Controller(store, dns)
 	if _, _, err := controller.ConfigurePlatformDomain(context.Background(), "example.test", "put", "admin_1"); err != nil {
 		t.Fatal(err)
@@ -285,13 +356,13 @@ func TestG3CustomDomainDNSAndUnbindStateMachine(t *testing.T) {
 func TestG3AccessPreservesRuntimeFallbackAndNeverFakesCertificateReady(t *testing.T) {
 	ip := "http://203.0.113.77:18080"
 	store := &g3MemoryStore{apps: map[domain.ID]string{"app_1": "Demo"}, domains: map[domain.ID]G3ApplicationDomainFact{}, runtime: map[domain.ID]G3ApplicationAccessFacts{"app_1": {Runtime: G3RuntimeFact{RuntimeReady: true, IPFallback: &ip}, Routes: []G3RouteFact{{ID: "route_1", Desired: true, Serving: true, Certificate: &G3CertificateFact{Status: "ready", Subject: "www.customer.test"}}}}}}
-	dns := &g3DNSVerifier{platform: map[string]contracts.PublicDNSStatus{"example.test": contracts.PublicDNSVerified, "wildcard-probe.apps.example.test": contracts.PublicDNSVerified}}
+	dns := &g3DNSVerifier{platform: map[string]contracts.PublicDNSStatus{"console.example.test": contracts.PublicDNSVerified, "ingress.example.test": contracts.PublicDNSVerified, "wildcard-probe.apps.example.test": contracts.PublicDNSVerified}}
 	controller := newG3Controller(store, dns)
 	if _, _, err := controller.ConfigurePlatformDomain(context.Background(), "example.test", "put", "admin_1"); err != nil {
 		t.Fatal(err)
 	}
 	access, err := controller.ApplicationAccess(context.Background(), "app_1")
-	if err != nil || !access.RuntimeReady || access.IPFallback == nil || *access.IPFallback != ip || !access.Route.Desired || !access.Serving || access.Certificate.Status != "pending" || access.PlatformAddress == nil || access.PlatformAddress.Status != "certificate_pending" {
+	if err != nil || !access.RuntimeReady || access.IPFallback == nil || *access.IPFallback != ip || !access.Route.Desired || access.Route.Serving || access.Serving || access.Certificate.Status != "pending" || access.PlatformAddress == nil || access.PlatformAddress.Status != "certificate_pending" {
 		t.Fatalf("access=%+v err=%v", access, err)
 	}
 	if _, err := controller.ApplicationAccess(context.Background(), "missing"); !domain.IsCode(err, domain.ErrNotFound) {
@@ -299,19 +370,19 @@ func TestG3AccessPreservesRuntimeFallbackAndNeverFakesCertificateReady(t *testin
 	}
 }
 
-func TestG3DomainListProjectsDurablePlatformServingRoute(t *testing.T) {
+func TestG3DomainListDoesNotProjectInternalRouteServingAsPublicEdgeServing(t *testing.T) {
 	host, err := domain.StableApplicationHost("Demo", "app_1", "example.test")
 	if err != nil {
 		t.Fatal(err)
 	}
 	store := &g3MemoryStore{apps: map[domain.ID]string{"app_1": "Demo"}, domains: map[domain.ID]G3ApplicationDomainFact{}, runtime: map[domain.ID]G3ApplicationAccessFacts{"app_1": {Routes: []G3RouteFact{{ID: "route_platform", Hostname: host, Desired: true, Serving: true}}}}}
-	dns := &g3DNSVerifier{platform: map[string]contracts.PublicDNSStatus{"example.test": contracts.PublicDNSVerified, "wildcard-probe.apps.example.test": contracts.PublicDNSVerified}}
+	dns := &g3DNSVerifier{platform: map[string]contracts.PublicDNSStatus{"console.example.test": contracts.PublicDNSVerified, "ingress.example.test": contracts.PublicDNSVerified, "wildcard-probe.apps.example.test": contracts.PublicDNSVerified}}
 	controller := newG3Controller(store, dns)
 	if _, _, err := controller.ConfigurePlatformDomain(context.Background(), "example.test", "put", "admin_1"); err != nil {
 		t.Fatal(err)
 	}
 	items, err := controller.ListApplicationDomains(context.Background(), "app_1")
-	if err != nil || len(items) != 1 || items[0].Kind != "platform" || !items[0].Serving {
+	if err != nil || len(items) != 1 || items[0].Kind != "platform" || items[0].Serving || items[0].Verification.Name == nil || *items[0].Verification.Name != "wildcard-probe.apps.example.test" {
 		t.Fatalf("domains=%+v err=%v", items, err)
 	}
 }
@@ -326,7 +397,7 @@ func TestG3ResolverFailureFailsClosed(t *testing.T) {
 
 func TestG3DNSMismatchAndTimeoutNeverClaimReady(t *testing.T) {
 	store := &g3MemoryStore{apps: map[domain.ID]string{"app_1": "Demo"}, domains: map[domain.ID]G3ApplicationDomainFact{}}
-	mismatchDNS := &g3DNSVerifier{platform: map[string]contracts.PublicDNSStatus{"example.test": contracts.PublicDNSVerified, "wildcard-probe.apps.example.test": contracts.PublicDNSMismatch}}
+	mismatchDNS := &g3DNSVerifier{platform: map[string]contracts.PublicDNSStatus{"console.example.test": contracts.PublicDNSVerified, "ingress.example.test": contracts.PublicDNSVerified, "wildcard-probe.apps.example.test": contracts.PublicDNSMismatch}}
 	controller := newG3Controller(store, mismatchDNS)
 	settings, _, err := controller.ConfigurePlatformDomain(context.Background(), "example.test", "mismatch", "admin_1")
 	if err != nil || settings.Status != "failed" || settings.Failure == nil {

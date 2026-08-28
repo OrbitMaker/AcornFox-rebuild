@@ -26,8 +26,6 @@ import (
 	"github.com/open-card/open-card/internal/providers/buildkit"
 	caddyprovider "github.com/open-card/open-card/internal/providers/caddy"
 	"github.com/open-card/open-card/internal/providers/capacity"
-	"github.com/open-card/open-card/internal/providers/certfixture"
-	"github.com/open-card/open-card/internal/providers/dnsfixture"
 	imageprovider "github.com/open-card/open-card/internal/providers/image"
 	meterlocal "github.com/open-card/open-card/internal/providers/meter/local"
 	registryprovider "github.com/open-card/open-card/internal/providers/registryhttp"
@@ -170,41 +168,21 @@ func main() {
 				}
 				server.SetM2Lifecycle(lifecycle)
 				if os.Getenv("OPEN_CARD_M3_ENABLED") == "true" {
+					composition, compositionErr := resolveM3Composition(os.Getenv("OPEN_CARD_M3_COMPOSITION"), os.Getenv("OPEN_CARD_RUNTIME_TASK_PREFIX"), false, authorizeM3FixtureHost)
+					if compositionErr != nil {
+						log.Fatal(compositionErr)
+					}
+					if composition != m3CompositionFixture {
+						log.Fatal("M3 production composition is not available until Gate4B-2")
+					}
 					caddyProvider, caddyErr := caddyprovider.New(caddyprovider.Config{AdminURL: os.Getenv("OPEN_CARD_CADDY_ADMIN_URL"), Listen: os.Getenv("OPEN_CARD_CADDY_LISTEN"), Issuer: "internal"})
 					if caddyErr != nil {
 						log.Fatal(caddyErr)
 					}
-					dnsProvider, dnsErr := dnsfixture.New(dnsfixture.Config{StatePath: buildWorkRoot + "/m3-dns-state.json"})
-					if dnsErr != nil {
-						log.Fatal(dnsErr)
+					accessController, fixtureErr := newM3FixtureAccessController(caddyProvider, store, secretProvider, buildWorkRoot+"/m3-dns-state.json", os.Getenv("OPEN_CARD_M3_DNS_FAIL") == "true", os.Getenv("OPEN_CARD_M3_CERT_FAIL") == "true")
+					if fixtureErr != nil {
+						log.Fatal(fixtureErr)
 					}
-					if os.Getenv("OPEN_CARD_M3_DNS_FAIL") == "true" {
-						if err := dnsProvider.SetFault(dnsfixture.Fault{Operation: "verify_cname", Code: contracts.ErrUnavailable, Message: "isolated DNS verification failure"}); err != nil {
-							log.Fatal(err)
-						}
-					}
-					dnsAuthority := certfixture.DNSAdapter{
-						Present: func(ctx context.Context, name, token string, op contracts.OperationContext) (certfixture.DNS01Challenge, error) {
-							challenge, err := dnsProvider.PresentDNS01(ctx, name, token, op)
-							return certfixture.DNS01Challenge{Domain: challenge.Domain, Name: challenge.Name, Token: challenge.Token}, err
-						},
-						Verify: func(ctx context.Context, challenge certfixture.DNS01Challenge, op contracts.OperationContext) error {
-							return dnsProvider.VerifyDNS01(ctx, dnsfixture.DNS01Challenge{Domain: challenge.Domain, Name: challenge.Name, Token: challenge.Token}, op)
-						},
-						Cleanup: func(ctx context.Context, challenge certfixture.DNS01Challenge, op contracts.OperationContext) error {
-							return dnsProvider.CleanupDNS01(ctx, dnsfixture.DNS01Challenge{Domain: challenge.Domain, Name: challenge.Name, Token: challenge.Token}, op)
-						},
-					}
-					certificateProvider, certificateErr := certfixture.New(certfixture.Config{Secrets: secretProvider, DNS: dnsAuthority, Validity: 24 * time.Hour})
-					if certificateErr != nil {
-						log.Fatal(certificateErr)
-					}
-					if os.Getenv("OPEN_CARD_M3_CERT_FAIL") == "true" {
-						if err := certificateProvider.SetFault(certfixture.Fault{Operation: "issue", Code: contracts.ErrUnavailable, Message: "isolated certificate issuance failure"}); err != nil {
-							log.Fatal(err)
-						}
-					}
-					accessController := &controllers.M3AccessController{Routes: caddyProvider, Store: &m3PostgresAdapter{store: store}, DNS: &m3DNSAdapter{provider: dnsProvider}, Certificates: &m3CertificateAdapter{provider: certificateProvider}}
 					server.SetM3Access(&M3AccessHTTPHandler{Controller: accessController})
 					server.SetTLSAllow(&TLSAllowHTTPHandler{Controller: &controllers.TLSAllowController{Store: store}})
 					if _, rebuildErr := accessController.RebuildRoutes(context.Background(), "m3-startup-rebuild", "control-plane"); rebuildErr != nil {

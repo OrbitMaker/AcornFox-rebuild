@@ -60,9 +60,14 @@ func TestG3AccessStoreUsesTaskScopedPostgresAndFailsClosedOnServingUnbind(t *tes
 	store := NewStore(db)
 	now := time.Unix(1_700_000_000, 0).UTC()
 	verifiedAt := now
-	platform, _, err := store.PutPlatformDomain(ctx, G3PlatformDomainFact{ID: domain.ID("platform_" + suffix), BaseDomain: "example.test", VerificationStatus: G3VerificationVerified, VerifiedAt: &verifiedAt, CreatedAt: now, UpdatedAt: now}, g3TestIdempotency("g3.platform-domain.put", "platform-"+suffix))
-	if err != nil || platform.BaseDomain != "example.test" {
+	const platformVerificationRef = "public-dns-read-only/v2-console-ingress-wildcard"
+	platform, _, err := store.PutPlatformDomain(ctx, G3PlatformDomainFact{ID: domain.ID("platform_" + suffix), BaseDomain: "example.test", VerificationRef: platformVerificationRef, VerificationStatus: G3VerificationVerified, VerifiedAt: &verifiedAt, CreatedAt: now, UpdatedAt: now}, g3TestIdempotency("g3.platform-domain.put.v2", "platform-"+suffix))
+	if err != nil || platform.BaseDomain != "example.test" || platform.VerificationRef != platformVerificationRef {
 		t.Fatalf("platform=%+v err=%v", platform, err)
+	}
+	storedPlatform, found, err := store.PlatformDomain(ctx)
+	if err != nil || !found || storedPlatform.VerificationRef != platformVerificationRef {
+		t.Fatalf("stored platform=%+v found=%v err=%v", storedPlatform, found, err)
 	}
 	if _, _, err := store.PutPlatformDomain(ctx, G3PlatformDomainFact{ID: domain.ID("platform_other_" + suffix), BaseDomain: "other.test", VerificationStatus: G3VerificationPending, CreatedAt: now, UpdatedAt: now}, g3TestIdempotency("g3.platform-domain.put", "platform-other-"+suffix)); !errors.Is(err, ErrG3AccessConflict) {
 		t.Fatalf("singleton platform conflict=%v", err)

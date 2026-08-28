@@ -257,7 +257,7 @@ func (a *g3PostgresAdapter) ReplayG3Idempotency(ctx context.Context, request con
 	return response, replay, g3StoreAdapterError(err)
 }
 func (a *g3PostgresAdapter) PutPlatformDomain(ctx context.Context, fact controllers.G3PlatformDomainFact, request controllers.G3Idempotency) (controllers.G3PlatformDomainFact, bool, error) {
-	value, replay, err := a.store.PutPlatformDomain(ctx, postgres.G3PlatformDomainFact{ID: fact.ID, BaseDomain: fact.BaseDomain, VerificationStatus: postgres.G3VerificationStatus(fact.VerificationStatus), VerifiedAt: fact.VerifiedAt, Certificate: g3PostgresCertificate(fact.Certificate), CreatedAt: fact.CreatedAt, UpdatedAt: fact.UpdatedAt}, g3PostgresIdempotency(request))
+	value, replay, err := a.store.PutPlatformDomain(ctx, postgres.G3PlatformDomainFact{ID: fact.ID, BaseDomain: fact.BaseDomain, VerificationRef: fact.VerificationRef, VerificationStatus: postgres.G3VerificationStatus(fact.VerificationStatus), VerifiedAt: fact.VerifiedAt, Certificate: g3PostgresCertificate(fact.Certificate), CreatedAt: fact.CreatedAt, UpdatedAt: fact.UpdatedAt}, g3PostgresIdempotency(request))
 	return g3PlatformFact(value), replay, g3StoreAdapterError(err)
 }
 func (a *g3PostgresAdapter) ListApplicationDomains(ctx context.Context, applicationID domain.ID) ([]controllers.G3ApplicationDomainFact, error) {
@@ -294,7 +294,7 @@ func (a *g3PostgresAdapter) ApplicationAccessFacts(ctx context.Context, applicat
 }
 
 func g3PlatformFact(value postgres.G3PlatformDomainFact) controllers.G3PlatformDomainFact {
-	return controllers.G3PlatformDomainFact{ID: value.ID, BaseDomain: value.BaseDomain, VerificationStatus: controllers.G3VerificationStatus(value.VerificationStatus), VerifiedAt: value.VerifiedAt, Certificate: g3ControllerCertificate(value.Certificate), CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt}
+	return controllers.G3PlatformDomainFact{ID: value.ID, BaseDomain: value.BaseDomain, VerificationRef: value.VerificationRef, VerificationStatus: controllers.G3VerificationStatus(value.VerificationStatus), VerifiedAt: value.VerifiedAt, Certificate: g3ControllerCertificate(value.Certificate), CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt}
 }
 func g3ApplicationFact(value postgres.G3ApplicationDomainFact) controllers.G3ApplicationDomainFact {
 	return controllers.G3ApplicationDomainFact{ID: value.ID, ApplicationID: value.ApplicationID, Hostname: value.Hostname, Kind: value.Kind, CNAME: value.CNAME, VerificationStatus: controllers.G3VerificationStatus(value.VerificationStatus), VerifiedAt: value.VerifiedAt, Certificate: g3ControllerCertificate(value.Certificate), Serving: value.Serving, RouteID: value.RouteID, CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt}
@@ -330,6 +330,7 @@ var _ controllers.G3AccessStore = (*g3PostgresAdapter)(nil)
 func newG3AccessHTTPHandler(store *postgres.Store) *G3AccessHTTPHandler {
 	config := controllers.G3AccessConfig{
 		ExpectedPublicIP:   strings.TrimSpace(os.Getenv("OPEN_CARD_G3_EXPECTED_PUBLIC_IP")),
+		ConsoleLabel:       strings.TrimSpace(os.Getenv("OPEN_CARD_G3_CONSOLE_LABEL")),
 		IngressLabel:       strings.TrimSpace(os.Getenv("OPEN_CARD_G3_INGRESS_LABEL")),
 		AppsLabel:          strings.TrimSpace(os.Getenv("OPEN_CARD_G3_APPS_LABEL")),
 		WildcardProbeLabel: strings.TrimSpace(os.Getenv("OPEN_CARD_G3_WILDCARD_PROBE_LABEL")),

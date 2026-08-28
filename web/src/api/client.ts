@@ -156,7 +156,7 @@ function asDomainVerification(value: unknown): DomainVerification {
   const method = value.method;
   if (method !== 'dns_txt' && method !== 'cname' && method !== 'public_dns_read_only') throw new Error('Domain verification method is invalid');
   const status = value.status;
-  if (status !== 'pending' && status !== 'verifying' && status !== 'certificate_pending' && status !== 'ready' && status !== 'failed') throw new Error('Domain verification status is invalid');
+  if (status !== 'unconfigured' && status !== 'pending' && status !== 'verifying' && status !== 'certificate_pending' && status !== 'ready' && status !== 'failed') throw new Error('Domain verification status is invalid');
   return {
     method,
     status,
@@ -182,7 +182,7 @@ function asApplicationDomain(value: unknown): ApplicationDomain {
   const kind = value.kind;
   if (kind !== 'platform' && kind !== 'custom') throw new Error('Application domain kind is invalid');
   const status = value.status;
-  if (status !== 'pending' && status !== 'verifying' && status !== 'certificate_pending' && status !== 'ready' && status !== 'failed') throw new Error('Application domain status is invalid');
+  if (status !== 'unconfigured' && status !== 'pending' && status !== 'verifying' && status !== 'certificate_pending' && status !== 'ready' && status !== 'failed') throw new Error('Application domain status is invalid');
   return {
     id: requireString(value.id, 'domain.id'),
     hostname: requireString(value.hostname, 'domain.hostname'),
@@ -199,14 +199,22 @@ function asApplicationDomain(value: unknown): ApplicationDomain {
 function asPlatformDomainSettings(value: unknown): PlatformDomainSettingsResponse {
   if (!isRecord(value)) throw new Error('Platform domain settings are invalid');
   const status = value.status;
-  if (status !== 'pending' && status !== 'verifying' && status !== 'certificate_pending' && status !== 'ready' && status !== 'failed') throw new Error('Platform domain status is invalid');
+  if (status !== 'unconfigured' && status !== 'pending' && status !== 'verifying' && status !== 'certificate_pending' && status !== 'ready' && status !== 'failed') throw new Error('Platform domain status is invalid');
   const nextAction = value.next_action;
   if (nextAction !== 'configure_base_domain' && nextAction !== 'publish_verification_record' && nextAction !== 'wait_for_verification' && nextAction !== 'wait_for_certificate' && nextAction !== 'ready' && nextAction !== 'retry') throw new Error('Platform domain next action is invalid');
+  if (!Array.isArray(value.dns_records)) throw new Error('Platform DNS records are invalid');
+  const dnsRecords = value.dns_records.map((record) => {
+    if (!isRecord(record) || record.type !== 'A') throw new Error('Platform DNS record is invalid');
+    const purpose = record.purpose;
+    if (purpose !== 'console' && purpose !== 'ingress' && purpose !== 'platform_app_wildcard') throw new Error('Platform DNS record purpose is invalid');
+    return { hostname: requireString(record.hostname, 'dns_record.hostname'), type: 'A' as const, value: requireString(record.value, 'dns_record.value'), purpose: purpose as 'console' | 'ingress' | 'platform_app_wildcard' };
+  });
   return {
     status,
     baseDomain: optionalString(value.base_domain) ?? null,
     consoleDomain: optionalString(value.console_domain) ?? null,
     wildcardPattern: optionalString(value.wildcard_pattern) ?? null,
+    dnsRecords,
     verification: asDomainVerification(value.verification),
     certificate: asCertificateStatus(value.certificate),
     failure: asFailureState(value.failure),

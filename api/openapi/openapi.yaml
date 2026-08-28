@@ -756,7 +756,9 @@ paths:
                 dns_target: {type: string}
       responses:
         '201':
-          description: Platform DNS and isolated wildcard certificate are verified.
+          description: >-
+            Legacy fixture-only isolated compatibility response. It is not production Edge
+            certificate or public-serving proof; production UI uses /api/v1/settings/platform-domain.
           content:
             application/json:
               schema: {$ref: '#/components/schemas/DomainBindingResponse'}
@@ -779,7 +781,9 @@ paths:
                 cname_target: {type: string}
       responses:
         '201':
-          description: CNAME and isolated application certificate are verified.
+          description: >-
+            Legacy fixture-only isolated compatibility response. It is not production Edge
+            certificate or public-serving proof; production UI uses /api/v1/applications/{applicationId}/domains.
           content:
             application/json:
               schema: {$ref: '#/components/schemas/DomainBindingResponse'}
@@ -1177,16 +1181,29 @@ components:
     PlatformDomainSettingsResponse:
       type: object
       additionalProperties: false
-      required: [status, base_domain, console_domain, wildcard_pattern, verification, certificate, failure, next_action]
+      required: [status, base_domain, console_domain, wildcard_pattern, dns_records, verification, certificate, failure, next_action]
       properties:
         status: {$ref: '#/components/schemas/DomainLifecycleStatus'}
         base_domain: {type: string, nullable: true}
         console_domain: {type: string, nullable: true}
         wildcard_pattern: {type: string, nullable: true, description: "*.apps.<base_domain> when configured."}
+        dns_records:
+          type: array
+          description: Public records an operator must publish; provider credentials and RecordId are never exposed.
+          items: {$ref: '#/components/schemas/PlatformDNSRecord'}
         verification: {$ref: '#/components/schemas/DomainVerification'}
         certificate: {$ref: '#/components/schemas/CertificateStatus'}
         failure: {$ref: '#/components/schemas/FailureState', nullable: true}
         next_action: {type: string, enum: [configure_base_domain, publish_verification_record, wait_for_verification, wait_for_certificate, ready, retry]}
+    PlatformDNSRecord:
+      type: object
+      additionalProperties: false
+      required: [hostname, type, value, purpose]
+      properties:
+        hostname: {type: string}
+        type: {type: string, enum: [A]}
+        value: {type: string, format: ipv4}
+        purpose: {type: string, enum: [console, ingress, platform_app_wildcard]}
     CustomDomainBindRequest:
       type: object
       additionalProperties: false

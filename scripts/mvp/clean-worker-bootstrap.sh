@@ -297,6 +297,7 @@ for url in http://127.0.0.1:8080/readyz http://127.0.0.1:18481/readyz; do
 done
 cat >>/etc/open-card/server.env <<'EOF'
 OPEN_CARD_M3_ENABLED=true
+OPEN_CARD_M3_COMPOSITION=fixture
 OPEN_CARD_M4_ROLLOUT_ENABLED=true
 OPEN_CARD_M4_ROLLOUT_INTERVAL=3s
 OPEN_CARD_CADDY_ADMIN_URL=http://127.0.0.1:2019

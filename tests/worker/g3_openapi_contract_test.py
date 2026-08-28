@@ -66,8 +66,20 @@ class Gate3OpenAPIContractTests(unittest.TestCase):
     def test_domain_and_upload_safety_constraints_are_explicit(self) -> None:
         platform = self.components["schemas"]["PlatformDomainSettingsResponse"]
         self.assertEqual(platform["properties"]["status"]["$ref"], "#/components/schemas/DomainLifecycleStatus")
+        self.assertIn("dns_records", platform["required"])
+        records = platform["properties"]["dns_records"]
+        self.assertEqual(records["items"]["$ref"], "#/components/schemas/PlatformDNSRecord")
+        record = self.components["schemas"]["PlatformDNSRecord"]
+        self.assertEqual(record["properties"]["type"]["enum"], ["A"])
+        self.assertEqual(record["properties"]["value"]["format"], "ipv4")
+        self.assertEqual(record["properties"]["purpose"]["enum"], self.fixture["platform_dns_record_purposes"])
+        self.assertNotIn("record_id", record["properties"])
         self.assertIn("unconfigured", self.components["schemas"]["DomainLifecycleStatus"]["enum"])
         self.assertIn("<slug>-<short>.apps.<base_domain>", self.operation("PUT /api/v1/settings/platform-domain")["description"])
+        for path in ("/api/v1/access/platform-domains", "/api/v1/access/application-domains"):
+            description = self.paths[path]["post"]["responses"]["201"]["description"].lower()
+            self.assertIn("legacy fixture-only", description)
+            self.assertIn("not production edge", description)
         custom = self.operation("POST /api/v1/applications/{applicationId}/domains")
         self.assertIn("never writes a customer DNS zone", custom["description"])
         verify = self.operation("POST /api/v1/applications/{applicationId}/domains/{domainId}/verify")

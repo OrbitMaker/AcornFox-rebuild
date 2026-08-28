@@ -45,5 +45,6 @@
   },
   "invalid_relative_paths": ["/absolute", "foo//bar", "foo/./bar", "foo/../bar", "foo/"],
   "multipart_modes": ["archive", "directory"],
+  "platform_dns_record_purposes": ["console", "ingress", "platform_app_wildcard"],
   "forbidden_cloud_terms": ["dnspod", "tccli", "secretid", "secretkey", "accesskey"]
 }

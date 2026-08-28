@@ -104,7 +104,7 @@ func newG3HTTPServer(t *testing.T) (*Server, *http.Cookie, *http.Cookie) {
 	now := time.Unix(1_700_000_000, 0).UTC()
 	_, session, csrf := attachTestAdministratorTokens(t, server, &now)
 	store := &g3HTTPStore{apps: map[domain.ID]string{"app_1": "Demo"}, domains: map[domain.ID]controllers.G3ApplicationDomainFact{}}
-	controller := &controllers.G3AccessController{Store: store, Config: controllers.G3AccessConfig{PublicDNSVerifier: g3HTTPDNS{}, ExpectedPublicIP: "203.0.113.77", IngressLabel: "ingress", AppsLabel: "apps", WildcardProbeLabel: "wildcard-probe"}, Clock: func() time.Time { return now }}
+	controller := &controllers.G3AccessController{Store: store, Config: controllers.G3AccessConfig{PublicDNSVerifier: g3HTTPDNS{}, ExpectedPublicIP: "203.0.113.77", ConsoleLabel: "console", IngressLabel: "ingress", AppsLabel: "apps", WildcardProbeLabel: "wildcard-probe"}, Clock: func() time.Time { return now }}
 	server.SetG3Access(&G3AccessHTTPHandler{Controller: controller})
 	return server, session, csrf
 }
@@ -126,6 +126,32 @@ func TestG3AccessHTTPFacadeUsesSessionCSRFAndFrozenResponses(t *testing.T) {
 	server.Handler().ServeHTTP(putResponse, put)
 	if putResponse.Code != http.StatusAccepted || !strings.Contains(putResponse.Body.String(), `"certificate_pending"`) {
 		t.Fatalf("platform response=%d %s", putResponse.Code, putResponse.Body.String())
+	}
+	var platform struct {
+		ConsoleDomain string `json:"console_domain"`
+		DNSRecords    []struct {
+			Hostname string `json:"hostname"`
+			Type     string `json:"type"`
+			Value    string `json:"value"`
+			Purpose  string `json:"purpose"`
+		} `json:"dns_records"`
+	}
+	if err := json.Unmarshal(putResponse.Body.Bytes(), &platform); err != nil {
+		t.Fatalf("decode platform response: %v", err)
+	}
+	if platform.ConsoleDomain != "console.example.test" || len(platform.DNSRecords) != 3 {
+		t.Fatalf("platform domain contract=%+v", platform)
+	}
+	wantRecords := []struct{ hostname, purpose string }{
+		{"console.example.test", "console"},
+		{"ingress.example.test", "ingress"},
+		{"*.apps.example.test", "platform_app_wildcard"},
+	}
+	for index, want := range wantRecords {
+		record := platform.DNSRecords[index]
+		if record.Hostname != want.hostname || record.Type != "A" || record.Value != "203.0.113.77" || record.Purpose != want.purpose {
+			t.Fatalf("dns_records[%d]=%+v want hostname=%q purpose=%q", index, record, want.hostname, want.purpose)
+		}
 	}
 
 	bind := controlPlaneRequest(http.MethodPost, "/api/v1/applications/app_1/domains", strings.NewReader(`{"hostname":"www.customer.test"}`), session)

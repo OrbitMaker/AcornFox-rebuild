@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"net"
 	"strings"
 	"time"
 
@@ -40,12 +41,15 @@ type G3CertificateFact struct {
 type G3PlatformDomainFact struct {
 	ID                 domain.ID
 	BaseDomain         string
+	VerificationRef    string
 	VerificationStatus G3VerificationStatus
 	VerifiedAt         *time.Time
 	Certificate        *G3CertificateFact
 	CreatedAt          time.Time
 	UpdatedAt          time.Time
 }
+
+const g3PlatformDNSVerificationRef = "public-dns-read-only/v2-console-ingress-wildcard"
 
 type G3ApplicationDomainFact struct {
 	ID                 domain.ID
@@ -106,6 +110,7 @@ type G3AccessStore interface {
 type G3AccessConfig struct {
 	PublicDNSVerifier  contracts.PublicDNSVerifier
 	ExpectedPublicIP   string
+	ConsoleLabel       string
 	IngressLabel       string
 	AppsLabel          string
 	WildcardProbeLabel string
@@ -142,10 +147,20 @@ type G3PlatformSettings struct {
 	BaseDomain      *string              `json:"base_domain"`
 	ConsoleDomain   *string              `json:"console_domain"`
 	WildcardPattern *string              `json:"wildcard_pattern"`
+	DNSRecords      []G3DNSRecord        `json:"dns_records"`
 	Verification    G3DomainVerification `json:"verification"`
 	Certificate     G3CertificateStatus  `json:"certificate"`
 	Failure         *G3FailureState      `json:"failure"`
 	NextAction      string               `json:"next_action"`
+}
+
+// G3DNSRecord is an operator-visible publication instruction. It deliberately
+// exposes no DNS provider credentials or provider record identifiers.
+type G3DNSRecord struct {
+	Hostname string `json:"hostname"`
+	Type     string `json:"type"`
+	Value    string `json:"value"`
+	Purpose  string `json:"purpose"`
 }
 
 type G3ApplicationDomain struct {
@@ -203,7 +218,7 @@ func (c *G3AccessController) ConfigurePlatformDomain(ctx context.Context, baseDo
 	if err != nil {
 		return G3PlatformSettings{}, false, err
 	}
-	request := g3Idempotency("g3.platform-domain.put", idempotencyKey, base)
+	request := g3Idempotency("g3.platform-domain.put.v2", idempotencyKey, base)
 	if replay, found, err := c.replayPlatformDomain(ctx, request); err != nil {
 		return G3PlatformSettings{}, false, err
 	} else if found {
@@ -217,14 +232,6 @@ func (c *G3AccessController) ConfigurePlatformDomain(ctx context.Context, baseDo
 	if found && existing.BaseDomain != base {
 		return G3PlatformSettings{}, false, domain.NewError(domain.ErrConflict, "a different platform base domain is already configured")
 	}
-	if found && existing.VerificationStatus == G3VerificationVerified {
-		stored, replay, storeErr := c.Store.PutPlatformDomain(ctx, existing, request)
-		if storeErr != nil {
-			return G3PlatformSettings{}, false, g3StoreError(storeErr, "platform domain idempotency conflict")
-		}
-		view, viewErr := c.platformSettings(stored)
-		return view, replay || true, viewErr
-	}
 	verification, verifiedAt, err := c.verifyPlatform(ctx, base)
 	if err != nil {
 		return G3PlatformSettings{}, false, err
@@ -232,6 +239,7 @@ func (c *G3AccessController) ConfigurePlatformDomain(ctx context.Context, baseDo
 	fact := G3PlatformDomainFact{
 		ID:                 g3AccessID("platform-domain", base),
 		BaseDomain:         base,
+		VerificationRef:    g3PlatformDNSVerificationRef,
 		VerificationStatus: verification,
 		VerifiedAt:         verifiedAt,
 		CreatedAt:          c.now(),
@@ -260,15 +268,14 @@ func (c *G3AccessController) ListApplicationDomains(ctx context.Context, applica
 	if err != nil {
 		return nil, g3Unavailable("application domain facts are unavailable", err)
 	}
-	accessFacts, err := c.Store.ApplicationAccessFacts(ctx, applicationID)
-	if err != nil {
+	if _, err := c.Store.ApplicationAccessFacts(ctx, applicationID); err != nil {
 		return nil, g3Unavailable("application access facts are unavailable", err)
 	}
 	result := make([]G3ApplicationDomain, 0, len(domains)+1)
 	if platform, found, platformErr := c.platformFact(ctx); platformErr != nil {
 		return nil, platformErr
 	} else if found {
-		result = append(result, c.platformApplicationDomain(name, applicationID, platform, accessFacts.Routes))
+		result = append(result, c.platformApplicationDomain(name, applicationID, platform))
 	}
 	for _, item := range domains {
 		if item.Kind == "custom" {
@@ -409,8 +416,11 @@ func (c *G3AccessController) ApplicationAccess(ctx context.Context, applicationI
 	if platform, found, platformErr := c.platformFact(ctx); platformErr != nil {
 		return G3ApplicationAccess{}, platformErr
 	} else if found {
-		result.PlatformAddress = ptrG3Domain(c.platformApplicationDomain(name, applicationID, platform, facts.Routes))
+		result.PlatformAddress = ptrG3Domain(c.platformApplicationDomain(name, applicationID, platform))
 	}
+	// Gate4B-1 exposes a durable desired route, but the legacy internal route
+	// provider cannot prove public Edge TLS/SNI serving. Gate4B-2 owns that
+	// observation, so Route.Serving and Serving deliberately remain false here.
 	for _, route := range facts.Routes {
 		if !result.Route.Desired && route.Desired {
 			result.Route.Desired = true
@@ -418,9 +428,6 @@ func (c *G3AccessController) ApplicationAccess(ctx context.Context, applicationI
 				id := route.ID.String()
 				result.Route.RouteID = &id
 			}
-		}
-		if route.Serving {
-			result.Route.Serving, result.Serving = true, true
 		}
 		if route.Certificate != nil {
 			result.Certificate = g3Certificate(route.Certificate)
@@ -430,7 +437,11 @@ func (c *G3AccessController) ApplicationAccess(ctx context.Context, applicationI
 }
 
 func (c *G3AccessController) verifyPlatform(ctx context.Context, base string) (G3VerificationStatus, *time.Time, error) {
-	baseResult, err := c.Config.PublicDNSVerifier.VerifyPlatformAddress(ctx, base, c.Config.ExpectedPublicIP)
+	consoleResult, err := c.Config.PublicDNSVerifier.VerifyPlatformAddress(ctx, c.consoleHostname(base), c.Config.ExpectedPublicIP)
+	if err != nil {
+		return "", nil, g3Unavailable("public DNS verification is unavailable", err)
+	}
+	ingressResult, err := c.Config.PublicDNSVerifier.VerifyPlatformAddress(ctx, c.ingressHostname(base), c.Config.ExpectedPublicIP)
 	if err != nil {
 		return "", nil, g3Unavailable("public DNS verification is unavailable", err)
 	}
@@ -438,7 +449,7 @@ func (c *G3AccessController) verifyPlatform(ctx context.Context, base string) (G
 	if err != nil {
 		return "", nil, g3Unavailable("public DNS verification is unavailable", err)
 	}
-	return g3VerificationOutcome([]contracts.PublicDNSVerification{baseResult, wildcardResult}, c.now())
+	return g3VerificationOutcome([]contracts.PublicDNSVerification{consoleResult, ingressResult, wildcardResult}, c.now())
 }
 
 func g3VerificationOutcome(results []contracts.PublicDNSVerification, now time.Time) (G3VerificationStatus, *time.Time, error) {
@@ -501,9 +512,12 @@ func (c *G3AccessController) requireConfiguredWrite(idempotencyKey, actor string
 }
 
 func (c *G3AccessController) configured() bool {
-	return c.Config.PublicDNSVerifier != nil && strings.TrimSpace(c.Config.ExpectedPublicIP) != "" && g3DNSLabel(c.Config.IngressLabel) && g3DNSLabel(c.Config.AppsLabel) && g3DNSLabel(c.Config.WildcardProbeLabel)
+	return c.Config.PublicDNSVerifier != nil && g3IPv4(c.Config.ExpectedPublicIP) && g3DNSLabel(c.Config.ConsoleLabel) && g3DNSLabel(c.Config.IngressLabel) && g3DNSLabel(c.Config.AppsLabel) && g3DNSLabel(c.Config.WildcardProbeLabel)
 }
 
+func (c *G3AccessController) consoleHostname(base string) string {
+	return strings.ToLower(c.Config.ConsoleLabel) + "." + base
+}
 func (c *G3AccessController) ingressHostname(base string) string {
 	return strings.ToLower(c.Config.IngressLabel) + "." + base
 }
@@ -521,34 +535,47 @@ func (c *G3AccessController) platformSettings(fact G3PlatformDomainFact) (G3Plat
 	if fact.BaseDomain == "" {
 		return G3PlatformSettings{}, domain.NewError(domain.ErrConflict, "platform domain fact is malformed")
 	}
+	fact = g3PresentationPlatformFact(fact)
 	base := fact.BaseDomain
+	console := c.consoleHostname(base)
+	ingress := c.ingressHostname(base)
 	wildcard := "*." + strings.ToLower(c.Config.AppsLabel) + "." + base
 	status := g3Lifecycle(fact.VerificationStatus)
 	return G3PlatformSettings{
 		Status:          status,
 		BaseDomain:      &base,
-		ConsoleDomain:   &base,
+		ConsoleDomain:   &console,
 		WildcardPattern: &wildcard,
-		Verification:    g3Verification("public_dns_read_only", status, base, c.Config.ExpectedPublicIP, fact.VerifiedAt),
-		Certificate:     g3Certificate(fact.Certificate),
-		Failure:         g3Failure(fact.VerificationStatus),
-		NextAction:      g3NextAction(status, true),
+		DNSRecords: []G3DNSRecord{
+			{Hostname: console, Type: "A", Value: c.Config.ExpectedPublicIP, Purpose: "console"},
+			{Hostname: ingress, Type: "A", Value: c.Config.ExpectedPublicIP, Purpose: "ingress"},
+			{Hostname: wildcard, Type: "A", Value: c.Config.ExpectedPublicIP, Purpose: "platform_app_wildcard"},
+		},
+		Verification: g3Verification("public_dns_read_only", status, console, c.Config.ExpectedPublicIP, fact.VerifiedAt),
+		Certificate:  g3Certificate(fact.Certificate),
+		Failure:      g3Failure(fact.VerificationStatus),
+		NextAction:   g3NextAction(status, true),
 	}, nil
 }
 
-func (c *G3AccessController) platformApplicationDomain(name string, applicationID domain.ID, platform G3PlatformDomainFact, routes []G3RouteFact) G3ApplicationDomain {
+func (c *G3AccessController) platformApplicationDomain(name string, applicationID domain.ID, platform G3PlatformDomainFact) G3ApplicationDomain {
+	platform = g3PresentationPlatformFact(platform)
 	host, err := domain.StableApplicationHost(name, applicationID, platform.BaseDomain)
 	if err != nil {
 		host = ""
 	}
 	status := g3Lifecycle(platform.VerificationStatus)
-	view := G3ApplicationDomain{ID: g3AccessID("platform-address", applicationID.String()+":"+platform.BaseDomain).String(), Hostname: host, Kind: "platform", Status: status, Verification: g3Verification("public_dns_read_only", status, platform.BaseDomain, c.Config.ExpectedPublicIP, platform.VerifiedAt), Certificate: g3Certificate(platform.Certificate), Failure: g3Failure(platform.VerificationStatus)}
-	for _, route := range routes {
-		if route.Hostname == host && route.Serving {
-			view.Serving = true
-		}
+	return G3ApplicationDomain{ID: g3AccessID("platform-address", applicationID.String()+":"+platform.BaseDomain).String(), Hostname: host, Kind: "platform", Status: status, Verification: g3Verification("public_dns_read_only", status, c.wildcardProbeHostname(platform.BaseDomain), c.Config.ExpectedPublicIP, platform.VerifiedAt), Certificate: g3Certificate(platform.Certificate), Failure: g3Failure(platform.VerificationStatus)}
+}
+
+func g3PresentationPlatformFact(fact G3PlatformDomainFact) G3PlatformDomainFact {
+	if fact.VerificationStatus == G3VerificationVerified && fact.VerificationRef != g3PlatformDNSVerificationRef {
+		// Legacy apex-plus-probe evidence cannot satisfy the v2 console,
+		// ingress, and wildcard-probe contract. A new v2 PUT revalidates it;
+		// reads stay fail-closed and never recast it as certificate_pending.
+		fact.VerificationStatus, fact.VerifiedAt, fact.Certificate = G3VerificationPending, nil, nil
 	}
-	return view
+	return fact
 }
 
 func (c *G3AccessController) applicationDomain(fact G3ApplicationDomainFact) G3ApplicationDomain {
@@ -558,15 +585,15 @@ func (c *G3AccessController) applicationDomain(fact G3ApplicationDomainFact) G3A
 		value := fact.CNAME
 		target = &value
 	}
-	return G3ApplicationDomain{ID: fact.ID.String(), Hostname: fact.Hostname, Kind: fact.Kind, Status: status, CNAME: target, Verification: g3Verification("public_dns_read_only", status, fact.Hostname, fact.CNAME, fact.VerifiedAt), Certificate: g3Certificate(fact.Certificate), Failure: g3Failure(fact.VerificationStatus), Serving: fact.Serving}
+	return G3ApplicationDomain{ID: fact.ID.String(), Hostname: fact.Hostname, Kind: fact.Kind, Status: status, CNAME: target, Verification: g3Verification("public_dns_read_only", status, fact.Hostname, fact.CNAME, fact.VerifiedAt), Certificate: g3Certificate(fact.Certificate), Failure: g3Failure(fact.VerificationStatus)}
 }
 
 func g3UnconfiguredPlatformSettings() G3PlatformSettings {
-	return G3PlatformSettings{Status: "unconfigured", Verification: G3DomainVerification{Method: "public_dns_read_only", Status: "unconfigured"}, Certificate: G3CertificateStatus{Status: "pending"}, NextAction: "configure_base_domain"}
+	return G3PlatformSettings{Status: "unconfigured", DNSRecords: []G3DNSRecord{}, Verification: G3DomainVerification{Method: "public_dns_read_only", Status: "unconfigured"}, Certificate: G3CertificateStatus{Status: "pending"}, NextAction: "configure_base_domain"}
 }
 
 func g3PlatformSettingsForAbsentConfig() G3PlatformSettings {
-	return G3PlatformSettings{Status: "pending", Verification: G3DomainVerification{Method: "public_dns_read_only", Status: "pending"}, Certificate: G3CertificateStatus{Status: "pending"}, NextAction: "configure_base_domain"}
+	return G3PlatformSettings{Status: "pending", DNSRecords: []G3DNSRecord{}, Verification: G3DomainVerification{Method: "public_dns_read_only", Status: "pending"}, Certificate: G3CertificateStatus{Status: "pending"}, NextAction: "configure_base_domain"}
 }
 
 func g3Lifecycle(status G3VerificationStatus) string {
@@ -634,6 +661,12 @@ func g3DNSLabel(value string) bool {
 		}
 	}
 	return true
+}
+
+func g3IPv4(value string) bool {
+	value = strings.TrimSpace(value)
+	parsed := net.ParseIP(value)
+	return parsed != nil && parsed.To4() != nil && parsed.To4().String() == value
 }
 
 func (c *G3AccessController) replayPlatformDomain(ctx context.Context, request G3Idempotency) (G3PlatformDomainFact, bool, error) {

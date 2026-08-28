@@ -62,7 +62,7 @@ export interface ApplicationListResponse {
   nextCursor?: string;
 }
 
-export type DomainLifecycleStatus = 'pending' | 'verifying' | 'certificate_pending' | 'ready' | 'failed';
+export type DomainLifecycleStatus = 'unconfigured' | 'pending' | 'verifying' | 'certificate_pending' | 'ready' | 'failed';
 export type DomainVerificationMethod = 'dns_txt' | 'cname' | 'public_dns_read_only';
 export type DomainKind = 'platform' | 'custom';
 
@@ -95,10 +95,18 @@ export interface PlatformDomainSettingsResponse {
   baseDomain: string | null;
   consoleDomain: string | null;
   wildcardPattern: string | null;
+  dnsRecords: PlatformDNSRecord[];
   verification: DomainVerification;
   certificate: CertificateStatus;
   failure: FailureState | null;
   nextAction: 'configure_base_domain' | 'publish_verification_record' | 'wait_for_verification' | 'wait_for_certificate' | 'ready' | 'retry';
+}
+
+export interface PlatformDNSRecord {
+  hostname: string;
+  type: 'A';
+  value: string;
+  purpose: 'console' | 'ingress' | 'platform_app_wildcard';
 }
 
 export interface ApplicationDomain {

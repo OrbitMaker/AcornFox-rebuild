@@ -45,6 +45,7 @@ export function normalizeHostnameInput(raw: string): NormalizedHostname {
 
 export function domainStatusLabel(status: ApplicationDomain['status'] | PlatformDomainSettingsResponse['status']): string {
   return {
+    unconfigured: '未配置',
     pending: '待处理',
     verifying: '验证中',
     certificate_pending: '证书处理中',

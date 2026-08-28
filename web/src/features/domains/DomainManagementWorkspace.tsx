@@ -142,6 +142,21 @@ export function DomainManagementPanel({
               <div><dt>证书状态</dt><dd>{certificateStatusLabel(platform.certificate.status)}{platform.certificate.notAfter ? ` · 到期 ${platform.certificate.notAfter}` : ''}</dd></div>
               <div><dt>下一步</dt><dd>{platform.nextAction}</dd></div>
             </dl>
+            <section className="domain-management__records" aria-labelledby="platform-dns-records-heading">
+              <h3 id="platform-dns-records-heading">需发布的 DNS 记录</h3>
+              {platform.dnsRecords.length === 0 ? <p className="domain-management__hint">配置平台基础域名后，服务端会列出 console、ingress 与应用通配记录。</p> : (
+                <ul>
+                  {platform.dnsRecords.map((record) => {
+                    const copyValue = `${record.hostname} ${record.type} ${record.value}`;
+                    return <li key={`${record.hostname}:${record.type}`}>
+                      <code>{copyValue}</code>
+                      <span>{record.purpose}</span>
+                      <button type="button" onClick={() => onCopyCname(copyValue)} disabled={Boolean(pendingAction)}>{copiedTarget === copyValue ? '已复制' : '复制记录'}</button>
+                    </li>;
+                  })}
+                </ul>
+              )}
+            </section>
             {platform.failure && <p className="domain-management__failure"><strong>失败：</strong>{platform.failure.message} ({platform.failure.code})</p>}
           </>
         )}

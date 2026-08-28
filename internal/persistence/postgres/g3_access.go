@@ -39,6 +39,7 @@ type G3CertificateFact struct {
 type G3PlatformDomainFact struct {
 	ID                 domain.ID
 	BaseDomain         string
+	VerificationRef    string
 	VerificationStatus G3VerificationStatus
 	VerifiedAt         *time.Time
 	Certificate        *G3CertificateFact
@@ -203,7 +204,7 @@ func (s *Store) PlatformDomain(ctx context.Context) (G3PlatformDomainFact, bool,
 	if err := s.requireDB(); err != nil {
 		return G3PlatformDomainFact{}, false, err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id,hostname,verification_status,verified_at,created_at,updated_at FROM m3_platform_domains ORDER BY created_at,id`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id,hostname,COALESCE(verification_ref,''),verification_status,verified_at,created_at,updated_at FROM m3_platform_domains ORDER BY created_at,id`)
 	if err != nil {
 		return G3PlatformDomainFact{}, false, fmt.Errorf("list platform domains: %w", err)
 	}
@@ -301,9 +302,9 @@ func (s *Store) PutPlatformDomain(ctx context.Context, fact G3PlatformDomainFact
 		if created.IsZero() {
 			created = now
 		}
-		_, err = tx.ExecContext(ctx, `INSERT INTO m3_platform_domains(id,hostname,dns_provider_ref,verification_status,wildcard_enabled,verification_ref,verified_at,created_at,updated_at) VALUES($1,$2,'public-dns-read-only',$3,false,'public-dns-read-only',$4,$5,$6)`, fact.ID.String(), base, fact.VerificationStatus, fact.VerifiedAt, created, now)
+		_, err = tx.ExecContext(ctx, `INSERT INTO m3_platform_domains(id,hostname,dns_provider_ref,verification_status,wildcard_enabled,verification_ref,verified_at,created_at,updated_at) VALUES($1,$2,'public-dns-read-only',$3,false,$4,$5,$6,$7)`, fact.ID.String(), base, fact.VerificationStatus, nullableM3String(fact.VerificationRef), fact.VerifiedAt, created, now)
 	} else {
-		_, err = tx.ExecContext(ctx, `UPDATE m3_platform_domains SET verification_status=$2,wildcard_enabled=false,verification_ref='public-dns-read-only',verified_at=$3,updated_at=$4 WHERE id=$1`, existingID, fact.VerificationStatus, fact.VerifiedAt, now)
+		_, err = tx.ExecContext(ctx, `UPDATE m3_platform_domains SET verification_status=$2,wildcard_enabled=false,verification_ref=$3,verified_at=$4,updated_at=$5 WHERE id=$1`, existingID, fact.VerificationStatus, nullableM3String(fact.VerificationRef), fact.VerifiedAt, now)
 	}
 	if err != nil {
 		return rollback(err)
@@ -662,7 +663,7 @@ func (s *Store) ApplicationAccessFacts(ctx context.Context, applicationID domain
 func scanG3PlatformDomain(scanner interface{ Scan(...any) error }) (G3PlatformDomainFact, error) {
 	var fact G3PlatformDomainFact
 	var verified sql.NullTime
-	if err := scanner.Scan(&fact.ID, &fact.BaseDomain, &fact.VerificationStatus, &verified, &fact.CreatedAt, &fact.UpdatedAt); err != nil {
+	if err := scanner.Scan(&fact.ID, &fact.BaseDomain, &fact.VerificationRef, &fact.VerificationStatus, &verified, &fact.CreatedAt, &fact.UpdatedAt); err != nil {
 		return G3PlatformDomainFact{}, err
 	}
 	if !g3VerificationStatus(fact.VerificationStatus) {
