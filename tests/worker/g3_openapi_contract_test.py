@@ -58,7 +58,7 @@ class Gate3OpenAPIContractTests(unittest.TestCase):
                 parameters = [parameter.get("$ref") for parameter in operation["parameters"]]
                 self.assertIn("#/components/parameters/CSRFHeader", parameters)
                 self.assertIn("#/components/parameters/OriginHeader", parameters)
-                self.assertIn("#/components/parameters/RequiredIdempotencyKey" if operation["operationId"] != "createApplication" else "#/components/parameters/IdempotencyKey", parameters)
+                self.assertIn("#/components/parameters/RequiredIdempotencyKey", parameters)
         for _, response_name in self.fixture["error_responses"].items():
             self.assertIn(response_name, self.components["responses"])
             self.assertEqual(self.components["responses"][response_name].get("content", {}).get("application/json", {}).get("schema", {}).get("$ref"), "#/components/schemas/APIError")

@@ -22,11 +22,27 @@ func (s *publishStoreFixture) LatestApplicationPublishInput(context.Context, dom
 	return s.input, nil
 }
 
-type publisherFixture struct{ request controllers.PublishRequest }
+type publisherFixture struct {
+	request controllers.PublishRequest
+	empty   bool
+}
 
 func (p *publisherFixture) Publish(_ context.Context, r controllers.PublishRequest) (controllers.PublishResult, error) {
 	p.request = r
+	if p.empty {
+		return controllers.PublishResult{}, nil
+	}
 	return controllers.PublishResult{Operation: domain.Operation{ID: "op_publish"}, Release: domain.Release{ID: "rel_publish"}, Deployment: domain.Deployment{ID: "dep_publish"}, TaskID: "task_publish", SourceRevision: domain.SourceRevision{ID: "src_publish"}}, nil
+}
+func TestApplicationPublishRejectsIncompleteResult(t *testing.T) {
+	store := &publishStoreFixture{input: postgres.ApplicationPublishInput{SourceRevisionID: "src_1", SourceKind: "upload", Locator: "upload://upload_1", ContentDigest: "sha256:" + strings.Repeat("a", 64), EnvironmentID: "env_1", NextVersion: 2}}
+	request := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"build_kind":"static","context_path":".","service_name":"web","container_port":8080}`))
+	request.Header.Set("Idempotency-Key", "key")
+	recorder := httptest.NewRecorder()
+	handleApplicationPublish(recorder, request, "app_1", store, &publisherFixture{empty: true}, "admin", time.Now)
+	if recorder.Code != http.StatusInternalServerError || strings.Contains(recorder.Body.String(), "workspace") || strings.Contains(recorder.Body.String(), "locator") {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
 }
 func TestApplicationPublishSuccessUsesDerivedSafeRequest(t *testing.T) {
 	store := &publishStoreFixture{input: postgres.ApplicationPublishInput{SourceRevisionID: "src_1", SourceKind: "upload", Locator: "upload://upload_1", ContentDigest: "sha256:" + strings.Repeat("a", 64), EnvironmentID: "env_1", NextVersion: 2}}

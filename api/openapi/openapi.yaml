@@ -185,6 +185,9 @@ paths:
       operationId: publishApplication
       parameters:
         - $ref: '#/components/parameters/ApplicationID'
+        - $ref: '#/components/parameters/APIVersion'
+        - $ref: '#/components/parameters/APIMinVersion'
+        - $ref: '#/components/parameters/APIMaxVersion'
         - $ref: '#/components/parameters/RequiredIdempotencyKey'
         - $ref: '#/components/parameters/CSRFHeader'
         - $ref: '#/components/parameters/OriginHeader'
@@ -193,10 +196,12 @@ paths:
         content: {application/json: {schema: {$ref: '#/components/schemas/ApplicationPublishRequest'}}}
       responses:
         '202': {description: Deployment queued, content: {application/json: {schema: {$ref: '#/components/schemas/ApplicationPublishResponse'}}}}
+        '400': {description: Invalid request}
         '401': {$ref: '#/components/responses/AuthenticationRequired'}
         '409': {$ref: '#/components/responses/StateConflict'}
         '422': {$ref: '#/components/responses/ValidationFailed'}
         '503': {$ref: '#/components/responses/DependencyUnavailable'}
+        '426': {$ref: '#/components/responses/APIUpgradeRequired'}
   /api/v1/settings/system-status:
     get:
       operationId: getSystemStatus

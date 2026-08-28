@@ -82,18 +82,20 @@ type applicationPublishResponse struct {
 
 func deriveApplicationPublishRequest(input applicationPublishRequest, applicationID domain.ID, publishInput postgres.ApplicationPublishInput, key, actor string, now time.Time) (controllers.PublishRequest, error) {
 	kind := domain.BuildKind(input.BuildKind)
+	contextPath := strings.TrimSpace(input.ContextPath)
+	dockerfilePath := strings.TrimSpace(input.DockerfilePath)
 	if kind != domain.BuildStatic && kind != domain.BuildDockerfile {
 		return controllers.PublishRequest{}, domain.ValidationError("build_kind is invalid")
 	}
-	if applicationID.Empty() || strings.TrimSpace(key) == "" || strings.TrimSpace(actor) == "" || publishInput.SourceRevisionID.Empty() || publishInput.EnvironmentID.Empty() || publishInput.NextVersion < 1 || !publishServiceNamePattern.MatchString(strings.TrimSpace(input.ServiceName)) || strings.TrimSpace(input.ContextPath) == "" || input.ContainerPort < 1 || input.ContainerPort > 65535 {
+	if applicationID.Empty() || strings.TrimSpace(key) == "" || strings.TrimSpace(actor) == "" || publishInput.SourceRevisionID.Empty() || publishInput.EnvironmentID.Empty() || publishInput.NextVersion < 1 || !publishServiceNamePattern.MatchString(strings.TrimSpace(input.ServiceName)) || contextPath == "" || input.ContainerPort < 1 || input.ContainerPort > 65535 {
 		return controllers.PublishRequest{}, domain.ValidationError("publish request is invalid")
 	}
-	if (kind == domain.BuildStatic && input.DockerfilePath != "") || (kind == domain.BuildDockerfile && strings.TrimSpace(input.DockerfilePath) == "") || unsafeApplicationPublishContextPath(input.ContextPath) || unsafeApplicationPublishPath(input.DockerfilePath) {
+	if (kind == domain.BuildStatic && dockerfilePath != "") || (kind == domain.BuildDockerfile && dockerfilePath == "") || unsafeApplicationPublishContextPath(contextPath) || unsafeApplicationPublishPath(dockerfilePath) {
 		return controllers.PublishRequest{}, domain.ValidationError("publish paths are invalid")
 	}
 	service := strings.TrimSpace(input.ServiceName)
 	version := publishInput.NextVersion
-	return controllers.PublishRequest{ApplicationID: applicationID, EnvironmentID: publishInput.EnvironmentID, ServiceGroupID: domain.ID("group_" + applicationID.String()), ServiceName: service, Source: contracts.PrepareSourceRequest{ApplicationID: applicationID, Kind: domain.SourceKind(publishInput.SourceKind), Locator: publishInput.Locator, Ref: publishInput.Ref, ContentDigest: publishInput.ContentDigest, Operation: contracts.OperationContext{IdempotencyKey: key + ":source", Actor: actor}}, BuildKind: kind, ContextPath: input.ContextPath, DockerfilePath: input.DockerfilePath, TargetRepository: "open-card.local/" + applicationID.String() + "/" + service, OutputStorageKey: "publish/" + applicationID.String() + "/v" + strconv.Itoa(version) + "/" + service, BuildResources: contracts.ResourceLimits{CPUMillis: 500, MemoryBytes: 512 << 20, DiskBytes: 1 << 30, PIDs: 128}, BuildNetwork: contracts.NetworkPolicy{Mode: "none"}, RuntimeResources: contracts.ResourceLimits{CPUMillis: 250, MemoryBytes: 256 << 20, DiskBytes: 512 << 20, PIDs: 64}, ContainerPort: input.ContainerPort, Version: version, IdempotencyKey: key, Deadline: now.Add(10 * time.Minute), Actor: actor}, nil
+	return controllers.PublishRequest{ApplicationID: applicationID, EnvironmentID: publishInput.EnvironmentID, ServiceGroupID: domain.ID("group_" + applicationID.String()), ServiceName: service, Source: contracts.PrepareSourceRequest{ApplicationID: applicationID, Kind: domain.SourceKind(publishInput.SourceKind), Locator: publishInput.Locator, Ref: publishInput.Ref, ContentDigest: publishInput.ContentDigest, Operation: contracts.OperationContext{IdempotencyKey: key + ":source", Actor: actor}}, BuildKind: kind, ContextPath: contextPath, DockerfilePath: dockerfilePath, TargetRepository: "open-card.local/" + applicationID.String() + "/" + service, OutputStorageKey: "publish/" + applicationID.String() + "/v" + strconv.Itoa(version) + "/" + service, BuildResources: contracts.ResourceLimits{CPUMillis: 500, MemoryBytes: 512 << 20, DiskBytes: 1 << 30, PIDs: 128}, BuildNetwork: contracts.NetworkPolicy{Mode: "none"}, RuntimeResources: contracts.ResourceLimits{CPUMillis: 250, MemoryBytes: 256 << 20, DiskBytes: 512 << 20, PIDs: 64}, ContainerPort: input.ContainerPort, Version: version, IdempotencyKey: key, Deadline: now.Add(10 * time.Minute), Actor: actor}, nil
 }
 func unsafeApplicationPublishContextPath(value string) bool {
 	if strings.TrimSpace(value) == "." {
