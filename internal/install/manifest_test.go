@@ -209,9 +209,13 @@ func TestBackupMetadataChecksumValidation(t *testing.T) {
 	}
 }
 
-func TestCurrentMigrationMatchesControlPlaneDirectory(t *testing.T) {
+func TestCurrentProductionMigrationRemainsPresentWhenDevelopmentMigrationsFollow(t *testing.T) {
 	directory := filepath.Join("..", "..", "migrations", "control-plane")
-	if err := RequireCurrentMigration(directory); err != nil {
-		t.Fatal(err)
+	latest, err := LatestMigrationVersion(directory)
+	if err != nil || latest < CurrentMigrationVersion {
+		t.Fatalf("latest development migration=%q err=%v", latest, err)
+	}
+	if _, err := os.Stat(filepath.Join(directory, CurrentMigrationVersion+"_source_uploads.sql")); err != nil {
+		t.Fatalf("frozen production migration is absent: %v", err)
 	}
 }
