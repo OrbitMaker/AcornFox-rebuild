@@ -17,6 +17,7 @@ import (
 	aiprovider "github.com/open-card/open-card/internal/ai/provider"
 	airunner "github.com/open-card/open-card/internal/ai/runner"
 	aitools "github.com/open-card/open-card/internal/ai/tools"
+	"github.com/open-card/open-card/internal/auth"
 	"github.com/open-card/open-card/internal/contracts"
 	"github.com/open-card/open-card/internal/controllers"
 	"github.com/open-card/open-card/internal/observability"
@@ -59,6 +60,13 @@ func main() {
 		}()
 		server = NewServerWithRepository(store)
 		controllerStore = store
+		if origin := os.Getenv("OPEN_CARD_AUTH_ORIGIN"); origin != "" {
+			authService, authErr := auth.NewService(auth.Config{Store: store, Origin: origin})
+			if authErr != nil {
+				log.Fatal(authErr)
+			}
+			server.SetAuth(&AuthHTTPHandler{Service: authService})
+		}
 		server.AgentGateway().SetEventSink(&controllers.DurableAgentSink{Store: store})
 		applicationWorker := &controllers.Worker{
 			Store: store, Handler: applicationTaskHandler{}, Owner: "control-plane-application",

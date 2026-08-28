@@ -137,6 +137,43 @@ func (s *Store) ActiveAdminSessionByDigest(ctx context.Context, digest domain.Au
 	return session, nil
 }
 
+// TouchAdminSession advances the idle deadline only while the same credential
+// version remains active. The absolute expiry stays fixed at session creation.
+func (s *Store) TouchAdminSession(ctx context.Context, sessionID domain.ID, credentialVersion int64, now time.Time) (domain.AdminSession, error) {
+	if err := s.requireDB(); err != nil {
+		return domain.AdminSession{}, err
+	}
+	if err := domain.RequireID(sessionID, "administrator session id"); err != nil {
+		return domain.AdminSession{}, err
+	}
+	if credentialVersion < 1 || now.IsZero() {
+		return domain.AdminSession{}, domain.ValidationError("session touch identity or time is invalid")
+	}
+	session, err := scanAdminSession(s.db.QueryRowContext(ctx, `
+		UPDATE admin_sessions s
+		   SET last_seen_at = $3,
+		       idle_expires_at = LEAST($3 + INTERVAL '8 hours', s.absolute_expires_at)
+		  FROM admin_credentials a
+		 WHERE s.id = $1
+		   AND s.credential_version = $2
+		   AND a.id = s.admin_id
+		   AND a.disabled_at IS NULL
+		   AND a.credential_version = s.credential_version
+		   AND s.revoked_at IS NULL
+		   AND s.idle_expires_at > $3
+		   AND s.absolute_expires_at > $3
+		 RETURNING s.id, s.admin_id, s.session_digest, s.csrf_digest, s.credential_version,
+		           s.created_at, s.last_seen_at, s.idle_expires_at, s.absolute_expires_at, s.revoked_at
+	`, sessionID.String(), credentialVersion, now.UTC()))
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.AdminSession{}, ErrNotFound
+	}
+	if err != nil {
+		return domain.AdminSession{}, fmt.Errorf("touch administrator session: %w", err)
+	}
+	return session, nil
+}
+
 func (s *Store) RevokeAdminSession(ctx context.Context, sessionID domain.ID, revokedAt time.Time) error {
 	if err := s.requireDB(); err != nil {
 		return err

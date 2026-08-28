@@ -26,6 +26,67 @@ paths:
           description: Process is ready
         '503':
           description: Process is not ready
+  /api/v1/auth/login:
+    post:
+      operationId: loginAdministrator
+      description: >-
+        Creates one cookie-bound administrator session. The password, session token, CSRF token,
+        and source address are never returned in the JSON body or persisted as plaintext.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AuthLoginRequest'}
+      responses:
+        '200':
+          description: Authenticated session. The browser receives Secure Strict cookies.
+          headers:
+            Set-Cookie: {description: Session and CSRF cookies, schema: {type: string}}
+            Cache-Control: {schema: {type: string, enum: [no-store]}}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AuthSessionResponse'}
+        '400': {description: Invalid JSON request}
+        '401': {description: Generic authentication failure}
+        '429': {description: Generic authentication failure while rate limited}
+        '503': {description: Authentication persistence unavailable}
+  /api/v1/auth/logout:
+    post:
+      operationId: logoutAdministrator
+      parameters:
+        - {name: Origin, in: header, required: true, schema: {type: string, format: uri}}
+        - {name: X-Open-Card-CSRF, in: header, required: true, schema: {type: string, minLength: 1}}
+      responses:
+        '204': {description: Session revoked and both cookies cleared}
+        '401': {description: Generic authentication or CSRF failure}
+        '503': {description: Authentication persistence unavailable}
+  /api/v1/auth/session:
+    get:
+      operationId: getAdministratorSession
+      responses:
+        '200':
+          description: Active session facts only; no credential or token material.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AuthSessionResponse'}
+        '401': {description: Generic authentication failure}
+        '503': {description: Authentication persistence unavailable}
+  /api/v1/auth/password:
+    post:
+      operationId: rotateAdministratorPassword
+      parameters:
+        - {name: Origin, in: header, required: true, schema: {type: string, format: uri}}
+        - {name: X-Open-Card-CSRF, in: header, required: true, schema: {type: string, minLength: 1}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AuthPasswordChangeRequest'}
+      responses:
+        '204': {description: Credential version advanced and both cookies cleared}
+        '400': {description: Password policy or JSON request rejected}
+        '401': {description: Generic authentication or CSRF failure}
+        '503': {description: Authentication persistence unavailable}
   /api/v1/applications:
     parameters:
       - $ref: '#/components/parameters/APIVersion'
@@ -661,6 +722,27 @@ components:
           type: string
         message:
           type: string
+    AuthLoginRequest:
+      type: object
+      additionalProperties: false
+      required: [password]
+      properties:
+        password: {type: string, minLength: 1, maxLength: 1024, writeOnly: true}
+    AuthPasswordChangeRequest:
+      type: object
+      additionalProperties: false
+      required: [current_password, new_password]
+      properties:
+        current_password: {type: string, minLength: 1, maxLength: 1024, writeOnly: true}
+        new_password: {type: string, minLength: 1, maxLength: 1024, writeOnly: true}
+    AuthSessionResponse:
+      type: object
+      additionalProperties: false
+      required: [authenticated, idle_expires_at, absolute_expires_at]
+      properties:
+        authenticated: {type: boolean, enum: [true]}
+        idle_expires_at: {type: string, format: date-time}
+        absolute_expires_at: {type: string, format: date-time}
     Application:
       type: object
       required: [id, name, created_at, updated_at]
