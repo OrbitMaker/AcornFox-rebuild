@@ -21,3 +21,4 @@ __pycache__/
 # Frontend prototype dependencies and build output.
 node_modules/
 dist/
+dist-stub/
