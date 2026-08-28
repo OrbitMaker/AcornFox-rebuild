@@ -341,7 +341,17 @@ func (s *Store) CreateApplication(ctx context.Context, record application.Create
 				return rollback(fmt.Errorf("finalize source upload claim: %w", err))
 			}
 		case application.CreateApplicationSourceGit:
-			return rollback(domain.NewError(domain.ErrUnsupportedCapability, "git application creation is not implemented"))
+			if _, err := tx.ExecContext(ctx, `
+				INSERT INTO source_revisions
+					(id,application_id,provider,git_commit,content_digest,workspace_manifest,
+					 source_kind,locator,source_ref,workspace_ref,workspace_lifecycle,immutable)
+				VALUES($1,$2,'git',$3,$4,'{}'::jsonb,'git_https',$5,$6,$7,'prepared',true)
+			`, record.PreparedSource.ID.String(), record.Application.ID.String(), record.PreparedSource.Commit, record.PreparedSource.ContentDigest, record.PreparedSource.Locator, record.PreparedSource.Ref, record.PreparedSource.WorkspaceRef); err != nil {
+				return rollback(fmt.Errorf("insert public Git source revision: %w", err))
+			}
+			if _, err := tx.ExecContext(ctx, `INSERT INTO source_workspace_events(source_revision_id,sequence,workspace_ref,state,created_at) VALUES($1,1,$2,'prepared',$3)`, record.PreparedSource.ID.String(), record.PreparedSource.WorkspaceRef, createdAt); err != nil {
+				return rollback(fmt.Errorf("record public Git source preparation: %w", err))
+			}
 		default:
 			return rollback(domain.ValidationError("application source kind is unsupported"))
 		}
@@ -450,8 +460,13 @@ func validateCreateRecord(record application.CreateApplicationRecord) error {
 				return err
 			}
 		}
-		if record.Source.Kind == application.CreateApplicationSourceGit && record.PreparedSource != nil {
-			return domain.ValidationError("git source cannot claim an upload revision")
+		if record.Source.Kind == application.CreateApplicationSourceGit {
+			if record.PreparedSource == nil || !application.PreparedSourceMatches(*record.Source, *record.PreparedSource) {
+				return domain.ValidationError("git source requires a prepared immutable source revision")
+			}
+			if err := record.PreparedSource.Validate(); err != nil {
+				return err
+			}
 		}
 	} else if record.PreparedSource != nil {
 		return domain.ValidationError("source revision requires a source input")

@@ -19,6 +19,7 @@ type testSourcePreparer struct {
 	mu       sync.Mutex
 	prepares int
 	releases int
+	err      error
 }
 
 func (*testSourcePreparer) Metadata(context.Context) contracts.ProviderMetadata {
@@ -28,8 +29,16 @@ func (*testSourcePreparer) Metadata(context.Context) contracts.ProviderMetadata 
 func (p *testSourcePreparer) Prepare(_ context.Context, request contracts.PrepareSourceRequest) (contracts.PrepareSourceResult, error) {
 	p.mu.Lock()
 	p.prepares++
+	err := p.err
 	p.mu.Unlock()
-	revision, err := domain.NewSourceRevision(request.ApplicationID, request.Kind, request.Locator, request.Ref, "", "sha256:"+strings.Repeat("c", 64), "memory://source-workspace", time.Now().UTC())
+	if err != nil {
+		return contracts.PrepareSourceResult{}, err
+	}
+	commit := ""
+	if request.Kind == domain.SourceGitHTTPS {
+		commit = strings.Repeat("d", 40)
+	}
+	revision, err := domain.NewSourceRevision(request.ApplicationID, request.Kind, request.Locator, request.Ref, commit, "sha256:"+strings.Repeat("c", 64), "memory://source-workspace", time.Now().UTC())
 	if err != nil {
 		return contracts.PrepareSourceResult{}, err
 	}
@@ -123,6 +132,43 @@ func TestControllerCreateWithUploadCarriesImmutableSourceRevision(t *testing.T) 
 	changed := &CreateApplicationSource{Kind: CreateApplicationSourceUpload, UploadID: "upload_2"}
 	if _, err := controller.CreateApplicationWithSource(context.Background(), "upload app", changed, "upload-create"); !errors.Is(err, ErrIdempotencyConflict) {
 		t.Fatalf("changed source idempotency error=%v", err)
+	}
+}
+
+func TestControllerCreateWithPublicGitReplaysPreparedRevision(t *testing.T) {
+	repository := NewMemoryRepository()
+	preparer := &testSourcePreparer{}
+	controller := NewController(repository)
+	controller.SetSourcePreparer(preparer)
+	source := &CreateApplicationSource{Kind: CreateApplicationSourceGit, RepositoryURL: "https://git.public.example/project/repo.git", Ref: "main"}
+	first, err := controller.CreateApplicationWithSource(context.Background(), "git app", source, "git-create")
+	if err != nil || first.SourceRevisionID.Empty() {
+		t.Fatalf("first=%+v err=%v", first, err)
+	}
+	replay, err := controller.CreateApplicationWithSource(context.Background(), "git app", source, "git-create")
+	if err != nil || replay.Application.ID != first.Application.ID || replay.SourceRevisionID != first.SourceRevisionID {
+		t.Fatalf("replay=%+v err=%v", replay, err)
+	}
+	if prepares, releases := preparer.counts(); prepares != 1 || releases != 0 {
+		t.Fatalf("Git replay source side effect: prepares=%d releases=%d", prepares, releases)
+	}
+	changed := &CreateApplicationSource{Kind: CreateApplicationSourceGit, RepositoryURL: source.RepositoryURL, Ref: "release"}
+	if _, err := controller.CreateApplicationWithSource(context.Background(), "git app", changed, "git-create"); !errors.Is(err, ErrIdempotencyConflict) {
+		t.Fatalf("changed Git source idempotency error=%v", err)
+	}
+}
+
+func TestControllerPublicGitPreparationFailureCreatesNoApplicationFacts(t *testing.T) {
+	repository := NewMemoryRepository()
+	controller := NewController(repository)
+	controller.SetSourcePreparer(&testSourcePreparer{err: domain.NewError(domain.ErrUnavailable, "fixture Git unavailable")})
+	source := &CreateApplicationSource{Kind: CreateApplicationSourceGit, RepositoryURL: "https://git.public.org/project/repo.git", Ref: "main"}
+	if _, err := controller.CreateApplicationWithSource(context.Background(), "broken Git", source, "git-failure"); err == nil {
+		t.Fatal("expected Git source preparation failure")
+	}
+	applications, err := repository.ListApplications(context.Background())
+	if err != nil || len(applications) != 0 {
+		t.Fatalf("failed Git source created applications=%+v err=%v", applications, err)
 	}
 }
 
@@ -229,6 +275,21 @@ func TestControllerCompensatesFailedSourceCreateWithoutWorkspaceOrphan(t *testin
 	}
 	if len(entries) != 0 {
 		t.Fatalf("failed source create left workspace entries: %#v", entries)
+	}
+}
+
+func TestControllerCompensatesFailedPublicGitCreate(t *testing.T) {
+	base := NewMemoryRepository()
+	createFailure := errors.New("forced Git application transaction failure")
+	preparer := &testSourcePreparer{}
+	controller := NewController(failingCreateRepository{MemoryRepository: base, err: createFailure})
+	controller.SetSourcePreparer(preparer)
+	source := &CreateApplicationSource{Kind: CreateApplicationSourceGit, RepositoryURL: "https://git.public.org/project/repo.git", Ref: "main"}
+	if _, err := controller.CreateApplicationWithSource(context.Background(), "git cleanup", source, "git-cleanup-failure"); !errors.Is(err, createFailure) {
+		t.Fatalf("create failure=%v", err)
+	}
+	if prepares, releases := preparer.counts(); prepares != 1 || releases != 1 {
+		t.Fatalf("Git cleanup side effect: prepares=%d releases=%d", prepares, releases)
 	}
 }
 

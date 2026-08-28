@@ -93,7 +93,10 @@ class Gate3OpenAPIContractTests(unittest.TestCase):
         self.assertEqual(set(create["required"]), {"name", "source"})
         variants = [self.components["schemas"][item["$ref"].rsplit("/", 1)[1]] for item in create["properties"]["source"]["oneOf"]]
         self.assertEqual({variant["properties"]["kind"]["enum"][0] for variant in variants}, {"git", "upload"})
-        self.assertIn("501", self.paths["/api/v1/applications"]["post"]["responses"])
+        create_operation = self.paths["/api/v1/applications"]["post"]
+        self.assertEqual(create_operation["x-open-card-handler-status"], "implemented")
+        self.assertNotIn("501", create_operation["responses"])
+        self.assertIn("two-resolver", create_operation["description"])
 
     def test_sse_reconnect_and_cloud_credential_exclusion_are_declared(self) -> None:
         for path in ("/api/v1/events", "/api/v1/operations/{operationId}/events"):

@@ -13,6 +13,7 @@ import (
 
 	"github.com/open-card/open-card/internal/contracts"
 	"github.com/open-card/open-card/internal/domain"
+	"github.com/open-card/open-card/internal/foundation"
 )
 
 var (
@@ -91,6 +92,10 @@ func (s CreateApplicationSource) Validate() error {
 		if !s.UploadID.Empty() || s.RepositoryURL == "" || s.Ref == "" {
 			return domain.ValidationError("git application source requires repository_url and ref")
 		}
+		git, err := foundation.NormalizeGitSource(s.RepositoryURL, s.Ref)
+		if err != nil || git.Scheme != foundation.GitHTTPS {
+			return domain.ValidationError("git application source requires a canonical HTTPS repository and ref")
+		}
 	default:
 		return domain.ValidationError("application source kind is unsupported")
 	}
@@ -153,10 +158,10 @@ func (c *Controller) CreateApplicationWithSource(ctx context.Context, name strin
 	}
 	digestBytes := sha256.Sum256([]byte(digestInput))
 	preflight := CreateApplicationPreflight{IdempotencyKey: idempotencyKey, RequestDigest: "sha256:" + hex.EncodeToString(digestBytes[:]), Source: source, Now: now}
-	if source != nil && source.Kind == CreateApplicationSourceUpload {
-		// MVP has one controller process. Serializing upload consumption closes
-		// the gap between the durable preflight and the source provider's
-		// filesystem publication without widening the PostgreSQL transaction.
+	if source != nil {
+		// MVP has one controller process. Serializing source creation closes the
+		// gap between durable preflight and filesystem publication without
+		// widening the PostgreSQL transaction.
 		c.sourceCreateMu.Lock()
 		defer c.sourceCreateMu.Unlock()
 	}
@@ -182,15 +187,24 @@ func (c *Controller) CreateApplicationWithSource(ctx context.Context, name strin
 		return CreateApplicationResult{}, domain.WrapError(domain.ErrUnavailable, "generate task id", err)
 	}
 	var preparedSource *domain.SourceRevision
-	if source != nil && source.Kind == CreateApplicationSourceUpload {
+	if source != nil {
 		if c.sourcePreparer == nil {
 			return CreateApplicationResult{}, domain.NewError(domain.ErrUnavailable, "source preparation is unavailable")
 		}
-		prepared, prepareErr := c.sourcePreparer.Prepare(ctx, contracts.PrepareSourceRequest{ApplicationID: application.ID, Kind: domain.SourceUpload, Locator: "upload://" + source.UploadID.String(), WorkspaceRef: "memory://" + source.UploadID.String(), Operation: contracts.OperationContext{IdempotencyKey: idempotencyKey + ":source:" + application.ID.String(), Actor: "control-plane"}})
+		prepareRequest := contracts.PrepareSourceRequest{ApplicationID: application.ID, WorkspaceRef: "memory://" + application.ID.String(), Operation: contracts.OperationContext{IdempotencyKey: idempotencyKey + ":source:" + application.ID.String(), Actor: "control-plane"}}
+		switch source.Kind {
+		case CreateApplicationSourceUpload:
+			prepareRequest.Kind, prepareRequest.Locator = domain.SourceUpload, "upload://"+source.UploadID.String()
+		case CreateApplicationSourceGit:
+			prepareRequest.Kind, prepareRequest.Locator, prepareRequest.Ref = domain.SourceGitHTTPS, source.RepositoryURL, source.Ref
+		default:
+			return CreateApplicationResult{}, domain.ValidationError("application source kind is unsupported")
+		}
+		prepared, prepareErr := c.sourcePreparer.Prepare(ctx, prepareRequest)
 		if prepareErr != nil {
 			return CreateApplicationResult{}, prepareErr
 		}
-		if err := prepared.Revision.Validate(); err != nil || prepared.Revision.ApplicationID != application.ID || prepared.Revision.Kind != domain.SourceUpload || prepared.Revision.Locator != "upload://"+source.UploadID.String() {
+		if err := prepared.Revision.Validate(); err != nil || prepared.Revision.ApplicationID != application.ID || !PreparedSourceMatches(*source, prepared.Revision) {
 			return CreateApplicationResult{}, domain.NewError(domain.ErrUnavailable, "source preparation returned an invalid revision")
 		}
 		preparedSource = &prepared.Revision
@@ -219,6 +233,21 @@ func (c *Controller) CreateApplicationWithSource(ctx context.Context, name strin
 		return result, err
 	}
 	return c.compensateFailedSourceCreate(ctx, preflight, *preparedSource, err)
+}
+
+// PreparedSourceMatches ensures the source provider's immutable result is the
+// exact source the application request named, rather than merely a valid but
+// different workspace.
+func PreparedSourceMatches(source CreateApplicationSource, revision domain.SourceRevision) bool {
+	switch source.Kind {
+	case CreateApplicationSourceUpload:
+		return revision.Kind == domain.SourceUpload && revision.Locator == "upload://"+source.UploadID.String()
+	case CreateApplicationSourceGit:
+		git, err := foundation.NormalizeGitSource(source.RepositoryURL, source.Ref)
+		return err == nil && git.Scheme == foundation.GitHTTPS && revision.Kind == domain.SourceGitHTTPS && revision.Locator == git.Locator && revision.Ref == git.Ref && revision.Commit != ""
+	default:
+		return false
+	}
 }
 
 // compensateFailedSourceCreate first resolves the durable outcome. It releases

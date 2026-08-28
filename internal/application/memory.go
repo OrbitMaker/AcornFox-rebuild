@@ -103,7 +103,14 @@ func (r *MemoryRepository) CreateApplication(_ context.Context, record CreateApp
 			upload.Status, upload.ClaimedApplicationID, upload.ClaimedSourceID, upload.UpdatedAt = domain.SourceUploadClaimed, record.Application.ID, record.PreparedSource.ID, record.Application.CreatedAt
 			r.uploads[upload.ID] = upload
 		case CreateApplicationSourceGit:
-			return CreateApplicationResult{}, domain.NewError(domain.ErrUnsupportedCapability, "git application creation is not implemented")
+			if record.PreparedSource == nil || !PreparedSourceMatches(*record.Source, *record.PreparedSource) {
+				return CreateApplicationResult{}, domain.ValidationError("git source requires a prepared immutable source revision")
+			}
+			if err := record.PreparedSource.Validate(); err != nil {
+				return CreateApplicationResult{}, err
+			}
+		default:
+			return CreateApplicationResult{}, domain.ValidationError("application source kind is unsupported")
 		}
 	}
 	r.nextSequence++

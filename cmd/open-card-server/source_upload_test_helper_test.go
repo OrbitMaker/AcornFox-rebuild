@@ -32,7 +32,11 @@ func (testSourcePreparer) Metadata(context.Context) contracts.ProviderMetadata {
 }
 
 func (testSourcePreparer) Prepare(_ context.Context, request contracts.PrepareSourceRequest) (contracts.PrepareSourceResult, error) {
-	revision, err := domain.NewSourceRevision(request.ApplicationID, request.Kind, request.Locator, request.Ref, "", "sha256:"+strings.Repeat("c", 64), "memory://source-workspace", time.Now().UTC())
+	commit := ""
+	if request.Kind == domain.SourceGitHTTPS {
+		commit = strings.Repeat("d", 40)
+	}
+	revision, err := domain.NewSourceRevision(request.ApplicationID, request.Kind, request.Locator, request.Ref, commit, "sha256:"+strings.Repeat("c", 64), "memory://source-workspace", time.Now().UTC())
 	if err != nil {
 		return contracts.PrepareSourceResult{}, err
 	}

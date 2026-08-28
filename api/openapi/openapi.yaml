@@ -112,6 +112,11 @@ paths:
           $ref: '#/components/responses/APIUpgradeRequired'
     post:
       operationId: createApplication
+      x-open-card-handler-status: implemented
+      description: >-
+        Creates an application from a claimed upload or a public HTTPS Git
+        repository. Git requires an explicit two-resolver public-DNS policy;
+        missing or unavailable resolver configuration fails closed with 503.
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
         - $ref: '#/components/parameters/CSRFHeader'
@@ -144,8 +149,6 @@ paths:
               $ref: '#/components/headers/APINegotiatedVersion'
         '422': {$ref: '#/components/responses/ValidationFailed'}
         '503': {$ref: '#/components/responses/DependencyUnavailable'}
-        '501':
-          description: Git application creation is declared but not yet backed by a real preparation workflow.
         '426':
           $ref: '#/components/responses/APIUpgradeRequired'
   /api/v1/applications/{applicationId}:

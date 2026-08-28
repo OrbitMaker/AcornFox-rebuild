@@ -17,6 +17,33 @@ import (
 	"github.com/open-card/open-card/internal/foundation"
 )
 
+// boundedGitObjectDirectory caps the transient bare repository before archive
+// extraction. It is deliberately separate from the tree limits: a hostile
+// server must not retain an unbounded pack/object fan-out merely because its
+// final worktree would be small. The directory is removed by materializeGit on
+// every success or failure path.
+func boundedGitObjectDirectory(root string, limits foundation.ArchiveLimits) error {
+	var files, bytes int64
+	return filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil || entry.Type()&fs.ModeSymlink != 0 {
+			return errGitTooLarge
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil || !info.Mode().IsRegular() || info.Size() < 0 {
+			return errGitTooLarge
+		}
+		files++
+		if files > limits.MaxFiles || info.Size() > limits.MaxUnpackedBytes-bytes {
+			return errGitTooLarge
+		}
+		bytes += info.Size()
+		return nil
+	})
+}
+
 // copyDirectory copies a local upload through a staging directory. It never
 // follows a symlink and checks the actual bytes copied, rather than trusting
 // file metadata that may change while an upload handler is finalizing a file.

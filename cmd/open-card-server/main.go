@@ -137,7 +137,7 @@ func main() {
 			if err != nil {
 				log.Fatal(err)
 			}
-			sourceProvider, err := source.New(source.Config{UploadRoot: uploadRoot, WorkspaceRoot: workspaceRoot})
+			sourceProvider, err := source.New(source.Config{UploadRoot: uploadRoot, WorkspaceRoot: workspaceRoot, GitResolverEndpoints: sourceGitResolverEndpoints(os.Getenv("OPEN_CARD_SOURCE_GIT_RESOLVERS"))})
 			if err != nil {
 				log.Fatal(err)
 			}
@@ -457,4 +457,18 @@ func main() {
 		log.Fatal(err)
 	}
 	_ = server.Shutdown(context.Background())
+}
+
+// sourceGitResolverEndpoints has no default: an empty value leaves public Git
+// disabled while preserving upload-only source creation. Resolver addresses
+// themselves are validated by source.New as explicit public IP:port values.
+func sourceGitResolverEndpoints(raw string) []string {
+	parts := strings.Split(raw, ",")
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if value := strings.TrimSpace(part); value != "" {
+			result = append(result, value)
+		}
+	}
+	return result
 }

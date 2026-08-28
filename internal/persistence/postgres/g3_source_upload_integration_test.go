@@ -27,6 +27,36 @@ type countingSourceProvider struct {
 	prepares int
 }
 
+type postgresGitSourcePreparer struct {
+	mu       sync.Mutex
+	prepares int
+}
+
+func (*postgresGitSourcePreparer) Metadata(context.Context) contracts.ProviderMetadata {
+	return contracts.ProviderMetadata{Name: "postgres-git-source", Version: "test", ContractVersion: contracts.ContractAPIVersion}
+}
+
+func (p *postgresGitSourcePreparer) Prepare(_ context.Context, request contracts.PrepareSourceRequest) (contracts.PrepareSourceResult, error) {
+	p.mu.Lock()
+	p.prepares++
+	p.mu.Unlock()
+	revision, err := domain.NewSourceRevision(request.ApplicationID, request.Kind, request.Locator, request.Ref, strings.Repeat("d", 40), "sha256:"+strings.Repeat("e", 64), "memory://postgres-git-workspace", time.Now().UTC())
+	if err != nil {
+		return contracts.PrepareSourceResult{}, err
+	}
+	return contracts.PrepareSourceResult{Revision: revision}, nil
+}
+
+func (*postgresGitSourcePreparer) Release(context.Context, contracts.ReleaseSourceRequest) error {
+	return nil
+}
+
+func (p *postgresGitSourcePreparer) prepareCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.prepares
+}
+
 func (p *countingSourceProvider) Prepare(ctx context.Context, request contracts.PrepareSourceRequest) (contracts.PrepareSourceResult, error) {
 	p.mu.Lock()
 	p.prepares++
@@ -161,6 +191,25 @@ func TestG3SourceUploadPersistsAndApplicationClaimIsAtomic(t *testing.T) {
 	var applicationCount int
 	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM applications`).Scan(&applicationCount); err != nil || applicationCount != 1 {
 		t.Fatalf("atomic claim application count=%d err=%v", applicationCount, err)
+	}
+
+	gitPreparer := &postgresGitSourcePreparer{}
+	gitController := application.NewController(store)
+	gitController.SetSourcePreparer(gitPreparer)
+	gitSource := &application.CreateApplicationSource{Kind: application.CreateApplicationSourceGit, RepositoryURL: "https://git.public.org/project/repo.git", Ref: "main"}
+	gitCreated, err := gitController.CreateApplicationWithSource(ctx, "git-backed", gitSource, "create-git")
+	if err != nil || gitCreated.SourceRevisionID.Empty() {
+		t.Fatalf("Git create=%+v err=%v", gitCreated, err)
+	}
+	var provider, commit, sourceRef, lifecycle string
+	if err := db.QueryRowContext(ctx, `SELECT provider,git_commit,source_ref,workspace_lifecycle FROM source_revisions WHERE id=$1`, gitCreated.SourceRevisionID.String()).Scan(&provider, &commit, &sourceRef, &lifecycle); err != nil || provider != "git" || commit != strings.Repeat("d", 40) || sourceRef != "main" || lifecycle != string(WorkspacePrepared) {
+		t.Fatalf("Git source persistence provider=%q commit=%q ref=%q lifecycle=%q err=%v", provider, commit, sourceRef, lifecycle, err)
+	}
+	if replayed, err := gitController.CreateApplicationWithSource(ctx, "git-backed", gitSource, "create-git"); err != nil || replayed.Application.ID != gitCreated.Application.ID || replayed.SourceRevisionID != gitCreated.SourceRevisionID || gitPreparer.prepareCount() != 1 {
+		t.Fatalf("Git replay=%+v err=%v prepares=%d", replayed, err, gitPreparer.prepareCount())
+	}
+	if _, err := gitController.CreateApplicationWithSource(ctx, "git-backed", &application.CreateApplicationSource{Kind: application.CreateApplicationSourceGit, RepositoryURL: gitSource.RepositoryURL, Ref: "release"}, "create-git"); !errors.Is(err, ErrIdempotencyConflict) {
+		t.Fatalf("Git idempotency conflict=%v", err)
 	}
 }
 

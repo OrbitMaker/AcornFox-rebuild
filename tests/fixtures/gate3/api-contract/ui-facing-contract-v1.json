@@ -8,6 +8,7 @@
     "POST /api/v1/applications/{applicationId}/domains/{domainId}/verify": "partial",
     "DELETE /api/v1/applications/{applicationId}/domains/{domainId}": "partial",
     "GET /api/v1/applications/{applicationId}/access": "partial",
+    "POST /api/v1/applications": "implemented",
     "POST /api/v1/source-uploads": "implemented",
     "GET /api/v1/source-uploads/{uploadId}": "implemented"
   },
@@ -21,6 +22,7 @@
     "POST /api/v1/applications/{applicationId}/domains/{domainId}/verify": "verifyApplicationDomain",
     "DELETE /api/v1/applications/{applicationId}/domains/{domainId}": "unbindApplicationDomain",
     "GET /api/v1/applications/{applicationId}/access": "getApplicationAccess",
+    "POST /api/v1/applications": "createApplication",
     "POST /api/v1/source-uploads": "createSourceUpload",
     "GET /api/v1/source-uploads/{uploadId}": "getSourceUpload"
   },
@@ -29,6 +31,7 @@
     "bindApplicationCustomDomain",
     "verifyApplicationDomain",
     "unbindApplicationDomain",
+    "createApplication",
     "createSourceUpload"
   ],
   "error_responses": {

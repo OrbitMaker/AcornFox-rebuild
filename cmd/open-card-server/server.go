@@ -337,17 +337,13 @@ func (s *Server) handleApplications(writer http.ResponseWriter, request *http.Re
 		var source *application.CreateApplicationSource
 		if input.Source != nil {
 			source = &application.CreateApplicationSource{Kind: application.CreateApplicationSourceKind(input.Source.Kind), UploadID: domain.ID(input.Source.UploadID), RepositoryURL: input.Source.RepositoryURL, Ref: input.Source.Ref}
-			if source.Kind == application.CreateApplicationSourceGit {
-				writeJSONError(writer, http.StatusNotImplemented, "source_git_not_implemented", "git application creation is not implemented")
-				return
-			}
 		} else {
 			writeJSONError(writer, http.StatusUnprocessableEntity, "validation_failed", "source is required")
 			return
 		}
 		result, err := s.controller.CreateApplicationWithSource(request.Context(), input.Name, source, request.Header.Get("Idempotency-Key"))
 		if err != nil {
-			writeApplicationError(writer, err)
+			writeCreateApplicationError(writer, err)
 			return
 		}
 		s.broker.publish(result.Event)
@@ -505,6 +501,19 @@ func writeApplicationError(writer http.ResponseWriter, err error) {
 	default:
 		writeDomainError(writer, err)
 	}
+}
+
+func writeCreateApplicationError(writer http.ResponseWriter, err error) {
+	var providerError *contracts.ProviderError
+	if errors.As(err, &providerError) && providerError.Code == contracts.ErrValidation {
+		writeJSONError(writer, http.StatusUnprocessableEntity, string(providerError.Code), providerError.Message)
+		return
+	}
+	if domain.IsCode(err, domain.ErrValidation) {
+		writeJSONError(writer, http.StatusUnprocessableEntity, string(domain.ErrValidation), "application source is invalid")
+		return
+	}
+	writeApplicationError(writer, err)
 }
 
 func writeDomainError(writer http.ResponseWriter, err error) {

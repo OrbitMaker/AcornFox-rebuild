@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/open-card/open-card/internal/contracts"
 	"github.com/open-card/open-card/internal/domain"
 	"github.com/open-card/open-card/internal/persistence/postgres"
 	"github.com/open-card/open-card/internal/providers/sourceupload"
@@ -144,8 +145,8 @@ func TestG3SourceUploadHTTPArchiveKeepsRawDigest(t *testing.T) {
 	}
 }
 
-func TestCreateApplicationGitSourceIsExplicitlyNotImplemented(t *testing.T) {
-	server := NewServer()
+func TestCreateApplicationGitSourceUsesPreparedRevision(t *testing.T) {
+	server := newServerWithReadySourceUpload(t)
 	now := time.Unix(1_700_000_000, 0).UTC()
 	_, session, csrf := attachTestAdministratorTokens(t, server, &now)
 	request := controlPlaneRequest(http.MethodPost, "/api/v1/applications", strings.NewReader(`{"name":"git app","source":{"kind":"git","repository_url":"https://example.test/repo.git","ref":"main"}}`), session)
@@ -154,8 +155,36 @@ func TestCreateApplicationGitSourceIsExplicitlyNotImplemented(t *testing.T) {
 	addControlPlaneWriteProof(request, csrf)
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, request)
-	if response.Code != http.StatusNotImplemented || !strings.Contains(response.Body.String(), "source_git_not_implemented") {
+	if response.Code != http.StatusCreated || !strings.Contains(response.Body.String(), `"source_revision_id":"src_`) {
 		t.Fatalf("git source=%d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestCreateApplicationGitSourceFailsClosedWhenSourceProviderIsUnconfigured(t *testing.T) {
+	server := NewServer()
+	now := time.Unix(1_700_000_000, 0).UTC()
+	_, session, csrf := attachTestAdministratorTokens(t, server, &now)
+	request := controlPlaneRequest(http.MethodPost, "/api/v1/applications", strings.NewReader(`{"name":"git app","source":{"kind":"git","repository_url":"https://git.public.org/repo.git","ref":"main"}}`), session)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Idempotency-Key", "git-source-unconfigured")
+	addControlPlaneWriteProof(request, csrf)
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable || strings.Contains(response.Body.String(), "501") {
+		t.Fatalf("unconfigured Git source=%d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestCreateApplicationValidationUsesOpenAPI422Contract(t *testing.T) {
+	for _, err := range []error{
+		domain.ValidationError("invalid Git source"),
+		&contracts.ProviderError{Code: contracts.ErrValidation, Message: "public Git source was rejected"},
+	} {
+		response := httptest.NewRecorder()
+		writeCreateApplicationError(response, err)
+		if response.Code != http.StatusUnprocessableEntity || !strings.Contains(response.Body.String(), "validation") {
+			t.Fatalf("create validation status=%d body=%s", response.Code, response.Body.String())
+		}
 	}
 }
 

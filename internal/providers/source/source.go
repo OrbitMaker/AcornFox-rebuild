@@ -7,6 +7,7 @@ package source
 
 import (
 	"archive/tar"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -14,10 +15,12 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -45,7 +48,13 @@ type Config struct {
 	WorkspaceRoot string
 	Limits        foundation.ArchiveLimits
 	GitBinary     string
-	Clock         func() time.Time
+	// GitResolvers and GitResolverEndpoints are a fail-closed public-DNS
+	// boundary. When both are empty, uploads remain available but public Git
+	// preparation is deliberately unavailable rather than using the host
+	// resolver.
+	GitResolvers         []GitResolver
+	GitResolverEndpoints []string
+	Clock                func() time.Time
 }
 
 // Provider is a concrete contracts.SourceProvider. A mutex intentionally
@@ -57,7 +66,15 @@ type Provider struct {
 	workspaceRoot string
 	limits        foundation.ArchiveLimits
 	gitBinary     string
+	gitResolvers  []GitResolver
 	clock         func() time.Time
+
+	// testGitFixture and gitTLSCAFile have no Config surface. They exist only
+	// for the package-local HTTPS fixture which proves Git's TLS/pinned-address
+	// behavior without making a local-address or custom-CA escape available to
+	// the production process.
+	testGitFixture bool
+	gitTLSCAFile   string
 
 	mu    sync.Mutex
 	byKey map[string]storedResult
@@ -91,6 +108,10 @@ func New(config Config) (*Provider, error) {
 	if gitBinary == "" {
 		gitBinary = "git"
 	}
+	gitResolvers, err := configuredGitResolvers(config.GitResolvers, config.GitResolverEndpoints)
+	if err != nil {
+		return nil, fmt.Errorf("public Git resolvers: %w", err)
+	}
 	clock := config.Clock
 	if clock == nil {
 		clock = time.Now
@@ -104,7 +125,7 @@ func New(config Config) (*Provider, error) {
 			SensitiveInputs: []string{"source.locator", "source.workspace_ref"},
 		},
 		uploadRoot: uploadRoot, workspaceRoot: workspaceRoot, limits: limits,
-		gitBinary: gitBinary, clock: clock, byKey: make(map[string]storedResult),
+		gitBinary: gitBinary, gitResolvers: gitResolvers, clock: clock, byKey: make(map[string]storedResult),
 	}, nil
 }
 
@@ -266,7 +287,7 @@ func (p *Provider) requestFingerprint(request contracts.PrepareSourceRequest) (s
 	parts := []string{string(request.ApplicationID), string(request.Kind), strings.TrimSpace(request.Ref), strings.TrimSpace(request.ContentDigest)}
 	switch request.Kind {
 	case domain.SourceGitHTTPS:
-		git, err := foundation.NormalizeGitSource(request.Locator, request.Ref)
+		git, err := p.normalizeGitSource(request.Locator, request.Ref)
 		if err != nil || git.Scheme != foundation.GitHTTPS {
 			return "", errUnsupportedSource
 		}
@@ -287,11 +308,17 @@ func (p *Provider) requestFingerprint(request contracts.PrepareSourceRequest) (s
 }
 
 func (p *Provider) materializeGit(ctx context.Context, stage string, request contracts.PrepareSourceRequest) (string, string, string, error) {
-	git, err := foundation.NormalizeGitSource(request.Locator, request.Ref)
+	git, err := p.normalizeGitSource(request.Locator, request.Ref)
 	if err != nil || git.Scheme != foundation.GitHTTPS {
 		return "", "", "", errUnsupportedSource
 	}
-	commit, err := p.resolveCommit(ctx, git)
+	gitContext, cancel := context.WithTimeout(ctx, defaultGitTimeout)
+	defer cancel()
+	authority, err := p.resolveGitAuthority(gitContext, git)
+	if err != nil {
+		return "", "", "", err
+	}
+	commit, err := p.resolveCommit(gitContext, git, authority)
 	if err != nil {
 		return "", "", "", err
 	}
@@ -306,23 +333,32 @@ func (p *Provider) materializeGit(ctx context.Context, stage string, request con
 		}
 		return "", "", "", errGitUnavailable
 	}
-	if err := p.git(ctx, gitDir, "fetch", "--depth=1", git.Locator, commit); err != nil {
-		if ctx.Err() != nil {
-			return "", "", "", ctx.Err()
+	if err := p.gitPinnedFetch(gitContext, gitDir, authority, "fetch", "--depth=1", "--no-tags", git.Locator, commit); err != nil {
+		if gitContext.Err() != nil {
+			return "", "", "", gitContext.Err()
+		}
+		if errors.Is(err, errGitTooLarge) {
+			return "", "", "", err
 		}
 		return "", "", "", errGitUnavailable
 	}
-	if err := p.extractGitArchive(ctx, gitDir, commit, stage); err != nil {
+	if err := boundedGitObjectDirectory(gitDir, p.limits); err != nil {
+		return "", "", "", err
+	}
+	if err := p.extractGitArchive(gitContext, gitDir, commit, stage); err != nil {
 		return "", "", "", err
 	}
 	return git.Locator, git.Ref, commit, nil
 }
 
-func (p *Provider) resolveCommit(ctx context.Context, git foundation.GitSource) (string, error) {
-	output, err := p.gitOutput(ctx, "", "ls-remote", "--refs", git.Locator, git.Ref)
+func (p *Provider) resolveCommit(ctx context.Context, git foundation.GitSource, authority gitAuthority) (string, error) {
+	output, err := p.gitOutputPinned(ctx, "", authority, "ls-remote", "--refs", "--exit-code", git.Locator, git.Ref)
 	if err != nil {
 		if ctx.Err() != nil {
 			return "", ctx.Err()
+		}
+		if errors.Is(err, errGitTooLarge) {
+			return "", err
 		}
 		return "", errGitUnavailable
 	}
@@ -410,7 +446,6 @@ func (p *Provider) storedUploadPath(locator string) (string, error) {
 	return path, nil
 }
 
-
 func (p *Provider) publish(stage, digest string) (string, error) {
 	final := filepath.Join(p.workspaceRoot, digest)
 	if existing, err := os.Lstat(final); err == nil {
@@ -446,7 +481,113 @@ func (p *Provider) git(ctx context.Context, dir string, args ...string) error {
 	return err
 }
 
+// gitPinnedFetch monitors the transient bare repository while Git is still
+// receiving network data. Archive limits are enforced again after completion,
+// but this loop bounds retained pack/object growth instead of waiting for a
+// hostile remote to finish an arbitrarily large transfer.
+func (p *Provider) gitPinnedFetch(ctx context.Context, dir string, authority gitAuthority, args ...string) error {
+	command := p.gitCommand(ctx, dir, p.pinnedGitConfig(authority), args...)
+	command.Stdout, command.Stderr = io.Discard, io.Discard
+	startGitProcessGroup(command)
+	if err := command.Start(); err != nil {
+		return err
+	}
+	completed := make(chan error, 1)
+	go func() { completed <- command.Wait() }()
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case err := <-completed:
+			if err != nil {
+				return err
+			}
+			return boundedGitObjectDirectory(dir, p.limits)
+		case <-ticker.C:
+			if err := boundedGitObjectDirectory(dir, p.limits); err != nil {
+				stopGitProcessGroup(command)
+				<-completed
+				return errGitTooLarge
+			}
+		case <-ctx.Done():
+			stopGitProcessGroup(command)
+			<-completed
+			return ctx.Err()
+		}
+	}
+}
+
 func (p *Provider) gitOutput(ctx context.Context, dir string, args ...string) ([]byte, error) {
+	return p.gitOutputWithConfig(ctx, dir, nil, args...)
+}
+
+func (p *Provider) gitOutputPinned(ctx context.Context, dir string, authority gitAuthority, args ...string) ([]byte, error) {
+	return p.gitOutputWithConfig(ctx, dir, p.pinnedGitConfig(authority), args...)
+}
+
+func (p *Provider) pinnedGitConfig(authority gitAuthority) []string {
+	config := []string{
+		"protocol.allow=never",
+		"protocol.https.allow=always",
+		"protocol.http.allow=never",
+		"protocol.file.allow=never",
+		"protocol.ssh.allow=never",
+		"protocol.git.allow=never",
+		"protocol.ext.allow=never",
+		"http.followRedirects=false",
+		"http.sslVerify=true",
+		"http.curloptResolve=",
+		"http.curloptResolve=" + authority.host + ":" + strconv.Itoa(int(authority.port)) + ":" + joinGitAddresses(authority.addresses),
+		"fetch.recurseSubmodules=false",
+	}
+	if p.gitTLSCAFile != "" {
+		config = append(config, "http.sslCAInfo="+p.gitTLSCAFile)
+	}
+	return config
+}
+
+func (p *Provider) gitOutputWithConfig(ctx context.Context, dir string, config []string, args ...string) ([]byte, error) {
+	command := p.gitCommand(ctx, dir, config, args...)
+	stdout := boundedGitOutput{limit: p.limits.MaxUnpackedBytes}
+	command.Stdout, command.Stderr = &stdout, io.Discard
+	startGitProcessGroup(command)
+	if err := command.Start(); err != nil {
+		return nil, err
+	}
+	completed := make(chan error, 1)
+	go func() { completed <- command.Wait() }()
+	select {
+	case err := <-completed:
+		if stdout.exceeded {
+			return stdout.Bytes(), errGitTooLarge
+		}
+		return stdout.Bytes(), err
+	case <-ctx.Done():
+		stopGitProcessGroup(command)
+		<-completed
+		return stdout.Bytes(), ctx.Err()
+	}
+}
+
+type boundedGitOutput struct {
+	bytes.Buffer
+	limit    int64
+	exceeded bool
+}
+
+func (b *boundedGitOutput) Write(value []byte) (int, error) {
+	if b.limit <= 0 || int64(len(value)) > b.limit-int64(b.Len()) {
+		remaining := b.limit - int64(b.Len())
+		if remaining > 0 {
+			_, _ = b.Buffer.Write(value[:remaining])
+		}
+		b.exceeded = true
+		return len(value), errGitTooLarge
+	}
+	return b.Buffer.Write(value)
+}
+
+func (p *Provider) gitCommand(ctx context.Context, dir string, config []string, args ...string) *exec.Cmd {
 	commandArgs := make([]string, 0, len(args)+6)
 	if dir != "" {
 		commandArgs = append(commandArgs, "-C", dir)
@@ -456,10 +597,21 @@ func (p *Provider) gitOutput(ctx context.Context, dir string, args ...string) ([
 		"-c", "core.hooksPath=/dev/null",
 		"-c", "protocol.file.allow=never",
 	)
+	for _, item := range config {
+		commandArgs = append(commandArgs, "-c", item)
+	}
 	commandArgs = append(commandArgs, args...)
 	command := exec.CommandContext(ctx, p.gitBinary, commandArgs...)
 	command.Env = gitEnvironment()
-	return command.Output()
+	return command
+}
+
+func joinGitAddresses(addresses []netip.Addr) string {
+	values := make([]string, 0, len(addresses))
+	for _, address := range addresses {
+		values = append(values, address.String())
+	}
+	return strings.Join(values, ",")
 }
 
 func gitEnvironment() []string {
@@ -473,15 +625,19 @@ func gitEnvironment() []string {
 		"PATH=" + path,
 		"HOME=" + os.TempDir(),
 		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_CONFIG_GLOBAL=/dev/null",
+		"GIT_ATTR_NOSYSTEM=1",
 		"GIT_TERMINAL_PROMPT=0",
 		"GIT_ASKPASS=/bin/false",
 		"GCM_INTERACTIVE=Never",
+		"GIT_LFS_SKIP_SMUDGE=1",
 	}
 }
 
 var (
 	errGitUnavailable       = errors.New("git source could not be read")
 	errGitUnresolved        = errors.New("git reference could not be resolved")
+	errGitTooLarge          = errors.New("git source exceeded bounded object limits")
 	errUploadRejected       = errors.New("upload source was rejected")
 	errWorkspaceUnavailable = errors.New("source workspace unavailable")
 )
@@ -496,6 +652,14 @@ func (p *Provider) classify(operation contracts.OperationContext, err error) err
 		return p.failure(operation, contracts.ErrUnavailable, "git source could not be read", nil)
 	case errors.Is(err, errGitUnresolved):
 		return p.failure(operation, contracts.ErrNotFound, "git reference could not be resolved", nil)
+	case errors.Is(err, errGitPolicyUnavailable), errors.Is(err, errGitResolverUnavailable):
+		return p.failure(operation, contracts.ErrUnavailable, "public Git resolver policy is unavailable", nil)
+	case errors.Is(err, errGitResolverConflict):
+		return p.failure(operation, contracts.ErrConflict, "public Git resolver answers conflicted", nil)
+	case errors.Is(err, errGitRejected):
+		return p.failure(operation, contracts.ErrValidation, "public Git source was rejected", nil)
+	case errors.Is(err, errGitTooLarge):
+		return p.failure(operation, contracts.ErrValidation, "public Git source exceeded bounded limits", nil)
 	case errors.Is(err, errWorkspaceUnavailable):
 		return p.failure(operation, contracts.ErrUnavailable, "source workspace is unavailable", nil)
 	default:
