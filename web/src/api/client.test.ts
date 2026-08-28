@@ -1,17 +1,22 @@
 import { ApiRequestError, RestApiClient, StubApiClient } from './client';
 import { CSRF_COOKIE_NAME, CSRF_HEADER_NAME } from '../features/auth/auth';
+import { vi } from 'vitest';
 
 class FakeEventSource {
-  private listener?: EventListener;
+  private listeners = new Map<string, Set<EventListener>>();
   closed = false;
-  options?: EventSourceInit;
+  options?: EventSourceInit & { lastEventId?: string };
+  onerror?: ((event: Event) => void) | null;
+  onopen?: ((event: Event) => void) | null;
 
-  addEventListener(_type: string, listener: EventListener): void {
-    this.listener = listener;
+  addEventListener(type: string, listener: EventListener): void {
+    const listeners = this.listeners.get(type) ?? new Set<EventListener>();
+    listeners.add(listener);
+    this.listeners.set(type, listeners);
   }
 
-  removeEventListener(_type: string, listener: EventListener): void {
-    if (this.listener === listener) this.listener = undefined;
+  removeEventListener(type: string, listener: EventListener): void {
+    this.listeners.get(type)?.delete(listener);
   }
 
   close(): void {
@@ -19,8 +24,105 @@ class FakeEventSource {
   }
 
   emit(data: string): void {
-    this.listener?.(new MessageEvent('message', { data }));
+    this.listeners.get('message')?.forEach((listener) => listener(new MessageEvent('message', { data })));
   }
+
+  emitOpen(): void {
+    this.onopen?.(new Event('open'));
+  }
+
+  emitError(status?: number): void {
+    const event = new Event('error') as Event & { status?: number };
+    event.status = status;
+    this.onerror?.(event);
+  }
+}
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+}
+
+function domainFixture(overrides: Record<string, unknown> = {}) {
+  return {
+    id: 'domain-1',
+    hostname: 'portal.apps.example.test',
+    kind: 'platform',
+    status: 'ready',
+    cname_target: 'ingress.example.test',
+    verification: { method: 'cname', status: 'ready', name: null, value: null, observed_at: '2026-08-28T00:00:00Z' },
+    certificate: { status: 'ready', subject: 'portal.apps.example.test', not_after: '2027-08-28T00:00:00Z' },
+    failure: null,
+    serving: true,
+    ...overrides,
+  };
+}
+
+function platformDomainFixture() {
+  return {
+    status: 'ready',
+    base_domain: 'example.test',
+    console_domain: 'console.example.test',
+    wildcard_pattern: '*.apps.example.test',
+    verification: { method: 'cname', status: 'ready', name: null, value: null, observed_at: '2026-08-28T00:00:00Z' },
+    certificate: { status: 'ready', subject: '*.apps.example.test', not_after: '2027-08-28T00:00:00Z' },
+    failure: null,
+    next_action: 'ready',
+  };
+}
+
+function accessFixture() {
+  return {
+    runtimeReady: true,
+    ipFallback: '198.51.100.20',
+    platformAddress: domainFixture(),
+    customDomains: [domainFixture({ id: 'domain-2', hostname: 'portal.example.com', kind: 'custom', cname_target: 'ingress.example.test' })],
+    route: { desired: true, serving: true, route_id: 'route-1' },
+    certificate: { status: 'ready', subject: 'portal.apps.example.test', not_after: '2027-08-28T00:00:00Z' },
+    serving: true,
+  };
+}
+
+function uploadFixture(kind: 'archive' | 'directory' = 'archive') {
+  return {
+    upload_id: 'upload-1',
+    kind,
+    digest: 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    bytes: 12,
+    file_count: kind === 'archive' ? 1 : 2,
+    expires_at: '2026-08-28T01:00:00Z',
+  };
+}
+
+function publishEvent(id: string, sequence: number, operationId = 'op-live') {
+  return {
+    id,
+    operation_id: operationId,
+    application_id: 'app-live',
+    sequence,
+    occurred_at: `2026-08-28T00:00:0${sequence}Z`,
+    kind: 'operation.created',
+    status: 'preparing',
+  };
+}
+
+function streamResponse(events: unknown[]): Response {
+  const encoder = new TextEncoder();
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      events.forEach((event) => {
+        const payload = event as { id: string };
+        controller.enqueue(encoder.encode(`id: ${payload.id}\ndata: ${JSON.stringify(event)}\n\n`));
+      });
+      controller.close();
+    },
+  });
+  return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } });
+}
+
+function fakeFile(name: string, content = 'file'): File {
+  const file = new Blob([content], { type: 'text/plain' }) as File;
+  Object.defineProperty(file, 'name', { configurable: true, value: name });
+  return file;
 }
 
 describe('StubApiClient', () => {
@@ -41,6 +143,19 @@ describe('StubApiClient', () => {
     expect(events).toEqual(['preparing', 'building', 'deploying', 'succeeded']);
     expect((await client.listApplications()).items[0]?.name).toBe('Release Demo');
   }, 4_000);
+
+  it('does not claim live domain or upload capability in Stub mode', async () => {
+    const client = new StubApiClient();
+    await client.login({ username: 'admin', password: 'local-demo-password' });
+
+    await expect(client.getPlatformDomainSettings()).rejects.toMatchObject({ kind: 'unavailable', code: 'stub_unavailable' });
+    await expect(client.listApplicationDomains('app-notes')).rejects.toMatchObject({ kind: 'unavailable', code: 'stub_unavailable' });
+    await expect(client.getApplicationAccess('app-notes')).rejects.toMatchObject({ kind: 'unavailable', code: 'stub_unavailable' });
+    await expect(client.createSourceUpload({ mode: 'archive', archive: new Blob(['demo']) })).rejects.toMatchObject({ kind: 'unavailable', code: 'stub_unavailable' });
+    await expect(client.getSourceUpload('upload-1')).rejects.toMatchObject({ kind: 'unavailable', code: 'stub_unavailable' });
+
+    await expect(client.getApplication('app-notes')).resolves.toMatchObject({ id: 'app-notes', sourceUploadId: null, access: { platformAddress: null } });
+  });
 });
 
 describe('RestApiClient', () => {
@@ -144,6 +259,252 @@ describe('RestApiClient', () => {
     expect([...requests[0].headers.keys()]).toEqual([]);
     expect([...requests[1].headers.keys()]).toEqual([]);
   });
+
+  it('implements the 9038b2a application, domain, access and upload routes', async () => {
+    Object.defineProperty(globalThis, 'document', { configurable: true, value: { cookie: `${CSRF_COOKIE_NAME}=csrf-value` } });
+    const requests: Array<{ url: string; method: string; init: RequestInit }> = [];
+    const responses = [
+      jsonResponse({ id: 'app/live', name: 'Live App', created_at: '2026-08-28T00:00:00Z', updated_at: '2026-08-28T00:00:00Z', source_upload_id: 'upload-1', access: accessFixture() }),
+      jsonResponse(platformDomainFixture()),
+      jsonResponse(platformDomainFixture(), 202),
+      jsonResponse({ items: [domainFixture()] }),
+      jsonResponse({ domain: domainFixture({ id: 'domain-2', kind: 'custom', hostname: 'portal.example.com' }) }, 202),
+      jsonResponse({ domain: domainFixture({ id: 'domain-2', kind: 'custom', status: 'verifying', hostname: 'portal.example.com' }) }, 202),
+      new Response(null, { status: 204 }),
+      jsonResponse(accessFixture()),
+      jsonResponse(uploadFixture(), 201),
+      jsonResponse(uploadFixture()),
+    ];
+    const client = new RestApiClient({
+      baseUrl: '/api/v1',
+      fetchImpl: async (input, init) => {
+        requests.push({ url: String(input), method: init?.method ?? 'GET', init: init ?? {} });
+        const response = responses.shift();
+        if (!response) throw new Error('unexpected request');
+        return response;
+      },
+    });
+
+    const detail = await client.getApplication('app/live');
+    const platform = await client.getPlatformDomainSettings();
+    const updatedPlatform = await client.putPlatformDomainSettings({ baseDomain: 'example.test' });
+    const domains = await client.listApplicationDomains('app/live');
+    const bound = await client.bindApplicationCustomDomain('app/live', { hostname: 'portal.example.com' });
+    const verified = await client.verifyApplicationDomain('app/live', 'domain-2');
+    await client.unbindApplicationDomain('app/live', 'domain-2');
+    const access = await client.getApplicationAccess('app/live');
+    const upload = await client.createSourceUpload({ mode: 'archive', archive: new Blob(['archive'], { type: 'application/gzip' }) });
+    const uploadStatus = await client.getSourceUpload(upload.uploadId);
+
+    expect(detail.sourceUploadId).toBe('upload-1');
+    expect(platform.wildcardPattern).toBe('*.apps.example.test');
+    expect(updatedPlatform.nextAction).toBe('ready');
+    expect(domains.items[0]?.hostname).toBe('portal.apps.example.test');
+    expect(bound.domain.kind).toBe('custom');
+    expect(verified.domain.status).toBe('verifying');
+    expect(access.ipFallback).toBe('198.51.100.20');
+    expect(upload.kind).toBe('archive');
+    expect(uploadStatus.uploadId).toBe('upload-1');
+    expect(requests.map((request) => `${request.method} ${request.url}`)).toEqual([
+      'GET /api/v1/applications/app%2Flive',
+      'GET /api/v1/settings/platform-domain',
+      'PUT /api/v1/settings/platform-domain',
+      'GET /api/v1/applications/app%2Flive/domains',
+      'POST /api/v1/applications/app%2Flive/domains',
+      'POST /api/v1/applications/app%2Flive/domains/domain-2/verify',
+      'DELETE /api/v1/applications/app%2Flive/domains/domain-2',
+      'GET /api/v1/applications/app%2Flive/access',
+      'POST /api/v1/source-uploads',
+      'GET /api/v1/source-uploads/upload-1',
+    ]);
+    expect(requests.every(({ init }) => init.credentials === 'same-origin' && init.signal instanceof AbortSignal)).toBe(true);
+    const writes = requests.filter(({ method }) => method !== 'GET');
+    expect(writes.every(({ init }) => {
+      const headers = new Headers(init.headers);
+      return headers.get(CSRF_HEADER_NAME) === 'csrf-value' && Boolean(headers.get('Idempotency-Key'));
+    })).toBe(true);
+    expect(JSON.parse(String(requests[2]?.init.body))).toEqual({ base_domain: 'example.test' });
+    const archiveBody = requests[8]?.init.body;
+    expect(archiveBody).toBeInstanceOf(FormData);
+    expect((archiveBody as FormData).get('mode')).toBe('archive');
+    expect((archiveBody as FormData).get('archive')).toBeInstanceOf(Blob);
+    Reflect.deleteProperty(globalThis, 'document');
+  });
+
+  it('accepts only safe mutually exclusive archive or directory multipart inputs', async () => {
+    const requests: RequestInit[] = [];
+    const client = new RestApiClient({
+      baseUrl: '/api/v1',
+      fetchImpl: async (_input, init) => {
+        requests.push(init ?? {});
+        return jsonResponse(uploadFixture('directory'), 201);
+      },
+    });
+    const first = fakeFile('src/index.html', '<h1>ok</h1>');
+    Object.defineProperty(first, 'webkitRelativePath', { configurable: true, value: 'src/index.html' });
+    const second = fakeFile('src/app.js', 'console.log(1)');
+    Object.defineProperty(second, 'webkitRelativePath', { configurable: true, value: 'src/app.js' });
+    const manifest = { files: [{ path: 'src/index.html', bytes: first.size }, { path: 'src/app.js', bytes: second.size }] };
+    await expect(client.createSourceUpload({ mode: 'directory', files: [first, second], manifest })).resolves.toMatchObject({ kind: 'directory' });
+
+    const form = requests[0]?.body as FormData;
+    const uploadedFiles = form.getAll('files');
+    expect(uploadedFiles.map((file) => file instanceof Blob && 'name' in file ? file.name : '')).toEqual(['src/index.html', 'src/app.js']);
+    expect(JSON.parse(await (form.get('manifest') as Blob).text())).toEqual(manifest);
+    expect(JSON.stringify([...form.entries()])).not.toContain('/Users/');
+
+    const archiveForm = new FormData();
+    archiveForm.append('mode', 'archive');
+    archiveForm.append('archive', new Blob(['archive']), 'archive.zip');
+    await expect(client.createSourceUpload(archiveForm)).resolves.toHaveProperty('uploadId', 'upload-1');
+    const normalizedArchive = requests[1]?.body as FormData;
+    expect(normalizedArchive.get('mode')).toBe('archive');
+    expect(normalizedArchive.get('files')).toBeNull();
+
+    for (const unsafePath of ['', '/absolute/file', 'C:/absolute/file', 'src/../file', 'src//file', 'src/', 'src\\file', '.']) {
+      const file = fakeFile(unsafePath || 'file');
+      Object.defineProperty(file, 'webkitRelativePath', { configurable: true, value: unsafePath });
+      await expect(client.createSourceUpload({ mode: 'directory', files: [file], manifest: { files: [{ path: unsafePath, bytes: file.size }] } })).rejects.toMatchObject({ kind: 'validation', code: 'invalid_upload' });
+    }
+
+    const mixed = new FormData();
+    mixed.append('mode', 'archive');
+    mixed.append('archive', new Blob(['archive']), 'archive.zip');
+    mixed.append('files', first, 'src/index.html');
+    await expect(client.createSourceUpload(mixed)).rejects.toMatchObject({ kind: 'validation', code: 'invalid_upload' });
+    await expect(client.createSourceUpload({ mode: 'directory', files: [first], manifest: { files: [{ path: 'src/index.html', bytes: 999 }] } })).rejects.toMatchObject({ kind: 'validation', code: 'invalid_upload' });
+  });
+
+  it.each([
+    [401, 'auth'],
+    [409, 'conflict'],
+    [413, 'size'],
+    [415, 'media'],
+    [422, 'validation'],
+    [429, 'rate'],
+    [503, 'unavailable'],
+    [500, 'unavailable'],
+  ] as const)('maps HTTP %s to the stable %s error kind', async (status, kind) => {
+    let unauthorized = 0;
+    const client = new RestApiClient({
+      fetchImpl: async () => jsonResponse({ code: 'safe_error', message: 'safe message', secret: 'ignored' }, status),
+      onUnauthorized: () => { unauthorized += 1; },
+    });
+    await expect(client.getApplicationAccess('app-live')).rejects.toMatchObject({ status, kind, code: 'safe_error', message: 'safe message' });
+    expect(unauthorized).toBe(status === 401 ? 1 : 0);
+  });
+
+  it('distinguishes timeout from network failure and forwards caller AbortSignal', async () => {
+    const timedOut = new RestApiClient({
+      timeoutMs: 5,
+      fetchImpl: async (_input, init) => new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new Error('aborted by timeout')), { once: true });
+      }),
+    });
+    await expect(timedOut.getApplicationAccess('app-live')).rejects.toMatchObject({ kind: 'timeout', code: 'request_timeout' });
+
+    const network = new RestApiClient({ fetchImpl: async () => { throw new Error('socket failure'); } });
+    await expect(network.getApplicationAccess('app-live')).rejects.toMatchObject({ kind: 'network', code: 'network_error' });
+
+    const controller = new AbortController();
+    let receivedSignal: AbortSignal | undefined;
+    const callerAbort = new RestApiClient({
+      fetchImpl: async (_input, init) => {
+        receivedSignal = init?.signal ?? undefined;
+        return new Promise<Response>((_resolve, reject) => init?.signal?.addEventListener('abort', () => reject(new Error('caller abort')), { once: true }));
+      },
+    });
+    const pending = callerAbort.getApplicationAccess('app-live', controller.signal);
+    controller.abort();
+    await expect(pending).rejects.toThrow('caller abort');
+    expect(receivedSignal).toBeInstanceOf(AbortSignal);
+  });
+
+  it('reconnects fake EventSource with bounded backoff, Last-Event-ID and deduplication', async () => {
+    vi.useFakeTimers();
+    try {
+      const sources: FakeEventSource[] = [];
+      let unauthorized = 0;
+      const client = new RestApiClient({
+        baseUrl: '/api/v1',
+        eventSourceFactory: (_url, init) => {
+          const source = new FakeEventSource();
+          source.options = init;
+          sources.push(source);
+          return source as unknown as EventSource;
+        },
+        onUnauthorized: () => { unauthorized += 1; },
+      });
+      const received: string[] = [];
+      const unsubscribe = client.subscribeToPublishEvents('op-live', (event) => received.push(event.id));
+      sources[0]?.emit(JSON.stringify(publishEvent('evt-1', 1)));
+      sources[0]?.emit(JSON.stringify(publishEvent('evt-1', 1)));
+      sources[0]?.emitError();
+      await vi.advanceTimersByTimeAsync(999);
+      expect(sources).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(sources).toHaveLength(2);
+      expect(sources[1]?.options?.lastEventId).toBe('evt-1');
+      sources[1]?.emitError();
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(sources).toHaveLength(3);
+      sources[2]?.emitError();
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(sources).toHaveLength(4);
+      unsubscribe();
+      const countAfterClose = sources.length;
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(sources).toHaveLength(countAfterClose);
+      expect(received).toEqual(['evt-1']);
+      expect(unauthorized).toBe(0);
+
+      const authSources: FakeEventSource[] = [];
+      const authClient = new RestApiClient({
+        eventSourceFactory: (_url, init) => {
+          const source = new FakeEventSource();
+          source.options = init;
+          authSources.push(source);
+          return source as unknown as EventSource;
+        },
+        onUnauthorized: () => { unauthorized += 1; },
+      });
+      authClient.subscribeToPublishEvents('op-auth', () => undefined);
+      authSources[0]?.emitError(401);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(authSources).toHaveLength(1);
+      expect(unauthorized).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('uses fetch SSE with Last-Event-ID when no EventSource test double is supplied', async () => {
+    vi.useFakeTimers();
+    try {
+      const requests: Array<{ url: string; headers: Headers; credentials?: RequestCredentials }> = [];
+      let call = 0;
+      const client = new RestApiClient({
+        baseUrl: '/api/v1',
+        fetchImpl: async (input, init) => {
+          requests.push({ url: String(input), headers: new Headers(init?.headers), credentials: init?.credentials });
+          call += 1;
+          return streamResponse(call === 1 ? [publishEvent('evt-1', 1)] : [publishEvent('evt-1', 1), publishEvent('evt-2', 2)]);
+        },
+      });
+      const received: string[] = [];
+      const unsubscribe = client.subscribeToPublishEvents('op-live', (event) => received.push(event.id));
+      for (let index = 0; index < 8; index += 1) await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(1_000);
+      for (let index = 0; index < 8; index += 1) await Promise.resolve();
+      unsubscribe();
+      expect(requests.map((request) => request.url)).toEqual(['/api/v1/operations/op-live/events', '/api/v1/operations/op-live/events']);
+      expect(requests.every((request) => request.credentials === 'same-origin')).toBe(true);
+      expect(requests[1]?.headers.get('Last-Event-ID')).toBe('evt-1');
+      expect(received).toEqual(['evt-1', 'evt-2']);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe('Authentication client', () => {
@@ -172,6 +533,7 @@ describe('Authentication client', () => {
     expect(requests.every((request) => request.credentials === 'same-origin')).toBe(true);
     expect(requests.filter((request) => request.method === 'POST')).toHaveLength(3);
     expect(requests.filter((request) => request.method === 'POST').every((request) => request.headers.get(CSRF_HEADER_NAME) === 'csrf-value')).toBe(true);
+    expect(requests.filter((request) => request.method === 'POST').every((request) => request.headers.has('Idempotency-Key'))).toBe(true);
     expect(requests.find((request) => request.url.endsWith('/auth/password'))?.body).toBe(JSON.stringify({ current_password: 'old-password', new_password: 'new-password' }));
   });
 
