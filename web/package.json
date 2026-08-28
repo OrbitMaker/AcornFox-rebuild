@@ -6,10 +6,12 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 4175",
     "build": "tsc --noEmit && vite build",
+    "build:stub": "VITE_API_MODE=stub VITE_API_BASE_URL=/api/v1 tsc --noEmit && VITE_API_MODE=stub VITE_API_BASE_URL=/api/v1 vite build --mode stub",
     "generate:api": "node scripts/generate-api.mjs",
-    "lint": "eslint .",
+    "lint": "eslint . --ignore-pattern dist-stub",
     "preview": "vite preview --host 127.0.0.1 --port 4175",
-    "test": "vitest run",
+    "test": "vitest run --exclude scripts/live-build-contract.test.mjs",
+    "test:build-contract": "node --test scripts/live-build-contract.test.mjs",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
