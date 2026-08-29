@@ -134,6 +134,68 @@ func TestUpgradeStoreLockMarkerAndStubs(t *testing.T) {
 	}
 }
 
+func TestUpgradeStoreCloseReleasesLockAndAttemptsWritersInReverseOrder(t *testing.T) {
+	root := t.TempDir()
+	for _, p := range []string{"var", "var/lib", "var/lib/open-card", "var/lib/open-card/upgrade-transactions", "opt", "opt/open-card", "etc", "etc/open-card", "etc/systemd", "etc/systemd/system"} {
+		if err := os.Mkdir(filepath.Join(root, p), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	prepareTaskLock(t, root)
+	store, err := TaskUpgradeStore(root, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Acquire(context.Background(), "txn-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	second, err := TaskUpgradeStore(root, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	if lock, err := second.Acquire(context.Background(), "txn-2"); err != nil {
+		t.Fatalf("lock was not released: %v", err)
+	} else {
+		defer lock.Release()
+	}
+
+	order := []string{}
+	first := errors.New("first close")
+	writers := []*DurableWriter{
+		{ops: &storeCloseOps{name: "data", order: &order}},
+		{ops: &storeCloseOps{name: "activation", order: &order}},
+		{ops: &storeCloseOps{name: "config", order: &order, err: first}},
+		{ops: &storeCloseOps{name: "unit", order: &order}},
+	}
+	manual := &UpgradeStore{dataWriter: writers[0], activationWriter: writers[1], configDurable: writers[2], unitDurable: writers[3]}
+	if err := manual.Close(); !errors.Is(err, first) {
+		t.Fatalf("close error = %v", err)
+	}
+	want := []string{"unit", "config", "activation", "data"}
+	if !reflect.DeepEqual(order, want) {
+		t.Fatalf("close order = %v, want %v", order, want)
+	}
+	if err := manual.Close(); err != nil || !reflect.DeepEqual(order, want) {
+		t.Fatalf("second close=%v order=%v", err, order)
+	}
+}
+
+type storeCloseOps struct {
+	durableOps
+	name  string
+	order *[]string
+	err   error
+}
+
+func (o *storeCloseOps) Close() error {
+	*o.order = append(*o.order, o.name)
+	return o.err
+}
+
 func TestUpgradeStoreLockIsPreprovisionedAndValidated(t *testing.T) {
 	root := t.TempDir()
 	for _, p := range []string{"var/lib/open-card/upgrade-transactions", "opt/open-card/activations", "etc/open-card", "etc/systemd/system"} {

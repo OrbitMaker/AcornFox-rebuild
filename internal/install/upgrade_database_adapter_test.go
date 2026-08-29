@@ -7,7 +7,9 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -16,6 +18,135 @@ import (
 type adapterValidationFake struct {
 	got string
 	err error
+}
+
+func TestProductionPostgresRunnerUsesOnlyValidatedChildEnvironment(t *testing.T) {
+	for key, value := range map[string]string{
+		"OPEN_CARD_DATABASE_URL": "postgresql://ambient:secret@example.invalid/open_card",
+		"DATABASE_URL":           "postgresql://ambient:secret@example.invalid/open_card",
+		"PGPASSWORD":             "ambient-secret",
+		"TENCENT_SECRET_ID":      "cloud-secret",
+		"AWS_SECRET_ACCESS_KEY":  "cloud-secret",
+		"HTTP_PROXY":             "http://proxy.invalid",
+		"ACCESS_TOKEN":           "token-secret",
+	} {
+		t.Setenv(key, value)
+	}
+	var captured *exec.Cmd
+	runner := productionPostgresRunner{command: func(ctx context.Context, path string, args ...string) *exec.Cmd {
+		if path != "/usr/bin/true" || len(args) != 0 {
+			t.Fatalf("argv = %q %q", path, args)
+		}
+		captured = exec.CommandContext(ctx, path)
+		return captured
+	}}
+	environment, err := PostgresEnvironment([]byte("OPEN_CARD_DATABASE_URL=postgresql://user:password@127.0.0.1:5432/open_card?sslmode=require\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result := runner.Run(context.Background(), []string{"/usr/bin/true"}, environment.ChildEnv); result.Err != nil || result.ExitCode != 0 {
+		t.Fatalf("result = %#v", result)
+	}
+	if captured == nil {
+		t.Fatal("command factory was not called")
+	}
+	want := append(append([]string(nil), productionSubprocessBaseEnv...), environment.ChildEnv...)
+	if !reflect.DeepEqual(captured.Env, want) {
+		t.Fatalf("child env = %q, want %q", captured.Env, want)
+	}
+	for _, entry := range captured.Env {
+		if strings.Contains(entry, "ambient") || strings.Contains(entry, "cloud-secret") || strings.Contains(entry, "proxy.invalid") || strings.Contains(entry, "token-secret") {
+			t.Fatalf("ambient value leaked into child env: %q", entry)
+		}
+	}
+	for _, invalid := range [][]string{
+		append(append([]string(nil), environment.ChildEnv...), "HTTP_PROXY=http://proxy.invalid"),
+		append(append([]string(nil), environment.ChildEnv...), "PGHOST=duplicate"),
+		append(append([]string(nil), environment.ChildEnv...), "PGPORT=not-a-port"),
+		append(append([]string(nil), environment.ChildEnv...), "PGSSLMODE=unsafe"),
+		append(append([]string(nil), environment.ChildEnv...), "malformed"),
+	} {
+		if result := runner.Run(context.Background(), []string{"/usr/bin/true"}, invalid); !errors.Is(result.Err, ErrPostgresOutcomeUnknown) {
+			t.Fatalf("unsafe env result = %#v", result)
+		}
+	}
+}
+
+func TestUpgradeDatabaseAdapterCloseAttemptsAllResourcesOnce(t *testing.T) {
+	writerOps := &adapterCloseOps{err: errors.New("writer close")}
+	adapter := &UpgradeDatabaseAdapter{
+		control: &ProductionPostgresControl{admin: &adapterDB{closeErr: errors.New("control close")}},
+		plan:    UpgradeDatabasePlan{ArtifactWriter: &DurableWriter{ops: writerOps}},
+	}
+	if err := adapter.Close(); !errors.Is(err, ErrPostgresOutcomeUnknown) {
+		t.Fatalf("close error = %v", err)
+	}
+	if writerOps.calls != 1 {
+		t.Fatalf("writer close calls = %d", writerOps.calls)
+	}
+	if err := adapter.Close(); err != nil || writerOps.calls != 1 {
+		t.Fatalf("second close = %v calls=%d", err, writerOps.calls)
+	}
+}
+
+type adapterCloseOps struct {
+	durableOps
+	calls int
+	err   error
+}
+
+func (o *adapterCloseOps) Close() error { o.calls++; return o.err }
+
+type migrationLifecycleDB struct {
+	adapterDB
+	rowsCall int
+	first    []MigrationRow
+	second   []MigrationRow
+}
+
+func (d *migrationLifecycleDB) QueryContext(_ context.Context, _ string, _ ...any) (postgresRows, error) {
+	d.rowsCall++
+	if d.rowsCall == 1 {
+		return inspectionRows(d.first), nil
+	}
+	return inspectionRows(d.second), nil
+}
+
+func TestUpgradeDatabaseAdapterMigrateObservesCandidateClose(t *testing.T) {
+	plan, _, pg := adapterPlan(t)
+	active, err := PostgresEnvironment(plan.ActiveDatabaseEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := verifiedUpgradeRelease(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected, _, err := migrationInput(plan.CandidateReleaseRoot, manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	database := &migrationLifecycleDB{adapterDB: adapterDB{tx: &adapterTx{}, closeErr: errors.New("candidate close")}, first: expected[:23], second: expected}
+	adapter, err := TaskUpgradeDatabaseAdapter(plan, adapterControl(active), adapterSnapshotter(t, pg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer adapter.Close()
+	adapter.candidateOpen = func(string) (*SQLMigrationControl, error) { return &SQLMigrationControl{database: database}, nil }
+	if _, err := adapter.Migrate(context.Background()); !errors.Is(err, ErrPostgresOutcomeUnknown) {
+		t.Fatalf("close failure was ignored: %v", err)
+	}
+	if database.rowsCall != 2 {
+		t.Fatalf("migration did not complete before close: rows=%d", database.rowsCall)
+	}
+
+	drift := &migrationLifecycleDB{adapterDB: adapterDB{closeErr: errors.New("candidate close")}}
+	adapter.candidateOpen = func(string) (*SQLMigrationControl, error) { return &SQLMigrationControl{database: drift}, nil }
+	// The query returns no valid rows, so the migration error is primary and
+	// must not be replaced by the close error.
+	if _, err := adapter.Migrate(context.Background()); !errors.Is(err, ErrCandidateConflict) {
+		t.Fatalf("primary migration failure was replaced: %v", err)
+	}
 }
 
 type upgradeAdapterDB struct {
@@ -322,7 +453,7 @@ func TestProductionCandidateValidatorUsesFixedSafeInvocation(t *testing.T) {
 	if err := validator.ValidateCandidate(context.Background(), "activation-new"); err != nil {
 		t.Fatal(err)
 	}
-	if path != "/opt/open-card/releases/release-rc1/bin/open-card-admin" || strings.Join(args, " ") != "candidate validate --activation-id activation-new" || strings.Join(env, "\n") != "PATH=/usr/bin:/bin" || strings.Contains(strings.Join(args, "\n")+strings.Join(env, "\n"), "postgres") {
+	if path != "/opt/open-card/releases/release-rc1/bin/open-card-admin" || strings.Join(args, " ") != "candidate validate --activation-id activation-new" || !reflect.DeepEqual(env, productionSubprocessBaseEnv) || strings.Contains(strings.Join(args, "\n")+strings.Join(env, "\n"), "postgres") {
 		t.Fatalf("path=%q args=%v env=%v", path, args, env)
 	}
 }

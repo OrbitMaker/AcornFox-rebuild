@@ -31,11 +31,16 @@ func ProductionUpgradeServiceAdapter() (*UpgradeServiceAdapter, error) {
 	if err != nil {
 		return nil, err
 	}
-	return TaskUpgradeServiceAdapter(controller, UpgradeServiceProbeConfig{
+	adapter, err := TaskUpgradeServiceAdapter(controller, UpgradeServiceProbeConfig{
 		ServerHealth: productionServerHealthURL,
 		ServerReady:  productionServerReadyURL,
 		EdgeHealth:   productionEdgeHealthURL,
 	})
+	if err != nil {
+		_ = controller.Close()
+		return nil, err
+	}
+	return adapter, nil
 }
 
 func TaskUpgradeServiceAdapter(controller *ServiceController, probes UpgradeServiceProbeConfig) (*UpgradeServiceAdapter, error) {
@@ -43,6 +48,18 @@ func TaskUpgradeServiceAdapter(controller *ServiceController, probes UpgradeServ
 		return nil, ErrServiceOutcomeUnknown
 	}
 	return &UpgradeServiceAdapter{controller: controller, probes: probes}, nil
+}
+
+func (a *UpgradeServiceAdapter) Close() error {
+	if a == nil {
+		return nil
+	}
+	controller := a.controller
+	a.controller = nil
+	if controller == nil {
+		return nil
+	}
+	return controller.Close()
 }
 
 func (a *UpgradeServiceAdapter) Capture(ctx context.Context) (ServiceSnapshotV1, error) {

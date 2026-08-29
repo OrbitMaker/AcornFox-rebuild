@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -69,6 +70,7 @@ type UpgradeDatabaseAdapter struct {
 	activeEnvSHA  string
 	snapshot      *SnapshotEvidence
 	activeFactory ActiveDatabaseInspectionFactory
+	candidateOpen func(string) (*SQLMigrationControl, error)
 }
 
 // UpgradeDatabaseOpenFunc is a task-only seam for locked engine tests.  It
@@ -242,7 +244,7 @@ func (v productionCandidateValidator) ValidateCandidate(ctx context.Context, act
 	if run == nil {
 		run = runProductionCandidateValidation
 	}
-	return run(ctx, v.path, []string{"candidate", "validate", "--activation-id", activationID}, []string{"PATH=/usr/bin:/bin"})
+	return run(ctx, v.path, []string{"candidate", "validate", "--activation-id", activationID}, append([]string(nil), productionSubprocessBaseEnv...))
 }
 
 func runProductionCandidateValidation(ctx context.Context, path string, args, env []string) error {
@@ -253,14 +255,66 @@ func runProductionCandidateValidation(ctx context.Context, path string, args, en
 	return command.Run()
 }
 
-type productionPostgresRunner struct{}
+type productionCommandFactory func(context.Context, string, ...string) *exec.Cmd
 
-func (productionPostgresRunner) Run(ctx context.Context, argv, env []string) PostgresRunResult {
+const productionSubprocessPath = "PATH=/usr/bin:/bin"
+
+var productionSubprocessBaseEnv = []string{productionSubprocessPath, "LANG=C", "LC_ALL=C"}
+
+type productionPostgresRunner struct{ command productionCommandFactory }
+
+func productionPostgresChildEnv(env []string) ([]string, error) {
+	values := make(map[string]string, 6)
+	for _, entry := range env {
+		key, value, ok := strings.Cut(entry, "=")
+		if !ok || key == "" || value == "" || strings.ContainsAny(key, "\x00\n\r") || strings.ContainsAny(value, "\x00\n\r") {
+			return nil, ErrPostgresOutcomeUnknown
+		}
+		switch key {
+		case "PGHOST", "PGPORT", "PGUSER", "PGPASSWORD", "PGDATABASE", "PGSSLMODE":
+		default:
+			return nil, ErrPostgresOutcomeUnknown
+		}
+		if _, exists := values[key]; exists {
+			return nil, ErrPostgresOutcomeUnknown
+		}
+		values[key] = value
+	}
+	for _, key := range []string{"PGHOST", "PGPORT", "PGUSER", "PGPASSWORD", "PGDATABASE"} {
+		if values[key] == "" {
+			return nil, ErrPostgresOutcomeUnknown
+		}
+	}
+	port, err := strconv.Atoi(values["PGPORT"])
+	if err != nil || port < 1 || port > 65535 {
+		return nil, ErrPostgresOutcomeUnknown
+	}
+	if mode, ok := values["PGSSLMODE"]; ok && mode != "disable" && mode != "require" && mode != "verify-ca" && mode != "verify-full" {
+		return nil, ErrPostgresOutcomeUnknown
+	}
+	result := append([]string(nil), productionSubprocessBaseEnv...)
+	for _, key := range []string{"PGHOST", "PGPORT", "PGUSER", "PGPASSWORD", "PGDATABASE", "PGSSLMODE"} {
+		if value, ok := values[key]; ok {
+			result = append(result, key+"="+value)
+		}
+	}
+	return result, nil
+}
+
+func (r productionPostgresRunner) Run(ctx context.Context, argv, env []string) PostgresRunResult {
 	if len(argv) == 0 {
 		return PostgresRunResult{ExitCode: -1, Err: ErrPostgresOutcomeUnknown}
 	}
-	command := exec.CommandContext(ctx, argv[0], argv[1:]...)
-	command.Env = append(os.Environ(), env...)
+	childEnv, err := productionPostgresChildEnv(env)
+	if err != nil {
+		return PostgresRunResult{ExitCode: -1, Err: ErrPostgresOutcomeUnknown}
+	}
+	commandFactory := r.command
+	if commandFactory == nil {
+		commandFactory = exec.CommandContext
+	}
+	command := commandFactory(ctx, argv[0], argv[1:]...)
+	command.Env = childEnv
 	if err := command.Run(); err != nil {
 		if exited, ok := err.(*exec.ExitError); ok {
 			return PostgresRunResult{ExitCode: exited.ExitCode(), Err: err}
@@ -341,7 +395,7 @@ func newUpgradeDatabaseAdapter(plan UpgradeDatabasePlan, control *ProductionPost
 		return nil, ErrPostgresOutcomeUnknown
 	}
 	digest := sha256.Sum256(plan.ActiveDatabaseEnv)
-	return &UpgradeDatabaseAdapter{plan: cloneUpgradeDatabasePlan(plan), control: control, snapshotter: snapshotter, activeEnv: activeEnv, activeEnvSHA: hex.EncodeToString(digest[:])}, nil
+	return &UpgradeDatabaseAdapter{plan: cloneUpgradeDatabasePlan(plan), control: control, snapshotter: snapshotter, activeEnv: activeEnv, activeEnvSHA: hex.EncodeToString(digest[:]), candidateOpen: control.ForCandidate}, nil
 }
 
 func verifiedProductionValidator(releaseRoot string, manifest Manifest, path string) bool {
@@ -488,7 +542,7 @@ func mustPostgresEnvironment(raw []byte) PostgresProcessEnvironment {
 	return env
 }
 
-func (a *UpgradeDatabaseAdapter) Migrate(ctx context.Context) (UpgradeMigrationEvidence, error) {
+func (a *UpgradeDatabaseAdapter) Migrate(ctx context.Context) (result UpgradeMigrationEvidence, returnErr error) {
 	if a == nil || a.control == nil {
 		return UpgradeMigrationEvidence{}, ErrPostgresOutcomeUnknown
 	}
@@ -500,11 +554,20 @@ func (a *UpgradeDatabaseAdapter) Migrate(ctx context.Context) (UpgradeMigrationE
 	if err != nil {
 		return UpgradeMigrationEvidence{}, ErrPostgresOutcomeUnknown
 	}
-	control, err := a.control.ForCandidate(a.plan.CandidateDatabaseName)
+	open := a.candidateOpen
+	if open == nil {
+		open = a.control.ForCandidate
+	}
+	control, err := open(a.plan.CandidateDatabaseName)
 	if err != nil || control == nil {
 		return UpgradeMigrationEvidence{}, ErrPostgresOutcomeUnknown
 	}
-	defer control.Close()
+	defer func() {
+		if closeErr := control.Close(); closeErr != nil && returnErr == nil {
+			result = UpgradeMigrationEvidence{}
+			returnErr = ErrPostgresOutcomeUnknown
+		}
+	}()
 	evidence, err := ApplyCandidateMigration(ctx, control, rows, migrationSQL)
 	if err != nil {
 		return UpgradeMigrationEvidence{}, upgradeDatabaseError(err)
@@ -532,16 +595,24 @@ func (a *UpgradeDatabaseAdapter) Validate(ctx context.Context, activationID stri
 }
 
 func (a *UpgradeDatabaseAdapter) Close() error {
-	if a == nil || a.control == nil {
+	if a == nil {
 		return nil
 	}
-	controlErr := a.control.Close()
-	if a.plan.ArtifactWriter != nil {
-		if err := a.plan.ArtifactWriter.Close(); controlErr == nil {
-			return err
+	control, writer := a.control, a.plan.ArtifactWriter
+	a.control = nil
+	a.plan.ArtifactWriter = nil
+	var first error
+	if control != nil {
+		if err := control.Close(); err != nil {
+			first = ErrPostgresOutcomeUnknown
 		}
 	}
-	return controlErr
+	if writer != nil {
+		if err := writer.Close(); err != nil && first == nil {
+			first = ErrPostgresOutcomeUnknown
+		}
+	}
+	return first
 }
 
 func (a *UpgradeDatabaseAdapter) CandidateDatabaseEnv() []byte {

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -22,6 +23,65 @@ type fakeServiceRunner struct {
 	argv    [][]string
 	fail    map[string]error
 }
+
+func TestProductionServiceRunnerDoesNotInheritAmbientEnvironment(t *testing.T) {
+	for key, value := range map[string]string{
+		"OPEN_CARD_DATABASE_URL": "postgresql://ambient:secret@example.invalid/open_card",
+		"DATABASE_URL":           "postgresql://ambient:secret@example.invalid/open_card",
+		"PGPASSWORD":             "ambient-secret",
+		"TENCENT_SECRET_ID":      "cloud-secret",
+		"AWS_SECRET_ACCESS_KEY":  "cloud-secret",
+		"HTTP_PROXY":             "http://proxy.invalid",
+		"ACCESS_TOKEN":           "token-secret",
+	} {
+		t.Setenv(key, value)
+	}
+	var captured *exec.Cmd
+	runner := productionServiceRunner{command: func(ctx context.Context, path string, args ...string) *exec.Cmd {
+		if path != "/usr/bin/systemctl" || !reflect.DeepEqual(args, []string{"daemon-reload"}) {
+			t.Fatalf("command = %q %q", path, args)
+		}
+		captured = exec.CommandContext(ctx, "/usr/bin/true")
+		return captured
+	}}
+	if result := runner.Run(context.Background(), "systemctl", "daemon-reload"); result.Err != nil || result.ExitCode != 0 {
+		t.Fatalf("result = %#v", result)
+	}
+	if captured == nil || !reflect.DeepEqual(captured.Env, productionSubprocessBaseEnv) {
+		t.Fatalf("child env = %#v", captured)
+	}
+	for _, entry := range captured.Env {
+		if strings.Contains(entry, "secret") || strings.Contains(entry, "proxy") || strings.Contains(entry, "token") {
+			t.Fatalf("ambient value leaked into child env: %q", entry)
+		}
+	}
+}
+
+func TestServiceControllerAndAdapterCloseAreIdempotent(t *testing.T) {
+	writerOps := &serviceCloseOps{err: errors.New("unit writer close")}
+	controller := &ServiceController{unitWriter: &DurableWriter{ops: writerOps}}
+	if err := controller.Close(); !errors.Is(err, ErrServiceOutcomeUnknown) || writerOps.calls != 1 {
+		t.Fatalf("controller close=%v calls=%d", err, writerOps.calls)
+	}
+	if err := controller.Close(); err != nil || writerOps.calls != 1 {
+		t.Fatalf("second controller close=%v calls=%d", err, writerOps.calls)
+	}
+	adapter := &UpgradeServiceAdapter{controller: &ServiceController{unitWriter: &DurableWriter{ops: writerOps}}}
+	if err := adapter.Close(); !errors.Is(err, ErrServiceOutcomeUnknown) || writerOps.calls != 2 {
+		t.Fatalf("adapter close=%v calls=%d", err, writerOps.calls)
+	}
+	if err := adapter.Close(); err != nil || writerOps.calls != 2 {
+		t.Fatalf("second adapter close=%v calls=%d", err, writerOps.calls)
+	}
+}
+
+type serviceCloseOps struct {
+	durableOps
+	calls int
+	err   error
+}
+
+func (o *serviceCloseOps) Close() error { o.calls++; return o.err }
 
 func newFakeServiceRunner() *fakeServiceRunner {
 	return &fakeServiceRunner{active: map[string]bool{}, enabled: map[string]bool{}, fail: map[string]error{}}

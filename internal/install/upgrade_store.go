@@ -575,22 +575,27 @@ func (s *UpgradeStore) Close() error {
 	if s == nil {
 		return nil
 	}
-	if s == nil {
-		return nil
+	lock := s.lock
+	unit, config, activation, data := s.unitDurable, s.configDurable, s.activationWriter, s.dataWriter
+	s.lock = nil
+	s.unitDurable = nil
+	s.configDurable = nil
+	s.activationWriter = nil
+	s.dataWriter = nil
+	var first error
+	if lock != nil {
+		if err := lock.Release(); err != nil {
+			first = err
+		}
 	}
-	if s.dataWriter != nil {
-		_ = s.dataWriter.Close()
+	for _, writer := range []*DurableWriter{unit, config, activation, data} {
+		if writer != nil {
+			if err := writer.Close(); err != nil && first == nil {
+				first = err
+			}
+		}
 	}
-	if s.activationWriter != nil {
-		_ = s.activationWriter.Close()
-	}
-	if s.configDurable != nil {
-		_ = s.configDurable.Close()
-	}
-	if s.unitDurable != nil {
-		return s.unitDurable.Close()
-	}
-	return nil
+	return first
 }
 
 func (s *UpgradeStore) ReadActualState(_ context.Context, oldID, candidateID string) (UpgradeActualState, error) {

@@ -15,7 +15,8 @@ import (
 	"syscall"
 	"time"
 
-	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/stdlib"
 )
 
 var candidateDatabaseName = regexp.MustCompile(`^open_card_act_[a-f0-9]{16}$`)
@@ -104,7 +105,7 @@ func candidateDatabaseEvidence(recoveryEvidence string) string {
 type ProductionPostgresControl struct {
 	admin       postgresDB
 	environment PostgresProcessEnvironment
-	base        *url.URL
+	base        *pgx.ConnConfig
 }
 
 // SelectedPostgresDatabase is a short-lived connection to exactly the
@@ -168,51 +169,71 @@ func (t databaseTx) Commit() error   { return t.tx.Commit() }
 func (t databaseTx) Rollback() error { return t.tx.Rollback() }
 
 func NewProductionPostgresControl(databaseEnv []byte) (*ProductionPostgresControl, error) {
-	env, err := PostgresEnvironment(databaseEnv)
+	env, base, err := productionPostgresConfig(databaseEnv)
 	if err != nil {
 		return nil, errors.New("invalid database environment")
 	}
-	dsn, err := ParseDatabaseEnv(databaseEnv)
-	if err != nil {
-		return nil, errors.New("invalid database environment")
-	}
-	u, err := url.Parse(dsn)
-	if err != nil {
-		return nil, errors.New("invalid database environment")
-	}
-	u.Path = "/postgres"
-	db, err := sql.Open("pgx", u.String())
-	if err != nil {
+	admin := *base
+	admin.Database = "postgres"
+	db := stdlib.OpenDB(admin)
+	if db == nil {
 		return nil, errors.New("open postgres control failed")
 	}
-	return &ProductionPostgresControl{databaseSQL{db}, env, u}, nil
+	return &ProductionPostgresControl{admin: databaseSQL{db}, environment: env, base: base}, nil
 }
 
 func NewSelectedPostgresDatabase(databaseEnv []byte) (*SelectedPostgresDatabase, error) {
-	environment, err := PostgresEnvironment(databaseEnv)
-	if err != nil {
+	environment, config, err := productionPostgresConfig(databaseEnv)
+	if err != nil || config.Database != environment.Descriptor.Database {
 		return nil, errors.New("invalid database environment")
 	}
-	dsn, err := ParseDatabaseEnv(databaseEnv)
-	if err != nil {
-		return nil, errors.New("invalid database environment")
-	}
-	u, err := url.Parse(dsn)
-	if err != nil || strings.Trim(u.EscapedPath(), "/") != environment.Descriptor.Database {
-		return nil, errors.New("invalid database environment")
-	}
-	database, err := sql.Open("pgx", u.String())
-	if err != nil {
+	database := stdlib.OpenDB(*config)
+	if database == nil {
 		return nil, errors.New("open selected database failed")
 	}
 	return &SelectedPostgresDatabase{database: databaseSQL{database}, environment: environment}, nil
+}
+
+// productionPostgresConfig makes the validated database.env the sole source
+// of connection identity. libpq-style PG* environment defaults are rejected
+// rather than inherited, so a process-level credential or service profile
+// cannot silently redirect an upgrade connection.
+func productionPostgresConfig(databaseEnv []byte) (PostgresProcessEnvironment, *pgx.ConnConfig, error) {
+	if hasAmbientPostgresEnvironment() {
+		return PostgresProcessEnvironment{}, nil, errors.New("ambient postgres environment is forbidden")
+	}
+	environment, err := PostgresEnvironment(databaseEnv)
+	if err != nil {
+		return PostgresProcessEnvironment{}, nil, errors.New("invalid database environment")
+	}
+	dsn, err := ParseDatabaseEnv(databaseEnv)
+	if err != nil {
+		return PostgresProcessEnvironment{}, nil, errors.New("invalid database environment")
+	}
+	config, err := pgx.ParseConfig(dsn)
+	if err != nil || config.Database != environment.Descriptor.Database || config.Host != environment.Descriptor.Host {
+		return PostgresProcessEnvironment{}, nil, errors.New("invalid database environment")
+	}
+	return environment, config, nil
+}
+
+func hasAmbientPostgresEnvironment() bool {
+	for _, entry := range os.Environ() {
+		key, value, ok := strings.Cut(entry, "=")
+		if ok && strings.HasPrefix(key, "PG") && value != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *SelectedPostgresDatabase) Close() error {
 	if s == nil || s.database == nil {
 		return nil
 	}
-	return s.database.Close()
+	database := s.database
+	s.database = nil
+	return database.Close()
 }
 
 func (s *SelectedPostgresDatabase) MigrationRows(ctx context.Context) ([]MigrationRow, error) {
@@ -225,7 +246,9 @@ func (p *ProductionPostgresControl) Close() error {
 	if p == nil || p.admin == nil {
 		return nil
 	}
-	return p.admin.Close()
+	admin := p.admin
+	p.admin = nil
+	return admin.Close()
 }
 func (p *ProductionPostgresControl) CandidateEvidence(ctx context.Context, name string) (bool, string, error) {
 	if p == nil || !candidateDatabaseName.MatchString(name) {
@@ -260,13 +283,13 @@ func (p *ProductionPostgresControl) CountOpenCardSessions(ctx context.Context) (
 	return count, nil
 }
 func (p *ProductionPostgresControl) ForCandidate(name string) (*SQLMigrationControl, error) {
-	if p == nil || !candidateDatabaseName.MatchString(name) {
+	if p == nil || p.base == nil || !candidateDatabaseName.MatchString(name) || hasAmbientPostgresEnvironment() {
 		return nil, ErrPostgresOutcomeUnknown
 	}
-	u := *p.base
-	u.Path = "/" + name
-	db, err := sql.Open("pgx", u.String())
-	if err != nil {
+	config := *p.base
+	config.Database = name
+	db := stdlib.OpenDB(config)
+	if db == nil {
 		return nil, ErrPostgresOutcomeUnknown
 	}
 	return &SQLMigrationControl{databaseSQL{db}}, nil
@@ -278,7 +301,9 @@ func (s *SQLMigrationControl) Close() error {
 	if s == nil || s.database == nil {
 		return nil
 	}
-	return s.database.Close()
+	database := s.database
+	s.database = nil
+	return database.Close()
 }
 func (s *SQLMigrationControl) MigrationRows(ctx context.Context) ([]MigrationRow, error) {
 	rows, err := s.database.QueryContext(ctx, "SELECT version, checksum FROM schema_migrations ORDER BY version")

@@ -641,7 +641,11 @@ func (e *UpgradeEngine) RunNew(ctx context.Context, r UpgradeRequest) (result er
 	if err != nil {
 		return err
 	}
-	defer lock.Release()
+	defer func() {
+		if err := lock.Release(); err != nil && result == nil {
+			result = upgradeError(JournalCommitted, "lock_release_failed")
+		}
+	}()
 
 	preflight, err := e.Store.PreflightPlan(ctx, UpgradePreflightRequest{TransactionID: r.TransactionID, CandidateRelease: r.CandidateRelease})
 	if err != nil || preflight.ValidateForRequest(UpgradePreflightRequest{TransactionID: r.TransactionID, CandidateRelease: r.CandidateRelease}) != nil || (preflight.Legacy != nil) != r.ExpectedLegacy {
@@ -1047,7 +1051,7 @@ func (e *UpgradeEngine) recoverLegacyPreflight(ctx context.Context, j *UpgradeJo
 // Recover reconciles one durable journal against observed activation and marker
 // state. It never removes upgrade artifacts; ambiguity is preserved as a
 // RECOVERY_REQUIRED journal rather than guessed away.
-func (e *UpgradeEngine) Recover(ctx context.Context, transactionID string) error {
+func (e *UpgradeEngine) Recover(ctx context.Context, transactionID string) (result error) {
 	if e == nil || e.Store == nil || e.Services == nil || e.Now == nil || !validID(transactionID) {
 		return upgradeError(JournalRecoveryRequired, "invalid_request")
 	}
@@ -1055,7 +1059,11 @@ func (e *UpgradeEngine) Recover(ctx context.Context, transactionID string) error
 	if err != nil {
 		return err
 	}
-	defer lock.Release()
+	defer func() {
+		if err := lock.Release(); err != nil && result == nil {
+			result = upgradeError(JournalRecoveryRequired, "lock_release_failed")
+		}
+	}()
 	j, err := e.Store.LoadJournal(ctx, transactionID)
 	if err != nil || j.TransactionID != transactionID || j.Validate() != nil {
 		_ = e.Services.GuardEdge(ctx)

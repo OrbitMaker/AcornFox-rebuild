@@ -213,7 +213,10 @@ func (w *DurableWriter) Close() error {
 	if w == nil || w.ops == nil {
 		return nil
 	}
-	return w.ops.Close()
+	ops := w.ops
+	w.ops = nil
+	w.rootInfo = nil
+	return ops.Close()
 }
 
 func (w *DurableWriter) WriteMetadata(name string, value []byte) error {

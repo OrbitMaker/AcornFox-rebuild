@@ -282,8 +282,8 @@ func TestSelectedPostgresDatabaseNeverRewritesActiveDatabaseToPostgres(t *testin
 		t.Fatal(err)
 	}
 	defer control.Close()
-	if selected.environment.Descriptor.Database != "open_card_active" || control.base == nil || control.base.Path != "/postgres" || selected.environment.Descriptor.Database == strings.Trim(control.base.Path, "/") {
-		t.Fatalf("selected=%q control=%q", selected.environment.Descriptor.Database, control.base.Path)
+	if selected.environment.Descriptor.Database != "open_card_active" || control.base == nil || control.base.Database != "open_card_active" {
+		t.Fatalf("selected=%q control=%#v", selected.environment.Descriptor.Database, control.base)
 	}
 }
 
@@ -307,6 +307,67 @@ func TestSQLMigrationControlReadsRowsAndUsesParameterizedRecord(t *testing.T) {
 		t.Fatalf("sql=%q args=%v", tx.execSQL, tx.args)
 	}
 }
+
+func TestProductionConnectionsRejectAmbientPGConfiguration(t *testing.T) {
+	raw := []byte("OPEN_CARD_DATABASE_URL=postgresql://user:password@127.0.0.1:5432/open_card_active?sslmode=require\n")
+	for _, key := range []string{"PGSERVICE", "PGSERVICEFILE", "PGSSLKEY", "PGSSLROOTCERT", "PGOPTIONS", "PGTARGETSESSIONATTRS"} {
+		t.Run(key, func(t *testing.T) {
+			t.Setenv(key, "ambient-canary")
+			if _, err := NewProductionPostgresControl(raw); err == nil {
+				t.Fatalf("production control accepted %s", key)
+			}
+			if _, err := NewSelectedPostgresDatabase(raw); err == nil {
+				t.Fatalf("selected database accepted %s", key)
+			}
+		})
+	}
+	control, err := NewProductionPostgresControl(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer control.Close()
+	t.Setenv("PGOPTIONS", "ambient-canary")
+	if _, err := control.ForCandidate("open_card_act_0123456789abcdef"); !errors.Is(err, ErrPostgresOutcomeUnknown) {
+		t.Fatalf("candidate connection accepted ambient config: %v", err)
+	}
+}
+
+func TestPostgresSessionClosesAreIdempotent(t *testing.T) {
+	selectedDB := &closeCountingPostgresDB{err: errors.New("selected close")}
+	selected := &SelectedPostgresDatabase{database: selectedDB}
+	if err := selected.Close(); err == nil || selectedDB.calls != 1 {
+		t.Fatalf("selected close=%v calls=%d", err, selectedDB.calls)
+	}
+	if err := selected.Close(); err != nil || selectedDB.calls != 1 {
+		t.Fatalf("second selected close=%v calls=%d", err, selectedDB.calls)
+	}
+
+	adminDB := &closeCountingPostgresDB{err: errors.New("admin close")}
+	control := &ProductionPostgresControl{admin: adminDB}
+	if err := control.Close(); err == nil || adminDB.calls != 1 {
+		t.Fatalf("control close=%v calls=%d", err, adminDB.calls)
+	}
+	if err := control.Close(); err != nil || adminDB.calls != 1 {
+		t.Fatalf("second control close=%v calls=%d", err, adminDB.calls)
+	}
+
+	migrationDB := &closeCountingPostgresDB{err: errors.New("migration close")}
+	migration := &SQLMigrationControl{database: migrationDB}
+	if err := migration.Close(); err == nil || migrationDB.calls != 1 {
+		t.Fatalf("migration close=%v calls=%d", err, migrationDB.calls)
+	}
+	if err := migration.Close(); err != nil || migrationDB.calls != 1 {
+		t.Fatalf("second migration close=%v calls=%d", err, migrationDB.calls)
+	}
+}
+
+type closeCountingPostgresDB struct {
+	adapterDB
+	calls int
+	err   error
+}
+
+func (d *closeCountingPostgresDB) Close() error { d.calls++; return d.err }
 
 func TestSQLMigrationTransactionPropagatesCommitAndRollback(t *testing.T) {
 	tx := &adapterTx{commitErr: errors.New("commit-secret"), rollbackErr: errors.New("rollback-secret")}

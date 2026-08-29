@@ -220,6 +220,42 @@ type phaseFaultOps struct {
 	afterRename func() error
 }
 
+func TestDurableWriterCloseDetachesRootAfterFirstAttempt(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, durableDirMode); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := os.OpenRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ops := &durableCloseOps{durableOps: realDurableOps{durableRoot: osDurableRoot{root: opened}}, err: errors.New("injected root close")}
+	writer, err := newDurableWriter(root, os.Getuid(), os.Getgid(), ops)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err == nil || ops.calls != 1 {
+		t.Fatalf("first close=%v calls=%d", err, ops.calls)
+	}
+	if err := writer.Close(); err != nil || ops.calls != 1 {
+		t.Fatalf("second close=%v calls=%d", err, ops.calls)
+	}
+}
+
+type durableCloseOps struct {
+	durableOps
+	calls int
+	err   error
+}
+
+func (o *durableCloseOps) Close() error {
+	o.calls++
+	if err := o.durableOps.Close(); err != nil {
+		return err
+	}
+	return o.err
+}
+
 func (f *phaseFaultOps) OpenFile(name string, flag int, mode os.FileMode) (*os.File, error) {
 	if f.fail == "create" {
 		return nil, errors.New("injected create failure")

@@ -70,13 +70,18 @@ type ServiceController struct {
 	unitWriter     *DurableWriter
 }
 
-type productionServiceRunner struct{}
+type productionServiceRunner struct{ command productionCommandFactory }
 
-func (productionServiceRunner) Run(ctx context.Context, argv ...string) CommandResult {
+func (r productionServiceRunner) Run(ctx context.Context, argv ...string) CommandResult {
 	if len(argv) == 0 || argv[0] != "systemctl" {
 		return CommandResult{ExitCode: -1, Err: errors.New("unsafe command")}
 	}
-	result := exec.CommandContext(ctx, "/usr/bin/systemctl", argv[1:]...)
+	commandFactory := r.command
+	if commandFactory == nil {
+		commandFactory = exec.CommandContext
+	}
+	result := commandFactory(ctx, "/usr/bin/systemctl", argv[1:]...)
+	result.Env = append([]string(nil), productionSubprocessBaseEnv...)
 	output, err := result.CombinedOutput()
 	if err == nil {
 		return CommandResult{Output: string(output)}
@@ -85,6 +90,23 @@ func (productionServiceRunner) Run(ctx context.Context, argv ...string) CommandR
 		return CommandResult{ExitCode: exit.ExitCode(), Output: string(output), Err: err}
 	}
 	return CommandResult{ExitCode: -1, Output: string(output), Err: err}
+}
+
+// Close releases the pinned unit-root descriptor at most once. The controller
+// deliberately detaches it before closing so callers may safely defer Close.
+func (c *ServiceController) Close() error {
+	if c == nil {
+		return nil
+	}
+	writer := c.unitWriter
+	c.unitWriter = nil
+	if writer == nil {
+		return nil
+	}
+	if err := writer.Close(); err != nil {
+		return ErrServiceOutcomeUnknown
+	}
+	return nil
 }
 
 func ProductionServiceController() (*ServiceController, error) {

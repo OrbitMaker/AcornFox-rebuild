@@ -12,9 +12,12 @@ import (
 
 var errEngineFake = errors.New("engine fake failure")
 
-type engineLock struct{ released *int }
+type engineLock struct {
+	released *int
+	err      error
+}
 
-func (l engineLock) Release() error { *l.released++; return nil }
+func (l engineLock) Release() error { *l.released++; return l.err }
 
 type engineStoreFake struct {
 	events                                         *[]string
@@ -25,6 +28,7 @@ type engineStoreFake struct {
 	legacy                                         bool
 	conflict                                       bool
 	released                                       int
+	releaseErr                                     error
 	created                                        []UpgradeJournalV1
 	saved                                          []UpgradeJournalV1
 	old                                            ActivationV1
@@ -57,7 +61,7 @@ func (s *engineStoreFake) Acquire(context.Context, string) (UpgradeLock, error) 
 	if err := s.event("acquire"); err != nil {
 		return nil, err
 	}
-	return engineLock{&s.released}, nil
+	return engineLock{released: &s.released, err: s.releaseErr}, nil
 }
 func (s *engineStoreFake) LoadJournal(context.Context, string) (UpgradeJournalV1, error) {
 	if err := s.event("load"); err != nil {
@@ -531,6 +535,41 @@ func TestRunNewCommittedWithInactiveEdgeGuardsWithoutStartingEdge(t *testing.T) 
 	}
 	if len(store.saved) == 0 || store.saved[len(store.saved)-1].State != JournalCommitted {
 		t.Fatalf("journal=%v", store.saved)
+	}
+}
+
+func TestUpgradeEngineObservesLockReleaseFailuresWithoutReplacingPrimaryErrors(t *testing.T) {
+	e, store, _, svc, _ := engineFixture(false)
+	store.releaseErr = errors.New("release secret")
+	phase := enginePhase(t, e.RunNew(context.Background(), engineRequest()))
+	if phase.Phase != JournalCommitted || phase.Code != "lock_release_failed" || strings.Contains(phase.Error(), "secret") || store.released != 1 {
+		t.Fatalf("run release error=%#v released=%d", phase, store.released)
+	}
+
+	e, store, _, svc, _ = engineFixture(false)
+	store.releaseErr = errors.New("release secret")
+	svc.fail, svc.remaining = "capture", 1
+	phase = enginePhase(t, e.RunNew(context.Background(), engineRequest()))
+	if phase.Code != "service_capture_failed" || store.released != 1 {
+		t.Fatalf("primary error replaced=%#v released=%d", phase, store.released)
+	}
+
+	e, store, _, _, _ = engineFixture(false)
+	if err := e.RunNew(context.Background(), engineRequest()); err != nil {
+		t.Fatal(err)
+	}
+	store.releaseErr = errors.New("release secret")
+	phase = enginePhase(t, e.Recover(context.Background(), "txn-1"))
+	if phase.Phase != JournalRecoveryRequired || phase.Code != "lock_release_failed" || store.released != 2 {
+		t.Fatalf("recover release error=%#v released=%d", phase, store.released)
+	}
+
+	e, store, _, _, _ = engineFixture(false)
+	store.releaseErr = errors.New("release secret")
+	store.fail, store.remaining = "load", 1
+	phase = enginePhase(t, e.Recover(context.Background(), "txn-1"))
+	if phase.Code != "integrity_failed" || store.released != 1 {
+		t.Fatalf("recover primary error replaced=%#v released=%d", phase, store.released)
 	}
 }
 
