@@ -1,0 +1,326 @@
+package install
+
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+	"time"
+)
+
+func rc0ReleaseFixture() ReleaseV1 {
+	return ReleaseV1{
+		ID:             "release-0.8.0-rc.0",
+		Version:        ProductionNMinusOneVersion,
+		SourceCommit:   RC0SourceCommit,
+		Architecture:   "amd64",
+		ManifestSHA256: RC0ReleaseManifestSHA256,
+	}
+}
+
+func assertJSONKeys(t *testing.T, raw []byte, expected ...string) map[string]json.RawMessage {
+	t.Helper()
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if len(fields) != len(expected) {
+		t.Fatalf("JSON fields=%v, want %v", fields, expected)
+	}
+	for _, name := range expected {
+		if fields[name] == nil {
+			t.Fatalf("missing JSON field %q", name)
+		}
+	}
+	return fields
+}
+
+func legacyPlanFixture() LegacyProjectionPlan {
+	env := []byte("OPEN_CARD_DATABASE_URL=postgresql://user:pass@localhost:5432/open_card?sslmode=disable\n")
+	release := rc0ReleaseFixture()
+	return LegacyProjectionPlan{
+		TransactionID:          "txn-1",
+		ActivationID:           "activation-old",
+		Release:                release,
+		CurrentTarget:          legacyReleaseTarget(release),
+		ExpectedMigration:      "0023",
+		ExpectedRowsSHA256:     sha("a"),
+		DatabaseEnv:            env,
+		DatabaseEnvSHA256:      databaseEnvSHA256(env),
+		ServerEnvBeforeSHA256:  sha("b"),
+		ServerEnvAfterSHA256:   sha("c"),
+		ServerUnitBeforeSHA256: sha("d"),
+		ServerUnitAfterSHA256:  sha("e"),
+		ServerUnitReleaseID:    "release-0.8.0-rc.1",
+		Previous: ActivationPointerIdentity{
+			ID:         "activation-previous",
+			JSONSHA256: sha("f"),
+		},
+	}
+}
+
+func legacyActivationFixture() ActivationV1 {
+	plan := legacyPlanFixture()
+	return ActivationV1{
+		SchemaVersion:          ActivationSchemaVersion,
+		ActivationID:           plan.ActivationID,
+		Origin:                 "rc0_compat_projection",
+		Release:                plan.Release,
+		Database:               DatabaseV1{Name: "open_card", Migration: "0023", SchemaMigrationsSHA256: plan.ExpectedRowsSHA256},
+		DatabaseEnvSHA256:      plan.DatabaseEnvSHA256,
+		CreatedAt:              time.Unix(1, 0).UTC(),
+		CreatedByTransactionID: plan.TransactionID,
+		LegacyProjection: &LegacyProjectionV1{
+			Target:                 plan.CurrentTarget,
+			ServerEnvBeforeSHA256:  plan.ServerEnvBeforeSHA256,
+			ServerEnvAfterSHA256:   plan.ServerEnvAfterSHA256,
+			ServerUnitBeforeSHA256: plan.ServerUnitBeforeSHA256,
+			ServerUnitAfterSHA256:  plan.ServerUnitAfterSHA256,
+			ServerUnitReleaseID:    plan.ServerUnitReleaseID,
+		},
+	}
+}
+
+func TestActivationPointerIdentityPairs(t *testing.T) {
+	for _, pointer := range []ActivationPointerIdentity{
+		{}, {ID: "activation-1", JSONSHA256: sha("a")},
+	} {
+		if err := pointer.Validate(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, pointer := range []ActivationPointerIdentity{
+		{ID: "activation-1"}, {JSONSHA256: sha("a")}, {ID: "!", JSONSHA256: sha("a")}, {ID: "activation-1", JSONSHA256: "bad"},
+	} {
+		if err := pointer.Validate(); err == nil {
+			t.Fatal("invalid pointer pair accepted")
+		}
+	}
+}
+
+func TestLegacyProjectionPlanValidationAndSecretBoundary(t *testing.T) {
+	plan := legacyPlanFixture()
+	if err := plan.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "postgresql://") || strings.Contains(string(raw), "database_env\"") {
+		t.Fatal("legacy plan serialized database environment")
+	}
+	fields := assertJSONKeys(t, raw,
+		"transaction_id", "activation_id", "release", "current_target", "expected_migration", "expected_rows_sha256",
+		"database_env_sha256", "server_env_before_sha256", "server_env_after_sha256", "server_unit_before_sha256", "server_unit_after_sha256", "server_unit_release_id", "previous",
+	)
+	if _, exists := fields["database_env"]; exists || fields["database_env_sha256"] == nil || fields["previous"] == nil {
+		t.Fatal("legacy plan JSON shape is unsafe")
+	}
+
+	for _, edit := range []func(*LegacyProjectionPlan){
+		func(p *LegacyProjectionPlan) { p.TransactionID = "" },
+		func(p *LegacyProjectionPlan) { p.ActivationID = "" },
+		func(p *LegacyProjectionPlan) { p.Release.ID = "" },
+		func(p *LegacyProjectionPlan) { p.Release.Version = "0.8.0-rc.1" },
+		func(p *LegacyProjectionPlan) { p.Release.SourceCommit = strings.Repeat("a", 40) },
+		func(p *LegacyProjectionPlan) { p.Release.Architecture = "arm64" },
+		func(p *LegacyProjectionPlan) { p.Release.ManifestSHA256 = sha("0") },
+		func(p *LegacyProjectionPlan) { p.CurrentTarget = "/tmp/release" },
+		func(p *LegacyProjectionPlan) { p.ExpectedMigration = "0024" },
+		func(p *LegacyProjectionPlan) { p.ExpectedRowsSHA256 = "bad" },
+		func(p *LegacyProjectionPlan) { p.DatabaseEnv = []byte("bad\n") },
+		func(p *LegacyProjectionPlan) { p.DatabaseEnvSHA256 = sha("0") },
+		func(p *LegacyProjectionPlan) { p.ServerEnvBeforeSHA256 = "bad" },
+		func(p *LegacyProjectionPlan) { p.ServerEnvAfterSHA256 = "bad" },
+		func(p *LegacyProjectionPlan) { p.ServerUnitBeforeSHA256 = "bad" },
+		func(p *LegacyProjectionPlan) { p.ServerUnitAfterSHA256 = "bad" },
+		func(p *LegacyProjectionPlan) { p.ServerUnitReleaseID = "" },
+		func(p *LegacyProjectionPlan) { p.Previous.JSONSHA256 = "" },
+	} {
+		broken := legacyPlanFixture()
+		edit(&broken)
+		if err := broken.Validate(); err == nil {
+			t.Fatal("invalid legacy projection plan accepted")
+		}
+	}
+}
+
+func TestPreflightAndInspectionContracts(t *testing.T) {
+	native := activationFixture()
+	nativeDigest, err := CanonicalActivationJSONSHA256(native)
+	if err != nil {
+		t.Fatal(err)
+	}
+	existing := UpgradePreflight{Existing: &ExistingActivationPreflight{Activation: native, JSONSHA256: nativeDigest}}
+	if err := existing.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	plan := legacyPlanFixture()
+	legacy := UpgradePreflight{Legacy: &plan, Previous: plan.Previous}
+	if err := legacy.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	for _, broken := range []UpgradePreflight{
+		{}, {Existing: existing.Existing, Legacy: &plan}, {Existing: existing.Existing, Previous: ActivationPointerIdentity{ID: "bad"}},
+		{Existing: &ExistingActivationPreflight{Activation: native, JSONSHA256: sha("0")}},
+		{Legacy: &plan},
+	} {
+		if err := broken.Validate(); err == nil {
+			t.Fatal("invalid preflight accepted")
+		}
+	}
+	request := UpgradePreflightRequest{TransactionID: "txn-1", CandidateRelease: ReleaseV1{ID: plan.ServerUnitReleaseID, Version: "0.8.0-rc.1", SourceCommit: strings.Repeat("a", 40), Architecture: "amd64", ManifestSHA256: sha("b")}}
+	if err := request.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.ValidateForRequest(request); err != nil {
+		t.Fatal(err)
+	}
+	request.CandidateRelease.ID = "another-release"
+	if err := legacy.ValidateForRequest(request); err == nil {
+		t.Fatal("legacy unit was not bound to candidate release")
+	}
+	request.CandidateRelease.ID = plan.ServerUnitReleaseID
+	request.CandidateRelease.SourceCommit = "bad"
+	if err := request.Validate(); err == nil {
+		t.Fatal("invalid preflight request accepted")
+	}
+	inspection := ActiveDatabaseInspectionRequest{DatabaseEnv: plan.DatabaseEnv, ExpectedMigration: plan.ExpectedMigration, ExpectedRowsSHA256: plan.ExpectedRowsSHA256}
+	if err := inspection.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(inspection)
+	if err != nil || strings.Contains(string(raw), "postgresql://") || strings.Contains(string(raw), "database_env") {
+		t.Fatal("inspection request serialized secret")
+	}
+	assertJSONKeys(t, raw, "expected_migration", "expected_rows_sha256")
+	inspection.ExpectedMigration = "0024"
+	if err := inspection.Validate(); err == nil {
+		t.Fatal("invalid inspection request accepted")
+	}
+}
+
+func TestLegacyActivationAndObservationContracts(t *testing.T) {
+	activation := legacyActivationFixture()
+	if err := activation.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	for _, edit := range []func(*ActivationV1){
+		func(a *ActivationV1) { a.Origin = "native" },
+		func(a *ActivationV1) { a.Release.Version = "0.8.0-rc.1" },
+		func(a *ActivationV1) { a.Database.Migration = "0024" },
+		func(a *ActivationV1) { a.LegacyProjection.Target = "/tmp/release" },
+		func(a *ActivationV1) { a.LegacyProjection.ServerEnvBeforeSHA256 = "bad" },
+		func(a *ActivationV1) { a.LegacyProjection.ServerEnvAfterSHA256 = "bad" },
+		func(a *ActivationV1) { a.LegacyProjection.ServerUnitBeforeSHA256 = "bad" },
+		func(a *ActivationV1) { a.LegacyProjection.ServerUnitAfterSHA256 = "bad" },
+		func(a *ActivationV1) { a.LegacyProjection.ServerUnitReleaseID = "" },
+	} {
+		broken := legacyActivationFixture()
+		edit(&broken)
+		if err := broken.Validate(); err == nil {
+			t.Fatal("invalid legacy activation accepted")
+		}
+	}
+	native := activationFixture()
+	native.LegacyProjection = &LegacyProjectionV1{}
+	if err := native.Validate(); err == nil {
+		t.Fatal("native activation accepted legacy projection")
+	}
+	digest, err := CanonicalActivationJSONSHA256(activation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observation := LegacyProjectionObservation{ActivationID: activation.ActivationID, ActivationJSONSHA256: digest, DatabaseEnvSHA256: activation.DatabaseEnvSHA256, Active: ActivationPointerIdentity{ID: activation.ActivationID, JSONSHA256: digest}, CurrentTarget: legacyCurrentTarget, ServerEnvSHA256: sha("a"), ServerUnitSHA256: sha("b")}
+	if err := observation.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	for _, edit := range []func(*LegacyProjectionObservation){
+		func(o *LegacyProjectionObservation) { o.ActivationID = "" },
+		func(o *LegacyProjectionObservation) { o.ActivationJSONSHA256 = "bad" },
+		func(o *LegacyProjectionObservation) { o.DatabaseEnvSHA256 = "bad" },
+		func(o *LegacyProjectionObservation) { o.Active.ID = "another" },
+		func(o *LegacyProjectionObservation) { o.Previous.ID = "unpaired" },
+		func(o *LegacyProjectionObservation) { o.CurrentTarget = "releases/old" },
+		func(o *LegacyProjectionObservation) { o.ServerEnvSHA256 = "bad" },
+		func(o *LegacyProjectionObservation) { o.ServerUnitSHA256 = "bad" },
+	} {
+		broken := observation
+		edit(&broken)
+		if err := broken.Validate(); err == nil {
+			t.Fatal("invalid legacy projection observation accepted")
+		}
+	}
+}
+
+func TestPlannedOldActivationJournalRoundTripAndStrictJSON(t *testing.T) {
+	planned := legacyActivationFixture()
+	digest, err := CanonicalActivationJSONSHA256(planned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal := journalFixture()
+	journal.OldActivationID = planned.ActivationID
+	journal.OldActivationJSONSHA256 = digest
+	journal.PlannedOldActivation = &planned
+	if err := journal.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := MarshalUpgradeJournalV1(journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "postgresql://") || strings.Contains(string(raw), "pass@") {
+		t.Fatal("journal serialized database secret")
+	}
+	fields := assertJSONKeys(t, raw,
+		"schema_version", "transaction_id", "revision", "state", "created_at", "updated_at", "requested_manifest_sha256",
+		"old_activation_id", "old_activation_json_sha256", "planned_old_activation", "candidate_activation_id", "candidate_database_name", "service_snapshot", "history",
+	)
+	assertJSONKeys(t, fields["planned_old_activation"],
+		"schema_version", "activation_id", "origin", "release", "database", "database_env_sha256", "created_at", "created_by_transaction_id", "legacy_projection",
+	)
+	got, err := ParseUpgradeJournalV1(raw)
+	if err != nil || got.PlannedOldActivation == nil || got.PlannedOldActivation.ActivationID != planned.ActivationID {
+		t.Fatalf("planned old activation did not round-trip: %v", err)
+	}
+	appendTransition(&journal, JournalLegacyProjected)
+	raw, err = MarshalUpgradeJournalV1(journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err = ParseUpgradeJournalV1(raw); err != nil || got.PlannedOldActivation == nil || got.PlannedOldActivation.ActivationID != planned.ActivationID {
+		t.Fatalf("planned old activation was not retained: %v", err)
+	}
+	for _, edit := range []func(*UpgradeJournalV1){
+		func(j *UpgradeJournalV1) { j.OldActivationID = "activation-other" },
+		func(j *UpgradeJournalV1) { j.OldActivationJSONSHA256 = sha("0") },
+		func(j *UpgradeJournalV1) { j.PlannedOldActivation.Origin = "native" },
+	} {
+		broken := journal
+		plannedCopy := *journal.PlannedOldActivation
+		broken.PlannedOldActivation = &plannedCopy
+		edit(&broken)
+		if err := broken.Validate(); err == nil {
+			t.Fatal("invalid planned activation journal accepted")
+		}
+	}
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatal(err)
+	}
+	fields["planned_old_activation"] = json.RawMessage("null")
+	nullPlanned, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range [][]byte{
+		[]byte(`{"schema_version":1,"schema_version":1}`),
+		append(raw, []byte(" {}")...),
+		nullPlanned,
+		[]byte(strings.Replace(string(raw), `"planned_old_activation":{`, `"planned_old_activation":{"unknown":true,`, 1)),
+	} {
+		if _, err := ParseUpgradeJournalV1(bad); err == nil {
+			t.Fatal("unsafe planned journal JSON accepted")
+		}
+	}
+}

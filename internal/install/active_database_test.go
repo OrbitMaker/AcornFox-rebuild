@@ -31,7 +31,7 @@ func activeDatabaseFixture(t *testing.T) (*ActiveDatabaseResolver, string, strin
 	activation := ActivationV1{
 		SchemaVersion:          ActivationSchemaVersion,
 		ActivationID:           activationID,
-		Origin:                 "install",
+		Origin:                 "native",
 		Release:                ReleaseV1{ID: releaseID, Version: "0.8.0-rc.1", SourceCommit: strings.Repeat("a", 40), Architecture: "arm64", ManifestSHA256: sha("b")},
 		Database:               DatabaseV1{Name: "open_card", Migration: "0024", SchemaMigrationsSHA256: sha("c")},
 		DatabaseEnvSHA256:      hex.EncodeToString(sum[:]),

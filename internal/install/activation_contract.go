@@ -53,7 +53,12 @@ type DatabaseV1 struct {
 	SchemaMigrationsSHA256 string `json:"schema_migrations_sha256"`
 }
 type LegacyProjectionV1 struct {
-	Target string `json:"target"`
+	Target                 string `json:"target"`
+	ServerEnvBeforeSHA256  string `json:"server_env_before_sha256"`
+	ServerEnvAfterSHA256   string `json:"server_env_after_sha256"`
+	ServerUnitBeforeSHA256 string `json:"server_unit_before_sha256"`
+	ServerUnitAfterSHA256  string `json:"server_unit_after_sha256"`
+	ServerUnitReleaseID    string `json:"server_unit_release_id"`
 }
 type ActivationV1 struct {
 	SchemaVersion          int                 `json:"schema_version"`
@@ -112,6 +117,7 @@ type UpgradeJournalV1 struct {
 	OldActivationJSONSHA256                string                `json:"old_activation_json_sha256"`
 	PreUpgradePreviousActivationID         string                `json:"pre_upgrade_previous_activation_id,omitempty"`
 	PreUpgradePreviousActivationJSONSHA256 string                `json:"pre_upgrade_previous_activation_json_sha256,omitempty"`
+	PlannedOldActivation                   *ActivationV1         `json:"planned_old_activation,omitempty"`
 	CandidateActivationID                  string                `json:"candidate_activation_id"`
 	CandidateActivationJSONSHA256          string                `json:"candidate_activation_json_sha256,omitempty"`
 	CandidateDatabaseName                  string                `json:"candidate_database_name"`
@@ -215,13 +221,30 @@ func (j UpgradeJournalV1) effectiveEvidenceRank() (int, error) {
 	return rank, nil
 }
 func (a ActivationV1) Validate() error {
-	if a.SchemaVersion != 1 || !validID(a.ActivationID) || !validID(a.Origin) || !a.Release.valid() || !a.Database.valid() || !validSHA(a.DatabaseEnvSHA256) || a.CreatedAt.IsZero() || !validID(a.CreatedByTransactionID) {
+	if a.SchemaVersion != 1 || !validID(a.ActivationID) || !a.Release.valid() || !a.Database.valid() || !validSHA(a.DatabaseEnvSHA256) || a.CreatedAt.IsZero() || !validID(a.CreatedByTransactionID) {
 		return fmt.Errorf("invalid activation v1")
 	}
-	if a.LegacyProjection != nil && a.LegacyProjection.Target != filepath.Join("/opt/open-card/releases", a.Release.ID) {
+	if a.LegacyProjection == nil {
+		if a.Origin != "native" {
+			return fmt.Errorf("invalid native activation origin")
+		}
+		return nil
+	}
+	if a.Origin != "rc0_compat_projection" || !validRC0Release(a.Release) || a.Database.Migration != "0023" || !a.LegacyProjection.valid(a.Release) {
 		return fmt.Errorf("invalid legacy projection")
 	}
 	return nil
+}
+
+// CanonicalActivationJSONSHA256 returns the digest of the activation's stable
+// JSON representation. It is used as the journaled pointer identity.
+func CanonicalActivationJSONSHA256(a ActivationV1) (string, error) {
+	raw, err := MarshalActivationV1(a)
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(raw)
+	return hex.EncodeToString(digest[:]), nil
 }
 func (j UpgradeJournalV1) Validate() error {
 	if j.SchemaVersion != 1 || !validID(j.TransactionID) || j.History == nil || j.Revision != int64(len(j.History)+1) || !stateOK(j.State) || j.CreatedAt.IsZero() || j.UpdatedAt.Before(j.CreatedAt) || !validSHA(j.RequestedManifestSHA256) || !validID(j.OldActivationID) || !validSHA(j.OldActivationJSONSHA256) || !validID(j.CandidateActivationID) || !candidateDatabaseName.MatchString(j.CandidateDatabaseName) {
@@ -229,6 +252,16 @@ func (j UpgradeJournalV1) Validate() error {
 	}
 	if (j.PreUpgradePreviousActivationID == "") != (j.PreUpgradePreviousActivationJSONSHA256 == "") || j.PreUpgradePreviousActivationID != "" && (!validID(j.PreUpgradePreviousActivationID) || !validSHA(j.PreUpgradePreviousActivationJSONSHA256)) {
 		return fmt.Errorf("invalid pre-upgrade previous activation")
+	}
+	if j.PlannedOldActivation != nil {
+		planned := *j.PlannedOldActivation
+		if planned.Validate() != nil || planned.LegacyProjection == nil || planned.ActivationID != j.OldActivationID {
+			return fmt.Errorf("invalid planned old activation")
+		}
+		digest, err := CanonicalActivationJSONSHA256(planned)
+		if err != nil || digest != j.OldActivationJSONSHA256 {
+			return fmt.Errorf("invalid planned old activation digest")
+		}
 	}
 	if len(j.History) == 0 {
 		if j.Revision != 1 || j.State != JournalPreflighted || !j.UpdatedAt.Equal(j.CreatedAt) {
@@ -369,6 +402,9 @@ func requireJournalFields(raw []byte, j UpgradeJournalV1) error {
 		if !ok || bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
 			return fmt.Errorf("missing required journal field %q", name)
 		}
+	}
+	if value, present := fields["planned_old_activation"]; present && bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+		return fmt.Errorf("invalid planned old activation field")
 	}
 	rank, err := j.effectiveEvidenceRank()
 	if err != nil {

@@ -256,7 +256,7 @@ func (s *engineServiceFake) RestoreEdge(context.Context, ServiceSnapshotV1) erro
 }
 
 func engineOldActivation() ActivationV1 {
-	return ActivationV1{SchemaVersion: 1, ActivationID: "activation-old", Origin: "install", Release: ReleaseV1{ID: "release-old", Version: "0.8.0-rc.0", SourceCommit: strings.Repeat("a", 40), Architecture: "amd64", ManifestSHA256: strings.Repeat("b", 64)}, Database: DatabaseV1{Name: "open_card", Migration: "0023", SchemaMigrationsSHA256: strings.Repeat("c", 64)}, DatabaseEnvSHA256: strings.Repeat("d", 64), CreatedAt: time.Unix(1, 0).UTC(), CreatedByTransactionID: "old-txn"}
+	return ActivationV1{SchemaVersion: 1, ActivationID: "activation-old", Origin: "native", Release: ReleaseV1{ID: "release-old", Version: "0.8.0-rc.0", SourceCommit: strings.Repeat("a", 40), Architecture: "amd64", ManifestSHA256: strings.Repeat("b", 64)}, Database: DatabaseV1{Name: "open_card", Migration: "0023", SchemaMigrationsSHA256: strings.Repeat("c", 64)}, DatabaseEnvSHA256: strings.Repeat("d", 64), CreatedAt: time.Unix(1, 0).UTC(), CreatedByTransactionID: "old-txn"}
 }
 func engineRequest() UpgradeRequest {
 	return UpgradeRequest{TransactionID: "txn-1", CandidateRelease: ReleaseV1{ID: "release-new", Version: "0.8.0-rc.1", SourceCommit: strings.Repeat("e", 40), Architecture: "amd64", ManifestSHA256: strings.Repeat("f", 64)}, CandidateActivationID: "activation-new", CandidateDatabaseName: "open_card_act_0123456789abcdef", CandidateDatabaseEnv: []byte("OPEN_CARD_DATABASE_URL=postgresql://user:pass@localhost:5432/open_card?sslmode=disable\n"), RequestedManifestSHA256: strings.Repeat("f", 64)}

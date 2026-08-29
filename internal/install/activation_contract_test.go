@@ -10,7 +10,7 @@ import (
 func sha(c string) string { return strings.Repeat(c, 64) }
 
 func activationFixture() ActivationV1 {
-	return ActivationV1{1, "activation-1", "install", ReleaseV1{"release-2", "1.2.3", strings.Repeat("a", 40), "amd64", sha("b")}, DatabaseV1{"open_card", "0024", sha("c")}, sha("d"), time.Unix(1, 0).UTC(), "txn-1", &LegacyProjectionV1{"/opt/open-card/releases/release-2"}}
+	return ActivationV1{SchemaVersion: 1, ActivationID: "activation-1", Origin: "native", Release: ReleaseV1{ID: "release-2", Version: "1.2.3", SourceCommit: strings.Repeat("a", 40), Architecture: "amd64", ManifestSHA256: sha("b")}, Database: DatabaseV1{Name: "open_card", Migration: "0024", SchemaMigrationsSHA256: sha("c")}, DatabaseEnvSHA256: sha("d"), CreatedAt: time.Unix(1, 0).UTC(), CreatedByTransactionID: "txn-1"}
 }
 
 func journalFixture() UpgradeJournalV1 {
