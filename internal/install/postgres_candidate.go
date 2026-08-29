@@ -51,8 +51,8 @@ type SessionCounter interface {
 	CountOpenCardSessions(context.Context) (int, error)
 }
 type CandidateControl interface {
-	Exists(context.Context, string) (bool, error)
-	Create(context.Context, string) error
+	CandidateEvidence(context.Context, string) (bool, string, error)
+	CreateCandidate(context.Context, string, string) error
 }
 type CreateCandidateRequest struct{ ActivationID, ExpectedExistingName, RecoveryEvidence string }
 type CandidateValidator interface {
@@ -72,27 +72,31 @@ type MigrationRow struct{ Version, Checksum string }
 type MigrationEvidence struct{ From, To, RowsSHA256 string }
 
 func CreateCandidate(ctx context.Context, control CandidateControl, request CreateCandidateRequest) (string, error) {
-	if control == nil {
+	if control == nil || !validSHA(request.RecoveryEvidence) {
 		return "", ErrPostgresOutcomeUnknown
 	}
 	name, err := CandidateDatabaseName(request.ActivationID)
 	if err != nil {
 		return "", err
 	}
-	exists, err := control.Exists(ctx, name)
+	exists, evidence, err := control.CandidateEvidence(ctx, name)
 	if err != nil {
 		return "", ErrPostgresOutcomeUnknown
 	}
 	if exists {
-		if request.ExpectedExistingName == name && request.RecoveryEvidence != "" {
+		if request.ExpectedExistingName == name && evidence == candidateDatabaseEvidence(request.RecoveryEvidence) {
 			return name, nil
 		}
 		return "", ErrCandidateConflict
 	}
-	if err := control.Create(ctx, name); err != nil {
+	if err := control.CreateCandidate(ctx, name, request.RecoveryEvidence); err != nil {
 		return "", ErrPostgresOutcomeUnknown
 	}
 	return name, nil
+}
+
+func candidateDatabaseEvidence(recoveryEvidence string) string {
+	return "open-card-upgrade:" + recoveryEvidence
 }
 
 // ProductionPostgresControl keeps decoded DSNs private and exposes only safe
@@ -180,22 +184,26 @@ func (p *ProductionPostgresControl) Close() error {
 	}
 	return p.admin.Close()
 }
-func (p *ProductionPostgresControl) Exists(ctx context.Context, name string) (bool, error) {
+func (p *ProductionPostgresControl) CandidateEvidence(ctx context.Context, name string) (bool, string, error) {
 	if p == nil || !candidateDatabaseName.MatchString(name) {
-		return false, ErrPostgresOutcomeUnknown
+		return false, "", ErrPostgresOutcomeUnknown
 	}
 	var exists bool
-	err := p.admin.QueryRowContext(ctx, "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)", name).Scan(&exists)
+	var evidence string
+	err := p.admin.QueryRowContext(ctx, "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1), COALESCE((SELECT obj_description(oid, 'pg_database') FROM pg_database WHERE datname = $1), '')", name).Scan(&exists, &evidence)
 	if err != nil {
-		return false, ErrPostgresOutcomeUnknown
+		return false, "", ErrPostgresOutcomeUnknown
 	}
-	return exists, nil
+	return exists, evidence, nil
 }
-func (p *ProductionPostgresControl) Create(ctx context.Context, name string) error {
-	if p == nil || !candidateDatabaseName.MatchString(name) {
+func (p *ProductionPostgresControl) CreateCandidate(ctx context.Context, name, recoveryEvidence string) error {
+	if p == nil || !candidateDatabaseName.MatchString(name) || !validSHA(recoveryEvidence) {
 		return ErrPostgresOutcomeUnknown
 	}
 	if _, err := p.admin.ExecContext(ctx, "CREATE DATABASE "+name); err != nil {
+		return ErrPostgresOutcomeUnknown
+	}
+	if _, err := p.admin.ExecContext(ctx, "COMMENT ON DATABASE "+name+" IS '"+candidateDatabaseEvidence(recoveryEvidence)+"'"); err != nil {
 		return ErrPostgresOutcomeUnknown
 	}
 	return nil

@@ -72,8 +72,16 @@ type UpgradeDatabaseDriver interface {
 	Drain(context.Context) error
 	Snapshot(context.Context) (SnapshotEvidence, string, error)
 	CreateRestore(context.Context, string) error
-	Migrate(context.Context) (MigrationEvidence, error)
+	Migrate(context.Context) (UpgradeMigrationEvidence, error)
 	Validate(context.Context, string) (ArtifactV1, error)
+}
+
+// UpgradeMigrationEvidence keeps the independently verified candidate schema
+// rows distinct from the release manifest that authorized their migration.
+type UpgradeMigrationEvidence struct {
+	From, To              string
+	RowsSHA256            string
+	ReleaseManifestSHA256 string
 }
 
 type UpgradeServiceDriver interface {
@@ -462,7 +470,7 @@ func (e *UpgradeEngine) RunNew(ctx context.Context, r UpgradeRequest) error {
 		return fail(JournalMigrated, "migration_failed", err)
 	} else {
 		j.CandidateDatabase = &DatabaseV1{Name: r.CandidateDatabaseName, Migration: evidence.To, SchemaMigrationsSHA256: evidence.RowsSHA256}
-		j.Migration = &MigrationV1{From: evidence.From, To: evidence.To, ManifestSHA256: evidence.RowsSHA256}
+		j.Migration = &MigrationV1{From: evidence.From, To: evidence.To, ManifestSHA256: evidence.ReleaseManifestSHA256}
 		if err := e.advance(ctx, &j, JournalMigrated); err != nil {
 			return fail(JournalMigrated, "migration_journal_failed", err)
 		}

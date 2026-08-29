@@ -36,6 +36,14 @@
 	}
 }
 
+# Upgrade health is a dedicated local-only HTTP listener. It must stay apart
+# from public TLS and exposes no routing, administration, or diagnostic data.
+http://127.0.0.1:18482 {
+	@edge_health path /healthz
+	respond @edge_health 200
+	respond 404
+}
+
 # Replace only this documentation hostname during an approved deployment.
 # API/SSE must match before the SPA fallback so a deep link never consumes it.
 console.example.invalid {

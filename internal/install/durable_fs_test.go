@@ -110,6 +110,63 @@ func TestActivationLinksAreTypedAndRelative(t *testing.T) {
 	}
 }
 
+func TestReadAndRemoveActivationLinkAreTyped(t *testing.T) {
+	w, root := taskWriter(t)
+	if err := os.Mkdir(filepath.Join(root, "activations", "act-1"), durableDirMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.SwapActivationLink(ActivationLinkPreviousActive, "act-1", ""); err != nil {
+		t.Fatal(err)
+	}
+	if target, err := w.ReadActivationLink(ActivationLinkPreviousActive); err != nil || target != "activations/act-1" {
+		t.Fatalf("target=%q err=%v", target, err)
+	}
+	if err := w.RemoveActivationLink(ActivationLinkPreviousActive); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.ReadActivationLink(ActivationLinkPreviousActive); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("removed link readable: %v", err)
+	}
+	if err := w.RemoveActivationLink(ActivationLinkActive); err == nil {
+		t.Fatal("active pointer removal accepted")
+	}
+	if err := os.WriteFile(filepath.Join(root, "previous-active"), []byte("not a link"), durableFileMode); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.ReadActivationLink(ActivationLinkPreviousActive); err == nil {
+		t.Fatal("regular pointer accepted")
+	}
+	if err := os.Remove(filepath.Join(root, "previous-active")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../../outside", filepath.Join(root, "previous-active")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.ReadActivationLink(ActivationLinkPreviousActive); err == nil {
+		t.Fatal("unsafe pointer target accepted")
+	}
+}
+
+func TestReadAndRemoveActivationLinkPropagateFaults(t *testing.T) {
+	for _, failure := range []string{"readlink", "remove"} {
+		t.Run(failure, func(t *testing.T) {
+			w, _ := faultWriter(t, failure, true)
+			if err := w.SwapActivationLink(ActivationLinkPreviousActive, "act-1", ""); err != nil {
+				t.Fatal(err)
+			}
+			if failure == "readlink" {
+				if _, err := w.ReadActivationLink(ActivationLinkPreviousActive); err == nil {
+					t.Fatal("readlink failure was hidden")
+				}
+				return
+			}
+			if err := w.RemoveActivationLink(ActivationLinkPreviousActive); err == nil {
+				t.Fatal("remove failure was hidden")
+			}
+		})
+	}
+}
+
 type phaseFaultOps struct {
 	durableOps
 	fail       string
@@ -122,6 +179,20 @@ func (f *phaseFaultOps) OpenFile(name string, flag int, mode os.FileMode) (*os.F
 		return nil, errors.New("injected create failure")
 	}
 	return f.durableOps.OpenFile(name, flag, mode)
+}
+
+func (f *phaseFaultOps) Readlink(name string) (string, error) {
+	if f.fail == "readlink" {
+		return "", errors.New("injected readlink failure")
+	}
+	return f.durableOps.Readlink(name)
+}
+
+func (f *phaseFaultOps) Remove(name string) error {
+	if f.fail == "remove" {
+		return errors.New("injected remove failure")
+	}
+	return f.durableOps.Remove(name)
 }
 
 func (f *phaseFaultOps) Write(file *os.File, value []byte) (int, error) {
@@ -240,6 +311,30 @@ func TestWriteMetadataPropagatesEveryPreRenameBoundaryFailure(t *testing.T) {
 				t.Fatalf("target exists or could not be inspected after %s: %v", phase, err)
 			}
 		})
+	}
+}
+
+func TestCreateMetadataDoesNotReplaceExistingDestination(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, durableDirMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(root, "journal"), durableDirMode); err != nil {
+		t.Fatal(err)
+	}
+	w, err := TaskDurableWriter(root, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.CreateMetadata("journal/item", []byte("first")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.CreateMetadata("journal/item", []byte("second")); !errors.Is(err, os.ErrExist) {
+		t.Fatalf("err=%v", err)
+	}
+	got, err := w.ReadMetadata("journal/item")
+	if err != nil || string(got) != "first" {
+		t.Fatalf("got=%q err=%v", got, err)
 	}
 }
 

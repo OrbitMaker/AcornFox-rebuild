@@ -199,11 +199,11 @@ func (d *engineDBFake) Snapshot(context.Context) (SnapshotEvidence, string, erro
 	return SnapshotEvidence{SHA256: strings.Repeat("c", 64), Size: 17}, "open_card", nil
 }
 func (d *engineDBFake) CreateRestore(context.Context, string) error { return d.event("candidate") }
-func (d *engineDBFake) Migrate(context.Context) (MigrationEvidence, error) {
+func (d *engineDBFake) Migrate(context.Context) (UpgradeMigrationEvidence, error) {
 	if err := d.event("migrate"); err != nil {
-		return MigrationEvidence{}, err
+		return UpgradeMigrationEvidence{}, err
 	}
-	return MigrationEvidence{From: "0023", To: "0024", RowsSHA256: strings.Repeat("d", 64)}, nil
+	return UpgradeMigrationEvidence{From: "0023", To: "0024", RowsSHA256: strings.Repeat("d", 64), ReleaseManifestSHA256: strings.Repeat("f", 64)}, nil
 }
 func (d *engineDBFake) Validate(context.Context, string) (ArtifactV1, error) {
 	if err := d.event("validate"); err != nil {
@@ -438,6 +438,9 @@ func TestUpgradeEngineHappyJournalAndOrdering(t *testing.T) {
 	}
 	if last.Snapshot == nil || last.Migration == nil || last.Validation == nil || last.CandidateDatabase == nil || last.CandidateActivationJSONSHA256 == "" {
 		t.Fatal("zero progressive evidence")
+	}
+	if last.CandidateDatabase.SchemaMigrationsSHA256 != strings.Repeat("d", 64) || last.Migration.ManifestSHA256 != strings.Repeat("f", 64) || last.CandidateDatabase.SchemaMigrationsSHA256 == last.Migration.ManifestSHA256 {
+		t.Fatalf("rows/manifest evidence=%+v %+v", last.CandidateDatabase, last.Migration)
 	}
 }
 

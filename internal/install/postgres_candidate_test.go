@@ -15,18 +15,19 @@ import (
 )
 
 type candidateFake struct {
-	exists    bool
-	err       error
-	execErr   error
-	name, sql string
+	exists             bool
+	evidence           string
+	err, execErr       error
+	name, sql, comment string
 }
 
-func (f *candidateFake) Exists(_ context.Context, name string) (bool, error) {
+func (f *candidateFake) CandidateEvidence(_ context.Context, name string) (bool, string, error) {
 	f.name = name
-	return f.exists, f.err
+	return f.exists, f.evidence, f.err
 }
-func (f *candidateFake) Create(_ context.Context, name string) error {
+func (f *candidateFake) CreateCandidate(_ context.Context, name, evidence string) error {
 	f.sql = "CREATE DATABASE " + name
+	f.comment = candidateDatabaseEvidence(evidence)
 	return f.execErr
 }
 
@@ -56,11 +57,11 @@ func (f *migrationFake) BeginMigration(context.Context) (MigrationTx, error) {
 	return &migrationTxFake{f}, nil
 }
 func candidateRequest(id string) CreateCandidateRequest {
-	return CreateCandidateRequest{ActivationID: id}
+	return CreateCandidateRequest{ActivationID: id, RecoveryEvidence: strings.Repeat("a", 64)}
 }
 func recoveryRequest(id string) CreateCandidateRequest {
 	name, _ := CandidateDatabaseName(id)
-	return CreateCandidateRequest{ActivationID: id, ExpectedExistingName: name, RecoveryEvidence: "test"}
+	return CreateCandidateRequest{ActivationID: id, ExpectedExistingName: name, RecoveryEvidence: strings.Repeat("a", 64)}
 }
 
 type validatorFake struct {
@@ -130,6 +131,7 @@ type adapterDB struct {
 	args     []any
 	exec     string
 	execArgs []any
+	execs    []string
 	tx       *adapterTx
 	closeErr error
 }
@@ -147,6 +149,7 @@ func (d *adapterDB) QueryContext(_ context.Context, q string, a ...any) (postgre
 func (d *adapterDB) ExecContext(_ context.Context, q string, a ...any) (postgresResult, error) {
 	d.exec = q
 	d.execArgs = a
+	d.execs = append(d.execs, q)
 	return nil, nil
 }
 func (d *adapterDB) BeginTx(context.Context, *sql.TxOptions) (postgresTx, error) { return d.tx, nil }
@@ -236,23 +239,23 @@ func TestPGEnvAndSessions(t *testing.T) {
 	}
 }
 
-func TestProductionControlExistsUsesParameterizedCandidateQuery(t *testing.T) {
-	db := &adapterDB{row: adapterRow{values: []any{true}}}
+func TestProductionControlReadsParameterizedCandidateEvidence(t *testing.T) {
+	db := &adapterDB{row: adapterRow{values: []any{true, "open-card-upgrade:" + strings.Repeat("a", 64)}}}
 	p := &ProductionPostgresControl{admin: db}
-	ok, err := p.Exists(context.Background(), "open_card_act_0123456789abcdef")
-	if err != nil || !ok || db.query != "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)" || len(db.args) != 1 {
-		t.Fatalf("ok=%v err=%v query=%q args=%v", ok, err, db.query, db.args)
+	ok, evidence, err := p.CandidateEvidence(context.Background(), "open_card_act_0123456789abcdef")
+	if err != nil || !ok || evidence != "open-card-upgrade:"+strings.Repeat("a", 64) || db.query != "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1), COALESCE((SELECT obj_description(oid, 'pg_database') FROM pg_database WHERE datname = $1), '')" || len(db.args) != 1 {
+		t.Fatalf("ok=%v evidence=%q err=%v query=%q args=%v", ok, evidence, err, db.query, db.args)
 	}
 }
 
-func TestProductionControlCreateUsesRegexGatedFixedSQL(t *testing.T) {
+func TestProductionControlCreateStoresFixedCandidateEvidence(t *testing.T) {
 	db := &adapterDB{}
 	p := &ProductionPostgresControl{admin: db}
-	if err := p.Create(context.Background(), "open_card_act_0123456789abcdef"); err != nil || db.exec != "CREATE DATABASE open_card_act_0123456789abcdef" {
-		t.Fatalf("err=%v sql=%q", err, db.exec)
+	evidence := strings.Repeat("a", 64)
+	if err := p.CreateCandidate(context.Background(), "open_card_act_0123456789abcdef", evidence); err != nil || len(db.execs) != 2 || db.execs[0] != "CREATE DATABASE open_card_act_0123456789abcdef" || db.execs[1] != "COMMENT ON DATABASE open_card_act_0123456789abcdef IS 'open-card-upgrade:"+evidence+"'" {
+		t.Fatalf("err=%v sql=%q all=%q", err, db.exec, db.execs)
 	}
-	db.exec = ""
-	if err := p.Create(context.Background(), "bad; DROP DATABASE x"); !errors.Is(err, ErrPostgresOutcomeUnknown) || db.exec != "" {
+	if err := p.CreateCandidate(context.Background(), "bad; DROP DATABASE x", evidence); !errors.Is(err, ErrPostgresOutcomeUnknown) {
 		t.Fatalf("err=%v sql=%q", err, db.exec)
 	}
 }
@@ -309,13 +312,13 @@ func TestCreateCandidateUsesDerivedSafeNameAndExactSQL(t *testing.T) {
 		t.Fatal(err)
 	}
 	want, _ := CandidateDatabaseName("activation-1")
-	if name != want || f.name != want || f.sql != "CREATE DATABASE "+want {
-		t.Fatalf("name=%q exists=%q sql=%q", name, f.name, f.sql)
+	if name != want || f.name != want || f.sql != "CREATE DATABASE "+want || f.comment != "open-card-upgrade:"+strings.Repeat("a", 64) {
+		t.Fatalf("name=%q exists=%q sql=%q comment=%q", name, f.name, f.sql, f.comment)
 	}
 }
 
-func TestCreateCandidateAllowsExistingOnlyWhenRequested(t *testing.T) {
-	f := &candidateFake{exists: true}
+func TestCreateCandidateAllowsExistingOnlyWithExactPersistentEvidence(t *testing.T) {
+	f := &candidateFake{exists: true, evidence: candidateDatabaseEvidence(strings.Repeat("a", 64))}
 	name, err := CreateCandidate(context.Background(), f, recoveryRequest("activation-1"))
 	if err != nil || name == "" || f.sql != "" {
 		t.Fatalf("name=%q err=%v sql=%q", name, err, f.sql)
@@ -323,9 +326,11 @@ func TestCreateCandidateAllowsExistingOnlyWhenRequested(t *testing.T) {
 }
 
 func TestCreateCandidateRejectsExistingConflict(t *testing.T) {
-	_, err := CreateCandidate(context.Background(), &candidateFake{exists: true}, candidateRequest("activation-1"))
-	if !errors.Is(err, ErrCandidateConflict) {
-		t.Fatalf("err=%v", err)
+	for _, evidence := range []string{"", "open-card-upgrade:" + strings.Repeat("b", 64)} {
+		_, err := CreateCandidate(context.Background(), &candidateFake{exists: true, evidence: evidence}, recoveryRequest("activation-1"))
+		if !errors.Is(err, ErrCandidateConflict) {
+			t.Fatalf("evidence=%q err=%v", evidence, err)
+		}
 	}
 }
 

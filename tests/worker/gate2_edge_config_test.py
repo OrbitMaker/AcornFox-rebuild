@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import unittest
 from pathlib import Path
 
@@ -45,6 +46,20 @@ class EdgeConfigContractTests(unittest.TestCase):
         self.assertIn("import identity_headers", application_proxy)
         self.assertNotIn("header_up X-Open-Card-Client-IP", application_proxy)
         self.assertIn("flush_interval -1", self.caddyfile)
+
+    def test_upgrade_health_listener_is_loopback_only_and_has_no_public_features(self) -> None:
+        listener = "http://127.0.0.1:18482 {"
+        self.assertIn(listener, self.caddyfile)
+        listeners = re.findall(r"(?m)^([^\s{]+):18482\s*\{", self.caddyfile)
+        self.assertEqual(listeners, ["http://127.0.0.1"])
+        health_start = self.caddyfile.index(listener)
+        health_end = self.caddyfile.index("# Replace only this documentation hostname", health_start)
+        health_block = self.caddyfile[health_start:health_end]
+        self.assertIn("@edge_health path /healthz", health_block)
+        self.assertIn("respond @edge_health 200", health_block)
+        self.assertIn("respond 404", health_block)
+        for forbidden in ("reverse_proxy", "tls", "on_demand", "admin", "log"):
+            self.assertNotIn(forbidden, health_block)
 
     def test_tls_and_transport_contract_is_bounded(self) -> None:
         for expected in (
