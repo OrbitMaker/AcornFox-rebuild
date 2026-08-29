@@ -1,0 +1,403 @@
+package install
+
+import (
+	"crypto/rand"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"syscall"
+)
+
+const (
+	durableFileMode = 0o600
+	durableDirMode  = 0o700
+
+	upgradeInProgressPath = "var/lib/open-card/upgrade-in-progress"
+)
+
+// ErrDurableCommitUnknown means Rename succeeded but fsyncing its parent did
+// not. Callers must reread the named object from the same DurableWriter and
+// reconcile against their journal; they must not assume the old name survived.
+var ErrDurableCommitUnknown = errors.New("durable commit outcome is unknown")
+
+// durableRoot is deliberately narrow so tests can inject every persistence
+// boundary without allowing production callers to opt out of root containment.
+type durableRoot interface {
+	OpenFile(string, int, os.FileMode) (*os.File, error)
+	Rename(string, string) error
+	Remove(string) error
+	Symlink(string, string) error
+	Lstat(string) (os.FileInfo, error)
+	Close() error
+}
+
+type osDurableRoot struct{ root *os.Root }
+
+func (r osDurableRoot) OpenFile(name string, flag int, mode os.FileMode) (*os.File, error) {
+	return r.root.OpenFile(name, flag, mode)
+}
+func (r osDurableRoot) Rename(oldName, newName string) error   { return r.root.Rename(oldName, newName) }
+func (r osDurableRoot) Remove(name string) error               { return r.root.Remove(name) }
+func (r osDurableRoot) Symlink(target, name string) error      { return r.root.Symlink(target, name) }
+func (r osDurableRoot) Lstat(name string) (os.FileInfo, error) { return r.root.Lstat(name) }
+func (r osDurableRoot) Close() error                           { return r.root.Close() }
+
+type durableOps interface {
+	durableRoot
+	Write(*os.File, []byte) (int, error)
+	Sync(*os.File) error
+	Chmod(*os.File, os.FileMode) error
+	Chown(*os.File, int, int) error
+	Stat(*os.File) (os.FileInfo, error)
+	CloseFile(*os.File) error
+}
+
+type realDurableOps struct{ durableRoot }
+
+func (realDurableOps) Write(file *os.File, value []byte) (int, error) { return file.Write(value) }
+func (realDurableOps) Sync(file *os.File) error                       { return file.Sync() }
+func (realDurableOps) Chmod(file *os.File, mode os.FileMode) error    { return file.Chmod(mode) }
+func (realDurableOps) Chown(file *os.File, uid, gid int) error        { return file.Chown(uid, gid) }
+func (realDurableOps) Stat(file *os.File) (os.FileInfo, error)        { return file.Stat() }
+func (realDurableOps) CloseFile(file *os.File) error                  { return file.Close() }
+
+// DurableWriter is a fixed-root, ownership-enforcing writer for activation,
+// journal and marker metadata. It deliberately has no zero-value constructor.
+// Use ProductionDurableWriter for root-owned production metadata or
+// TaskDurableWriter only from task-scoped test roots.
+type DurableWriter struct {
+	ops durableOps
+	uid int
+	gid int
+}
+
+func ProductionDurableWriter(root string) (*DurableWriter, error) {
+	return newDurableWriter(root, 0, 0, nil)
+}
+
+func TaskDurableWriter(root string, uid, gid int) (*DurableWriter, error) {
+	if uid < 0 || gid < 0 {
+		return nil, fmt.Errorf("task durable writer owner is invalid")
+	}
+	return newDurableWriter(root, uid, gid, nil)
+}
+
+func newDurableWriter(root string, uid, gid int, injected durableOps) (*DurableWriter, error) {
+	if !safeAbsoluteDurableRoot(root) {
+		return nil, fmt.Errorf("durable root is unsafe")
+	}
+	info, err := os.Lstat(root)
+	if err != nil {
+		return nil, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm()&0o022 != 0 {
+		return nil, fmt.Errorf("durable root must be a non-symlink non-writable-by-others directory")
+	}
+	if err := verifyOwner(info, uid, gid); err != nil {
+		return nil, err
+	}
+	if injected != nil {
+		return &DurableWriter{ops: injected, uid: uid, gid: gid}, nil
+	}
+	opened, err := os.OpenRoot(root)
+	if err != nil {
+		return nil, err
+	}
+	rootOps := osDurableRoot{root: opened}
+	return &DurableWriter{ops: realDurableOps{durableRoot: rootOps}, uid: uid, gid: gid}, nil
+}
+
+func safeAbsoluteDurableRoot(path string) bool {
+	return filepath.IsAbs(path) && filepath.Clean(path) == path && !strings.Contains(path, "\x00")
+}
+
+func cleanRelative(name string) error {
+	if name == "" || filepath.IsAbs(name) || strings.ContainsAny(name, "\x00\\") || filepath.Clean(name) != name || name == "." || name == ".." || strings.HasPrefix(name, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("durable path must be clean and relative")
+	}
+	return nil
+}
+
+func (w *DurableWriter) Close() error {
+	if w == nil || w.ops == nil {
+		return nil
+	}
+	return w.ops.Close()
+}
+
+func (w *DurableWriter) WriteMetadata(name string, value []byte) error {
+	if w == nil || w.ops == nil {
+		return fmt.Errorf("durable writer is not initialized")
+	}
+	if err := cleanRelative(name); err != nil {
+		return err
+	}
+	if err := w.requireSecureParents(filepath.Dir(name)); err != nil {
+		return err
+	}
+	temporary, err := durableTempName(filepath.Dir(name), ".open-card-file-")
+	if err != nil {
+		return err
+	}
+	file, err := w.ops.OpenFile(temporary, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, durableFileMode)
+	if err != nil {
+		return err
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			_ = w.ops.CloseFile(file)
+		}
+		_ = w.ops.Remove(temporary)
+	}()
+	if _, err = w.ops.Write(file, value); err != nil {
+		return err
+	}
+	if err = w.ops.Sync(file); err != nil {
+		return err
+	}
+	if err = w.ops.Chmod(file, durableFileMode); err != nil {
+		return err
+	}
+	if err = w.ops.Chown(file, w.uid, w.gid); err != nil {
+		return err
+	}
+	info, err := w.ops.Stat(file)
+	if err != nil {
+		return err
+	}
+	if err = verifyDurableFile(info, w.uid, w.gid); err != nil {
+		return err
+	}
+	if err = w.ops.Sync(file); err != nil {
+		return err
+	}
+	if err = w.ops.CloseFile(file); err != nil {
+		return err
+	}
+	closed = true
+	if err = w.ops.Rename(temporary, name); err != nil {
+		return err
+	}
+	if err = w.syncParent(filepath.Dir(name)); err != nil {
+		return fmt.Errorf("%w: %v", ErrDurableCommitUnknown, err)
+	}
+	return nil
+}
+
+func (w *DurableWriter) ReadMetadata(name string) ([]byte, error) {
+	if w == nil || w.ops == nil {
+		return nil, fmt.Errorf("durable writer is not initialized")
+	}
+	if err := cleanRelative(name); err != nil {
+		return nil, err
+	}
+	if err := w.requireSecureParents(filepath.Dir(name)); err != nil {
+		return nil, err
+	}
+	file, err := w.ops.OpenFile(name, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer w.ops.CloseFile(file)
+	info, err := w.ops.Stat(file)
+	if err != nil {
+		return nil, err
+	}
+	if err := verifyDurableFile(info, w.uid, w.gid); err != nil {
+		return nil, err
+	}
+	return io.ReadAll(file)
+}
+
+func (w *DurableWriter) WriteUpgradeInProgress(transactionID string) error {
+	if !validID(transactionID) {
+		return fmt.Errorf("upgrade transaction id is invalid")
+	}
+	return w.WriteMetadata(upgradeInProgressPath, []byte(transactionID+"\n"))
+}
+
+// ReadUpgradeInProgress reads only the fixed filesystem-root-relative marker;
+// callers cannot substitute a different marker path.
+func (w *DurableWriter) ReadUpgradeInProgress() ([]byte, error) {
+	return w.ReadMetadata(upgradeInProgressPath)
+}
+
+// ClearUpgradeInProgress removes only the fixed upgrade marker after a
+// committed upgrade. It verifies the marker through its no-follow descriptor
+// before unlinking and makes the directory-sync outcome explicit.
+func (w *DurableWriter) ClearUpgradeInProgress() error {
+	if _, err := w.ReadUpgradeInProgress(); err != nil {
+		return err
+	}
+	if err := w.ops.Remove(upgradeInProgressPath); err != nil {
+		return err
+	}
+	if err := w.syncParent(filepath.Dir(upgradeInProgressPath)); err != nil {
+		return fmt.Errorf("%w: %v", ErrDurableCommitUnknown, err)
+	}
+	return nil
+}
+
+type ActivationLinkKind string
+
+const (
+	ActivationLinkActive         ActivationLinkKind = "active"
+	ActivationLinkPreviousActive ActivationLinkKind = "previous-active"
+	ActivationLinkCurrent        ActivationLinkKind = "current"
+	ActivationLinkRelease        ActivationLinkKind = "release"
+)
+
+func (w *DurableWriter) SwapActivationLink(kind ActivationLinkKind, activationID, releaseID string) error {
+	name, target, err := activationLink(kind, activationID, releaseID)
+	if err != nil {
+		return err
+	}
+	return w.swapRelativeSymlink(name, target)
+}
+
+func activationLink(kind ActivationLinkKind, activationID, releaseID string) (string, string, error) {
+	switch kind {
+	case ActivationLinkActive, ActivationLinkPreviousActive:
+		if !validID(activationID) || releaseID != "" {
+			return "", "", fmt.Errorf("activation link identity is invalid")
+		}
+		return string(kind), filepath.ToSlash(filepath.Join("activations", activationID)), nil
+	case ActivationLinkCurrent:
+		if activationID != "" || releaseID != "" {
+			return "", "", fmt.Errorf("current link identity is invalid")
+		}
+		return "current", filepath.ToSlash(filepath.Join("active", "release")), nil
+	case ActivationLinkRelease:
+		if !validID(activationID) || !validID(releaseID) {
+			return "", "", fmt.Errorf("release link identity is invalid")
+		}
+		return filepath.ToSlash(filepath.Join("activations", activationID, "release")), filepath.ToSlash(filepath.Join("..", "..", "releases", releaseID)), nil
+	default:
+		return "", "", fmt.Errorf("activation link kind is invalid")
+	}
+}
+
+func (w *DurableWriter) swapRelativeSymlink(name, target string) error {
+	if err := cleanRelative(name); err != nil {
+		return err
+	}
+	if err := cleanLinkTarget(target); err != nil {
+		return err
+	}
+	if err := w.requireSecureParents(filepath.Dir(name)); err != nil {
+		return err
+	}
+	temporary, err := durableTempName(filepath.Dir(name), ".open-card-link-")
+	if err != nil {
+		return err
+	}
+	defer w.ops.Remove(temporary)
+	if err := w.ops.Symlink(target, temporary); err != nil {
+		return err
+	}
+	info, err := w.ops.Lstat(temporary)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		return fmt.Errorf("durable temporary link is not a symlink")
+	}
+	if err := w.ops.Rename(temporary, name); err != nil {
+		return err
+	}
+	if err := w.syncParent(filepath.Dir(name)); err != nil {
+		return fmt.Errorf("%w: %v", ErrDurableCommitUnknown, err)
+	}
+	return nil
+}
+
+func (w *DurableWriter) requireSecureParents(dir string) error {
+	if dir == "." {
+		return nil
+	}
+	if err := cleanRelative(dir); err != nil {
+		return err
+	}
+	current := ""
+	for _, part := range strings.Split(filepath.ToSlash(dir), "/") {
+		if current == "" {
+			current = part
+		} else {
+			current = filepath.ToSlash(filepath.Join(current, part))
+		}
+		info, err := w.ops.Lstat(current)
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm() != durableDirMode {
+			return fmt.Errorf("durable parent is unsafe")
+		}
+		if err := verifyOwner(info, w.uid, w.gid); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (w *DurableWriter) syncParent(dir string) error {
+	file, err := w.ops.OpenFile(dir, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return err
+	}
+	defer w.ops.CloseFile(file)
+	info, err := w.ops.Stat(file)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm() != durableDirMode {
+		return fmt.Errorf("durable parent is unsafe")
+	}
+	if err := verifyOwner(info, w.uid, w.gid); err != nil {
+		return err
+	}
+	return w.ops.Sync(file)
+}
+
+func verifyDurableFile(info os.FileInfo, uid, gid int) error {
+	if !info.Mode().IsRegular() || info.Mode().Perm() != durableFileMode {
+		return fmt.Errorf("durable file mode or type is unsafe")
+	}
+	return verifyOwner(info, uid, gid)
+}
+
+func verifyOwner(info os.FileInfo, uid, gid int) error {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || int(stat.Uid) != uid || int(stat.Gid) != gid {
+		return fmt.Errorf("durable owner mismatch")
+	}
+	return nil
+}
+
+func durableTempName(dir, prefix string) (string, error) {
+	if dir == "." {
+		dir = ""
+	}
+	var random [16]byte
+	if _, err := rand.Read(random[:]); err != nil {
+		return "", err
+	}
+	return filepath.ToSlash(filepath.Join(dir, fmt.Sprintf("%s%x", prefix, random[:]))), nil
+}
+
+// cleanLinkTarget permits only the two link target shapes produced by
+// activationLink. The release link intentionally climbs two directories, but
+// only to the sibling releases directory inside the durable root.
+func cleanLinkTarget(target string) error {
+	if cleanRelative(target) == nil {
+		return nil
+	}
+	const releasePrefix = "../../releases/"
+	if strings.HasPrefix(target, releasePrefix) && validID(strings.TrimPrefix(target, releasePrefix)) {
+		return nil
+	}
+	return fmt.Errorf("durable link target must be a recognized relative target")
+}
