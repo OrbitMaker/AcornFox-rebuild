@@ -374,13 +374,18 @@ func TestG5BRecoverySubstrateStaysStageOnlyAndBootDisabled(t *testing.T) {
 		"durable_sync_directory_and_parent",
 		"prepare_upgrade_data_root",
 		"install -d -m 0711 -o root -g root /var/lib/open-card",
+		"open-card-upgrade-safe.target",
+		"open-card-upgrade-finalize.service",
+		"open-card-edge.service.d/10-upgrade-marker.conf",
 	} {
 		if !strings.Contains(install, required) {
 			t.Fatalf("install substrate contract is missing %q", required)
 		}
 	}
-	if strings.Contains(install, "enable open-card-upgrade-recover.service") || strings.Contains(install, "start open-card-upgrade-recover.service") {
-		t.Fatal("installer enables or starts recovery before the boot-safe gate")
+	for _, unit := range []string{"open-card-upgrade-recover.service", "open-card-upgrade-safe.target", "open-card-upgrade-finalize.service"} {
+		if strings.Contains(install, "enable "+unit) || strings.Contains(install, "start "+unit) {
+			t.Fatalf("installer enables or starts %s before the boot-safe gate", unit)
+		}
 	}
 	stage := strings.Index(install, "if (( stage_upgrade_substrate )); then\n  if (( dry_run ))")
 	units := strings.Index(install, "units=(open-card-server.service")

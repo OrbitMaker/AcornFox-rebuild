@@ -66,16 +66,19 @@ func ValidateProductionCandidate(manifest Manifest) error {
 		return errors.New("manifest is not the 0.8.0-rc.1 production candidate")
 	}
 	required := map[string]bool{
-		"bin/open-card-admin":                                 false,
-		"bin/open-card-upgrade":                               false,
-		"systemd/open-card-edge.service":                      false,
-		"systemd/open-card-upgrade-recover.service":           false,
-		"caddy/open-card-edge.Caddyfile.example":              false,
-		"migrations/control-plane/0024_dns_change_ledger.sql": false,
-		"web/dist/index.html":                                 false,
-		"docs/licenses/licenses-manifest.json":                false,
-		"sbom.spdx.json":                                      false,
-		"source-manifest.sha256":                              false,
+		"bin/open-card-admin":                                     false,
+		"bin/open-card-upgrade":                                   false,
+		"systemd/open-card-edge.service":                          false,
+		"systemd/open-card-upgrade-recover.service":               false,
+		"systemd/open-card-upgrade-safe.target":                   false,
+		"systemd/open-card-upgrade-finalize.service":              false,
+		"systemd/open-card-edge.service.d/10-upgrade-marker.conf": false,
+		"caddy/open-card-edge.Caddyfile.example":                  false,
+		"migrations/control-plane/0024_dns_change_ledger.sql":     false,
+		"web/dist/index.html":                                     false,
+		"docs/licenses/licenses-manifest.json":                    false,
+		"sbom.spdx.json":                                          false,
+		"source-manifest.sha256":                                  false,
 	}
 	for _, file := range manifest.Files {
 		if strings.Contains(file.Path, "fixture") || strings.Contains(file.Path, "/tests/") || strings.HasSuffix(file.Path, ".test") || strings.Contains(file.Path, "open-card-caddy-fixture") {

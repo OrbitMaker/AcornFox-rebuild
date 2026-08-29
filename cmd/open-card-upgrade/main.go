@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -35,6 +36,17 @@ const (
 const productionUpgradeExecutable = "/opt/open-card/upgrade-tools/open-card-upgrade"
 const productionUpgradeRecoveryUnit = install.ProductionUpgradeRecoveryUnitPath
 
+var productionBootUnitFiles = []struct {
+	path string
+	name string
+	raw  func() []byte
+}{
+	{install.ProductionUpgradeRecoveryUnitPath, "open-card-upgrade-recover.service", install.ProductionUpgradeRecoveryUnitBytes},
+	{install.ProductionUpgradeSafeBootTargetPath, "open-card-upgrade-safe.target", install.ProductionUpgradeSafeBootTargetBytes},
+	{install.ProductionUpgradeFinalizeUnitPath, "open-card-upgrade-finalize.service", install.ProductionUpgradeFinalizeUnitBytes},
+	{install.ProductionUpgradeEdgeMarkerDropInPath, "10-upgrade-marker.conf", install.ProductionUpgradeEdgeMarkerDropInBytes},
+}
+
 type upgradeCommandConfig struct {
 	command        string
 	transactionID  string
@@ -48,6 +60,8 @@ type upgradeRuntime struct {
 	preflight func(context.Context, install.UpgradeRequest) (install.UpgradeEligibilityV1, error)
 	run       func(context.Context, install.UpgradeRequest) error
 	recover   func(context.Context, string) error
+	prepare   func(context.Context, string) (install.BootRecoveryResultV1, error)
+	finalize  func(context.Context, string) (install.BootRecoveryResultV1, error)
 	status    func(context.Context, string) (install.UpgradeStatusV1, error)
 	pending   func(context.Context) (install.PendingTransaction, error)
 	close     func() error
@@ -59,6 +73,8 @@ type upgradeDependencies struct {
 	verifyCandidateExecutable func(string) error
 	newRuntime                func(context.Context) (upgradeRuntime, error)
 	newStatusRuntime          func(context.Context) (upgradeRuntime, error)
+	newPrepareRuntime         func(context.Context) (upgradeRuntime, error)
+	newFinalizeRuntime        func(context.Context) (upgradeRuntime, error)
 }
 
 // productionRuntimeDependencies is a private construction seam. It proves the
@@ -95,7 +111,54 @@ func productionUpgradeDependencies() upgradeDependencies {
 		verifyCandidateExecutable: verifyProductionUpgradeExecutableDigest,
 		newRuntime:                newProductionRuntime,
 		newStatusRuntime:          newProductionStatusRuntime,
+		newPrepareRuntime:         newProductionPrepareRuntime,
+		newFinalizeRuntime:        newProductionFinalizeRuntime,
 	}
+}
+
+// newProductionPrepareRuntime intentionally exposes only the DB factory and
+// narrow unit reloader to ReconcileBoot. The engine's prepare method has no
+// UpgradeServiceDriver parameter, so this constructor cannot accidentally
+// start, stop, probe, or restore a business service.
+func newProductionPrepareRuntime(ctx context.Context) (upgradeRuntime, error) {
+	return newProductionBootRuntime(ctx, false)
+}
+
+func newProductionFinalizeRuntime(ctx context.Context) (upgradeRuntime, error) {
+	return newProductionBootRuntime(ctx, true)
+}
+
+func newProductionBootRuntime(ctx context.Context, finalize bool) (upgradeRuntime, error) {
+	deps := productionRuntimeDeps()
+	if deps.verifyExecutable == nil || deps.openStore == nil || deps.openService == nil || deps.databaseFactory == nil || deps.now == nil || verifyProductionBootArtifacts(ctx) != nil || deps.verifyExecutable() != nil {
+		return upgradeRuntime{}, errors.New("invalid production boot runtime")
+	}
+	store, err := deps.openStore()
+	if err != nil || store.store == nil || store.close == nil || store.pending == nil {
+		return upgradeRuntime{}, errors.New("open upgrade store failed")
+	}
+	services, closeServices, err := deps.openService()
+	if err != nil || services == nil || closeServices == nil {
+		_ = store.close()
+		return upgradeRuntime{}, errors.New("open upgrade service failed")
+	}
+	engine := &install.UpgradeEngine{Store: store.store, DatabaseFactory: deps.databaseFactory, Now: deps.now}
+	runtime := upgradeRuntime{pending: store.pending, close: func() error {
+		first := closeServices()
+		if closeErr := store.close(); first == nil {
+			first = closeErr
+		}
+		return first
+	}}
+	if finalize {
+		engine.Services = services
+		runtime.finalize = engine.FinalizeBoot
+	} else {
+		runtime.prepare = func(callCtx context.Context, tx string) (install.BootRecoveryResultV1, error) {
+			return engine.ReconcileBoot(callCtx, tx, services)
+		}
+	}
+	return runtime, nil
 }
 
 func run(args []string, stdout, stderr io.Writer) int {
@@ -123,8 +186,13 @@ func runWithDependenciesCore(ctx context.Context, args []string, stdout, stderr 
 		return writeUpgradeError(stderr, exitPrivilege, "root_required")
 	}
 	constructor := deps.newRuntime
-	if config.command == "status" {
+	switch config.command {
+	case "status":
 		constructor = deps.newStatusRuntime
+	case "recover-prepare":
+		constructor = deps.newPrepareRuntime
+	case "recover-finalize":
+		constructor = deps.newFinalizeRuntime
 	}
 	if constructor == nil || ((config.command == "preflight" || config.command == "run") && deps.derive == nil) {
 		return writeUpgradeError(stderr, exitInternal, "internal_error")
@@ -207,6 +275,30 @@ func runWithDependenciesCore(ctx context.Context, args []string, stdout, stderr 
 			return writeUpgradeError(stderr, exitRecovery, "recovery_required")
 		}
 		return writeUpgradeJSON(stdout, exitOK, map[string]any{"ok": true, "command": "recover", "status": status})
+	case "recover-prepare", "recover-finalize":
+		if runtime.pending == nil {
+			return writeUpgradeError(stderr, exitInternal, "runtime_unavailable")
+		}
+		pending, pendingErr := runtime.pending(ctx)
+		if pendingErr != nil || pending.Marker != install.UpgradeMarkerSame || pending.TransactionID == "" {
+			return writeUpgradeError(stderr, exitConflict, "status_unreadable")
+		}
+		var result install.BootRecoveryResultV1
+		if config.command == "recover-prepare" {
+			if runtime.prepare == nil {
+				return writeUpgradeError(stderr, exitInternal, "runtime_unavailable")
+			}
+			result, err = runtime.prepare(ctx, pending.TransactionID)
+		} else {
+			if runtime.finalize == nil {
+				return writeUpgradeError(stderr, exitInternal, "runtime_unavailable")
+			}
+			result, err = runtime.finalize(ctx, pending.TransactionID)
+		}
+		if err != nil {
+			return writeUpgradeEngineError(stderr, err)
+		}
+		return writeUpgradeJSON(stdout, exitOK, map[string]any{"ok": true, "command": config.command, "recovery": result})
 	default:
 		return writeUpgradeError(stderr, exitArgs, "invalid_arguments")
 	}
@@ -324,6 +416,11 @@ func parseUpgradeArgs(args []string) (upgradeCommandConfig, error) {
 		if (config.transactionID == "" && !config.pending) || (config.transactionID != "" && config.pending) || !containsOnlyRecoveryFlags(args[1:]) || (config.transactionID != "" && !validCLIIdentifier(config.transactionID)) {
 			return upgradeCommandConfig{}, errors.New("invalid recovery command")
 		}
+	case "recover-prepare", "recover-finalize":
+		if len(args) != 2 || args[1] != "--pending" {
+			return upgradeCommandConfig{}, errors.New("invalid boot recovery command")
+		}
+		config.pending = true
 	default:
 		return upgradeCommandConfig{}, errors.New("unsupported command")
 	}
@@ -529,8 +626,136 @@ func verifyProductionRecoveryUnit(path string) error {
 	return nil
 }
 
+// verifyProductionBootArtifacts binds the privileged boot commands to all
+// four exact fragments. It checks files before querying systemd so an unsafe
+// fragment or drop-in can never influence an argv passed to systemctl.
+func verifyProductionBootArtifacts(ctx context.Context) error {
+	for _, file := range productionBootUnitFiles {
+		root, name := filepath.Dir(file.path), filepath.Base(file.path)
+		if err := verifyRootOwnedDirectoryChain("/etc", "/etc/systemd", "/etc/systemd/system", root); err != nil {
+			return errors.New("invalid boot unit")
+		}
+		raw, err := readRootOwnedNoFollowFile(root, name, 0o644)
+		if err != nil || !bytes.Equal(raw, file.raw()) {
+			return errors.New("invalid boot unit")
+		}
+	}
+	if err := verifyProductionSystemctl(); err != nil {
+		return errors.New("invalid systemctl")
+	}
+	for _, check := range []struct {
+		unit, path, state, dropins string
+	}{
+		{"open-card-upgrade-recover.service", install.ProductionUpgradeRecoveryUnitPath, "static", ""},
+		{"open-card-upgrade-safe.target", install.ProductionUpgradeSafeBootTargetPath, "enabled", ""},
+		{"open-card-upgrade-finalize.service", install.ProductionUpgradeFinalizeUnitPath, "static", ""},
+		{"open-card-edge.service", "/etc/systemd/system/open-card-edge.service", "enabled", install.ProductionUpgradeEdgeMarkerDropInPath},
+	} {
+		values, err := productionSystemctlProperties(ctx, check.unit, "FragmentPath", "DropInPaths", "NeedDaemonReload", "UnitFileState")
+		if err != nil || values["FragmentPath"] != check.path || values["DropInPaths"] != check.dropins || values["NeedDaemonReload"] != "no" || values["UnitFileState"] != check.state {
+			return errors.New("invalid boot unit state")
+		}
+	}
+	target, err := productionSystemctlProperties(ctx, "open-card-upgrade-safe.target", "Requires", "Wants", "Before")
+	if err != nil || !containsRequiredBootUnits(target["Requires"], "open-card-upgrade-recover.service") || !containsRequiredBootUnits(target["Wants"], "open-card-upgrade-finalize.service") || !containsRequiredBootUnits(target["Before"], "open-card-buildkit.service", "open-card-caddy.service", "open-card-server.service", "open-card-agent.service", "open-card-edge.service", "open-card-upgrade-finalize.service") {
+		return errors.New("invalid boot target relationships")
+	}
+	for _, unit := range []string{"open-card-buildkit.service", "open-card-caddy.service", "open-card-server.service", "open-card-agent.service", "open-card-edge.service"} {
+		values, err := productionSystemctlProperties(ctx, unit, "Requires")
+		if err != nil || !containsRequiredBootUnits(values["Requires"], "open-card-upgrade-safe.target") {
+			return errors.New("invalid boot business relationship")
+		}
+	}
+	return nil
+}
+
+func productionSystemctlProperties(ctx context.Context, unit string, properties ...string) (map[string]string, error) {
+	if !validSystemdUnitName(unit) || len(properties) == 0 {
+		return nil, errors.New("invalid systemctl property request")
+	}
+	args := []string{"show", unit}
+	for _, property := range properties {
+		if property == "" || strings.ContainsAny(property, "= \t\n") {
+			return nil, errors.New("invalid systemctl property")
+		}
+		args = append(args, "--property="+property)
+	}
+	args = append(args, "--no-pager")
+	command := exec.CommandContext(ctx, "/usr/bin/systemctl", args...)
+	command.Env = []string{"PATH=/usr/sbin:/usr/bin:/sbin:/bin", "LANG=C", "LC_ALL=C"}
+	raw, err := command.Output()
+	if err != nil {
+		return nil, errors.New("systemctl show failed")
+	}
+	return parseSystemctlProperties(raw, properties)
+}
+
+func validSystemdUnitName(value string) bool {
+	if !strings.HasPrefix(value, "open-card-") || !(strings.HasSuffix(value, ".service") || strings.HasSuffix(value, ".target")) {
+		return false
+	}
+	return !strings.ContainsAny(value, "/\\\x00 \t\n")
+}
+
+func parseSystemctlProperties(raw []byte, required []string) (map[string]string, error) {
+	values := map[string]string{}
+	for _, line := range strings.Split(strings.TrimSuffix(string(raw), "\n"), "\n") {
+		key, value, ok := strings.Cut(line, "=")
+		if _, exists := values[key]; !ok || key == "" || exists {
+			return nil, errors.New("invalid systemctl properties")
+		}
+		values[key] = value
+	}
+	if len(values) != len(required) {
+		return nil, errors.New("invalid systemctl properties")
+	}
+	for _, property := range required {
+		if _, ok := values[property]; !ok {
+			return nil, errors.New("invalid systemctl properties")
+		}
+	}
+	return values, nil
+}
+
+// containsRequiredBootUnits validates only the declarative Open Card part of
+// a systemd graph. systemd appends ordering/default dependencies such as
+// sysinit.target and shutdown.target at runtime and may reorder all entries,
+// so byte-for-byte equality would reject a correct host. It still rejects a
+// duplicate, malformed, or unapproved Open Card unit.
+func containsRequiredBootUnits(value string, expected ...string) bool {
+	fields := strings.Fields(value)
+	wanted := make(map[string]struct{}, len(expected))
+	for _, unit := range expected {
+		if !validSystemdUnitName(unit) {
+			return false
+		}
+		wanted[unit] = struct{}{}
+	}
+	seen := make(map[string]struct{}, len(fields))
+	for _, unit := range fields {
+		if unit == "" || strings.ContainsAny(unit, "/\\\x00") {
+			return false
+		}
+		if _, exists := seen[unit]; exists {
+			return false
+		}
+		seen[unit] = struct{}{}
+		if strings.HasPrefix(unit, "open-card-") {
+			if _, approved := wanted[unit]; !approved {
+				return false
+			}
+		}
+	}
+	for unit := range wanted {
+		if _, found := seen[unit]; !found {
+			return false
+		}
+	}
+	return true
+}
+
 func verifyProductionRecoveryServiceState(ctx context.Context) error {
-	return verifyRecoveryServiceStateWithDependencies(ctx, verifyProductionSystemctl, exec.CommandContext)
+	return verifyProductionBootArtifacts(ctx)
 }
 
 type systemctlCommandFactory func(context.Context, string, ...string) *exec.Cmd
@@ -588,7 +813,7 @@ func parseRecoveryServiceState(raw []byte) error {
 		}
 		values[key] = value
 	}
-	if len(values) != 4 || values["FragmentPath"] != productionUpgradeRecoveryUnit || values["DropInPaths"] != "" || values["NeedDaemonReload"] != "no" || values["UnitFileState"] != "enabled" {
+	if len(values) != 4 || values["FragmentPath"] != productionUpgradeRecoveryUnit || values["DropInPaths"] != "" || values["NeedDaemonReload"] != "no" || values["UnitFileState"] != "static" {
 		return errors.New("invalid recovery unit state")
 	}
 	return nil

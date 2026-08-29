@@ -42,16 +42,19 @@ func TestLoadVerifiedUpgradeReleaseRejectsManifestAndPayloadDrift(t *testing.T) 
 		data []byte
 		mode os.FileMode
 	}{
-		"bin/open-card-admin":                                 {[]byte("admin"), 0o755},
-		"bin/open-card-upgrade":                               {[]byte("upgrade"), 0o755},
-		"systemd/open-card-edge.service":                      {[]byte("edge unit"), 0o644},
-		"systemd/open-card-upgrade-recover.service":           {ProductionUpgradeRecoveryUnitBytes(), 0o644},
-		"caddy/open-card-edge.Caddyfile.example":              {[]byte("edge caddy"), 0o644},
-		"migrations/control-plane/0024_dns_change_ledger.sql": {[]byte("migration"), 0o644},
-		"web/dist/index.html":                                 {[]byte("web"), 0o644},
-		"docs/licenses/licenses-manifest.json":                {[]byte("licenses"), 0o644},
-		"sbom.spdx.json":                                      {[]byte("sbom"), 0o644},
-		"source-manifest.sha256":                              {[]byte("source"), 0o644},
+		"bin/open-card-admin":                                     {[]byte("admin"), 0o755},
+		"bin/open-card-upgrade":                                   {[]byte("upgrade"), 0o755},
+		"systemd/open-card-edge.service":                          {[]byte("edge unit"), 0o644},
+		"systemd/open-card-upgrade-recover.service":               {ProductionUpgradeRecoveryUnitBytes(), 0o644},
+		"systemd/open-card-upgrade-safe.target":                   {ProductionUpgradeSafeBootTargetBytes(), 0o644},
+		"systemd/open-card-upgrade-finalize.service":              {ProductionUpgradeFinalizeUnitBytes(), 0o644},
+		"systemd/open-card-edge.service.d/10-upgrade-marker.conf": {ProductionUpgradeEdgeMarkerDropInBytes(), 0o644},
+		"caddy/open-card-edge.Caddyfile.example":                  {[]byte("edge caddy"), 0o644},
+		"migrations/control-plane/0024_dns_change_ledger.sql":     {[]byte("migration"), 0o644},
+		"web/dist/index.html":                                     {[]byte("web"), 0o644},
+		"docs/licenses/licenses-manifest.json":                    {[]byte("licenses"), 0o644},
+		"sbom.spdx.json":                                          {[]byte("sbom"), 0o644},
+		"source-manifest.sha256":                                  {[]byte("source"), 0o644},
 	}
 	manifest := Manifest{SchemaVersion: ManifestSchemaVersion, Product: ManifestProduct, Version: ProductionCandidateVersion, ReleaseID: releaseID, Architecture: "amd64", MigrationVersion: CurrentMigrationVersion, SourceCommit: strings.Repeat("a", 40), NMinusOne: &NMinusOne{Version: ProductionNMinusOneVersion, MigrationVersion: "0023", SourceCommit: RC0SourceCommit, ReleaseManifestSHA256: RC0ReleaseManifestSHA256, ArchiveSHA256: RC0ArchiveSHA256, BundleManifestSHA256: RC0BundleManifestSHA256}, Protocol: AgentProtocolVersion, ConfigDir: DefaultConfigDir, DataDir: DefaultDataDir, Compatibility: Compatibility{MinDataVersion: 1, MaxDataVersion: 8, MinAgentProtocol: PreviousAgentProtocol, MaxAgentProtocol: AgentProtocolVersion}}
 	for path, file := range files {

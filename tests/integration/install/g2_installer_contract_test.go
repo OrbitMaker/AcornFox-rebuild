@@ -32,7 +32,16 @@ func writeG2CandidateBundle(t *testing.T, directory string, includeEdge bool) st
 	}
 	_, sourceFile, _, _ := runtime.Caller(0)
 	repo := filepath.Clean(filepath.Join(filepath.Dir(sourceFile), "..", "..", ".."))
-	units := []string{"open-card-server.service", "open-card-agent.service", "open-card-buildkit.service", "open-card-caddy.service", "open-card-upgrade-recover.service"}
+	units := []string{
+		"open-card-server.service",
+		"open-card-agent.service",
+		"open-card-buildkit.service",
+		"open-card-caddy.service",
+		"open-card-upgrade-recover.service",
+		"open-card-upgrade-safe.target",
+		"open-card-upgrade-finalize.service",
+		"open-card-edge.service.d/10-upgrade-marker.conf",
+	}
 	if includeEdge {
 		units = append(units, "open-card-edge.service")
 	}
@@ -91,15 +100,29 @@ func TestG2CandidateStagesEdgeAndRequires0024WithoutActivation(t *testing.T) {
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("install candidate: %v\n%s", err, output)
 	}
-	for _, relative := range []string{"etc/systemd/system/open-card-edge.service", "etc/systemd/system/open-card-upgrade-recover.service", "opt/open-card/current/bin/open-card-admin", "opt/open-card/current/migrations/control-plane/0024_dns_change_ledger.sql", "opt/open-card/current/web/dist/index.html", "opt/open-card/upgrade-tools/open-card-upgrade", "run/lock/open-card-upgrade.lock"} {
+	for _, relative := range []string{
+		"etc/systemd/system/open-card-edge.service",
+		"etc/systemd/system/open-card-upgrade-recover.service",
+		"etc/systemd/system/open-card-upgrade-safe.target",
+		"etc/systemd/system/open-card-upgrade-finalize.service",
+		"etc/systemd/system/open-card-edge.service.d/10-upgrade-marker.conf",
+		"opt/open-card/current/bin/open-card-admin",
+		"opt/open-card/current/migrations/control-plane/0024_dns_change_ledger.sql",
+		"opt/open-card/current/web/dist/index.html",
+		"opt/open-card/upgrade-tools/open-card-upgrade",
+		"run/lock/open-card-upgrade.lock",
+	} {
 		if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(relative))); err != nil {
 			t.Fatalf("missing staged %s: %v", relative, err)
 		}
 	}
 	for relative, mode := range map[string]os.FileMode{
-		"etc/systemd/system/open-card-upgrade-recover.service": 0o644,
-		"opt/open-card/upgrade-tools/open-card-upgrade":        0o755,
-		"run/lock/open-card-upgrade.lock":                      0o600,
+		"etc/systemd/system/open-card-upgrade-recover.service":               0o644,
+		"etc/systemd/system/open-card-upgrade-safe.target":                   0o644,
+		"etc/systemd/system/open-card-upgrade-finalize.service":              0o644,
+		"etc/systemd/system/open-card-edge.service.d/10-upgrade-marker.conf": 0o644,
+		"opt/open-card/upgrade-tools/open-card-upgrade":                      0o755,
+		"run/lock/open-card-upgrade.lock":                                    0o600,
 	} {
 		if info, err := os.Lstat(filepath.Join(root, filepath.FromSlash(relative))); err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != mode {
 			t.Fatalf("stable %s mode=%v err=%v", relative, info.Mode(), err)
@@ -152,6 +175,33 @@ func TestG2CandidateRejectsUnsafeStableRecoveryArtifacts(t *testing.T) {
 				t.Fatal(err)
 			}
 			if err := os.WriteFile(filepath.Join(path, "open-card-upgrade-recover.service"), []byte("foreign\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		"safe target conflict": {expected: "conflicts", prepare: func(root string) {
+			path := filepath.Join(root, "etc/systemd/system")
+			if err := os.MkdirAll(path, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(path, "open-card-upgrade-safe.target"), []byte("foreign\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		"finalizer symlink": {expected: "unsafe", prepare: func(root string) {
+			path := filepath.Join(root, "etc/systemd/system")
+			if err := os.MkdirAll(path, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink("/tmp/foreign-finalizer", filepath.Join(path, "open-card-upgrade-finalize.service")); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		"edge dropin mode": {expected: "mode mismatch", prepare: func(root string) {
+			path := filepath.Join(root, "etc/systemd/system/open-card-edge.service.d")
+			if err := os.MkdirAll(path, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(path, "10-upgrade-marker.conf"), []byte("foreign\n"), 0o600); err != nil {
 				t.Fatal(err)
 			}
 		}},
@@ -233,13 +283,16 @@ func TestG2StageUpgradeSubstrateLeavesLegacyRuntimeUntouched(t *testing.T) {
 		t.Fatalf("stage changed migration state=%q err=%v", got, err)
 	}
 	for relative, mode := range map[string]os.FileMode{
-		"opt/open-card/activations":                            0o711,
-		"var/lib/open-card":                                    0o711,
-		"var/lib/open-card/upgrade-transactions":               0o700,
-		"var/lib/open-card/upgrade-artifacts":                  0o700,
-		"opt/open-card/upgrade-tools/open-card-upgrade":        0o755,
-		"etc/systemd/system/open-card-upgrade-recover.service": 0o644,
-		"run/lock/open-card-upgrade.lock":                      0o600,
+		"opt/open-card/activations":                                          0o711,
+		"var/lib/open-card":                                                  0o711,
+		"var/lib/open-card/upgrade-transactions":                             0o700,
+		"var/lib/open-card/upgrade-artifacts":                                0o700,
+		"opt/open-card/upgrade-tools/open-card-upgrade":                      0o755,
+		"etc/systemd/system/open-card-upgrade-recover.service":               0o644,
+		"etc/systemd/system/open-card-upgrade-safe.target":                   0o644,
+		"etc/systemd/system/open-card-upgrade-finalize.service":              0o644,
+		"etc/systemd/system/open-card-edge.service.d/10-upgrade-marker.conf": 0o644,
+		"run/lock/open-card-upgrade.lock":                                    0o600,
 	} {
 		info, err := os.Lstat(filepath.Join(root, filepath.FromSlash(relative)))
 		if err != nil || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != mode {

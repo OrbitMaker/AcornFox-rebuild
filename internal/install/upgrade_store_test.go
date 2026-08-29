@@ -818,17 +818,20 @@ func productionCandidateUnitFixture(t *testing.T) (*UpgradeStore, ReleaseV1, Man
 		body []byte
 		mode os.FileMode
 	}{
-		"bin/open-card-admin":                                 {[]byte("admin\n"), 0o755},
-		"bin/open-card-upgrade":                               {[]byte("upgrade\n"), 0o755},
-		"systemd/open-card-server.service":                    {[]byte("[Unit]\nDescription=Open Card\n[Service]\nEnvironmentFile=-/etc/open-card/server.env\nEnvironmentFile=/opt/open-card/active/database.env\nExecStart=/opt/open-card/current/bin/open-card-server\n[Install]\nWantedBy=multi-user.target\n"), 0o644},
-		"systemd/open-card-edge.service":                      {[]byte("edge\n"), 0o644},
-		"systemd/open-card-upgrade-recover.service":           {ProductionUpgradeRecoveryUnitBytes(), 0o644},
-		"caddy/open-card-edge.Caddyfile.example":              {[]byte("edge\n"), 0o644},
-		"migrations/control-plane/0024_dns_change_ledger.sql": {[]byte("migration\n"), 0o644},
-		"web/dist/index.html":                                 {[]byte("web\n"), 0o644},
-		"docs/licenses/licenses-manifest.json":                {[]byte("{}\n"), 0o644},
-		"sbom.spdx.json":                                      {[]byte("{}\n"), 0o644},
-		"source-manifest.sha256":                              {[]byte("source\n"), 0o644},
+		"bin/open-card-admin":                                     {[]byte("admin\n"), 0o755},
+		"bin/open-card-upgrade":                                   {[]byte("upgrade\n"), 0o755},
+		"systemd/open-card-server.service":                        {[]byte("[Unit]\nDescription=Open Card\n[Service]\nEnvironmentFile=-/etc/open-card/server.env\nEnvironmentFile=/opt/open-card/active/database.env\nExecStart=/opt/open-card/current/bin/open-card-server\n[Install]\nWantedBy=multi-user.target\n"), 0o644},
+		"systemd/open-card-edge.service":                          {[]byte("edge\n"), 0o644},
+		"systemd/open-card-upgrade-recover.service":               {ProductionUpgradeRecoveryUnitBytes(), 0o644},
+		"systemd/open-card-upgrade-safe.target":                   {ProductionUpgradeSafeBootTargetBytes(), 0o644},
+		"systemd/open-card-upgrade-finalize.service":              {ProductionUpgradeFinalizeUnitBytes(), 0o644},
+		"systemd/open-card-edge.service.d/10-upgrade-marker.conf": {ProductionUpgradeEdgeMarkerDropInBytes(), 0o644},
+		"caddy/open-card-edge.Caddyfile.example":                  {[]byte("edge\n"), 0o644},
+		"migrations/control-plane/0024_dns_change_ledger.sql":     {[]byte("migration\n"), 0o644},
+		"web/dist/index.html":                                     {[]byte("web\n"), 0o644},
+		"docs/licenses/licenses-manifest.json":                    {[]byte("{}\n"), 0o644},
+		"sbom.spdx.json":                                          {[]byte("{}\n"), 0o644},
+		"source-manifest.sha256":                                  {[]byte("source\n"), 0o644},
 	}
 	manifest := Manifest{SchemaVersion: ManifestSchemaVersion, Product: ManifestProduct, Version: ProductionCandidateVersion, ReleaseID: releaseID, Architecture: "amd64", MigrationVersion: CurrentMigrationVersion, SourceCommit: strings.Repeat("a", 40), NMinusOne: &NMinusOne{Version: ProductionNMinusOneVersion, MigrationVersion: "0023", SourceCommit: RC0SourceCommit, ReleaseManifestSHA256: RC0ReleaseManifestSHA256, ArchiveSHA256: RC0ArchiveSHA256, BundleManifestSHA256: RC0BundleManifestSHA256}, Protocol: AgentProtocolVersion, ConfigDir: DefaultConfigDir, DataDir: DefaultDataDir, Compatibility: Compatibility{MinDataVersion: 1, MaxDataVersion: 8, MinAgentProtocol: PreviousAgentProtocol, MaxAgentProtocol: AgentProtocolVersion}}
 	for path, value := range files {

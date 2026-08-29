@@ -67,6 +67,72 @@ func TestParseUpgradeArgsIsExactAndForbidsDangerousInputs(t *testing.T) {
 	if config, err := parseUpgradeArgs([]string{"recover", "--pending"}); err != nil || !config.pending {
 		t.Fatalf("pending parse failed: %#v %v", config, err)
 	}
+	for _, command := range []string{"recover-prepare", "recover-finalize"} {
+		config, err := parseUpgradeArgs([]string{command, "--pending"})
+		if err != nil || !config.pending || config.transactionID != "" {
+			t.Fatalf("boot parse failed for %s: %#v %v", command, config, err)
+		}
+		for _, invalid := range [][]string{{command}, {command, "--transaction-id", testTransaction}, {command, "--pending", "--pending"}, {command, "--pending", "--task-root", "/tmp/x"}} {
+			if _, err := parseUpgradeArgs(invalid); err == nil {
+				t.Fatalf("accepted unsafe boot args %#v", invalid)
+			}
+		}
+	}
+}
+
+func TestBootCommandsUseOnlyPendingTransactionAndRedactErrors(t *testing.T) {
+	for _, tc := range []struct {
+		command string
+		field   string
+	}{
+		{"recover-prepare", "prepare"},
+		{"recover-finalize", "finalize"},
+	} {
+		t.Run(tc.command, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			called := ""
+			runtime := upgradeRuntime{
+				pending: func(context.Context) (install.PendingTransaction, error) {
+					return install.PendingTransaction{TransactionID: testTransaction, Marker: install.UpgradeMarkerSame}, nil
+				},
+				close: func() error { return nil },
+			}
+			result := install.BootRecoveryResultV1{SchemaVersion: 1, TransactionID: testTransaction, State: install.JournalCommitted, MarkerRetained: true, FinalizeRequired: true}
+			if tc.field == "prepare" {
+				runtime.prepare = func(_ context.Context, tx string) (install.BootRecoveryResultV1, error) {
+					called = tx
+					return result, nil
+				}
+			} else {
+				runtime.finalize = func(_ context.Context, tx string) (install.BootRecoveryResultV1, error) {
+					called = tx
+					return result, nil
+				}
+			}
+			deps := testDependencies(upgradeRuntime{})
+			deps.newPrepareRuntime = func(context.Context) (upgradeRuntime, error) { return runtime, nil }
+			deps.newFinalizeRuntime = func(context.Context) (upgradeRuntime, error) { return runtime, nil }
+			if code := runWithDependencies(context.Background(), []string{tc.command, "--pending"}, &stdout, &stderr, deps); code != exitOK || called != testTransaction || stderr.Len() != 0 || !strings.Contains(stdout.String(), "COMMITTED") {
+				t.Fatalf("boot command failed: code=%d called=%q out=%q err=%q", code, called, stdout.String(), stderr.String())
+			}
+		})
+	}
+}
+
+func TestBootCommandsRejectMissingOrForeignPendingMarker(t *testing.T) {
+	for _, pending := range []install.PendingTransaction{{Marker: install.UpgradeMarkerAbsent}, {Marker: install.UpgradeMarkerForeign}, {Marker: install.UpgradeMarkerUnknown}} {
+		var stdout, stderr bytes.Buffer
+		called := false
+		runtime := upgradeRuntime{pending: func(context.Context) (install.PendingTransaction, error) { return pending, nil }, prepare: func(context.Context, string) (install.BootRecoveryResultV1, error) {
+			called = true
+			return install.BootRecoveryResultV1{}, nil
+		}, close: func() error { return nil }}
+		deps := testDependencies(upgradeRuntime{})
+		deps.newPrepareRuntime = func(context.Context) (upgradeRuntime, error) { return runtime, nil }
+		if code := runWithDependencies(context.Background(), []string{"recover-prepare", "--pending"}, &stdout, &stderr, deps); code != exitConflict || called || strings.Contains(stderr.String(), "foreign") {
+			t.Fatalf("pending=%+v code=%d called=%v out=%q err=%q", pending, code, called, stdout.String(), stderr.String())
+		}
+	}
 }
 
 func TestRunParsesBeforePrivilegeAndRedactsErrors(t *testing.T) {
@@ -151,21 +217,43 @@ func TestRunBuffersSuccessUntilCloseAndEmitsExactlyOneObject(t *testing.T) {
 }
 
 func TestRecoveryServiceStateParserIsClosed(t *testing.T) {
-	valid := []byte("FragmentPath=/etc/systemd/system/open-card-upgrade-recover.service\nDropInPaths=\nNeedDaemonReload=no\nUnitFileState=enabled\n")
+	valid := []byte("FragmentPath=/etc/systemd/system/open-card-upgrade-recover.service\nDropInPaths=\nNeedDaemonReload=no\nUnitFileState=static\n")
 	if err := parseRecoveryServiceState(valid); err != nil {
 		t.Fatal(err)
 	}
 	for _, raw := range [][]byte{
-		[]byte("FragmentPath=/etc/systemd/system/open-card-upgrade-recover.service\nDropInPaths=/etc/systemd/system/x.conf\nNeedDaemonReload=no\nUnitFileState=enabled\n"),
-		[]byte("FragmentPath=/etc/systemd/system/open-card-upgrade-recover.service\nDropInPaths=\nNeedDaemonReload=yes\nUnitFileState=enabled\n"),
-		[]byte("FragmentPath=/etc/systemd/system/open-card-upgrade-recover.service\nDropInPaths=\nNeedDaemonReload=no\nUnitFileState=disabled\n"),
-		[]byte("FragmentPath=/tmp/other\nDropInPaths=\nNeedDaemonReload=no\nUnitFileState=enabled\n"),
-		[]byte("FragmentPath=/etc/systemd/system/open-card-upgrade-recover.service\nDropInPaths=\nNeedDaemonReload=no\nUnitFileState=enabled\nExecStart=/bin/sh -c unsafe\n"),
-		[]byte("FragmentPath=/etc/systemd/system/open-card-upgrade-recover.service\nFragmentPath=/etc/systemd/system/open-card-upgrade-recover.service\nDropInPaths=\nNeedDaemonReload=no\nUnitFileState=enabled\n"),
+		[]byte("FragmentPath=/etc/systemd/system/open-card-upgrade-recover.service\nDropInPaths=/etc/systemd/system/x.conf\nNeedDaemonReload=no\nUnitFileState=static\n"),
+		[]byte("FragmentPath=/etc/systemd/system/open-card-upgrade-recover.service\nDropInPaths=\nNeedDaemonReload=yes\nUnitFileState=static\n"),
+		[]byte("FragmentPath=/etc/systemd/system/open-card-upgrade-recover.service\nDropInPaths=\nNeedDaemonReload=no\nUnitFileState=enabled\n"),
+		[]byte("FragmentPath=/tmp/other\nDropInPaths=\nNeedDaemonReload=no\nUnitFileState=static\n"),
+		[]byte("FragmentPath=/etc/systemd/system/open-card-upgrade-recover.service\nDropInPaths=\nNeedDaemonReload=no\nUnitFileState=static\nExecStart=/bin/sh -c unsafe\n"),
+		[]byte("FragmentPath=/etc/systemd/system/open-card-upgrade-recover.service\nFragmentPath=/etc/systemd/system/open-card-upgrade-recover.service\nDropInPaths=\nNeedDaemonReload=no\nUnitFileState=static\n"),
 	} {
 		if err := parseRecoveryServiceState(raw); err == nil {
 			t.Fatalf("accepted unsafe unit state %q", raw)
 		}
+	}
+}
+
+func TestBootGraphAcceptsSystemdDerivedDependenciesButRejectsOpenCardDrift(t *testing.T) {
+	if !containsRequiredBootUnits("shutdown.target sysinit.target open-card-edge.service default.target open-card-upgrade-finalize.service basic.target open-card-server.service open-card-agent.service open-card-caddy.service open-card-buildkit.service", "open-card-buildkit.service", "open-card-caddy.service", "open-card-server.service", "open-card-agent.service", "open-card-edge.service", "open-card-upgrade-finalize.service") {
+		t.Fatal("reordered systemd-derived target graph was rejected")
+	}
+	if !containsRequiredBootUnits("sysinit.target open-card-upgrade-safe.target shutdown.target", "open-card-upgrade-safe.target") {
+		t.Fatal("derived business requirement was rejected")
+	}
+	for _, value := range []string{
+		"sysinit.target open-card-edge.service",                               // missing required members
+		"open-card-upgrade-recover.service open-card-foreign.service",         // foreign Open Card edge
+		"open-card-upgrade-recover.service open-card-upgrade-recover.service", // duplicate
+		"open-card-upgrade-recover.service ../unsafe.service",                 // malformed
+	} {
+		if containsRequiredBootUnits(value, "open-card-upgrade-recover.service") {
+			t.Fatalf("accepted unsafe graph property %q", value)
+		}
+	}
+	if _, err := parseSystemctlProperties([]byte("Requires=open-card-upgrade-recover.service\nRequires=open-card-upgrade-recover.service\n"), []string{"Requires"}); err == nil {
+		t.Fatal("duplicate systemctl property was accepted")
 	}
 }
 

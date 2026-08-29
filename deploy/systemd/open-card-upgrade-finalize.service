@@ -1,13 +1,11 @@
 [Unit]
-Description=Prepare interrupted Open Card upgrade recovery
-Wants=network-online.target
-After=local-fs.target network-online.target
-Before=open-card-upgrade-safe.target
+Description=Finalize interrupted Open Card upgrade recovery
+After=open-card-upgrade-safe.target
 ConditionPathExists=/var/lib/open-card/upgrade-in-progress
 
 [Service]
 Type=oneshot
-ExecStart=/opt/open-card/upgrade-tools/open-card-upgrade recover-prepare --pending
+ExecStart=/opt/open-card/upgrade-tools/open-card-upgrade recover-finalize --pending
 TimeoutStartSec=15min
 NoNewPrivileges=true
 PrivateTmp=true

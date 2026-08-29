@@ -46,7 +46,7 @@ RUNTIME = (
     "docker-buildx",
     "caddy",
 )
-UNITS = (
+RC0_UNITS = (
     "open-card-server.service",
     "open-card-agent.service",
     "open-card-buildkit.service",
@@ -54,6 +54,27 @@ UNITS = (
     "open-card-edge.service",
     "open-card-upgrade-recover.service",
 )
+UNITS = (*RC0_UNITS,
+    "open-card-upgrade-safe.target",
+    "open-card-upgrade-finalize.service",
+)
+UNIT_DROP_INS = (
+    "open-card-edge.service.d/10-upgrade-marker.conf",
+)
+
+
+def systemd_files(version: str) -> tuple[str, ...]:
+    """Return the immutable systemd payload allowed for one release line.
+
+    The RC0 bootstrap source predates the boot-safe barrier.  Keeping the
+    additional units RC1-only preserves its frozen artifact contract while
+    requiring the complete barrier before any RC1 upgrade is staged.
+    """
+    if version == "0.8.0-rc.0":
+        return RC0_UNITS
+    if version == "0.8.0-rc.1":
+        return (*UNITS, *UNIT_DROP_INS)
+    raise ProductionBundleError("unsupported release version")
 INSTALLER_SCRIPTS = (
     "install.sh",
     "install-host.sh",
@@ -573,6 +594,7 @@ def assemble(
         raise ProductionBundleError("refusing to overwrite production bundle output")
 
     spec = release_spec(version, migration_version)
+    systemd_payload = systemd_files(version)
     tracked = verify_repo(repo, source_commit, migration_version)
     needs_n_minus_one = spec["expected_n_minus_one_version"] is not None
     if not needs_n_minus_one and (
@@ -640,8 +662,8 @@ def assemble(
         copy_tree(web_dist, web_snapshot)
         preflight_tree(web_snapshot, payload=True)
 
-        for unit in UNITS:
-            regular(repo_snapshot / "deploy/systemd" / unit)
+        for systemd_file in systemd_payload:
+            regular(repo_snapshot / "deploy/systemd" / systemd_file)
         for script in INSTALLER_SCRIPTS:
             regular(repo_snapshot / "scripts/mvp" / script)
         regular(repo_snapshot / "deploy/caddy/open-card-edge.Caddyfile.example")
@@ -680,10 +702,10 @@ def assemble(
                     release / "bin" / binary,
                     0o755,
                 )
-            for unit in UNITS:
+            for systemd_file in systemd_payload:
                 copy_file(
-                    repo_snapshot / "deploy/systemd" / unit,
-                    release / "systemd" / unit,
+                    repo_snapshot / "deploy/systemd" / systemd_file,
+                    release / "systemd" / systemd_file,
                     0o644,
                 )
             copy_file(

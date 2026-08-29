@@ -170,12 +170,12 @@ func TestRuntimeUnitsPutActiveDatabaseAfterGlobalConfigAndGateEdge(t *testing.T)
 	if global < 0 || active < 0 || global >= active {
 		t.Fatal("server unit does not load mandatory active database.env after global config")
 	}
-	edge, err := os.ReadFile(filepath.Join("..", "..", "deploy", "systemd", "open-card-edge.service"))
+	edge, err := os.ReadFile(filepath.Join("..", "..", "deploy", "systemd", "open-card-edge.service.d", "10-upgrade-marker.conf"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(edge), "ConditionPathExists=!/var/lib/open-card/upgrade-in-progress") {
-		t.Fatal("edge is not gated by the fixed upgrade marker")
+	if string(edge) != string(install.ProductionUpgradeEdgeMarkerDropInBytes()) {
+		t.Fatal("edge marker drop-in drifted from the fixed upgrade contract")
 	}
 }
 

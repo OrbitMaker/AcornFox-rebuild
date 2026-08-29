@@ -2,7 +2,6 @@
 Description=Open Card public Edge Caddy
 Wants=network-online.target
 After=network-online.target open-card-server.service
-ConditionPathExists=!/var/lib/open-card/upgrade-in-progress
 
 [Service]
 Type=notify

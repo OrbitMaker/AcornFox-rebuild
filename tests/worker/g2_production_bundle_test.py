@@ -38,6 +38,9 @@ def minimal_repo(root: Path, migration_version: str) -> tuple[Path, str]:
         "deploy/systemd/open-card-caddy.service": "[Service]\n",
         "deploy/systemd/open-card-edge.service": "[Service]\n",
         "deploy/systemd/open-card-upgrade-recover.service": "[Service]\n",
+        "deploy/systemd/open-card-upgrade-safe.target": "[Unit]\n",
+        "deploy/systemd/open-card-upgrade-finalize.service": "[Service]\n",
+        "deploy/systemd/open-card-edge.service.d/10-upgrade-marker.conf": "[Unit]\n",
         "deploy/caddy/open-card-edge.Caddyfile.example": "{}\n",
         "deploy/caddy/open-card-edge.env.example": "# env\n",
         "docs/licenses/licenses-manifest.json": "{}\n",
@@ -131,30 +134,74 @@ class ProductionBundleTests(unittest.TestCase):
             self.assertFalse((output / "release/manifest.json").exists())
             self.assertFalse(list(output.glob("*.tar.gz")))
 
-    def test_recovery_unit_is_canonical_and_included_in_release_contract(self) -> None:
+    def test_boot_safe_units_are_canonical_and_included_in_release_contract(self) -> None:
         tool = load_tool()
-        expected = """[Unit]
-Description=Recover interrupted Open Card upgrade
+        recovery = """[Unit]
+Description=Prepare interrupted Open Card upgrade recovery
 Wants=network-online.target
 After=local-fs.target network-online.target
+Before=open-card-upgrade-safe.target
 ConditionPathExists=/var/lib/open-card/upgrade-in-progress
 
 [Service]
 Type=oneshot
-ExecStart=/opt/open-card/upgrade-tools/open-card-upgrade recover --pending
+ExecStart=/opt/open-card/upgrade-tools/open-card-upgrade recover-prepare --pending
 TimeoutStartSec=15min
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/opt/open-card /var/lib/open-card /run/lock /etc/open-card /etc/systemd/system
+"""
+        safe_target = """[Unit]
+Description=Open Card upgrade-safe boot barrier
+Requires=open-card-upgrade-recover.service
+Wants=open-card-upgrade-finalize.service
+After=open-card-upgrade-recover.service
+Before=open-card-buildkit.service open-card-caddy.service open-card-server.service open-card-agent.service open-card-edge.service open-card-upgrade-finalize.service
 
 [Install]
 WantedBy=multi-user.target
+RequiredBy=open-card-buildkit.service open-card-caddy.service open-card-server.service open-card-agent.service open-card-edge.service
 """
-        self.assertEqual((ROOT / "deploy/systemd/open-card-upgrade-recover.service").read_text(encoding="utf-8"), expected)
+        finalizer = """[Unit]
+Description=Finalize interrupted Open Card upgrade recovery
+After=open-card-upgrade-safe.target
+ConditionPathExists=/var/lib/open-card/upgrade-in-progress
+
+[Service]
+Type=oneshot
+ExecStart=/opt/open-card/upgrade-tools/open-card-upgrade recover-finalize --pending
+TimeoutStartSec=15min
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/open-card /var/lib/open-card /run/lock /etc/open-card /etc/systemd/system
+"""
+        drop_in = """[Unit]
+ConditionPathExists=!/var/lib/open-card/upgrade-in-progress
+"""
+        expected = {
+            "open-card-upgrade-recover.service": recovery,
+            "open-card-upgrade-safe.target": safe_target,
+            "open-card-upgrade-finalize.service": finalizer,
+            "open-card-edge.service.d/10-upgrade-marker.conf": drop_in,
+        }
+        for path, contents in expected.items():
+            self.assertEqual((ROOT / "deploy/systemd" / path).read_text(encoding="utf-8"), contents)
+        self.assertEqual(set(tool.systemd_files("0.8.0-rc.0")), set(tool.RC0_UNITS))
+        self.assertEqual(
+            set(tool.systemd_files("0.8.0-rc.1")),
+            set(tool.UNITS) | set(tool.UNIT_DROP_INS),
+        )
+        self.assertFalse("[Install]" in recovery or "[Install]" in finalizer)
+        self.assertNotIn("Before=open-card-edge.service", finalizer)
+        self.assertIn("RequiredBy=open-card-buildkit.service open-card-caddy.service open-card-server.service open-card-agent.service open-card-edge.service", safe_target)
         self.assertIn("open-card-upgrade", tool.BINARIES)
-        self.assertIn("open-card-upgrade-recover.service", tool.UNITS)
+        self.assertIn("open-card-upgrade-recover.service", tool.RC0_UNITS)
+        self.assertTrue({"open-card-upgrade-safe.target", "open-card-upgrade-finalize.service"} <= set(tool.UNITS))
+        self.assertIn("open-card-edge.service.d/10-upgrade-marker.conf", tool.UNIT_DROP_INS)
 
     def test_rc0_bootstrap_build_contains_provenance_and_installers(self) -> None:
         tool = load_tool()
@@ -217,11 +264,20 @@ WantedBy=multi-user.target
             self.assertEqual(metadata["n_minus_one"]["status"], "verified_local_candidate")
             manifest = json.loads((output / "release/manifest.json").read_text(encoding="utf-8"))
             paths = {item["path"] for item in manifest["files"]}
-            self.assertTrue({"bin/open-card-upgrade", "systemd/open-card-upgrade-recover.service"} <= paths)
+            self.assertTrue({
+                "bin/open-card-upgrade",
+                "systemd/open-card-upgrade-recover.service",
+                "systemd/open-card-upgrade-safe.target",
+                "systemd/open-card-upgrade-finalize.service",
+                "systemd/open-card-edge.service.d/10-upgrade-marker.conf",
+            } <= paths)
             sbom = json.loads((output / "release/sbom.spdx.json").read_text(encoding="utf-8"))
             sbom_names = {package["name"] for package in sbom["packages"]}
             self.assertIn("bin/open-card-upgrade", sbom_names)
             self.assertIn("systemd/open-card-upgrade-recover.service", sbom_names)
+            self.assertIn("systemd/open-card-upgrade-safe.target", sbom_names)
+            self.assertIn("systemd/open-card-upgrade-finalize.service", sbom_names)
+            self.assertIn("systemd/open-card-edge.service.d/10-upgrade-marker.conf", sbom_names)
             bad = root / "bad-output"
             with self.assertRaises(tool.ProductionBundleError):
                 tool.assemble(self.stage(root / "rc1"), rc1_repo, bad, "amd64", rc0_output / "release", "0" * 64, rc1_dist, version="0.8.0-rc.1", migration_version="0024", source_commit=rc1_commit, live_attestation=rc1_attestation, live_attestation_sha256=self.attestation_digest(rc1_attestation))

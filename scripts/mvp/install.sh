@@ -385,6 +385,9 @@ prepare_upgrade_substrate() {
   install_stable_file "$release_dir/bin/open-card-upgrade" "$upgrade_tools/open-card-upgrade" "$expected_owner" 755 "upgrade recovery binary"
   require_stable_directory "$systemd_dir" "$expected_owner" 755
   install_stable_file "$release_dir/systemd/open-card-upgrade-recover.service" "$systemd_dir/open-card-upgrade-recover.service" "$expected_owner" 644 "upgrade recovery unit"
+  install_stable_file "$release_dir/systemd/open-card-upgrade-safe.target" "$systemd_dir/open-card-upgrade-safe.target" "$expected_owner" 644 "upgrade safe target"
+  install_stable_file "$release_dir/systemd/open-card-upgrade-finalize.service" "$systemd_dir/open-card-upgrade-finalize.service" "$expected_owner" 644 "upgrade finalizer unit"
+  install_stable_file "$release_dir/systemd/open-card-edge.service.d/10-upgrade-marker.conf" "$systemd_dir/open-card-edge.service.d/10-upgrade-marker.conf" "$expected_owner" 644 "upgrade Edge marker drop-in"
   prepare_upgrade_lock "$expected_owner"
 }
 
@@ -491,6 +494,8 @@ if value["version"] == "0.8.0-rc.1":
     production_required = {
         "bin/open-card-admin", "bin/open-card-upgrade",
         "systemd/open-card-edge.service", "systemd/open-card-upgrade-recover.service",
+        "systemd/open-card-upgrade-safe.target", "systemd/open-card-upgrade-finalize.service",
+        "systemd/open-card-edge.service.d/10-upgrade-marker.conf",
         "caddy/open-card-edge.Caddyfile.example",
         "migrations/control-plane/0024_dns_change_ledger.sql", "web/dist/index.html",
         "docs/licenses/licenses-manifest.json", "sbom.spdx.json", "source-manifest.sha256",
