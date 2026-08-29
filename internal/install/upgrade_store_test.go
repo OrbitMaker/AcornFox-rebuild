@@ -398,6 +398,29 @@ func TestVerifySecureReleaseRejectsExactSetViolations(t *testing.T) {
 	}
 }
 
+func TestUpgradeStoreRejectsIncompleteProductionCandidateBeforeSlotPublication(t *testing.T) {
+	store, release, _, _, cleanup := productionCandidateUnitFixture(t)
+	defer cleanup()
+	lock := acquireCandidate(t, store)
+	defer lock.Release()
+	if err := os.Remove(filepath.Join(store.root, "opt/open-card/releases", release.ID, "web/dist/index.html")); err != nil {
+		t.Fatal(err)
+	}
+	activationID := "activation-production"
+	name, err := CandidateDatabaseName(activationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := []byte("OPEN_CARD_DATABASE_URL=postgresql://user:pass@localhost:5432/" + name + "?sslmode=disable\n")
+	activation := ActivationV1{SchemaVersion: ActivationSchemaVersion, ActivationID: activationID, Origin: "native", Release: release, Database: DatabaseV1{Name: name, Migration: "0024", SchemaMigrationsSHA256: strings.Repeat("a", 64)}, DatabaseEnvSHA256: sha256Bytes(env), CreatedAt: time.Unix(1, 0).UTC(), CreatedByTransactionID: "txn-1"}
+	if _, err := store.WriteCandidateActivation(context.Background(), activation, env); err == nil {
+		t.Fatal("incomplete production candidate was published")
+	}
+	if _, err := store.activationWriter.ops.Lstat(filepath.Join("activations", activationID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("activation slot was created before candidate verification: %v", err)
+	}
+}
+
 func TestValidateLegacyCandidateUnitAcceptsProductionSemanticsAndRejectsUnsafeEnvironmentFiles(t *testing.T) {
 	golden, err := os.ReadFile(filepath.Join("..", "..", "deploy", "systemd", "open-card-server.service"))
 	if err != nil {
@@ -514,6 +537,33 @@ func TestUpgradeStorePreflightPlanRequiresOwnedLockAndIsReadOnly(t *testing.T) {
 	}
 	if _, err := os.Stat(before); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestUpgradeStoreNativePreflightPinsDatabaseEnvWithoutSerializingIt(t *testing.T) {
+	store, _, activation, env, cleanup := candidateStore(t)
+	defer cleanup()
+	lock := acquireCandidate(t, store)
+	defer lock.Release()
+	if _, err := store.WriteCandidateActivation(context.Background(), activation, env); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.activationWriter.SwapActivationLink(ActivationLinkActive, activation.ActivationID, ""); err != nil {
+		t.Fatal(err)
+	}
+	preflight, err := store.PreflightPlan(context.Background(), UpgradePreflightRequest{TransactionID: "txn-1", CandidateRelease: activation.Release})
+	if err != nil || preflight.Existing == nil || !bytes.Equal(preflight.Existing.DatabaseEnv, env) {
+		t.Fatalf("preflight=%#v err=%v", preflight, err)
+	}
+	raw, err := json.Marshal(preflight)
+	if err != nil || bytes.Contains(raw, []byte("postgresql://")) {
+		t.Fatalf("native preflight leaked env: %s err=%v", raw, err)
+	}
+	if err := os.WriteFile(filepath.Join(store.root, "opt/open-card/activations", activation.ActivationID, "database.env"), []byte("OPEN_CARD_DATABASE_URL=postgresql://user:pass@localhost:5432/other?sslmode=disable\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.PreflightPlan(context.Background(), UpgradePreflightRequest{TransactionID: "txn-1", CandidateRelease: activation.Release}); !errors.Is(err, ErrUpgradeJournalConflict) {
+		t.Fatalf("database env drift accepted: %v", err)
 	}
 }
 

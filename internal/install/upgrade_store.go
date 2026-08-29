@@ -995,7 +995,10 @@ func (s *UpgradeStore) verifyCandidateRelease(activation ActivationV1) error {
 	if err != nil {
 		return err
 	}
-	if manifest.ReleaseID != release.ID || manifest.Version != release.Version || manifest.SourceCommit != release.SourceCommit || manifest.Architecture != release.Architecture || manifest.MigrationVersion != activation.Database.Migration {
+	// The activation store remains reusable for historical/fixture releases,
+	// while every real RC1 publication is pinned to the production candidate
+	// payload contract before slot creation.
+	if (release.Version == ProductionCandidateVersion && ValidateProductionCandidate(manifest) != nil) || manifest.ReleaseID != release.ID || manifest.Version != release.Version || manifest.SourceCommit != release.SourceCommit || manifest.Architecture != release.Architecture || manifest.MigrationVersion != activation.Database.Migration {
 		return ErrUpgradeJournalConflict
 	}
 	return verifySecureRelease(s.activationWriter, release.ID, manifest)
@@ -1118,11 +1121,20 @@ func (s *UpgradeStore) PreflightPlan(_ context.Context, request UpgradePreflight
 		if err != nil {
 			return UpgradePreflight{}, ErrUpgradeJournalConflict
 		}
+		slot, err := s.activationSlotWriter(id)
+		if err != nil {
+			return UpgradePreflight{}, ErrUpgradeJournalConflict
+		}
+		defer slot.Close()
+		databaseEnv, err := slot.ReadMetadata("database.env")
+		if err != nil || databaseEnvSHA256(databaseEnv) != a.DatabaseEnvSHA256 {
+			return UpgradePreflight{}, ErrUpgradeJournalConflict
+		}
 		previous, err := s.legacyPrevious()
 		if err != nil {
 			return UpgradePreflight{}, ErrUpgradeJournalConflict
 		}
-		return UpgradePreflight{Existing: &ExistingActivationPreflight{Activation: a, JSONSHA256: digest}, Previous: previous}, nil
+		return UpgradePreflight{Existing: &ExistingActivationPreflight{Activation: a, JSONSHA256: digest, DatabaseEnv: append([]byte(nil), databaseEnv...)}, Previous: previous}, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return UpgradePreflight{}, ErrUpgradeJournalConflict
 	}

@@ -108,7 +108,7 @@ func (s *engineStoreFake) PreflightPlan(_ context.Context, request UpgradePrefli
 		return UpgradePreflight{}, err
 	}
 	if !s.legacy {
-		return UpgradePreflight{Existing: &ExistingActivationPreflight{Activation: s.old, JSONSHA256: s.oldDigest}}, nil
+		return UpgradePreflight{Existing: &ExistingActivationPreflight{Activation: s.old, JSONSHA256: s.oldDigest, DatabaseEnv: engineActiveDatabaseEnv()}, Previous: ActivationPointerIdentity{ID: s.state.PreviousID, JSONSHA256: s.state.PreviousJSONSHA256}}, nil
 	}
 	plan := &LegacyProjectionPlan{
 		TransactionID: request.TransactionID, ActivationID: "legacy-0123456789abcdef012345", Release: ReleaseV1{ID: "release-rc0", Version: ProductionNMinusOneVersion, SourceCommit: RC0SourceCommit, Architecture: "amd64", ManifestSHA256: RC0ReleaseManifestSHA256}, CurrentTarget: "/opt/open-card/releases/release-rc0", ExpectedMigration: "0023", ExpectedRowsSHA256: strings.Repeat("c", 64), DatabaseEnv: []byte("OPEN_CARD_DATABASE_URL=postgresql://user:pass@localhost:5432/open_card?sslmode=disable\n"), ServerEnvBeforeSHA256: strings.Repeat("1", 64), ServerEnvAfterSHA256: strings.Repeat("2", 64), ServerUnitBeforeSHA256: strings.Repeat("3", 64), ServerUnitAfterSHA256: strings.Repeat("4", 64), ServerUnitReleaseID: request.CandidateRelease.ID,
@@ -242,12 +242,17 @@ func (s *engineStoreFake) RestoreActive(_ context.Context, old, candidate string
 }
 
 type engineDBFake struct {
-	events       *[]string
-	fail         string
-	remaining    int
-	unknown      bool
-	inspectCalls int
-	inspectDrift bool
+	events          *[]string
+	fail            string
+	remaining       int
+	unknown         bool
+	inspectCalls    int
+	inspectDrift    bool
+	inspectMismatch bool
+	candidateEnv    []byte
+	snapshotSource  string
+	closed          int
+	closeErr        error
 }
 
 func (d *engineDBFake) InspectActive(_ context.Context, request ActiveDatabaseInspectionRequest) (DatabaseV1, error) {
@@ -255,6 +260,9 @@ func (d *engineDBFake) InspectActive(_ context.Context, request ActiveDatabaseIn
 		return DatabaseV1{}, err
 	}
 	d.inspectCalls++
+	if d.inspectMismatch {
+		return DatabaseV1{Name: "open_card_other", Migration: request.ExpectedMigration, SchemaMigrationsSHA256: request.ExpectedRowsSHA256}, nil
+	}
 	if d.inspectDrift && d.inspectCalls > 1 {
 		return DatabaseV1{Name: "open_card", Migration: request.ExpectedMigration, SchemaMigrationsSHA256: strings.Repeat("9", 64)}, nil
 	}
@@ -279,7 +287,11 @@ func (d *engineDBFake) Snapshot(context.Context) (SnapshotEvidence, string, erro
 	if err := d.event("snapshot"); err != nil {
 		return SnapshotEvidence{}, "", err
 	}
-	return SnapshotEvidence{SHA256: strings.Repeat("c", 64), Size: 17}, "open_card", nil
+	source := d.snapshotSource
+	if source == "" {
+		source = "open_card"
+	}
+	return SnapshotEvidence{SHA256: strings.Repeat("c", 64), Size: 17}, source, nil
 }
 func (d *engineDBFake) CreateRestore(context.Context, string) error { return d.event("candidate") }
 func (d *engineDBFake) Migrate(context.Context) (UpgradeMigrationEvidence, error) {
@@ -294,6 +306,9 @@ func (d *engineDBFake) Validate(context.Context, string) (ArtifactV1, error) {
 	}
 	return ArtifactV1{Path: artifactPath("txn-1", "validation.json"), SHA256: strings.Repeat("e", 64), Size: 9}, nil
 }
+
+func (d *engineDBFake) CandidateDatabaseEnv() []byte { return append([]byte(nil), d.candidateEnv...) }
+func (d *engineDBFake) Close() error                 { d.closed++; return d.closeErr }
 
 type engineServiceFake struct {
 	events     *[]string
@@ -341,11 +356,19 @@ func (s *engineServiceFake) RestoreEdge(context.Context, ServiceSnapshotV1) erro
 	return s.event("restore:edge")
 }
 
+func engineActiveDatabaseEnv() []byte {
+	return []byte("OPEN_CARD_DATABASE_URL=postgresql://user:pass@localhost:5432/open_card?sslmode=disable\n")
+}
+
 func engineOldActivation() ActivationV1 {
-	return ActivationV1{SchemaVersion: 1, ActivationID: "activation-old", Origin: "native", Release: ReleaseV1{ID: "release-old", Version: "0.8.0-rc.0", SourceCommit: strings.Repeat("a", 40), Architecture: "amd64", ManifestSHA256: strings.Repeat("b", 64)}, Database: DatabaseV1{Name: "open_card", Migration: "0023", SchemaMigrationsSHA256: strings.Repeat("c", 64)}, DatabaseEnvSHA256: strings.Repeat("d", 64), CreatedAt: time.Unix(1, 0).UTC(), CreatedByTransactionID: "old-txn"}
+	return ActivationV1{SchemaVersion: 1, ActivationID: "activation-old", Origin: "native", Release: ReleaseV1{ID: "release-old", Version: "0.8.0-rc.0", SourceCommit: strings.Repeat("a", 40), Architecture: "amd64", ManifestSHA256: strings.Repeat("b", 64)}, Database: DatabaseV1{Name: "open_card", Migration: "0023", SchemaMigrationsSHA256: strings.Repeat("c", 64)}, DatabaseEnvSHA256: sha256Bytes(engineActiveDatabaseEnv()), CreatedAt: time.Unix(1, 0).UTC(), CreatedByTransactionID: "old-txn"}
 }
 func engineRequest() UpgradeRequest {
-	return UpgradeRequest{TransactionID: "txn-1", CandidateRelease: ReleaseV1{ID: "release-new", Version: "0.8.0-rc.1", SourceCommit: strings.Repeat("e", 40), Architecture: "amd64", ManifestSHA256: strings.Repeat("f", 64)}, CandidateActivationID: "activation-new", CandidateDatabaseName: "open_card_act_0123456789abcdef", CandidateDatabaseEnv: []byte("OPEN_CARD_DATABASE_URL=postgresql://user:pass@localhost:5432/open_card?sslmode=disable\n"), RequestedManifestSHA256: strings.Repeat("f", 64)}
+	name, err := CandidateDatabaseName("activation-new")
+	if err != nil {
+		panic(err)
+	}
+	return UpgradeRequest{TransactionID: "txn-1", CandidateRelease: ReleaseV1{ID: "release-new", Version: "0.8.0-rc.1", SourceCommit: strings.Repeat("e", 40), Architecture: "amd64", ManifestSHA256: strings.Repeat("f", 64)}, CandidateActivationID: "activation-new", CandidateDatabaseName: name, RequestedManifestSHA256: strings.Repeat("f", 64)}
 }
 func engineFixture(legacy bool) (*UpgradeEngine, *engineStoreFake, *engineDBFake, *engineServiceFake, *[]string) {
 	events := []string{}
@@ -360,9 +383,20 @@ func engineFixture(legacy bool) (*UpgradeEngine, *engineStoreFake, *engineDBFake
 	}
 	s := &engineStoreFake{events: &events, old: old, oldDigest: oldDigest, legacy: legacy, state: state}
 	d := &engineDBFake{events: &events}
+	candidateEnv, err := CandidateDatabaseEnv(engineActiveDatabaseEnv(), engineRequest().CandidateDatabaseName)
+	if err != nil {
+		panic(err)
+	}
+	d.candidateEnv = candidateEnv
+	factory := UpgradeDatabaseOpenFunc(func(_ context.Context, request UpgradeDatabaseOpenRequest) (UpgradeDatabaseSession, error) {
+		if request.Validate() != nil {
+			return nil, errEngineFake
+		}
+		return d, nil
+	})
 	svc := &engineServiceFake{events: &events, edgeActive: true}
 	n := 1
-	return &UpgradeEngine{Store: s, Database: d, Services: svc, Now: func() time.Time { n++; return time.Unix(int64(n), 0).UTC() }}, s, d, svc, &events
+	return &UpgradeEngine{Store: s, DatabaseFactory: factory, Services: svc, Now: func() time.Time { n++; return time.Unix(int64(n), 0).UTC() }}, s, d, svc, &events
 }
 func enginePhase(t *testing.T, err error) UpgradePhaseError {
 	t.Helper()
@@ -508,7 +542,7 @@ func TestRecoveryRequiredMissingMarkerEnsuresMarkerAndGuards(t *testing.T) {
 }
 
 func TestUpgradeEngineHappyJournalAndOrdering(t *testing.T) {
-	e, store, _, _, events := engineFixture(false)
+	e, store, database, _, events := engineFixture(false)
 	if err := e.RunNew(context.Background(), engineRequest()); err != nil {
 		t.Fatal(err)
 	}
@@ -528,7 +562,7 @@ func TestUpgradeEngineHappyJournalAndOrdering(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(raw), "postgresql://user:pass") || !strings.EqualFold(string(store.candidateEnv), string(engineRequest().CandidateDatabaseEnv)) {
+	if strings.Contains(string(raw), "postgresql://user:pass") || !strings.EqualFold(string(store.candidateEnv), string(database.CandidateDatabaseEnv())) {
 		t.Fatal("database env leaked or was not passed")
 	}
 	if last.Snapshot == nil || last.Migration == nil || last.Validation == nil || last.CandidateDatabase == nil || last.CandidateActivationJSONSHA256 == "" {
@@ -536,6 +570,141 @@ func TestUpgradeEngineHappyJournalAndOrdering(t *testing.T) {
 	}
 	if last.CandidateDatabase.SchemaMigrationsSHA256 != strings.Repeat("d", 64) || last.Migration.ManifestSHA256 != strings.Repeat("f", 64) || last.CandidateDatabase.SchemaMigrationsSHA256 == last.Migration.ManifestSHA256 {
 		t.Fatalf("rows/manifest evidence=%+v %+v", last.CandidateDatabase, last.Migration)
+	}
+}
+
+func TestUpgradeEngineFactoryPrecedesJournalAndSessionAlwaysCloses(t *testing.T) {
+	e, store, database, _, events := engineFixture(false)
+	e.DatabaseFactory = UpgradeDatabaseOpenFunc(func(_ context.Context, request UpgradeDatabaseOpenRequest) (UpgradeDatabaseSession, error) {
+		*events = append(*events, "factory:open")
+		if request.Validate() != nil {
+			return nil, errEngineFake
+		}
+		return database, nil
+	})
+	if err := e.RunNew(context.Background(), engineRequest()); err != nil {
+		t.Fatal(err)
+	}
+	open, inspect, create := eventIndex(*events, "factory:open"), eventIndex(*events, "inspect-active"), eventIndex(*events, "create")
+	secondInspect := -1
+	for i, event := range *events {
+		if event == "inspect-active" && i > inspect {
+			secondInspect = i
+			break
+		}
+	}
+	drain, snapshot := eventIndex(*events, "drain"), eventIndex(*events, "snapshot")
+	if open < 0 || inspect < open || create < inspect || drain < create || secondInspect < drain || snapshot < secondInspect || database.closed != 1 {
+		t.Fatalf("events=%v closes=%d", *events, database.closed)
+	}
+	if len(store.created) != 1 {
+		t.Fatalf("journal was not created: %#v", store.created)
+	}
+}
+
+func TestUpgradeEngineNativeInspectionMismatchCreatesNoJournalAndCloses(t *testing.T) {
+	e, store, database, _, _ := engineFixture(false)
+	database.inspectMismatch = true
+	if got := enginePhase(t, e.RunNew(context.Background(), engineRequest())); got.Code != "preflight_failed" {
+		t.Fatal(got)
+	}
+	if len(store.created) != 0 || database.closed != 1 {
+		t.Fatalf("created=%#v closes=%d", store.created, database.closed)
+	}
+}
+
+func TestUpgradeEngineFactoryFailureCreatesNoJournal(t *testing.T) {
+	e, store, _, _, _ := engineFixture(false)
+	e.DatabaseFactory = UpgradeDatabaseOpenFunc(func(context.Context, UpgradeDatabaseOpenRequest) (UpgradeDatabaseSession, error) {
+		return nil, errEngineFake
+	})
+	if got := enginePhase(t, e.RunNew(context.Background(), engineRequest())); got.Code != "database_open_failed" {
+		t.Fatal(got)
+	}
+	if len(store.created) != 0 {
+		t.Fatalf("journal was created: %#v", store.created)
+	}
+}
+
+func TestUpgradeEngineClosesSessionAfterPostJournalFailure(t *testing.T) {
+	e, _, database, _, _ := engineFixture(false)
+	database.fail, database.remaining = "snapshot", 1
+	if err := e.RunNew(context.Background(), engineRequest()); err == nil {
+		t.Fatal("expected snapshot failure")
+	}
+	if database.closed != 1 {
+		t.Fatalf("database session closes=%d", database.closed)
+	}
+}
+
+func TestUpgradeEngineCloseFailureDoesNotHidePriorFailure(t *testing.T) {
+	e, _, database, _, _ := engineFixture(false)
+	database.closeErr = errEngineFake
+	if got := enginePhase(t, e.RunNew(context.Background(), engineRequest())); got.Code != "database_close_failed" || got.Phase != JournalCommitted {
+		t.Fatal(got)
+	}
+	e, _, database, _, _ = engineFixture(false)
+	database.fail, database.remaining, database.closeErr = "snapshot", 1, errEngineFake
+	if got := enginePhase(t, e.RunNew(context.Background(), engineRequest())); got.Code != "snapshot_failed" {
+		t.Fatal(got)
+	}
+}
+
+func TestUpgradeEngineRejectsSessionCandidateEnvironmentOutsideCandidateDatabase(t *testing.T) {
+	e, store, database, _, events := engineFixture(false)
+	database.candidateEnv = engineActiveDatabaseEnv()
+	if err := e.RunNew(context.Background(), engineRequest()); err == nil {
+		t.Fatal("expected invalid candidate environment")
+	}
+	if store.writtenCandidate.ActivationID != "" || eventIndex(*events, "write") >= 0 {
+		t.Fatalf("candidate activation was written: %#v events=%v", store.writtenCandidate, *events)
+	}
+}
+
+func TestUpgradeEngineNativeSecondInspectionDriftBlocksSnapshot(t *testing.T) {
+	e, _, database, _, events := engineFixture(false)
+	database.inspectDrift = true
+	if got := enginePhase(t, e.RunNew(context.Background(), engineRequest())); got.Phase != JournalRecoveryRequired {
+		t.Fatal(got)
+	}
+	if database.inspectCalls != 2 || eventIndex(*events, "snapshot") >= 0 {
+		t.Fatalf("inspects=%d events=%v", database.inspectCalls, *events)
+	}
+}
+
+func TestUpgradeEngineRejectsForeignSnapshotSourceBeforeSnapshotJournal(t *testing.T) {
+	e, store, database, _, events := engineFixture(false)
+	database.snapshotSource = "open_card_foreign"
+	if err := e.RunNew(context.Background(), engineRequest()); err == nil {
+		t.Fatal("expected source mismatch")
+	}
+	for _, forbidden := range []string{"save:SNAPSHOT_CREATED", "candidate", "migrate", "write", "validate"} {
+		if eventIndex(*events, forbidden) >= 0 {
+			t.Fatalf("foreign snapshot source reached %s: %v", forbidden, *events)
+		}
+	}
+	for _, journal := range store.saved {
+		if journal.State == JournalSnapshotCreated || journal.Snapshot != nil {
+			t.Fatalf("snapshot evidence was journaled: %#v", journal)
+		}
+	}
+}
+
+func TestRecoverNonLegacyTerminalDoesNotOpenDatabase(t *testing.T) {
+	e, store, _, _, _ := engineFixture(false)
+	if err := e.RunNew(context.Background(), engineRequest()); err != nil {
+		t.Fatal(err)
+	}
+	opened := 0
+	e.DatabaseFactory = UpgradeDatabaseOpenFunc(func(context.Context, UpgradeDatabaseOpenRequest) (UpgradeDatabaseSession, error) {
+		opened++
+		return nil, errEngineFake
+	})
+	if err := e.Recover(context.Background(), "txn-1"); err != nil {
+		t.Fatal(err)
+	}
+	if opened != 0 || len(store.saved) == 0 || store.saved[len(store.saved)-1].State != JournalCommitted {
+		t.Fatalf("opens=%d journal=%#v", opened, store.saved)
 	}
 }
 
@@ -656,7 +825,7 @@ func TestRecoverRecoveryGuardsAfterRecoveryJournalIsPersisted(t *testing.T) {
 }
 
 func TestUpgradeEngineLegacyBranch(t *testing.T) {
-	e, store, _, _, events := engineFixture(true)
+	e, store, database, _, events := engineFixture(true)
 	r := engineRequest()
 	r.ExpectedLegacy = true
 	if err := e.RunNew(context.Background(), r); err != nil {
@@ -676,6 +845,9 @@ func TestUpgradeEngineLegacyBranch(t *testing.T) {
 	}
 	if raw, err := MarshalUpgradeJournalV1(store.created[0]); err != nil || strings.Contains(string(raw), "user:pass") || strings.Contains(string(raw), "postgresql://") {
 		t.Fatalf("planned legacy journal leaked database env: %v %s", err, raw)
+	}
+	if database.closed != 1 {
+		t.Fatalf("legacy session closes=%d", database.closed)
 	}
 }
 
@@ -706,7 +878,7 @@ func TestUpgradeEngineLegacyReloadFailureRetainsPreFinalizeRecoveryState(t *test
 }
 
 func TestRecoverLegacyPreflightProjectsThenAbortsWithoutCandidate(t *testing.T) {
-	e, store, _, _, events := engineFixture(true)
+	e, store, database, _, events := engineFixture(true)
 	// Fail just before the first projection mutation, then simulate a restart
 	// with the durable PREFLIGHTED journal as the only authority.
 	store.fail, store.remaining = "legacy:prepare", 1
@@ -721,6 +893,7 @@ func TestRecoverLegacyPreflightProjectsThenAbortsWithoutCandidate(t *testing.T) 
 	store.fail, store.remaining = "", 0
 	store.saved = []UpgradeJournalV1{store.created[0]}
 	store.state = UpgradeActivationState{Marker: true}
+	database.closeErr = errEngineFake
 	if got := enginePhase(t, e.Recover(context.Background(), "txn-1")); got.Phase != JournalAbortedPreSwitch {
 		t.Fatalf("%v events=%v", got, *events)
 	}
@@ -729,6 +902,9 @@ func TestRecoverLegacyPreflightProjectsThenAbortsWithoutCandidate(t *testing.T) 
 	}
 	if len(store.saved) == 0 || store.saved[len(store.saved)-1].State != JournalAbortedPreSwitch {
 		t.Fatalf("legacy recovery did not terminally abort: %#v", store.saved)
+	}
+	if database.closed != 2 {
+		t.Fatalf("legacy recovery session closes=%d", database.closed)
 	}
 }
 
@@ -1041,7 +1217,7 @@ func TestUpgradeEngineRecoverCandidateStateRejectsWrongPreviousDigest(t *testing
 
 func TestRecoverLegacyPreflightWithoutDatabaseFailsClosed(t *testing.T) {
 	e, store, _, _ := legacyPreflightForRecovery(t, ActivationPointerIdentity{})
-	e.Database = nil
+	e.DatabaseFactory = nil
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			t.Fatalf("legacy recovery panicked: %v", recovered)

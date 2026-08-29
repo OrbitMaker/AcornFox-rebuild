@@ -48,6 +48,10 @@ func (r UpgradePreflightRequest) Validate() error {
 type ExistingActivationPreflight struct {
 	Activation ActivationV1 `json:"activation"`
 	JSONSHA256 string       `json:"json_sha256"`
+	// DatabaseEnv is deliberately in-memory only.  A native activation is not
+	// sufficient to open the upgrade database: the pinned slot environment
+	// must agree with the activation digest before a session is created.
+	DatabaseEnv []byte `json:"-"`
 }
 
 func (p ExistingActivationPreflight) Validate() error {
@@ -57,6 +61,9 @@ func (p ExistingActivationPreflight) Validate() error {
 	digest, err := CanonicalActivationJSONSHA256(p.Activation)
 	if err != nil || digest != p.JSONSHA256 {
 		return fmt.Errorf("existing activation digest mismatch")
+	}
+	if _, err := ParseDatabaseEnv(p.DatabaseEnv); err != nil || databaseEnvSHA256(p.DatabaseEnv) != p.Activation.DatabaseEnvSHA256 {
+		return fmt.Errorf("existing activation database environment mismatch")
 	}
 	return nil
 }
@@ -159,10 +166,11 @@ type ActiveDatabaseInspectionRequest struct {
 	DatabaseEnv        []byte `json:"-"`
 	ExpectedMigration  string `json:"expected_migration"`
 	ExpectedRowsSHA256 string `json:"expected_rows_sha256"`
+	ExpectedRowCount   int    `json:"expected_row_count"`
 }
 
 func (r ActiveDatabaseInspectionRequest) Validate() error {
-	if _, err := ParseDatabaseEnv(r.DatabaseEnv); err != nil || r.ExpectedMigration != "0023" || !validSHA(r.ExpectedRowsSHA256) {
+	if _, err := ParseDatabaseEnv(r.DatabaseEnv); err != nil || !validSHA(r.ExpectedRowsSHA256) || (r.ExpectedMigration != "0023" && r.ExpectedMigration != "0024") || r.ExpectedRowCount != 23 && r.ExpectedRowCount != 24 || r.ExpectedMigration != fmt.Sprintf("%04d", r.ExpectedRowCount) {
 		return fmt.Errorf("invalid active database inspection request")
 	}
 	return nil

@@ -43,7 +43,6 @@ type UpgradeRequest struct {
 	CandidateRelease        ReleaseV1
 	CandidateActivationID   string
 	CandidateDatabaseName   string
-	CandidateDatabaseEnv    []byte
 	RequestedManifestSHA256 string
 	ExpectedLegacy          bool
 }
@@ -78,6 +77,44 @@ type UpgradeDatabaseDriver interface {
 	CreateRestore(context.Context, string) error
 	Migrate(context.Context) (UpgradeMigrationEvidence, error)
 	Validate(context.Context, string) (ArtifactV1, error)
+}
+
+// UpgradeDatabaseOpenRequest is the complete non-secret identity a locked
+// database session may use.  The active environment is supplied only from a
+// validated preflight result and remains in memory.
+type UpgradeDatabaseOpenRequest struct {
+	TransactionID         string
+	CandidateRelease      ReleaseV1
+	CandidateActivationID string
+	CandidateDatabaseName string
+	ActiveDatabaseEnv     []byte `json:"-"`
+}
+
+func (r UpgradeDatabaseOpenRequest) Validate() error {
+	if !validID(r.TransactionID) || !validID(r.CandidateActivationID) || !candidateDatabaseName.MatchString(r.CandidateDatabaseName) {
+		return errors.New("invalid upgrade database open request")
+	}
+	name, err := CandidateDatabaseName(r.CandidateActivationID)
+	if err != nil || name != r.CandidateDatabaseName {
+		return errors.New("invalid upgrade database candidate")
+	}
+	if r.CandidateRelease.ID != "" && !r.CandidateRelease.valid() {
+		return errors.New("invalid upgrade database release")
+	}
+	_, err = ParseDatabaseEnv(r.ActiveDatabaseEnv)
+	return err
+}
+
+// UpgradeDatabaseSession binds all mutable candidate work to one active
+// database identity for the lifetime of the upgrade lock.
+type UpgradeDatabaseSession interface {
+	UpgradeDatabaseDriver
+	CandidateDatabaseEnv() []byte
+	Close() error
+}
+
+type UpgradeDatabaseFactory interface {
+	Open(context.Context, UpgradeDatabaseOpenRequest) (UpgradeDatabaseSession, error)
 }
 
 // UpgradeMigrationEvidence keeps the independently verified candidate schema
@@ -135,6 +172,23 @@ func sameDatabase(left, right DatabaseV1) bool {
 	return left.Name == right.Name && left.Migration == right.Migration && left.SchemaMigrationsSHA256 == right.SchemaMigrationsSHA256
 }
 
+func inspectionRequestForActivation(databaseEnv []byte, activation ActivationV1) (ActiveDatabaseInspectionRequest, error) {
+	count := 0
+	switch activation.Database.Migration {
+	case "0023":
+		count = 23
+	case "0024":
+		count = 24
+	default:
+		return ActiveDatabaseInspectionRequest{}, errors.New("unsupported active migration")
+	}
+	request := ActiveDatabaseInspectionRequest{DatabaseEnv: append([]byte(nil), databaseEnv...), ExpectedMigration: activation.Database.Migration, ExpectedRowsSHA256: activation.Database.SchemaMigrationsSHA256, ExpectedRowCount: count}
+	if err := request.Validate(); err != nil {
+		return ActiveDatabaseInspectionRequest{}, err
+	}
+	return request, nil
+}
+
 func expectedLegacyObservation(plan LegacyProjectionPlan, activation ActivationV1, digest string) LegacyProjectionObservation {
 	return LegacyProjectionObservation{
 		ActivationID:         activation.ActivationID,
@@ -153,10 +207,10 @@ func sameLegacyObservation(left, right LegacyProjectionObservation) bool {
 }
 
 type UpgradeEngine struct {
-	Store    UpgradeJournalStore
-	Database UpgradeDatabaseDriver
-	Services UpgradeServiceDriver
-	Now      func() time.Time
+	Store           UpgradeJournalStore
+	DatabaseFactory UpgradeDatabaseFactory
+	Services        UpgradeServiceDriver
+	Now             func() time.Time
 }
 
 func upgradeError(phase JournalState, code string) error {
@@ -175,8 +229,7 @@ func validUpgradeRequest(r UpgradeRequest) bool {
 	if !validID(r.TransactionID) || !r.CandidateRelease.valid() || !validID(r.CandidateActivationID) || !candidateDatabaseName.MatchString(r.CandidateDatabaseName) || !validSHA(r.RequestedManifestSHA256) || r.CandidateRelease.ManifestSHA256 != r.RequestedManifestSHA256 {
 		return false
 	}
-	_, err := ParseDatabaseEnv(r.CandidateDatabaseEnv)
-	return err == nil
+	return true
 }
 
 func transitionEvidenceSHA256(j UpgradeJournalV1, from, to JournalState) string {
@@ -451,8 +504,8 @@ func (e *UpgradeEngine) handleFailure(ctx context.Context, j *UpgradeJournalV1, 
 	return e.recoveryRequired(ctx, j, phase, code, cause)
 }
 
-func (e *UpgradeEngine) RunNew(ctx context.Context, r UpgradeRequest) error {
-	if e == nil || e.Store == nil || e.Database == nil || e.Services == nil || e.Now == nil || !validUpgradeRequest(r) {
+func (e *UpgradeEngine) RunNew(ctx context.Context, r UpgradeRequest) (result error) {
+	if e == nil || e.Store == nil || e.DatabaseFactory == nil || e.Services == nil || e.Now == nil || !validUpgradeRequest(r) {
 		return upgradeError(JournalPreflighted, "invalid_request")
 	}
 	lock, err := e.Store.Acquire(ctx, r.TransactionID)
@@ -468,10 +521,24 @@ func (e *UpgradeEngine) RunNew(ctx context.Context, r UpgradeRequest) error {
 	actualLegacy := preflight.Legacy != nil
 	var old ActivationV1
 	var oldJSONSHA256 string
+	var activeDatabaseEnv []byte
+	var database UpgradeDatabaseSession
 	baseline := UpgradeActivationState{PreviousID: preflight.Previous.ID, PreviousJSONSHA256: preflight.Previous.JSONSHA256}
 	now := e.now()
 	if actualLegacy {
-		inspected, inspectErr := e.Database.InspectActive(ctx, ActiveDatabaseInspectionRequest{DatabaseEnv: preflight.Legacy.DatabaseEnv, ExpectedMigration: preflight.Legacy.ExpectedMigration, ExpectedRowsSHA256: preflight.Legacy.ExpectedRowsSHA256})
+		activeDatabaseEnv = append([]byte(nil), preflight.Legacy.DatabaseEnv...)
+		request := ActiveDatabaseInspectionRequest{DatabaseEnv: activeDatabaseEnv, ExpectedMigration: preflight.Legacy.ExpectedMigration, ExpectedRowsSHA256: preflight.Legacy.ExpectedRowsSHA256, ExpectedRowCount: 23}
+		var openErr error
+		database, openErr = e.DatabaseFactory.Open(ctx, UpgradeDatabaseOpenRequest{TransactionID: r.TransactionID, CandidateRelease: r.CandidateRelease, CandidateActivationID: r.CandidateActivationID, CandidateDatabaseName: r.CandidateDatabaseName, ActiveDatabaseEnv: activeDatabaseEnv})
+		if openErr != nil || database == nil {
+			return upgradeError(JournalPreflighted, "database_open_failed")
+		}
+		defer func() {
+			if closeErr := database.Close(); closeErr != nil && result == nil {
+				result = upgradeError(JournalCommitted, "database_close_failed")
+			}
+		}()
+		inspected, inspectErr := database.InspectActive(ctx, request)
 		if inspectErr != nil {
 			return upgradeError(JournalPreflighted, "preflight_failed")
 		}
@@ -481,6 +548,32 @@ func (e *UpgradeEngine) RunNew(ctx context.Context, r UpgradeRequest) error {
 		}
 	} else {
 		old, oldJSONSHA256 = preflight.Existing.Activation, preflight.Existing.JSONSHA256
+		activeDatabaseEnv = append([]byte(nil), preflight.Existing.DatabaseEnv...)
+	}
+	if actualLegacy {
+		// The legacy branch opened and inspected its session above so that the
+		// planned old activation can be journaled before any host mutation.
+		// Re-open below only for the common continuation is intentionally avoided.
+	} else {
+		database, err = e.DatabaseFactory.Open(ctx, UpgradeDatabaseOpenRequest{TransactionID: r.TransactionID, CandidateRelease: r.CandidateRelease, CandidateActivationID: r.CandidateActivationID, CandidateDatabaseName: r.CandidateDatabaseName, ActiveDatabaseEnv: activeDatabaseEnv})
+		if err != nil || database == nil {
+			return upgradeError(JournalPreflighted, "database_open_failed")
+		}
+		defer func() {
+			if closeErr := database.Close(); closeErr != nil && result == nil {
+				result = upgradeError(JournalCommitted, "database_close_failed")
+			}
+		}()
+		request, requestErr := inspectionRequestForActivation(activeDatabaseEnv, old)
+		if requestErr != nil {
+			return upgradeError(JournalPreflighted, "preflight_failed")
+		}
+		inspected, inspectErr := database.InspectActive(ctx, request)
+		if inspectErr != nil || !sameDatabase(inspected, old.Database) {
+			return upgradeError(JournalPreflighted, "preflight_failed")
+		}
+	}
+	if !actualLegacy {
 		baseline, err = e.Store.ReadActivationState(ctx)
 		if err != nil || baseline.Marker || !sameOldState(baseline, baseline, old, oldJSONSHA256) {
 			return upgradeError(JournalPreflighted, "preflight_failed")
@@ -541,12 +634,12 @@ func (e *UpgradeEngine) RunNew(ctx context.Context, r UpgradeRequest) error {
 	if err := e.Services.Quiesce(ctx); err != nil {
 		return fail(JournalQuiesced, "service_quiesce_failed", err)
 	}
-	if err := e.Database.Drain(ctx); err != nil {
+	if err := database.Drain(ctx); err != nil {
 		return fail(JournalQuiesced, "database_drain_failed", err)
 	}
 	if actualLegacy {
 		plan := *preflight.Legacy
-		inspected, inspectErr := e.Database.InspectActive(ctx, ActiveDatabaseInspectionRequest{DatabaseEnv: plan.DatabaseEnv, ExpectedMigration: plan.ExpectedMigration, ExpectedRowsSHA256: plan.ExpectedRowsSHA256})
+		inspected, inspectErr := database.InspectActive(ctx, ActiveDatabaseInspectionRequest{DatabaseEnv: plan.DatabaseEnv, ExpectedMigration: plan.ExpectedMigration, ExpectedRowsSHA256: plan.ExpectedRowsSHA256, ExpectedRowCount: 23})
 		if inspectErr != nil || !sameDatabase(inspected, old.Database) {
 			return e.recoveryRequired(ctx, &j, JournalLegacyProjected, "legacy_projection_failed", inspectErr)
 		}
@@ -569,25 +662,36 @@ func (e *UpgradeEngine) RunNew(ctx context.Context, r UpgradeRequest) error {
 		if err := e.advance(ctx, &j, JournalLegacyProjected); err != nil {
 			return e.legacyProjectionPending(ctx, &j, r.TransactionID, err)
 		}
+	} else {
+		request, requestErr := inspectionRequestForActivation(activeDatabaseEnv, old)
+		if requestErr != nil {
+			return e.recoveryRequired(ctx, &j, JournalSnapshotCreated, "native_database_drift", requestErr)
+		}
+		inspected, inspectErr := database.InspectActive(ctx, request)
+		if inspectErr != nil || !sameDatabase(inspected, old.Database) {
+			return e.recoveryRequired(ctx, &j, JournalSnapshotCreated, "native_database_drift", inspectErr)
+		}
 	}
 	if err := e.advance(ctx, &j, JournalQuiesced); err != nil {
 		return fail(JournalQuiesced, "quiesce_journal_failed", err)
 	}
-	if evidence, sourceDatabase, err := e.Database.Snapshot(ctx); err != nil {
+	if evidence, sourceDatabase, err := database.Snapshot(ctx); err != nil {
 		return fail(JournalSnapshotCreated, "snapshot_failed", err)
+	} else if sourceDatabase != old.Database.Name {
+		return fail(JournalSnapshotCreated, "snapshot_failed", errors.New("snapshot source database mismatch"))
 	} else {
 		j.Snapshot = &ArtifactV1{Path: artifactPath(j.TransactionID, "control-plane.dump"), SHA256: evidence.SHA256, Size: evidence.Size, SourceDatabase: sourceDatabase}
 		if err := e.advance(ctx, &j, JournalSnapshotCreated); err != nil {
 			return fail(JournalSnapshotCreated, "snapshot_journal_failed", err)
 		}
 	}
-	if err := e.Database.CreateRestore(ctx, r.CandidateDatabaseName); err != nil {
+	if err := database.CreateRestore(ctx, r.CandidateDatabaseName); err != nil {
 		return fail(JournalCandidateDBReady, "candidate_database_failed", err)
 	}
 	if err := e.advance(ctx, &j, JournalCandidateDBReady); err != nil {
 		return fail(JournalCandidateDBReady, "candidate_journal_failed", err)
 	}
-	if evidence, err := e.Database.Migrate(ctx); err != nil {
+	if evidence, err := database.Migrate(ctx); err != nil {
 		return fail(JournalMigrated, "migration_failed", err)
 	} else {
 		j.CandidateDatabase = &DatabaseV1{Name: r.CandidateDatabaseName, Migration: evidence.To, SchemaMigrationsSHA256: evidence.RowsSHA256}
@@ -596,15 +700,20 @@ func (e *UpgradeEngine) RunNew(ctx context.Context, r UpgradeRequest) error {
 			return fail(JournalMigrated, "migration_journal_failed", err)
 		}
 	}
-	candidate := ActivationV1{SchemaVersion: ActivationSchemaVersion, ActivationID: r.CandidateActivationID, Origin: "native", Release: r.CandidateRelease, Database: *j.CandidateDatabase, DatabaseEnvSHA256: sha256Bytes(r.CandidateDatabaseEnv), CreatedAt: e.now(), CreatedByTransactionID: r.TransactionID}
+	candidateEnv := database.CandidateDatabaseEnv()
+	candidateEnvironment, candidateEnvErr := PostgresEnvironment(candidateEnv)
+	if candidateEnvErr != nil || candidateEnvironment.Descriptor.Database != r.CandidateDatabaseName {
+		return fail(JournalValidated, "invalid_candidate_database_env", candidateEnvErr)
+	}
+	candidate := ActivationV1{SchemaVersion: ActivationSchemaVersion, ActivationID: r.CandidateActivationID, Origin: "native", Release: r.CandidateRelease, Database: *j.CandidateDatabase, DatabaseEnvSHA256: sha256Bytes(candidateEnv), CreatedAt: e.now(), CreatedByTransactionID: r.TransactionID}
 	if err := candidate.Validate(); err != nil {
 		return fail(JournalValidated, "invalid_candidate_activation", err)
 	}
-	candidateJSONSHA256, err := e.Store.WriteCandidateActivation(ctx, candidate, r.CandidateDatabaseEnv)
+	candidateJSONSHA256, err := e.Store.WriteCandidateActivation(ctx, candidate, candidateEnv)
 	if err != nil || !validSHA(candidateJSONSHA256) {
 		return fail(JournalValidated, "write_candidate_activation_failed", err)
 	}
-	validation, err := e.Database.Validate(ctx, r.CandidateActivationID)
+	validation, err := database.Validate(ctx, r.CandidateActivationID)
 	if err != nil {
 		return fail(JournalValidated, "validation_failed", err)
 	}
@@ -742,8 +851,8 @@ func (e *UpgradeEngine) convergeCommittedPublic(ctx context.Context, j *UpgradeJ
 // already journaled. It deliberately restores the old service policy and
 // stops at ABORTED_PRE_SWITCH rather than silently resuming a new candidate
 // upgrade after a host crash.
-func (e *UpgradeEngine) recoverLegacyPreflight(ctx context.Context, j *UpgradeJournalV1, transactionID string) error {
-	if e.Database == nil {
+func (e *UpgradeEngine) recoverLegacyPreflight(ctx context.Context, j *UpgradeJournalV1, transactionID string) (result error) {
+	if e.DatabaseFactory == nil {
 		return e.recoverRecovery(ctx, j, transactionID, JournalPreflighted, errors.New("legacy database driver unavailable"))
 	}
 	if j.PlannedOldActivation == nil || j.PlannedOldActivation.Validate() != nil || j.PlannedOldActivation.LegacyProjection == nil {
@@ -765,7 +874,18 @@ func (e *UpgradeEngine) recoverLegacyPreflight(ctx context.Context, j *UpgradeJo
 	if baseline.Validate() != nil || !plan.Previous.equal(baseline) {
 		return e.recoverRecovery(ctx, j, transactionID, j.State, errors.New("legacy previous pointer drift"))
 	}
-	inspected, err := e.Database.InspectActive(ctx, ActiveDatabaseInspectionRequest{DatabaseEnv: plan.DatabaseEnv, ExpectedMigration: plan.ExpectedMigration, ExpectedRowsSHA256: plan.ExpectedRowsSHA256})
+	database, err := e.DatabaseFactory.Open(ctx, UpgradeDatabaseOpenRequest{TransactionID: transactionID, CandidateActivationID: j.CandidateActivationID, CandidateDatabaseName: j.CandidateDatabaseName, ActiveDatabaseEnv: plan.DatabaseEnv})
+	if err != nil || database == nil {
+		return e.recoverRecovery(ctx, j, transactionID, j.State, err)
+	}
+	defer func() {
+		// Recovery already has a durable terminal/error outcome.  A close failure
+		// must not hide that outcome, but a future successful path fails closed.
+		if closeErr := database.Close(); closeErr != nil && result == nil {
+			result = upgradeError(JournalRecoveryRequired, "database_close_failed")
+		}
+	}()
+	inspected, err := database.InspectActive(ctx, ActiveDatabaseInspectionRequest{DatabaseEnv: plan.DatabaseEnv, ExpectedMigration: plan.ExpectedMigration, ExpectedRowsSHA256: plan.ExpectedRowsSHA256, ExpectedRowCount: 23})
 	if err != nil || !sameDatabase(inspected, old.Database) {
 		return e.recoverRecovery(ctx, j, transactionID, j.State, err)
 	}

@@ -147,13 +147,19 @@ func TestLegacyProjectionPlanValidationAndSecretBoundary(t *testing.T) {
 
 func TestPreflightAndInspectionContracts(t *testing.T) {
 	native := activationFixture()
+	nativeEnv := []byte("OPEN_CARD_DATABASE_URL=postgresql://user:pass@localhost:5432/open_card?sslmode=disable\n")
+	native.DatabaseEnvSHA256 = databaseEnvSHA256(nativeEnv)
 	nativeDigest, err := CanonicalActivationJSONSHA256(native)
 	if err != nil {
 		t.Fatal(err)
 	}
-	existing := UpgradePreflight{Existing: &ExistingActivationPreflight{Activation: native, JSONSHA256: nativeDigest}}
+	existing := UpgradePreflight{Existing: &ExistingActivationPreflight{Activation: native, JSONSHA256: nativeDigest, DatabaseEnv: nativeEnv}}
 	if err := existing.Validate(); err != nil {
 		t.Fatal(err)
+	}
+	rawExisting, err := json.Marshal(existing)
+	if err != nil || strings.Contains(string(rawExisting), "postgresql://") || strings.Contains(string(rawExisting), "\"database_env\"") {
+		t.Fatalf("native preflight serialized database environment: %s", rawExisting)
 	}
 	plan := legacyPlanFixture()
 	legacy := UpgradePreflight{Legacy: &plan, Previous: plan.Previous}
@@ -162,7 +168,7 @@ func TestPreflightAndInspectionContracts(t *testing.T) {
 	}
 	for _, broken := range []UpgradePreflight{
 		{}, {Existing: existing.Existing, Legacy: &plan}, {Existing: existing.Existing, Previous: ActivationPointerIdentity{ID: "bad"}},
-		{Existing: &ExistingActivationPreflight{Activation: native, JSONSHA256: sha("0")}},
+		{Existing: &ExistingActivationPreflight{Activation: native, JSONSHA256: sha("0"), DatabaseEnv: nativeEnv}},
 		{Legacy: &plan},
 	} {
 		if err := broken.Validate(); err == nil {
@@ -185,7 +191,7 @@ func TestPreflightAndInspectionContracts(t *testing.T) {
 	if err := request.Validate(); err == nil {
 		t.Fatal("invalid preflight request accepted")
 	}
-	inspection := ActiveDatabaseInspectionRequest{DatabaseEnv: plan.DatabaseEnv, ExpectedMigration: plan.ExpectedMigration, ExpectedRowsSHA256: plan.ExpectedRowsSHA256}
+	inspection := ActiveDatabaseInspectionRequest{DatabaseEnv: plan.DatabaseEnv, ExpectedMigration: plan.ExpectedMigration, ExpectedRowsSHA256: plan.ExpectedRowsSHA256, ExpectedRowCount: 23}
 	if err := inspection.Validate(); err != nil {
 		t.Fatal(err)
 	}
@@ -193,7 +199,11 @@ func TestPreflightAndInspectionContracts(t *testing.T) {
 	if err != nil || strings.Contains(string(raw), "postgresql://") || strings.Contains(string(raw), "database_env") {
 		t.Fatal("inspection request serialized secret")
 	}
-	assertJSONKeys(t, raw, "expected_migration", "expected_rows_sha256")
+	assertJSONKeys(t, raw, "expected_migration", "expected_rows_sha256", "expected_row_count")
+	openRequest := UpgradeDatabaseOpenRequest{TransactionID: "txn-1", CandidateActivationID: "activation-1", CandidateDatabaseName: "open_card_act_0123456789abcdef", ActiveDatabaseEnv: plan.DatabaseEnv}
+	if raw, err := json.Marshal(openRequest); err != nil || strings.Contains(string(raw), "postgresql://") || strings.Contains(string(raw), "active_database_env") {
+		t.Fatalf("database open request serialized secret: %s err=%v", raw, err)
+	}
 	inspection.ExpectedMigration = "0024"
 	if err := inspection.Validate(); err == nil {
 		t.Fatal("invalid inspection request accepted")

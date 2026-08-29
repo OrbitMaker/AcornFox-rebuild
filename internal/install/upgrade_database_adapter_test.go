@@ -50,12 +50,37 @@ func adapterRelease(t *testing.T) (ReleaseV1, string) {
 	files := make([]FileDigest, 0, 24)
 	for version := 1; version <= 24; version++ {
 		name := formatMigrationVersion(version) + "_upgrade.sql"
+		if version == 24 {
+			name = "0024_dns_change_ledger.sql"
+		}
 		path := filepath.Join(root, "migrations/control-plane", name)
 		raw := []byte("-- migration " + formatMigrationVersion(version) + "\nSELECT " + formatMigrationVersion(version) + ";\n")
 		if err := os.WriteFile(path, raw, 0o644); err != nil {
 			t.Fatal(err)
 		}
 		files = append(files, FileDigest{Path: "migrations/control-plane/" + name, SHA256: adapterDigest(raw), Mode: 0o644})
+	}
+	for path, raw := range map[string][]byte{
+		"bin/open-card-admin":                    []byte("admin\n"),
+		"systemd/open-card-edge.service":         []byte("edge\n"),
+		"caddy/open-card-edge.Caddyfile.example": []byte("edge\n"),
+		"web/dist/index.html":                    []byte("web\n"),
+		"docs/licenses/licenses-manifest.json":   []byte("{}\n"),
+		"sbom.spdx.json":                         []byte("{}\n"),
+		"source-manifest.sha256":                 []byte("source\n"),
+	} {
+		full := filepath.Join(root, filepath.FromSlash(path))
+		if err := os.MkdirAll(filepath.Dir(full), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		mode := os.FileMode(0o644)
+		if path == "bin/open-card-admin" {
+			mode = 0o755
+		}
+		if err := os.WriteFile(full, raw, mode); err != nil {
+			t.Fatal(err)
+		}
+		files = append(files, FileDigest{Path: path, SHA256: adapterDigest(raw), Mode: uint32(mode)})
 	}
 	manifest := Manifest{
 		SchemaVersion:    ManifestSchemaVersion,
@@ -195,7 +220,7 @@ func TestUpgradeDatabaseAdapterRejectsReleaseDriftAndUnsafeArtifacts(t *testing.
 		t.Fatal(err)
 	}
 	defer adapter.Close()
-	if err := os.Chmod(filepath.Join(plan.CandidateReleaseRoot, "migrations/control-plane/0024_upgrade.sql"), 0o600); err != nil {
+	if err := os.Chmod(filepath.Join(plan.CandidateReleaseRoot, "migrations/control-plane/0024_dns_change_ledger.sql"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := adapter.Migrate(context.Background()); !errors.Is(err, ErrPostgresOutcomeUnknown) {
@@ -206,6 +231,35 @@ func TestUpgradeDatabaseAdapterRejectsReleaseDriftAndUnsafeArtifacts(t *testing.
 	}
 	if _, _, err := adapter.Snapshot(context.Background()); !errors.Is(err, ErrPostgresOutcomeUnknown) {
 		t.Fatalf("snapshot error=%v", err)
+	}
+}
+
+func TestUpgradeDatabaseAdapterRejectsIncompleteProductionPayloadBeforeMutableWork(t *testing.T) {
+	plan, _, pg := adapterPlan(t)
+	if err := os.Remove(filepath.Join(plan.CandidateReleaseRoot, "web/dist/index.html")); err != nil {
+		t.Fatal(err)
+	}
+	active, err := PostgresEnvironment(plan.ActiveDatabaseEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := TaskUpgradeDatabaseAdapter(plan, adapterControl(active), adapterSnapshotter(t, pg)); !errors.Is(err, ErrPostgresOutcomeUnknown) {
+		t.Fatalf("incomplete production release accepted: %v", err)
+	}
+	if len(pg.argv) != 0 {
+		t.Fatalf("mutable postgres tool invoked before release validation: %v", pg.argv)
+	}
+	plan, _, pg = adapterPlan(t)
+	plan.CandidateRelease.Version = ProductionNMinusOneVersion
+	active, err = PostgresEnvironment(plan.ActiveDatabaseEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := TaskUpgradeDatabaseAdapter(plan, adapterControl(active), adapterSnapshotter(t, pg)); !errors.Is(err, ErrPostgresOutcomeUnknown) {
+		t.Fatalf("wrong production tuple accepted: %v", err)
+	}
+	if len(pg.argv) != 0 {
+		t.Fatalf("mutable postgres tool invoked for wrong tuple: %v", pg.argv)
 	}
 }
 
@@ -314,7 +368,7 @@ func inspectionAdapter(t *testing.T, database postgresDB, factoryErr error) (*Up
 }
 
 func inspectionRequest(env []byte, expected string) ActiveDatabaseInspectionRequest {
-	return ActiveDatabaseInspectionRequest{DatabaseEnv: env, ExpectedMigration: "0023", ExpectedRowsSHA256: expected}
+	return ActiveDatabaseInspectionRequest{DatabaseEnv: env, ExpectedMigration: "0023", ExpectedRowsSHA256: expected, ExpectedRowCount: 23}
 }
 
 func TestUpgradeDatabaseAdapterInspectActiveExactRowsAndStableInvocation(t *testing.T) {
@@ -334,6 +388,37 @@ func TestUpgradeDatabaseAdapterInspectActiveExactRowsAndStableInvocation(t *test
 		t.Fatalf("second=%+v err=%v opens=%d closes=%d", second, err, *opens, database.closes)
 	}
 	_ = plan
+}
+
+func TestUpgradeDatabaseAdapterInspectActiveSupportsRC1Rows(t *testing.T) {
+	rows := migrationRows(24)
+	database := &inspectionDB{adapterDB: &adapterDB{rows: inspectionRows(rows)}}
+	adapter, plan, _ := inspectionAdapter(t, database, nil)
+	defer adapter.Close()
+	request := ActiveDatabaseInspectionRequest{DatabaseEnv: plan.ActiveDatabaseEnv, ExpectedMigration: "0024", ExpectedRowsSHA256: migrationDigest(rows), ExpectedRowCount: 24}
+	got, err := adapter.InspectActive(context.Background(), request)
+	if err != nil || got != (DatabaseV1{Name: "open_card", Migration: "0024", SchemaMigrationsSHA256: migrationDigest(rows)}) {
+		t.Fatalf("database=%+v err=%v", got, err)
+	}
+}
+
+func TestCandidateDatabaseEnvPreservesEncodedAuthorityAndTLS(t *testing.T) {
+	active := []byte("OPEN_CARD_DATABASE_URL=postgresql://us%40er:p%2Fass@db.example:5544/open_card?sslmode=verify-full&application_name=open-card\n")
+	candidate, err := CandidateDatabaseName("activation-new")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := CandidateDatabaseEnv(active, candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dsn, err := ParseDatabaseEnv(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(dsn, "us%40er:p%2Fass@db.example:5544/") || !strings.Contains(dsn, "sslmode=verify-full") || !strings.Contains(dsn, "application_name=open-card") || !strings.Contains(dsn, "/"+candidate) {
+		t.Fatalf("candidate DSN lost authority/query semantics: %q", dsn)
+	}
 }
 
 func TestUpgradeDatabaseAdapterInspectActiveBindsExactPlanEnvironment(t *testing.T) {
@@ -410,7 +495,7 @@ func TestUpgradeDatabaseAdapterInspectActiveRejectsDrift(t *testing.T) {
 	if _, err := adapter.InspectActive(context.Background(), inspectionRequest(plan.ActiveDatabaseEnv, strings.Repeat("f", 64))); !errors.Is(err, ErrCandidateConflict) {
 		t.Fatalf("wrong expected err=%v", err)
 	}
-	if _, err := adapter.InspectActive(context.Background(), ActiveDatabaseInspectionRequest{DatabaseEnv: plan.ActiveDatabaseEnv, ExpectedMigration: "0024", ExpectedRowsSHA256: migrationDigest(base)}); !errors.Is(err, ErrPostgresOutcomeUnknown) {
+	if _, err := adapter.InspectActive(context.Background(), ActiveDatabaseInspectionRequest{DatabaseEnv: plan.ActiveDatabaseEnv, ExpectedMigration: "0024", ExpectedRowsSHA256: migrationDigest(base), ExpectedRowCount: 24}); !errors.Is(err, ErrPostgresOutcomeUnknown) {
 		t.Fatalf("wrong migration err=%v", err)
 	}
 }

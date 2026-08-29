@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -68,6 +69,112 @@ type UpgradeDatabaseAdapter struct {
 	activeEnvSHA  string
 	snapshot      *SnapshotEvidence
 	activeFactory ActiveDatabaseInspectionFactory
+}
+
+// UpgradeDatabaseOpenFunc is a task-only seam for locked engine tests.  It
+// receives a defensive copy of the active environment.
+type UpgradeDatabaseOpenFunc func(context.Context, UpgradeDatabaseOpenRequest) (UpgradeDatabaseSession, error)
+
+func (f UpgradeDatabaseOpenFunc) Open(ctx context.Context, request UpgradeDatabaseOpenRequest) (UpgradeDatabaseSession, error) {
+	if f == nil || request.Validate() != nil {
+		return nil, ErrPostgresOutcomeUnknown
+	}
+	copyRequest := request
+	copyRequest.ActiveDatabaseEnv = append([]byte(nil), request.ActiveDatabaseEnv...)
+	return f(ctx, copyRequest)
+}
+
+// ProductionUpgradeDatabaseFactory is intentionally parameterless: the
+// privileged caller may choose an upgrade identity, never paths, tools, or a
+// database environment other than the pinned active activation value.
+type ProductionUpgradeDatabaseFactory struct{}
+
+func NewProductionUpgradeDatabaseFactory() ProductionUpgradeDatabaseFactory {
+	return ProductionUpgradeDatabaseFactory{}
+}
+
+func (ProductionUpgradeDatabaseFactory) Open(_ context.Context, request UpgradeDatabaseOpenRequest) (UpgradeDatabaseSession, error) {
+	if request.Validate() != nil {
+		return nil, ErrPostgresOutcomeUnknown
+	}
+	candidateEnv, err := CandidateDatabaseEnv(request.ActiveDatabaseEnv, request.CandidateDatabaseName)
+	if err != nil {
+		return nil, ErrPostgresOutcomeUnknown
+	}
+	if request.CandidateRelease.ID == "" {
+		return newActiveInspectionSession(request.ActiveDatabaseEnv, candidateEnv), nil
+	}
+	adapter, err := ProductionUpgradeDatabaseAdapter(ProductionUpgradeDatabaseInput{
+		TransactionID:          request.TransactionID,
+		ActiveDatabaseEnv:      append([]byte(nil), request.ActiveDatabaseEnv...),
+		CandidateDatabaseName:  request.CandidateDatabaseName,
+		CandidateActivationID:  request.CandidateActivationID,
+		CandidateDatabaseEnv:   candidateEnv,
+		CandidateRelease:       request.CandidateRelease,
+		RecoveryEvidenceSHA256: sha256TextFrom(request.TransactionID + "\n" + request.CandidateActivationID + "\n" + request.CandidateRelease.ManifestSHA256),
+	})
+	if err != nil {
+		return nil, ErrPostgresOutcomeUnknown
+	}
+	return adapter, nil
+}
+
+// activeInspectionSession is used only by legacy PREFLIGHTED recovery, where
+// the candidate release tuple is not serialized in the journal.  It can
+// inspect the pinned old database but deliberately refuses every mutable
+// candidate operation.
+type activeInspectionSession struct {
+	activeEnv    []byte
+	activeEnvSHA string
+	candidateEnv []byte
+}
+
+func newActiveInspectionSession(activeEnv, candidateEnv []byte) *activeInspectionSession {
+	digest := sha256.Sum256(activeEnv)
+	return &activeInspectionSession{activeEnv: append([]byte(nil), activeEnv...), activeEnvSHA: hex.EncodeToString(digest[:]), candidateEnv: append([]byte(nil), candidateEnv...)}
+}
+
+func (s *activeInspectionSession) InspectActive(ctx context.Context, request ActiveDatabaseInspectionRequest) (DatabaseV1, error) {
+	if s == nil || request.Validate() != nil || !bytes.Equal(request.DatabaseEnv, s.activeEnv) || sha256Bytes(request.DatabaseEnv) != s.activeEnvSHA {
+		return DatabaseV1{}, ErrPostgresOutcomeUnknown
+	}
+	return inspectSelectedActiveDatabase(ctx, request, NewSelectedPostgresDatabase)
+}
+func (s *activeInspectionSession) CandidateDatabaseEnv() []byte {
+	return append([]byte(nil), s.candidateEnv...)
+}
+func (*activeInspectionSession) Close() error                { return nil }
+func (*activeInspectionSession) Drain(context.Context) error { return ErrPostgresOutcomeUnknown }
+func (*activeInspectionSession) Snapshot(context.Context) (SnapshotEvidence, string, error) {
+	return SnapshotEvidence{}, "", ErrPostgresOutcomeUnknown
+}
+func (*activeInspectionSession) CreateRestore(context.Context, string) error {
+	return ErrPostgresOutcomeUnknown
+}
+func (*activeInspectionSession) Migrate(context.Context) (UpgradeMigrationEvidence, error) {
+	return UpgradeMigrationEvidence{}, ErrPostgresOutcomeUnknown
+}
+func (*activeInspectionSession) Validate(context.Context, string) (ArtifactV1, error) {
+	return ArtifactV1{}, ErrPostgresOutcomeUnknown
+}
+
+// CandidateDatabaseEnv changes only the selected database path. Credentials,
+// host, port, query parameters and TLS mode are preserved by url.URL.
+func CandidateDatabaseEnv(active []byte, candidate string) ([]byte, error) {
+	if !candidateDatabaseName.MatchString(candidate) {
+		return nil, ErrPostgresOutcomeUnknown
+	}
+	dsn, err := ParseDatabaseEnv(active)
+	if err != nil {
+		return nil, ErrPostgresOutcomeUnknown
+	}
+	u, err := url.Parse(dsn)
+	if err != nil || strings.Trim(u.EscapedPath(), "/") == "" {
+		return nil, ErrPostgresOutcomeUnknown
+	}
+	u.Path = "/" + candidate
+	u.RawPath = ""
+	return FormatDatabaseEnv(u.String())
 }
 
 // ProductionUpgradeDatabaseAdapter binds only fixed production dependencies.
@@ -308,6 +415,17 @@ func (a *UpgradeDatabaseAdapter) InspectActive(ctx context.Context, request Acti
 	if factory == nil {
 		factory = NewSelectedPostgresDatabase
 	}
+	return inspectSelectedActiveDatabase(ctx, request, factory)
+}
+
+func inspectSelectedActiveDatabase(ctx context.Context, request ActiveDatabaseInspectionRequest, factory ActiveDatabaseInspectionFactory) (database DatabaseV1, err error) {
+	if request.Validate() != nil || factory == nil {
+		return DatabaseV1{}, ErrPostgresOutcomeUnknown
+	}
+	environment, parseErr := PostgresEnvironment(request.DatabaseEnv)
+	if parseErr != nil || !validID(environment.Descriptor.Database) {
+		return DatabaseV1{}, ErrPostgresOutcomeUnknown
+	}
 	selected, openErr := factory(append([]byte(nil), request.DatabaseEnv...))
 	if openErr != nil || selected == nil || selected.database == nil {
 		return DatabaseV1{}, ErrPostgresOutcomeUnknown
@@ -318,14 +436,14 @@ func (a *UpgradeDatabaseAdapter) InspectActive(ctx context.Context, request Acti
 		}
 	}()
 	rows, queryErr := selected.MigrationRows(ctx)
-	if queryErr != nil || !validMigrationRows(rows, 23) {
+	if queryErr != nil || !validMigrationRows(rows, request.ExpectedRowCount) {
 		return DatabaseV1{}, ErrPostgresOutcomeUnknown
 	}
 	evidence, evidenceErr := migrationEvidence(rows)
 	if evidenceErr != nil || evidence.RowsSHA256 != request.ExpectedRowsSHA256 {
 		return DatabaseV1{}, ErrCandidateConflict
 	}
-	return DatabaseV1{Name: environment.Descriptor.Database, Migration: "0023", SchemaMigrationsSHA256: evidence.RowsSHA256}, nil
+	return DatabaseV1{Name: environment.Descriptor.Database, Migration: request.ExpectedMigration, SchemaMigrationsSHA256: evidence.RowsSHA256}, nil
 }
 
 func (a *UpgradeDatabaseAdapter) Snapshot(ctx context.Context) (SnapshotEvidence, string, error) {
@@ -426,6 +544,13 @@ func (a *UpgradeDatabaseAdapter) Close() error {
 	return controlErr
 }
 
+func (a *UpgradeDatabaseAdapter) CandidateDatabaseEnv() []byte {
+	if a == nil {
+		return nil
+	}
+	return append([]byte(nil), a.plan.CandidateDatabaseEnv...)
+}
+
 func secureArtifactDirectory(path string) bool {
 	info, err := os.Lstat(path)
 	return err == nil && info.IsDir() && info.Mode()&os.ModeSymlink == 0 && info.Mode().Perm()&0o022 == 0
@@ -451,7 +576,7 @@ func verifiedUpgradeRelease(plan UpgradeDatabasePlan) (Manifest, error) {
 	if err != nil || manifest.ReleaseID != plan.CandidateRelease.ID || manifest.Version != plan.CandidateRelease.Version || manifest.SourceCommit != plan.CandidateRelease.SourceCommit || manifest.Architecture != plan.CandidateRelease.Architecture || manifest.MigrationVersion != CurrentMigrationVersion {
 		return Manifest{}, ErrPostgresOutcomeUnknown
 	}
-	if err := VerifyRelease(plan.CandidateReleaseRoot, manifest); err != nil {
+	if ValidateProductionCandidate(manifest) != nil || VerifyRelease(plan.CandidateReleaseRoot, manifest) != nil {
 		return Manifest{}, ErrPostgresOutcomeUnknown
 	}
 	return manifest, nil
@@ -524,4 +649,5 @@ func upgradeDatabaseError(err error) error {
 	return ErrPostgresOutcomeUnknown
 }
 
-var _ UpgradeDatabaseDriver = (*UpgradeDatabaseAdapter)(nil)
+var _ UpgradeDatabaseSession = (*UpgradeDatabaseAdapter)(nil)
+var _ UpgradeDatabaseFactory = ProductionUpgradeDatabaseFactory{}
