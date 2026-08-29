@@ -177,6 +177,40 @@ func TestUpgradeJournalRejectsMissingAndEarlyEvidence(t *testing.T) {
 	}
 }
 
+func TestUpgradeJournalPreUpgradePreviousPair(t *testing.T) {
+	j := journalAt(JournalPreflighted, false)
+	j.PreUpgradePreviousActivationID, j.PreUpgradePreviousActivationJSONSHA256 = "activation-previous", sha("a")
+	raw, err := MarshalUpgradeJournalV1(j)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := ParseUpgradeJournalV1(raw); err != nil || got.PreUpgradePreviousActivationID != j.PreUpgradePreviousActivationID {
+		t.Fatal(err)
+	}
+	j.PreUpgradePreviousActivationJSONSHA256 = ""
+	if err := j.Validate(); err == nil {
+		t.Fatal("unpaired previous baseline accepted")
+	}
+}
+
+func TestUpgradeJournalPreviousBaselineAbsentAndPresentRoundTrip(t *testing.T) {
+	for _, previous := range []bool{false, true} {
+		j := journalFixture()
+		if previous {
+			j.PreUpgradePreviousActivationID = "activation-previous"
+			j.PreUpgradePreviousActivationJSONSHA256 = sha("a")
+		}
+		raw, err := MarshalUpgradeJournalV1(j)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := ParseUpgradeJournalV1(raw)
+		if err != nil || (got.PreUpgradePreviousActivationID != j.PreUpgradePreviousActivationID) || (got.PreUpgradePreviousActivationJSONSHA256 != j.PreUpgradePreviousActivationJSONSHA256) {
+			t.Fatalf("previous=%v got=%+v err=%v", previous, got, err)
+		}
+	}
+}
+
 func TestUpgradeJournalRejectsBrokenHistory(t *testing.T) {
 	valid := journalAt(JournalValidated, true)
 	for _, tc := range []struct {

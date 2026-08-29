@@ -101,25 +101,27 @@ type ServiceSnapshotV1 struct {
 	BuildKit UnitSnapshotV1 `json:"buildkit"`
 }
 type UpgradeJournalV1 struct {
-	SchemaVersion                 int                   `json:"schema_version"`
-	TransactionID                 string                `json:"transaction_id"`
-	Revision                      int64                 `json:"revision"`
-	State                         JournalState          `json:"state"`
-	CreatedAt                     time.Time             `json:"created_at"`
-	UpdatedAt                     time.Time             `json:"updated_at"`
-	RequestedManifestSHA256       string                `json:"requested_manifest_sha256"`
-	OldActivationID               string                `json:"old_activation_id"`
-	OldActivationJSONSHA256       string                `json:"old_activation_json_sha256"`
-	CandidateActivationID         string                `json:"candidate_activation_id"`
-	CandidateActivationJSONSHA256 string                `json:"candidate_activation_json_sha256,omitempty"`
-	CandidateDatabaseName         string                `json:"candidate_database_name"`
-	CandidateDatabase             *DatabaseV1           `json:"candidate_database,omitempty"`
-	Snapshot                      *ArtifactV1           `json:"snapshot,omitempty"`
-	Migration                     *MigrationV1          `json:"migration,omitempty"`
-	Validation                    *ArtifactV1           `json:"validation,omitempty"`
-	ServiceSnapshot               ServiceSnapshotV1     `json:"service_snapshot"`
-	Failure                       *FailureV1            `json:"failure,omitempty"`
-	History                       []JournalTransitionV1 `json:"history"`
+	SchemaVersion                          int                   `json:"schema_version"`
+	TransactionID                          string                `json:"transaction_id"`
+	Revision                               int64                 `json:"revision"`
+	State                                  JournalState          `json:"state"`
+	CreatedAt                              time.Time             `json:"created_at"`
+	UpdatedAt                              time.Time             `json:"updated_at"`
+	RequestedManifestSHA256                string                `json:"requested_manifest_sha256"`
+	OldActivationID                        string                `json:"old_activation_id"`
+	OldActivationJSONSHA256                string                `json:"old_activation_json_sha256"`
+	PreUpgradePreviousActivationID         string                `json:"pre_upgrade_previous_activation_id,omitempty"`
+	PreUpgradePreviousActivationJSONSHA256 string                `json:"pre_upgrade_previous_activation_json_sha256,omitempty"`
+	CandidateActivationID                  string                `json:"candidate_activation_id"`
+	CandidateActivationJSONSHA256          string                `json:"candidate_activation_json_sha256,omitempty"`
+	CandidateDatabaseName                  string                `json:"candidate_database_name"`
+	CandidateDatabase                      *DatabaseV1           `json:"candidate_database,omitempty"`
+	Snapshot                               *ArtifactV1           `json:"snapshot,omitempty"`
+	Migration                              *MigrationV1          `json:"migration,omitempty"`
+	Validation                             *ArtifactV1           `json:"validation,omitempty"`
+	ServiceSnapshot                        ServiceSnapshotV1     `json:"service_snapshot"`
+	Failure                                *FailureV1            `json:"failure,omitempty"`
+	History                                []JournalTransitionV1 `json:"history"`
 }
 
 // CanonicalServiceSnapshotSHA256 returns the digest of the fixed service
@@ -224,6 +226,9 @@ func (a ActivationV1) Validate() error {
 func (j UpgradeJournalV1) Validate() error {
 	if j.SchemaVersion != 1 || !validID(j.TransactionID) || j.History == nil || j.Revision != int64(len(j.History)+1) || !stateOK(j.State) || j.CreatedAt.IsZero() || j.UpdatedAt.Before(j.CreatedAt) || !validSHA(j.RequestedManifestSHA256) || !validID(j.OldActivationID) || !validSHA(j.OldActivationJSONSHA256) || !validID(j.CandidateActivationID) || !candidateDatabaseName.MatchString(j.CandidateDatabaseName) {
 		return fmt.Errorf("invalid upgrade journal v1")
+	}
+	if (j.PreUpgradePreviousActivationID == "") != (j.PreUpgradePreviousActivationJSONSHA256 == "") || j.PreUpgradePreviousActivationID != "" && (!validID(j.PreUpgradePreviousActivationID) || !validSHA(j.PreUpgradePreviousActivationJSONSHA256)) {
+		return fmt.Errorf("invalid pre-upgrade previous activation")
 	}
 	if len(j.History) == 0 {
 		if j.Revision != 1 || j.State != JournalPreflighted || !j.UpdatedAt.Equal(j.CreatedAt) {

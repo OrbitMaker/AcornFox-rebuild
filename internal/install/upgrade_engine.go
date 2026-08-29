@@ -1,6 +1,7 @@
 package install
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -15,10 +16,26 @@ var ErrUpgradeConflict = errors.New("upgrade transaction conflicts with existing
 type UpgradePhaseError struct {
 	Phase JournalState
 	Code  string
+	cause error
 }
 
 func (e UpgradePhaseError) Error() string {
 	return "upgrade stopped at " + string(e.Phase) + ": " + e.Code
+}
+func (e UpgradePhaseError) Unwrap() error { return e.cause }
+
+type UpgradeActivationState struct {
+	ActiveID, PreviousID                           string
+	ActiveActivationJSONSHA256, PreviousJSONSHA256 string
+	Marker                                         bool
+}
+
+type UpgradeActualState struct {
+	ActiveID, PreviousID                                   string
+	MarkerTransactionID                                    string
+	OldActivationJSONSHA256, CandidateActivationJSONSHA256 string
+	PreviousActivationJSONSHA256                           string
+	OldActivationExists, CandidateActivationExists         bool
 }
 
 type UpgradeRequest struct {
@@ -35,13 +52,20 @@ type UpgradeLock interface{ Release() error }
 
 type UpgradeJournalStore interface {
 	Acquire(context.Context, string) (UpgradeLock, error)
+	LoadJournal(context.Context, string) (UpgradeJournalV1, error)
+	ReadActualState(context.Context, string, string) (UpgradeActualState, error)
+	EnsureMarker(context.Context, string) error
 	Preflight(context.Context, string) (ActivationV1, string, bool, error)
+	ProjectLegacy(context.Context, string, ActivationV1) (string, error)
+	ReadActivationState(context.Context) (UpgradeActivationState, error)
 	CreateJournal(context.Context, UpgradeJournalV1) error
 	SaveJournal(context.Context, UpgradeJournalV1) error
 	Marker(context.Context, bool) error
 	WriteCandidateActivation(context.Context, ActivationV1, []byte) (string, error)
 	SetPrevious(context.Context, string) error
+	RestorePrevious(context.Context, string, string, string) error
 	SwapActive(context.Context, string) error
+	RestoreActive(context.Context, string, string) error
 }
 
 type UpgradeDatabaseDriver interface {
@@ -59,6 +83,10 @@ type UpgradeServiceDriver interface {
 	HealthInternal(context.Context) error
 	StartEdge(context.Context) error
 	HealthEdge(context.Context) error
+	GuardEdge(context.Context) error
+	RestoreSnapshot(context.Context, ServiceSnapshotV1) error
+	HealthRestoredInternal(context.Context) error
+	RestoreEdge(context.Context, ServiceSnapshotV1) error
 }
 
 type UpgradeEngine struct {
@@ -70,6 +98,9 @@ type UpgradeEngine struct {
 
 func upgradeError(phase JournalState, code string) error {
 	return UpgradePhaseError{Phase: phase, Code: code}
+}
+func upgradeErrorWith(phase JournalState, code string, cause error) error {
+	return UpgradePhaseError{Phase: phase, Code: code, cause: cause}
 }
 
 func sha256Bytes(raw []byte) string {
@@ -128,24 +159,203 @@ func transitionEvidenceSHA256(j UpgradeJournalV1, from, to JournalState) string 
 func (e *UpgradeEngine) now() time.Time { return e.Now().UTC() }
 
 func (e *UpgradeEngine) advance(ctx context.Context, j *UpgradeJournalV1, to JournalState) error {
-	from := j.State
+	next := *j
+	next.History = append([]JournalTransitionV1(nil), j.History...)
+	from := next.State
 	if err := ValidateJournalTransition(from, to); err != nil {
 		return upgradeError(to, "invalid_transition")
 	}
 	at := e.now()
-	if at.Before(j.UpdatedAt) {
+	if at.Before(next.UpdatedAt) {
 		return upgradeError(to, "clock_regressed")
 	}
-	j.History = append(j.History, JournalTransitionV1{Revision: j.Revision + 1, From: from, To: to, At: at, EvidenceSHA256: transitionEvidenceSHA256(*j, from, to)})
-	j.Revision++
-	j.State, j.UpdatedAt = to, at
-	if err := j.Validate(); err != nil {
+	next.History = append(next.History, JournalTransitionV1{Revision: next.Revision + 1, From: from, To: to, At: at, EvidenceSHA256: transitionEvidenceSHA256(next, from, to)})
+	next.Revision++
+	next.State, next.UpdatedAt = to, at
+	if err := next.Validate(); err != nil {
 		return upgradeError(to, "invalid_journal")
 	}
-	if err := e.Store.SaveJournal(ctx, *j); err != nil {
-		return upgradeError(to, "save_journal_failed")
+	if err := e.Store.SaveJournal(ctx, next); err != nil {
+		return upgradeErrorWith(to, "save_journal_failed", err)
 	}
+	*j = next
 	return nil
+}
+
+func outcomeUnknown(err error) bool {
+	if err == nil {
+		return false
+	}
+	var phase UpgradePhaseError
+	return errors.Is(err, ErrDurableCommitUnknown) || errors.Is(err, ErrPostgresOutcomeUnknown) || errors.Is(err, ErrServiceOutcomeUnknown) || errors.As(err, &phase) && phase.Code == "save_journal_failed"
+}
+
+func failureDigest(err error) string {
+	var phase UpgradePhaseError
+	if errors.As(err, &phase) && phase.cause != nil {
+		err = phase.cause
+	}
+	if err == nil {
+		return sha256Bytes(nil)
+	}
+	return sha256Bytes([]byte(err.Error()))
+}
+
+var upgradeFailureCodes = map[string]struct{}{
+	"legacy_projection_failed": {}, "marker_create_failed": {}, "service_quiesce_failed": {}, "database_drain_failed": {}, "quiesce_journal_failed": {}, "snapshot_failed": {}, "snapshot_journal_failed": {}, "candidate_database_failed": {}, "candidate_journal_failed": {}, "migration_failed": {}, "migration_journal_failed": {}, "invalid_candidate_activation": {}, "write_candidate_activation_failed": {}, "validation_failed": {}, "validation_journal_failed": {}, "set_previous_failed": {}, "swap_active_failed": {}, "active_journal_failed": {}, "start_internal_failed": {}, "internal_health_failed": {}, "healthy_journal_failed": {}, "edge_journal_failed": {}, "marker_remove_failed": {}, "start_edge_failed": {}, "edge_health_failed": {}, "commit_journal_failed": {},
+}
+
+func failureFor(phase JournalState, code string, err error) *FailureV1 {
+	if _, ok := upgradeFailureCodes[code]; !ok {
+		code = "upgrade_failure"
+	}
+	return &FailureV1{Code: code, Phase: phase, MessageDigest: failureDigest(err)}
+}
+
+func coherentState(s UpgradeActivationState) bool {
+	if !validID(s.ActiveID) || !validSHA(s.ActiveActivationJSONSHA256) {
+		return false
+	}
+	if s.PreviousID == "" && s.PreviousJSONSHA256 == "" {
+		return true
+	}
+	return validID(s.PreviousID) && validSHA(s.PreviousJSONSHA256)
+}
+
+func sameOldState(s, baseline UpgradeActivationState, old ActivationV1, oldDigest string) bool {
+	if !coherentState(s) || s.ActiveID != old.ActivationID || s.ActiveActivationJSONSHA256 != oldDigest {
+		return false
+	}
+	return s.PreviousID == baseline.PreviousID && s.PreviousJSONSHA256 == baseline.PreviousJSONSHA256 || s.PreviousID == old.ActivationID && s.PreviousJSONSHA256 == oldDigest
+}
+
+func (e *UpgradeEngine) recoveryRequired(ctx context.Context, j *UpgradeJournalV1, phase JournalState, code string, cause error) error {
+	if j == nil {
+		_ = e.Services.GuardEdge(ctx)
+		return upgradeErrorWith(JournalRecoveryRequired, "recovery_required", cause)
+	}
+	if err := e.Store.Marker(ctx, true); err != nil {
+		_ = e.Services.GuardEdge(ctx)
+		return upgradeErrorWith(JournalRecoveryRequired, "recovery_required", cause)
+	}
+	if err := e.Services.GuardEdge(ctx); err != nil {
+		return upgradeErrorWith(JournalRecoveryRequired, "recovery_required", cause)
+	}
+	if terminal(j.State) {
+		return upgradeErrorWith(JournalRecoveryRequired, "recovery_required", cause)
+	}
+	j.Failure = failureFor(phase, code, cause)
+	if err := e.advance(ctx, j, JournalRecoveryRequired); err != nil {
+		return upgradeErrorWith(JournalRecoveryRequired, "recovery_required", cause)
+	}
+	return upgradeErrorWith(JournalRecoveryRequired, "recovery_required", cause)
+}
+
+func (e *UpgradeEngine) abortPreSwitch(ctx context.Context, j *UpgradeJournalV1, old ActivationV1, baseline UpgradeActivationState, phase JournalState, code string, cause error) error {
+	current, err := e.Store.ReadActivationState(ctx)
+	if err != nil || current.ActiveID != old.ActivationID || current.ActiveActivationJSONSHA256 != j.OldActivationJSONSHA256 {
+		return e.recoveryRequired(ctx, j, phase, code, cause)
+	}
+	if current.PreviousID != baseline.PreviousID || current.PreviousJSONSHA256 != baseline.PreviousJSONSHA256 {
+		if current.PreviousID != old.ActivationID || current.PreviousJSONSHA256 != j.OldActivationJSONSHA256 {
+			return e.recoveryRequired(ctx, j, phase, code, cause)
+		}
+		if err := e.Store.RestorePrevious(ctx, old.ActivationID, baseline.PreviousID, baseline.PreviousJSONSHA256); err != nil {
+			return e.recoveryRequired(ctx, j, phase, code, err)
+		}
+		current, err = e.Store.ReadActivationState(ctx)
+		if err != nil || current.PreviousID != baseline.PreviousID || current.PreviousJSONSHA256 != baseline.PreviousJSONSHA256 {
+			return e.recoveryRequired(ctx, j, phase, code, err)
+		}
+	}
+	if err := e.Services.RestoreSnapshot(ctx, j.ServiceSnapshot); err != nil {
+		return e.recoveryRequired(ctx, j, phase, code, err)
+	}
+	if err := e.Services.HealthRestoredInternal(ctx); err != nil {
+		return e.recoveryRequired(ctx, j, phase, code, err)
+	}
+	if err := e.Store.Marker(ctx, false); err != nil {
+		return e.recoveryRequired(ctx, j, phase, code, err)
+	}
+	if !j.ServiceSnapshot.Edge.Active {
+		if err := e.Services.GuardEdge(ctx); err != nil {
+			return e.recoveryRequired(ctx, j, phase, code, err)
+		}
+	} else {
+		if err := e.Services.RestoreEdge(ctx, j.ServiceSnapshot); err != nil {
+			return e.recoveryRequired(ctx, j, phase, code, err)
+		}
+		if err := e.Services.HealthEdge(ctx); err != nil {
+			return e.recoveryRequired(ctx, j, phase, code, err)
+		}
+	}
+	j.Failure = failureFor(phase, code, cause)
+	if err := e.advance(ctx, j, JournalAbortedPreSwitch); err != nil {
+		return e.recoveryRequired(ctx, j, phase, code, err)
+	}
+	return upgradeErrorWith(JournalAbortedPreSwitch, code, cause)
+}
+
+func (e *UpgradeEngine) rollback(ctx context.Context, j *UpgradeJournalV1, old ActivationV1, phase JournalState, code string, cause error) error {
+	if err := e.Store.Marker(ctx, true); err != nil {
+		return e.recoveryRequired(ctx, j, phase, code, err)
+	}
+	if err := e.Services.GuardEdge(ctx); err != nil {
+		return e.recoveryRequired(ctx, j, phase, code, err)
+	}
+	if err := e.Store.RestoreActive(ctx, old.ActivationID, j.CandidateActivationID); err != nil {
+		return e.recoveryRequired(ctx, j, phase, code, err)
+	}
+	current, err := e.Store.ReadActivationState(ctx)
+	if err != nil || !coherentState(current) || current.ActiveID != old.ActivationID || current.ActiveActivationJSONSHA256 != j.OldActivationJSONSHA256 || current.PreviousID != j.CandidateActivationID || current.PreviousJSONSHA256 != j.CandidateActivationJSONSHA256 {
+		return e.recoveryRequired(ctx, j, phase, code, cause)
+	}
+	j.Failure = failureFor(phase, code, cause)
+	if err := e.advance(ctx, j, JournalRollbackSwitched); err != nil {
+		return e.recoveryRequired(ctx, j, phase, code, err)
+	}
+	if err := e.Services.RestoreSnapshot(ctx, j.ServiceSnapshot); err != nil {
+		return e.recoveryRequired(ctx, j, phase, code, err)
+	}
+	if err := e.Services.HealthRestoredInternal(ctx); err != nil {
+		return e.recoveryRequired(ctx, j, phase, code, err)
+	}
+	if err := e.Store.Marker(ctx, false); err != nil {
+		return e.recoveryRequired(ctx, j, phase, code, err)
+	}
+	if !j.ServiceSnapshot.Edge.Active {
+		if err := e.Services.GuardEdge(ctx); err != nil {
+			return e.recoveryRequired(ctx, j, phase, code, err)
+		}
+	} else {
+		if err := e.Services.RestoreEdge(ctx, j.ServiceSnapshot); err != nil {
+			return e.recoveryRequired(ctx, j, phase, code, err)
+		}
+		if err := e.Services.HealthEdge(ctx); err != nil {
+			return e.recoveryRequired(ctx, j, phase, code, err)
+		}
+	}
+	if err := e.advance(ctx, j, JournalRolledBack); err != nil {
+		return e.recoveryRequired(ctx, j, phase, code, err)
+	}
+	return upgradeErrorWith(JournalRolledBack, code, cause)
+}
+
+func (e *UpgradeEngine) handleFailure(ctx context.Context, j *UpgradeJournalV1, old ActivationV1, baseline UpgradeActivationState, phase JournalState, code string, cause error) error {
+	if outcomeUnknown(cause) {
+		return e.recoveryRequired(ctx, j, phase, code, cause)
+	}
+	current, err := e.Store.ReadActivationState(ctx)
+	if err != nil {
+		return e.recoveryRequired(ctx, j, phase, code, cause)
+	}
+	if sameOldState(current, baseline, old, j.OldActivationJSONSHA256) {
+		return e.abortPreSwitch(ctx, j, old, baseline, phase, code, cause)
+	}
+	if coherentState(current) && current.ActiveID == j.CandidateActivationID && current.ActiveActivationJSONSHA256 == j.CandidateActivationJSONSHA256 && current.PreviousID == old.ActivationID && current.PreviousJSONSHA256 == j.OldActivationJSONSHA256 {
+		return e.rollback(ctx, j, old, phase, code, cause)
+	}
+	return e.recoveryRequired(ctx, j, phase, code, cause)
 }
 
 func (e *UpgradeEngine) RunNew(ctx context.Context, r UpgradeRequest) error {
@@ -162,25 +372,31 @@ func (e *UpgradeEngine) RunNew(ctx context.Context, r UpgradeRequest) error {
 	if err != nil || old.Validate() != nil || !validSHA(oldJSONSHA256) || actualLegacy != r.ExpectedLegacy {
 		return upgradeError(JournalPreflighted, "preflight_failed")
 	}
+	baseline, err := e.Store.ReadActivationState(ctx)
+	if err != nil || baseline.Marker || !sameOldState(baseline, baseline, old, oldJSONSHA256) {
+		return upgradeError(JournalPreflighted, "preflight_failed")
+	}
 	serviceSnapshot, err := e.Services.Capture(ctx)
 	if err != nil {
 		return upgradeError(JournalPreflighted, "service_capture_failed")
 	}
 	now := e.now()
 	j := UpgradeJournalV1{
-		SchemaVersion:           ActivationSchemaVersion,
-		TransactionID:           r.TransactionID,
-		Revision:                1,
-		State:                   JournalPreflighted,
-		CreatedAt:               now,
-		UpdatedAt:               now,
-		RequestedManifestSHA256: r.RequestedManifestSHA256,
-		OldActivationID:         old.ActivationID,
-		OldActivationJSONSHA256: oldJSONSHA256,
-		CandidateActivationID:   r.CandidateActivationID,
-		CandidateDatabaseName:   r.CandidateDatabaseName,
-		ServiceSnapshot:         serviceSnapshot,
-		History:                 []JournalTransitionV1{},
+		SchemaVersion:                          ActivationSchemaVersion,
+		TransactionID:                          r.TransactionID,
+		Revision:                               1,
+		State:                                  JournalPreflighted,
+		CreatedAt:                              now,
+		UpdatedAt:                              now,
+		RequestedManifestSHA256:                r.RequestedManifestSHA256,
+		OldActivationID:                        old.ActivationID,
+		OldActivationJSONSHA256:                oldJSONSHA256,
+		PreUpgradePreviousActivationID:         baseline.PreviousID,
+		PreUpgradePreviousActivationJSONSHA256: baseline.PreviousJSONSHA256,
+		CandidateActivationID:                  r.CandidateActivationID,
+		CandidateDatabaseName:                  r.CandidateDatabaseName,
+		ServiceSnapshot:                        serviceSnapshot,
+		History:                                []JournalTransitionV1{},
 	}
 	if err := j.Validate(); err != nil {
 		return upgradeError(JournalPreflighted, "invalid_journal")
@@ -189,99 +405,347 @@ func (e *UpgradeEngine) RunNew(ctx context.Context, r UpgradeRequest) error {
 		if errors.Is(err, ErrUpgradeConflict) {
 			return ErrUpgradeConflict
 		}
-		return upgradeError(JournalPreflighted, "create_journal_failed")
-	}
-	if actualLegacy {
-		if err := e.advance(ctx, &j, JournalLegacyProjected); err != nil {
-			return err
+		if outcomeUnknown(err) {
+			loaded, loadErr := e.Store.LoadJournal(ctx, r.TransactionID)
+			expectedRaw, expectedErr := MarshalUpgradeJournalV1(j)
+			actualRaw, actualErr := MarshalUpgradeJournalV1(loaded)
+			if loadErr != nil || expectedErr != nil || actualErr != nil || !bytes.Equal(expectedRaw, actualRaw) {
+				return upgradeErrorWith(JournalPreflighted, "create_journal_unknown", err)
+			}
+		} else {
+			return upgradeError(JournalPreflighted, "create_journal_failed")
 		}
 	}
+	fail := func(phase JournalState, code string, cause error) error {
+		return e.handleFailure(ctx, &j, old, baseline, phase, code, cause)
+	}
 	if err := e.Store.Marker(ctx, true); err != nil {
-		return upgradeError(j.State, "marker_create_failed")
+		return fail(j.State, "marker_create_failed", err)
 	}
 	if err := e.Services.Quiesce(ctx); err != nil {
-		return upgradeError(JournalQuiesced, "service_quiesce_failed")
+		return fail(JournalQuiesced, "service_quiesce_failed", err)
 	}
 	if err := e.Database.Drain(ctx); err != nil {
-		return upgradeError(JournalQuiesced, "database_drain_failed")
+		return fail(JournalQuiesced, "database_drain_failed", err)
+	}
+	if actualLegacy {
+		projectedDigest, err := e.Store.ProjectLegacy(ctx, r.TransactionID, old)
+		if err != nil || projectedDigest != oldJSONSHA256 {
+			return fail(JournalLegacyProjected, "legacy_projection_failed", err)
+		}
+		projected, err := e.Store.ReadActivationState(ctx)
+		if err != nil || projected.ActiveID != old.ActivationID || projected.ActiveActivationJSONSHA256 != oldJSONSHA256 {
+			return e.recoveryRequired(ctx, &j, JournalLegacyProjected, "legacy_projection_failed", err)
+		}
+		if err := e.advance(ctx, &j, JournalLegacyProjected); err != nil {
+			return fail(JournalLegacyProjected, "legacy_projection_failed", err)
+		}
 	}
 	if err := e.advance(ctx, &j, JournalQuiesced); err != nil {
-		return err
+		return fail(JournalQuiesced, "quiesce_journal_failed", err)
 	}
 	if evidence, sourceDatabase, err := e.Database.Snapshot(ctx); err != nil {
-		return upgradeError(JournalSnapshotCreated, "snapshot_failed")
+		return fail(JournalSnapshotCreated, "snapshot_failed", err)
 	} else {
 		j.Snapshot = &ArtifactV1{Path: artifactPath(j.TransactionID, "control-plane.dump"), SHA256: evidence.SHA256, Size: evidence.Size, SourceDatabase: sourceDatabase}
 		if err := e.advance(ctx, &j, JournalSnapshotCreated); err != nil {
-			return err
+			return fail(JournalSnapshotCreated, "snapshot_journal_failed", err)
 		}
 	}
 	if err := e.Database.CreateRestore(ctx, r.CandidateDatabaseName); err != nil {
-		return upgradeError(JournalCandidateDBReady, "candidate_database_failed")
+		return fail(JournalCandidateDBReady, "candidate_database_failed", err)
 	}
 	if err := e.advance(ctx, &j, JournalCandidateDBReady); err != nil {
-		return err
+		return fail(JournalCandidateDBReady, "candidate_journal_failed", err)
 	}
 	if evidence, err := e.Database.Migrate(ctx); err != nil {
-		return upgradeError(JournalMigrated, "migration_failed")
+		return fail(JournalMigrated, "migration_failed", err)
 	} else {
 		j.CandidateDatabase = &DatabaseV1{Name: r.CandidateDatabaseName, Migration: evidence.To, SchemaMigrationsSHA256: evidence.RowsSHA256}
 		j.Migration = &MigrationV1{From: evidence.From, To: evidence.To, ManifestSHA256: evidence.RowsSHA256}
 		if err := e.advance(ctx, &j, JournalMigrated); err != nil {
-			return err
+			return fail(JournalMigrated, "migration_journal_failed", err)
 		}
 	}
-	candidate := ActivationV1{SchemaVersion: ActivationSchemaVersion, ActivationID: r.CandidateActivationID, Origin: "upgrade", Release: r.CandidateRelease, Database: *j.CandidateDatabase, DatabaseEnvSHA256: sha256Bytes(r.CandidateDatabaseEnv), CreatedAt: e.now(), CreatedByTransactionID: r.TransactionID}
-	if actualLegacy {
-		candidate.LegacyProjection = &LegacyProjectionV1{Target: "/opt/open-card/releases/" + r.CandidateRelease.ID}
-	}
+	candidate := ActivationV1{SchemaVersion: ActivationSchemaVersion, ActivationID: r.CandidateActivationID, Origin: "native", Release: r.CandidateRelease, Database: *j.CandidateDatabase, DatabaseEnvSHA256: sha256Bytes(r.CandidateDatabaseEnv), CreatedAt: e.now(), CreatedByTransactionID: r.TransactionID}
 	if err := candidate.Validate(); err != nil {
-		return upgradeError(JournalValidated, "invalid_candidate_activation")
+		return fail(JournalValidated, "invalid_candidate_activation", err)
 	}
 	candidateJSONSHA256, err := e.Store.WriteCandidateActivation(ctx, candidate, r.CandidateDatabaseEnv)
 	if err != nil || !validSHA(candidateJSONSHA256) {
-		return upgradeError(JournalValidated, "write_candidate_activation_failed")
+		return fail(JournalValidated, "write_candidate_activation_failed", err)
 	}
 	validation, err := e.Database.Validate(ctx, r.CandidateActivationID)
 	if err != nil {
-		return upgradeError(JournalValidated, "validation_failed")
+		return fail(JournalValidated, "validation_failed", err)
 	}
 	j.CandidateActivationJSONSHA256, j.Validation = candidateJSONSHA256, &validation
 	if err := e.advance(ctx, &j, JournalValidated); err != nil {
-		return err
+		return fail(JournalValidated, "validation_journal_failed", err)
 	}
 	if err := e.Store.SetPrevious(ctx, old.ActivationID); err != nil {
-		return upgradeError(JournalActiveSwitched, "set_previous_failed")
+		return fail(JournalActiveSwitched, "set_previous_failed", err)
+	}
+	actualPointers, err := e.Store.ReadActivationState(ctx)
+	if err != nil || actualPointers.PreviousID != old.ActivationID || actualPointers.PreviousJSONSHA256 != oldJSONSHA256 {
+		return e.recoveryRequired(ctx, &j, JournalActiveSwitched, "set_previous_failed", err)
 	}
 	if err := e.Store.SwapActive(ctx, r.CandidateActivationID); err != nil {
-		return upgradeError(JournalActiveSwitched, "swap_active_failed")
+		return fail(JournalActiveSwitched, "swap_active_failed", err)
+	}
+	actualPointers, err = e.Store.ReadActivationState(ctx)
+	if err != nil || actualPointers.ActiveID != r.CandidateActivationID || actualPointers.ActiveActivationJSONSHA256 != candidateJSONSHA256 || actualPointers.PreviousID != old.ActivationID || actualPointers.PreviousJSONSHA256 != oldJSONSHA256 {
+		return e.recoveryRequired(ctx, &j, JournalActiveSwitched, "swap_active_failed", err)
 	}
 	if err := e.advance(ctx, &j, JournalActiveSwitched); err != nil {
-		return err
+		return fail(JournalActiveSwitched, "active_journal_failed", err)
 	}
 	if err := e.Services.StartInternal(ctx); err != nil {
-		return upgradeError(JournalHealthy, "start_internal_failed")
+		return fail(JournalHealthy, "start_internal_failed", err)
 	}
 	if err := e.Services.HealthInternal(ctx); err != nil {
-		return upgradeError(JournalHealthy, "internal_health_failed")
+		return fail(JournalHealthy, "internal_health_failed", err)
 	}
 	if err := e.advance(ctx, &j, JournalHealthy); err != nil {
-		return err
+		return fail(JournalHealthy, "healthy_journal_failed", err)
 	}
 	if err := e.advance(ctx, &j, JournalEdgeArmed); err != nil {
+		return fail(JournalEdgeArmed, "edge_journal_failed", err)
+	}
+	actualPointers, err = e.Store.ReadActivationState(ctx)
+	if err != nil || actualPointers.ActiveID != r.CandidateActivationID || actualPointers.ActiveActivationJSONSHA256 != candidateJSONSHA256 || actualPointers.PreviousID != old.ActivationID || actualPointers.PreviousJSONSHA256 != oldJSONSHA256 {
+		return e.recoveryRequired(ctx, &j, JournalCommitted, "commit_journal_failed", err)
+	}
+	if err := e.advance(ctx, &j, JournalCommitted); err != nil {
+		return e.recoveryRequired(ctx, &j, JournalCommitted, "commit_journal_failed", err)
+	}
+	return e.convergeCommittedPublic(ctx, &j, r.TransactionID, r.TransactionID)
+}
+
+func actualMatchesOld(s UpgradeActualState, j UpgradeJournalV1) bool {
+	return s.OldActivationExists && validSHA(s.OldActivationJSONSHA256) && s.ActiveID == j.OldActivationID && s.OldActivationJSONSHA256 == j.OldActivationJSONSHA256
+}
+
+func actualMatchesCandidate(s UpgradeActualState, j UpgradeJournalV1) bool {
+	return s.CandidateActivationExists && validSHA(s.CandidateActivationJSONSHA256) && s.ActiveID == j.CandidateActivationID && s.CandidateActivationJSONSHA256 == j.CandidateActivationJSONSHA256
+}
+
+func actualPreviousOld(s UpgradeActualState, j UpgradeJournalV1) bool {
+	return s.PreviousID == j.OldActivationID && s.OldActivationJSONSHA256 == j.OldActivationJSONSHA256
+}
+
+func actualBaselinePrevious(s UpgradeActualState, j UpgradeJournalV1) bool {
+	return s.PreviousID == j.PreUpgradePreviousActivationID && s.PreviousActivationJSONSHA256 == j.PreUpgradePreviousActivationJSONSHA256
+}
+
+func recoveredFailure(phase JournalState, err error) *FailureV1 {
+	return failureFor(phase, "recovered", err)
+}
+
+func (e *UpgradeEngine) recoverRecovery(ctx context.Context, j *UpgradeJournalV1, tx string, phase JournalState, cause error) error {
+	if err := e.Store.EnsureMarker(ctx, tx); err != nil {
+		_ = e.Services.GuardEdge(ctx)
+		return upgradeErrorWith(JournalRecoveryRequired, "recovery_required", cause)
+	}
+	if terminal(j.State) {
+		_ = e.Services.GuardEdge(ctx)
+		return upgradeErrorWith(JournalRecoveryRequired, "recovery_required", cause)
+	}
+	j.Failure = recoveredFailure(phase, cause)
+	if err := e.advance(ctx, j, JournalRecoveryRequired); err != nil {
+		_ = e.Services.GuardEdge(ctx)
+		return upgradeErrorWith(JournalRecoveryRequired, "recovery_required", cause)
+	}
+	_ = e.Services.GuardEdge(ctx)
+	return upgradeErrorWith(JournalRecoveryRequired, "recovery_required", cause)
+}
+
+func (e *UpgradeEngine) restoreOldServices(ctx context.Context, j *UpgradeJournalV1) error {
+	if err := e.Services.RestoreSnapshot(ctx, j.ServiceSnapshot); err != nil {
+		return err
+	}
+	if err := e.Services.HealthRestoredInternal(ctx); err != nil {
 		return err
 	}
 	if err := e.Store.Marker(ctx, false); err != nil {
-		return upgradeError(JournalEdgeArmed, "marker_remove_failed")
-	}
-	if err := e.Services.StartEdge(ctx); err != nil {
-		return upgradeError(JournalEdgeArmed, "start_edge_failed")
-	}
-	if err := e.Services.HealthEdge(ctx); err != nil {
-		return upgradeError(JournalEdgeArmed, "edge_health_failed")
-	}
-	if err := e.advance(ctx, &j, JournalCommitted); err != nil {
 		return err
 	}
+	if !j.ServiceSnapshot.Edge.Active {
+		return e.Services.GuardEdge(ctx)
+	}
+	if err := e.Services.RestoreEdge(ctx, j.ServiceSnapshot); err != nil {
+		return err
+	}
+	return e.Services.HealthEdge(ctx)
+}
+
+func (e *UpgradeEngine) convergeCommittedPublic(ctx context.Context, j *UpgradeJournalV1, tx, markerTx string) error {
+	fail := func(err error) error {
+		_ = e.Store.EnsureMarker(ctx, tx)
+		_ = e.Services.GuardEdge(ctx)
+		return upgradeErrorWith(JournalCommitted, "public_activation_failed", err)
+	}
+	if markerTx != "" && markerTx != tx {
+		_ = e.Services.GuardEdge(ctx)
+		return upgradeError(JournalCommitted, "integrity_failed")
+	}
+	if markerTx == tx {
+		if err := e.Store.Marker(ctx, false); err != nil {
+			return fail(err)
+		}
+	}
+	if !j.ServiceSnapshot.Edge.Active {
+		if err := e.Services.GuardEdge(ctx); err != nil {
+			return fail(err)
+		}
+		return nil
+	}
+	if err := e.Services.StartEdge(ctx); err != nil {
+		return fail(err)
+	}
+	if err := e.Services.HealthEdge(ctx); err != nil {
+		return fail(err)
+	}
 	return nil
+}
+
+// Recover reconciles one durable journal against observed activation and marker
+// state. It never removes upgrade artifacts; ambiguity is preserved as a
+// RECOVERY_REQUIRED journal rather than guessed away.
+func (e *UpgradeEngine) Recover(ctx context.Context, transactionID string) error {
+	if e == nil || e.Store == nil || e.Services == nil || e.Now == nil || !validID(transactionID) {
+		return upgradeError(JournalRecoveryRequired, "invalid_request")
+	}
+	lock, err := e.Store.Acquire(ctx, transactionID)
+	if err != nil || lock == nil {
+		return ErrUpgradeLocked
+	}
+	defer lock.Release()
+	j, err := e.Store.LoadJournal(ctx, transactionID)
+	if err != nil || j.TransactionID != transactionID || j.Validate() != nil {
+		_ = e.Services.GuardEdge(ctx)
+		return upgradeError(JournalRecoveryRequired, "integrity_failed")
+	}
+	actual, err := e.Store.ReadActualState(ctx, j.OldActivationID, j.CandidateActivationID)
+	if err != nil {
+		return e.recoverRecovery(ctx, &j, transactionID, j.State, err)
+	}
+	if j.State == JournalRecoveryRequired {
+		_ = e.Store.EnsureMarker(ctx, transactionID)
+		_ = e.Services.GuardEdge(ctx)
+		return upgradeError(JournalRecoveryRequired, "recovery_required")
+	}
+	if j.State == JournalCommitted {
+		if !actualMatchesCandidate(actual, j) || !actualPreviousOld(actual, j) {
+			if actual.MarkerTransactionID == "" {
+				_ = e.Store.EnsureMarker(ctx, transactionID)
+			}
+			_ = e.Services.GuardEdge(ctx)
+			return upgradeError(JournalCommitted, "integrity_failed")
+		}
+		return e.convergeCommittedPublic(ctx, &j, transactionID, actual.MarkerTransactionID)
+	}
+	if terminal(j.State) {
+		if !actualMatchesOld(actual, j) || j.State == JournalAbortedPreSwitch && !actualBaselinePrevious(actual, j) || actual.MarkerTransactionID != "" && actual.MarkerTransactionID != transactionID {
+			if actual.MarkerTransactionID == "" {
+				_ = e.Store.EnsureMarker(ctx, transactionID)
+			}
+			_ = e.Services.GuardEdge(ctx)
+			return upgradeError(j.State, "integrity_failed")
+		}
+		if err := e.restoreOldServices(ctx, &j); err != nil {
+			return e.recoverRecovery(ctx, &j, transactionID, j.State, err)
+		}
+		return nil
+	}
+	if actual.MarkerTransactionID != "" && actual.MarkerTransactionID != transactionID {
+		_ = e.Services.GuardEdge(ctx)
+		return upgradeError(JournalRecoveryRequired, "integrity_failed")
+	}
+	if actual.MarkerTransactionID == "" {
+		if err := e.Store.EnsureMarker(ctx, transactionID); err != nil {
+			_ = e.Services.GuardEdge(ctx)
+			return upgradeErrorWith(JournalRecoveryRequired, "recovery_required", err)
+		}
+	}
+	if err := e.Services.GuardEdge(ctx); err != nil {
+		return e.recoverRecovery(ctx, &j, transactionID, j.State, err)
+	}
+	if j.State == JournalRollbackSwitched && actualMatchesOld(actual, j) && actual.PreviousID == j.CandidateActivationID && actual.CandidateActivationJSONSHA256 == j.CandidateActivationJSONSHA256 {
+		if err := e.restoreOldServices(ctx, &j); err != nil {
+			return e.recoverRecovery(ctx, &j, transactionID, j.State, err)
+		}
+		if err := e.advance(ctx, &j, JournalRolledBack); err != nil {
+			return e.recoverRecovery(ctx, &j, transactionID, j.State, err)
+		}
+		return upgradeError(JournalRolledBack, "recovered")
+	}
+	if (j.State == JournalActiveSwitched || j.State == JournalHealthy || j.State == JournalEdgeArmed) && actualMatchesOld(actual, j) && actual.PreviousID == j.CandidateActivationID && actual.CandidateActivationJSONSHA256 == j.CandidateActivationJSONSHA256 {
+		j.Failure = recoveredFailure(j.State, errors.New("recovered completed rollback pointer"))
+		if err := e.advance(ctx, &j, JournalRollbackSwitched); err != nil {
+			return e.recoverRecovery(ctx, &j, transactionID, j.State, err)
+		}
+		if err := e.restoreOldServices(ctx, &j); err != nil {
+			return e.recoverRecovery(ctx, &j, transactionID, j.State, err)
+		}
+		if err := e.advance(ctx, &j, JournalRolledBack); err != nil {
+			return e.recoverRecovery(ctx, &j, transactionID, j.State, err)
+		}
+		return upgradeError(JournalRolledBack, "recovered")
+	}
+	if actualMatchesOld(actual, j) {
+		if !actualBaselinePrevious(actual, j) {
+			if actual.PreviousID != j.OldActivationID || actual.PreviousActivationJSONSHA256 != j.OldActivationJSONSHA256 {
+				return e.recoverRecovery(ctx, &j, transactionID, j.State, errors.New("pre-upgrade previous pointer drift"))
+			}
+			if err := e.Store.RestorePrevious(ctx, j.OldActivationID, j.PreUpgradePreviousActivationID, j.PreUpgradePreviousActivationJSONSHA256); err != nil {
+				return e.recoverRecovery(ctx, &j, transactionID, j.State, err)
+			}
+			actual, err = e.Store.ReadActualState(ctx, j.OldActivationID, j.CandidateActivationID)
+			if err != nil || !actualBaselinePrevious(actual, j) {
+				return e.recoverRecovery(ctx, &j, transactionID, j.State, err)
+			}
+		}
+		if err := e.restoreOldServices(ctx, &j); err != nil {
+			return e.recoverRecovery(ctx, &j, transactionID, j.State, err)
+		}
+		j.Failure = recoveredFailure(j.State, errors.New("recovered pre-switch state"))
+		if err := e.advance(ctx, &j, JournalAbortedPreSwitch); err != nil {
+			return e.recoverRecovery(ctx, &j, transactionID, j.State, err)
+		}
+		return upgradeError(JournalAbortedPreSwitch, "recovered")
+	}
+	if !actualMatchesCandidate(actual, j) || !actualPreviousOld(actual, j) || j.CandidateActivationJSONSHA256 == "" || j.Validation == nil {
+		return e.recoverRecovery(ctx, &j, transactionID, j.State, errors.New("actual activation state is not provable"))
+	}
+	if j.State == JournalValidated {
+		if err := e.advance(ctx, &j, JournalActiveSwitched); err != nil {
+			return e.recoverRecovery(ctx, &j, transactionID, j.State, err)
+		}
+	}
+	if j.State != JournalActiveSwitched && j.State != JournalHealthy && j.State != JournalEdgeArmed && j.State != JournalRollbackSwitched {
+		return e.recoverRecovery(ctx, &j, transactionID, j.State, errors.New("candidate active before validated journal state"))
+	}
+	if err := e.Store.RestoreActive(ctx, j.OldActivationID, j.CandidateActivationID); err != nil {
+		return e.recoverRecovery(ctx, &j, transactionID, j.State, err)
+	}
+	actual, err = e.Store.ReadActualState(ctx, j.OldActivationID, j.CandidateActivationID)
+	if err != nil || !actualMatchesOld(actual, j) || actual.PreviousID != j.CandidateActivationID || actual.CandidateActivationJSONSHA256 != j.CandidateActivationJSONSHA256 {
+		return e.recoverRecovery(ctx, &j, transactionID, j.State, err)
+	}
+	if j.State != JournalRollbackSwitched {
+		j.Failure = recoveredFailure(j.State, errors.New("recovered candidate activation"))
+		if err := e.advance(ctx, &j, JournalRollbackSwitched); err != nil {
+			return e.recoverRecovery(ctx, &j, transactionID, j.State, err)
+		}
+	}
+	if err := e.restoreOldServices(ctx, &j); err != nil {
+		return e.recoverRecovery(ctx, &j, transactionID, j.State, err)
+	}
+	if j.State == JournalRollbackSwitched {
+		if err := e.advance(ctx, &j, JournalRolledBack); err != nil {
+			return e.recoverRecovery(ctx, &j, transactionID, j.State, err)
+		}
+	}
+	return upgradeError(JournalRolledBack, "recovered")
 }
