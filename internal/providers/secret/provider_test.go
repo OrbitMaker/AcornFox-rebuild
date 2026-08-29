@@ -104,6 +104,17 @@ func TestStoreResolveRevokeNeverPersistsCanary(t *testing.T) {
 	assertNoCanary(t, canary, root, materialRoot, keyPath)
 }
 
+func TestEdgeCaddyCertificateObservationCanNeverBeResolvedAsASecret(t *testing.T) {
+	provider, _, _, _ := testProvider(t, time.Unix(1_700_000_000, 0).UTC(), time.Minute)
+	reference := domain.SecretReference{ID: "edge-caddy-observation:sha256:deadbeef", Name: "edge-observation", Provider: "edge-caddy"}
+	if _, err := provider.ResolveBuildSecret(context.Background(), reference, operation("edge-observation-resolve")); !hasCode(err, contracts.ErrForbidden) {
+		t.Fatalf("edge observation resolve error=%v", err)
+	}
+	if _, err := provider.Mount(context.Background(), contracts.SecretRequest{Reference: reference, Operation: operation("edge-observation-mount")}); !hasCode(err, contracts.ErrForbidden) {
+		t.Fatalf("edge observation mount error=%v", err)
+	}
+}
+
 func TestSecretProviderMountAndRevokeAreReferenceOnly(t *testing.T) {
 	provider, _, materialRoot, _ := testProvider(t, time.Unix(1_700_000_000, 0).UTC(), time.Minute)
 	reference := testReference("secret_1")

@@ -148,11 +148,12 @@ func (h *G3AccessHTTPHandler) handleUnbind(writer http.ResponseWriter, request *
 	if !ok {
 		return
 	}
-	if err := h.Controller.UnbindCustomDomain(request.Context(), applicationID, domainID, key, controlPlaneActor(request)); err != nil {
+	value, err := h.Controller.UnbindCustomDomain(request.Context(), applicationID, domainID, key, controlPlaneActor(request))
+	if err != nil {
 		writeG3Error(writer, err)
 		return
 	}
-	writer.WriteHeader(http.StatusNoContent)
+	writeJSON(writer, http.StatusAccepted, map[string]any{"operation": value})
 }
 
 func (h *G3AccessHTTPHandler) handleAccess(writer http.ResponseWriter, request *http.Request, applicationID domain.ID) {
@@ -280,9 +281,31 @@ func (a *g3PostgresAdapter) SetApplicationDomainVerification(ctx context.Context
 	value, replay, err := a.store.SetApplicationDomainVerification(ctx, applicationID, domainID, postgres.G3VerificationStatus(status), verifiedAt, g3PostgresIdempotency(request))
 	return g3ApplicationFact(value), replay, g3StoreAdapterError(err)
 }
-func (a *g3PostgresAdapter) UnbindCustomDomain(ctx context.Context, applicationID, domainID domain.ID, actor string, request controllers.G3Idempotency) (bool, error) {
-	replay, err := a.store.UnbindCustomDomain(ctx, applicationID, domainID, actor, g3PostgresIdempotency(request))
-	return replay, g3StoreAdapterError(err)
+func (a *g3PostgresAdapter) BeginDomainUnbind(ctx context.Context, applicationID, domainID domain.ID, actor string, request controllers.G3Idempotency) (controllers.G3DomainUnbindOperation, bool, error) {
+	intent, replay, err := a.store.BeginDomainUnbind(ctx, applicationID, domainID, actor, request.Key, time.Now().UTC())
+	if err != nil {
+		if errors.Is(err, postgres.ErrDomainConvergenceConflict) {
+			return controllers.G3DomainUnbindOperation{}, false, controllers.ErrG3AccessConflict
+		}
+		return controllers.G3DomainUnbindOperation{}, false, g3StoreAdapterError(err)
+	}
+	if intent.Request.ApplicationID != applicationID || intent.Request.ApplicationDomainID != domainID {
+		return controllers.G3DomainUnbindOperation{}, false, controllers.ErrG3AccessConflict
+	}
+	return controllers.G3DomainUnbindOperation{ID: intent.Request.ID, Status: g3UnbindOperationStatus(intent.Request.Phase, intent.Request.Status), DomainID: domainID}, replay, nil
+}
+
+func g3UnbindOperationStatus(phase postgres.DomainConvergencePhase, status postgres.DomainConvergenceStatus) string {
+	if phase == postgres.DomainConvergenceCompleted && status == postgres.DomainConvergenceCompletedStatus {
+		return "completed"
+	}
+	if phase == postgres.DomainConvergenceFailed && status == postgres.DomainConvergenceFailedStatus {
+		return "failed"
+	}
+	if status == postgres.DomainConvergenceLeased || status == postgres.DomainConvergenceRecoveryStatus || phase == postgres.DomainConvergenceUnbindRouteRemoved {
+		return "in_progress"
+	}
+	return "queued"
 }
 func (a *g3PostgresAdapter) ApplicationAccessFacts(ctx context.Context, applicationID domain.ID) (controllers.G3ApplicationAccessFacts, error) {
 	facts, err := a.store.ApplicationAccessFacts(ctx, applicationID)
@@ -297,19 +320,19 @@ func g3PlatformFact(value postgres.G3PlatformDomainFact) controllers.G3PlatformD
 	return controllers.G3PlatformDomainFact{ID: value.ID, BaseDomain: value.BaseDomain, VerificationRef: value.VerificationRef, VerificationStatus: controllers.G3VerificationStatus(value.VerificationStatus), VerifiedAt: value.VerifiedAt, Certificate: g3ControllerCertificate(value.Certificate), CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt}
 }
 func g3ApplicationFact(value postgres.G3ApplicationDomainFact) controllers.G3ApplicationDomainFact {
-	return controllers.G3ApplicationDomainFact{ID: value.ID, ApplicationID: value.ApplicationID, Hostname: value.Hostname, Kind: value.Kind, CNAME: value.CNAME, VerificationStatus: controllers.G3VerificationStatus(value.VerificationStatus), VerifiedAt: value.VerifiedAt, Certificate: g3ControllerCertificate(value.Certificate), Serving: value.Serving, RouteID: value.RouteID, CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt}
+	return controllers.G3ApplicationDomainFact{ID: value.ID, ApplicationID: value.ApplicationID, Hostname: value.Hostname, Kind: value.Kind, CNAME: value.CNAME, VerificationStatus: controllers.G3VerificationStatus(value.VerificationStatus), VerifiedAt: value.VerifiedAt, Certificate: g3ControllerCertificate(value.Certificate), Serving: value.Serving, RouteID: value.RouteID, ConvergencePhase: value.ConvergencePhase, ConvergenceStatus: value.ConvergenceStatus, ConvergenceError: value.ConvergenceError, ConvergenceID: value.ConvergenceID, ConvergenceKind: value.ConvergenceKind, CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt}
 }
 func g3ControllerCertificate(value *postgres.G3CertificateFact) *controllers.G3CertificateFact {
 	if value == nil {
 		return nil
 	}
-	return &controllers.G3CertificateFact{ID: value.ID, Status: value.Status, Subject: value.Subject, NotAfter: value.NotAfter}
+	return &controllers.G3CertificateFact{ID: value.ID, Status: value.Status, Subject: value.Subject, NotAfter: value.NotAfter, Observed: value.Observed}
 }
 func g3PostgresCertificate(value *controllers.G3CertificateFact) *postgres.G3CertificateFact {
 	if value == nil {
 		return nil
 	}
-	return &postgres.G3CertificateFact{ID: value.ID, Status: value.Status, Subject: value.Subject, NotAfter: value.NotAfter}
+	return &postgres.G3CertificateFact{ID: value.ID, Status: value.Status, Subject: value.Subject, NotAfter: value.NotAfter, Observed: value.Observed}
 }
 func g3StoreAdapterError(err error) error {
 	if errors.Is(err, postgres.ErrG3AccessConflict) {

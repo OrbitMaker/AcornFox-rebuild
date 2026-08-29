@@ -12,12 +12,14 @@ import (
 	"github.com/open-card/open-card/internal/contracts"
 	"github.com/open-card/open-card/internal/controllers"
 	"github.com/open-card/open-card/internal/domain"
+	"github.com/open-card/open-card/internal/persistence/postgres"
 )
 
 type g3HTTPStore struct {
 	apps     map[domain.ID]string
 	platform *controllers.G3PlatformDomainFact
 	domains  map[domain.ID]controllers.G3ApplicationDomainFact
+	unbinds  map[string]controllers.G3DomainUnbindOperation
 }
 
 func (s *g3HTTPStore) ApplicationName(_ context.Context, id domain.ID) (string, bool, error) {
@@ -74,19 +76,48 @@ func (s *g3HTTPStore) SetApplicationDomainVerification(_ context.Context, applic
 	s.domains[id] = item
 	return item, false, nil
 }
-func (s *g3HTTPStore) UnbindCustomDomain(_ context.Context, applicationID, id domain.ID, _ string, _ controllers.G3Idempotency) (bool, error) {
+func (s *g3HTTPStore) BeginDomainUnbind(_ context.Context, applicationID, id domain.ID, _ string, request controllers.G3Idempotency) (controllers.G3DomainUnbindOperation, bool, error) {
+	if s.unbinds == nil {
+		s.unbinds = map[string]controllers.G3DomainUnbindOperation{}
+	}
+	if operation, found := s.unbinds[request.Scope+":"+request.Key]; found {
+		if operation.DomainID != id {
+			return controllers.G3DomainUnbindOperation{}, false, controllers.ErrG3AccessConflict
+		}
+		return operation, true, nil
+	}
 	item, ok := s.domains[id]
 	if !ok || item.ApplicationID != applicationID {
-		return false, domain.NewError(domain.ErrNotFound, "application domain not found")
+		return controllers.G3DomainUnbindOperation{}, false, domain.NewError(domain.ErrNotFound, "application domain not found")
 	}
-	if item.Serving {
-		return false, controllers.ErrG3AccessConflict
+	if item.Kind != "custom" {
+		return controllers.G3DomainUnbindOperation{}, false, controllers.ErrG3AccessConflict
 	}
-	delete(s.domains, id)
-	return false, nil
+	operation := controllers.G3DomainUnbindOperation{ID: domain.ID("unbind_" + id.String()), Status: "queued", DomainID: id}
+	s.unbinds[request.Scope+":"+request.Key] = operation
+	return operation, false, nil
 }
 func (s *g3HTTPStore) ApplicationAccessFacts(context.Context, domain.ID) (controllers.G3ApplicationAccessFacts, error) {
 	return controllers.G3ApplicationAccessFacts{Runtime: controllers.G3RuntimeFact{RuntimeReady: true}}, nil
+}
+
+func TestG3UnbindOperationStatusReflectsDurableLifecycle(t *testing.T) {
+	tests := []struct {
+		phase  postgres.DomainConvergencePhase
+		status postgres.DomainConvergenceStatus
+		want   string
+	}{
+		{postgres.DomainConvergenceQueued, postgres.DomainConvergenceQueuedStatus, "queued"},
+		{postgres.DomainConvergenceInternalRouteActive, postgres.DomainConvergenceLeased, "in_progress"},
+		{postgres.DomainConvergenceRecoveryRequired, postgres.DomainConvergenceRecoveryStatus, "in_progress"},
+		{postgres.DomainConvergenceCompleted, postgres.DomainConvergenceCompletedStatus, "completed"},
+		{postgres.DomainConvergenceFailed, postgres.DomainConvergenceFailedStatus, "failed"},
+	}
+	for _, test := range tests {
+		if got := g3UnbindOperationStatus(test.phase, test.status); got != test.want {
+			t.Fatalf("phase=%s status=%s got=%s want=%s", test.phase, test.status, got, test.want)
+		}
+	}
 }
 
 type g3HTTPDNS struct{}
@@ -201,8 +232,16 @@ func TestG3AccessHTTPFacadeUsesSessionCSRFAndFrozenResponses(t *testing.T) {
 	addControlPlaneWriteProof(remove, csrf)
 	removed := httptest.NewRecorder()
 	server.Handler().ServeHTTP(removed, remove)
-	if removed.Code != http.StatusNoContent {
+	if removed.Code != http.StatusAccepted || !strings.Contains(removed.Body.String(), `"status":"queued"`) || !strings.Contains(removed.Body.String(), `"domain_id":"`+decoded.Domain.ID+`"`) {
 		t.Fatalf("unbind response=%d %s", removed.Code, removed.Body.String())
+	}
+	replay := controlPlaneRequest(http.MethodDelete, "/api/v1/applications/app_1/domains/"+decoded.Domain.ID, nil, session)
+	replay.Header.Set("Idempotency-Key", "g3-unbind")
+	addControlPlaneWriteProof(replay, csrf)
+	replayed := httptest.NewRecorder()
+	server.Handler().ServeHTTP(replayed, replay)
+	if replayed.Code != http.StatusAccepted || replayed.Body.String() != removed.Body.String() {
+		t.Fatalf("unbind replay=%d %s want=%d %s", replayed.Code, replayed.Body.String(), removed.Code, removed.Body.String())
 	}
 }
 

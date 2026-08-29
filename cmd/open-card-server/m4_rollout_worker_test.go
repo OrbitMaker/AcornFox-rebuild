@@ -15,6 +15,18 @@ type m4RolloutRunnerFake struct {
 	notified chan struct{}
 }
 
+type blockingM4LifecycleWorker struct {
+	entered, cancelled, allowReturn, returned chan struct{}
+}
+
+func (w *blockingM4LifecycleWorker) Run(ctx context.Context) {
+	close(w.entered)
+	<-ctx.Done()
+	close(w.cancelled)
+	<-w.allowReturn
+	close(w.returned)
+}
+
 func (f *m4RolloutRunnerFake) ReconcileOnce(context.Context, int) (int, error) {
 	f.mu.Lock()
 	f.calls++
@@ -89,4 +101,59 @@ func TestM4RolloutIntervalIsBoundedAndExplicit(t *testing.T) {
 			t.Fatalf("unsafe rollout interval %q accepted", value)
 		}
 	}
+}
+
+func TestM4RolloutShutdownRetainsRouteFenceUntilWorkerReturns(t *testing.T) {
+	fence := newRouteSetMutationFence()
+	adapter := &m4StagedRouteAdapter{fence: fence}
+	if err := adapter.acquireRouteSet(context.Background(), "m4_shutdown"); err != nil {
+		t.Fatal(err)
+	}
+	worker := &blockingM4LifecycleWorker{entered: make(chan struct{}), cancelled: make(chan struct{}), allowReturn: make(chan struct{}), returned: make(chan struct{})}
+	lifecycleContext, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	released := make(chan struct{})
+	if !startM4RolloutWorker(lifecycleContext, newRouteMutationWorkerGroup(), worker, func() {
+		adapter.releaseAllRouteSets()
+		close(released)
+	}) {
+		t.Fatal("M4 worker was not registered")
+	}
+	select {
+	case <-worker.entered:
+	case <-time.After(time.Second):
+		t.Fatal("M4 worker did not start")
+	}
+	cancel()
+	select {
+	case <-worker.cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("M4 worker did not observe lifecycle cancellation")
+	}
+	blocked, blockedCancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer blockedCancel()
+	if _, err := fence.Acquire(blocked); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("route fence was released before worker return: %v", err)
+	}
+	select {
+	case <-released:
+		t.Fatal("route fence release ran before worker return")
+	default:
+	}
+	close(worker.allowReturn)
+	select {
+	case <-worker.returned:
+	case <-time.After(time.Second):
+		t.Fatal("M4 worker did not return")
+	}
+	select {
+	case <-released:
+	case <-time.After(time.Second):
+		t.Fatal("route fence was not released after worker return")
+	}
+	release, err := fence.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("route fence did not become available after worker return: %v", err)
+	}
+	release()
 }

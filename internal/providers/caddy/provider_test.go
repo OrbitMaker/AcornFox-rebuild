@@ -3,6 +3,8 @@ package caddy
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,6 +15,19 @@ import (
 	"github.com/open-card/open-card/internal/contracts"
 	"github.com/open-card/open-card/internal/domain"
 )
+
+type caddyRoundTripper func(*http.Request) (*http.Response, error)
+
+func (fn caddyRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	return fn(request)
+}
+
+type caddyReadFailureBody struct{}
+
+func (caddyReadFailureBody) Read([]byte) (int, error) { return 0, errors.New("response stream lost") }
+func (caddyReadFailureBody) Close() error             { return nil }
+
+var _ io.ReadCloser = caddyReadFailureBody{}
 
 type adminFixture struct {
 	server  *httptest.Server
@@ -126,8 +141,8 @@ func providerErrorCode(t *testing.T, err error, want contracts.ErrorCode) {
 	if err == nil {
 		t.Fatalf("expected error %q", want)
 	}
-	providerError, ok := err.(*contracts.ProviderError)
-	if !ok || providerError.Code != want {
+	var providerError *contracts.ProviderError
+	if !errors.As(err, &providerError) || providerError.Code != want {
 		t.Fatalf("got %T %v, want provider error %q", err, err, want)
 	}
 }
@@ -220,6 +235,50 @@ func TestCADDY_RejectsNonIsolatedIssuer(t *testing.T) {
 	}
 }
 
+func TestCADDY_PlainHTTPRequiresExplicitLoopbackWithoutIssuer(t *testing.T) {
+	for _, config := range []Config{
+		{PlainHTTP: true},
+		{PlainHTTP: true, Listen: ":18481"},
+		{PlainHTTP: true, Listen: "0.0.0.0:18481"},
+		{PlainHTTP: true, Listen: "127.0.0.1:18481", Issuer: "internal"},
+	} {
+		if _, err := New(config); err == nil {
+			t.Fatalf("accepted unsafe plain HTTP config: %#v", config)
+		}
+	}
+	if _, err := New(Config{PlainHTTP: true, Listen: "127.0.0.1:18481"}); err != nil {
+		t.Fatalf("rejected explicit loopback plain HTTP config: %v", err)
+	}
+}
+
+func TestCADDY_PlainHTTPDisablesHTTPSAndOmitsTLSAutomation(t *testing.T) {
+	fixture := newAdminFixture(t)
+	provider, err := New(Config{AdminURL: fixture.server.URL, Listen: "127.0.0.1:18481", PlainHTTP: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := provider.Apply(context.Background(), routeRequest("plain-http-route", "app.example.test", "/", 9001)); err != nil {
+		t.Fatal(err)
+	}
+	config, _ := fixture.snapshot()
+	var document map[string]any
+	if err := json.Unmarshal(config, &document); err != nil {
+		t.Fatal(err)
+	}
+	apps := document["apps"].(map[string]any)
+	if _, found := apps["tls"]; found {
+		t.Fatalf("plain HTTP config retained TLS automation: %s", config)
+	}
+	server := apps["http"].(map[string]any)["servers"].(map[string]any)["open-card"].(map[string]any)
+	if server["automatic_https"].(map[string]any)["disable"] != true || strings.Contains(string(config), `"module":"internal"`) {
+		t.Fatalf("plain HTTP config did not disable HTTPS: %s", config)
+	}
+	listen := server["listen"].([]any)
+	if len(listen) != 1 || listen[0] != "127.0.0.1:18481" {
+		t.Fatalf("plain HTTP listener=%#v", listen)
+	}
+}
+
 func TestCADDY_CT_001_FailedLoadKeepsPriorConfigAndDerivedCache(t *testing.T) {
 	fixture := newAdminFixture(t)
 	provider := fixture.provider(t)
@@ -245,6 +304,45 @@ func TestCADDY_CT_001_FailedLoadKeepsPriorConfigAndDerivedCache(t *testing.T) {
 	if _, err := provider.Observe(context.Background(), routeRequest("observe-second", "app.example.test", "/api", 9001)); err == nil {
 		t.Fatal("failed route was retained in derived cache")
 	}
+}
+
+func TestCADDYLoadOutcomeUnknownOnlyForUnconfirmedDelivery(t *testing.T) {
+	fixture := newAdminFixture(t)
+	newProvider := func(client *http.Client) *Provider {
+		provider, err := New(Config{AdminURL: fixture.server.URL, Listen: "127.0.0.1:8443", HTTPClient: client})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return provider
+	}
+	t.Run("transport result is unknown after dispatch", func(t *testing.T) {
+		provider := newProvider(&http.Client{Transport: caddyRoundTripper(func(*http.Request) (*http.Response, error) {
+			return nil, errors.New("connection dropped after write")
+		})})
+		_, _, err := provider.Apply(context.Background(), routeRequest("route-load-unknown-transport", "app.example.test", "/", 9000))
+		if !contracts.IsProviderOutcomeUnknown(err) {
+			t.Fatalf("transport error is not outcome-unknown: %T %v", err, err)
+		}
+		providerErrorCode(t, err, contracts.ErrUnavailable)
+	})
+	t.Run("successful status with unreadable body is unknown", func(t *testing.T) {
+		provider := newProvider(&http.Client{Transport: caddyRoundTripper(func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusOK, Body: caddyReadFailureBody{}, Header: make(http.Header)}, nil
+		})})
+		_, _, err := provider.Apply(context.Background(), routeRequest("route-load-unknown-read", "app.example.test", "/", 9000))
+		if !contracts.IsProviderOutcomeUnknown(err) {
+			t.Fatalf("read error is not outcome-unknown: %T %v", err, err)
+		}
+		providerErrorCode(t, err, contracts.ErrUnavailable)
+	})
+	t.Run("explicit rejection remains confirmed", func(t *testing.T) {
+		fixture.setFailure(http.StatusBadRequest)
+		_, _, err := fixture.provider(t).Apply(context.Background(), routeRequest("route-load-rejected", "app.example.test", "/", 9000))
+		if contracts.IsProviderOutcomeUnknown(err) {
+			t.Fatalf("confirmed rejection became outcome-unknown: %v", err)
+		}
+		providerErrorCode(t, err, contracts.ErrValidation)
+	})
 }
 
 func TestCADDY_RebuildRoutesUsesOpenCardFactsAfterCacheLoss(t *testing.T) {

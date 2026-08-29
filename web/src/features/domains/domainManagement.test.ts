@@ -9,12 +9,28 @@ import {
   domainStatusLabel,
   fallbackAccessNotice,
   normalizeHostnameInput,
+  UNBIND_OPERATION_FAILED_MESSAGE,
   unbindDomain,
+  updateQueuedUnbindDomainIDs,
   verificationEvidenceSummary,
   verifyDomain,
 } from './domainManagement';
 
 describe('domain management helpers', () => {
+  it.each([
+    ['queued', true],
+    ['in_progress', true],
+    ['completed', false],
+    ['failed', false],
+  ] as const)('maps unbind operation status %s to queued UI state', (status, queued) => {
+    const result = updateQueuedUnbindDomainIDs(new Set(['domain-1']), { id: 'unbind-1', status, domainId: 'domain-1' });
+    expect(result.has('domain-1')).toBe(queued);
+  });
+
+  it('provides an actionable generic unbind failure message', () => {
+    expect(UNBIND_OPERATION_FAILED_MESSAGE).toBe('解绑请求未完成，请刷新状态后重试。');
+  });
+
   it('normalizes ASCII hostnames and reports a single trailing-dot change', () => {
     expect(normalizeHostnameInput('  WWW.Example.COM. ')).toEqual({ value: 'www.example.com', changed: true });
     expect(normalizeHostnameInput('www.example.com')).toEqual({ value: 'www.example.com', changed: false });
@@ -49,19 +65,19 @@ describe('domain management helpers', () => {
     const domains = {
       bindApplicationCustomDomain: vi.fn().mockResolvedValue({}),
       verifyApplicationDomain: vi.fn().mockResolvedValue({}),
-      unbindApplicationDomain: vi.fn().mockResolvedValue(undefined),
+      unbindApplicationDomain: vi.fn().mockResolvedValue({ operation: { id: 'unbind-1', status: 'queued', domainId: 'domain-1' } }),
     };
     const client = { ...platform, ...domains };
 
     await configurePlatformDomain(client, ' Example.COM. ');
     await bindCustomDomain(client, 'app-1', ' WWW.Example.COM. ');
     await verifyDomain(client, 'app-1', 'domain-1');
-    await unbindDomain(client, 'app-1', 'domain-1');
+    await unbindDomain(client, 'app-1', 'domain-1', 'unbind-attempt-1');
 
     expect(platform.putPlatformDomainSettings).toHaveBeenCalledWith({ baseDomain: 'example.com' }, undefined);
     expect(domains.bindApplicationCustomDomain).toHaveBeenCalledWith('app-1', { hostname: 'www.example.com' }, undefined);
     expect(domains.verifyApplicationDomain).toHaveBeenCalledWith('app-1', 'domain-1', undefined);
-    expect(domains.unbindApplicationDomain).toHaveBeenCalledWith('app-1', 'domain-1', undefined);
+    expect(domains.unbindApplicationDomain).toHaveBeenCalledWith('app-1', 'domain-1', 'unbind-attempt-1', undefined);
   });
 
   it('copies the exact CNAME target without invoking a network client', async () => {

@@ -84,6 +84,20 @@ class Gate3OpenAPIContractTests(unittest.TestCase):
         self.assertIn("never writes a customer DNS zone", custom["description"])
         verify = self.operation("POST /api/v1/applications/{applicationId}/domains/{domainId}/verify")
         self.assertIn("never creates", verify["description"])
+        unbind = self.operation("DELETE /api/v1/applications/{applicationId}/domains/{domainId}")
+        self.assertIn("asynchronous", unbind["description"])
+        self.assertIn("202", unbind["responses"])
+        unbind_schema = self.components["schemas"]["ApplicationDomainUnbindResponse"]
+        self.assertEqual(unbind_schema["properties"]["operation"]["$ref"], "#/components/schemas/ApplicationDomainUnbindOperation")
+        operation = self.components["schemas"]["ApplicationDomainUnbindOperation"]
+        self.assertEqual(operation["required"], ["id", "status", "domain_id"])
+        self.assertEqual(operation["properties"]["status"]["enum"], ["queued", "in_progress", "completed", "failed"])
+        application_domain = self.components["schemas"]["ApplicationDomain"]
+        self.assertIn("convergence", application_domain["required"])
+        convergence = self.components["schemas"]["DomainConvergenceState"]
+        self.assertEqual(convergence["required"], ["id", "kind", "phase", "status"])
+        self.assertNotIn("payload", convergence["properties"])
+        self.assertNotIn("result", convergence["properties"])
         upload = self.operation("POST /api/v1/source-uploads")
         self.assertIn("multipart/form-data", upload["requestBody"]["content"])
         schema = self.components["schemas"]["SourceUploadRequest"]

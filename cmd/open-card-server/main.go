@@ -7,8 +7,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -35,6 +37,8 @@ import (
 )
 
 func main() {
+	lifecycleContext, lifecycleCancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer lifecycleCancel()
 	address := os.Getenv("OPEN_CARD_SERVER_ADDR")
 	if address == "" {
 		address = "127.0.0.1:8080"
@@ -167,43 +171,80 @@ func main() {
 					log.Fatal(lifecycleErr)
 				}
 				server.SetM2Lifecycle(lifecycle)
+				var m3RouteProvider contracts.RouteProvider
+				routeSetFence := newRouteSetMutationFence()
+				routeMutationWorkers := newRouteMutationWorkerGroup()
 				if os.Getenv("OPEN_CARD_M3_ENABLED") == "true" {
-					composition, compositionErr := resolveM3Composition(os.Getenv("OPEN_CARD_M3_COMPOSITION"), os.Getenv("OPEN_CARD_RUNTIME_TASK_PREFIX"), false, authorizeM3FixtureHost)
+					production, productionErr := newM3ProductionConvergence(store, caddyprovider.Config{AdminURL: os.Getenv("OPEN_CARD_CADDY_ADMIN_URL"), Listen: os.Getenv("OPEN_CARD_CADDY_LISTEN"), Issuer: "internal"}, "control-plane-domain-convergence")
+					composition, compositionErr := resolveM3Composition(os.Getenv("OPEN_CARD_M3_COMPOSITION"), os.Getenv("OPEN_CARD_RUNTIME_TASK_PREFIX"), productionErr == nil, authorizeM3FixtureHost)
 					if compositionErr != nil {
+						server.SetReady(false)
 						log.Fatal(compositionErr)
 					}
-					if composition != m3CompositionFixture {
-						log.Fatal("M3 production composition is not available until Gate4B-2")
-					}
-					caddyProvider, caddyErr := caddyprovider.New(caddyprovider.Config{AdminURL: os.Getenv("OPEN_CARD_CADDY_ADMIN_URL"), Listen: os.Getenv("OPEN_CARD_CADDY_LISTEN"), Issuer: "internal"})
-					if caddyErr != nil {
-						log.Fatal(caddyErr)
-					}
-					accessController, fixtureErr := newM3FixtureAccessController(caddyProvider, store, secretProvider, buildWorkRoot+"/m3-dns-state.json", os.Getenv("OPEN_CARD_M3_DNS_FAIL") == "true", os.Getenv("OPEN_CARD_M3_CERT_FAIL") == "true")
-					if fixtureErr != nil {
-						log.Fatal(fixtureErr)
-					}
-					server.SetM3Access(&M3AccessHTTPHandler{Controller: accessController})
-					server.SetTLSAllow(&TLSAllowHTTPHandler{Controller: &controllers.TLSAllowController{Store: store}})
-					if _, rebuildErr := accessController.RebuildRoutes(context.Background(), "m3-startup-rebuild", "control-plane"); rebuildErr != nil {
-						log.Printf("M3 route rebuild deferred: %v", rebuildErr)
-					}
-					go func() {
-						ticker := time.NewTicker(5 * time.Second)
-						defer ticker.Stop()
-						for range ticker.C {
-							ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
-							_, err := accessController.RebuildRoutes(ctx, "m3-periodic-rebuild", "control-plane")
-							cancel()
-							if err != nil {
-								log.Printf("M3 route reconciliation failed: %v", err)
-							}
+					if composition == m3CompositionProduction {
+						m3RouteProvider = production.Routes
+						releaseLeader, startupErr := startProductionDomainConvergence(
+							lifecycleContext,
+							acquirePostgresDomainConvergenceLeader(store),
+							func(ctx context.Context) error {
+								startupContext, startupCancel := context.WithTimeout(ctx, 10*time.Second)
+								defer startupCancel()
+								return rebuildDomainConvergenceRoutes(startupContext, store, production.Routes, "control-plane-domain-convergence")
+							},
+							func() {
+								server.SetTLSAllow(&TLSAllowHTTPHandler{Controller: &controllers.TLSAllowController{Store: store}})
+								if server.g3Access != nil && server.g3Access.Controller != nil {
+									server.g3Access.Controller.Waker = &g4b2PostgresWaker{store: store}
+								}
+								routeMutationWorkers.Go(lifecycleContext, func() {
+									runDomainConvergenceWorker(lifecycleContext, fencedDomainConvergenceReconciler{reconciler: production, fence: routeSetFence}, &g4b2PostgresWaker{store: store}, "control-plane-domain-convergence", time.Minute)
+								})
+							},
+						)
+						if startupErr != nil {
+							server.SetReady(false)
+							log.Fatal(startupErr)
 						}
-					}()
+						releaseDomainConvergenceLeaderAfterRouteWorkers(lifecycleContext, routeMutationWorkers, releaseLeader)
+						// This defer is registered after Store.Close, therefore it first
+						// cancels and joins every route mutator before releasing the leader.
+						defer func() {
+							lifecycleCancel()
+							routeMutationWorkers.StopAndWait()
+							releaseLeader()
+						}()
+					} else {
+						caddyProvider, caddyErr := caddyprovider.New(caddyprovider.Config{AdminURL: os.Getenv("OPEN_CARD_CADDY_ADMIN_URL"), Listen: os.Getenv("OPEN_CARD_CADDY_LISTEN"), Issuer: "internal"})
+						if caddyErr != nil {
+							log.Fatal(caddyErr)
+						}
+						accessController, fixtureErr := newM3FixtureAccessController(caddyProvider, store, secretProvider, buildWorkRoot+"/m3-dns-state.json", os.Getenv("OPEN_CARD_M3_DNS_FAIL") == "true", os.Getenv("OPEN_CARD_M3_CERT_FAIL") == "true")
+						if fixtureErr != nil {
+							log.Fatal(fixtureErr)
+						}
+						server.SetM3Access(&M3AccessHTTPHandler{Controller: accessController})
+						m3RouteProvider = accessController.Routes
+						server.SetTLSAllow(&TLSAllowHTTPHandler{Controller: &controllers.TLSAllowController{Store: store}})
+						if _, rebuildErr := accessController.RebuildRoutes(context.Background(), "m3-startup-rebuild", "control-plane"); rebuildErr != nil {
+							log.Printf("M3 route rebuild deferred: %v", rebuildErr)
+						}
+						go func() {
+							ticker := time.NewTicker(5 * time.Second)
+							defer ticker.Stop()
+							for range ticker.C {
+								ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+								_, err := accessController.RebuildRoutes(ctx, "m3-periodic-rebuild", "control-plane")
+								cancel()
+								if err != nil {
+									log.Printf("M3 route reconciliation failed: %v", err)
+								}
+							}
+						}()
+					}
 				}
 				if os.Getenv("OPEN_CARD_M4_ENABLED") == "true" {
 					rolloutEnabled := os.Getenv("OPEN_CARD_M4_ROLLOUT_ENABLED") == "true"
-					if err := validateM4RolloutComposition(rolloutEnabled, server.m3Access != nil && server.m3Access.Controller != nil, store != nil); err != nil {
+					if err := validateM4RolloutComposition(rolloutEnabled, m3RouteProvider != nil, store != nil); err != nil {
 						log.Fatal(err)
 					}
 					logStore := m4LogStore
@@ -228,10 +269,10 @@ func main() {
 						if intervalErr != nil {
 							log.Fatal(intervalErr)
 						}
-						routeAdapter := &m4StagedRouteAdapter{store: store, routes: server.m3Access.Controller.Routes, owner: "m4-rollout-worker"}
+						routeAdapter := &m4StagedRouteAdapter{store: store, routes: m3RouteProvider, owner: "m4-rollout-worker", fence: routeSetFence}
 						reconciler := &controllers.M4RolloutReconciler{Store: store, Routes: routeAdapter, Runtime: &m4RolloutRuntime{store: store, owner: "m4-rollout-worker"}, Retirer: &m4OldRetirer{store: store}, Owner: "m4-rollout-worker", Lease: 30 * time.Second}
 						rolloutWorker := newM4RolloutWorker(reconciler, rolloutInterval)
-						go rolloutWorker.Run(context.Background())
+						startM4RolloutWorker(lifecycleContext, routeMutationWorkers, rolloutWorker, routeAdapter.releaseAllRouteSets)
 					} else {
 						log.Print("M4 rollout coordinator is disabled; rollout mutations remain unavailable")
 					}
@@ -436,8 +477,23 @@ func main() {
 	}
 	httpServer := server.HTTPServer(address)
 	log.Printf("open-card server listening on %s", address)
-	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Fatal(err)
+	serveResult := make(chan error, 1)
+	go func() { serveResult <- httpServer.ListenAndServe() }()
+	var serveErr error
+	select {
+	case serveErr = <-serveResult:
+		lifecycleCancel()
+	case <-lifecycleContext.Done():
+		shutdownContext, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		shutdownErr := httpServer.Shutdown(shutdownContext)
+		shutdownCancel()
+		if shutdownErr != nil {
+			log.Printf("HTTP server shutdown: %v", shutdownErr)
+		}
+		serveErr = <-serveResult
+	}
+	if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+		log.Fatal(serveErr)
 	}
 	_ = server.Shutdown(context.Background())
 }

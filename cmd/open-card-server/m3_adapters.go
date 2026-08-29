@@ -102,7 +102,9 @@ func (a *m3PostgresAdapter) ListDesiredRoutes(ctx context.Context) ([]domain.Des
 	}
 	result := make([]domain.DesiredRoute, 0, len(items))
 	for _, item := range items {
-		if item.State != postgres.DesiredRouteActive || !item.Route.Verified || !item.Route.Serving || item.Pointer == nil || item.Lease == nil || item.Lease.ReleasedAt != nil {
+		// Active non-serving routes are deliberately rebuilt too: they are the
+		// durable internal route prerequisite for the first TLS issuance.
+		if item.State != postgres.DesiredRouteActive || !item.Route.Verified || item.Pointer == nil || item.Lease == nil || item.Lease.ReleasedAt != nil {
 			continue
 		}
 		route := item.Route

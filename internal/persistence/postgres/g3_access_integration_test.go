@@ -89,7 +89,14 @@ func TestG3AccessStoreUsesTaskScopedPostgresAndFailsClosedOnServingUnbind(t *tes
 	if err != nil || domainFact.VerificationStatus != G3VerificationVerified {
 		t.Fatalf("verify domain=%+v err=%v", domainFact, err)
 	}
-	if _, err := db.ExecContext(ctx, `INSERT INTO m3_desired_routes(id,application_id,application_domain_id,deployment_id,service_name,hostname,path_prefix,desired_state,verified,serving) VALUES($1,$2,$3,$4,'frontend',$5,'/','active',true,true)`, "route_"+suffix, appID.String(), domainFact.ID.String(), deploymentID.String(), domainFact.Hostname); err != nil {
+	routeID, leaseID := "route_"+suffix, "lease_"+suffix
+	if _, err := db.ExecContext(ctx, `INSERT INTO m3_port_leases(id,application_id,deployment_id,service_name,bind_host,port,acquired_at) VALUES($1,$2,$3,'frontend','127.0.0.1',18080,$4)`, leaseID, appID.String(), deploymentID.String(), verifiedAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO m3_desired_routes(id,application_id,application_domain_id,deployment_id,service_name,hostname,path_prefix,desired_state,verified,serving) VALUES($1,$2,$3,$4,'frontend',$5,'/','active',true,true)`, routeID, appID.String(), domainFact.ID.String(), deploymentID.String(), domainFact.Hostname); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO m3_route_pointers(route_id,deployment_id,port_lease_id,revision,updated_at) VALUES($1,$2,$3,1,$4)`, routeID, deploymentID.String(), leaseID, verifiedAt); err != nil {
 		t.Fatal(err)
 	}
 	access, err := store.ApplicationAccessFacts(ctx, appID)
@@ -99,7 +106,7 @@ func TestG3AccessStoreUsesTaskScopedPostgresAndFailsClosedOnServingUnbind(t *tes
 	if _, err := store.UnbindCustomDomain(ctx, appID, domainFact.ID, "admin_1", g3TestIdempotency("g3.application-domain.unbind", "unbind-conflict-"+suffix)); !errors.Is(err, ErrG3AccessConflict) {
 		t.Fatalf("serving unbind=%v", err)
 	}
-	if _, err := db.ExecContext(ctx, `UPDATE m3_desired_routes SET serving=false WHERE id=$1`, "route_"+suffix); err != nil {
+	if _, err := db.ExecContext(ctx, `UPDATE m3_desired_routes SET serving=false WHERE id=$1`, routeID); err != nil {
 		t.Fatal(err)
 	}
 	unbindRequest := g3TestIdempotency("g3.application-domain.unbind", "unbind-"+suffix)

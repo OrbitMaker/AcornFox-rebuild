@@ -235,3 +235,18 @@ func StableApplicationHost(name string, applicationID ID, baseDomain string) (st
 	short := hex.EncodeToString(sum[:4])
 	return slug + "-" + short + ".apps." + base, nil
 }
+
+// StablePlatformApplicationDomainID is the single durable identity for an
+// application's platform hostname.  The UI fallback and the persistence
+// upsert must use the same value: otherwise a queued placeholder changes ID
+// when the convergence worker first writes m3_application_domains.
+func StablePlatformApplicationDomainID(platformDomainID, applicationID ID) (ID, error) {
+	if err := RequireID(platformDomainID, "platform domain id"); err != nil {
+		return "", err
+	}
+	if err := RequireID(applicationID, "application id"); err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256([]byte("g3-platform-domain:" + platformDomainID.String() + ":" + applicationID.String()))
+	return ID("domain_" + hex.EncodeToString(sum[:16])), nil
+}

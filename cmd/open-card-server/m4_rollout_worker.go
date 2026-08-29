@@ -20,6 +20,24 @@ type m4RolloutWorker struct {
 	once       sync.Once
 }
 
+type m4RolloutLifecycleWorker interface {
+	Run(context.Context)
+}
+
+// startM4RolloutWorker retains route-set mutation authority until the worker
+// has observed lifecycle cancellation and returned from its reconcile loop.
+func startM4RolloutWorker(ctx context.Context, workers *routeMutationWorkerGroup, worker m4RolloutLifecycleWorker, afterRun func()) bool {
+	if workers == nil || worker == nil {
+		return false
+	}
+	return workers.Go(ctx, func() {
+		worker.Run(ctx)
+		if afterRun != nil {
+			afterRun()
+		}
+	})
+}
+
 func newM4RolloutWorker(reconciler m4RolloutRunner, interval time.Duration) *m4RolloutWorker {
 	if interval <= 0 {
 		interval = time.Second

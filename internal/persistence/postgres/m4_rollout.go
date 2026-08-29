@@ -478,23 +478,35 @@ func (s *Store) FinalizeM4Serving(ctx context.Context, request FinalizeM4Serving
 			rows.Close()
 			return rollback(ErrRoutePointerConflict)
 		}
-		leaseID := m4ServingID("lease", request.OperationID.String(), entry.RouteID.String(), entry.CandidateDeployment.String(), fmt.Sprint(entry.CandidatePort))
-		if _, err := tx.ExecContext(ctx, `INSERT INTO m3_port_leases(id,application_id,deployment_id,service_name,bind_host,port,acquired_at) VALUES($1,$2,$3,$4,'127.0.0.1',$5,$6) ON CONFLICT(id) DO NOTHING`, leaseID.String(), routeSet.ApplicationID.String(), entry.CandidateDeployment.String(), entry.ServiceName, entry.CandidatePort, now); err != nil {
-			rows.Close()
-			return rollback(err)
-		}
-		result, err := tx.ExecContext(ctx, `UPDATE m3_route_pointers SET deployment_id=$1,port_lease_id=$2,revision=revision+1,updated_at=$3 WHERE route_id=$4 AND deployment_id=$5 AND port_lease_id=$6 AND revision=$7`, entry.CandidateDeployment.String(), leaseID.String(), now, entry.RouteID.String(), entry.OldDeploymentID.String(), entry.OldPortLeaseID.String(), entry.OldPointerRevision)
+		candidateLeaseID := tlsAllowLeaseID(routeSet.ApplicationID, entry.CandidateDeployment, entry.ServiceName, entry.CandidatePort)
+		leaseID, err := ensureTLSAllowLeaseTx(ctx, tx, candidateLeaseID, routeSet.ApplicationID, entry.CandidateDeployment, entry.ServiceName, entry.CandidatePort, now)
 		if err != nil {
 			rows.Close()
 			return rollback(err)
 		}
-		if err := requireOneTaskMutation(result); err != nil {
-			rows.Close()
-			return rollback(ErrRoutePointerConflict)
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE m3_desired_routes SET deployment_id=$1,updated_at=$2 WHERE id=$3`, entry.CandidateDeployment.String(), now, entry.RouteID.String()); err != nil {
-			rows.Close()
-			return rollback(err)
+		if currentLease != leaseID.String() || currentDeployment != entry.CandidateDeployment.String() {
+			var oldPort int
+			if err := tx.QueryRowContext(ctx, `SELECT port FROM m3_port_leases WHERE id=$1 AND application_id=$2 AND deployment_id=$3 AND service_name=$4 AND bind_host='127.0.0.1' AND released_at IS NULL FOR UPDATE`, entry.OldPortLeaseID.String(), routeSet.ApplicationID.String(), entry.OldDeploymentID.String(), entry.ServiceName).Scan(&oldPort); err != nil {
+				rows.Close()
+				return rollback(ErrRoutePointerConflict)
+			}
+			result, err := tx.ExecContext(ctx, `UPDATE m3_route_pointers SET deployment_id=$1,port_lease_id=$2,revision=revision+1,updated_at=$3 WHERE route_id=$4 AND deployment_id=$5 AND port_lease_id=$6 AND revision=$7`, entry.CandidateDeployment.String(), leaseID.String(), now, entry.RouteID.String(), entry.OldDeploymentID.String(), entry.OldPortLeaseID.String(), entry.OldPointerRevision)
+			if err != nil {
+				rows.Close()
+				return rollback(err)
+			}
+			if err := requireOneTaskMutation(result); err != nil {
+				rows.Close()
+				return rollback(ErrRoutePointerConflict)
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE m3_desired_routes SET deployment_id=$1,updated_at=$2 WHERE id=$3`, entry.CandidateDeployment.String(), now, entry.RouteID.String()); err != nil {
+				rows.Close()
+				return rollback(err)
+			}
+			if _, err := releaseTLSAllowLeaseIfUnreferencedTx(ctx, tx, entry.OldPortLeaseID, routeSet.ApplicationID, entry.OldDeploymentID, entry.ServiceName, oldPort, now); err != nil {
+				rows.Close()
+				return rollback(err)
+			}
 		}
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE deployments SET state='serving',version=version+1,updated_at=$1 WHERE id=$2 AND state IN ('runtime_ready','degraded')`, now, routeSet.CandidateDeploymentID.String())

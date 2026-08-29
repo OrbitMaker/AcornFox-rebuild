@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
+import { ApiRequestError } from '../../api/errors';
 import type {
   ApiClient,
   ApplicationAccessResponse,
@@ -15,11 +16,16 @@ import {
   domainStatusLabel,
   fallbackAccessNotice,
   normalizeHostnameInput,
+  UNBIND_OPERATION_FAILED_MESSAGE,
   unbindDomain,
+  updateQueuedUnbindDomainIDs,
   verificationEvidenceSummary,
   verifyDomain,
 } from './domainManagement';
+import { createUnbindAttemptStore } from './unbindAttemptStore';
 import './domainManagementWorkspace.css';
+
+const unbindAttemptStore = createUnbindAttemptStore();
 
 export interface DomainManagementWorkspaceProps {
   client: ApiClient;
@@ -39,6 +45,7 @@ export interface DomainManagementPanelProps {
   actionError?: unknown;
   loading: boolean;
   pendingAction?: string;
+  queuedUnbindDomainIDs?: readonly string[];
   baseDomain: string;
   hostname: string;
   hostnameNotice?: string;
@@ -82,6 +89,7 @@ export function DomainManagementPanel({
   actionError,
   loading,
   pendingAction,
+  queuedUnbindDomainIDs = [],
   baseDomain,
   hostname,
   hostnameNotice,
@@ -196,14 +204,15 @@ export function DomainManagementPanel({
                   <div><dt>验证证据</dt><dd>{verificationEvidenceSummary(domain)}</dd></div>
                   <div><dt>证书</dt><dd>{certificateStatusLabel(domain.certificate.status)}</dd></div>
                   <div><dt>当前服务</dt><dd>{domain.serving ? '此域名正在服务' : '未切换服务'}</dd></div>
+				  {domain.convergence && <div><dt>收敛状态</dt><dd>{domain.convergence.phase}{domain.convergence.lastError ? ` · ${domain.convergence.lastError}` : ''}</dd></div>}
                 </dl>
                 {domain.failure && <p className="domain-management__failure"><strong>失败：</strong>{domain.failure.message} ({domain.failure.code})</p>}
                 <div className="domain-management__actions">
                   <button type="button" onClick={() => domain.cnameTarget && onCopyCname(domain.cnameTarget)} disabled={!domain.cnameTarget || Boolean(pendingAction)}>{copiedTarget === domain.cnameTarget ? '已复制' : '复制 CNAME'}</button>
-                  <button type="button" onClick={() => onVerify(domain.id)} disabled={Boolean(pendingAction)}>{pending(`verify:${domain.id}`, pendingAction) ? '正在验证…' : domain.status === 'failed' ? '重试验证' : '验证域名'}</button>
-                  {domain.kind === 'custom' && <button className="domain-management__danger" type="button" onClick={() => onUnbind(domain.id, domain.hostname)} disabled={Boolean(pendingAction)}>{pending(`unbind:${domain.id}`, pendingAction) ? '正在解绑…' : '解绑'}</button>}
+				  <button type="button" onClick={() => onVerify(domain.id)} disabled={Boolean(pendingAction) || queuedUnbindDomainIDs.includes(domain.id)}>{pending(`verify:${domain.id}`, pendingAction) ? '正在验证…' : domain.status === 'failed' ? '重试验证' : '验证域名'}</button>
+				  {domain.kind === 'custom' && <button className="domain-management__danger" type="button" onClick={() => onUnbind(domain.id, domain.hostname)} disabled={Boolean(pendingAction) || queuedUnbindDomainIDs.includes(domain.id)}>{pending(`unbind:${domain.id}`, pendingAction) || queuedUnbindDomainIDs.includes(domain.id) ? '正在解绑…' : '解绑'}</button>}
                 </div>
-                {domain.kind === 'custom' && <p className="domain-management__hint">解绑不会影响 IP fallback 或平台地址。</p>}
+                {domain.kind === 'custom' && <p className="domain-management__hint">{queuedUnbindDomainIDs.includes(domain.id) ? '解绑请求已记录，正在等待安全移除路由；IP fallback 和平台地址仍保留。' : '解绑不会影响 IP fallback 或平台地址。'}</p>}
               </article>
             ))}
           </div>
@@ -256,6 +265,7 @@ export function DomainManagementWorkspace({ client, applicationId, onRefresh, on
   const [hostname, setHostname] = useState('');
   const [hostnameNotice, setHostnameNotice] = useState<string>();
   const [copiedTarget, setCopiedTarget] = useState<string>();
+  const [queuedUnbindDomainIDs, setQueuedUnbindDomainIDs] = useState<ReadonlySet<string>>(() => new Set());
   const requestId = useRef(0);
 
   const reportError = useCallback((error: unknown) => {
@@ -284,7 +294,12 @@ export function DomainManagementWorkspace({ client, applicationId, onRefresh, on
       setPlatformError(platformResult.reason);
       reportError(platformResult.reason);
     }
-    if (domainsResult.status === 'fulfilled') setDomains(domainsResult.value.items);
+    if (domainsResult.status === 'fulfilled') {
+      setDomains(domainsResult.value.items);
+	      setQueuedUnbindDomainIDs(new Set(domainsResult.value.items.filter((domain) => domain.convergence?.kind === 'unbind' && (domain.convergence.status === 'queued' || domain.convergence.status === 'leased' || domain.convergence.status === 'recovery_required')).map((domain) => domain.id)));
+		  const active = new Set(domainsResult.value.items.filter((domain) => domain.convergence?.kind === 'unbind' && (domain.convergence.status === 'queued' || domain.convergence.status === 'leased' || domain.convergence.status === 'recovery_required')).map((domain) => domain.id));
+		  unbindAttemptStore.reconcileApplication(applicationId, active);
+    }
     else {
       setDomains(null);
       setDomainsError(domainsResult.reason);
@@ -361,8 +376,19 @@ export function DomainManagementWorkspace({ client, applicationId, onRefresh, on
     const confirmed = typeof window === 'undefined' || typeof window.confirm !== 'function'
       || window.confirm(`确认解绑 ${domainHostname}？解绑不会影响 IP fallback 或平台地址。`);
     if (!confirmed) return;
-    void runAction(`unbind:${domainId}`, () => unbindDomain(client, applicationId, domainId));
-  }, [applicationId, client, runAction]);
+	void runAction(`unbind:${domainId}`, async () => {
+		const idempotencyKey = unbindAttemptStore.getOrCreate(applicationId, domainId, () => `unbind:${domainId}:${typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`}`);
+		const operation = await unbindDomain(client, applicationId, domainId, idempotencyKey);
+		setQueuedUnbindDomainIDs((current) => updateQueuedUnbindDomainIDs(current, operation.operation));
+		if (operation.operation.status === 'failed') {
+			unbindAttemptStore.clear(applicationId, domainId);
+			await load();
+			throw new ApiRequestError(409, UNBIND_OPERATION_FAILED_MESSAGE, 'conflict', 'unbind_failed');
+		}
+		if (operation.operation.status === 'completed') unbindAttemptStore.clear(applicationId, domainId);
+		return operation;
+	});
+  }, [applicationId, client, load, runAction]);
 
   const handleCopyCname = useCallback((target: string) => {
     setPendingAction(`copy:${target}`);
@@ -387,6 +413,7 @@ export function DomainManagementWorkspace({ client, applicationId, onRefresh, on
     actionError={actionError}
     loading={loading}
     pendingAction={pendingAction}
+    queuedUnbindDomainIDs={[...queuedUnbindDomainIDs]}
     baseDomain={baseDomain}
     hostname={hostname}
     hostnameNotice={hostnameNotice}

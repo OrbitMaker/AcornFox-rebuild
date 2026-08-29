@@ -339,13 +339,20 @@ paths:
     delete:
       operationId: unbindApplicationDomain
       x-open-card-handler-status: partial
-      description: Unbinds only the selected custom domain; runtime, IP fallback and platform address remain available.
+      description: >-
+        Records an asynchronous unbind intent for only the selected custom domain. The old runtime,
+        IP fallback and platform address remain available until the durable full-route-set convergence
+        worker has removed the external route; a 202 response is not proof that traffic has stopped.
       parameters:
         - $ref: '#/components/parameters/RequiredIdempotencyKey'
         - $ref: '#/components/parameters/CSRFHeader'
         - $ref: '#/components/parameters/OriginHeader'
       responses:
-        '204': {description: Custom domain binding removed without altering fallback access.}
+        '202':
+          description: Durable unbind operation accepted; refresh domain facts for completion rather than assuming deletion.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ApplicationDomainUnbindResponse'}
         '401': {$ref: '#/components/responses/AuthenticationRequired'}
         '404': {$ref: '#/components/responses/NotFound'}
         '409': {$ref: '#/components/responses/StateConflict'}
@@ -1213,7 +1220,7 @@ components:
     ApplicationDomain:
       type: object
       additionalProperties: false
-      required: [id, hostname, kind, status, cname_target, verification, certificate, failure, serving]
+      required: [id, hostname, kind, status, cname_target, verification, certificate, failure, serving, convergence]
       properties:
         id: {type: string}
         hostname: {type: string}
@@ -1224,6 +1231,17 @@ components:
         certificate: {$ref: '#/components/schemas/CertificateStatus'}
         failure: {$ref: '#/components/schemas/FailureState', nullable: true}
         serving: {type: boolean}
+        convergence: {$ref: '#/components/schemas/DomainConvergenceState', nullable: true}
+    DomainConvergenceState:
+      type: object
+      additionalProperties: false
+      required: [id, kind, phase, status]
+      properties:
+        id: {type: string}
+        kind: {type: string, enum: [converge, unbind]}
+        phase: {type: string, enum: [queued, route_prepared, internal_route_active, tls_allowed, certificate_observed, serving, unbind_route_removed, completed, failed, recovery_required]}
+        status: {type: string, enum: [queued, leased, completed, failed, recovery_required]}
+        last_error: {type: string, maxLength: 120, description: Safe convergence error code only; payload and result are never exposed.}
     ApplicationDomainsResponse:
       type: object
       additionalProperties: false
@@ -1236,6 +1254,20 @@ components:
       required: [domain]
       properties:
         domain: {$ref: '#/components/schemas/ApplicationDomain'}
+    ApplicationDomainUnbindOperation:
+      type: object
+      additionalProperties: false
+      required: [id, status, domain_id]
+      properties:
+        id: {type: string}
+        status: {type: string, enum: [queued, in_progress, completed, failed]}
+        domain_id: {type: string}
+    ApplicationDomainUnbindResponse:
+      type: object
+      additionalProperties: false
+      required: [operation]
+      properties:
+        operation: {$ref: '#/components/schemas/ApplicationDomainUnbindOperation'}
     AccessRouteStatus:
       type: object
       additionalProperties: false

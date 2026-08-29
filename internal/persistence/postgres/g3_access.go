@@ -34,6 +34,7 @@ type G3CertificateFact struct {
 	Status   string
 	Subject  string
 	NotAfter *time.Time
+	Observed bool
 }
 
 type G3PlatformDomainFact struct {
@@ -58,6 +59,11 @@ type G3ApplicationDomainFact struct {
 	Certificate        *G3CertificateFact
 	Serving            bool
 	RouteID            domain.ID
+	ConvergencePhase   string
+	ConvergenceStatus  string
+	ConvergenceError   string
+	ConvergenceID      domain.ID
+	ConvergenceKind    string
 	CreatedAt          time.Time
 	UpdatedAt          time.Time
 }
@@ -332,17 +338,35 @@ func (s *Store) ListApplicationDomains(ctx context.Context, applicationID domain
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT d.id,d.application_id,d.hostname,d.domain_kind,COALESCE(d.verification_ref,''),d.verification_status,d.verified_at,d.created_at,d.updated_at,
 		       route.id,COALESCE(route.serving,false),
-		       cert.id,cert.status,cert.subject_hostname,cert.not_after
+		       cert.id,cert.status,cert.subject_hostname,cert.not_after,
+		       COALESCE(cert.secret_reference_id ~ '^edge-caddy-observation:sha256:[0-9a-f]{64}$',false),
+		       COALESCE(convergence.phase,''),COALESCE(convergence.status,''),COALESCE(convergence.last_error,''),COALESCE(convergence.id,''),COALESCE(convergence.request_kind,'')
 		  FROM m3_application_domains d
 		  LEFT JOIN LATERAL (
-			SELECT id,serving FROM m3_desired_routes
-			 WHERE application_domain_id=d.id AND desired_state NOT IN ('disabled','failed')
+			SELECT r.id,r.certificate_reference_id,(r.desired_state='active' AND r.verified AND r.serving AND EXISTS (
+					SELECT 1 FROM m3_route_pointers p
+					JOIN m3_port_leases l ON l.id=p.port_lease_id
+					WHERE p.route_id=r.id AND p.deployment_id=r.deployment_id
+					  AND l.application_id=r.application_id AND l.deployment_id=r.deployment_id
+					  AND l.service_name=r.service_name AND l.bind_host='127.0.0.1'
+					  AND l.released_at IS NULL AND (l.expires_at IS NULL OR l.expires_at>CURRENT_TIMESTAMP)
+				)) AS serving FROM m3_desired_routes r
+				 WHERE r.application_domain_id=d.id AND r.desired_state NOT IN ('disabled','failed')
 			 ORDER BY serving DESC,updated_at DESC,id LIMIT 1
 		  ) route ON true
 		  LEFT JOIN LATERAL (
-			SELECT id,status,subject_hostname,not_after FROM m3_certificate_references
-			 WHERE application_domain_id=d.id ORDER BY updated_at DESC,id DESC LIMIT 1
+			SELECT id,status,subject_hostname,not_after,secret_reference_id FROM m3_certificate_references
+			 WHERE id=route.certificate_reference_id
 		  ) cert ON true
+		  LEFT JOIN LATERAL (
+			SELECT id,request_kind,phase,status,last_error FROM m3_domain_convergence_requests
+			 WHERE application_domain_id=d.id
+			 ORDER BY CASE
+				WHEN request_kind='unbind' AND status IN ('queued','leased','recovery_required') THEN 0
+				WHEN request_kind='unbind' THEN 1
+				ELSE 2
+			 END,updated_at DESC,id DESC LIMIT 1
+		  ) convergence ON true
 		 WHERE d.application_id=$1
 		 ORDER BY d.created_at,d.id
 	`, applicationID.String())
@@ -627,8 +651,17 @@ func (s *Store) ApplicationAccessFacts(ctx context.Context, applicationID domain
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT r.id,COALESCE(r.application_domain_id,''),r.hostname,
 		       (r.desired_state IN ('pending','active') AND r.verified),
-		       (r.desired_state='active' AND r.verified AND r.serving),
-		       cert.id,cert.status,cert.subject_hostname,cert.not_after
+		       (r.desired_state='active' AND r.verified AND r.serving AND EXISTS (
+				SELECT 1 FROM m3_route_pointers p JOIN m3_port_leases l ON l.id=p.port_lease_id
+				 WHERE p.route_id=r.id AND p.deployment_id=r.deployment_id
+				   AND l.application_id=r.application_id AND l.deployment_id=r.deployment_id
+				   AND l.service_name=r.service_name AND l.bind_host='127.0.0.1'
+				   AND l.released_at IS NULL AND (l.expires_at IS NULL OR l.expires_at>CURRENT_TIMESTAMP)
+			) AND EXISTS (
+				SELECT 1 FROM m3_application_domains d WHERE d.id=r.application_domain_id AND d.verification_status='verified'
+			)),
+		       cert.id,cert.status,cert.subject_hostname,cert.not_after,
+		       COALESCE(cert.secret_reference_id ~ '^edge-caddy-observation:sha256:[0-9a-f]{64}$',false)
 		  FROM m3_desired_routes r
 		  LEFT JOIN m3_certificate_references cert ON cert.id=r.certificate_reference_id
 		 WHERE r.application_id=$1
@@ -643,14 +676,15 @@ func (s *Store) ApplicationAccessFacts(ctx context.Context, applicationID domain
 		var domainID sql.NullString
 		var certificateID, certificateStatus, certificateSubject sql.NullString
 		var certificateNotAfter sql.NullTime
-		if err := rows.Scan(&route.ID, &domainID, &route.Hostname, &route.Desired, &route.Serving, &certificateID, &certificateStatus, &certificateSubject, &certificateNotAfter); err != nil {
+		var certificateObserved bool
+		if err := rows.Scan(&route.ID, &domainID, &route.Hostname, &route.Desired, &route.Serving, &certificateID, &certificateStatus, &certificateSubject, &certificateNotAfter, &certificateObserved); err != nil {
 			return G3ApplicationAccessFacts{}, err
 		}
 		if domainID.Valid {
 			route.DomainID = domain.ID(domainID.String)
 		}
 		if certificateID.Valid {
-			route.Certificate = g3CertificateFact(certificateID, certificateStatus, certificateSubject, certificateNotAfter)
+			route.Certificate = g3CertificateFact(certificateID, certificateStatus, certificateSubject, certificateNotAfter, certificateObserved)
 		}
 		result.Routes = append(result.Routes, route)
 	}
@@ -683,7 +717,8 @@ func scanG3ApplicationDomain(scanner interface{ Scan(...any) error }) (G3Applica
 	var routeID sql.NullString
 	var certificateID, certificateStatus, certificateSubject sql.NullString
 	var certificateNotAfter sql.NullTime
-	if err := scanner.Scan(&fact.ID, &fact.ApplicationID, &fact.Hostname, &fact.Kind, &fact.CNAME, &fact.VerificationStatus, &verified, &fact.CreatedAt, &fact.UpdatedAt, &routeID, &fact.Serving, &certificateID, &certificateStatus, &certificateSubject, &certificateNotAfter); err != nil {
+	var certificateObserved bool
+	if err := scanner.Scan(&fact.ID, &fact.ApplicationID, &fact.Hostname, &fact.Kind, &fact.CNAME, &fact.VerificationStatus, &verified, &fact.CreatedAt, &fact.UpdatedAt, &routeID, &fact.Serving, &certificateID, &certificateStatus, &certificateSubject, &certificateNotAfter, &certificateObserved, &fact.ConvergencePhase, &fact.ConvergenceStatus, &fact.ConvergenceError, &fact.ConvergenceID, &fact.ConvergenceKind); err != nil {
 		return G3ApplicationDomainFact{}, err
 	}
 	if !g3VerificationStatus(fact.VerificationStatus) {
@@ -697,7 +732,7 @@ func scanG3ApplicationDomain(scanner interface{ Scan(...any) error }) (G3Applica
 		fact.RouteID = domain.ID(routeID.String)
 	}
 	if certificateID.Valid {
-		fact.Certificate = g3CertificateFact(certificateID, certificateStatus, certificateSubject, certificateNotAfter)
+		fact.Certificate = g3CertificateFact(certificateID, certificateStatus, certificateSubject, certificateNotAfter, certificateObserved)
 	}
 	fact.CreatedAt, fact.UpdatedAt = fact.CreatedAt.UTC(), fact.UpdatedAt.UTC()
 	return fact, nil
@@ -713,14 +748,14 @@ func (s *Store) g3PlatformCertificate(ctx context.Context, platformID domain.ID)
 	if err != nil {
 		return nil, err
 	}
-	return g3CertificateFact(id, status, subject, notAfter), nil
+	return g3CertificateFact(id, status, subject, notAfter, false), nil
 }
 
-func g3CertificateFact(id, status, subject sql.NullString, notAfter sql.NullTime) *G3CertificateFact {
+func g3CertificateFact(id, status, subject sql.NullString, notAfter sql.NullTime, observed bool) *G3CertificateFact {
 	if !id.Valid {
 		return nil
 	}
-	fact := &G3CertificateFact{ID: domain.ID(id.String), Status: status.String, Subject: subject.String}
+	fact := &G3CertificateFact{ID: domain.ID(id.String), Status: status.String, Subject: subject.String, Observed: observed}
 	if notAfter.Valid {
 		value := notAfter.Time.UTC()
 		fact.NotAfter = &value

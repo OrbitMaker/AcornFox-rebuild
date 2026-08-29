@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/open-card/open-card/internal/contracts"
@@ -20,53 +21,46 @@ type m4StagedRouteAdapter struct {
 	routes contracts.RouteProvider
 	owner  string
 	clock  func() time.Time
+	fence  *routeSetMutationFence
+	holds  map[domain.ID]func()
+	holdMu sync.Mutex
 }
 
 func (a *m4StagedRouteAdapter) Stage(ctx context.Context, rollout postgres.M4RolloutCoordinator) ([]domain.EvidenceRef, error) {
 	if a == nil || a.store == nil || a.routes == nil {
 		return nil, fmt.Errorf("M4 staged route adapter is unavailable")
 	}
+	if err := a.acquireRouteSet(ctx, rollout.OperationID); err != nil {
+		return nil, err
+	}
+	keepFence := false
+	defer func() {
+		if !keepFence {
+			a.releaseRouteSet(rollout.OperationID)
+		}
+	}()
 	staged, err := a.store.ClaimM4StagedRouteSet(ctx, rollout.OperationID, a.owner, a.now(), 30*time.Second)
 	if err != nil {
 		return nil, err
 	}
-	requests, err := a.replacementRequests(ctx, staged)
+	evidence, err := a.loadAndObserveCandidateRoutes(ctx, rollout, staged, "route-stage")
 	if err != nil {
 		return nil, err
 	}
-	if len(staged.Entries) == 0 {
-		if err := a.store.MarkM4RouteSetObserved(ctx, rollout.OperationID, a.owner, []domain.EvidenceRef{}, a.now()); err != nil {
-			return nil, err
-		}
-		return []domain.EvidenceRef{}, nil
-	}
-	rebuilder, ok := a.routes.(contracts.RouteSetRebuilder)
-	if !ok {
-		return nil, domain.NewError(domain.ErrUnsupportedCapability, "RouteProvider does not support full route-set rebuild")
-	}
-	evidence, err := rebuilder.RebuildRoutes(ctx, requests, contracts.OperationContext{IdempotencyKey: rollout.OperationID.String() + ":route-stage", EvidenceID: domain.ID(rollout.RouteSetDigest), Actor: "m4-rollout"})
-	if err != nil {
+	if err := a.store.MarkM4RouteSetObserved(ctx, rollout.OperationID, a.owner, evidence, a.now()); err != nil {
 		return nil, err
 	}
-	for _, request := range requests {
-		if request.Route.DeploymentID != staged.CandidateDeploymentID {
-			continue
-		}
-		observation, observeErr := a.routes.Observe(ctx, request)
-		if observeErr != nil {
-			return nil, observeErr
-		}
-		evidence.Refs = append(evidence.Refs, observation.Evidence...)
-	}
-	if err := a.store.MarkM4RouteSetObserved(ctx, rollout.OperationID, a.owner, evidence.Refs, a.now()); err != nil {
-		return nil, err
-	}
-	return evidence.Refs, nil
+	keepFence = true
+	return evidence, nil
 }
 func (a *m4StagedRouteAdapter) Restore(ctx context.Context, rollout postgres.M4RolloutCoordinator) error {
 	if a == nil || a.store == nil || a.routes == nil {
 		return fmt.Errorf("M4 staged route adapter is unavailable")
 	}
+	if err := a.acquireRouteSet(ctx, rollout.OperationID); err != nil {
+		return err
+	}
+	defer a.releaseRouteSet(rollout.OperationID)
 	stored, err := a.store.ListDesiredRoutes(ctx)
 	if err != nil {
 		return err
@@ -92,6 +86,24 @@ func (a *m4StagedRouteAdapter) Commit(ctx context.Context, rollout postgres.M4Ro
 	if a == nil || a.store == nil {
 		return nil, fmt.Errorf("M4 staged route adapter is unavailable")
 	}
+	if err := a.acquireRouteSet(ctx, rollout.OperationID); err != nil {
+		return nil, err
+	}
+	defer a.releaseRouteSet(rollout.OperationID)
+	current, err := a.store.GetM4StagedRouteSet(ctx, rollout.OperationID)
+	if err != nil {
+		return nil, err
+	}
+	if current.State == "current" {
+		if current.CandidateDigest != rollout.RouteSetDigest || current.ExpectedVersion != rollout.ExpectedRouteSetVersion {
+			return nil, domain.NewError(domain.ErrConflict, "staged route-set identity changed before serving commit")
+		}
+		result, err := a.store.FinalizeM4Serving(ctx, postgres.FinalizeM4ServingRequest{OperationID: rollout.OperationID, Owner: a.owner, RouteSetDigest: rollout.RouteSetDigest, ExpectedVersion: rollout.ExpectedRouteSetVersion, Actor: "m4-rollout", Reason: "route-set serving commit replay", Evidence: rollout.Evidence, Now: a.now()})
+		if err != nil {
+			return nil, err
+		}
+		return result.Coordinator.Evidence, nil
+	}
 	// Stage and commit are deliberately separate crash-recoverable phases. A
 	// control-plane restart can outlive the staged-set lease while the rollout
 	// coordinator waits for its own lease takeover. Reclaim the exact staged
@@ -104,11 +116,57 @@ func (a *m4StagedRouteAdapter) Commit(ctx context.Context, rollout postgres.M4Ro
 	if staged.CandidateDigest != rollout.RouteSetDigest || staged.ExpectedVersion != rollout.ExpectedRouteSetVersion {
 		return nil, domain.NewError(domain.ErrConflict, "staged route-set identity changed before serving commit")
 	}
-	result, err := a.store.FinalizeM4Serving(ctx, postgres.FinalizeM4ServingRequest{OperationID: rollout.OperationID, Owner: a.owner, RouteSetDigest: rollout.RouteSetDigest, ExpectedVersion: rollout.ExpectedRouteSetVersion, Actor: "m4-rollout", Reason: "full staged route-set observed and committed", Evidence: rollout.Evidence, Now: a.now()})
+	// A startup rebuild restores only current durable pointers. Therefore every
+	// commit, including an in-process retry, must prove the staged candidate
+	// route-set again before it changes those pointers in PostgreSQL.
+	evidence, err := a.loadAndObserveCandidateRoutes(ctx, rollout, staged, "route-commit")
+	if err != nil {
+		return nil, err
+	}
+	finalEvidence := append([]domain.EvidenceRef(nil), rollout.Evidence...)
+	finalEvidence = append(finalEvidence, evidence...)
+	result, err := a.store.FinalizeM4Serving(ctx, postgres.FinalizeM4ServingRequest{OperationID: rollout.OperationID, Owner: a.owner, RouteSetDigest: rollout.RouteSetDigest, ExpectedVersion: rollout.ExpectedRouteSetVersion, Actor: "m4-rollout", Reason: "full staged route-set re-observed and committed", Evidence: finalEvidence, Now: a.now()})
 	if err != nil {
 		return nil, err
 	}
 	return result.Coordinator.Evidence, nil
+}
+
+// loadAndObserveCandidateRoutes performs the one provider proof shared by
+// Stage and Commit. It starts from persisted pointer facts and never treats a
+// provider cache or its current live configuration as the source of truth.
+func (a *m4StagedRouteAdapter) loadAndObserveCandidateRoutes(ctx context.Context, rollout postgres.M4RolloutCoordinator, staged postgres.M4StagedRouteSet, phase string) ([]domain.EvidenceRef, error) {
+	requests, err := a.replacementRequests(ctx, staged)
+	if err != nil {
+		return nil, err
+	}
+	rebuilder, ok := a.routes.(contracts.RouteSetRebuilder)
+	if !ok {
+		return nil, domain.NewError(domain.ErrUnsupportedCapability, "RouteProvider does not support full route-set rebuild")
+	}
+	evidence, err := rebuilder.RebuildRoutes(ctx, requests, contracts.OperationContext{IdempotencyKey: rollout.OperationID.String() + ":" + phase, EvidenceID: domain.ID(rollout.RouteSetDigest), Actor: "m4-rollout"})
+	if err != nil {
+		return nil, err
+	}
+	for _, request := range requests {
+		if request.Route.DeploymentID != staged.CandidateDeploymentID {
+			continue
+		}
+		observation, observeErr := a.routes.Observe(ctx, request)
+		if observeErr != nil {
+			return nil, observeErr
+		}
+		if err := observation.Validate(); err != nil {
+			return nil, err
+		}
+		evidence.Refs = append(evidence.Refs, observation.Evidence...)
+	}
+	for _, ref := range evidence.Refs {
+		if err := ref.Validate(); err != nil {
+			return nil, err
+		}
+	}
+	return evidence.Refs, nil
 }
 func (a *m4StagedRouteAdapter) replacementRequests(ctx context.Context, staged postgres.M4StagedRouteSet) ([]contracts.RouteRequest, error) {
 	stored, err := a.store.ListDesiredRoutes(ctx)
@@ -158,4 +216,62 @@ func (a *m4StagedRouteAdapter) now() time.Time {
 		return time.Now().UTC()
 	}
 	return a.clock().UTC()
+}
+
+func (a *m4StagedRouteAdapter) acquireRouteSet(ctx context.Context, operationID domain.ID) error {
+	if a == nil || a.fence == nil {
+		return nil
+	}
+	a.holdMu.Lock()
+	if a.holds != nil && a.holds[operationID] != nil {
+		a.holdMu.Unlock()
+		return nil
+	}
+	a.holdMu.Unlock()
+	release, err := a.fence.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	a.holdMu.Lock()
+	defer a.holdMu.Unlock()
+	if a.holds == nil {
+		a.holds = make(map[domain.ID]func())
+	}
+	if existing := a.holds[operationID]; existing != nil {
+		release()
+		return nil
+	}
+	a.holds[operationID] = release
+	return nil
+}
+
+func (a *m4StagedRouteAdapter) releaseRouteSet(operationID domain.ID) {
+	if a == nil || a.fence == nil {
+		return
+	}
+	a.holdMu.Lock()
+	release := a.holds[operationID]
+	delete(a.holds, operationID)
+	a.holdMu.Unlock()
+	if release != nil {
+		release()
+	}
+}
+
+func (a *m4StagedRouteAdapter) releaseAllRouteSets() {
+	if a == nil || a.fence == nil {
+		return
+	}
+	a.holdMu.Lock()
+	releases := make([]func(), 0, len(a.holds))
+	for operationID, release := range a.holds {
+		delete(a.holds, operationID)
+		releases = append(releases, release)
+	}
+	a.holdMu.Unlock()
+	for _, release := range releases {
+		if release != nil {
+			release()
+		}
+	}
 }

@@ -19,6 +19,7 @@ type g3MemoryStore struct {
 	domains  map[domain.ID]G3ApplicationDomainFact
 	runtime  map[domain.ID]G3ApplicationAccessFacts
 	idem     map[string]g3MemoryIdempotency
+	unbind   map[string]G3DomainUnbindOperation
 }
 
 type g3MemoryIdempotency struct {
@@ -113,21 +114,28 @@ func (s *g3MemoryStore) SetApplicationDomainVerification(_ context.Context, appl
 	s.domains[domainID] = item
 	return item, false, s.completeLocked(request, item)
 }
-func (s *g3MemoryStore) UnbindCustomDomain(_ context.Context, applicationID, domainID domain.ID, _ string, request G3Idempotency) (bool, error) {
+func (s *g3MemoryStore) BeginDomainUnbind(_ context.Context, applicationID, domainID domain.ID, _ string, request G3Idempotency) (G3DomainUnbindOperation, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, replay, err := s.emptyReplayLocked(request); err != nil || replay {
-		return replay, err
+	if s.unbind == nil {
+		s.unbind = map[string]G3DomainUnbindOperation{}
+	}
+	if operation, found := s.unbind[request.Scope+":"+request.Key]; found {
+		if operation.DomainID != domainID {
+			return G3DomainUnbindOperation{}, false, ErrG3IdempotencyConflict
+		}
+		return operation, true, nil
 	}
 	item, found := s.domains[domainID]
 	if !found || item.ApplicationID != applicationID {
-		return false, domain.NewError(domain.ErrNotFound, "application domain not found")
+		return G3DomainUnbindOperation{}, false, domain.NewError(domain.ErrNotFound, "application domain not found")
 	}
-	if item.Kind != "custom" || item.Serving {
-		return false, ErrG3AccessConflict
+	if item.Kind != "custom" {
+		return G3DomainUnbindOperation{}, false, ErrG3AccessConflict
 	}
-	delete(s.domains, domainID)
-	return false, s.completeLocked(request, map[string]bool{"unbound": true})
+	operation := G3DomainUnbindOperation{ID: domain.ID("unbind_" + domainID.String()), Status: "queued", DomainID: domainID}
+	s.unbind[request.Scope+":"+request.Key] = operation
+	return operation, false, nil
 }
 func (s *g3MemoryStore) ApplicationAccessFacts(_ context.Context, applicationID domain.ID) (G3ApplicationAccessFacts, error) {
 	s.mu.Lock()
@@ -195,6 +203,20 @@ type g3DNSVerifier struct {
 	calls    []string
 }
 
+type g3ConvergenceWakeFake struct {
+	platform, custom int
+	err              error
+}
+
+func (w *g3ConvergenceWakeFake) WakePlatform(context.Context, G3PlatformDomainFact) error {
+	w.platform++
+	return w.err
+}
+func (w *g3ConvergenceWakeFake) WakeCustom(context.Context, G3ApplicationDomainFact) error {
+	w.custom++
+	return w.err
+}
+
 func (d *g3DNSVerifier) VerifyPlatformAddress(_ context.Context, hostname, expected string) (contracts.PublicDNSVerification, error) {
 	d.calls = append(d.calls, "platform:"+hostname)
 	if d.err != nil {
@@ -259,6 +281,8 @@ func TestG3PlatformDomainRequiresConsoleIngressAndWildcardPublicDNS(t *testing.T
 	store := &g3MemoryStore{apps: map[domain.ID]string{"app_1": "Demo"}, domains: map[domain.ID]G3ApplicationDomainFact{}}
 	dns := &g3DNSVerifier{platform: map[string]contracts.PublicDNSStatus{"console.example.test": contracts.PublicDNSVerified, "ingress.example.test": contracts.PublicDNSVerified, "wildcard-probe.apps.example.test": contracts.PublicDNSVerified}}
 	controller := newG3Controller(store, dns)
+	waker := &g3ConvergenceWakeFake{}
+	controller.Waker = waker
 	settings, replay, err := controller.ConfigurePlatformDomain(context.Background(), "example.test", "put-1", "admin_1")
 	if err != nil || replay || settings.Status != "certificate_pending" || settings.ConsoleDomain == nil || *settings.ConsoleDomain != "console.example.test" || settings.WildcardPattern == nil || *settings.WildcardPattern != "*.apps.example.test" || len(settings.DNSRecords) != 3 {
 		t.Fatalf("settings=%+v replay=%v err=%v", settings, replay, err)
@@ -268,6 +292,9 @@ func TestG3PlatformDomainRequiresConsoleIngressAndWildcardPublicDNS(t *testing.T
 	}
 	if store.platform == nil || store.platform.VerificationRef != g3PlatformDNSVerificationRef {
 		t.Fatalf("platform verification ref=%+v", store.platform)
+	}
+	if waker.platform != 1 {
+		t.Fatalf("platform wake calls=%d", waker.platform)
 	}
 	if replaySettings, replay, err := controller.ConfigurePlatformDomain(context.Background(), "example.test", "put-1", "admin_1"); err != nil || !replay || replaySettings.Status != "certificate_pending" || len(dns.calls) != 3 {
 		t.Fatalf("replay=%+v %v %v calls=%v", replaySettings, replay, err, dns.calls)
@@ -321,6 +348,8 @@ func TestG3CustomDomainDNSAndUnbindStateMachine(t *testing.T) {
 	store := &g3MemoryStore{apps: map[domain.ID]string{"app_1": "Demo", "app_2": "Other"}, domains: map[domain.ID]G3ApplicationDomainFact{}}
 	dns := &g3DNSVerifier{platform: map[string]contracts.PublicDNSStatus{"console.example.test": contracts.PublicDNSVerified, "ingress.example.test": contracts.PublicDNSVerified, "wildcard-probe.apps.example.test": contracts.PublicDNSVerified}, custom: map[string]contracts.PublicDNSStatus{"www.customer.test": contracts.PublicDNSVerified}}
 	controller := newG3Controller(store, dns)
+	waker := &g3ConvergenceWakeFake{err: errors.New("wake unavailable")}
+	controller.Waker = waker
 	if _, _, err := controller.ConfigurePlatformDomain(context.Background(), "example.test", "put", "admin_1"); err != nil {
 		t.Fatal(err)
 	}
@@ -338,18 +367,32 @@ func TestG3CustomDomainDNSAndUnbindStateMachine(t *testing.T) {
 	if err != nil || verified.Status != "certificate_pending" || verified.Verification.ObservedAt == nil {
 		t.Fatalf("verified=%+v err=%v", verified, err)
 	}
+	if waker.custom != 1 || verified.Serving {
+		t.Fatalf("wake=%d verified=%+v", waker.custom, verified)
+	}
 	store.domains[domain.ID(bound.ID)] = G3ApplicationDomainFact{ID: domain.ID(bound.ID), ApplicationID: "app_1", Hostname: "www.customer.test", Kind: "custom", CNAME: "ingress.example.test", VerificationStatus: G3VerificationVerified, Serving: true}
-	if err := controller.UnbindCustomDomain(context.Background(), "app_1", domain.ID(bound.ID), "unbind", "admin_1"); !domain.IsCode(err, domain.ErrConflict) {
-		t.Fatalf("serving unbind error=%v", err)
+	beforeUnbinds := len(store.unbind)
+	if _, err := controller.UnbindCustomDomain(context.Background(), "app_2", domain.ID(bound.ID), "cross-app-unbind", "admin_1"); !domain.IsCode(err, domain.ErrNotFound) {
+		t.Fatalf("cross application unbind error=%v", err)
 	}
-	item := store.domains[domain.ID(bound.ID)]
-	item.Serving = false
-	store.domains[item.ID] = item
-	if err := controller.UnbindCustomDomain(context.Background(), "app_1", item.ID, "unbind-2", "admin_1"); err != nil {
-		t.Fatal(err)
+	if len(store.unbind) != beforeUnbinds {
+		t.Fatalf("cross application unbind created an operation: %+v", store.unbind)
 	}
-	if err := controller.UnbindCustomDomain(context.Background(), "app_1", item.ID, "unbind-2", "admin_1"); err != nil {
+	operation, err := controller.UnbindCustomDomain(context.Background(), "app_1", domain.ID(bound.ID), "unbind", "admin_1")
+	if err != nil || operation.Status != "queued" || operation.DomainID != domain.ID(bound.ID) {
+		t.Fatalf("serving unbind operation=%+v err=%v", operation, err)
+	}
+	// Model the durable worker's post-finalize binding deletion.  The original
+	// idempotency key must still replay its accepted operation; a fresh key must
+	// not turn the deleted binding into a newly accepted operation.
+	store.mu.Lock()
+	delete(store.domains, domain.ID(bound.ID))
+	store.mu.Unlock()
+	if _, err := controller.UnbindCustomDomain(context.Background(), "app_1", domain.ID(bound.ID), "unbind", "admin_1"); err != nil {
 		t.Fatalf("idempotent unbind replay=%v", err)
+	}
+	if _, err := controller.UnbindCustomDomain(context.Background(), "app_1", domain.ID(bound.ID), "different-unbind-key", "admin_1"); !domain.IsCode(err, domain.ErrNotFound) {
+		t.Fatalf("deleted binding with a new key error=%v", err)
 	}
 }
 
@@ -386,6 +429,94 @@ func TestG3DomainListDoesNotProjectInternalRouteServingAsPublicEdgeServing(t *te
 		t.Fatalf("domains=%+v err=%v", items, err)
 	}
 }
+
+func TestG3PlatformPlaceholderAndDurableDomainUseTheSameStableID(t *testing.T) {
+	store := &g3MemoryStore{apps: map[domain.ID]string{"app_1": "Demo"}, domains: map[domain.ID]G3ApplicationDomainFact{}}
+	dns := &g3DNSVerifier{platform: map[string]contracts.PublicDNSStatus{"console.example.test": contracts.PublicDNSVerified, "ingress.example.test": contracts.PublicDNSVerified, "wildcard-probe.apps.example.test": contracts.PublicDNSVerified}}
+	controller := newG3Controller(store, dns)
+	if _, _, err := controller.ConfigurePlatformDomain(context.Background(), "example.test", "platform", "admin_1"); err != nil {
+		t.Fatal(err)
+	}
+	items, err := controller.ListApplicationDomains(context.Background(), "app_1")
+	if err != nil || len(items) != 1 {
+		t.Fatalf("placeholder items=%+v err=%v", items, err)
+	}
+	stableID, err := domain.StablePlatformApplicationDomainID(store.platform.ID, "app_1")
+	if err != nil || items[0].ID != stableID.String() {
+		t.Fatalf("placeholder ID=%q stable=%q err=%v", items[0].ID, stableID, err)
+	}
+	store.domains[stableID] = G3ApplicationDomainFact{ID: stableID, ApplicationID: "app_1", Hostname: items[0].Hostname, Kind: "platform", VerificationStatus: G3VerificationVerified}
+	items, err = controller.ListApplicationDomains(context.Background(), "app_1")
+	if err != nil || len(items) != 1 || items[0].ID != stableID.String() {
+		t.Fatalf("durable items=%+v err=%v", items, err)
+	}
+}
+
+func TestG3ApplicationDomainRequiresObservedServingCertificateForReady(t *testing.T) {
+	now := time.Date(2026, 8, 29, 0, 0, 0, 0, time.UTC)
+	store := &g3MemoryStore{apps: map[domain.ID]string{"app_1": "Demo"}, domains: map[domain.ID]G3ApplicationDomainFact{
+		"custom_1":  {ID: "custom_1", ApplicationID: "app_1", Hostname: "www.customer.test", Kind: "custom", CNAME: "ingress.example.test", VerificationStatus: G3VerificationVerified, Serving: true, Certificate: &G3CertificateFact{Status: "ready", Observed: true, Subject: "www.customer.test", NotAfter: ptrG3Time(now.Add(time.Hour))}},
+		"fixture_1": {ID: "fixture_1", ApplicationID: "app_1", Hostname: "fixture.customer.test", Kind: "custom", CNAME: "ingress.example.test", VerificationStatus: G3VerificationVerified, Serving: true, Certificate: &G3CertificateFact{Status: "ready", Subject: "fixture.customer.test", NotAfter: ptrG3Time(now.Add(time.Hour))}},
+	}}
+	controller := newG3Controller(store, &g3DNSVerifier{})
+	controller.Clock = func() time.Time { return now }
+	items, err := controller.ListApplicationDomains(context.Background(), "app_1")
+	if err != nil || len(items) != 2 {
+		t.Fatalf("items=%+v err=%v", items, err)
+	}
+	var observed, fixture G3ApplicationDomain
+	for _, item := range items {
+		if item.ID == "custom_1" {
+			observed = item
+		} else {
+			fixture = item
+		}
+	}
+	if observed.Status != "ready" || !observed.Serving || observed.Certificate.Status != "ready" {
+		t.Fatalf("observed=%+v", observed)
+	}
+	if fixture.Status != "certificate_pending" || fixture.Serving || fixture.Certificate.Status != "pending" {
+		t.Fatalf("fixture=%+v", fixture)
+	}
+}
+
+func TestG3ApplicationDomainKeepsCertificatePendingForIncompleteOrExpiredFacts(t *testing.T) {
+	now := time.Date(2026, 8, 29, 0, 0, 0, 0, time.UTC)
+	store := &g3MemoryStore{apps: map[domain.ID]string{"app_1": "Demo"}, domains: map[domain.ID]G3ApplicationDomainFact{
+		"no_pointer":    {ID: "no_pointer", ApplicationID: "app_1", Hostname: "no-pointer.customer.test", Kind: "custom", CNAME: "ingress.example.test", VerificationStatus: G3VerificationVerified, Serving: false, Certificate: &G3CertificateFact{Status: "ready", Observed: true, Subject: "no-pointer.customer.test", NotAfter: ptrG3Time(now.Add(time.Hour))}},
+		"wrong_subject": {ID: "wrong_subject", ApplicationID: "app_1", Hostname: "wrong-subject.customer.test", Kind: "custom", CNAME: "ingress.example.test", VerificationStatus: G3VerificationVerified, Serving: true, Certificate: &G3CertificateFact{Status: "ready", Observed: true, Subject: "other.customer.test", NotAfter: ptrG3Time(now.Add(time.Hour))}},
+		"expired":       {ID: "expired", ApplicationID: "app_1", Hostname: "expired.customer.test", Kind: "custom", CNAME: "ingress.example.test", VerificationStatus: G3VerificationVerified, Serving: true, Certificate: &G3CertificateFact{Status: "ready", Observed: true, Subject: "expired.customer.test", NotAfter: ptrG3Time(now.Add(-time.Hour))}, ConvergencePhase: "recovery_required", ConvergenceStatus: "recovery_required", ConvergenceError: "serving_fact_mismatch"},
+	}}
+	controller := newG3Controller(store, &g3DNSVerifier{})
+	controller.Clock = func() time.Time { return now }
+	items, err := controller.ListApplicationDomains(context.Background(), "app_1")
+	if err != nil || len(items) != 3 {
+		t.Fatalf("items=%+v err=%v", items, err)
+	}
+	for _, item := range items {
+		if item.Status != "certificate_pending" || item.Serving || item.Certificate.Status != "pending" {
+			t.Fatalf("incomplete durable fact became ready: %+v", item)
+		}
+		if item.ID == "expired" && (item.Failure == nil || item.Failure.Code != "serving_fact_mismatch" || item.Convergence == nil || item.Convergence.LastError != "serving_fact_mismatch") {
+			t.Fatalf("recovery state was not safely projected: %+v", item)
+		}
+	}
+}
+
+func TestG3AccessProjectsOnlyObservedServingCertificateAsReady(t *testing.T) {
+	now := time.Date(2026, 8, 29, 0, 0, 0, 0, time.UTC)
+	store := &g3MemoryStore{apps: map[domain.ID]string{"app_1": "Demo"}, domains: map[domain.ID]G3ApplicationDomainFact{}, runtime: map[domain.ID]G3ApplicationAccessFacts{
+		"app_1": {Runtime: G3RuntimeFact{RuntimeReady: true}, Routes: []G3RouteFact{{ID: "route_1", Hostname: "app.apps.example.test", Desired: true, Serving: true, Certificate: &G3CertificateFact{Status: "ready", Observed: true, Subject: "app.apps.example.test", NotAfter: ptrG3Time(now.Add(time.Hour))}}}},
+	}}
+	controller := newG3Controller(store, &g3DNSVerifier{})
+	controller.Clock = func() time.Time { return now }
+	access, err := controller.ApplicationAccess(context.Background(), "app_1")
+	if err != nil || !access.Route.Serving || !access.Serving || access.Certificate.Status != "ready" {
+		t.Fatalf("access=%+v err=%v", access, err)
+	}
+}
+
+func ptrG3Time(value time.Time) *time.Time { return &value }
 
 func TestG3ResolverFailureFailsClosed(t *testing.T) {
 	store := &g3MemoryStore{apps: map[domain.ID]string{"app_1": "Demo"}, domains: map[domain.ID]G3ApplicationDomainFact{}}

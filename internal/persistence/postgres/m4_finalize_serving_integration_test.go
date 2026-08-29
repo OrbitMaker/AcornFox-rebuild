@@ -101,6 +101,14 @@ func TestFinalizeM4ServingIsAtomicAndIdempotent(t *testing.T) {
 	if pointer != candidate.String() || revision != 2 || state != "serving" || operation != "succeeded" || routeState != "current" {
 		t.Fatalf("partial finalization: %s %d %s %s %s", pointer, revision, state, operation, routeState)
 	}
+	var candidateLease string
+	var oldReleased sql.NullTime
+	if err := db.QueryRowContext(ctx, `SELECT p.port_lease_id,old_lease.released_at FROM m3_route_pointers p JOIN m3_port_leases old_lease ON old_lease.id=$2 WHERE p.route_id=$1`, route.String(), oldLease.String()).Scan(&candidateLease, &oldReleased); err != nil {
+		t.Fatal(err)
+	}
+	if want := tlsAllowLeaseID(app, candidate, "web", 18082); candidateLease != want.String() || !oldReleased.Valid {
+		t.Fatalf("M4 endpoint lease identity=%s want=%s old_released=%+v", candidateLease, want, oldReleased)
+	}
 	var lifecycleID, lifecycleKind, lifecycleStatus, lifecycleMessage string
 	if err := db.QueryRowContext(ctx, `SELECT payload->>'id',payload->>'kind',payload->>'status',payload->>'message' FROM outbox_events WHERE aggregate_type='operation' AND aggregate_id=$1 AND event_type='operations.route_set_serving.succeeded'`, op.String()).Scan(&lifecycleID, &lifecycleKind, &lifecycleStatus, &lifecycleMessage); err != nil {
 		t.Fatal(err)

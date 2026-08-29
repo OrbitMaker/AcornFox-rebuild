@@ -29,6 +29,7 @@ const customDomain: ApplicationDomain = {
   certificate: { status: 'failed', subject: 'www.example.com', notAfter: null },
   failure: { code: 'dns_not_ready', message: '尚未观测到 CNAME', retryable: true },
   serving: false,
+	convergence: { id: 'convergence-unbind-1', kind: 'unbind', phase: 'recovery_required', status: 'recovery_required', lastError: 'serving_fact_mismatch' },
 };
 
 const access: ApplicationAccessResponse = {
@@ -82,10 +83,31 @@ describe('DomainManagementPanel', () => {
     expect(markup).toContain('复制 CNAME');
     expect(markup).toContain('重试验证');
     expect(markup).toContain('解绑');
+		expect(markup).toContain('收敛状态');
+		expect(markup).toContain('serving_fact_mismatch');
     expect(markup).toContain('解绑不会影响 IP fallback 或平台地址');
     expect(markup).toContain('198.51.100.20');
     expect(markup).toContain('请求过于频繁');
     expect(markup).toContain('label');
+  });
+
+  it.each([
+    ['queued', true],
+    ['in_progress', true],
+    ['completed', false],
+    ['failed', false],
+  ] as const)('renders %s unbind state with the correct button and hint', (_status, waiting) => {
+    const markup = renderToStaticMarkup(<DomainManagementPanel
+      {...panelProps}
+      queuedUnbindDomainIDs={waiting ? ['domain-1'] : []}
+    />);
+    expect(markup).toContain(waiting ? '正在解绑…' : '解绑');
+    expect(markup).toContain(waiting ? '解绑请求已记录，正在等待安全移除路由' : '解绑不会影响 IP fallback 或平台地址');
+    if (waiting) {
+      expect(markup).not.toContain('>解绑</button>');
+      expect(markup).toContain('disabled="">重试验证</button>');
+    }
+    else expect(markup).not.toContain('正在解绑…');
   });
 
   it.each(['pending', 'verifying', 'certificate_pending', 'ready', 'failed'] as const)('renders application domain state %s from API data', (status) => {

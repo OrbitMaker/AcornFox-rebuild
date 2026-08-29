@@ -276,6 +276,9 @@ func (p *Provider) Store(ctx context.Context, request contracts.SecretRequest) (
 // contracts.SecretMount; BuildSecretResolver callers receive it through the
 // separate, non-JSON Path field.
 func (p *Provider) Mount(ctx context.Context, request contracts.SecretRequest) (contracts.SecretMount, error) {
+	if edgeCaddyObservationReference(request.Reference) {
+		return contracts.SecretMount{}, p.failure(request.Operation, contracts.CapabilitySecretManage, "mount", contracts.ErrForbidden, "edge certificate observations are not secrets", nil)
+	}
 	if len(request.Value) != 0 {
 		return contracts.SecretMount{}, p.failure(request.Operation, contracts.CapabilitySecretManage, "mount", contracts.ErrInvalidArgument, "mount does not accept plaintext secret input", nil)
 	}
@@ -316,6 +319,9 @@ func (p *Provider) Revoke(ctx context.Context, mount contracts.SecretMount, oper
 // ResolveBuildSecret decrypts a stored record into a short-lived 0400 file
 // under MaterialRoot. The returned Path is deliberately excluded from JSON.
 func (p *Provider) ResolveBuildSecret(ctx context.Context, reference domain.SecretReference, operation contracts.OperationContext) (contracts.BuildSecretMaterial, error) {
+	if edgeCaddyObservationReference(reference) {
+		return contracts.BuildSecretMaterial{}, p.failure(operation, contracts.CapabilitySecretResolve, "resolve_build_secret", contracts.ErrForbidden, "edge certificate observations are not secrets", nil)
+	}
 	if err := p.check(ctx, operation, contracts.CapabilitySecretResolve, "resolve_build_secret"); err != nil {
 		return contracts.BuildSecretMaterial{}, err
 	}
@@ -380,6 +386,10 @@ func (p *Provider) ResolveBuildSecret(ctx context.Context, reference domain.Secr
 	}
 	p.resolveOps[opDigest] = operationRecord{fingerprint: fingerprint, ref: reference, material: material}
 	return material, nil
+}
+
+func edgeCaddyObservationReference(reference domain.SecretReference) bool {
+	return strings.HasPrefix(reference.ID.String(), "edge-caddy-observation:")
 }
 
 // RevokeBuildSecret is the path-aware counterpart of Revoke. A supplied Path

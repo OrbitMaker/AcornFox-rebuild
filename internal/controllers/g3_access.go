@@ -62,6 +62,11 @@ type G3ApplicationDomainFact struct {
 	Certificate        *G3CertificateFact
 	Serving            bool
 	RouteID            domain.ID
+	ConvergencePhase   string
+	ConvergenceStatus  string
+	ConvergenceError   string
+	ConvergenceID      domain.ID
+	ConvergenceKind    string
 	CreatedAt          time.Time
 	UpdatedAt          time.Time
 }
@@ -91,9 +96,17 @@ type G3Idempotency struct {
 	Digest string
 }
 
-// G3AccessStore is a deliberately small view of M3 durable facts. Implementors
-// must make UnbindCustomDomain atomic: serving routes are a conflict and no
-// Caddy removal is inferred from a database-only update.
+// G3DomainUnbindOperation is the accepted, durable intent for an asynchronous
+// custom-domain unbind. It intentionally says nothing about Caddy completion:
+// IP fallback and the platform hostname remain facts until the worker finalizes.
+type G3DomainUnbindOperation struct {
+	ID       domain.ID `json:"id"`
+	Status   string    `json:"status"`
+	DomainID domain.ID `json:"domain_id"`
+}
+
+// G3AccessStore is a deliberately small view of M3 durable facts. Unbind must
+// create a durable intent; it must never infer Caddy removal from an HTTP call.
 type G3AccessStore interface {
 	ApplicationName(context.Context, domain.ID) (string, bool, error)
 	PlatformDomain(context.Context) (G3PlatformDomainFact, bool, error)
@@ -103,7 +116,7 @@ type G3AccessStore interface {
 	ApplicationDomain(context.Context, domain.ID, domain.ID) (G3ApplicationDomainFact, bool, error)
 	BindCustomDomain(context.Context, G3ApplicationDomainFact, G3Idempotency) (G3ApplicationDomainFact, bool, error)
 	SetApplicationDomainVerification(context.Context, domain.ID, domain.ID, G3VerificationStatus, *time.Time, G3Idempotency) (G3ApplicationDomainFact, bool, error)
-	UnbindCustomDomain(context.Context, domain.ID, domain.ID, string, G3Idempotency) (bool, error)
+	BeginDomainUnbind(context.Context, domain.ID, domain.ID, string, G3Idempotency) (G3DomainUnbindOperation, bool, error)
 	ApplicationAccessFacts(context.Context, domain.ID) (G3ApplicationAccessFacts, error)
 }
 
@@ -116,10 +129,19 @@ type G3AccessConfig struct {
 	WildcardProbeLabel string
 }
 
+// G3DomainConvergenceWaker receives only committed durable facts. It has no
+// RouteProvider or probe dependency, so HTTP verification cannot invoke an
+// external convergence call in its request transaction.
+type G3DomainConvergenceWaker interface {
+	WakePlatform(context.Context, G3PlatformDomainFact) error
+	WakeCustom(context.Context, G3ApplicationDomainFact) error
+}
+
 type G3AccessController struct {
 	Store  G3AccessStore
 	Config G3AccessConfig
 	Clock  func() time.Time
+	Waker  G3DomainConvergenceWaker
 }
 
 type G3DomainVerification struct {
@@ -173,6 +195,18 @@ type G3ApplicationDomain struct {
 	Certificate  G3CertificateStatus  `json:"certificate"`
 	Failure      *G3FailureState      `json:"failure"`
 	Serving      bool                 `json:"serving"`
+	Convergence  *G3ConvergenceState  `json:"convergence"`
+}
+
+// G3ConvergenceState is deliberately a small safe projection of the durable
+// request. Payload and result can contain topology facts and are never UI
+// response data.
+type G3ConvergenceState struct {
+	ID        string `json:"id"`
+	Kind      string `json:"kind"`
+	Phase     string `json:"phase"`
+	Status    string `json:"status"`
+	LastError string `json:"last_error,omitempty"`
 }
 
 type G3AccessRouteStatus struct {
@@ -252,6 +286,11 @@ func (c *G3AccessController) ConfigurePlatformDomain(ctx context.Context, baseDo
 	if err != nil {
 		return G3PlatformSettings{}, false, g3StoreError(err, "platform domain idempotency conflict")
 	}
+	if fact.VerificationStatus == G3VerificationVerified && c.Waker != nil {
+		// The fact is already durable. A wake failure leaves it queued for the
+		// periodic reconciler; never manufacture serving from the HTTP path.
+		_ = c.Waker.WakePlatform(ctx, fact)
+	}
 	view, err := c.platformSettings(fact)
 	return view, false, err
 }
@@ -272,10 +311,22 @@ func (c *G3AccessController) ListApplicationDomains(ctx context.Context, applica
 		return nil, g3Unavailable("application access facts are unavailable", err)
 	}
 	result := make([]G3ApplicationDomain, 0, len(domains)+1)
+	var durablePlatform *G3ApplicationDomainFact
+	for index := range domains {
+		if domains[index].Kind == "platform" {
+			value := domains[index]
+			durablePlatform = &value
+			break
+		}
+	}
 	if platform, found, platformErr := c.platformFact(ctx); platformErr != nil {
 		return nil, platformErr
 	} else if found {
-		result = append(result, c.platformApplicationDomain(name, applicationID, platform))
+		if durablePlatform != nil {
+			result = append(result, c.applicationDomain(*durablePlatform))
+		} else {
+			result = append(result, c.platformApplicationDomain(name, applicationID, platform))
+		}
 	}
 	for _, item := range domains {
 		if item.Kind == "custom" {
@@ -367,28 +418,38 @@ func (c *G3AccessController) VerifyApplicationDomain(ctx context.Context, applic
 	if err != nil {
 		return G3ApplicationDomain{}, g3StoreError(err, "application domain idempotency conflict")
 	}
+	if fact.VerificationStatus == G3VerificationVerified && c.Waker != nil {
+		_ = c.Waker.WakeCustom(ctx, fact)
+	}
 	return c.applicationDomain(fact), nil
 }
 
-func (c *G3AccessController) UnbindCustomDomain(ctx context.Context, applicationID, domainID domain.ID, idempotencyKey, actor string) error {
+func (c *G3AccessController) UnbindCustomDomain(ctx context.Context, applicationID, domainID domain.ID, idempotencyKey, actor string) (G3DomainUnbindOperation, error) {
 	if err := c.requireConfiguredWrite(idempotencyKey, actor); err != nil {
-		return err
+		return G3DomainUnbindOperation{}, err
 	}
 	request := g3Idempotency("g3.application-domain.unbind", idempotencyKey, applicationID.String(), domainID.String())
-	if _, found, err := c.replayEmpty(ctx, request); err != nil {
-		return err
-	} else if found {
-		return nil
-	}
 	if _, exists, err := c.applicationName(ctx, applicationID); err != nil {
-		return err
+		return G3DomainUnbindOperation{}, err
 	} else if !exists {
-		return domain.NewError(domain.ErrNotFound, "application not found")
+		return G3DomainUnbindOperation{}, domain.NewError(domain.ErrNotFound, "application not found")
 	}
-	if _, err := c.Store.UnbindCustomDomain(ctx, applicationID, domainID, actor, request); err != nil {
-		return g3StoreError(err, "custom domain cannot be unbound while serving")
+	// Begin/replay comes before reading the binding.  A successful worker
+	// finalization removes a custom binding, but an original idempotency key
+	// must still replay the durable operation rather than turning into a 404.
+	// The persistence adapter verifies the binding is custom only for a new
+	// intent; it verifies application/domain association for both paths.
+	operation, _, err := c.Store.BeginDomainUnbind(ctx, applicationID, domainID, actor, request)
+	if err != nil {
+		return G3DomainUnbindOperation{}, g3StoreError(err, "custom domain unbind intent cannot be recorded")
 	}
-	return nil
+	if err := domain.RequireID(operation.ID, "domain unbind operation id"); err != nil {
+		return G3DomainUnbindOperation{}, g3Unavailable("domain unbind operation is unavailable", err)
+	}
+	if operation.DomainID != domainID || (operation.Status != "queued" && operation.Status != "in_progress" && operation.Status != "completed" && operation.Status != "failed") {
+		return G3DomainUnbindOperation{}, g3Unavailable("domain unbind operation is unavailable", domain.ValidationError("domain unbind operation is invalid"))
+	}
+	return operation, nil
 }
 
 func (c *G3AccessController) ApplicationAccess(ctx context.Context, applicationID domain.ID) (G3ApplicationAccess, error) {
@@ -408,19 +469,25 @@ func (c *G3AccessController) ApplicationAccess(ctx context.Context, applicationI
 		return G3ApplicationAccess{}, g3Unavailable("application access facts are unavailable", err)
 	}
 	result := G3ApplicationAccess{RuntimeReady: facts.Runtime.RuntimeReady, IPFallback: facts.Runtime.IPFallback, CustomDomains: make([]G3ApplicationDomain, 0, len(domains)), Certificate: G3CertificateStatus{Status: "pending"}}
-	for _, item := range domains {
+	var durablePlatform *G3ApplicationDomainFact
+	for index := range domains {
+		item := domains[index]
 		if item.Kind == "custom" {
 			result.CustomDomains = append(result.CustomDomains, c.applicationDomain(item))
+		} else if item.Kind == "platform" {
+			value := item
+			durablePlatform = &value
 		}
 	}
 	if platform, found, platformErr := c.platformFact(ctx); platformErr != nil {
 		return G3ApplicationAccess{}, platformErr
 	} else if found {
-		result.PlatformAddress = ptrG3Domain(c.platformApplicationDomain(name, applicationID, platform))
+		if durablePlatform != nil {
+			result.PlatformAddress = ptrG3Domain(c.applicationDomain(*durablePlatform))
+		} else {
+			result.PlatformAddress = ptrG3Domain(c.platformApplicationDomain(name, applicationID, platform))
+		}
 	}
-	// Gate4B-1 exposes a durable desired route, but the legacy internal route
-	// provider cannot prove public Edge TLS/SNI serving. Gate4B-2 owns that
-	// observation, so Route.Serving and Serving deliberately remain false here.
 	for _, route := range facts.Routes {
 		if !result.Route.Desired && route.Desired {
 			result.Route.Desired = true
@@ -430,7 +497,11 @@ func (c *G3AccessController) ApplicationAccess(ctx context.Context, applicationI
 			}
 		}
 		if route.Certificate != nil {
-			result.Certificate = g3Certificate(route.Certificate)
+			result.Certificate = g3ApplicationCertificate(route.Certificate, route.Hostname, route.Serving, route.Serving, c.now())
+		}
+		if route.Serving && g3ReadyCertificate(route.Certificate, route.Hostname, c.now()) {
+			result.Route.Serving = true
+			result.Serving = true
 		}
 	}
 	return result, nil
@@ -564,8 +635,12 @@ func (c *G3AccessController) platformApplicationDomain(name string, applicationI
 	if err != nil {
 		host = ""
 	}
+	stableID, stableErr := domain.StablePlatformApplicationDomainID(platform.ID, applicationID)
+	if stableErr != nil {
+		stableID = ""
+	}
 	status := g3Lifecycle(platform.VerificationStatus)
-	return G3ApplicationDomain{ID: g3AccessID("platform-address", applicationID.String()+":"+platform.BaseDomain).String(), Hostname: host, Kind: "platform", Status: status, Verification: g3Verification("public_dns_read_only", status, c.wildcardProbeHostname(platform.BaseDomain), c.Config.ExpectedPublicIP, platform.VerifiedAt), Certificate: g3Certificate(platform.Certificate), Failure: g3Failure(platform.VerificationStatus)}
+	return G3ApplicationDomain{ID: stableID.String(), Hostname: host, Kind: "platform", Status: status, Verification: g3Verification("public_dns_read_only", status, c.wildcardProbeHostname(platform.BaseDomain), c.Config.ExpectedPublicIP, platform.VerifiedAt), Certificate: G3CertificateStatus{Status: "pending"}, Failure: g3Failure(platform.VerificationStatus)}
 }
 
 func g3PresentationPlatformFact(fact G3PlatformDomainFact) G3PlatformDomainFact {
@@ -579,13 +654,23 @@ func g3PresentationPlatformFact(fact G3PlatformDomainFact) G3PlatformDomainFact 
 }
 
 func (c *G3AccessController) applicationDomain(fact G3ApplicationDomainFact) G3ApplicationDomain {
-	status := g3Lifecycle(fact.VerificationStatus)
+	status := c.applicationDomainLifecycle(fact)
 	var target *string
 	if fact.CNAME != "" {
 		value := fact.CNAME
 		target = &value
 	}
-	return G3ApplicationDomain{ID: fact.ID.String(), Hostname: fact.Hostname, Kind: fact.Kind, Status: status, CNAME: target, Verification: g3Verification("public_dns_read_only", status, fact.Hostname, fact.CNAME, fact.VerifiedAt), Certificate: g3Certificate(fact.Certificate), Failure: g3Failure(fact.VerificationStatus)}
+	return G3ApplicationDomain{ID: fact.ID.String(), Hostname: fact.Hostname, Kind: fact.Kind, Status: status, CNAME: target, Verification: g3Verification("public_dns_read_only", status, fact.Hostname, fact.CNAME, fact.VerifiedAt), Certificate: g3ApplicationCertificate(fact.Certificate, fact.Hostname, fact.VerificationStatus == G3VerificationVerified, fact.Serving, c.now()), Failure: g3ApplicationFailure(fact), Serving: status == "ready", Convergence: g3Convergence(fact)}
+}
+
+func (c *G3AccessController) applicationDomainLifecycle(fact G3ApplicationDomainFact) string {
+	if fact.VerificationStatus == G3VerificationVerified {
+		if fact.Serving && g3ReadyCertificate(fact.Certificate, fact.Hostname, c.now()) {
+			return "ready"
+		}
+		return "certificate_pending"
+	}
+	return g3Lifecycle(fact.VerificationStatus)
 }
 
 func g3UnconfiguredPlatformSettings() G3PlatformSettings {
@@ -627,11 +712,44 @@ func g3Certificate(fact *G3CertificateFact) G3CertificateStatus {
 	return G3CertificateStatus{Status: "failed"}
 }
 
+func g3ApplicationCertificate(fact *G3CertificateFact, hostname string, verified, serving bool, now time.Time) G3CertificateStatus {
+	if !verified || !serving || !g3ReadyCertificate(fact, hostname, now) {
+		return G3CertificateStatus{Status: "pending"}
+	}
+	subject := fact.Subject
+	return G3CertificateStatus{Status: "ready", Subject: &subject, NotAfter: fact.NotAfter}
+}
+
+func g3ReadyCertificate(fact *G3CertificateFact, hostname string, now time.Time) bool {
+	return fact != nil && fact.Status == "ready" && fact.Observed && fact.Subject == hostname && fact.NotAfter != nil && fact.NotAfter.After(now.UTC())
+}
+
 func g3Failure(status G3VerificationStatus) *G3FailureState {
 	if status != G3VerificationFailed {
 		return nil
 	}
 	return &G3FailureState{Code: "public_dns_mismatch", Message: "public DNS does not match the expected ingress target", Retryable: true}
+}
+
+func g3ApplicationFailure(fact G3ApplicationDomainFact) *G3FailureState {
+	if failure := g3Failure(fact.VerificationStatus); failure != nil {
+		return failure
+	}
+	if fact.ConvergencePhase == "failed" || fact.ConvergencePhase == "recovery_required" {
+		code := "convergence_retry_required"
+		if fact.ConvergenceError != "" {
+			code = fact.ConvergenceError
+		}
+		return &G3FailureState{Code: code, Message: "域名收敛尚未完成；应用运行与 IP fallback 保持不变。", Retryable: true}
+	}
+	return nil
+}
+
+func g3Convergence(fact G3ApplicationDomainFact) *G3ConvergenceState {
+	if fact.ConvergencePhase == "" || fact.ConvergenceStatus == "" {
+		return nil
+	}
+	return &G3ConvergenceState{ID: fact.ConvergenceID.String(), Kind: fact.ConvergenceKind, Phase: fact.ConvergencePhase, Status: fact.ConvergenceStatus, LastError: fact.ConvergenceError}
 }
 
 func g3NextAction(status string, configured bool) string {

@@ -4,6 +4,8 @@ import type {
   ApplicationAccessResponse,
   ApplicationDomain,
   ApplicationDomainResponse,
+  ApplicationDomainUnbindOperation,
+  ApplicationDomainUnbindResponse,
   CustomDomainBindRequest,
   PlatformDomainSettingsRequest,
   PlatformDomainSettingsResponse,
@@ -122,12 +124,25 @@ export function verifyDomain(
 }
 
 export function unbindDomain(
-  client: Pick<DomainManagementClient, 'unbindApplicationDomain'>,
-  applicationId: string,
-  domainId: string,
-  signal?: AbortSignal,
-): Promise<void> {
-  return client.unbindApplicationDomain(applicationId, domainId, signal);
+	client: Pick<DomainManagementClient, 'unbindApplicationDomain'>,
+	applicationId: string,
+	domainId: string,
+	idempotencyKey: string,
+	signal?: AbortSignal,
+): Promise<ApplicationDomainUnbindResponse> {
+	return client.unbindApplicationDomain(applicationId, domainId, idempotencyKey, signal);
+}
+
+export const UNBIND_OPERATION_FAILED_MESSAGE = '解绑请求未完成，请刷新状态后重试。';
+
+export function updateQueuedUnbindDomainIDs(
+  current: ReadonlySet<string>,
+  operation: ApplicationDomainUnbindOperation,
+): ReadonlySet<string> {
+  const next = new Set(current);
+  if (operation.status === 'queued' || operation.status === 'in_progress') next.add(operation.domainId);
+  else next.delete(operation.domainId);
+  return next;
 }
 
 export async function copyCnameTarget(

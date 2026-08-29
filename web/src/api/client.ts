@@ -26,6 +26,8 @@ import type {
   ApplicationDetail,
   ApplicationDomain,
   ApplicationDomainResponse,
+  ApplicationDomainUnbindOperation,
+  ApplicationDomainUnbindResponse,
   ApplicationDomainsResponse,
   CertificateStatus,
   CustomDomainBindRequest,
@@ -183,6 +185,18 @@ function asApplicationDomain(value: unknown): ApplicationDomain {
   if (kind !== 'platform' && kind !== 'custom') throw new Error('Application domain kind is invalid');
   const status = value.status;
   if (status !== 'unconfigured' && status !== 'pending' && status !== 'verifying' && status !== 'certificate_pending' && status !== 'ready' && status !== 'failed') throw new Error('Application domain status is invalid');
+  if (!Object.prototype.hasOwnProperty.call(value, 'convergence')) throw new Error('Application domain convergence is missing');
+  const convergence = value.convergence;
+  let parsedConvergence: ApplicationDomain['convergence'] = null;
+  if (convergence !== null && convergence !== undefined) {
+    if (!isRecord(convergence) || !['converge', 'unbind'].includes(String(convergence.kind))) throw new Error('Application domain convergence is invalid');
+    const phase = convergence.phase;
+    const status = convergence.status;
+    if (!['queued', 'route_prepared', 'internal_route_active', 'tls_allowed', 'certificate_observed', 'serving', 'unbind_route_removed', 'completed', 'failed', 'recovery_required'].includes(String(phase)) || !['queued', 'leased', 'completed', 'failed', 'recovery_required'].includes(String(status))) throw new Error('Application domain convergence is invalid');
+    const lastError = optionalString(convergence.last_error);
+    if (typeof lastError === 'string' && !/^[a-z0-9_:-]{1,120}$/.test(lastError)) throw new Error('Application domain convergence error is invalid');
+    parsedConvergence = { id: requireString(convergence.id, 'Application domain convergence id'), kind: convergence.kind as NonNullable<ApplicationDomain['convergence']>['kind'], phase: phase as NonNullable<ApplicationDomain['convergence']>['phase'], status: status as NonNullable<ApplicationDomain['convergence']>['status'], lastError: lastError ?? undefined };
+  }
   return {
     id: requireString(value.id, 'domain.id'),
     hostname: requireString(value.hostname, 'domain.hostname'),
@@ -193,6 +207,7 @@ function asApplicationDomain(value: unknown): ApplicationDomain {
     certificate: asCertificateStatus(value.certificate),
     failure: asFailureState(value.failure),
     serving: value.serving === true,
+    convergence: parsedConvergence,
   };
 }
 
@@ -230,6 +245,19 @@ function asApplicationDomains(value: unknown): ApplicationDomainsResponse {
 function asApplicationDomainResponse(value: unknown): ApplicationDomainResponse {
   if (!isRecord(value)) throw new Error('Application domain response is invalid');
   return { domain: asApplicationDomain(value.domain) };
+}
+
+function asApplicationDomainUnbindResponse(value: unknown): ApplicationDomainUnbindResponse {
+  if (!isRecord(value) || !isRecord(value.operation) || !['queued', 'in_progress', 'completed', 'failed'].includes(String(value.operation.status))) {
+    throw new Error('Application domain unbind response is invalid');
+  }
+  return {
+    operation: {
+      id: requireString(value.operation.id, 'unbind.operation.id'),
+      status: value.operation.status as ApplicationDomainUnbindOperation['status'],
+      domainId: requireString(value.operation.domain_id, 'unbind.operation.domain_id'),
+    },
+  };
 }
 
 function asAccessRouteStatus(value: unknown): AccessRouteStatus {
@@ -906,12 +934,15 @@ export class RestApiClient implements ApiClient {
     return asApplicationDomainResponse(await this.json(response, 'Unable to verify application domain'));
   }
 
-  async unbindApplicationDomain(applicationId: string, domainId: string, signal?: AbortSignal): Promise<void> {
-    const response = await this.request(`/applications/${encodeURIComponent(applicationId)}/domains/${encodeURIComponent(domainId)}`, {
-      method: 'DELETE',
-      signal,
+  async unbindApplicationDomain(applicationId: string, domainId: string, idempotencyKey: string, signal?: AbortSignal): Promise<ApplicationDomainUnbindResponse> {
+	const response = await this.request(`/applications/${encodeURIComponent(applicationId)}/domains/${encodeURIComponent(domainId)}`, {
+		method: 'DELETE',
+		headers: { 'idempotency-key': idempotencyKey },
+		signal,
     });
-    await this.noContent(response, 'Unable to unbind application domain');
+    const value = asApplicationDomainUnbindResponse(await this.json(response, 'Unable to request application domain unbind'));
+    if (value.operation.domainId !== domainId) throw new Error('Application domain unbind response addressed a different domain');
+    return value;
   }
 
   async getApplicationAccess(applicationId: string, signal?: AbortSignal): Promise<ApplicationAccessResponse> {
@@ -1364,7 +1395,7 @@ export class StubApiClient implements ApiClient {
     return this.domainAndUploadUnavailable();
   }
 
-  async unbindApplicationDomain(_applicationId: string, _domainId: string, _signal?: AbortSignal): Promise<void> {
+  async unbindApplicationDomain(_applicationId: string, _domainId: string, _idempotencyKey: string, _signal?: AbortSignal): Promise<ApplicationDomainUnbindResponse> {
     this.requireAuthentication();
     return this.domainAndUploadUnavailable();
   }

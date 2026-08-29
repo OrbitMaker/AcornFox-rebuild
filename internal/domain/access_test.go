@@ -13,6 +13,20 @@ func TestStableApplicationHost(t *testing.T) {
 	}
 }
 
+func TestStablePlatformApplicationDomainID(t *testing.T) {
+	first, err := StablePlatformApplicationDomainID("platform_1", "app_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := StablePlatformApplicationDomainID("platform_1", "app_1")
+	if err != nil || first != second || first.Empty() {
+		t.Fatalf("unstable platform application domain ID: %q %q %v", first, second, err)
+	}
+	if other, err := StablePlatformApplicationDomainID("platform_2", "app_1"); err != nil || other == first {
+		t.Fatalf("platform identity collision: %q %q %v", first, other, err)
+	}
+}
+
 func TestNormalizeRoutePathAndConflict(t *testing.T) {
 	if path, err := NormalizeRoutePath("/api/"); err != nil || path != "/api" {
 		t.Fatalf("path=%q err=%v", path, err)

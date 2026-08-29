@@ -292,6 +292,8 @@ OPEN_CARD_G3_INGRESS_LABEL=ingress
 OPEN_CARD_G3_APPS_LABEL=apps
 OPEN_CARD_G3_WILDCARD_PROBE_LABEL=wildcard-probe
 OPEN_CARD_M4_ENABLED=true
+OPEN_CARD_M4_ROLLOUT_ENABLED=true
+OPEN_CARD_M4_ROLLOUT_INTERVAL=3s
 OPEN_CARD_M5_ENABLED=true
 OPEN_CARD_AGENT_TLS_CA=/etc/open-card/agent-ca.crt
 OPEN_CARD_AGENT_TLS_CERT=/etc/open-card/server.crt
@@ -318,9 +320,19 @@ OPEN_CARD_AGENT_DISPATCH_INSTANCE_ID=opencard-host
 OPEN_CARD_AGENT_DISPATCH_NODE_ID=opencard-host-01
 OPEN_CARD_M2_REGISTRY_BASE_URL=http://127.0.0.1:45532
 OPEN_CARD_CADDY_ADMIN_URL=http://127.0.0.1:2019
+OPEN_CARD_CADDY_LISTEN=127.0.0.1:18481
 EOF
     chmod 0600 /etc/open-card/server.env
   fi
+
+  # These are production control-plane boundaries, not optional provider
+  # defaults. Keep an existing installation's server.env explicit as well as
+  # populating a newly-created file above.
+  set_env_line /etc/open-card/server.env OPEN_CARD_CADDY_ADMIN_URL http://127.0.0.1:2019
+  set_env_line /etc/open-card/server.env OPEN_CARD_CADDY_LISTEN 127.0.0.1:18481
+  set_env_line /etc/open-card/server.env OPEN_CARD_M4_ROLLOUT_ENABLED true
+  set_env_line /etc/open-card/server.env OPEN_CARD_M4_ROLLOUT_INTERVAL 3s
+
   if [[ ! -f /etc/open-card/build-secret.key ]]; then openssl rand 32 >/etc/open-card/build-secret.key; fi
   chown opencard:opencard /etc/open-card/build-secret.key
   chmod 0400 /etc/open-card/build-secret.key

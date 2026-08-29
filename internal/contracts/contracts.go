@@ -144,6 +144,38 @@ type ProviderError struct {
 	Cause      error             `json:"-"`
 }
 
+// ProviderOutcomeUnknownError means a provider request may have taken effect,
+// but the caller did not receive enough of a response to prove either outcome.
+// Controllers must compensate from durable facts instead of treating it as a
+// confirmed provider rejection.
+type ProviderOutcomeUnknownError struct{ Cause error }
+
+func (e *ProviderOutcomeUnknownError) Error() string {
+	if e == nil || e.Cause == nil {
+		return "provider operation outcome is unknown"
+	}
+	return "provider operation outcome is unknown: " + e.Cause.Error()
+}
+
+func (e *ProviderOutcomeUnknownError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
+}
+
+func ProviderOutcomeUnknown(cause error) error {
+	if cause == nil {
+		cause = errors.New("provider operation outcome is unknown")
+	}
+	return &ProviderOutcomeUnknownError{Cause: cause}
+}
+
+func IsProviderOutcomeUnknown(err error) bool {
+	var unknown *ProviderOutcomeUnknownError
+	return errors.As(err, &unknown)
+}
+
 func (e *ProviderError) Error() string {
 	if e == nil {
 		return "<nil>"

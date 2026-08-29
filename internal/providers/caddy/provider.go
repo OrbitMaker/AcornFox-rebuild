@@ -38,8 +38,12 @@ const (
 // is deliberately HTTP-only: this API is a local privilege boundary, never a
 // network service for the control plane or browser.
 type Config struct {
-	AdminURL   string
-	Listen     string
+	AdminURL string
+	Listen   string
+	// PlainHTTP disables Caddy's HTTPS automation for an explicitly loopback
+	// listener. It is reserved for the production internal hop behind Edge;
+	// fixture and default M3 providers continue to use the isolated TLS issuer.
+	PlainHTTP  bool
 	Issuer     string
 	HTTPClient *http.Client
 	Timeout    time.Duration
@@ -288,10 +292,20 @@ func normalizeConfig(config Config) (Config, *url.URL, error) {
 	if strings.TrimSpace(config.Listen) == "" {
 		config.Listen = defaultListen
 	}
-	if _, port, err := net.SplitHostPort(config.Listen); err != nil {
+	host, port, err := net.SplitHostPort(config.Listen)
+	if err != nil {
 		return Config{}, nil, errors.New("caddy listener must be host:port or :port")
 	} else if number, err := strconv.Atoi(port); err != nil || number < 1 || number > 65535 {
 		return Config{}, nil, errors.New("caddy listener port is invalid")
+	}
+	if config.PlainHTTP {
+		ip := net.ParseIP(host)
+		if host == "" || ip == nil || !ip.IsLoopback() {
+			return Config{}, nil, errors.New("plain HTTP Caddy listener must be an explicit loopback address")
+		}
+		if strings.TrimSpace(config.Issuer) != "" {
+			return Config{}, nil, errors.New("plain HTTP Caddy listener cannot configure a TLS issuer")
+		}
 	}
 	if config.Timeout == 0 {
 		config.Timeout = defaultTimeout
@@ -302,11 +316,13 @@ func normalizeConfig(config Config) (Config, *url.URL, error) {
 	if config.Clock == nil {
 		config.Clock = time.Now
 	}
-	if strings.TrimSpace(config.Issuer) == "" {
-		config.Issuer = "internal"
-	}
-	if config.Issuer != "internal" {
-		return Config{}, nil, errors.New("M3 Caddy provider only permits the isolated internal issuer")
+	if !config.PlainHTTP {
+		if strings.TrimSpace(config.Issuer) == "" {
+			config.Issuer = "internal"
+		}
+		if config.Issuer != "internal" {
+			return Config{}, nil, errors.New("M3 Caddy provider only permits the isolated internal issuer")
+		}
 	}
 	transport := http.DefaultTransport
 	if config.HTTPClient != nil && config.HTTPClient.Transport != nil {
@@ -390,12 +406,17 @@ func (p *Provider) load(ctx context.Context, routes map[string]routeState, opera
 	setRouteFixtureScopeHeaders(request, operation)
 	response, err := p.config.HTTPClient.Do(request)
 	if err != nil {
-		return p.classify(operation, action, err)
+		// Once Do has been invoked, transport failure cannot prove that Caddy
+		// did not receive and apply /load. The caller must restore durable facts
+		// rather than retrying as though this were a confirmed rejection.
+		return contracts.ProviderOutcomeUnknown(p.classify(operation, action, err))
 	}
 	defer response.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maxResponseSize))
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 		return p.statusFailure(operation, action, response.StatusCode)
+	}
+	if _, err := io.Copy(io.Discard, io.LimitReader(response.Body, maxResponseSize)); err != nil {
+		return contracts.ProviderOutcomeUnknown(p.failure(operation, contracts.ErrUnavailable, action, "Caddy Admin response could not be read", err))
 	}
 	return nil
 }
@@ -608,20 +629,26 @@ func configJSON(config Config, routes map[string]routeState) ([]byte, error) {
 	for _, state := range ordered {
 		caddyRoutes = append(caddyRoutes, caddyRoute(state))
 	}
+	server := map[string]any{
+		"listen": []string{config.Listen},
+		"routes": caddyRoutes,
+	}
+	if config.PlainHTTP {
+		server["automatic_https"] = map[string]any{"disable": true}
+	} else {
+		server["automatic_https"] = map[string]any{"disable_redirects": true}
+	}
+	apps := map[string]any{
+		"http": map[string]any{"servers": map[string]any{"open-card": server}},
+	}
+	if !config.PlainHTTP {
+		apps["tls"] = map[string]any{"automation": map[string]any{"policies": []any{
+			map[string]any{"issuers": []any{map[string]any{"module": config.Issuer}}},
+		}}}
+	}
 	document := map[string]any{
 		"admin": map[string]any{"listen": config.adminListen()},
-		"apps": map[string]any{
-			"http": map[string]any{"servers": map[string]any{
-				"open-card": map[string]any{
-					"listen":          []string{config.Listen},
-					"routes":          caddyRoutes,
-					"automatic_https": map[string]any{"disable_redirects": true},
-				},
-			}},
-			"tls": map[string]any{"automation": map[string]any{"policies": []any{
-				map[string]any{"issuers": []any{map[string]any{"module": config.Issuer}}},
-			}}},
-		},
+		"apps":  apps,
 	}
 	return json.Marshal(document)
 }

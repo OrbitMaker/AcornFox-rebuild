@@ -119,6 +119,15 @@ export interface ApplicationDomain {
   certificate: CertificateStatus;
   failure: FailureState | null;
   serving: boolean;
+  convergence: DomainConvergenceState | null;
+}
+
+export interface DomainConvergenceState {
+  id: string;
+  kind: 'converge' | 'unbind';
+  phase: 'queued' | 'route_prepared' | 'internal_route_active' | 'tls_allowed' | 'certificate_observed' | 'serving' | 'unbind_route_removed' | 'completed' | 'failed' | 'recovery_required';
+  status: 'queued' | 'leased' | 'completed' | 'failed' | 'recovery_required';
+  lastError?: string;
 }
 
 export interface ApplicationDomainsResponse {
@@ -131,6 +140,17 @@ export interface CustomDomainBindRequest {
 
 export interface ApplicationDomainResponse {
   domain: ApplicationDomain;
+}
+
+/** Acceptance only: completion is reflected by a later durable facts refresh. */
+export interface ApplicationDomainUnbindOperation {
+  id: string;
+  status: 'queued' | 'in_progress' | 'completed' | 'failed';
+  domainId: string;
+}
+
+export interface ApplicationDomainUnbindResponse {
+  operation: ApplicationDomainUnbindOperation;
 }
 
 export interface AccessRouteStatus {
@@ -257,7 +277,7 @@ export interface ApiClient extends AuthClient {
   listApplicationDomains(applicationId: string, signal?: AbortSignal): Promise<ApplicationDomainsResponse>;
   bindApplicationCustomDomain(applicationId: string, input: CustomDomainBindRequest, signal?: AbortSignal): Promise<ApplicationDomainResponse>;
   verifyApplicationDomain(applicationId: string, domainId: string, signal?: AbortSignal): Promise<ApplicationDomainResponse>;
-  unbindApplicationDomain(applicationId: string, domainId: string, signal?: AbortSignal): Promise<void>;
+  unbindApplicationDomain(applicationId: string, domainId: string, idempotencyKey: string, signal?: AbortSignal): Promise<ApplicationDomainUnbindResponse>;
   getApplicationAccess(applicationId: string, signal?: AbortSignal): Promise<ApplicationAccessResponse>;
   publishApplication(applicationId: string, input: ApplicationPublishInput, signal?: AbortSignal): Promise<ApplicationPublishResponse>;
   createSourceUpload(input: SourceUploadInput, signal?: AbortSignal): Promise<SourceUploadResponse>;

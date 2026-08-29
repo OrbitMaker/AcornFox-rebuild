@@ -19,6 +19,25 @@ class Gate4BCompositionContractTests(unittest.TestCase):
             "OPEN_CARD_G3_WILDCARD_PROBE_LABEL=wildcard-probe",
         ):
             self.assertEqual(text.count(value), 2, value)
+        self.assertIn("OPEN_CARD_CADDY_ADMIN_URL=http://127.0.0.1:2019", text)
+        self.assertIn("OPEN_CARD_CADDY_LISTEN=127.0.0.1:18481", text)
+        self.assertIn(
+            "set_env_line /etc/open-card/server.env OPEN_CARD_CADDY_LISTEN 127.0.0.1:18481",
+            text,
+        )
+
+    def test_server_env_enables_m4_rollout_for_new_and_existing_hosts(self) -> None:
+        text = (ROOT / "scripts/mvp/install-host.sh").read_text(encoding="utf-8")
+        self.assertIn("OPEN_CARD_M4_ROLLOUT_ENABLED=true", text)
+        self.assertIn("OPEN_CARD_M4_ROLLOUT_INTERVAL=3s", text)
+        self.assertIn(
+            "set_env_line /etc/open-card/server.env OPEN_CARD_M4_ROLLOUT_ENABLED true",
+            text,
+        )
+        self.assertIn(
+            "set_env_line /etc/open-card/server.env OPEN_CARD_M4_ROLLOUT_INTERVAL 3s",
+            text,
+        )
 
     def test_clean_worker_explicitly_declares_the_fixture_boundary(self) -> None:
         text = (ROOT / "scripts/mvp/clean-worker-bootstrap.sh").read_text(encoding="utf-8")

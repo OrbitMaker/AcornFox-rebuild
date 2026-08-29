@@ -53,9 +53,23 @@ function domainFixture(overrides: Record<string, unknown> = {}) {
     certificate: { status: 'ready', subject: 'portal.apps.example.test', not_after: '2027-08-28T00:00:00Z' },
     failure: null,
     serving: true,
+	convergence: { id: 'convergence-1', kind: 'converge', phase: 'completed', status: 'completed' },
     ...overrides,
   };
 }
+
+it('rejects missing or unsafe application-domain convergence projections', async () => {
+  const missing = domainFixture();
+  delete (missing as Record<string, unknown>).convergence;
+  const missingClient = new RestApiClient({ baseUrl: '/api/v1', fetchImpl: async () => jsonResponse({ items: [missing] }) });
+  await expect(missingClient.listApplicationDomains('app-1')).rejects.toThrow('convergence is missing');
+
+  const unsafeClient = new RestApiClient({ baseUrl: '/api/v1', fetchImpl: async () => jsonResponse({ items: [domainFixture({ convergence: { id: 'convergence-1', kind: 'unbind', phase: 'failed', status: 'failed', last_error: 'private_key=not-safe' } })] }) });
+  await expect(unsafeClient.listApplicationDomains('app-1')).rejects.toThrow('convergence error is invalid');
+
+  const safeClient = new RestApiClient({ baseUrl: '/api/v1', fetchImpl: async () => jsonResponse({ items: [domainFixture({ convergence: { id: 'convergence-1', kind: 'unbind', phase: 'failed', status: 'failed', last_error: 'probe_failed' } })] }) });
+  await expect(safeClient.listApplicationDomains('app-1')).resolves.toMatchObject({ items: [{ convergence: { lastError: 'probe_failed' } }] });
+});
 
 function platformDomainFixture() {
   return {
@@ -344,7 +358,7 @@ describe('RestApiClient', () => {
       jsonResponse({ items: [domainFixture()] }),
       jsonResponse({ domain: domainFixture({ id: 'domain-2', kind: 'custom', hostname: 'portal.example.com' }) }, 202),
       jsonResponse({ domain: domainFixture({ id: 'domain-2', kind: 'custom', status: 'verifying', hostname: 'portal.example.com' }) }, 202),
-      new Response(null, { status: 204 }),
+      jsonResponse({ operation: { id: 'convergence-unbind-2', status: 'queued', domain_id: 'domain-2' } }, 202),
       jsonResponse(accessFixture()),
       jsonResponse(uploadFixture(), 201),
       jsonResponse(uploadFixture()),
@@ -365,7 +379,7 @@ describe('RestApiClient', () => {
     const domains = await client.listApplicationDomains('app/live');
     const bound = await client.bindApplicationCustomDomain('app/live', { hostname: 'portal.example.com' });
     const verified = await client.verifyApplicationDomain('app/live', 'domain-2');
-    await client.unbindApplicationDomain('app/live', 'domain-2');
+    const unbind = await client.unbindApplicationDomain('app/live', 'domain-2', 'unbind-attempt-1');
     const access = await client.getApplicationAccess('app/live');
     const upload = await client.createSourceUpload({ mode: 'archive', archive: new Blob(['archive'], { type: 'application/gzip' }) });
     const uploadStatus = await client.getSourceUpload(upload.uploadId);
@@ -376,6 +390,7 @@ describe('RestApiClient', () => {
     expect(domains.items[0]?.hostname).toBe('portal.apps.example.test');
     expect(bound.domain.kind).toBe('custom');
     expect(verified.domain.status).toBe('verifying');
+    expect(unbind.operation).toEqual({ id: 'convergence-unbind-2', status: 'queued', domainId: 'domain-2' });
     expect(access.ipFallback).toBe('198.51.100.20');
     expect(upload.kind).toBe('archive');
     expect(uploadStatus.uploadId).toBe('upload-1');
@@ -398,6 +413,7 @@ describe('RestApiClient', () => {
       return headers.get(CSRF_HEADER_NAME) === 'csrf-value' && Boolean(headers.get('Idempotency-Key'));
     })).toBe(true);
     expect(JSON.parse(String(requests[2]?.init.body))).toEqual({ base_domain: 'example.test' });
+		expect(new Headers(requests[6]?.init.headers).get('Idempotency-Key')).toBe('unbind-attempt-1');
     const archiveBody = requests[8]?.init.body;
     expect(archiveBody).toBeInstanceOf(FormData);
     expect((archiveBody as FormData).get('mode')).toBe('archive');
@@ -690,6 +706,14 @@ describe('Authentication client', () => {
         alerts: { status: 'not_installed' },
       },
     });
+  });
+
+  it('requires a queued unbind operation for the requested domain', async () => {
+    const client = new RestApiClient({
+      baseUrl: '/api/v1',
+      fetchImpl: async () => jsonResponse({ operation: { id: 'unbind-1', status: 'queued', domain_id: 'different-domain' } }, 202),
+    });
+    await expect(client.unbindApplicationDomain('app-1', 'domain-1', 'unbind-attempt-2')).rejects.toThrow('different domain');
   });
 
   it('binds the browser fetch implementation before calling it as a client member', async () => {
