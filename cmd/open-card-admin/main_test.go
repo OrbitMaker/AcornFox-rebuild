@@ -16,14 +16,48 @@ import (
 )
 
 func TestParseArgsRejectsPasswordArgumentsAndEnvironment(t *testing.T) {
-	for _, args := range [][]string{{"bootstrap"}, {"bootstrap", "--password", "secret"}, {"reset-password", "--password-file", "relative"}, {"bootstrap", "--password-file", "/tmp/password", "--server-env", "relative"}} {
+	for _, args := range [][]string{{"bootstrap"}, {"bootstrap", "--password", "secret"}, {"reset-password", "--password-file", "relative"}, {"bootstrap", "--password-file", "/tmp/password", "--server-env", "/etc/open-card/server.env"}, {"activation", "validate"}, {"candidate", "validate", "--activation-id", "../../escape"}} {
 		if _, err := parseArgs(args); err == nil {
 			t.Fatalf("expected rejected arguments: %#v", args)
 		}
 	}
 	config, err := parseArgs([]string{"bootstrap", "--password-file", "/etc/open-card/bootstrap-password"})
-	if err != nil || config.serverEnv != defaultServerEnv {
+	if err != nil || config.command != "bootstrap" || config.taskRoot != "" {
 		t.Fatalf("config=%#v err=%v", config, err)
+	}
+	candidate, err := parseArgs([]string{"candidate", "validate", "--activation-id", "activation-1", "--task-root", "/tmp/open-card-task-root"})
+	if err != nil || candidate.command != "candidate-validate" || candidate.activationID != "activation-1" || candidate.taskRoot != "/tmp/open-card-task-root" {
+		t.Fatalf("candidate=%#v err=%v", candidate, err)
+	}
+}
+
+func TestRuntimeUnitsPutActiveDatabaseAfterGlobalConfigAndGateEdge(t *testing.T) {
+	server, err := os.ReadFile(filepath.Join("..", "..", "deploy", "systemd", "open-card-server.service"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	global := strings.Index(string(server), "EnvironmentFile=-/etc/open-card/server.env")
+	active := strings.Index(string(server), "EnvironmentFile=/opt/open-card/active/database.env")
+	if global < 0 || active < 0 || global >= active {
+		t.Fatal("server unit does not load mandatory active database.env after global config")
+	}
+	edge, err := os.ReadFile(filepath.Join("..", "..", "deploy", "systemd", "open-card-edge.service"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(edge), "ConditionPathExists=!/var/lib/open-card/upgrade-in-progress") {
+		t.Fatal("edge is not gated by the fixed upgrade marker")
+	}
+}
+
+func TestAdminRejectsLegacyServerEnvAndRedactsActiveResolutionErrors(t *testing.T) {
+	t.Setenv("OPEN_CARD_DATABASE_URL", "postgresql://admin:secret@db.example/open_card")
+	if _, err := parseArgs([]string{"bootstrap", "--password-file", "/tmp/password", "--server-env", "/etc/open-card/server.env"}); err == nil {
+		t.Fatal("legacy server.env fallback flag was accepted")
+	}
+	_, err := resolveActiveDatabase(commandConfig{command: "activation-validate", activationID: "activation-1", taskRoot: "/definitely/missing/open-card"})
+	if err == nil || strings.Contains(err.Error(), "secret") || strings.Contains(err.Error(), "postgres") {
+		t.Fatalf("active resolution error leaked a DSN: %v", err)
 	}
 }
 

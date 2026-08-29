@@ -11,6 +11,7 @@ Group=opencard
 SupplementaryGroups=opencard-buildkit
 WorkingDirectory=/opt/open-card/current
 EnvironmentFile=-/etc/open-card/server.env
+EnvironmentFile=/opt/open-card/active/database.env
 ExecStart=/opt/open-card/current/bin/open-card-server
 Restart=on-failure
 RestartSec=5s
