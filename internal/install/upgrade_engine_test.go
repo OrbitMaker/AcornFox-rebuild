@@ -2,6 +2,7 @@ package install
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -408,6 +409,62 @@ func enginePhase(t *testing.T, err error) UpgradePhaseError {
 		t.Fatalf("unsafe code %q", phase.Code)
 	}
 	return phase
+}
+
+func TestUpgradeEnginePreflightIsLockedReadOnlyAndRedacted(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		t.Run(map[bool]string{false: "native", true: "legacy"}[legacy], func(t *testing.T) {
+			e, store, database, _, events := engineFixture(legacy)
+			request := engineRequest()
+			request.ExpectedLegacy = legacy
+			eligibility, err := e.Preflight(context.Background(), request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if eligibility.Layout != map[bool]string{false: "native", true: "rc0_compat_projection"}[legacy] || eligibility.TransactionID != request.TransactionID || eligibility.CandidateReleaseID != request.CandidateRelease.ID || eligibility.CandidateReleaseManifestSHA256 != request.RequestedManifestSHA256 || eligibility.CandidateActivationID != request.CandidateActivationID || eligibility.OldActivationID == "" || !validSHA(eligibility.OldEligibilitySHA256) || !legacy && eligibility.OldEligibilitySHA256 != eligibility.OldActivationJSONSHA256 || legacy && eligibility.OldActivationJSONSHA256 != "" {
+				t.Fatalf("eligibility=%#v", eligibility)
+			}
+			if len(store.created) != 0 || len(store.saved) != 0 || store.state.Marker || store.writtenCandidate.ActivationID != "" || database.closed != 1 || store.released != 1 {
+				t.Fatalf("preflight mutated state: journals=%d/%d marker=%v candidate=%q closed=%d released=%d events=%v", len(store.created), len(store.saved), store.state.Marker, store.writtenCandidate.ActivationID, database.closed, store.released, *events)
+			}
+			for _, forbidden := range []string{"capture", "marker:on", "quiesce", "drain", "snapshot", "candidate", "migrate", "validate", "previous", "swap", "start-internal"} {
+				if eventIndex(*events, forbidden) >= 0 {
+					t.Fatalf("preflight invoked %s: %v", forbidden, *events)
+				}
+			}
+			raw, marshalErr := json.Marshal(eligibility)
+			if marshalErr != nil || strings.Contains(string(raw), "postgres") || strings.Contains(string(raw), "user:pass") {
+				t.Fatalf("eligibility leaked a DSN: %q", raw)
+			}
+		})
+	}
+}
+
+func TestUpgradeEngineLegacyPreflightEligibilityIsTimeIndependent(t *testing.T) {
+	e, _, _, _, _ := engineFixture(true)
+	request := engineRequest()
+	request.ExpectedLegacy = true
+	first, err := e.Preflight(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := e.Preflight(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.OldActivationID != second.OldActivationID || first.OldEligibilitySHA256 != second.OldEligibilitySHA256 || first.OldActivationJSONSHA256 != "" || second.OldActivationJSONSHA256 != "" {
+		t.Fatalf("legacy eligibility drifted: first=%#v second=%#v", first, second)
+	}
+}
+
+func TestUpgradeEnginePreflightCloseFailureIsSanitized(t *testing.T) {
+	e, store, database, service, _ := engineFixture(false)
+	database.closeErr = errors.New("postgresql://user:password@localhost/open_card")
+	_, err := e.Preflight(context.Background(), engineRequest())
+	phase := enginePhase(t, err)
+	if phase.Phase != JournalPreflighted || phase.Code != "preflight_database_close_failed" || strings.Contains(err.Error(), "postgres") || len(store.created) != 0 || len(store.saved) != 0 || store.state.Marker || store.released != 1 {
+		t.Fatalf("close error=%v phase=%#v events=%v", err, phase, *service.events)
+	}
 }
 func eventIndex(events []string, want string) int {
 	for i, got := range events {
@@ -1068,8 +1125,8 @@ func TestUpgradeEngineFailureStopsAtBoundary(t *testing.T) {
 			svc.fail, svc.remaining = tc.target, 1
 			err := e.RunNew(context.Background(), engineRequest())
 			if tc.target == "acquire" {
-				if !errors.Is(err, ErrUpgradeLocked) {
-					t.Fatal(err)
+				if got := enginePhase(t, err); got.Phase != JournalPreflighted || got.Code != "upgrade_lock_invalid" {
+					t.Fatalf("phase=%#v", got)
 				}
 			} else if got := enginePhase(t, err); got.Phase != tc.phase {
 				t.Fatalf("phase=%s want %s", got.Phase, tc.phase)

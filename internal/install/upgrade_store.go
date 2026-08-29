@@ -15,20 +15,24 @@ import (
 	"syscall"
 )
 
-var ErrUpgradeStoreNotImplemented = errors.New("upgrade store method is not implemented")
 var ErrUpgradeJournalConflict = errors.New("upgrade journal conflict")
-var ErrLegacyProjectionRequired = errors.New("legacy activation projection is required")
 
 const storeUpgradeInProgressPath = "upgrade-in-progress"
 
 type UpgradeStore struct {
 	root             string
+	lockPath         string
+	production       bool
 	dataWriter       *DurableWriter
 	activationWriter *DurableWriter
 	configDurable    *DurableWriter
 	unitDurable      *DurableWriter
 	legacyVerifier   LegacyReleaseVerifier
 	lock             *upgradeStoreLock
+	// statusReadHook is a task-only test seam used to prove that the
+	// read-only status snapshot rejects a concurrent change. Production leaves
+	// it nil.
+	statusReadHook func()
 }
 
 // LegacyReleaseVerifier is intentionally narrow: task tests may replace only
@@ -293,9 +297,12 @@ func ProductionUpgradeStore() (*UpgradeStore, error) {
 		_ = c.Close()
 		return nil, e
 	}
-	return &UpgradeStore{root: "/", dataWriter: d, activationWriter: a, configDurable: c, unitDurable: u, legacyVerifier: fixedLegacyReleaseVerifier{writer: a}}, nil
+	return &UpgradeStore{root: "/", lockPath: "/run/lock/open-card-upgrade.lock", production: true, dataWriter: d, activationWriter: a, configDurable: c, unitDurable: u, legacyVerifier: fixedLegacyReleaseVerifier{writer: a}}, nil
 }
 func TaskUpgradeStore(root string, uid, gid int) (*UpgradeStore, error) {
+	if err := verifyPreparedTaskUpgradeLock(root, uid, gid); err != nil {
+		return nil, err
+	}
 	d, e := TaskDurableWriter(filepath.Join(root, "var/lib/open-card"), uid, gid)
 	if e != nil {
 		return nil, e
@@ -318,7 +325,124 @@ func TaskUpgradeStore(root string, uid, gid int) (*UpgradeStore, error) {
 		_ = c.Close()
 		return nil, e
 	}
-	return &UpgradeStore{root: root, dataWriter: d, activationWriter: a, configDurable: c, unitDurable: u, legacyVerifier: fixedLegacyReleaseVerifier{writer: a}}, nil
+	return &UpgradeStore{root: root, lockPath: filepath.Join(root, "run/lock/open-card-upgrade.lock"), dataWriter: d, activationWriter: a, configDurable: c, unitDurable: u, legacyVerifier: fixedLegacyReleaseVerifier{writer: a}}, nil
+}
+
+// PrepareTaskUpgradeLock is the explicit task-root setup surface for tests.
+// Production never calls it: a production lock must be provisioned by the
+// host before any upgrade or read-only preflight is attempted.
+func PrepareTaskUpgradeLock(root string, uid, gid int) error {
+	if !safeAbsoluteDurableRoot(root) || uid < 0 || gid < 0 {
+		return ErrUpgradeJournalConflict
+	}
+	if err := verifyTaskLockDirectory(root, uid, gid); err != nil {
+		return err
+	}
+	runDir := filepath.Join(root, "run")
+	if err := makeTaskLockDirectory(runDir, uid, gid); err != nil {
+		return err
+	}
+	lockDir := filepath.Join(runDir, "lock")
+	if err := makeTaskLockDirectory(lockDir, uid, gid); err != nil {
+		return err
+	}
+	path := filepath.Join(lockDir, "open-card-upgrade.lock")
+	if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
+		fd, createErr := syscall.Open(path, syscall.O_RDWR|syscall.O_CREAT|syscall.O_EXCL|syscall.O_NOFOLLOW, durableFileMode)
+		if createErr != nil {
+			return ErrUpgradeJournalConflict
+		}
+		if closeErr := syscall.Close(fd); closeErr != nil {
+			return ErrUpgradeJournalConflict
+		}
+	} else if err != nil {
+		return ErrUpgradeJournalConflict
+	}
+	if err := verifyLockFile(path, uid, gid); err != nil {
+		return err
+	}
+	return nil
+}
+
+func verifyPreparedTaskUpgradeLock(root string, uid, gid int) error {
+	if !safeAbsoluteDurableRoot(root) || uid < 0 || gid < 0 {
+		return ErrUpgradeJournalConflict
+	}
+	for _, parent := range []string{root, filepath.Join(root, "run"), filepath.Join(root, "run/lock")} {
+		if err := verifyTaskLockDirectory(parent, uid, gid); err != nil {
+			return err
+		}
+	}
+	return verifyLockFile(filepath.Join(root, "run/lock/open-card-upgrade.lock"), uid, gid)
+}
+
+func verifyTaskLockDirectory(path string, uid, gid int) error {
+	info, err := os.Lstat(path)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm()&0o022 != 0 || verifyOwner(info, uid, gid) != nil {
+		return ErrUpgradeJournalConflict
+	}
+	return nil
+}
+
+// /run/lock is commonly a root-owned sticky directory on Linux. The sticky
+// bit prevents another principal from replacing this root-owned 0600 lock;
+// rejecting that standard host layout would make the production constructor
+// unusable without improving the lock-file invariant.
+func verifyProductionLockDirectory(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || verifyOwner(info, 0, 0) != nil {
+		return ErrUpgradeJournalConflict
+	}
+	if info.Mode().Perm()&0o022 != 0 && !(info.Mode()&os.ModeSticky != 0 && info.Mode().Perm() == 0o777) {
+		return ErrUpgradeJournalConflict
+	}
+	return nil
+}
+
+func makeTaskLockDirectory(path string, uid, gid int) error {
+	if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
+		if err := os.Mkdir(path, durableDirMode); err != nil {
+			return ErrUpgradeJournalConflict
+		}
+	} else if err != nil {
+		return ErrUpgradeJournalConflict
+	}
+	return verifyTaskLockDirectory(path, uid, gid)
+}
+
+func verifyLockFile(path string, uid, gid int) error {
+	info, err := os.Lstat(path)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm() != durableFileMode || verifyOwner(info, uid, gid) != nil {
+		return ErrUpgradeJournalConflict
+	}
+	return nil
+}
+
+func (s *UpgradeStore) verifyLockPath() error {
+	if s == nil || s.dataWriter == nil || s.lockPath == "" {
+		return ErrUpgradeJournalConflict
+	}
+	uid, gid := s.dataWriter.uid, s.dataWriter.gid
+	if s.production {
+		if s.lockPath != "/run/lock/open-card-upgrade.lock" || uid != 0 || gid != 0 {
+			return ErrUpgradeJournalConflict
+		}
+		for _, parent := range []string{"/run", "/run/lock"} {
+			if err := verifyProductionLockDirectory(parent); err != nil {
+				return err
+			}
+		}
+	} else {
+		if !safeAbsoluteDurableRoot(s.root) || s.lockPath != filepath.Join(s.root, "run/lock/open-card-upgrade.lock") {
+			return ErrUpgradeJournalConflict
+		}
+		for _, parent := range []string{s.root, filepath.Join(s.root, "run"), filepath.Join(s.root, "run/lock")} {
+			if err := verifyTaskLockDirectory(parent, uid, gid); err != nil {
+				return err
+			}
+		}
+	}
+	return verifyLockFile(s.lockPath, uid, gid)
 }
 
 func TaskUpgradeStoreWithLegacyVerifier(root string, uid, gid int, verifier LegacyReleaseVerifier) (*UpgradeStore, error) {
@@ -337,22 +461,25 @@ func (s *UpgradeStore) journal(tx string) string {
 }
 
 func (s *UpgradeStore) Acquire(_ context.Context, tx string) (UpgradeLock, error) {
-	if s == nil || !validID(tx) || s.verifyLiveRoots() != nil {
+	if s == nil || !validID(tx) || s.lock != nil || s.verifyLiveRoots() != nil || s.lockPath == "" {
 		return nil, ErrUpgradeJournalConflict
 	}
-	d := filepath.Join(s.root, "run/lock")
-	if err := os.MkdirAll(d, 0700); err != nil {
+	if err := s.verifyLockPath(); err != nil {
 		return nil, err
 	}
-	p := filepath.Join(d, "open-card-upgrade.lock")
-	fd, err := syscall.Open(p, syscall.O_CREAT|syscall.O_RDWR|syscall.O_NOFOLLOW, 0600)
+	fd, err := syscall.Open(s.lockPath, syscall.O_RDWR|syscall.O_NOFOLLOW, 0)
 	if err != nil {
-		return nil, err
+		return nil, ErrUpgradeJournalConflict
 	}
-	f := os.NewFile(uintptr(fd), p)
+	var stat syscall.Stat_t
+	if err := syscall.Fstat(fd, &stat); err != nil || stat.Uid != uint32(s.dataWriter.uid) || stat.Gid != uint32(s.dataWriter.gid) || stat.Mode&syscall.S_IFMT != syscall.S_IFREG || stat.Mode&0o777 != durableFileMode {
+		_ = syscall.Close(fd)
+		return nil, ErrUpgradeJournalConflict
+	}
+	f := os.NewFile(uintptr(fd), s.lockPath)
 	if err = syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		_ = f.Close()
-		return nil, err
+		return nil, ErrUpgradeLocked
 	}
 	lock := &upgradeStoreLock{file: f, tx: tx, owner: s}
 	s.lock = lock
@@ -495,34 +622,6 @@ func (s *UpgradeStore) ReadActualState(_ context.Context, oldID, candidateID str
 	actual.OldActivationExists, actual.CandidateActivationExists = oldExists, candidateExists
 	actual.OldActivationJSONSHA256, actual.CandidateActivationJSONSHA256 = oldDigest, candidateDigest
 	return actual, nil
-}
-func (s *UpgradeStore) Preflight(_ context.Context, tx string) (ActivationV1, string, bool, error) {
-	if !s.ownsLock() || s.lock.tx != tx || !validID(tx) {
-		return ActivationV1{}, "", false, ErrUpgradeJournalConflict
-	}
-	target, err := s.activationWriter.ReadActivationLink(ActivationLinkActive)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) && s.legacyCurrentPresent() {
-			return ActivationV1{}, "", false, ErrLegacyProjectionRequired
-		}
-		return ActivationV1{}, "", false, ErrUpgradeJournalConflict
-	}
-	activeID, ok := activationIDFromTarget(target)
-	if !ok {
-		return ActivationV1{}, "", false, ErrUpgradeJournalConflict
-	}
-	activation, digest, err := s.readActivation(activeID)
-	if err != nil {
-		return ActivationV1{}, "", false, ErrUpgradeJournalConflict
-	}
-	current, err := s.activationWriter.ReadActivationLink(ActivationLinkCurrent)
-	if err != nil || current != "active/release" {
-		return ActivationV1{}, "", false, ErrUpgradeJournalConflict
-	}
-	return activation, digest, false, nil
-}
-func (s *UpgradeStore) ProjectLegacy(context.Context, string, ActivationV1) (string, error) {
-	return "", ErrUpgradeStoreNotImplemented
 }
 func (s *UpgradeStore) ReadActivationState(context.Context) (UpgradeActivationState, error) {
 	if !s.ownsLock() {

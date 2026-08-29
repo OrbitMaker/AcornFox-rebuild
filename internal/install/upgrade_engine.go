@@ -47,6 +47,22 @@ type UpgradeRequest struct {
 	ExpectedLegacy          bool
 }
 
+// UpgradeEligibilityV1 is the secret-free result of a locked, read-only
+// preflight. It proves only the immutable identities needed to decide whether
+// a later upgrade run may be attempted; it never publishes an activation,
+// creates a journal, or retains database environment bytes.
+type UpgradeEligibilityV1 struct {
+	SchemaVersion                  int    `json:"schema_version"`
+	TransactionID                  string `json:"transaction_id"`
+	Layout                         string `json:"layout"`
+	CandidateReleaseID             string `json:"candidate_release_id"`
+	CandidateReleaseManifestSHA256 string `json:"candidate_release_manifest_sha256"`
+	OldActivationID                string `json:"old_activation_id"`
+	OldActivationJSONSHA256        string `json:"old_activation_json_sha256"`
+	OldEligibilitySHA256           string `json:"old_eligibility_sha256"`
+	CandidateActivationID          string `json:"candidate_activation_id"`
+}
+
 type UpgradeLock interface{ Release() error }
 
 type UpgradeJournalStore interface {
@@ -211,6 +227,119 @@ type UpgradeEngine struct {
 	DatabaseFactory UpgradeDatabaseFactory
 	Services        UpgradeServiceDriver
 	Now             func() time.Time
+}
+
+// Preflight performs the minimum locked inspection needed to decide upgrade
+// eligibility. It deliberately has no journal, marker, pointer, unit,
+// artifact, service, snapshot, drain, or candidate-database side effects.
+func (e *UpgradeEngine) Preflight(ctx context.Context, r UpgradeRequest) (result UpgradeEligibilityV1, returnErr error) {
+	if e == nil || e.Store == nil || e.DatabaseFactory == nil || e.Now == nil || !validUpgradeRequest(r) {
+		return UpgradeEligibilityV1{}, upgradeError(JournalPreflighted, "invalid_request")
+	}
+	lock, err := acquireUpgradeLock(ctx, e.Store, r.TransactionID, JournalPreflighted)
+	if err != nil {
+		return UpgradeEligibilityV1{}, err
+	}
+	defer func() {
+		if err := lock.Release(); err != nil && returnErr == nil {
+			result = UpgradeEligibilityV1{}
+			returnErr = upgradeError(JournalPreflighted, "preflight_lock_release_failed")
+		}
+	}()
+
+	preflight, err := e.Store.PreflightPlan(ctx, UpgradePreflightRequest{TransactionID: r.TransactionID, CandidateRelease: r.CandidateRelease})
+	if err != nil || preflight.ValidateForRequest(UpgradePreflightRequest{TransactionID: r.TransactionID, CandidateRelease: r.CandidateRelease}) != nil || (preflight.Legacy != nil) != r.ExpectedLegacy {
+		return UpgradeEligibilityV1{}, upgradeError(JournalPreflighted, "preflight_failed")
+	}
+
+	var old ActivationV1
+	var oldDigest string
+	var oldEligibility string
+	var databaseEnv []byte
+	var inspectRequest ActiveDatabaseInspectionRequest
+	if preflight.Legacy != nil {
+		databaseEnv = append([]byte(nil), preflight.Legacy.DatabaseEnv...)
+		inspectRequest = ActiveDatabaseInspectionRequest{DatabaseEnv: databaseEnv, ExpectedMigration: preflight.Legacy.ExpectedMigration, ExpectedRowsSHA256: preflight.Legacy.ExpectedRowsSHA256, ExpectedRowCount: 23}
+	} else {
+		old, oldDigest = preflight.Existing.Activation, preflight.Existing.JSONSHA256
+		oldEligibility = oldDigest
+		databaseEnv = append([]byte(nil), preflight.Existing.DatabaseEnv...)
+		inspectRequest, err = inspectionRequestForActivation(databaseEnv, old)
+		if err != nil {
+			return UpgradeEligibilityV1{}, upgradeError(JournalPreflighted, "preflight_failed")
+		}
+	}
+
+	// An empty CandidateRelease selects the factory's inspection-only session.
+	// This keeps preflight from constructing candidate tooling or artifact paths.
+	database, err := e.DatabaseFactory.Open(ctx, UpgradeDatabaseOpenRequest{
+		TransactionID:         r.TransactionID,
+		CandidateActivationID: r.CandidateActivationID,
+		CandidateDatabaseName: r.CandidateDatabaseName,
+		ActiveDatabaseEnv:     databaseEnv,
+	})
+	if err != nil || database == nil {
+		return UpgradeEligibilityV1{}, upgradeError(JournalPreflighted, "database_open_failed")
+	}
+	defer func() {
+		if err := database.Close(); err != nil && returnErr == nil {
+			result = UpgradeEligibilityV1{}
+			returnErr = upgradeError(JournalPreflighted, "preflight_database_close_failed")
+		}
+	}()
+	inspected, err := database.InspectActive(ctx, inspectRequest)
+	if err != nil {
+		return UpgradeEligibilityV1{}, upgradeError(JournalPreflighted, "preflight_failed")
+	}
+	if preflight.Legacy != nil {
+		if !inspected.valid() || inspected.Migration != preflight.Legacy.ExpectedMigration || inspected.SchemaMigrationsSHA256 != preflight.Legacy.ExpectedRowsSHA256 {
+			return UpgradeEligibilityV1{}, upgradeError(JournalPreflighted, "preflight_failed")
+		}
+		old.ActivationID = preflight.Legacy.ActivationID
+		oldEligibility = legacyPreflightEligibilitySHA256(*preflight.Legacy, inspected)
+	} else if !sameDatabase(inspected, old.Database) {
+		return UpgradeEligibilityV1{}, upgradeError(JournalPreflighted, "preflight_failed")
+	}
+
+	layout := "native"
+	if preflight.Legacy != nil {
+		layout = "rc0_compat_projection"
+	}
+	return UpgradeEligibilityV1{
+		SchemaVersion:                  ActivationSchemaVersion,
+		TransactionID:                  r.TransactionID,
+		Layout:                         layout,
+		CandidateReleaseID:             r.CandidateRelease.ID,
+		CandidateReleaseManifestSHA256: r.CandidateRelease.ManifestSHA256,
+		OldActivationID:                old.ActivationID,
+		OldActivationJSONSHA256:        oldDigest,
+		OldEligibilitySHA256:           oldEligibility,
+		CandidateActivationID:          r.CandidateActivationID,
+	}, nil
+}
+
+func acquireUpgradeLock(ctx context.Context, store UpgradeJournalStore, transactionID string, phase JournalState) (UpgradeLock, error) {
+	lock, err := store.Acquire(ctx, transactionID)
+	if err != nil || lock == nil {
+		if errors.Is(err, ErrUpgradeLocked) {
+			return nil, ErrUpgradeLocked
+		}
+		return nil, upgradeError(phase, "upgrade_lock_invalid")
+	}
+	return lock, nil
+}
+
+func legacyPreflightEligibilitySHA256(plan LegacyProjectionPlan, database DatabaseV1) string {
+	payload := struct {
+		TransactionID      string     `json:"transaction_id"`
+		ActivationID       string     `json:"activation_id"`
+		Release            ReleaseV1  `json:"release"`
+		Database           DatabaseV1 `json:"database"`
+		DatabaseEnvSHA256  string     `json:"database_env_sha256"`
+		ExpectedRowsSHA256 string     `json:"expected_rows_sha256"`
+	}{plan.TransactionID, plan.ActivationID, plan.Release, database, plan.DatabaseEnvSHA256, plan.ExpectedRowsSHA256}
+	raw, _ := json.Marshal(payload)
+	return sha256Bytes(raw)
 }
 
 func upgradeError(phase JournalState, code string) error {
@@ -508,9 +637,9 @@ func (e *UpgradeEngine) RunNew(ctx context.Context, r UpgradeRequest) (result er
 	if e == nil || e.Store == nil || e.DatabaseFactory == nil || e.Services == nil || e.Now == nil || !validUpgradeRequest(r) {
 		return upgradeError(JournalPreflighted, "invalid_request")
 	}
-	lock, err := e.Store.Acquire(ctx, r.TransactionID)
-	if err != nil || lock == nil {
-		return ErrUpgradeLocked
+	lock, err := acquireUpgradeLock(ctx, e.Store, r.TransactionID, JournalPreflighted)
+	if err != nil {
+		return err
 	}
 	defer lock.Release()
 
@@ -922,9 +1051,9 @@ func (e *UpgradeEngine) Recover(ctx context.Context, transactionID string) error
 	if e == nil || e.Store == nil || e.Services == nil || e.Now == nil || !validID(transactionID) {
 		return upgradeError(JournalRecoveryRequired, "invalid_request")
 	}
-	lock, err := e.Store.Acquire(ctx, transactionID)
-	if err != nil || lock == nil {
-		return ErrUpgradeLocked
+	lock, err := acquireUpgradeLock(ctx, e.Store, transactionID, JournalRecoveryRequired)
+	if err != nil {
+		return err
 	}
 	defer lock.Release()
 	j, err := e.Store.LoadJournal(ctx, transactionID)

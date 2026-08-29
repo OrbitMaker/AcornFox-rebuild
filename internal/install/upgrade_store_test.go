@@ -24,6 +24,13 @@ type legacyVerifierFake struct {
 	err     error
 }
 
+func prepareTaskLock(t *testing.T, root string) {
+	t.Helper()
+	if err := PrepareTaskUpgradeLock(root, os.Getuid(), os.Getgid()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func (v legacyVerifierFake) VerifyRC0(string) (ReleaseV1, []MigrationRow, error) {
 	return v.release, v.rows, v.err
 }
@@ -52,6 +59,7 @@ func TestPreflightPlanLegacyWithInjectedVerifierIsPureAndRedacted(t *testing.T) 
 	release := ReleaseV1{ID: "rc0", Version: ProductionNMinusOneVersion, SourceCommit: RC0SourceCommit, Architecture: "amd64", ManifestSHA256: RC0ReleaseManifestSHA256}
 	candidate := ReleaseV1{ID: "rc1", Version: ProductionCandidateVersion, SourceCommit: strings.Repeat("a", 40), Architecture: "amd64", ManifestSHA256: strings.Repeat("b", 64)}
 	unit := []byte("[Service]\nEnvironmentFile=-/etc/open-card/server.env\nEnvironmentFile=/opt/open-card/active/database.env\n")
+	prepareTaskLock(t, root)
 	store, err := TaskUpgradeStoreWithLegacyVerifier(root, os.Getuid(), os.Getgid(), legacyVerifierFake{release: release, rows: rows, unit: unit})
 	if err != nil {
 		t.Fatal(err)
@@ -101,6 +109,7 @@ func TestUpgradeStoreLockMarkerAndStubs(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	prepareTaskLock(t, root)
 	s, err := TaskUpgradeStore(root, os.Getuid(), os.Getgid())
 	if err != nil {
 		t.Fatal(err)
@@ -123,8 +132,81 @@ func TestUpgradeStoreLockMarkerAndStubs(t *testing.T) {
 	if err = s.EnsureMarker(ctx, "txn-2"); err == nil {
 		t.Fatal("foreign marker")
 	}
-	if _, err = s.ProjectLegacy(ctx, "txn-1", ActivationV1{}); !errors.Is(err, ErrUpgradeStoreNotImplemented) {
+}
+
+func TestUpgradeStoreLockIsPreprovisionedAndValidated(t *testing.T) {
+	root := t.TempDir()
+	for _, p := range []string{"var/lib/open-card/upgrade-transactions", "opt/open-card/activations", "etc/open-card", "etc/systemd/system"} {
+		if err := os.MkdirAll(filepath.Join(root, p), durableDirMode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Chmod(filepath.Join(root, "opt/open-card/activations"), activationSlotDirMode); err != nil {
 		t.Fatal(err)
+	}
+	lockPath := filepath.Join(root, "run/lock/open-card-upgrade.lock")
+	if _, err := TaskUpgradeStore(root, os.Getuid(), os.Getgid()); err == nil {
+		t.Fatal("missing task lock constructor was accepted")
+	}
+	if _, err := os.Lstat(lockPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("constructor created task lock: %v", err)
+	}
+	if err := PrepareTaskUpgradeLock(root, os.Getuid(), os.Getgid()); err != nil {
+		t.Fatal(err)
+	}
+	store, err := TaskUpgradeStore(root, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := os.Remove(lockPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Acquire(context.Background(), "txn-1"); err == nil {
+		t.Fatal("missing lock was accepted")
+	}
+	if _, err := os.Lstat(lockPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Acquire recreated missing task lock: %v", err)
+	}
+	if err := PrepareTaskUpgradeLock(root, os.Getuid(), os.Getgid()); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyLockFile(lockPath, os.Getuid()+1, os.Getgid()); err == nil {
+		t.Fatal("wrong-owner lock was accepted")
+	}
+	if err := os.Chmod(lockPath, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Acquire(context.Background(), "txn-1"); err == nil {
+		t.Fatal("wrong-mode lock was accepted")
+	}
+	if err := os.Remove(lockPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("elsewhere", lockPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Acquire(context.Background(), "txn-1"); err == nil {
+		t.Fatal("symlink lock was accepted")
+	}
+	if err := os.Remove(lockPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := PrepareTaskUpgradeLock(root, os.Getuid(), os.Getgid()); err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.Acquire(context.Background(), "txn-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Release()
+	secondStore, err := TaskUpgradeStore(root, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer secondStore.Close()
+	if _, err := secondStore.Acquire(context.Background(), "txn-2"); !errors.Is(err, ErrUpgradeLocked) {
+		t.Fatalf("busy lock err=%v", err)
 	}
 }
 
@@ -135,6 +217,7 @@ func TestUpgradeStoreMarkerRequiresOwnedLock(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	prepareTaskLock(t, root)
 	s, err := TaskUpgradeStore(root, os.Getuid(), os.Getgid())
 	if err != nil {
 		t.Fatal(err)
@@ -206,6 +289,7 @@ func TestUpgradeStoreRejectsReplacedPinnedRoots(t *testing.T) {
 	if err := os.Chmod(filepath.Join(root, "opt/open-card/activations"), activationSlotDirMode); err != nil {
 		t.Fatal(err)
 	}
+	prepareTaskLock(t, root)
 	s, err := TaskUpgradeStore(root, os.Getuid(), os.Getgid())
 	if err != nil {
 		t.Fatal(err)
@@ -239,6 +323,7 @@ func TestUpgradeStoreRejectsReplacedPinnedRoots(t *testing.T) {
 		// Recreate the store each loop so each root is independently pinned.
 		_ = lock.Release()
 		s.Close()
+		prepareTaskLock(t, root)
 		s, err = TaskUpgradeStore(root, os.Getuid(), os.Getgid())
 		if err != nil {
 			t.Fatal(err)
@@ -630,6 +715,7 @@ func candidateStore(t *testing.T) (*UpgradeStore, string, ActivationV1, []byte, 
 		Database:          DatabaseV1{Name: "open_card_act_0123456789abcdef", Migration: manifest.MigrationVersion, SchemaMigrationsSHA256: strings.Repeat("a", 64)},
 		DatabaseEnvSHA256: hex.EncodeToString(envDigest[:]), CreatedAt: time.Unix(1, 0).UTC(), CreatedByTransactionID: "txn-1",
 	}
+	prepareTaskLock(t, root)
 	store, err := TaskUpgradeStore(root, os.Getuid(), os.Getgid())
 	if err != nil {
 		t.Fatal(err)
@@ -833,34 +919,6 @@ func TestUpgradeStoreRejectsWritableSlotsAndReadableSecrets(t *testing.T) {
 	}
 }
 
-func TestUpgradeStorePreflightAndPointersCAS(t *testing.T) {
-	store, _, old, candidate, _, lock, cleanup := seededPointerStore(t)
-	defer cleanup()
-	defer lock.Release()
-
-	got, oldDigest, legacy, err := store.Preflight(context.Background(), "txn-1")
-	if err != nil || legacy || got.ActivationID != old.ActivationID || !validSHA(oldDigest) {
-		t.Fatalf("preflight activation=%#v digest=%q legacy=%v err=%v", got, oldDigest, legacy, err)
-	}
-	if err := store.SetPrevious(context.Background(), old.ActivationID); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.SwapActive(context.Background(), candidate.ActivationID); err != nil {
-		t.Fatal(err)
-	}
-	state, err := store.ReadActivationState(context.Background())
-	if err != nil || state.ActiveID != candidate.ActivationID || state.PreviousID != old.ActivationID || state.Marker {
-		t.Fatalf("after switch state=%#v err=%v", state, err)
-	}
-	if err := store.RestoreActive(context.Background(), old.ActivationID, candidate.ActivationID); err != nil {
-		t.Fatal(err)
-	}
-	state, err = store.ReadActivationState(context.Background())
-	if err != nil || state.ActiveID != old.ActivationID || state.PreviousID != candidate.ActivationID {
-		t.Fatalf("after restore state=%#v err=%v", state, err)
-	}
-}
-
 func TestUpgradeStoreRestorePreviousAndActualState(t *testing.T) {
 	store, _, old, candidate, _, lock, cleanup := seededPointerStore(t)
 	defer cleanup()
@@ -916,36 +974,6 @@ func TestUpgradeStoreReadActivationStateFailsClosedOnCurrentDrift(t *testing.T) 
 	}
 	if _, err := store.ReadActivationState(context.Background()); !errors.Is(err, ErrUpgradeJournalConflict) {
 		t.Fatalf("current drift accepted: %v", err)
-	}
-}
-
-func TestUpgradeStorePreflightRefusesLegacyAndPointerDrift(t *testing.T) {
-	store, root, old, _, _, lock, cleanup := seededPointerStore(t)
-	defer cleanup()
-	defer lock.Release()
-	if err := os.Remove(filepath.Join(root, "opt/open-card/active")); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(filepath.Join(root, "opt/open-card/current")); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink("releases/"+old.Release.ID, filepath.Join(root, "opt/open-card/current")); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(filepath.Join(root, "etc/open-card"), durableDirMode); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(root, "etc/open-card/server.env"), []byte("legacy"), durableFileMode); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, _, err := store.Preflight(context.Background(), "txn-1"); !errors.Is(err, ErrLegacyProjectionRequired) {
-		t.Fatalf("legacy preflight err=%v", err)
-	}
-	if err := os.Remove(filepath.Join(root, "etc/open-card/server.env")); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, _, err := store.Preflight(context.Background(), "txn-1"); !errors.Is(err, ErrUpgradeJournalConflict) {
-		t.Fatalf("missing active preflight err=%v", err)
 	}
 }
 
