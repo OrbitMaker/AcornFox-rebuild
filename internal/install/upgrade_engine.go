@@ -55,8 +55,11 @@ type UpgradeJournalStore interface {
 	LoadJournal(context.Context, string) (UpgradeJournalV1, error)
 	ReadActualState(context.Context, string, string) (UpgradeActualState, error)
 	EnsureMarker(context.Context, string) error
-	Preflight(context.Context, string) (ActivationV1, string, bool, error)
-	ProjectLegacy(context.Context, string, ActivationV1) (string, error)
+	PreflightPlan(context.Context, UpgradePreflightRequest) (UpgradePreflight, error)
+	PrepareLegacyProjection(context.Context, LegacyProjectionPlan, ActivationV1) (LegacyProjectionObservation, error)
+	FinalizeLegacyProjection(context.Context, LegacyProjectionPlan, ActivationV1) (LegacyProjectionObservation, error)
+	ReadLegacyProjection(context.Context, LegacyProjectionPlan, ActivationV1) (LegacyProjectionObservation, error)
+	RecoverLegacyPlan(context.Context, ActivationV1, string) (LegacyProjectionPlan, error)
 	ReadActivationState(context.Context) (UpgradeActivationState, error)
 	CreateJournal(context.Context, UpgradeJournalV1) error
 	SaveJournal(context.Context, UpgradeJournalV1) error
@@ -69,6 +72,7 @@ type UpgradeJournalStore interface {
 }
 
 type UpgradeDatabaseDriver interface {
+	InspectActive(context.Context, ActiveDatabaseInspectionRequest) (DatabaseV1, error)
 	Drain(context.Context) error
 	Snapshot(context.Context) (SnapshotEvidence, string, error)
 	CreateRestore(context.Context, string) error
@@ -92,9 +96,60 @@ type UpgradeServiceDriver interface {
 	StartEdge(context.Context) error
 	HealthEdge(context.Context) error
 	GuardEdge(context.Context) error
+	ReloadServerUnit(context.Context, string) error
 	RestoreSnapshot(context.Context, ServiceSnapshotV1) error
 	HealthRestoredInternal(context.Context) error
 	RestoreEdge(context.Context, ServiceSnapshotV1) error
+}
+
+func legacyActivation(plan LegacyProjectionPlan, database DatabaseV1, createdAt time.Time) (ActivationV1, string, error) {
+	if plan.Validate() != nil || database.Migration != plan.ExpectedMigration || database.SchemaMigrationsSHA256 != plan.ExpectedRowsSHA256 || !database.valid() {
+		return ActivationV1{}, "", errors.New("invalid legacy activation facts")
+	}
+	activation := ActivationV1{
+		SchemaVersion:          ActivationSchemaVersion,
+		ActivationID:           plan.ActivationID,
+		Origin:                 "rc0_compat_projection",
+		Release:                plan.Release,
+		Database:               database,
+		DatabaseEnvSHA256:      plan.DatabaseEnvSHA256,
+		CreatedAt:              createdAt.UTC(),
+		CreatedByTransactionID: plan.TransactionID,
+		LegacyProjection: &LegacyProjectionV1{
+			Target:                 plan.CurrentTarget,
+			ServerEnvBeforeSHA256:  plan.ServerEnvBeforeSHA256,
+			ServerEnvAfterSHA256:   plan.ServerEnvAfterSHA256,
+			ServerUnitBeforeSHA256: plan.ServerUnitBeforeSHA256,
+			ServerUnitAfterSHA256:  plan.ServerUnitAfterSHA256,
+			ServerUnitReleaseID:    plan.ServerUnitReleaseID,
+		},
+	}
+	digest, err := CanonicalActivationJSONSHA256(activation)
+	if err != nil || activation.Validate() != nil {
+		return ActivationV1{}, "", errors.New("invalid legacy activation")
+	}
+	return activation, digest, nil
+}
+
+func sameDatabase(left, right DatabaseV1) bool {
+	return left.Name == right.Name && left.Migration == right.Migration && left.SchemaMigrationsSHA256 == right.SchemaMigrationsSHA256
+}
+
+func expectedLegacyObservation(plan LegacyProjectionPlan, activation ActivationV1, digest string) LegacyProjectionObservation {
+	return LegacyProjectionObservation{
+		ActivationID:         activation.ActivationID,
+		ActivationJSONSHA256: digest,
+		DatabaseEnvSHA256:    activation.DatabaseEnvSHA256,
+		Active:               ActivationPointerIdentity{ID: activation.ActivationID, JSONSHA256: digest},
+		Previous:             plan.Previous,
+		CurrentTarget:        legacyCurrentTarget,
+		ServerEnvSHA256:      plan.ServerEnvAfterSHA256,
+		ServerUnitSHA256:     plan.ServerUnitAfterSHA256,
+	}
+}
+
+func sameLegacyObservation(left, right LegacyProjectionObservation) bool {
+	return left.ActivationID == right.ActivationID && left.ActivationJSONSHA256 == right.ActivationJSONSHA256 && left.DatabaseEnvSHA256 == right.DatabaseEnvSHA256 && left.Active.equal(right.Active) && left.Previous.equal(right.Previous) && left.CurrentTarget == right.CurrentTarget && left.ServerEnvSHA256 == right.ServerEnvSHA256 && left.ServerUnitSHA256 == right.ServerUnitSHA256
 }
 
 type UpgradeEngine struct {
@@ -259,6 +314,36 @@ func (e *UpgradeEngine) recoveryRequired(ctx context.Context, j *UpgradeJournalV
 	return upgradeErrorWith(JournalRecoveryRequired, "recovery_required", cause)
 }
 
+// legacyProjectionPending preserves PREFLIGHTED until the compatibility
+// projection has been durably recorded. Prepare/reload/finalize/read errors
+// can be retried idempotently; terminalizing them would make the specifically
+// journaled legacy recovery path unreachable. Only an unprovable journal
+// outcome is escalated to RECOVERY_REQUIRED.
+func (e *UpgradeEngine) legacyProjectionPending(ctx context.Context, j *UpgradeJournalV1, transactionID string, cause error) error {
+	if err := e.Store.EnsureMarker(ctx, transactionID); err != nil {
+		_ = e.Services.GuardEdge(ctx)
+		return e.recoveryRequired(ctx, j, JournalLegacyProjected, "legacy_projection_failed", err)
+	}
+	if err := e.Services.GuardEdge(ctx); err != nil {
+		return e.recoveryRequired(ctx, j, JournalLegacyProjected, "legacy_projection_failed", err)
+	}
+	phase := JournalPreflighted
+	if outcomeUnknown(cause) {
+		latest, err := e.Store.LoadJournal(ctx, transactionID)
+		if err != nil || latest.Validate() != nil || latest.TransactionID != transactionID {
+			return e.recoveryRequired(ctx, j, JournalLegacyProjected, "legacy_projection_failed", cause)
+		}
+		switch latest.State {
+		case JournalPreflighted:
+		case JournalLegacyProjected:
+			phase = JournalLegacyProjected
+		default:
+			return e.recoveryRequired(ctx, j, JournalLegacyProjected, "legacy_projection_failed", cause)
+		}
+	}
+	return upgradeErrorWith(phase, "legacy_projection_pending", cause)
+}
+
 func (e *UpgradeEngine) abortPreSwitch(ctx context.Context, j *UpgradeJournalV1, old ActivationV1, baseline UpgradeActivationState, phase JournalState, code string, cause error) error {
 	current, err := e.Store.ReadActivationState(ctx)
 	if err != nil || current.ActiveID != old.ActivationID || current.ActiveActivationJSONSHA256 != j.OldActivationJSONSHA256 {
@@ -376,19 +461,35 @@ func (e *UpgradeEngine) RunNew(ctx context.Context, r UpgradeRequest) error {
 	}
 	defer lock.Release()
 
-	old, oldJSONSHA256, actualLegacy, err := e.Store.Preflight(ctx, r.TransactionID)
-	if err != nil || old.Validate() != nil || !validSHA(oldJSONSHA256) || actualLegacy != r.ExpectedLegacy {
+	preflight, err := e.Store.PreflightPlan(ctx, UpgradePreflightRequest{TransactionID: r.TransactionID, CandidateRelease: r.CandidateRelease})
+	if err != nil || preflight.ValidateForRequest(UpgradePreflightRequest{TransactionID: r.TransactionID, CandidateRelease: r.CandidateRelease}) != nil || (preflight.Legacy != nil) != r.ExpectedLegacy {
 		return upgradeError(JournalPreflighted, "preflight_failed")
 	}
-	baseline, err := e.Store.ReadActivationState(ctx)
-	if err != nil || baseline.Marker || !sameOldState(baseline, baseline, old, oldJSONSHA256) {
-		return upgradeError(JournalPreflighted, "preflight_failed")
+	actualLegacy := preflight.Legacy != nil
+	var old ActivationV1
+	var oldJSONSHA256 string
+	baseline := UpgradeActivationState{PreviousID: preflight.Previous.ID, PreviousJSONSHA256: preflight.Previous.JSONSHA256}
+	now := e.now()
+	if actualLegacy {
+		inspected, inspectErr := e.Database.InspectActive(ctx, ActiveDatabaseInspectionRequest{DatabaseEnv: preflight.Legacy.DatabaseEnv, ExpectedMigration: preflight.Legacy.ExpectedMigration, ExpectedRowsSHA256: preflight.Legacy.ExpectedRowsSHA256})
+		if inspectErr != nil {
+			return upgradeError(JournalPreflighted, "preflight_failed")
+		}
+		old, oldJSONSHA256, err = legacyActivation(*preflight.Legacy, inspected, now)
+		if err != nil {
+			return upgradeError(JournalPreflighted, "preflight_failed")
+		}
+	} else {
+		old, oldJSONSHA256 = preflight.Existing.Activation, preflight.Existing.JSONSHA256
+		baseline, err = e.Store.ReadActivationState(ctx)
+		if err != nil || baseline.Marker || !sameOldState(baseline, baseline, old, oldJSONSHA256) {
+			return upgradeError(JournalPreflighted, "preflight_failed")
+		}
 	}
 	serviceSnapshot, err := e.Services.Capture(ctx)
 	if err != nil {
 		return upgradeError(JournalPreflighted, "service_capture_failed")
 	}
-	now := e.now()
 	j := UpgradeJournalV1{
 		SchemaVersion:                          ActivationSchemaVersion,
 		TransactionID:                          r.TransactionID,
@@ -405,6 +506,10 @@ func (e *UpgradeEngine) RunNew(ctx context.Context, r UpgradeRequest) error {
 		CandidateDatabaseName:                  r.CandidateDatabaseName,
 		ServiceSnapshot:                        serviceSnapshot,
 		History:                                []JournalTransitionV1{},
+	}
+	if actualLegacy {
+		planned := old
+		j.PlannedOldActivation = &planned
 	}
 	if err := j.Validate(); err != nil {
 		return upgradeError(JournalPreflighted, "invalid_journal")
@@ -425,6 +530,9 @@ func (e *UpgradeEngine) RunNew(ctx context.Context, r UpgradeRequest) error {
 		}
 	}
 	fail := func(phase JournalState, code string, cause error) error {
+		if actualLegacy && j.State == JournalPreflighted {
+			return e.recoveryRequired(ctx, &j, phase, code, cause)
+		}
 		return e.handleFailure(ctx, &j, old, baseline, phase, code, cause)
 	}
 	if err := e.Store.Marker(ctx, true); err != nil {
@@ -437,16 +545,29 @@ func (e *UpgradeEngine) RunNew(ctx context.Context, r UpgradeRequest) error {
 		return fail(JournalQuiesced, "database_drain_failed", err)
 	}
 	if actualLegacy {
-		projectedDigest, err := e.Store.ProjectLegacy(ctx, r.TransactionID, old)
-		if err != nil || projectedDigest != oldJSONSHA256 {
-			return fail(JournalLegacyProjected, "legacy_projection_failed", err)
+		plan := *preflight.Legacy
+		inspected, inspectErr := e.Database.InspectActive(ctx, ActiveDatabaseInspectionRequest{DatabaseEnv: plan.DatabaseEnv, ExpectedMigration: plan.ExpectedMigration, ExpectedRowsSHA256: plan.ExpectedRowsSHA256})
+		if inspectErr != nil || !sameDatabase(inspected, old.Database) {
+			return e.recoveryRequired(ctx, &j, JournalLegacyProjected, "legacy_projection_failed", inspectErr)
 		}
-		projected, err := e.Store.ReadActivationState(ctx)
-		if err != nil || projected.ActiveID != old.ActivationID || projected.ActiveActivationJSONSHA256 != oldJSONSHA256 {
-			return e.recoveryRequired(ctx, &j, JournalLegacyProjected, "legacy_projection_failed", err)
+		if _, err := e.Store.PrepareLegacyProjection(ctx, plan, old); err != nil {
+			return e.legacyProjectionPending(ctx, &j, r.TransactionID, err)
+		}
+		if err := e.Services.ReloadServerUnit(ctx, plan.ServerUnitAfterSHA256); err != nil {
+			return e.legacyProjectionPending(ctx, &j, r.TransactionID, err)
+		}
+		if _, err := e.Store.FinalizeLegacyProjection(ctx, plan, old); err != nil {
+			return e.legacyProjectionPending(ctx, &j, r.TransactionID, err)
+		}
+		observation, err := e.Store.ReadLegacyProjection(ctx, plan, old)
+		if err != nil || observation.Validate() != nil || !sameLegacyObservation(observation, expectedLegacyObservation(plan, old, oldJSONSHA256)) {
+			if err == nil {
+				err = errors.New("legacy projection observation mismatch")
+			}
+			return e.legacyProjectionPending(ctx, &j, r.TransactionID, err)
 		}
 		if err := e.advance(ctx, &j, JournalLegacyProjected); err != nil {
-			return fail(JournalLegacyProjected, "legacy_projection_failed", err)
+			return e.legacyProjectionPending(ctx, &j, r.TransactionID, err)
 		}
 	}
 	if err := e.advance(ctx, &j, JournalQuiesced); err != nil {
@@ -539,7 +660,7 @@ func actualMatchesCandidate(s UpgradeActualState, j UpgradeJournalV1) bool {
 }
 
 func actualPreviousOld(s UpgradeActualState, j UpgradeJournalV1) bool {
-	return s.PreviousID == j.OldActivationID && s.OldActivationJSONSHA256 == j.OldActivationJSONSHA256
+	return s.PreviousID == j.OldActivationID && s.PreviousActivationJSONSHA256 == j.OldActivationJSONSHA256
 }
 
 func actualBaselinePrevious(s UpgradeActualState, j UpgradeJournalV1) bool {
@@ -617,6 +738,63 @@ func (e *UpgradeEngine) convergeCommittedPublic(ctx context.Context, j *UpgradeJ
 	return nil
 }
 
+// recoverLegacyPreflight finishes only the compatibility projection that was
+// already journaled. It deliberately restores the old service policy and
+// stops at ABORTED_PRE_SWITCH rather than silently resuming a new candidate
+// upgrade after a host crash.
+func (e *UpgradeEngine) recoverLegacyPreflight(ctx context.Context, j *UpgradeJournalV1, transactionID string) error {
+	if e.Database == nil {
+		return e.recoverRecovery(ctx, j, transactionID, JournalPreflighted, errors.New("legacy database driver unavailable"))
+	}
+	if j.PlannedOldActivation == nil || j.PlannedOldActivation.Validate() != nil || j.PlannedOldActivation.LegacyProjection == nil {
+		return e.recoverRecovery(ctx, j, transactionID, j.State, errors.New("missing planned legacy activation"))
+	}
+	old := *j.PlannedOldActivation
+	if err := e.Store.EnsureMarker(ctx, transactionID); err != nil {
+		_ = e.Services.GuardEdge(ctx)
+		return upgradeErrorWith(JournalRecoveryRequired, "recovery_required", err)
+	}
+	if err := e.Services.GuardEdge(ctx); err != nil {
+		return e.recoverRecovery(ctx, j, transactionID, j.State, err)
+	}
+	plan, err := e.Store.RecoverLegacyPlan(ctx, old, j.RequestedManifestSHA256)
+	if err != nil || plan.TransactionID != transactionID || plan.ActivationID != old.ActivationID || plan.Validate() != nil || plan.ServerUnitReleaseID != old.LegacyProjection.ServerUnitReleaseID {
+		return e.recoverRecovery(ctx, j, transactionID, j.State, err)
+	}
+	baseline := ActivationPointerIdentity{ID: j.PreUpgradePreviousActivationID, JSONSHA256: j.PreUpgradePreviousActivationJSONSHA256}
+	if baseline.Validate() != nil || !plan.Previous.equal(baseline) {
+		return e.recoverRecovery(ctx, j, transactionID, j.State, errors.New("legacy previous pointer drift"))
+	}
+	inspected, err := e.Database.InspectActive(ctx, ActiveDatabaseInspectionRequest{DatabaseEnv: plan.DatabaseEnv, ExpectedMigration: plan.ExpectedMigration, ExpectedRowsSHA256: plan.ExpectedRowsSHA256})
+	if err != nil || !sameDatabase(inspected, old.Database) {
+		return e.recoverRecovery(ctx, j, transactionID, j.State, err)
+	}
+	if _, err := e.Store.PrepareLegacyProjection(ctx, plan, old); err != nil {
+		return e.recoverRecovery(ctx, j, transactionID, j.State, err)
+	}
+	if err := e.Services.ReloadServerUnit(ctx, plan.ServerUnitAfterSHA256); err != nil {
+		return e.recoverRecovery(ctx, j, transactionID, j.State, err)
+	}
+	if _, err := e.Store.FinalizeLegacyProjection(ctx, plan, old); err != nil {
+		return e.recoverRecovery(ctx, j, transactionID, j.State, err)
+	}
+	observation, err := e.Store.ReadLegacyProjection(ctx, plan, old)
+	if err != nil || observation.Validate() != nil || !sameLegacyObservation(observation, expectedLegacyObservation(plan, old, j.OldActivationJSONSHA256)) {
+		return e.recoverRecovery(ctx, j, transactionID, j.State, err)
+	}
+	if err := e.advance(ctx, j, JournalLegacyProjected); err != nil {
+		return e.recoverRecovery(ctx, j, transactionID, j.State, err)
+	}
+	if err := e.restoreOldServices(ctx, j); err != nil {
+		return e.recoverRecovery(ctx, j, transactionID, j.State, err)
+	}
+	j.Failure = recoveredFailure(JournalLegacyProjected, errors.New("recovered legacy projection"))
+	if err := e.advance(ctx, j, JournalAbortedPreSwitch); err != nil {
+		return e.recoverRecovery(ctx, j, transactionID, j.State, err)
+	}
+	return upgradeError(JournalAbortedPreSwitch, "recovered")
+}
+
 // Recover reconciles one durable journal against observed activation and marker
 // state. It never removes upgrade artifacts; ambiguity is preserved as a
 // RECOVERY_REQUIRED journal rather than guessed away.
@@ -633,6 +811,9 @@ func (e *UpgradeEngine) Recover(ctx context.Context, transactionID string) error
 	if err != nil || j.TransactionID != transactionID || j.Validate() != nil {
 		_ = e.Services.GuardEdge(ctx)
 		return upgradeError(JournalRecoveryRequired, "integrity_failed")
+	}
+	if j.State == JournalPreflighted && j.PlannedOldActivation != nil {
+		return e.recoverLegacyPreflight(ctx, &j, transactionID)
 	}
 	actual, err := e.Store.ReadActualState(ctx, j.OldActivationID, j.CandidateActivationID)
 	if err != nil {

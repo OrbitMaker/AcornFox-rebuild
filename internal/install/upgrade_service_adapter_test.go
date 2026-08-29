@@ -169,6 +169,46 @@ func TestUpgradeServiceAdapterStartEdgePreservesEnabledPolicy(t *testing.T) {
 	}
 }
 
+func TestUpgradeServiceAdapterReloadServerUnitForwardsOnlyFixedControllerOperation(t *testing.T) {
+	raw := []byte("[Service]\nExecStart=/opt/open-card/current/bin/open-card-server\n")
+	reader := &serverUnitReaderFixture{results: []serverUnitReadResult{{raw: raw, info: safeServerUnitInfoFixture()}, {raw: raw, info: safeServerUnitInfoFixture()}}}
+	runner := &serverUnitReloadRunner{shows: []CommandResult{serverUnitShow(productionServerUnitPath, "", "yes"), serverUnitShow(productionServerUnitPath, "", "no")}}
+	controller, err := TaskServiceControllerWithServerUnit(runner, func() (bool, error) { return false, nil }, nil, productionServerUnitPath, reader.Read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter, err := TaskUpgradeServiceAdapter(controller, UpgradeServiceProbeConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := adapter.ReloadServerUnit(context.Background(), serverUnitHash(raw)); err != nil {
+		t.Fatal(err)
+	}
+	want := [][]string{
+		{"systemctl", "show", "open-card-server.service", "--property=FragmentPath", "--property=DropInPaths", "--property=NeedDaemonReload"},
+		{"systemctl", "daemon-reload"},
+		{"systemctl", "show", "open-card-server.service", "--property=FragmentPath", "--property=DropInPaths", "--property=NeedDaemonReload"},
+	}
+	if !reflect.DeepEqual(runner.argv, want) {
+		t.Fatalf("adapter reload commands = %v, want %v", runner.argv, want)
+	}
+
+	reader = &serverUnitReaderFixture{results: []serverUnitReadResult{{raw: raw, info: safeServerUnitInfoFixture()}}}
+	runner = &serverUnitReloadRunner{shows: []CommandResult{serverUnitShow(productionServerUnitPath, "", "yes")}, reload: CommandResult{ExitCode: -1, Output: "secret output", Err: errors.New("secret error")}}
+	controller, err = TaskServiceControllerWithServerUnit(runner, func() (bool, error) { return false, nil }, nil, productionServerUnitPath, reader.Read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter, err = TaskUpgradeServiceAdapter(controller, UpgradeServiceProbeConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = adapter.ReloadServerUnit(context.Background(), serverUnitHash(raw))
+	if !errors.Is(err, ErrServiceOutcomeUnknown) || strings.Contains(err.Error(), "secret") {
+		t.Fatalf("adapter reload error = %v", err)
+	}
+}
+
 func TestUpgradeServiceAdapterRestoreInternalPolicyOrderAndHealth(t *testing.T) {
 	paths := []string{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

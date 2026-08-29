@@ -107,6 +107,15 @@ type ProductionPostgresControl struct {
 	base        *url.URL
 }
 
+// SelectedPostgresDatabase is a short-lived connection to exactly the
+// database named by database.env. It is deliberately separate from
+// ProductionPostgresControl, whose administrative connection is rewritten to
+// /postgres for cluster-level candidate operations.
+type SelectedPostgresDatabase struct {
+	database    postgresDB
+	environment PostgresProcessEnvironment
+}
+
 // Small database seams keep adapter behavior unit-testable without requiring a
 // live PostgreSQL server or a third-party SQL mock package.
 type postgresDB interface {
@@ -177,6 +186,40 @@ func NewProductionPostgresControl(databaseEnv []byte) (*ProductionPostgresContro
 		return nil, errors.New("open postgres control failed")
 	}
 	return &ProductionPostgresControl{databaseSQL{db}, env, u}, nil
+}
+
+func NewSelectedPostgresDatabase(databaseEnv []byte) (*SelectedPostgresDatabase, error) {
+	environment, err := PostgresEnvironment(databaseEnv)
+	if err != nil {
+		return nil, errors.New("invalid database environment")
+	}
+	dsn, err := ParseDatabaseEnv(databaseEnv)
+	if err != nil {
+		return nil, errors.New("invalid database environment")
+	}
+	u, err := url.Parse(dsn)
+	if err != nil || strings.Trim(u.EscapedPath(), "/") != environment.Descriptor.Database {
+		return nil, errors.New("invalid database environment")
+	}
+	database, err := sql.Open("pgx", u.String())
+	if err != nil {
+		return nil, errors.New("open selected database failed")
+	}
+	return &SelectedPostgresDatabase{database: databaseSQL{database}, environment: environment}, nil
+}
+
+func (s *SelectedPostgresDatabase) Close() error {
+	if s == nil || s.database == nil {
+		return nil
+	}
+	return s.database.Close()
+}
+
+func (s *SelectedPostgresDatabase) MigrationRows(ctx context.Context) ([]MigrationRow, error) {
+	if s == nil || s.database == nil {
+		return nil, ErrPostgresOutcomeUnknown
+	}
+	return (&SQLMigrationControl{database: s.database}).MigrationRows(ctx)
 }
 func (p *ProductionPostgresControl) Close() error {
 	if p == nil || p.admin == nil {

@@ -37,6 +37,51 @@ func TestTaskDurableWriterRejectsRootOwnerMismatch(t *testing.T) {
 	}
 }
 
+func TestDurableWriterRejectsLiveRootReplacement(t *testing.T) {
+	w, root := taskWriter(t)
+	moved := root + "-moved"
+	if err := os.Rename(root, moved); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(root, durableDirMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.VerifyLiveRoot(); err == nil {
+		t.Fatal("writer accepted a replacement root")
+	}
+	if err := w.WriteMetadata("journal/replaced.json", []byte("x")); err == nil {
+		t.Fatal("writer wrote through a replaced root")
+	}
+	if _, err := os.Lstat(filepath.Join(root, "journal", "replaced.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("replacement root received a write: %v", err)
+	}
+}
+
+func TestChildWriterKeepsPinnedParentIdentity(t *testing.T) {
+	w, root := taskWriter(t)
+	if err := os.Chmod(filepath.Join(root, "activations"), activationSlotDirMode); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.CreateChildDirectory("slot", activationSlotDirMode); err != nil {
+		t.Fatal(err)
+	}
+	child, err := w.OpenChildWriter("slot", activationSlotDirMode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer child.Close()
+	moved := root + "-moved"
+	if err := os.Rename(root, moved); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(root, durableDirMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := child.WriteMetadata("activation.json", []byte("x")); err == nil {
+		t.Fatal("child writer wrote after its parent root was replaced")
+	}
+}
+
 func TestTaskDurableWriterWritesAndRereadsMetadata(t *testing.T) {
 	w, root := taskWriter(t)
 	if err := w.WriteMetadata("journal/transaction.json", []byte(`{"state":"PREFLIGHTED"}`)); err != nil {
@@ -169,9 +214,10 @@ func TestReadAndRemoveActivationLinkPropagateFaults(t *testing.T) {
 
 type phaseFaultOps struct {
 	durableOps
-	fail       string
-	syncCalls  int
-	closeCalls int
+	fail        string
+	syncCalls   int
+	closeCalls  int
+	afterRename func() error
 }
 
 func (f *phaseFaultOps) OpenFile(name string, flag int, mode os.FileMode) (*os.File, error) {
@@ -260,7 +306,23 @@ func (f *phaseFaultOps) Rename(oldName, newName string) error {
 	if f.fail == "rename" || f.fail == "link-rename" {
 		return errors.New("injected rename failure")
 	}
-	return f.durableOps.Rename(oldName, newName)
+	if err := f.durableOps.Rename(oldName, newName); err != nil {
+		return err
+	}
+	if f.afterRename != nil {
+		return f.afterRename()
+	}
+	return nil
+}
+
+func (f *phaseFaultOps) Link(oldName, newName string) error {
+	if err := f.durableOps.Link(oldName, newName); err != nil {
+		return err
+	}
+	if f.afterRename != nil {
+		return f.afterRename()
+	}
+	return nil
 }
 
 func (f *phaseFaultOps) Symlink(target, name string) error {
@@ -300,6 +362,21 @@ func faultWriter(t *testing.T, fail string, activation bool) (*DurableWriter, st
 	return w, root
 }
 
+func renameHookWriter(t *testing.T, root string) (*DurableWriter, *phaseFaultOps) {
+	t.Helper()
+	opened, err := os.OpenRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := realDurableOps{durableRoot: osDurableRoot{root: opened}}
+	fault := &phaseFaultOps{durableOps: base}
+	w, err := newDurableWriter(root, os.Getuid(), os.Getgid(), fault)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return w, fault
+}
+
 func TestWriteMetadataPropagatesEveryPreRenameBoundaryFailure(t *testing.T) {
 	for _, phase := range []string{"create", "write", "fsync1", "chmod", "chown", "fsync2", "close", "rename"} {
 		t.Run(phase, func(t *testing.T) {
@@ -335,6 +412,35 @@ func TestCreateMetadataDoesNotReplaceExistingDestination(t *testing.T) {
 	got, err := w.ReadMetadata("journal/item")
 	if err != nil || string(got) != "first" {
 		t.Fatalf("got=%q err=%v", got, err)
+	}
+}
+
+func TestRemoveMetadataValidatesLeafAndDistinguishesMissing(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, durableDirMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(root, "meta"), durableDirMode); err != nil {
+		t.Fatal(err)
+	}
+	w, err := TaskDurableWriter(root, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.CreateMetadata("meta/item", []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.RemoveMetadata("meta/item"); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.RemoveMetadata("meta/item"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing err=%v", err)
+	}
+	if err := os.Symlink("/tmp", filepath.Join(root, "meta", "link")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.RemoveMetadata("meta/link"); err == nil {
+		t.Fatal("symlink accepted")
 	}
 }
 
@@ -442,5 +548,35 @@ func TestUpgradeMarkerRequiresExplicitPreparedParent(t *testing.T) {
 	}
 	if _, err := os.Lstat(filepath.Join(root, "var")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("marker writer created an unexpected parent directory: %v", err)
+	}
+}
+
+func TestPublishedMetadataAndLinkRejectPostRenameRootReplacement(t *testing.T) {
+	for _, operation := range []string{"metadata", "systemd-unit", "link"} {
+		t.Run(operation, func(t *testing.T) {
+			w, root := faultWriter(t, "", operation == "link")
+			fault, ok := w.ops.(*phaseFaultOps)
+			if !ok {
+				t.Fatal("test writer does not expose fault operations")
+			}
+			fault.afterRename = func() error {
+				moved := root + "-moved"
+				if err := os.Rename(root, moved); err != nil {
+					return err
+				}
+				return os.Mkdir(root, durableDirMode)
+			}
+			var err error
+			if operation == "metadata" {
+				err = w.WriteMetadata("journal/published.json", []byte("published"))
+			} else if operation == "systemd-unit" {
+				err = w.WriteSystemdServerUnit([]byte("[Service]\n"))
+			} else {
+				err = w.SwapActivationLink(ActivationLinkActive, "act-1", "")
+			}
+			if !errors.Is(err, ErrDurableCommitUnknown) {
+				t.Fatalf("operation=%s err=%v", operation, err)
+			}
+		})
 	}
 }

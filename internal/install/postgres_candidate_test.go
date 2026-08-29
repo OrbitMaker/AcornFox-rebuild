@@ -127,6 +127,7 @@ func (t *adapterTx) Rollback() error { t.rolledBack = true; return t.rollbackErr
 type adapterDB struct {
 	row      postgresRow
 	rows     postgresRows
+	queryErr error
 	query    string
 	args     []any
 	exec     string
@@ -144,7 +145,7 @@ func (d *adapterDB) QueryRowContext(_ context.Context, q string, a ...any) postg
 func (d *adapterDB) QueryContext(_ context.Context, q string, a ...any) (postgresRows, error) {
 	d.query = q
 	d.args = a
-	return d.rows, nil
+	return d.rows, d.queryErr
 }
 func (d *adapterDB) ExecContext(_ context.Context, q string, a ...any) (postgresResult, error) {
 	d.exec = q
@@ -266,6 +267,23 @@ func TestProductionControlUsesFixedSessionQuery(t *testing.T) {
 	n, err := p.CountOpenCardSessions(context.Background())
 	if err != nil || n != 3 || db.query != WaitForNoOpenCardSessionsSQL {
 		t.Fatalf("n=%d err=%v query=%q", n, err, db.query)
+	}
+}
+
+func TestSelectedPostgresDatabaseNeverRewritesActiveDatabaseToPostgres(t *testing.T) {
+	raw := []byte("OPEN_CARD_DATABASE_URL=postgresql://user:password@127.0.0.1:5432/open_card_active?sslmode=require\n")
+	selected, err := NewSelectedPostgresDatabase(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer selected.Close()
+	control, err := NewProductionPostgresControl(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer control.Close()
+	if selected.environment.Descriptor.Database != "open_card_active" || control.base == nil || control.base.Path != "/postgres" || selected.environment.Descriptor.Database == strings.Trim(control.base.Path, "/") {
+		t.Fatalf("selected=%q control=%q", selected.environment.Descriptor.Database, control.base.Path)
 	}
 }
 

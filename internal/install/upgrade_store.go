@@ -5,8 +5,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -23,8 +25,233 @@ type UpgradeStore struct {
 	root             string
 	dataWriter       *DurableWriter
 	activationWriter *DurableWriter
+	configDurable    *DurableWriter
+	unitDurable      *DurableWriter
+	legacyVerifier   LegacyReleaseVerifier
 	lock             *upgradeStoreLock
 }
+
+// LegacyReleaseVerifier is intentionally narrow: task tests may replace only
+// immutable release evidence, never config, pointers, activation metadata, or
+// systemd persistence.
+type LegacyReleaseVerifier interface {
+	VerifyRC0(releaseID string) (ReleaseV1, []MigrationRow, error)
+	CandidateServerUnit(candidate ReleaseV1) ([]byte, error)
+}
+
+type fixedLegacyReleaseVerifier struct {
+	writer *DurableWriter
+}
+
+// secureReleaseFile opens a declared release file through a pinned root and
+// validates every path component and the opened descriptor. Release evidence
+// is only trusted when it is root-contained, non-writable by other users, and
+// owned by the same principal that owns the upgrade store.
+func secureReleaseFile(writer *DurableWriter, releaseID, name string, mode os.FileMode) ([]byte, error) {
+	return secureReleaseFileWithOwnerCheck(writer, releaseID, name, mode, verifyOwner)
+}
+
+func secureReleaseFileWithOwnerCheck(writer *DurableWriter, releaseID, name string, mode os.FileMode, ownerCheck func(os.FileInfo, int, int) error) ([]byte, error) {
+	if writer == nil || writer.ops == nil || !validID(releaseID) || name == "" || filepath.IsAbs(name) || filepath.Clean(name) != name || strings.ContainsAny(name, "\\\\\x00") || ownerCheck == nil {
+		return nil, ErrUpgradeJournalConflict
+	}
+	if err := secureReleaseParents(writer.ops, releaseID, name, writer.uid, writer.gid, ownerCheck); err != nil {
+		return nil, err
+	}
+	leaf := filepath.ToSlash(filepath.Join("releases", releaseID, name))
+	file, err := writer.ops.OpenFile(leaf, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, ErrUpgradeJournalConflict
+	}
+	defer writer.ops.CloseFile(file)
+	if err := verifySecureReleaseLeaf(file, mode, writer.uid, writer.gid, ownerCheck); err != nil {
+		return nil, err
+	}
+	raw, err := io.ReadAll(file)
+	if err != nil {
+		return nil, ErrUpgradeJournalConflict
+	}
+	if err := verifySecureReleaseLeaf(file, mode, writer.uid, writer.gid, ownerCheck); err != nil {
+		return nil, err
+	}
+	return raw, nil
+}
+
+func secureReleaseParents(root durableRoot, releaseID, name string, uid, gid int, ownerCheck func(os.FileInfo, int, int) error) error {
+	parents := []string{"releases", filepath.ToSlash(filepath.Join("releases", releaseID))}
+	parent := filepath.Dir(filepath.FromSlash(name))
+	if parent != "." {
+		current := filepath.ToSlash(filepath.Join("releases", releaseID))
+		for _, part := range strings.Split(filepath.ToSlash(parent), "/") {
+			if part == "" || part == "." || part == ".." {
+				return ErrUpgradeJournalConflict
+			}
+			current = filepath.ToSlash(filepath.Join(current, part))
+			parents = append(parents, current)
+		}
+	}
+	for _, parent := range parents {
+		info, err := root.Lstat(parent)
+		if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm()&0o022 != 0 || ownerCheck(info, uid, gid) != nil {
+			return ErrUpgradeJournalConflict
+		}
+	}
+	return nil
+}
+
+func verifySecureReleaseLeaf(file *os.File, mode os.FileMode, uid, gid int, ownerCheck func(os.FileInfo, int, int) error) error {
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != mode || ownerCheck(info, uid, gid) != nil {
+		return ErrUpgradeJournalConflict
+	}
+	return nil
+}
+
+// verifySecureRelease replaces the legacy path-based verifier. It verifies the
+// exact release tree through the same descriptor-rooted file reader used for
+// manifests and service units; no path-based release helper is trusted here.
+func verifySecureRelease(writer *DurableWriter, releaseID string, manifest Manifest) error {
+	if writer == nil || writer.ops == nil || manifest.Validate() != nil || manifest.ReleaseID != releaseID || !validID(releaseID) {
+		return ErrUpgradeJournalConflict
+	}
+	if err := secureReleaseParents(writer.ops, releaseID, "manifest.json", writer.uid, writer.gid, verifyOwner); err != nil {
+		return err
+	}
+	expectedFiles := make(map[string]FileDigest, len(manifest.Files))
+	expectedDirs := map[string]struct{}{"": {}}
+	for _, declared := range manifest.Files {
+		if _, exists := expectedFiles[declared.Path]; exists {
+			return ErrUpgradeJournalConflict
+		}
+		expectedFiles[declared.Path] = declared
+		for dir := filepath.Dir(filepath.FromSlash(declared.Path)); dir != "."; dir = filepath.Dir(dir) {
+			expectedDirs[filepath.ToSlash(dir)] = struct{}{}
+		}
+	}
+	seen := make(map[string]struct{}, len(expectedFiles))
+	if err := scanSecureRelease(writer.ops, releaseID, "", expectedFiles, expectedDirs, seen, writer.uid, writer.gid); err != nil {
+		return err
+	}
+	if len(seen) != len(expectedFiles) {
+		return ErrUpgradeJournalConflict
+	}
+	for path, declared := range expectedFiles {
+		raw, err := secureReleaseFile(writer, releaseID, path, os.FileMode(declared.Mode))
+		if err != nil || sha256Bytes(raw) != declared.SHA256 {
+			return ErrUpgradeJournalConflict
+		}
+	}
+	return nil
+}
+
+func scanSecureRelease(root durableRoot, releaseID, relative string, expectedFiles map[string]FileDigest, expectedDirs map[string]struct{}, seen map[string]struct{}, uid, gid int) error {
+	dir := filepath.ToSlash(filepath.Join("releases", releaseID, relative))
+	if err := secureReleaseParents(root, releaseID, filepath.ToSlash(filepath.Join(relative, "probe")), uid, gid, verifyOwner); err != nil {
+		return err
+	}
+	folder, err := root.OpenFile(dir, os.O_RDONLY, 0)
+	if err != nil {
+		return ErrUpgradeJournalConflict
+	}
+	entries, err := folder.ReadDir(-1)
+	closeErr := folder.Close()
+	if err != nil || closeErr != nil {
+		return ErrUpgradeJournalConflict
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		child := filepath.ToSlash(filepath.Join(relative, name))
+		full := filepath.ToSlash(filepath.Join("releases", releaseID, child))
+		info, err := root.Lstat(full)
+		if err != nil || info.Mode()&os.ModeSymlink != 0 {
+			return ErrUpgradeJournalConflict
+		}
+		if info.IsDir() {
+			if _, ok := expectedDirs[child]; !ok || info.Mode().Perm()&0o022 != 0 || verifyOwner(info, uid, gid) != nil {
+				return ErrUpgradeJournalConflict
+			}
+			if err := scanSecureRelease(root, releaseID, child, expectedFiles, expectedDirs, seen, uid, gid); err != nil {
+				return err
+			}
+			continue
+		}
+		if child == "manifest.json" && relative == "" {
+			if !info.Mode().IsRegular() || info.Mode().Perm() != 0o644 || verifyOwner(info, uid, gid) != nil {
+				return ErrUpgradeJournalConflict
+			}
+			continue
+		}
+		if !info.Mode().IsRegular() {
+			return ErrUpgradeJournalConflict
+		}
+		if _, ok := expectedFiles[child]; !ok {
+			return ErrUpgradeJournalConflict
+		}
+		seen[child] = struct{}{}
+	}
+	return nil
+}
+
+func parseReleaseManifest(raw []byte) (Manifest, error) {
+	var m Manifest
+	d := json.NewDecoder(bytes.NewReader(raw))
+	d.DisallowUnknownFields()
+	if err := d.Decode(&m); err != nil {
+		return Manifest{}, err
+	}
+	var extra any
+	if err := d.Decode(&extra); err != io.EOF {
+		return Manifest{}, ErrUpgradeJournalConflict
+	}
+	m, err := NormalizeManifest(m)
+	if err != nil || m.Validate() != nil {
+		return Manifest{}, ErrUpgradeJournalConflict
+	}
+	return m, nil
+}
+
+func (v fixedLegacyReleaseVerifier) VerifyRC0(releaseID string) (ReleaseV1, []MigrationRow, error) {
+	manifestRaw, err := secureReleaseFile(v.writer, releaseID, "manifest.json", 0o644)
+	manifest, err := parseReleaseManifest(manifestRaw)
+	if err != nil {
+		return ReleaseV1{}, nil, err
+	}
+	digest := sha256Bytes(manifestRaw)
+	if err != nil || manifest.ReleaseID != releaseID || digest != RC0ReleaseManifestSHA256 || manifest.Version != ProductionNMinusOneVersion || manifest.SourceCommit != RC0SourceCommit || manifest.Architecture != "amd64" || manifest.MigrationVersion != "0023" || verifySecureRelease(v.writer, releaseID, manifest) != nil {
+		return ReleaseV1{}, nil, ErrUpgradeJournalConflict
+	}
+	release := ReleaseV1{ID: manifest.ReleaseID, Version: manifest.Version, SourceCommit: manifest.SourceCommit, Architecture: manifest.Architecture, ManifestSHA256: digest}
+	if !validRC0Release(release) {
+		return ReleaseV1{}, nil, ErrUpgradeJournalConflict
+	}
+	rows, err := legacyMigrationRows(manifest)
+	return release, rows, err
+}
+func (v fixedLegacyReleaseVerifier) CandidateServerUnit(candidate ReleaseV1) ([]byte, error) {
+	manifestRaw, err := secureReleaseFile(v.writer, candidate.ID, "manifest.json", 0o644)
+	manifest, err := parseReleaseManifest(manifestRaw)
+	if err != nil || ValidateProductionCandidate(manifest) != nil || manifest.ReleaseID != candidate.ID || manifest.Version != candidate.Version || manifest.SourceCommit != candidate.SourceCommit || manifest.Architecture != candidate.Architecture {
+		return nil, ErrUpgradeJournalConflict
+	}
+	d := sha256Bytes(manifestRaw)
+	if d != candidate.ManifestSHA256 || verifySecureRelease(v.writer, candidate.ID, manifest) != nil {
+		return nil, ErrUpgradeJournalConflict
+	}
+	raw, err := secureReleaseFile(v.writer, candidate.ID, "systemd/open-card-server.service", 0o644)
+	if err != nil {
+		return nil, err
+	}
+	for _, f := range manifest.Files {
+		if f.Path == "systemd/open-card-server.service" && f.Mode == 0o644 && sha256Bytes(raw) == f.SHA256 {
+			if validateLegacyCandidateUnit(raw) != nil {
+				return nil, ErrUpgradeJournalConflict
+			}
+			return raw, nil
+		}
+	}
+	return nil, ErrUpgradeJournalConflict
+}
+
 type upgradeStoreLock struct {
 	file  *os.File
 	tx    string
@@ -53,7 +280,20 @@ func ProductionUpgradeStore() (*UpgradeStore, error) {
 		_ = d.Close()
 		return nil, e
 	}
-	return &UpgradeStore{root: "/", dataWriter: d, activationWriter: a}, nil
+	c, e := ProductionDurableWriter("/etc/open-card")
+	if e != nil {
+		_ = d.Close()
+		_ = a.Close()
+		return nil, e
+	}
+	u, e := ProductionDurableWriter("/etc/systemd/system")
+	if e != nil {
+		_ = d.Close()
+		_ = a.Close()
+		_ = c.Close()
+		return nil, e
+	}
+	return &UpgradeStore{root: "/", dataWriter: d, activationWriter: a, configDurable: c, unitDurable: u, legacyVerifier: fixedLegacyReleaseVerifier{writer: a}}, nil
 }
 func TaskUpgradeStore(root string, uid, gid int) (*UpgradeStore, error) {
 	d, e := TaskDurableWriter(filepath.Join(root, "var/lib/open-card"), uid, gid)
@@ -65,14 +305,39 @@ func TaskUpgradeStore(root string, uid, gid int) (*UpgradeStore, error) {
 		_ = d.Close()
 		return nil, e
 	}
-	return &UpgradeStore{root: root, dataWriter: d, activationWriter: a}, nil
+	c, e := TaskDurableWriter(filepath.Join(root, "etc/open-card"), uid, gid)
+	if e != nil {
+		_ = d.Close()
+		_ = a.Close()
+		return nil, e
+	}
+	u, e := TaskDurableWriter(filepath.Join(root, "etc/systemd/system"), uid, gid)
+	if e != nil {
+		_ = d.Close()
+		_ = a.Close()
+		_ = c.Close()
+		return nil, e
+	}
+	return &UpgradeStore{root: root, dataWriter: d, activationWriter: a, configDurable: c, unitDurable: u, legacyVerifier: fixedLegacyReleaseVerifier{writer: a}}, nil
+}
+
+func TaskUpgradeStoreWithLegacyVerifier(root string, uid, gid int, verifier LegacyReleaseVerifier) (*UpgradeStore, error) {
+	if verifier == nil {
+		return nil, ErrUpgradeJournalConflict
+	}
+	s, err := TaskUpgradeStore(root, uid, gid)
+	if err != nil {
+		return nil, err
+	}
+	s.legacyVerifier = verifier
+	return s, nil
 }
 func (s *UpgradeStore) journal(tx string) string {
 	return filepath.ToSlash(filepath.Join("upgrade-transactions", tx+".json"))
 }
 
 func (s *UpgradeStore) Acquire(_ context.Context, tx string) (UpgradeLock, error) {
-	if s == nil || !validID(tx) {
+	if s == nil || !validID(tx) || s.verifyLiveRoots() != nil {
 		return nil, ErrUpgradeJournalConflict
 	}
 	d := filepath.Join(s.root, "run/lock")
@@ -190,7 +455,13 @@ func (s *UpgradeStore) Close() error {
 		_ = s.dataWriter.Close()
 	}
 	if s.activationWriter != nil {
-		return s.activationWriter.Close()
+		_ = s.activationWriter.Close()
+	}
+	if s.configDurable != nil {
+		_ = s.configDurable.Close()
+	}
+	if s.unitDurable != nil {
+		return s.unitDurable.Close()
 	}
 	return nil
 }
@@ -297,7 +568,22 @@ func (s *UpgradeStore) ReadActivationState(context.Context) (UpgradeActivationSt
 }
 
 func (s *UpgradeStore) ownsLock() bool {
-	return s != nil && s.activationWriter != nil && s.dataWriter != nil && s.lock != nil && s.lock.owner == s && s.lock.file != nil && s.lock.tx != ""
+	return s != nil && s.activationWriter != nil && s.dataWriter != nil && s.lock != nil && s.lock.owner == s && s.lock.file != nil && s.lock.tx != "" && s.verifyLiveRoots() == nil
+}
+
+// verifyLiveRoots binds every privileged store action to the exact directory
+// descriptors captured by the constructor. A renamed/replaced live root is a
+// fail-closed conflict even though its old os.Root descriptor remains usable.
+func (s *UpgradeStore) verifyLiveRoots() error {
+	if s == nil || s.dataWriter == nil || s.activationWriter == nil || s.configDurable == nil || s.unitDurable == nil {
+		return ErrUpgradeJournalConflict
+	}
+	for _, writer := range []*DurableWriter{s.dataWriter, s.activationWriter, s.configDurable, s.unitDurable} {
+		if writer.VerifyLiveRoot() != nil {
+			return ErrUpgradeJournalConflict
+		}
+	}
+	return nil
 }
 
 func activationIDFromTarget(target string) (string, bool) {
@@ -342,8 +628,10 @@ func (s *UpgradeStore) readActivation(id string) (ActivationV1, string, error) {
 	if err != nil || target != filepath.ToSlash(filepath.Join("..", "..", "releases", activation.Release.ID)) {
 		return ActivationV1{}, "", ErrUpgradeJournalConflict
 	}
-	if err := s.verifyCandidateRelease(activation); err != nil {
-		return ActivationV1{}, "", err
+	if activation.LegacyProjection == nil {
+		if err := s.verifyCandidateRelease(activation); err != nil {
+			return ActivationV1{}, "", err
+		}
 	}
 	return activation, sha256Bytes(raw), nil
 }
@@ -378,14 +666,10 @@ func (s *UpgradeStore) markerTransaction() (string, error) {
 }
 
 func (s *UpgradeStore) legacyCurrentPresent() bool {
-	if s == nil {
+	if s == nil || s.activationWriter == nil || s.activationWriter.ops == nil {
 		return false
 	}
-	root, err := os.OpenRoot(s.activationRoot())
-	if err != nil {
-		return false
-	}
-	defer root.Close()
+	root := s.activationWriter.ops
 	info, err := root.Lstat("current")
 	if err != nil || info.Mode()&os.ModeSymlink == 0 {
 		return false
@@ -398,20 +682,26 @@ func (s *UpgradeStore) legacyCurrentPresent() bool {
 	if len(parts) != 2 || parts[0] != "releases" || !validID(parts[1]) || target != filepath.ToSlash(filepath.Join("releases", parts[1])) {
 		return false
 	}
-	legacyEnv := filepath.Join(s.root, "etc/open-card/server.env")
-	if s.root == "/" {
-		legacyEnv = "/etc/open-card/server.env"
-	}
-	legacy, err := os.Lstat(legacyEnv)
-	return err == nil && legacy.Mode().IsRegular() && legacy.Mode()&os.ModeSymlink == 0
+	_, err = s.readLegacyServerEnv()
+	return err == nil
 }
 
 // WriteCandidateActivation publishes a candidate activation only after its
 // release and database identity have been bound to the durable activation
 // metadata. Publication is deliberately append-only: an existing activation
 // is accepted only when every persisted object is byte-for-byte equivalent.
-func (s *UpgradeStore) WriteCandidateActivation(_ context.Context, activation ActivationV1, databaseEnv []byte) (string, error) {
+func (s *UpgradeStore) WriteCandidateActivation(ctx context.Context, activation ActivationV1, databaseEnv []byte) (string, error) {
+	if activation.Origin != "native" {
+		return "", ErrUpgradeJournalConflict
+	}
+	return s.writeActivation(ctx, activation, databaseEnv, false)
+}
+
+func (s *UpgradeStore) writeActivation(_ context.Context, activation ActivationV1, databaseEnv []byte, legacy bool) (string, error) {
 	if s == nil || s.activationWriter == nil || s.lock == nil || s.lock.owner != s || s.lock.file == nil || s.lock.tx != activation.CreatedByTransactionID {
+		return "", ErrUpgradeJournalConflict
+	}
+	if legacy != (activation.Origin == "rc0_compat_projection") {
 		return "", ErrUpgradeJournalConflict
 	}
 	if err := activation.Validate(); err != nil {
@@ -431,8 +721,15 @@ func (s *UpgradeStore) WriteCandidateActivation(_ context.Context, activation Ac
 	activationSum := sha256.Sum256(activationRaw)
 	digest := hex.EncodeToString(activationSum[:])
 
-	if err := s.verifyCandidateRelease(activation); err != nil {
-		return "", err
+	// A legacy projection records the already-verified RC0 release identity;
+	// its fixed compatibility manifest digest is not the candidate's on-disk
+	// manifest digest, so candidate-release verification is inapplicable.
+	if !legacy {
+		if err := s.verifyCandidateRelease(activation); err != nil {
+			return "", err
+		}
+	} else {
+		return s.writeLegacyActivation(activation, databaseEnv, activationRaw, digest)
 	}
 
 	created, err := s.createActivationDirectory(activation.ActivationID)
@@ -484,6 +781,83 @@ func (s *UpgradeStore) WriteCandidateActivation(_ context.Context, activation Ac
 	return digest, nil
 }
 
+// writeLegacyActivation is intentionally more permissive than the native
+// candidate publisher only at a crash-recovery boundary. A legacy slot may
+// already contain an exact prefix of the projection after a process crash;
+// it is completed object-by-object and every existing object must be the
+// exact immutable value. Native candidate slots remain append-only.
+func (s *UpgradeStore) writeLegacyActivation(activation ActivationV1, databaseEnv, activationRaw []byte, digest string) (string, error) {
+	if _, err := s.createActivationDirectory(activation.ActivationID); err != nil {
+		return "", err
+	}
+	slot, err := s.activationSlotWriter(activation.ActivationID)
+	if err != nil {
+		return "", err
+	}
+	defer slot.Close()
+	if err := ensureLegacyReleaseLink(slot, activation.Release.ID); err != nil {
+		return "", err
+	}
+	if err := ensureLegacyMetadata(slot, "database.env", databaseEnv); err != nil {
+		return "", err
+	}
+	if err := ensureLegacyMetadata(slot, "activation.json", activationRaw); err != nil {
+		return "", err
+	}
+	if err := s.syncActivationCollection(); err != nil {
+		return "", fmt.Errorf("%w: %v", ErrDurableCommitUnknown, err)
+	}
+	return digest, nil
+}
+
+func ensureLegacyReleaseLink(slot *DurableWriter, releaseID string) error {
+	if slot == nil || slot.ops == nil {
+		return ErrUpgradeJournalConflict
+	}
+	want := filepath.ToSlash(filepath.Join("..", "..", "releases", releaseID))
+	info, err := slot.ops.Lstat("release")
+	if errors.Is(err, os.ErrNotExist) {
+		if err := slot.SwapActivationReleaseLink(releaseID); err != nil {
+			return err
+		}
+		info, err = slot.ops.Lstat("release")
+	}
+	if err != nil || info.Mode()&os.ModeSymlink == 0 {
+		return ErrUpgradeJournalConflict
+	}
+	target, err := slot.ops.Readlink("release")
+	if err != nil || target != want {
+		return ErrUpgradeJournalConflict
+	}
+	return nil
+}
+
+func ensureLegacyMetadata(slot *DurableWriter, name string, value []byte) error {
+	if slot == nil {
+		return ErrUpgradeJournalConflict
+	}
+	existing, err := slot.ReadMetadata(name)
+	if err == nil {
+		if !bytes.Equal(existing, value) {
+			return ErrUpgradeJournalConflict
+		}
+		return nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return ErrUpgradeJournalConflict
+	}
+	if err := slot.CreateMetadata(name, value); err == nil {
+		return nil
+	}
+	// A rename/link plus parent-fsync ambiguity may have published the exact
+	// object. Re-read only through the same pinned slot root before deciding.
+	existing, err = slot.ReadMetadata(name)
+	if err != nil || !bytes.Equal(existing, value) {
+		return ErrUpgradeJournalConflict
+	}
+	return nil
+}
+
 // candidateWriteOutcome reconciles only a potentially durable outcome. A
 // normal write error remains an error even if a concurrent actor happened to
 // construct an equivalent activation afterwards.
@@ -529,37 +903,29 @@ func (s *UpgradeStore) matchExistingCandidateActivation(activation ActivationV1,
 	return nil
 }
 
-func (s *UpgradeStore) activationRoot() string {
-	if s.root == "/" {
-		return "/opt/open-card"
-	}
-	return filepath.Join(s.root, "opt/open-card")
-}
-
 func (s *UpgradeStore) validateActivationRoot() error {
-	if s == nil || s.activationWriter == nil {
+	if s == nil || s.activationWriter == nil || s.activationWriter.VerifyLiveRoot() != nil {
 		return ErrUpgradeJournalConflict
 	}
-	return s.validateNonWritableDirectory(s.activationRoot())
+	return nil
 }
 
 func (s *UpgradeStore) validateActivationLayout() error {
 	if err := s.validateActivationRoot(); err != nil {
 		return err
 	}
-	path := filepath.Join(s.activationRoot(), "activations")
-	info, err := os.Lstat(path)
+	info, err := s.activationWriter.ops.Lstat("activations")
 	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm() != activationSlotDirMode || verifyOwner(info, s.activationWriter.uid, s.activationWriter.gid) != nil {
 		return ErrUpgradeJournalConflict
 	}
 	return nil
 }
 
-func (s *UpgradeStore) validateNonWritableDirectory(path string) error {
-	if s == nil || s.activationWriter == nil {
+func (s *UpgradeStore) validateActivationDirectory(path string) error {
+	if s == nil || s.activationWriter == nil || cleanRelative(path) != nil {
 		return ErrUpgradeJournalConflict
 	}
-	info, err := os.Lstat(path)
+	info, err := s.activationWriter.ops.Lstat(path)
 	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm()&0o022 != 0 || verifyOwner(info, s.activationWriter.uid, s.activationWriter.gid) != nil {
 		return ErrUpgradeJournalConflict
 	}
@@ -570,19 +936,23 @@ func (s *UpgradeStore) activationSlotWriter(id string) (*DurableWriter, error) {
 	if !validID(id) || s.validateActivationLayout() != nil {
 		return nil, ErrUpgradeJournalConflict
 	}
-	path := filepath.Join(s.activationRoot(), "activations", id)
-	info, err := os.Lstat(path)
-	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm() != activationSlotDirMode || verifyOwner(info, s.activationWriter.uid, s.activationWriter.gid) != nil {
+	collection, err := s.activationWriter.OpenChildWriter("activations", activationSlotDirMode)
+	if err != nil {
 		return nil, ErrUpgradeJournalConflict
 	}
-	return newDurableWriter(path, s.activationWriter.uid, s.activationWriter.gid, nil)
+	defer collection.Close()
+	slot, err := collection.OpenChildWriter(id, activationSlotDirMode)
+	if err != nil {
+		return nil, ErrUpgradeJournalConflict
+	}
+	return slot, nil
 }
 
 func (s *UpgradeStore) syncActivationCollection() error {
 	if err := s.validateActivationLayout(); err != nil {
 		return err
 	}
-	writer, err := newDurableWriter(filepath.Join(s.activationRoot(), "activations"), s.activationWriter.uid, s.activationWriter.gid, nil)
+	writer, err := s.activationWriter.OpenChildWriter("activations", activationSlotDirMode)
 	if err != nil {
 		return err
 	}
@@ -597,21 +967,16 @@ func (s *UpgradeStore) createActivationDirectory(id string) (bool, error) {
 	if err := s.validateActivationLayout(); err != nil {
 		return false, err
 	}
-	path := filepath.Join(s.activationRoot(), "activations", id)
-	if err := os.Mkdir(path, activationSlotDirMode); err != nil {
-		if errors.Is(err, os.ErrExist) {
-			return false, nil
-		}
-		return false, err
-	}
-	info, err := os.Lstat(path)
-	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm() != activationSlotDirMode || verifyOwner(info, s.activationWriter.uid, s.activationWriter.gid) != nil {
+	collection, err := s.activationWriter.OpenChildWriter("activations", activationSlotDirMode)
+	if err != nil {
 		return false, ErrUpgradeJournalConflict
 	}
-	if err := s.syncActivationCollection(); err != nil {
-		return false, fmt.Errorf("%w: %v", ErrDurableCommitUnknown, err)
+	defer collection.Close()
+	created, err := collection.CreateChildDirectory(id, activationSlotDirMode)
+	if err != nil {
+		return false, err
 	}
-	return true, nil
+	return created, nil
 }
 
 func (s *UpgradeStore) verifyCandidateRelease(activation ActivationV1) error {
@@ -622,36 +987,18 @@ func (s *UpgradeStore) verifyCandidateRelease(activation ActivationV1) error {
 	if err := s.validateActivationRoot(); err != nil {
 		return err
 	}
-	if err := s.validateNonWritableDirectory(filepath.Join(s.activationRoot(), "releases")); err != nil {
-		return err
-	}
-	releaseDir := filepath.Join(s.activationRoot(), "releases", release.ID)
-	if err := s.validateNonWritableDirectory(releaseDir); err != nil {
-		return err
-	}
-	if err := ensureNoSymlinkBetween(s.activationRoot(), releaseDir); err != nil {
-		return err
-	}
-	manifestPath := filepath.Join(releaseDir, "manifest.json")
-	if err := ensureNoSymlinkBetween(releaseDir, manifestPath); err != nil {
-		return err
-	}
-	info, err := os.Lstat(manifestPath)
-	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+	manifestRaw, err := secureReleaseFile(s.activationWriter, release.ID, "manifest.json", 0o644)
+	if err != nil || sha256Bytes(manifestRaw) != release.ManifestSHA256 {
 		return ErrUpgradeJournalConflict
 	}
-	digest, err := SHA256File(manifestPath)
-	if err != nil || digest != release.ManifestSHA256 {
-		return ErrUpgradeJournalConflict
-	}
-	manifest, err := LoadManifest(manifestPath)
+	manifest, err := parseReleaseManifest(manifestRaw)
 	if err != nil {
 		return err
 	}
 	if manifest.ReleaseID != release.ID || manifest.Version != release.Version || manifest.SourceCommit != release.SourceCommit || manifest.Architecture != release.Architecture || manifest.MigrationVersion != activation.Database.Migration {
 		return ErrUpgradeJournalConflict
 	}
-	return VerifyRelease(releaseDir, manifest)
+	return verifySecureRelease(s.activationWriter, release.ID, manifest)
 }
 func (s *UpgradeStore) SetPrevious(_ context.Context, oldID string) error {
 	if !s.ownsLock() || !validID(oldID) {
@@ -751,3 +1098,536 @@ func (s *UpgradeStore) RestoreActive(_ context.Context, oldID, expectedCandidate
 }
 
 var _ UpgradeJournalStore = (*UpgradeStore)(nil)
+
+// PreflightPlan is the concrete, read-only preflight surface for native and
+// RC0 installations. It intentionally does not alter pointers, configuration,
+// units, or activation slots.
+func (s *UpgradeStore) PreflightPlan(_ context.Context, request UpgradePreflightRequest) (UpgradePreflight, error) {
+	if !s.ownsLock() || s.lock.tx != request.TransactionID || request.Validate() != nil {
+		return UpgradePreflight{}, ErrUpgradeJournalConflict
+	}
+	if marker, err := s.markerTransaction(); err != nil || marker != "" {
+		return UpgradePreflight{}, ErrUpgradeJournalConflict
+	}
+	if target, err := s.activationWriter.ReadActivationLink(ActivationLinkActive); err == nil {
+		id, ok := activationIDFromTarget(target)
+		if !ok {
+			return UpgradePreflight{}, ErrUpgradeJournalConflict
+		}
+		a, digest, err := s.readActivation(id)
+		if err != nil {
+			return UpgradePreflight{}, ErrUpgradeJournalConflict
+		}
+		previous, err := s.legacyPrevious()
+		if err != nil {
+			return UpgradePreflight{}, ErrUpgradeJournalConflict
+		}
+		return UpgradePreflight{Existing: &ExistingActivationPreflight{Activation: a, JSONSHA256: digest}, Previous: previous}, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return UpgradePreflight{}, ErrUpgradeJournalConflict
+	}
+
+	plan, err := s.readLegacyPlan(request)
+	if err != nil {
+		return UpgradePreflight{}, ErrUpgradeJournalConflict
+	}
+	return UpgradePreflight{Legacy: &plan, Previous: plan.Previous}, nil
+}
+
+func (s *UpgradeStore) readLegacyPlan(request UpgradePreflightRequest) (LegacyProjectionPlan, error) {
+	if s == nil || s.activationWriter == nil || s.activationWriter.ops == nil {
+		return LegacyProjectionPlan{}, ErrUpgradeJournalConflict
+	}
+	root := s.activationWriter.ops
+	info, err := root.Lstat("current")
+	if err != nil || info.Mode()&os.ModeSymlink == 0 {
+		return LegacyProjectionPlan{}, ErrUpgradeJournalConflict
+	}
+	target, err := root.Readlink("current")
+	if err != nil {
+		return LegacyProjectionPlan{}, err
+	}
+	parts := strings.Split(filepath.ToSlash(target), "/")
+	if len(parts) != 2 || parts[0] != "releases" || !validID(parts[1]) || target != filepath.ToSlash(filepath.Join("releases", parts[1])) {
+		return LegacyProjectionPlan{}, ErrUpgradeJournalConflict
+	}
+	if s.legacyVerifier == nil {
+		return LegacyProjectionPlan{}, ErrUpgradeJournalConflict
+	}
+	release, rows, err := s.legacyVerifier.VerifyRC0(parts[1])
+	if err != nil || release.ID != parts[1] || !validRC0Release(release) {
+		return LegacyProjectionPlan{}, ErrUpgradeJournalConflict
+	}
+	evidence, err := migrationEvidence(rows)
+	if err != nil || evidence.RowsSHA256 == "" {
+		return LegacyProjectionPlan{}, ErrUpgradeJournalConflict
+	}
+	envRaw, err := s.readLegacyServerEnv()
+	if err != nil {
+		return LegacyProjectionPlan{}, ErrUpgradeJournalConflict
+	}
+	databaseEnv, afterRaw, err := splitLegacyServerEnv(envRaw)
+	if err != nil {
+		return LegacyProjectionPlan{}, ErrUpgradeJournalConflict
+	}
+	unitBefore, err := s.readSystemdUnit()
+	if err != nil {
+		return LegacyProjectionPlan{}, ErrUpgradeJournalConflict
+	}
+	candidateUnit, err := s.legacyVerifier.CandidateServerUnit(request.CandidateRelease)
+	if err != nil {
+		return LegacyProjectionPlan{}, ErrUpgradeJournalConflict
+	}
+	if validateLegacyCandidateUnit(candidateUnit) != nil {
+		return LegacyProjectionPlan{}, ErrUpgradeJournalConflict
+	}
+	previous, err := s.legacyPrevious()
+	if err != nil {
+		return LegacyProjectionPlan{}, ErrUpgradeJournalConflict
+	}
+	activationID := "legacy-" + sha256Bytes([]byte(request.TransactionID))[:24]
+	return LegacyProjectionPlan{TransactionID: request.TransactionID, ActivationID: activationID, Release: release, CurrentTarget: legacyReleaseTarget(release), ExpectedMigration: "0023", ExpectedRowsSHA256: evidence.RowsSHA256, DatabaseEnv: databaseEnv, DatabaseEnvSHA256: sha256Bytes(databaseEnv), ServerEnvBeforeSHA256: sha256Bytes(envRaw), ServerEnvAfterSHA256: sha256Bytes(afterRaw), ServerUnitBeforeSHA256: sha256Bytes(unitBefore), ServerUnitAfterSHA256: sha256Bytes(candidateUnit), ServerUnitReleaseID: request.CandidateRelease.ID, Previous: previous}, nil
+}
+
+func legacyMigrationRows(manifest Manifest) ([]MigrationRow, error) {
+	byPath := map[string]FileDigest{}
+	for _, f := range manifest.Files {
+		byPath[f.Path] = f
+	}
+	rows := make([]MigrationRow, 0, 23)
+	for i := 1; i <= 23; i++ {
+		prefix := "migrations/control-plane/" + formatMigrationVersion(i) + "_"
+		var found FileDigest
+		n := 0
+		for path, f := range byPath {
+			if strings.HasPrefix(path, prefix) && strings.HasSuffix(path, ".sql") {
+				found, n = f, n+1
+			}
+		}
+		if n != 1 || found.Mode != 0o644 {
+			return nil, ErrUpgradeJournalConflict
+		}
+		rows = append(rows, MigrationRow{Version: formatMigrationVersion(i), Checksum: found.SHA256})
+	}
+	if !validMigrationRows(rows, 23) {
+		return nil, ErrUpgradeJournalConflict
+	}
+	return rows, nil
+}
+
+func splitLegacyServerEnv(raw []byte) ([]byte, []byte, error) {
+	if bytes.ContainsAny(raw, "\x00\r") {
+		return nil, nil, ErrUpgradeJournalConflict
+	}
+	var value string
+	n := 0
+	lines := strings.SplitAfter(string(raw), "\n")
+	if len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	after := make([]string, 0, len(lines))
+	for _, full := range lines {
+		line := strings.TrimSuffix(full, "\n")
+		if strings.HasPrefix(line, "OPEN_CARD_DATABASE_URL=") {
+			n++
+			value = strings.TrimPrefix(line, "OPEN_CARD_DATABASE_URL=")
+			continue
+		}
+		if strings.HasPrefix(line, "export ") || strings.HasPrefix(line, " ") || strings.HasPrefix(line, "\t") {
+			return nil, nil, ErrUpgradeJournalConflict
+		}
+		after = append(after, full)
+	}
+	if n != 1 {
+		return nil, nil, ErrUpgradeJournalConflict
+	}
+	database, err := FormatDatabaseEnv(value)
+	if err != nil {
+		return nil, nil, ErrUpgradeJournalConflict
+	}
+	return database, []byte(strings.Join(after, "")), nil
+}
+
+func (s *UpgradeStore) configRoot() string {
+	if s.root == "/" {
+		return "/etc/open-card"
+	}
+	return filepath.Join(s.root, "etc/open-card")
+}
+func (s *UpgradeStore) unitRoot() string {
+	if s.root == "/" {
+		return "/etc/systemd/system"
+	}
+	return filepath.Join(s.root, "etc/systemd/system")
+}
+func (s *UpgradeStore) configWriter() (*DurableWriter, error) {
+	if s == nil || s.configDurable == nil {
+		return nil, ErrUpgradeJournalConflict
+	}
+	return s.configDurable, nil
+}
+func (s *UpgradeStore) unitWriter() (*DurableWriter, error) {
+	if s == nil || s.unitDurable == nil {
+		return nil, ErrUpgradeJournalConflict
+	}
+	return s.unitDurable, nil
+}
+func (s *UpgradeStore) readLegacyServerEnv() ([]byte, error) {
+	w, err := s.configWriter()
+	if err != nil {
+		return nil, err
+	}
+	return w.ReadMetadata("server.env")
+}
+func (s *UpgradeStore) readSystemdUnit() ([]byte, error) {
+	w, err := s.unitWriter()
+	if err != nil {
+		return nil, err
+	}
+	return w.ReadSystemdServerUnit()
+}
+
+func (s *UpgradeStore) candidateServerUnit(release ReleaseV1) ([]byte, error) {
+	if s != nil && s.legacyVerifier != nil {
+		raw, err := s.legacyVerifier.CandidateServerUnit(release)
+		if err != nil || validateLegacyCandidateUnit(raw) != nil {
+			return nil, ErrUpgradeJournalConflict
+		}
+		return raw, nil
+	}
+	manifestRaw, err := secureReleaseFile(s.activationWriter, release.ID, "manifest.json", 0o644)
+	manifest, err := parseReleaseManifest(manifestRaw)
+	if err != nil || ValidateProductionCandidate(manifest) != nil || manifest.ReleaseID != release.ID || manifest.Version != release.Version || manifest.SourceCommit != release.SourceCommit || manifest.Architecture != release.Architecture || sha256Bytes(manifestRaw) != release.ManifestSHA256 {
+		return nil, ErrUpgradeJournalConflict
+	}
+	if err := verifySecureRelease(s.activationWriter, release.ID, manifest); err != nil {
+		return nil, ErrUpgradeJournalConflict
+	}
+	raw, err := secureReleaseFile(s.activationWriter, release.ID, "systemd/open-card-server.service", 0o644)
+	if err != nil {
+		return nil, err
+	}
+	for _, f := range manifest.Files {
+		if f.Path == "systemd/open-card-server.service" && f.Mode == 0o644 && sha256Bytes(raw) == f.SHA256 {
+			if validateLegacyCandidateUnit(raw) != nil {
+				return nil, ErrUpgradeJournalConflict
+			}
+			return raw, nil
+		}
+	}
+	return nil, ErrUpgradeJournalConflict
+}
+
+func validateLegacyCandidateUnit(raw []byte) error {
+	section := ""
+	environmentFiles := 0
+	for _, rawLine := range strings.Split(string(raw), "\n") {
+		line := strings.TrimSpace(rawLine)
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+			continue
+		}
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			name := strings.TrimSuffix(strings.TrimPrefix(line, "["), "]")
+			if name == "" || strings.TrimSpace(name) != name {
+				return ErrUpgradeJournalConflict
+			}
+			section = name
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok || strings.TrimSpace(key) == "" {
+			return ErrUpgradeJournalConflict
+		}
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if (key == "Environment" || key == "UnsetEnvironment" || key == "PassEnvironment") && strings.Contains(value, "OPEN_CARD_DATABASE_URL") {
+			return ErrUpgradeJournalConflict
+		}
+		if key != "EnvironmentFile" {
+			continue
+		}
+		if section != "Service" || environmentFiles >= 2 {
+			return ErrUpgradeJournalConflict
+		}
+		want := "-/etc/open-card/server.env"
+		if environmentFiles == 1 {
+			want = "/opt/open-card/active/database.env"
+		}
+		if value != want {
+			return ErrUpgradeJournalConflict
+		}
+		environmentFiles++
+	}
+	if environmentFiles != 2 {
+		return ErrUpgradeJournalConflict
+	}
+	return nil
+}
+
+func (s *UpgradeStore) candidateServerUnitByID(id string) ([]byte, error) {
+	if !validID(id) {
+		return nil, ErrUpgradeJournalConflict
+	}
+	manifestRaw, err := secureReleaseFile(s.activationWriter, id, "manifest.json", 0o644)
+	manifest, err := parseReleaseManifest(manifestRaw)
+	if err != nil {
+		return nil, ErrUpgradeJournalConflict
+	}
+	release := ReleaseV1{ID: manifest.ReleaseID, Version: manifest.Version, SourceCommit: manifest.SourceCommit, Architecture: manifest.Architecture}
+	if release.ID != id {
+		return nil, ErrUpgradeJournalConflict
+	}
+	release.ManifestSHA256 = sha256Bytes(manifestRaw)
+	// Task fixtures may inject immutable release evidence, but production uses
+	// fixedLegacyReleaseVerifier, which performs the exact production-candidate
+	// manifest validation below through candidateServerUnit.
+	return s.candidateServerUnit(release)
+}
+
+func (s *UpgradeStore) legacyPrevious() (ActivationPointerIdentity, error) {
+	target, err := s.activationWriter.ReadActivationLink(ActivationLinkPreviousActive)
+	if errors.Is(err, os.ErrNotExist) {
+		return ActivationPointerIdentity{}, nil
+	}
+	if err != nil {
+		return ActivationPointerIdentity{}, err
+	}
+	id, ok := activationIDFromTarget(target)
+	if !ok {
+		return ActivationPointerIdentity{}, ErrUpgradeJournalConflict
+	}
+	_, digest, err := s.readActivation(id)
+	if err != nil {
+		return ActivationPointerIdentity{}, err
+	}
+	return ActivationPointerIdentity{ID: id, JSONSHA256: digest}, nil
+}
+
+// PrepareLegacyProjection converges the non-secret activation projection and
+// candidate unit while preserving the global database line for rollback.
+func (s *UpgradeStore) PrepareLegacyProjection(_ context.Context, plan LegacyProjectionPlan, activation ActivationV1) (LegacyProjectionObservation, error) {
+	if !s.ownsLock() || s.lock.tx != plan.TransactionID || plan.Validate() != nil || activation.Validate() != nil || activation.ActivationID != plan.ActivationID || activation.CreatedByTransactionID != plan.TransactionID || activation.LegacyProjection == nil {
+		return LegacyProjectionObservation{}, ErrUpgradeJournalConflict
+	}
+	if err := s.validateLegacyMutationState(plan, activation, true); err != nil {
+		return LegacyProjectionObservation{}, err
+	}
+	envRaw, err := s.readLegacyServerEnv()
+	if err != nil || (sha256Bytes(envRaw) != plan.ServerEnvBeforeSHA256 && sha256Bytes(envRaw) != plan.ServerEnvAfterSHA256) {
+		return LegacyProjectionObservation{}, ErrUpgradeJournalConflict
+	}
+	if _, err := s.writeActivation(context.Background(), activation, plan.DatabaseEnv, true); err != nil {
+		return LegacyProjectionObservation{}, err
+	}
+	if previous, err := s.legacyPrevious(); err != nil || !previous.equal(plan.Previous) {
+		return LegacyProjectionObservation{}, ErrUpgradeJournalConflict
+	}
+	if err := s.activationWriter.SwapActivationLink(ActivationLinkActive, activation.ActivationID, ""); err != nil {
+		return LegacyProjectionObservation{}, err
+	}
+	if err := s.activationWriter.SwapActivationLink(ActivationLinkCurrent, "", ""); err != nil {
+		return LegacyProjectionObservation{}, err
+	}
+	unit, err := s.candidateServerUnitByID(plan.ServerUnitReleaseID)
+	if err != nil {
+		return LegacyProjectionObservation{}, ErrUpgradeJournalConflict
+	}
+	w, err := s.unitWriter()
+	if err != nil {
+		return LegacyProjectionObservation{}, err
+	}
+	if err := w.WriteSystemdServerUnit(unit); err != nil {
+		return LegacyProjectionObservation{}, err
+	}
+	if err := s.verifyLiveRoots(); err != nil {
+		return LegacyProjectionObservation{}, ErrUpgradeJournalConflict
+	}
+	return s.readLegacyProjectionPhase(context.Background(), plan, activation, true)
+}
+
+func (s *UpgradeStore) FinalizeLegacyProjection(_ context.Context, plan LegacyProjectionPlan, activation ActivationV1) (LegacyProjectionObservation, error) {
+	if !s.ownsLock() || s.lock.tx != plan.TransactionID || plan.Validate() != nil || activation.Validate() != nil || activation.ActivationID != plan.ActivationID || activation.CreatedByTransactionID != plan.TransactionID || activation.LegacyProjection == nil || activation.Release != plan.Release || activation.Database.Migration != plan.ExpectedMigration || activation.Database.SchemaMigrationsSHA256 != plan.ExpectedRowsSHA256 || activation.DatabaseEnvSHA256 != plan.DatabaseEnvSHA256 {
+		return LegacyProjectionObservation{}, ErrUpgradeJournalConflict
+	}
+	if err := s.validateLegacyMutationState(plan, activation, false); err != nil {
+		return LegacyProjectionObservation{}, err
+	}
+	if _, err := s.readLegacyProjectionPhase(context.Background(), plan, activation, true); err != nil {
+		return LegacyProjectionObservation{}, err
+	}
+	raw, err := s.readLegacyServerEnv()
+	if err != nil {
+		return LegacyProjectionObservation{}, err
+	}
+	if sha256Bytes(raw) == plan.ServerEnvBeforeSHA256 {
+		_, afterRaw, err := splitLegacyServerEnv(raw)
+		if err != nil || sha256Bytes(afterRaw) != plan.ServerEnvAfterSHA256 {
+			return LegacyProjectionObservation{}, ErrUpgradeJournalConflict
+		}
+		w, err := s.configWriter()
+		if err != nil {
+			return LegacyProjectionObservation{}, err
+		}
+		if err := s.verifyLiveRoots(); err != nil {
+			return LegacyProjectionObservation{}, ErrUpgradeJournalConflict
+		}
+		if err := w.WriteMetadata("server.env", afterRaw); err != nil {
+			return LegacyProjectionObservation{}, err
+		}
+	} else if sha256Bytes(raw) != plan.ServerEnvAfterSHA256 {
+		return LegacyProjectionObservation{}, ErrUpgradeJournalConflict
+	}
+	if err := s.verifyLiveRoots(); err != nil {
+		return LegacyProjectionObservation{}, ErrUpgradeJournalConflict
+	}
+	return s.ReadLegacyProjection(context.Background(), plan, activation)
+}
+
+// validateLegacyMutationState performs the compare-before-write portion of
+// the legacy CAS. It accepts only the untouched legacy shape or the exact
+// already-projected shape for idempotent retries.
+func (s *UpgradeStore) validateLegacyMutationState(plan LegacyProjectionPlan, activation ActivationV1, preparing bool) error {
+	if s.verifyLiveRoots() != nil {
+		return ErrUpgradeJournalConflict
+	}
+	currentInfo, err := s.activationWriter.ops.Lstat("current")
+	if err != nil || currentInfo.Mode()&os.ModeSymlink == 0 {
+		return ErrUpgradeJournalConflict
+	}
+	current, err := s.activationWriter.ops.Readlink("current")
+	if err != nil || (current != filepath.ToSlash(filepath.Join("releases", plan.Release.ID)) && current != legacyCurrentTarget) {
+		return ErrUpgradeJournalConflict
+	}
+	active, err := s.activationWriter.ReadActivationLink(ActivationLinkActive)
+	if err == nil {
+		id, ok := activationIDFromTarget(active)
+		if !ok || id != activation.ActivationID {
+			return ErrUpgradeJournalConflict
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return ErrUpgradeJournalConflict
+	}
+	previous, err := s.legacyPrevious()
+	if err != nil || !previous.equal(plan.Previous) {
+		return ErrUpgradeJournalConflict
+	}
+	env, err := s.readLegacyServerEnv()
+	if err != nil || (sha256Bytes(env) != plan.ServerEnvBeforeSHA256 && sha256Bytes(env) != plan.ServerEnvAfterSHA256) {
+		return ErrUpgradeJournalConflict
+	}
+	unit, err := s.readSystemdUnit()
+	if err != nil {
+		return ErrUpgradeJournalConflict
+	}
+	if preparing && sha256Bytes(unit) != plan.ServerUnitBeforeSHA256 && sha256Bytes(unit) != plan.ServerUnitAfterSHA256 {
+		return ErrUpgradeJournalConflict
+	}
+	if !preparing && sha256Bytes(unit) != plan.ServerUnitAfterSHA256 {
+		return ErrUpgradeJournalConflict
+	}
+	return nil
+}
+
+func (s *UpgradeStore) ReadLegacyProjection(_ context.Context, plan LegacyProjectionPlan, activation ActivationV1) (LegacyProjectionObservation, error) {
+	return s.readLegacyProjectionPhase(context.Background(), plan, activation, false)
+}
+
+func (s *UpgradeStore) readLegacyProjectionPhase(_ context.Context, plan LegacyProjectionPlan, activation ActivationV1, allowBefore bool) (LegacyProjectionObservation, error) {
+	if s.verifyLiveRoots() != nil || plan.Validate() != nil || activation.Validate() != nil {
+		return LegacyProjectionObservation{}, ErrUpgradeJournalConflict
+	}
+	_, digest, err := s.readActivation(activation.ActivationID)
+	if err != nil || digest != sha256BytesMust(activation) {
+		return LegacyProjectionObservation{}, ErrUpgradeJournalConflict
+	}
+	state, err := s.ReadActivationState(context.Background())
+	if err != nil || state.ActiveID != activation.ActivationID {
+		return LegacyProjectionObservation{}, ErrUpgradeJournalConflict
+	}
+	env, err := s.readLegacyServerEnv()
+	if err != nil || (sha256Bytes(env) != plan.ServerEnvAfterSHA256 && (!allowBefore || sha256Bytes(env) != plan.ServerEnvBeforeSHA256)) {
+		return LegacyProjectionObservation{}, ErrUpgradeJournalConflict
+	}
+	unit, err := s.readSystemdUnit()
+	if err != nil || sha256Bytes(unit) != plan.ServerUnitAfterSHA256 {
+		return LegacyProjectionObservation{}, ErrUpgradeJournalConflict
+	}
+	o := LegacyProjectionObservation{ActivationID: activation.ActivationID, ActivationJSONSHA256: digest, DatabaseEnvSHA256: activation.DatabaseEnvSHA256, Active: ActivationPointerIdentity{ID: state.ActiveID, JSONSHA256: state.ActiveActivationJSONSHA256}, Previous: ActivationPointerIdentity{ID: state.PreviousID, JSONSHA256: state.PreviousJSONSHA256}, CurrentTarget: legacyCurrentTarget, ServerEnvSHA256: sha256Bytes(env), ServerUnitSHA256: sha256Bytes(unit)}
+	if o.Validate() != nil {
+		return LegacyProjectionObservation{}, ErrUpgradeJournalConflict
+	}
+	return o, nil
+}
+
+// RecoverLegacyPlan reconstructs the non-secret compatibility plan from the
+// projected activation and fixed roots. Database credentials remain in memory.
+func (s *UpgradeStore) RecoverLegacyPlan(_ context.Context, plannedOld ActivationV1, requestedManifestSHA string) (LegacyProjectionPlan, error) {
+	if !s.ownsLock() || plannedOld.Validate() != nil || plannedOld.LegacyProjection == nil || !validSHA(requestedManifestSHA) {
+		return LegacyProjectionPlan{}, ErrUpgradeJournalConflict
+	}
+	lp := plannedOld.LegacyProjection
+	if s.verifyLiveRoots() != nil {
+		return LegacyProjectionPlan{}, ErrUpgradeJournalConflict
+	}
+	currentInfo, err := s.activationWriter.ops.Lstat("current")
+	if err != nil || currentInfo.Mode()&os.ModeSymlink == 0 {
+		return LegacyProjectionPlan{}, ErrUpgradeJournalConflict
+	}
+	currentTarget, err := s.activationWriter.ops.Readlink("current")
+	if err != nil || (currentTarget != filepath.ToSlash(filepath.Join("releases", plannedOld.Release.ID)) && currentTarget != legacyCurrentTarget) {
+		return LegacyProjectionPlan{}, ErrUpgradeJournalConflict
+	}
+	manifestRaw, err := secureReleaseFile(s.activationWriter, lp.ServerUnitReleaseID, "manifest.json", 0o644)
+	manifest, err := parseReleaseManifest(manifestRaw)
+	if err != nil {
+		return LegacyProjectionPlan{}, ErrUpgradeJournalConflict
+	}
+	if sha256Bytes(manifestRaw) != requestedManifestSHA || manifest.ReleaseID != lp.ServerUnitReleaseID {
+		return LegacyProjectionPlan{}, ErrUpgradeJournalConflict
+	}
+	previous, err := s.legacyPrevious()
+	if err != nil {
+		return LegacyProjectionPlan{}, ErrUpgradeJournalConflict
+	}
+	envRaw, err := s.readLegacyServerEnv()
+	if err != nil {
+		return LegacyProjectionPlan{}, ErrUpgradeJournalConflict
+	}
+	databaseEnv, afterRaw, splitErr := splitLegacyServerEnv(envRaw)
+	if splitErr != nil {
+		_, _, readErr := s.readActivation(plannedOld.ActivationID)
+		if readErr != nil {
+			return LegacyProjectionPlan{}, ErrUpgradeJournalConflict
+		}
+		slot, err := s.activationSlotWriter(plannedOld.ActivationID)
+		if err != nil {
+			return LegacyProjectionPlan{}, ErrUpgradeJournalConflict
+		}
+		defer slot.Close()
+		databaseEnv, err = slot.ReadMetadata("database.env")
+		if err != nil {
+			return LegacyProjectionPlan{}, ErrUpgradeJournalConflict
+		}
+		if _, err := ParseDatabaseEnv(databaseEnv); err != nil {
+			return LegacyProjectionPlan{}, ErrUpgradeJournalConflict
+		}
+		afterRaw = envRaw
+	}
+	unit, err := s.readSystemdUnit()
+	if err != nil {
+		return LegacyProjectionPlan{}, ErrUpgradeJournalConflict
+	}
+	plan := LegacyProjectionPlan{TransactionID: plannedOld.CreatedByTransactionID, ActivationID: plannedOld.ActivationID, Release: plannedOld.Release, CurrentTarget: lp.Target, ExpectedMigration: plannedOld.Database.Migration, ExpectedRowsSHA256: plannedOld.Database.SchemaMigrationsSHA256, DatabaseEnv: databaseEnv, DatabaseEnvSHA256: plannedOld.DatabaseEnvSHA256, ServerEnvBeforeSHA256: lp.ServerEnvBeforeSHA256, ServerEnvAfterSHA256: lp.ServerEnvAfterSHA256, ServerUnitBeforeSHA256: lp.ServerUnitBeforeSHA256, ServerUnitAfterSHA256: lp.ServerUnitAfterSHA256, ServerUnitReleaseID: lp.ServerUnitReleaseID, Previous: previous}
+	if plan.Validate() != nil || sha256Bytes(databaseEnv) != plan.DatabaseEnvSHA256 || (sha256Bytes(envRaw) != plan.ServerEnvBeforeSHA256 && sha256Bytes(envRaw) != plan.ServerEnvAfterSHA256) || (sha256Bytes(afterRaw) != plan.ServerEnvAfterSHA256 && sha256Bytes(envRaw) != plan.ServerEnvAfterSHA256) || (sha256Bytes(unit) != plan.ServerUnitBeforeSHA256 && sha256Bytes(unit) != plan.ServerUnitAfterSHA256) {
+		return LegacyProjectionPlan{}, ErrUpgradeJournalConflict
+	}
+	return plan, nil
+}
+
+func sha256BytesMust(a ActivationV1) string {
+	raw, err := MarshalActivationV1(a)
+	if err != nil {
+		return ""
+	}
+	return sha256Bytes(raw)
+}

@@ -20,12 +20,19 @@ type engineStoreFake struct {
 	fail                                           string
 	remaining                                      int
 	unknown                                        bool
+	persistBeforeFailure                           bool
 	legacy                                         bool
 	conflict                                       bool
 	released                                       int
 	created                                        []UpgradeJournalV1
 	saved                                          []UpgradeJournalV1
 	old                                            ActivationV1
+	oldDigest                                      string
+	legacyPlan                                     *LegacyProjectionPlan
+	legacyActivation                               ActivationV1
+	legacyDigest                                   string
+	writtenCandidate                               ActivationV1
+	legacyFinalized                                bool
 	candidateEnv                                   []byte
 	state                                          UpgradeActivationState
 	markerTx                                       string
@@ -55,13 +62,21 @@ func (s *engineStoreFake) LoadJournal(context.Context, string) (UpgradeJournalV1
 	if err := s.event("load"); err != nil {
 		return UpgradeJournalV1{}, err
 	}
+	var journal UpgradeJournalV1
 	if len(s.saved) > 0 {
-		return s.saved[len(s.saved)-1], nil
+		journal = s.saved[len(s.saved)-1]
+	} else if len(s.created) > 0 {
+		journal = s.created[len(s.created)-1]
+	} else {
+		return UpgradeJournalV1{}, errEngineFake
 	}
-	if len(s.created) > 0 {
-		return s.created[len(s.created)-1], nil
+	// Old fixture journals predate strict canonical activation digests. Keep
+	// their state-machine coverage while presenting the concrete activation
+	// identity the typed preflight now requires.
+	if journal.OldActivationJSONSHA256 == strings.Repeat("a", 64) && s.oldDigest != "" {
+		journal.OldActivationJSONSHA256 = s.oldDigest
 	}
-	return UpgradeJournalV1{}, errEngineFake
+	return journal, nil
 }
 func (s *engineStoreFake) ReadActualState(_ context.Context, oldID, candidateID string) (UpgradeActualState, error) {
 	if err := s.event("actual"); err != nil {
@@ -71,7 +86,15 @@ func (s *engineStoreFake) ReadActualState(_ context.Context, oldID, candidateID 
 	if markerTx == "" && s.state.Marker {
 		markerTx = "txn-1"
 	}
-	return UpgradeActualState{ActiveID: s.state.ActiveID, PreviousID: s.state.PreviousID, MarkerTransactionID: markerTx, OldActivationJSONSHA256: strings.Repeat("a", 64), CandidateActivationJSONSHA256: strings.Repeat("b", 64), PreviousActivationJSONSHA256: s.state.PreviousJSONSHA256, OldActivationExists: oldID == "activation-old", CandidateActivationExists: candidateID == "activation-new"}, nil
+	oldDigest := s.oldDigest
+	if oldDigest == "" {
+		oldDigest = strings.Repeat("a", 64)
+	}
+	previousDigest := s.state.PreviousJSONSHA256
+	if s.state.PreviousID == s.old.ActivationID && previousDigest == strings.Repeat("a", 64) {
+		previousDigest = oldDigest
+	}
+	return UpgradeActualState{ActiveID: s.state.ActiveID, PreviousID: s.state.PreviousID, MarkerTransactionID: markerTx, OldActivationJSONSHA256: oldDigest, CandidateActivationJSONSHA256: strings.Repeat("b", 64), PreviousActivationJSONSHA256: previousDigest, OldActivationExists: oldID == s.old.ActivationID || oldID == s.legacyActivation.ActivationID, CandidateActivationExists: candidateID == "activation-new"}, nil
 }
 func (s *engineStoreFake) EnsureMarker(_ context.Context, tx string) error {
 	if err := s.event("ensure-marker"); err != nil {
@@ -80,17 +103,59 @@ func (s *engineStoreFake) EnsureMarker(_ context.Context, tx string) error {
 	s.state.Marker = true
 	return nil
 }
-func (s *engineStoreFake) Preflight(context.Context, string) (ActivationV1, string, bool, error) {
+func (s *engineStoreFake) PreflightPlan(_ context.Context, request UpgradePreflightRequest) (UpgradePreflight, error) {
 	if err := s.event("preflight"); err != nil {
-		return ActivationV1{}, "", false, err
+		return UpgradePreflight{}, err
 	}
-	return s.old, strings.Repeat("a", 64), s.legacy, nil
+	if !s.legacy {
+		return UpgradePreflight{Existing: &ExistingActivationPreflight{Activation: s.old, JSONSHA256: s.oldDigest}}, nil
+	}
+	plan := &LegacyProjectionPlan{
+		TransactionID: request.TransactionID, ActivationID: "legacy-0123456789abcdef012345", Release: ReleaseV1{ID: "release-rc0", Version: ProductionNMinusOneVersion, SourceCommit: RC0SourceCommit, Architecture: "amd64", ManifestSHA256: RC0ReleaseManifestSHA256}, CurrentTarget: "/opt/open-card/releases/release-rc0", ExpectedMigration: "0023", ExpectedRowsSHA256: strings.Repeat("c", 64), DatabaseEnv: []byte("OPEN_CARD_DATABASE_URL=postgresql://user:pass@localhost:5432/open_card?sslmode=disable\n"), ServerEnvBeforeSHA256: strings.Repeat("1", 64), ServerEnvAfterSHA256: strings.Repeat("2", 64), ServerUnitBeforeSHA256: strings.Repeat("3", 64), ServerUnitAfterSHA256: strings.Repeat("4", 64), ServerUnitReleaseID: request.CandidateRelease.ID,
+	}
+	plan.Previous = ActivationPointerIdentity{ID: s.state.PreviousID, JSONSHA256: s.state.PreviousJSONSHA256}
+	plan.DatabaseEnvSHA256 = sha256Bytes(plan.DatabaseEnv)
+	s.legacyPlan = plan
+	return UpgradePreflight{Legacy: plan, Previous: plan.Previous}, nil
 }
-func (s *engineStoreFake) ProjectLegacy(context.Context, string, ActivationV1) (string, error) {
-	if err := s.event("project-legacy"); err != nil {
-		return "", err
+func (s *engineStoreFake) PrepareLegacyProjection(_ context.Context, plan LegacyProjectionPlan, activation ActivationV1) (LegacyProjectionObservation, error) {
+	if err := s.event("legacy:prepare"); err != nil {
+		return LegacyProjectionObservation{}, err
 	}
-	return strings.Repeat("a", 64), nil
+	s.legacyPlan = &plan
+	s.legacyActivation = activation
+	digest, err := CanonicalActivationJSONSHA256(activation)
+	if err != nil {
+		return LegacyProjectionObservation{}, err
+	}
+	s.legacyDigest = digest
+	s.oldDigest = digest
+	s.state.ActiveID, s.state.ActiveActivationJSONSHA256 = activation.ActivationID, digest
+	return expectedLegacyObservation(plan, activation, digest), nil
+}
+func (s *engineStoreFake) FinalizeLegacyProjection(_ context.Context, plan LegacyProjectionPlan, activation ActivationV1) (LegacyProjectionObservation, error) {
+	if err := s.event("legacy:finalize"); err != nil {
+		return LegacyProjectionObservation{}, err
+	}
+	s.legacyFinalized = true
+	return expectedLegacyObservation(plan, activation, s.legacyDigest), nil
+}
+func (s *engineStoreFake) ReadLegacyProjection(_ context.Context, plan LegacyProjectionPlan, activation ActivationV1) (LegacyProjectionObservation, error) {
+	if err := s.event("legacy:read"); err != nil {
+		return LegacyProjectionObservation{}, err
+	}
+	return expectedLegacyObservation(plan, activation, s.legacyDigest), nil
+}
+func (s *engineStoreFake) RecoverLegacyPlan(_ context.Context, old ActivationV1, _ string) (LegacyProjectionPlan, error) {
+	if err := s.event("legacy:recover-plan"); err != nil {
+		return LegacyProjectionPlan{}, err
+	}
+	if s.legacyPlan == nil || old.ActivationID != s.legacyPlan.ActivationID {
+		return LegacyProjectionPlan{}, errEngineFake
+	}
+	plan := *s.legacyPlan
+	plan.Previous = ActivationPointerIdentity{ID: s.state.PreviousID, JSONSHA256: s.state.PreviousJSONSHA256}
+	return plan, nil
 }
 func (s *engineStoreFake) ReadActivationState(context.Context) (UpgradeActivationState, error) {
 	if err := s.event("read"); err != nil {
@@ -109,6 +174,10 @@ func (s *engineStoreFake) CreateJournal(_ context.Context, j UpgradeJournalV1) e
 	return nil
 }
 func (s *engineStoreFake) SaveJournal(_ context.Context, j UpgradeJournalV1) error {
+	if s.fail == "save:"+string(j.State) && s.remaining != 0 && s.persistBeforeFailure {
+		s.saved = append(s.saved, j)
+		return s.event("save:" + string(j.State))
+	}
 	if err := s.event("save:" + string(j.State)); err != nil {
 		return err
 	}
@@ -126,7 +195,8 @@ func (s *engineStoreFake) Marker(_ context.Context, set bool) error {
 	s.state.Marker = set
 	return nil
 }
-func (s *engineStoreFake) WriteCandidateActivation(_ context.Context, _ ActivationV1, env []byte) (string, error) {
+func (s *engineStoreFake) WriteCandidateActivation(_ context.Context, candidate ActivationV1, env []byte) (string, error) {
+	s.writtenCandidate = candidate
 	s.candidateEnv = append([]byte(nil), env...)
 	if err := s.event("write"); err != nil {
 		return "", err
@@ -138,7 +208,7 @@ func (s *engineStoreFake) SetPrevious(_ context.Context, id string) error {
 		return err
 	}
 	s.state.PreviousID = id
-	s.state.PreviousJSONSHA256 = strings.Repeat("a", 64)
+	s.state.PreviousJSONSHA256 = s.oldDigest
 	return nil
 }
 func (s *engineStoreFake) RestorePrevious(_ context.Context, current, previous, digest string) error {
@@ -165,17 +235,30 @@ func (s *engineStoreFake) RestoreActive(_ context.Context, old, candidate string
 		return err
 	}
 	s.state.ActiveID = old
-	s.state.ActiveActivationJSONSHA256 = strings.Repeat("a", 64)
+	s.state.ActiveActivationJSONSHA256 = s.oldDigest
 	s.state.PreviousID = candidate
 	s.state.PreviousJSONSHA256 = strings.Repeat("b", 64)
 	return nil
 }
 
 type engineDBFake struct {
-	events    *[]string
-	fail      string
-	remaining int
-	unknown   bool
+	events       *[]string
+	fail         string
+	remaining    int
+	unknown      bool
+	inspectCalls int
+	inspectDrift bool
+}
+
+func (d *engineDBFake) InspectActive(_ context.Context, request ActiveDatabaseInspectionRequest) (DatabaseV1, error) {
+	if err := d.event("inspect-active"); err != nil {
+		return DatabaseV1{}, err
+	}
+	d.inspectCalls++
+	if d.inspectDrift && d.inspectCalls > 1 {
+		return DatabaseV1{Name: "open_card", Migration: request.ExpectedMigration, SchemaMigrationsSHA256: strings.Repeat("9", 64)}, nil
+	}
+	return DatabaseV1{Name: "open_card", Migration: request.ExpectedMigration, SchemaMigrationsSHA256: request.ExpectedRowsSHA256}, nil
 }
 
 func (d *engineDBFake) event(name string) error {
@@ -245,6 +328,9 @@ func (s *engineServiceFake) HealthInternal(context.Context) error { return s.eve
 func (s *engineServiceFake) StartEdge(context.Context) error      { return s.event("edge:start") }
 func (s *engineServiceFake) HealthEdge(context.Context) error     { return s.event("edge:health") }
 func (s *engineServiceFake) GuardEdge(context.Context) error      { return s.event("edge:guard") }
+func (s *engineServiceFake) ReloadServerUnit(context.Context, string) error {
+	return s.event("unit:reload")
+}
 func (s *engineServiceFake) RestoreSnapshot(context.Context, ServiceSnapshotV1) error {
 	return s.event("restore:snapshot")
 }
@@ -263,7 +349,16 @@ func engineRequest() UpgradeRequest {
 }
 func engineFixture(legacy bool) (*UpgradeEngine, *engineStoreFake, *engineDBFake, *engineServiceFake, *[]string) {
 	events := []string{}
-	s := &engineStoreFake{events: &events, old: engineOldActivation(), legacy: legacy, state: UpgradeActivationState{ActiveID: "activation-old", ActiveActivationJSONSHA256: strings.Repeat("a", 64)}}
+	old := engineOldActivation()
+	oldDigest, err := CanonicalActivationJSONSHA256(old)
+	if err != nil {
+		panic(err)
+	}
+	state := UpgradeActivationState{ActiveID: old.ActivationID, ActiveActivationJSONSHA256: oldDigest}
+	if legacy {
+		state = UpgradeActivationState{}
+	}
+	s := &engineStoreFake{events: &events, old: old, oldDigest: oldDigest, legacy: legacy, state: state}
 	d := &engineDBFake{events: &events}
 	svc := &engineServiceFake{events: &events, edgeActive: true}
 	n := 1
@@ -561,14 +656,210 @@ func TestRecoverRecoveryGuardsAfterRecoveryJournalIsPersisted(t *testing.T) {
 }
 
 func TestUpgradeEngineLegacyBranch(t *testing.T) {
-	e, store, _, _, _ := engineFixture(true)
+	e, store, _, _, events := engineFixture(true)
 	r := engineRequest()
 	r.ExpectedLegacy = true
 	if err := e.RunNew(context.Background(), r); err != nil {
-		t.Fatal(err)
+		t.Fatalf("%v events=%v", err, *events)
 	}
 	if len(store.saved) != 10 || store.saved[0].State != JournalLegacyProjected || store.saved[5].State != JournalValidated {
 		t.Fatalf("unexpected legacy journals: %#v", store.saved)
+	}
+	if store.writtenCandidate.Origin != "native" || store.writtenCandidate.LegacyProjection != nil {
+		t.Fatalf("candidate was not native: %#v", store.writtenCandidate)
+	}
+	want := []string{"acquire", "preflight", "inspect-active", "capture", "create", "marker:on", "quiesce", "drain", "inspect-active", "legacy:prepare", "unit:reload", "legacy:finalize", "legacy:read", "save:LEGACY_PROJECTED", "save:QUIESCED"}
+	for i, event := range want {
+		if i >= len(*events) || (*events)[i] != event {
+			t.Fatalf("legacy order at %d = %v, want prefix %v", i, *events, want)
+		}
+	}
+	if raw, err := MarshalUpgradeJournalV1(store.created[0]); err != nil || strings.Contains(string(raw), "user:pass") || strings.Contains(string(raw), "postgresql://") {
+		t.Fatalf("planned legacy journal leaked database env: %v %s", err, raw)
+	}
+}
+
+func TestUpgradeEngineLegacyInspectionDriftRequiresRecoveryBeforeProjection(t *testing.T) {
+	e, store, db, _, events := engineFixture(true)
+	db.inspectDrift = true
+	r := engineRequest()
+	r.ExpectedLegacy = true
+	if got := enginePhase(t, e.RunNew(context.Background(), r)); got.Phase != JournalRecoveryRequired {
+		t.Fatal(got)
+	}
+	if db.inspectCalls != 2 || eventIndex(*events, "legacy:prepare") >= 0 || !store.state.Marker {
+		t.Fatalf("drift reached projection or lost marker: calls=%d events=%v marker=%v", db.inspectCalls, *events, store.state.Marker)
+	}
+}
+
+func TestUpgradeEngineLegacyReloadFailureRetainsPreFinalizeRecoveryState(t *testing.T) {
+	e, store, _, svc, events := engineFixture(true)
+	svc.fail, svc.remaining = "unit:reload", 1
+	r := engineRequest()
+	r.ExpectedLegacy = true
+	if got := enginePhase(t, e.RunNew(context.Background(), r)); got.Phase != JournalPreflighted {
+		t.Fatal(got)
+	}
+	if !store.state.Marker || store.legacyFinalized || eventIndex(*events, "legacy:finalize") >= 0 {
+		t.Fatalf("reload failure finalized legacy environment: marker=%v finalized=%v events=%v", store.state.Marker, store.legacyFinalized, *events)
+	}
+}
+
+func TestRecoverLegacyPreflightProjectsThenAbortsWithoutCandidate(t *testing.T) {
+	e, store, _, _, events := engineFixture(true)
+	// Fail just before the first projection mutation, then simulate a restart
+	// with the durable PREFLIGHTED journal as the only authority.
+	store.fail, store.remaining = "legacy:prepare", 1
+	r := engineRequest()
+	r.ExpectedLegacy = true
+	if err := e.RunNew(context.Background(), r); err == nil {
+		t.Fatal("expected injected legacy prepare failure")
+	}
+	if len(store.created) != 1 || store.created[0].PlannedOldActivation == nil {
+		t.Fatalf("missing planned legacy journal: %#v", store.created)
+	}
+	store.fail, store.remaining = "", 0
+	store.saved = []UpgradeJournalV1{store.created[0]}
+	store.state = UpgradeActivationState{Marker: true}
+	if got := enginePhase(t, e.Recover(context.Background(), "txn-1")); got.Phase != JournalAbortedPreSwitch {
+		t.Fatalf("%v events=%v", got, *events)
+	}
+	if store.writtenCandidate.ActivationID != "" || store.state.ActiveID != store.created[0].OldActivationID || store.state.Marker {
+		t.Fatalf("legacy recovery continued candidate work: candidate=%q state=%#v", store.writtenCandidate.ActivationID, store.state)
+	}
+	if len(store.saved) == 0 || store.saved[len(store.saved)-1].State != JournalAbortedPreSwitch {
+		t.Fatalf("legacy recovery did not terminally abort: %#v", store.saved)
+	}
+}
+
+func legacyPreflightForRecovery(t *testing.T, baseline ActivationPointerIdentity) (*UpgradeEngine, *engineStoreFake, *engineServiceFake, *[]string) {
+	t.Helper()
+	e, store, _, service, events := engineFixture(true)
+	store.state.PreviousID, store.state.PreviousJSONSHA256 = baseline.ID, baseline.JSONSHA256
+	store.fail, store.remaining = "legacy:prepare", 1
+	r := engineRequest()
+	r.ExpectedLegacy = true
+	runErr := e.RunNew(context.Background(), r)
+	if runErr == nil {
+		t.Fatal("expected injected legacy prepare failure")
+	}
+	if len(store.created) != 1 || store.created[0].PlannedOldActivation == nil {
+		t.Fatalf("missing legacy preflight journal: err=%v created=%#v events=%v", runErr, store.created, *events)
+	}
+	if store.created[0].PlannedOldActivation.Release.ID == r.CandidateRelease.ID || store.created[0].PlannedOldActivation.Release.Version != ProductionNMinusOneVersion {
+		t.Fatalf("legacy and candidate release identities collapsed: old=%#v candidate=%#v", store.created[0].PlannedOldActivation.Release, r.CandidateRelease)
+	}
+	store.fail, store.remaining = "", 0
+	store.saved = []UpgradeJournalV1{store.created[0]}
+	store.state = UpgradeActivationState{PreviousID: baseline.ID, PreviousJSONSHA256: baseline.JSONSHA256, Marker: true}
+	*events = nil
+	return e, store, service, events
+}
+
+func TestRecoverLegacyPreflightBindsPreviousBaseline(t *testing.T) {
+	for _, baseline := range []ActivationPointerIdentity{
+		{},
+		{ID: "activation-before", JSONSHA256: strings.Repeat("9", 64)},
+	} {
+		t.Run(fmt.Sprintf("baseline-%q", baseline.ID), func(t *testing.T) {
+			e, store, _, events := legacyPreflightForRecovery(t, baseline)
+			if got := enginePhase(t, e.Recover(context.Background(), "txn-1")); got.Phase != JournalAbortedPreSwitch {
+				t.Fatalf("%v events=%v", got, *events)
+			}
+			if eventIndex(*events, "legacy:prepare") < 0 || store.state.PreviousID != baseline.ID || store.state.PreviousJSONSHA256 != baseline.JSONSHA256 {
+				t.Fatalf("baseline was not preserved: state=%#v events=%v", store.state, *events)
+			}
+		})
+	}
+}
+
+func TestRecoverLegacyPreflightRejectsForeignPreviousBeforeProjection(t *testing.T) {
+	e, store, _, events := legacyPreflightForRecovery(t, ActivationPointerIdentity{})
+	store.state.PreviousID, store.state.PreviousJSONSHA256 = "activation-foreign", strings.Repeat("8", 64)
+	if got := enginePhase(t, e.Recover(context.Background(), "txn-1")); got.Phase != JournalRecoveryRequired {
+		t.Fatalf("%v events=%v", got, *events)
+	}
+	if eventIndex(*events, "legacy:prepare") >= 0 || eventIndex(*events, "unit:reload") >= 0 || eventIndex(*events, "legacy:finalize") >= 0 || !store.state.Marker || eventIndex(*events, "edge:guard") < 0 {
+		t.Fatalf("foreign previous reached projection: state=%#v events=%v", store.state, *events)
+	}
+}
+
+func TestUpgradeEngineLegacyProjectionUnknownBoundariesRemainRecoverable(t *testing.T) {
+	for _, target := range []string{"legacy:prepare", "unit:reload", "legacy:finalize", "legacy:read", "save:LEGACY_PROJECTED"} {
+		t.Run(target, func(t *testing.T) {
+			e, store, _, service, _ := engineFixture(true)
+			store.fail, store.remaining, store.unknown = target, 1, true
+			service.fail, service.remaining, service.unknown = target, 1, true
+			r := engineRequest()
+			r.ExpectedLegacy = true
+			if got := enginePhase(t, e.RunNew(context.Background(), r)); got.Phase != JournalPreflighted || !store.state.Marker {
+				t.Fatalf("%v marker=%v", got, store.state.Marker)
+			}
+			for _, journal := range append(store.created, store.saved...) {
+				raw, err := MarshalUpgradeJournalV1(journal)
+				if err != nil || strings.Contains(string(raw), "user:pass") || strings.Contains(string(raw), "postgresql://") {
+					t.Fatalf("journal leaked secret: %v %s", err, raw)
+				}
+			}
+		})
+	}
+}
+
+func TestUpgradeEngineLegacyOperationalFailuresResumeFromJournal(t *testing.T) {
+	for _, target := range []string{"legacy:prepare", "unit:reload", "legacy:finalize", "legacy:read", "save:LEGACY_PROJECTED"} {
+		t.Run(target, func(t *testing.T) {
+			e, store, _, service, _ := engineFixture(true)
+			store.fail, store.remaining = target, 1
+			service.fail, service.remaining = target, 1
+			r := engineRequest()
+			r.ExpectedLegacy = true
+			if got := enginePhase(t, e.RunNew(context.Background(), r)); got.Phase != JournalPreflighted || !store.state.Marker {
+				t.Fatalf("%v marker=%v", got, store.state.Marker)
+			}
+			if len(store.created) != 1 || store.created[0].State != JournalPreflighted || store.created[0].PlannedOldActivation == nil {
+				t.Fatalf("legacy failure did not retain preflight journal: %#v", store.created)
+			}
+			store.fail, store.remaining, store.unknown = "", 0, false
+			service.fail, service.remaining, service.unknown = "", 0, false
+			if got := enginePhase(t, e.Recover(context.Background(), "txn-1")); got.Phase != JournalAbortedPreSwitch {
+				t.Fatal(got)
+			}
+			if store.writtenCandidate.ActivationID != "" || store.state.Marker || store.saved[len(store.saved)-1].State != JournalAbortedPreSwitch {
+				t.Fatalf("recovery continued candidate or lost terminal state: candidate=%q state=%#v saved=%#v", store.writtenCandidate.ActivationID, store.state, store.saved)
+			}
+			for _, journal := range append(store.created, store.saved...) {
+				raw, err := MarshalUpgradeJournalV1(journal)
+				if err != nil || strings.Contains(string(raw), "user:pass") || strings.Contains(string(raw), "postgresql://") {
+					t.Fatalf("journal leaked secret: %v %s", err, raw)
+				}
+			}
+		})
+	}
+}
+
+func TestUpgradeEngineLegacyProjectedSaveUnknownReconcilesLatestJournal(t *testing.T) {
+	for _, persisted := range []bool{false, true} {
+		t.Run(fmt.Sprintf("persisted-%v", persisted), func(t *testing.T) {
+			e, store, _, _, _ := engineFixture(true)
+			store.fail, store.remaining, store.unknown, store.persistBeforeFailure = "save:LEGACY_PROJECTED", 1, true, persisted
+			r := engineRequest()
+			r.ExpectedLegacy = true
+			phase := enginePhase(t, e.RunNew(context.Background(), r))
+			want := JournalPreflighted
+			if persisted {
+				want = JournalLegacyProjected
+			}
+			if phase.Phase != want || !store.state.Marker {
+				t.Fatalf("phase=%s want=%s marker=%v", phase.Phase, want, store.state.Marker)
+			}
+			store.fail, store.remaining, store.unknown, store.persistBeforeFailure = "", 0, false, false
+			if got := enginePhase(t, e.Recover(context.Background(), "txn-1")); got.Phase != JournalAbortedPreSwitch {
+				t.Fatal(got)
+			}
+			if store.writtenCandidate.ActivationID != "" || store.state.Marker || store.saved[len(store.saved)-1].State != JournalAbortedPreSwitch {
+				t.Fatalf("save ambiguity recovery was unsafe: candidate=%q state=%#v saved=%#v", store.writtenCandidate.ActivationID, store.state, store.saved)
+			}
+		})
 	}
 }
 
@@ -578,7 +869,7 @@ func TestUpgradeEngineLegacySaveFailureStopsBeforeMarker(t *testing.T) {
 	store.remaining = 1
 	r := engineRequest()
 	r.ExpectedLegacy = true
-	if got := enginePhase(t, e.RunNew(context.Background(), r)); got.Phase != JournalRecoveryRequired {
+	if got := enginePhase(t, e.RunNew(context.Background(), r)); got.Phase != JournalPreflighted {
 		t.Fatal(got)
 	}
 	if eventIndex(*events, "save:LEGACY_PROJECTED") < 0 || eventIndex(*events, "marker:on") < 0 {
@@ -707,6 +998,60 @@ func TestUpgradeEngineRecoverTerminalAndDrift(t *testing.T) {
 	store.state.ActiveID = "activation-old"
 	if got := enginePhase(t, e.Recover(context.Background(), "txn-1")); got.Phase != JournalCommitted || got.Code != "integrity_failed" {
 		t.Fatal(got)
+	}
+}
+
+func TestUpgradeEngineRecoverRejectsWrongPreviousDigest(t *testing.T) {
+	e, store, _, _, events := engineFixture(false)
+	if err := e.RunNew(context.Background(), engineRequest()); err != nil {
+		t.Fatal(err)
+	}
+	store.state.PreviousID, store.state.PreviousJSONSHA256 = "activation-old", strings.Repeat("8", 64)
+	if got := enginePhase(t, e.Recover(context.Background(), "txn-1")); got.Phase != JournalCommitted || got.Code != "integrity_failed" {
+		t.Fatalf("%v events=%v", got, *events)
+	}
+	if eventIndex(*events, "edge:guard") < 0 {
+		t.Fatalf("wrong previous digest did not guard edge: %v", *events)
+	}
+}
+
+func TestUpgradeEngineRecoverCandidateStateRejectsWrongPreviousDigest(t *testing.T) {
+	e, store, _, _, events := engineFixture(false)
+	if err := e.RunNew(context.Background(), engineRequest()); err != nil {
+		t.Fatal(err)
+	}
+	for _, journal := range store.saved {
+		if journal.State == JournalValidated {
+			store.saved = []UpgradeJournalV1{journal}
+			break
+		}
+	}
+	if len(store.saved) != 1 || store.saved[0].State != JournalValidated {
+		t.Fatalf("missing validated journal: %#v", store.saved)
+	}
+	store.state.Marker = true
+	store.state.PreviousID, store.state.PreviousJSONSHA256 = "activation-old", strings.Repeat("8", 64)
+	if got := enginePhase(t, e.Recover(context.Background(), "txn-1")); got.Phase != JournalRecoveryRequired {
+		t.Fatalf("%v events=%v", got, *events)
+	}
+	if eventIndex(*events, "edge:guard") < 0 || !store.state.Marker {
+		t.Fatalf("candidate pointer drift was not fail-closed: state=%#v events=%v", store.state, *events)
+	}
+}
+
+func TestRecoverLegacyPreflightWithoutDatabaseFailsClosed(t *testing.T) {
+	e, store, _, _ := legacyPreflightForRecovery(t, ActivationPointerIdentity{})
+	e.Database = nil
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			t.Fatalf("legacy recovery panicked: %v", recovered)
+		}
+	}()
+	if got := enginePhase(t, e.Recover(context.Background(), "txn-1")); got.Phase != JournalRecoveryRequired {
+		t.Fatal(got)
+	}
+	if !store.state.Marker {
+		t.Fatal("missing database driver cleared legacy recovery marker")
 	}
 }
 

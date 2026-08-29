@@ -2,16 +2,22 @@ package install
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
+	"strings"
 	"syscall"
 	"time"
 )
+
+const productionServerUnitPath = "/etc/systemd/system/open-card-server.service"
 
 type ServiceUnit string
 
@@ -40,10 +46,28 @@ type ServiceRunner interface {
 }
 type markerProbe func() (bool, error)
 
+// ServiceUnitFileReader supplies the canonical unit file to task-scoped
+// controllers. ReloadServerUnit still rejects every path but the fixed one.
+type ServiceUnitFileReader func(string) ([]byte, os.FileInfo, error)
+
+// ServiceUnitDescriptor is an already-opened canonical unit file. Metadata
+// and bytes are read from the same descriptor, avoiding path re-resolution.
+type ServiceUnitDescriptor interface {
+	io.Reader
+	Stat() (os.FileInfo, error)
+	Close() error
+}
+
+type ServiceUnitDescriptorOpener func() (ServiceUnitDescriptor, error)
+
 type ServiceController struct {
-	runner ServiceRunner
-	marker markerProbe
-	client *http.Client
+	runner         ServiceRunner
+	marker         markerProbe
+	client         *http.Client
+	serverUnitPath string
+	readUnit       ServiceUnitFileReader
+	openUnit       ServiceUnitDescriptorOpener
+	unitWriter     *DurableWriter
 }
 
 type productionServiceRunner struct{}
@@ -72,13 +96,17 @@ func ProductionServiceController() (*ServiceController, error) {
 	if !ok || stat.Uid != 0 || stat.Gid != 0 {
 		return nil, errors.New("production systemctl is unsafe")
 	}
+	unitWriter, err := ProductionDurableWriter("/etc/systemd/system")
+	if err != nil {
+		return nil, errors.New("production server-unit root is unsafe")
+	}
 	return &ServiceController{runner: productionServiceRunner{}, marker: func() (bool, error) {
 		_, err := os.Lstat("/var/lib/open-card/upgrade-in-progress")
 		if os.IsNotExist(err) {
 			return false, nil
 		}
 		return err == nil, err
-	}, client: &http.Client{Timeout: 5 * time.Second}}, nil
+	}, client: &http.Client{Timeout: 5 * time.Second}, serverUnitPath: productionServerUnitPath, unitWriter: unitWriter}, nil
 }
 
 func TaskServiceController(runner ServiceRunner, marker markerProbe, client *http.Client) (*ServiceController, error) {
@@ -89,6 +117,47 @@ func TaskServiceController(runner ServiceRunner, marker markerProbe, client *htt
 		client = &http.Client{Timeout: 5 * time.Second}
 	}
 	return &ServiceController{runner: runner, marker: marker, client: client}, nil
+}
+
+// TaskServiceControllerWithServerUnit supplies a fixed server-unit reader for
+// local tests. ReloadServerUnit still accepts no caller-controlled unit path.
+func TaskServiceControllerWithServerUnit(runner ServiceRunner, marker markerProbe, client *http.Client, serverUnitPath string, readUnit ServiceUnitFileReader) (*ServiceController, error) {
+	controller, err := TaskServiceController(runner, marker, client)
+	if err != nil || serverUnitPath == "" || readUnit == nil {
+		return nil, ErrServiceOutcomeUnknown
+	}
+	controller.serverUnitPath = serverUnitPath
+	controller.readUnit = readUnit
+	return controller, nil
+}
+
+// TaskServiceControllerWithServerUnitDescriptor supplies an already-opened
+// descriptor seam for reload trust tests without exposing an arbitrary path.
+func TaskServiceControllerWithServerUnitDescriptor(runner ServiceRunner, marker markerProbe, client *http.Client, serverUnitPath string, openUnit ServiceUnitDescriptorOpener) (*ServiceController, error) {
+	controller, err := TaskServiceController(runner, marker, client)
+	if err != nil || serverUnitPath == "" || openUnit == nil {
+		return nil, ErrServiceOutcomeUnknown
+	}
+	controller.serverUnitPath = serverUnitPath
+	controller.openUnit = openUnit
+	return controller, nil
+}
+
+// TaskServiceControllerWithPinnedUnitRoot is a test-only equivalent of the
+// production unit-root pin. The fixed unit name is retained while the caller
+// supplies an explicitly owned task root.
+func TaskServiceControllerWithPinnedUnitRoot(runner ServiceRunner, marker markerProbe, client *http.Client, root string, uid, gid int) (*ServiceController, error) {
+	controller, err := TaskServiceController(runner, marker, client)
+	if err != nil {
+		return nil, err
+	}
+	writer, err := TaskDurableWriter(root, uid, gid)
+	if err != nil {
+		return nil, ErrServiceOutcomeUnknown
+	}
+	controller.serverUnitPath = productionServerUnitPath
+	controller.unitWriter = writer
+	return controller, nil
 }
 
 func serviceName(unit ServiceUnit) string { return string(unit) + ".service" }
@@ -255,6 +324,162 @@ func (c *ServiceController) DaemonReload(ctx context.Context) error {
 		return fmt.Errorf("%w: daemon-reload", ErrServiceOutcomeUnknown)
 	}
 	return nil
+}
+
+type serverUnitProperties struct {
+	fragmentPath     string
+	dropInPaths      string
+	needDaemonReload string
+}
+
+// ReloadServerUnit verifies the canonical server unit before and after the
+// fixed daemon-reload. It deliberately has no arbitrary unit/path surface.
+func (c *ServiceController) ReloadServerUnit(ctx context.Context, expectedFragmentSHA256 string) error {
+	if c == nil || c.runner == nil || c.serverUnitPath != productionServerUnitPath || (c.readUnit == nil && c.openUnit == nil && c.unitWriter == nil) {
+		return ErrServiceOutcomeUnknown
+	}
+	if err := c.verifyUnitRoot(); err != nil {
+		return ErrServiceOutcomeUnknown
+	}
+	before, err := c.serverUnitProperties(ctx)
+	if err != nil || !before.valid(false) {
+		return ErrServiceOutcomeUnknown
+	}
+	beforeDigest, err := c.serverUnitDigest(expectedFragmentSHA256)
+	if err != nil {
+		return ErrServiceOutcomeUnknown
+	}
+	if err := c.DaemonReload(ctx); err != nil {
+		return err
+	}
+	after, err := c.serverUnitProperties(ctx)
+	if err != nil || !after.valid(true) {
+		return ErrServiceOutcomeUnknown
+	}
+	afterDigest, err := c.serverUnitDigest(expectedFragmentSHA256)
+	if err != nil || afterDigest != beforeDigest {
+		return ErrServiceOutcomeUnknown
+	}
+	if err := c.verifyUnitRoot(); err != nil {
+		return ErrServiceOutcomeUnknown
+	}
+	return nil
+}
+
+func (c *ServiceController) verifyUnitRoot() error {
+	if c == nil || c.unitWriter == nil {
+		return nil
+	}
+	return c.unitWriter.VerifyLiveRoot()
+}
+
+func (c *ServiceController) serverUnitProperties(ctx context.Context) (serverUnitProperties, error) {
+	result := c.runner.Run(ctx, "systemctl", "show", serviceName(ServiceServer), "--property=FragmentPath", "--property=DropInPaths", "--property=NeedDaemonReload")
+	if result.Err != nil || result.ExitCode != 0 {
+		return serverUnitProperties{}, ErrServiceOutcomeUnknown
+	}
+	properties := serverUnitProperties{}
+	seen := map[string]bool{}
+	for _, line := range strings.Split(strings.TrimSuffix(result.Output, "\n"), "\n") {
+		name, value, ok := strings.Cut(line, "=")
+		if !ok || seen[name] {
+			return serverUnitProperties{}, ErrServiceOutcomeUnknown
+		}
+		seen[name] = true
+		switch name {
+		case "FragmentPath":
+			properties.fragmentPath = value
+		case "DropInPaths":
+			properties.dropInPaths = value
+		case "NeedDaemonReload":
+			properties.needDaemonReload = value
+		default:
+			return serverUnitProperties{}, ErrServiceOutcomeUnknown
+		}
+	}
+	if len(seen) != 3 {
+		return serverUnitProperties{}, ErrServiceOutcomeUnknown
+	}
+	return properties, nil
+}
+
+func (p serverUnitProperties) valid(afterReload bool) bool {
+	if p.fragmentPath != productionServerUnitPath || p.dropInPaths != "" {
+		return false
+	}
+	if afterReload {
+		return p.needDaemonReload == "no"
+	}
+	return p.needDaemonReload == "yes" || p.needDaemonReload == "no"
+}
+
+func (c *ServiceController) serverUnitDigest(expected string) (string, error) {
+	if len(expected) != sha256.Size*2 {
+		return "", ErrServiceOutcomeUnknown
+	}
+	if _, err := hex.DecodeString(expected); err != nil {
+		return "", ErrServiceOutcomeUnknown
+	}
+	raw, err := c.readServerUnit()
+	if err != nil {
+		return "", ErrServiceOutcomeUnknown
+	}
+	digest := sha256.Sum256(raw)
+	actual := hex.EncodeToString(digest[:])
+	if actual != expected {
+		return "", ErrServiceOutcomeUnknown
+	}
+	return actual, nil
+}
+
+func (c *ServiceController) readServerUnit() ([]byte, error) {
+	if c.unitWriter != nil {
+		if err := c.unitWriter.VerifyLiveRoot(); err != nil {
+			return nil, ErrServiceOutcomeUnknown
+		}
+		raw, err := c.unitWriter.ReadSystemdServerUnit()
+		if err != nil || c.unitWriter.VerifyLiveRoot() != nil {
+			return nil, ErrServiceOutcomeUnknown
+		}
+		return raw, nil
+	}
+	if c.openUnit == nil {
+		raw, info, err := c.readUnit(productionServerUnitPath)
+		if err != nil || !safeServerUnitInfo(info) {
+			return nil, ErrServiceOutcomeUnknown
+		}
+		return raw, nil
+	}
+	descriptor, err := c.openUnit()
+	if err != nil || descriptor == nil {
+		return nil, ErrServiceOutcomeUnknown
+	}
+	defer descriptor.Close()
+	info, err := descriptor.Stat()
+	if err != nil || !safeServerUnitInfo(info) {
+		return nil, ErrServiceOutcomeUnknown
+	}
+	raw, err := io.ReadAll(descriptor)
+	if err != nil {
+		return nil, ErrServiceOutcomeUnknown
+	}
+	return raw, nil
+}
+
+func safeServerUnitInfo(info os.FileInfo) bool {
+	if info == nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o644 {
+		return false
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	return ok && stat.Uid == 0 && stat.Gid == 0
+}
+
+func safeServerUnitDirectoryInfo(info os.FileInfo) bool {
+	if info == nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o022 != 0 {
+		return false
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	return ok && stat.Uid == 0 && stat.Gid == 0
 }
 
 type HealthResult struct{ Code string }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -269,5 +270,174 @@ func TestProductionCandidateValidatorUsesFixedSafeInvocation(t *testing.T) {
 	}
 	if path != "/opt/open-card/releases/release-rc1/bin/open-card-admin" || strings.Join(args, " ") != "candidate validate --activation-id activation-new" || strings.Join(env, "\n") != "PATH=/usr/bin:/bin" || strings.Contains(strings.Join(args, "\n")+strings.Join(env, "\n"), "postgres") {
 		t.Fatalf("path=%q args=%v env=%v", path, args, env)
+	}
+}
+
+type inspectionDB struct {
+	*adapterDB
+	closes int
+}
+
+func (d *inspectionDB) Close() error {
+	d.closes++
+	return d.closeErr
+}
+
+func inspectionRows(rows []MigrationRow) *adapterRows {
+	values := make([][]any, len(rows))
+	for index, row := range rows {
+		values[index] = []any{row.Version, row.Checksum}
+	}
+	return &adapterRows{rows: values}
+}
+
+func inspectionAdapter(t *testing.T, database postgresDB, factoryErr error) (*UpgradeDatabaseAdapter, UpgradeDatabasePlan, *int) {
+	t.Helper()
+	plan, _, pg := adapterPlan(t)
+	active, err := PostgresEnvironment(plan.ActiveDatabaseEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opens := 0
+	factory := ActiveDatabaseInspectionFactory(func([]byte) (*SelectedPostgresDatabase, error) {
+		opens++
+		if factoryErr != nil {
+			return nil, factoryErr
+		}
+		return &SelectedPostgresDatabase{database: database}, nil
+	})
+	adapter, err := TaskUpgradeDatabaseAdapter(plan, adapterControl(active), adapterSnapshotter(t, pg), factory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return adapter, plan, &opens
+}
+
+func inspectionRequest(env []byte, expected string) ActiveDatabaseInspectionRequest {
+	return ActiveDatabaseInspectionRequest{DatabaseEnv: env, ExpectedMigration: "0023", ExpectedRowsSHA256: expected}
+}
+
+func TestUpgradeDatabaseAdapterInspectActiveExactRowsAndStableInvocation(t *testing.T) {
+	rows := migrationRows(23)
+	database := &inspectionDB{adapterDB: &adapterDB{rows: inspectionRows(rows)}}
+	adapter, plan, opens := inspectionAdapter(t, database, nil)
+	defer adapter.Close()
+	expected := migrationDigest(rows)
+	request := inspectionRequest(plan.ActiveDatabaseEnv, expected)
+	first, err := adapter.InspectActive(context.Background(), request)
+	if err != nil || first != (DatabaseV1{Name: "open_card", Migration: "0023", SchemaMigrationsSHA256: expected}) || database.query != "SELECT version, checksum FROM schema_migrations ORDER BY version" || database.closes != 1 {
+		t.Fatalf("database=%+v err=%v query=%q closes=%d", first, err, database.query, database.closes)
+	}
+	database.rows = inspectionRows(rows)
+	second, err := adapter.InspectActive(context.Background(), request)
+	if err != nil || second != first || *opens != 2 || database.closes != 2 {
+		t.Fatalf("second=%+v err=%v opens=%d closes=%d", second, err, *opens, database.closes)
+	}
+	_ = plan
+}
+
+func TestUpgradeDatabaseAdapterInspectActiveBindsExactPlanEnvironment(t *testing.T) {
+	rows := migrationRows(23)
+	database := &inspectionDB{adapterDB: &adapterDB{rows: inspectionRows(rows)}}
+	adapter, plan, opens := inspectionAdapter(t, database, nil)
+	defer adapter.Close()
+	foreign := []byte("OPEN_CARD_DATABASE_URL=postgresql://user:password@127.0.0.1:5432/open_card_active?sslmode=require\n")
+	if _, err := adapter.InspectActive(context.Background(), inspectionRequest(foreign, migrationDigest(rows))); !errors.Is(err, ErrPostgresOutcomeUnknown) || *opens != 0 {
+		t.Fatalf("foreign request err=%v opens=%d", err, *opens)
+	}
+	encoded := []byte("OPEN_CARD_DATABASE_URL=postgresql://us%40er:p%2Fass@127.0.0.1:5432/open_card?sslmode=require\n")
+	plan.ActiveDatabaseEnv = encoded
+	active, err := PostgresEnvironment(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opens = new(int)
+	factory := ActiveDatabaseInspectionFactory(func(raw []byte) (*SelectedPostgresDatabase, error) {
+		*opens = *opens + 1
+		if string(raw) != string(encoded) {
+			t.Fatal("inspection opener received a different environment")
+		}
+		return &SelectedPostgresDatabase{database: database}, nil
+	})
+	bound, err := TaskUpgradeDatabaseAdapter(plan, adapterControl(active), adapterSnapshotter(t, &fakePG{}), factory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bound.Close()
+	got, err := bound.InspectActive(context.Background(), inspectionRequest(encoded, migrationDigest(rows)))
+	if err != nil || got.Name != "open_card" || *opens != 1 {
+		t.Fatalf("inspection=%+v err=%v opens=%d", got, err, *opens)
+	}
+}
+
+func TestUpgradeDatabaseAdapterInspectActiveRejectsDrift(t *testing.T) {
+	base := migrationRows(23)
+	cases := []struct {
+		name string
+		rows []MigrationRow
+	}{
+		{name: "missing", rows: base[:22]},
+		{name: "extra", rows: append(append([]MigrationRow(nil), base...), MigrationRow{Version: "0024", Checksum: strings.Repeat("a", 64)})},
+		{name: "reordered", rows: func() []MigrationRow {
+			rows := append([]MigrationRow(nil), base...)
+			rows[0], rows[1] = rows[1], rows[0]
+			return rows
+		}()},
+		{name: "duplicate", rows: func() []MigrationRow {
+			rows := append([]MigrationRow(nil), base...)
+			rows[1].Version = rows[0].Version
+			return rows
+		}()},
+		{name: "checksum", rows: func() []MigrationRow {
+			rows := append([]MigrationRow(nil), base...)
+			rows[4].Checksum = strings.Repeat("b", 64)
+			return rows
+		}()},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			database := &inspectionDB{adapterDB: &adapterDB{rows: inspectionRows(test.rows)}}
+			adapter, plan, _ := inspectionAdapter(t, database, nil)
+			defer adapter.Close()
+			if _, err := adapter.InspectActive(context.Background(), inspectionRequest(plan.ActiveDatabaseEnv, migrationDigest(base))); err == nil || strings.Contains(err.Error(), "password") {
+				t.Fatalf("err=%v", err)
+			}
+		})
+	}
+	database := &inspectionDB{adapterDB: &adapterDB{rows: inspectionRows(base)}}
+	adapter, plan, _ := inspectionAdapter(t, database, nil)
+	defer adapter.Close()
+	if _, err := adapter.InspectActive(context.Background(), inspectionRequest(plan.ActiveDatabaseEnv, strings.Repeat("f", 64))); !errors.Is(err, ErrCandidateConflict) {
+		t.Fatalf("wrong expected err=%v", err)
+	}
+	if _, err := adapter.InspectActive(context.Background(), ActiveDatabaseInspectionRequest{DatabaseEnv: plan.ActiveDatabaseEnv, ExpectedMigration: "0024", ExpectedRowsSHA256: migrationDigest(base)}); !errors.Is(err, ErrPostgresOutcomeUnknown) {
+		t.Fatalf("wrong migration err=%v", err)
+	}
+}
+
+func TestUpgradeDatabaseAdapterInspectActiveRedactsFailuresAndRequestJSON(t *testing.T) {
+	secretEnv := []byte("OPEN_CARD_DATABASE_URL=postgresql://user:password@127.0.0.1:5432/open_card?sslmode=require\n")
+	request := inspectionRequest(secretEnv, migrationDigest(migrationRows(23)))
+	raw, err := json.Marshal(request)
+	if err != nil || strings.Contains(string(raw), "postgresql") || strings.Contains(string(raw), "database_env") {
+		t.Fatalf("request JSON=%s err=%v", raw, err)
+	}
+	for _, test := range []struct {
+		name       string
+		database   postgresDB
+		factoryErr error
+	}{
+		{name: "open", factoryErr: errors.New("postgresql://password-secret")},
+		{name: "query", database: &inspectionDB{adapterDB: &adapterDB{queryErr: errors.New("password-secret")}}},
+		{name: "close", database: &inspectionDB{adapterDB: &adapterDB{rows: inspectionRows(migrationRows(23)), closeErr: errors.New("password-secret")}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			adapter, plan, _ := inspectionAdapter(t, test.database, test.factoryErr)
+			defer adapter.Close()
+			_, err := adapter.InspectActive(context.Background(), inspectionRequest(plan.ActiveDatabaseEnv, migrationDigest(migrationRows(23))))
+			if !errors.Is(err, ErrPostgresOutcomeUnknown) || strings.Contains(err.Error(), "secret") {
+				t.Fatalf("err=%v", err)
+			}
+		})
 	}
 }

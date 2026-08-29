@@ -113,6 +113,15 @@ func (a *UpgradeServiceAdapter) GuardEdge(ctx context.Context) error {
 	return a.controller.stop(ctx, ServiceEdge)
 }
 
+// ReloadServerUnit exposes only the controller's fixed canonical-unit reload;
+// callers can provide the expected digest but cannot select a unit or path.
+func (a *UpgradeServiceAdapter) ReloadServerUnit(ctx context.Context, expectedFragmentSHA256 string) error {
+	if a == nil || a.controller == nil {
+		return ErrServiceOutcomeUnknown
+	}
+	return a.controller.ReloadServerUnit(ctx, expectedFragmentSHA256)
+}
+
 // RestoreSnapshot deliberately excludes Edge. The engine clears the upgrade
 // marker before RestoreEdge, which is the sole edge activation path.
 func (a *UpgradeServiceAdapter) RestoreSnapshot(ctx context.Context, snapshot ServiceSnapshotV1) error {
@@ -201,3 +210,10 @@ func snapshotUnit(snapshot ServiceSnapshotV1, unit ServiceUnit) UnitSnapshotV1 {
 }
 
 var _ UpgradeServiceDriver = (*UpgradeServiceAdapter)(nil)
+
+type upgradeServiceDriverWithReload interface {
+	UpgradeServiceDriver
+	ReloadServerUnit(context.Context, string) error
+}
+
+var _ upgradeServiceDriverWithReload = (*UpgradeServiceAdapter)(nil)

@@ -48,15 +48,26 @@ type ProductionUpgradeDatabaseInput struct {
 	RecoveryEvidenceSHA256 string
 }
 
+// ActiveDatabaseInspectionFactory is task-only injection for the temporary
+// connection that remains bound to the selected active database.
+type ActiveDatabaseInspectionFactory func([]byte) (*SelectedPostgresDatabase, error)
+
+// ActiveDatabaseControlFactory is retained as a compatibility spelling for
+// task callers; it has the selected-database return type, never the /postgres
+// cluster control type.
+type ActiveDatabaseControlFactory = ActiveDatabaseInspectionFactory
+
 // UpgradeDatabaseAdapter composes the fixed Postgres candidate primitives
 // into the UpgradeDatabaseDriver boundary. It intentionally has no delete or
 // candidate-drop operation: a failed upgrade is recovered through its journal.
 type UpgradeDatabaseAdapter struct {
-	plan        UpgradeDatabasePlan
-	control     *ProductionPostgresControl
-	snapshotter *PostgresSnapshotter
-	activeEnv   PostgresProcessEnvironment
-	snapshot    *SnapshotEvidence
+	plan          UpgradeDatabasePlan
+	control       *ProductionPostgresControl
+	snapshotter   *PostgresSnapshotter
+	activeEnv     PostgresProcessEnvironment
+	activeEnvSHA  string
+	snapshot      *SnapshotEvidence
+	activeFactory ActiveDatabaseInspectionFactory
 }
 
 // ProductionUpgradeDatabaseAdapter binds only fixed production dependencies.
@@ -162,6 +173,7 @@ func (productionPostgresRunner) Run(ctx context.Context, argv, env []string) Pos
 func TaskUpgradeDatabaseAdapter(plan UpgradeDatabasePlan, dependencies ...any) (*UpgradeDatabaseAdapter, error) {
 	var control *ProductionPostgresControl
 	var snapshotter *PostgresSnapshotter
+	var activeFactory ActiveDatabaseInspectionFactory
 	for _, dependency := range dependencies {
 		switch value := dependency.(type) {
 		case *ProductionPostgresControl:
@@ -184,11 +196,26 @@ func TaskUpgradeDatabaseAdapter(plan UpgradeDatabasePlan, dependencies ...any) (
 				return nil, ErrPostgresOutcomeUnknown
 			}
 			plan.ArtifactWriter = value
+		case ActiveDatabaseInspectionFactory:
+			if activeFactory != nil {
+				return nil, ErrPostgresOutcomeUnknown
+			}
+			activeFactory = value
+		case func([]byte) (*SelectedPostgresDatabase, error):
+			if activeFactory != nil {
+				return nil, ErrPostgresOutcomeUnknown
+			}
+			activeFactory = ActiveDatabaseInspectionFactory(value)
 		default:
 			return nil, ErrPostgresOutcomeUnknown
 		}
 	}
-	return newUpgradeDatabaseAdapter(plan, control, snapshotter)
+	adapter, err := newUpgradeDatabaseAdapter(plan, control, snapshotter)
+	if err != nil {
+		return nil, err
+	}
+	adapter.activeFactory = activeFactory
+	return adapter, nil
 }
 
 func newUpgradeDatabaseAdapter(plan UpgradeDatabasePlan, control *ProductionPostgresControl, snapshotter *PostgresSnapshotter) (*UpgradeDatabaseAdapter, error) {
@@ -206,7 +233,8 @@ func newUpgradeDatabaseAdapter(plan UpgradeDatabasePlan, control *ProductionPost
 	if validator, ok := plan.Validator.(productionCandidateValidator); ok && !verifiedProductionValidator(plan.CandidateReleaseRoot, manifest, validator.path) {
 		return nil, ErrPostgresOutcomeUnknown
 	}
-	return &UpgradeDatabaseAdapter{plan: cloneUpgradeDatabasePlan(plan), control: control, snapshotter: snapshotter, activeEnv: activeEnv}, nil
+	digest := sha256.Sum256(plan.ActiveDatabaseEnv)
+	return &UpgradeDatabaseAdapter{plan: cloneUpgradeDatabasePlan(plan), control: control, snapshotter: snapshotter, activeEnv: activeEnv, activeEnvSHA: hex.EncodeToString(digest[:])}, nil
 }
 
 func verifiedProductionValidator(releaseRoot string, manifest Manifest, path string) bool {
@@ -262,6 +290,42 @@ func (a *UpgradeDatabaseAdapter) Drain(ctx context.Context) error {
 		return ErrPostgresOutcomeUnknown
 	}
 	return nil
+}
+
+// InspectActive verifies the pre-upgrade active database strictly from the
+// selected database.env. It never serializes the request environment or the
+// decoded DSN, and its temporary control is always closed before return.
+func (a *UpgradeDatabaseAdapter) InspectActive(ctx context.Context, request ActiveDatabaseInspectionRequest) (database DatabaseV1, err error) {
+	if a == nil || request.Validate() != nil {
+		return DatabaseV1{}, ErrPostgresOutcomeUnknown
+	}
+	environment, parseErr := PostgresEnvironment(request.DatabaseEnv)
+	digest := sha256.Sum256(request.DatabaseEnv)
+	if parseErr != nil || !validID(environment.Descriptor.Database) || hex.EncodeToString(digest[:]) != a.activeEnvSHA || environment.Descriptor != a.activeEnv.Descriptor {
+		return DatabaseV1{}, ErrPostgresOutcomeUnknown
+	}
+	factory := a.activeFactory
+	if factory == nil {
+		factory = NewSelectedPostgresDatabase
+	}
+	selected, openErr := factory(append([]byte(nil), request.DatabaseEnv...))
+	if openErr != nil || selected == nil || selected.database == nil {
+		return DatabaseV1{}, ErrPostgresOutcomeUnknown
+	}
+	defer func() {
+		if closeErr := selected.Close(); closeErr != nil && err == nil {
+			database, err = DatabaseV1{}, ErrPostgresOutcomeUnknown
+		}
+	}()
+	rows, queryErr := selected.MigrationRows(ctx)
+	if queryErr != nil || !validMigrationRows(rows, 23) {
+		return DatabaseV1{}, ErrPostgresOutcomeUnknown
+	}
+	evidence, evidenceErr := migrationEvidence(rows)
+	if evidenceErr != nil || evidence.RowsSHA256 != request.ExpectedRowsSHA256 {
+		return DatabaseV1{}, ErrCandidateConflict
+	}
+	return DatabaseV1{Name: environment.Descriptor.Database, Migration: "0023", SchemaMigrationsSHA256: evidence.RowsSHA256}, nil
 }
 
 func (a *UpgradeDatabaseAdapter) Snapshot(ctx context.Context) (SnapshotEvidence, string, error) {

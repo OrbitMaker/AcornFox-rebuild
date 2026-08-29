@@ -13,11 +13,14 @@ import (
 
 const (
 	durableFileMode       = 0o600
+	systemdUnitMode       = 0o644
 	durableDirMode        = 0o700
 	activationSlotDirMode = 0o711
 
 	upgradeInProgressPath = "var/lib/open-card/upgrade-in-progress"
 )
+
+const systemdServerUnitName = "open-card-server.service"
 
 // ErrDurableCommitUnknown means Rename succeeded but fsyncing its parent did
 // not. Callers must reread the named object from the same DurableWriter and
@@ -28,6 +31,8 @@ var ErrDurableCommitUnknown = errors.New("durable commit outcome is unknown")
 // boundary without allowing production callers to opt out of root containment.
 type durableRoot interface {
 	OpenFile(string, int, os.FileMode) (*os.File, error)
+	OpenRoot(string) (durableRoot, error)
+	Mkdir(string, os.FileMode) error
 	Readlink(string) (string, error)
 	Rename(string, string) error
 	Link(string, string) error
@@ -42,13 +47,21 @@ type osDurableRoot struct{ root *os.Root }
 func (r osDurableRoot) OpenFile(name string, flag int, mode os.FileMode) (*os.File, error) {
 	return r.root.OpenFile(name, flag, mode)
 }
-func (r osDurableRoot) Readlink(name string) (string, error)   { return r.root.Readlink(name) }
-func (r osDurableRoot) Rename(oldName, newName string) error   { return r.root.Rename(oldName, newName) }
-func (r osDurableRoot) Link(oldName, newName string) error     { return r.root.Link(oldName, newName) }
-func (r osDurableRoot) Remove(name string) error               { return r.root.Remove(name) }
-func (r osDurableRoot) Symlink(target, name string) error      { return r.root.Symlink(target, name) }
-func (r osDurableRoot) Lstat(name string) (os.FileInfo, error) { return r.root.Lstat(name) }
-func (r osDurableRoot) Close() error                           { return r.root.Close() }
+func (r osDurableRoot) OpenRoot(name string) (durableRoot, error) {
+	child, err := r.root.OpenRoot(name)
+	if err != nil {
+		return nil, err
+	}
+	return osDurableRoot{root: child}, nil
+}
+func (r osDurableRoot) Mkdir(name string, mode os.FileMode) error { return r.root.Mkdir(name, mode) }
+func (r osDurableRoot) Readlink(name string) (string, error)      { return r.root.Readlink(name) }
+func (r osDurableRoot) Rename(oldName, newName string) error      { return r.root.Rename(oldName, newName) }
+func (r osDurableRoot) Link(oldName, newName string) error        { return r.root.Link(oldName, newName) }
+func (r osDurableRoot) Remove(name string) error                  { return r.root.Remove(name) }
+func (r osDurableRoot) Symlink(target, name string) error         { return r.root.Symlink(target, name) }
+func (r osDurableRoot) Lstat(name string) (os.FileInfo, error)    { return r.root.Lstat(name) }
+func (r osDurableRoot) Close() error                              { return r.root.Close() }
 
 type durableOps interface {
 	durableRoot
@@ -74,9 +87,11 @@ func (realDurableOps) CloseFile(file *os.File) error                  { return f
 // Use ProductionDurableWriter for root-owned production metadata or
 // TaskDurableWriter only from task-scoped test roots.
 type DurableWriter struct {
-	ops durableOps
-	uid int
-	gid int
+	ops      durableOps
+	uid      int
+	gid      int
+	rootPath string
+	rootInfo os.FileInfo
 }
 
 func ProductionDurableWriter(root string) (*DurableWriter, error) {
@@ -105,14 +120,82 @@ func newDurableWriter(root string, uid, gid int, injected durableOps) (*DurableW
 		return nil, err
 	}
 	if injected != nil {
-		return &DurableWriter{ops: injected, uid: uid, gid: gid}, nil
+		return &DurableWriter{ops: injected, uid: uid, gid: gid, rootPath: root, rootInfo: info}, nil
 	}
 	opened, err := os.OpenRoot(root)
 	if err != nil {
 		return nil, err
 	}
 	rootOps := osDurableRoot{root: opened}
-	return &DurableWriter{ops: realDurableOps{durableRoot: rootOps}, uid: uid, gid: gid}, nil
+	return &DurableWriter{ops: realDurableOps{durableRoot: rootOps}, uid: uid, gid: gid, rootPath: root, rootInfo: info}, nil
+}
+
+// VerifyLiveRoot rejects a pathname replacement after the writer was opened.
+// os.Root keeps the old descriptor usable across a rename; accepting it after
+// the named root changed would split durable writes from the live deployment.
+func (w *DurableWriter) VerifyLiveRoot() error {
+	if w == nil || w.ops == nil || w.rootPath == "" || w.rootInfo == nil {
+		return fmt.Errorf("durable writer is not initialized")
+	}
+	info, err := os.Lstat(w.rootPath)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm()&0o022 != 0 || !os.SameFile(info, w.rootInfo) {
+		return fmt.Errorf("durable root identity changed")
+	}
+	return verifyOwner(info, w.uid, w.gid)
+}
+
+// OpenChildWriter opens one already-existing child directory through this
+// writer's pinned descriptor. It deliberately does not reopen an absolute
+// path, so a renamed parent cannot redirect slot writes.
+func (w *DurableWriter) OpenChildWriter(name string, mode os.FileMode) (*DurableWriter, error) {
+	if err := w.VerifyLiveRoot(); err != nil || cleanRelative(name) != nil || strings.Contains(filepath.ToSlash(name), "/") {
+		return nil, fmt.Errorf("durable child path is unsafe")
+	}
+	info, err := w.ops.Lstat(name)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm() != mode || verifyOwner(info, w.uid, w.gid) != nil {
+		return nil, fmt.Errorf("durable child directory is unsafe")
+	}
+	child, err := w.ops.OpenRoot(name)
+	if err != nil {
+		return nil, err
+	}
+	return &DurableWriter{ops: realDurableOps{durableRoot: child}, uid: w.uid, gid: w.gid, rootPath: filepath.Join(w.rootPath, name), rootInfo: info}, nil
+}
+
+// CreateChildDirectory creates one root-relative directory and synchronizes
+// the pinned parent before returning. Existing directories are reported, not
+// silently reused, so callers must read and reconcile them explicitly.
+func (w *DurableWriter) CreateChildDirectory(name string, mode os.FileMode) (bool, error) {
+	if err := w.VerifyLiveRoot(); err != nil || cleanRelative(name) != nil || strings.Contains(filepath.ToSlash(name), "/") {
+		return false, fmt.Errorf("durable child path is unsafe")
+	}
+	if err := w.ops.Mkdir(name, mode); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	info, err := w.ops.Lstat(name)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm() != mode || verifyOwner(info, w.uid, w.gid) != nil {
+		return false, fmt.Errorf("durable child directory is unsafe")
+	}
+	if err := w.SyncRoot(); err != nil {
+		return false, fmt.Errorf("%w: %v", ErrDurableCommitUnknown, err)
+	}
+	if err := w.verifyPublishedRoot(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// verifyPublishedRoot distinguishes an operation that failed before publish
+// from one whose descriptor-root mutation may have committed but whose live
+// pathname identity changed before the caller can safely proceed.
+func (w *DurableWriter) verifyPublishedRoot() error {
+	if err := w.VerifyLiveRoot(); err != nil {
+		return fmt.Errorf("%w: durable root identity changed", ErrDurableCommitUnknown)
+	}
+	return nil
 }
 
 func safeAbsoluteDurableRoot(path string) bool {
@@ -134,7 +217,7 @@ func (w *DurableWriter) Close() error {
 }
 
 func (w *DurableWriter) WriteMetadata(name string, value []byte) error {
-	if w == nil || w.ops == nil {
+	if w == nil || w.ops == nil || w.VerifyLiveRoot() != nil {
 		return fmt.Errorf("durable writer is not initialized")
 	}
 	if err := cleanRelative(name); err != nil {
@@ -190,14 +273,94 @@ func (w *DurableWriter) WriteMetadata(name string, value []byte) error {
 	if err = w.syncParent(filepath.Dir(name)); err != nil {
 		return fmt.Errorf("%w: %v", ErrDurableCommitUnknown, err)
 	}
-	return nil
+	return w.verifyPublishedRoot()
+}
+
+// WriteSystemdServerUnit replaces only the fixed server unit with durable
+// root-owned 0644 content. The writer root is /etc/systemd/system (or a task
+// equivalent), so callers cannot select another unit name.
+func (w *DurableWriter) WriteSystemdServerUnit(value []byte) error {
+	return w.writeMetadataMode(systemdServerUnitName, value, systemdUnitMode)
+}
+
+func (w *DurableWriter) ReadSystemdServerUnit() ([]byte, error) {
+	if w == nil || w.ops == nil || w.VerifyLiveRoot() != nil {
+		return nil, fmt.Errorf("durable writer is not initialized")
+	}
+	file, err := w.ops.OpenFile(systemdServerUnitName, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer w.ops.CloseFile(file)
+	info, err := w.ops.Stat(file)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != systemdUnitMode || verifyOwner(info, w.uid, w.gid) != nil {
+		return nil, fmt.Errorf("systemd server unit is unsafe")
+	}
+	return io.ReadAll(file)
+}
+
+func (w *DurableWriter) writeMetadataMode(name string, value []byte, mode os.FileMode) error {
+	if w == nil || w.ops == nil || mode != systemdUnitMode || w.VerifyLiveRoot() != nil {
+		return fmt.Errorf("durable unit writer is not initialized")
+	}
+	if err := cleanRelative(name); err != nil {
+		return err
+	}
+	if err := w.requireSecureParents(filepath.Dir(name)); err != nil {
+		return err
+	}
+	temporary, err := durableTempName(filepath.Dir(name), ".open-card-unit-")
+	if err != nil {
+		return err
+	}
+	file, err := w.ops.OpenFile(temporary, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, mode)
+	if err != nil {
+		return err
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			_ = w.ops.CloseFile(file)
+		}
+		_ = w.ops.Remove(temporary)
+	}()
+	if _, err = w.ops.Write(file, value); err != nil {
+		return err
+	}
+	if err = w.ops.Sync(file); err != nil {
+		return err
+	}
+	if err = w.ops.Chmod(file, mode); err != nil {
+		return err
+	}
+	if err = w.ops.Chown(file, w.uid, w.gid); err != nil {
+		return err
+	}
+	info, err := w.ops.Stat(file)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != mode || verifyOwner(info, w.uid, w.gid) != nil {
+		return fmt.Errorf("systemd server unit is unsafe")
+	}
+	if err = w.ops.Sync(file); err != nil {
+		return err
+	}
+	if err = w.ops.CloseFile(file); err != nil {
+		return err
+	}
+	closed = true
+	if err = w.ops.Rename(temporary, name); err != nil {
+		return err
+	}
+	if err = w.syncParent(filepath.Dir(name)); err != nil {
+		return fmt.Errorf("%w: %v", ErrDurableCommitUnknown, err)
+	}
+	return w.verifyPublishedRoot()
 }
 
 // CreateMetadata publishes metadata with no-replace semantics. Hard-linking
 // the fully fsynced temporary file makes destination creation atomic and
 // rejects an existing destination without a check-then-replace race.
 func (w *DurableWriter) CreateMetadata(name string, value []byte) error {
-	if w == nil || w.ops == nil {
+	if w == nil || w.ops == nil || w.VerifyLiveRoot() != nil {
 		return fmt.Errorf("durable writer is not initialized")
 	}
 	if err := cleanRelative(name); err != nil {
@@ -253,11 +416,11 @@ func (w *DurableWriter) CreateMetadata(name string, value []byte) error {
 	if err = w.syncParent(filepath.Dir(name)); err != nil {
 		return fmt.Errorf("%w: %v", ErrDurableCommitUnknown, err)
 	}
-	return nil
+	return w.verifyPublishedRoot()
 }
 
 func (w *DurableWriter) ReadMetadata(name string) ([]byte, error) {
-	if w == nil || w.ops == nil {
+	if w == nil || w.ops == nil || w.VerifyLiveRoot() != nil {
 		return nil, fmt.Errorf("durable writer is not initialized")
 	}
 	if err := cleanRelative(name); err != nil {
@@ -284,7 +447,7 @@ func (w *DurableWriter) ReadMetadata(name string) ([]byte, error) {
 // RemoveMetadata removes one writer-root-relative regular metadata file after
 // validating its descriptor and synchronizing the containing directory.
 func (w *DurableWriter) RemoveMetadata(name string) error {
-	if w == nil || w.ops == nil {
+	if w == nil || w.ops == nil || w.VerifyLiveRoot() != nil {
 		return fmt.Errorf("durable writer is not initialized")
 	}
 	if err := cleanRelative(name); err != nil {
@@ -314,7 +477,7 @@ func (w *DurableWriter) RemoveMetadata(name string) error {
 	if err := w.syncParent(filepath.Dir(name)); err != nil {
 		return fmt.Errorf("%w: %v", ErrDurableCommitUnknown, err)
 	}
-	return nil
+	return w.verifyPublishedRoot()
 }
 
 func (w *DurableWriter) WriteUpgradeInProgress(transactionID string) error {
@@ -343,7 +506,7 @@ func (w *DurableWriter) ClearUpgradeInProgress() error {
 	if err := w.syncParent(filepath.Dir(upgradeInProgressPath)); err != nil {
 		return fmt.Errorf("%w: %v", ErrDurableCommitUnknown, err)
 	}
-	return nil
+	return w.verifyPublishedRoot()
 }
 
 type ActivationLinkKind string
@@ -375,12 +538,23 @@ func (w *DurableWriter) SwapActivationReleaseLink(releaseID string) error {
 // SyncRoot durably records changes made directly beneath a writer root. It is
 // used by activation-slot writers whose 0711 roots deliberately differ from
 // the stricter 0700 journal/data subdirectories.
-func (w *DurableWriter) SyncRoot() error { return w.syncParent(".") }
+func (w *DurableWriter) SyncRoot() error {
+	if err := w.VerifyLiveRoot(); err != nil {
+		return err
+	}
+	if err := w.syncParent("."); err != nil {
+		return err
+	}
+	return w.verifyPublishedRoot()
+}
 
 // ReadActivationLink returns only a recognized typed activation pointer. The
 // release link has an activation-specific path and therefore cannot be read
 // from this fixed-name API.
 func (w *DurableWriter) ReadActivationLink(kind ActivationLinkKind) (string, error) {
+	if err := w.VerifyLiveRoot(); err != nil {
+		return "", err
+	}
 	name, err := fixedActivationLinkName(kind)
 	if err != nil {
 		return "", err
@@ -408,6 +582,9 @@ func (w *DurableWriter) ReadActivationLink(kind ActivationLinkKind) (string, err
 // RemoveActivationLink may remove only the fixed previous-active pointer.
 // It verifies both the link type and its recognized target before unlinking.
 func (w *DurableWriter) RemoveActivationLink(kind ActivationLinkKind) error {
+	if err := w.VerifyLiveRoot(); err != nil {
+		return err
+	}
 	if kind != ActivationLinkPreviousActive {
 		return fmt.Errorf("activation pointer removal is not allowed")
 	}
@@ -435,7 +612,7 @@ func (w *DurableWriter) RemoveActivationLink(kind ActivationLinkKind) error {
 	if err := w.syncParent(filepath.Dir(name)); err != nil {
 		return fmt.Errorf("%w: %v", ErrDurableCommitUnknown, err)
 	}
-	return nil
+	return w.verifyPublishedRoot()
 }
 
 func fixedActivationLinkName(kind ActivationLinkKind) (string, error) {
@@ -481,6 +658,9 @@ func activationLink(kind ActivationLinkKind, activationID, releaseID string) (st
 }
 
 func (w *DurableWriter) swapRelativeSymlink(name, target string) error {
+	if err := w.VerifyLiveRoot(); err != nil {
+		return err
+	}
 	if err := cleanRelative(name); err != nil {
 		return err
 	}
@@ -511,7 +691,7 @@ func (w *DurableWriter) swapRelativeSymlink(name, target string) error {
 	if err := w.syncParent(filepath.Dir(name)); err != nil {
 		return fmt.Errorf("%w: %v", ErrDurableCommitUnknown, err)
 	}
-	return nil
+	return w.verifyPublishedRoot()
 }
 
 func (w *DurableWriter) requireSecureParents(dir string) error {

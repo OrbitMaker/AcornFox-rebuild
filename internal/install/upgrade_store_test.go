@@ -1,20 +1,102 @@
 package install
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
 
+type legacyVerifierFake struct {
+	release ReleaseV1
+	rows    []MigrationRow
+	unit    []byte
+	err     error
+}
+
+func (v legacyVerifierFake) VerifyRC0(string) (ReleaseV1, []MigrationRow, error) {
+	return v.release, v.rows, v.err
+}
+func (v legacyVerifierFake) CandidateServerUnit(ReleaseV1) ([]byte, error) { return v.unit, v.err }
+
+func TestPreflightPlanLegacyWithInjectedVerifierIsPureAndRedacted(t *testing.T) {
+	root := t.TempDir()
+	for _, p := range []string{"var/lib/open-card/upgrade-transactions", "run/lock", "etc/open-card", "etc/systemd/system", "opt/open-card/releases/rc0"} {
+		if err := os.MkdirAll(filepath.Join(root, p), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, p := range []string{"opt", "opt/open-card", "opt/open-card/releases", "opt/open-card/releases/rc0"} {
+		_ = os.Chmod(filepath.Join(root, p), 0755)
+	}
+	if err := os.Symlink("releases/rc0", filepath.Join(root, "opt/open-card/current")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "etc/open-card/server.env"), []byte("# keep\nOPEN_CARD_DATABASE_URL=postgresql://u:p@127.0.0.1:5432/open_card\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "etc/systemd/system/open-card-server.service"), []byte("[Service]\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	rows := migrationRows(23)
+	release := ReleaseV1{ID: "rc0", Version: ProductionNMinusOneVersion, SourceCommit: RC0SourceCommit, Architecture: "amd64", ManifestSHA256: RC0ReleaseManifestSHA256}
+	candidate := ReleaseV1{ID: "rc1", Version: ProductionCandidateVersion, SourceCommit: strings.Repeat("a", 40), Architecture: "amd64", ManifestSHA256: strings.Repeat("b", 64)}
+	unit := []byte("[Service]\nEnvironmentFile=-/etc/open-card/server.env\nEnvironmentFile=/opt/open-card/active/database.env\n")
+	store, err := TaskUpgradeStoreWithLegacyVerifier(root, os.Getuid(), os.Getgid(), legacyVerifierFake{release: release, rows: rows, unit: unit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock, err := store.Acquire(context.Background(), "txn-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Release()
+	plan, err := store.PreflightPlan(context.Background(), UpgradePreflightRequest{TransactionID: "txn-1", CandidateRelease: candidate})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Legacy == nil || len(plan.Legacy.DatabaseEnv) == 0 {
+		t.Fatalf("plan=%+v", plan)
+	}
+	if plan.Legacy.ServerEnvBeforeSHA256 == plan.Legacy.ServerEnvAfterSHA256 {
+		t.Fatal("legacy plan did not record distinct server.env before/after hashes")
+	}
+	raw, _ := json.Marshal(plan)
+	if strings.Contains(string(raw), "postgresql://") || strings.Contains(string(raw), "u:p") {
+		t.Fatal("DSN leaked")
+	}
+}
+
+func TestLegacyDatabaseEnvRejectsAmbiguousOrUnsafeInput(t *testing.T) {
+	valid := []byte("# keep\nOPEN_CARD_DATABASE_URL=postgresql://u:p@127.0.0.1:5432/open_card\n")
+	got, _, err := splitLegacyServerEnv(valid)
+	if err != nil || !bytes.Contains(got, []byte("OPEN_CARD_DATABASE_URL=postgresql://u:p@127.0.0.1:5432/open_card")) {
+		t.Fatalf("valid env got=%q err=%v", got, err)
+	}
+	for _, raw := range [][]byte{
+		[]byte("OPEN_CARD_DATABASE_URL=x\nOPEN_CARD_DATABASE_URL=y\n"),
+		[]byte("export OPEN_CARD_DATABASE_URL=x\n"), []byte(" OPEN_CARD_DATABASE_URL=x\n"),
+		[]byte("OPEN_CARD_DATABASE_URL=x\r\n"), []byte("OPEN_CARD_DATABASE_URL=x\x00\n"), []byte("OTHER=x\n"),
+	} {
+		if _, _, err := splitLegacyServerEnv(raw); err == nil {
+			t.Fatalf("unsafe env accepted: %q", raw)
+		}
+	}
+}
+
 func TestUpgradeStoreLockMarkerAndStubs(t *testing.T) {
 	root := t.TempDir()
-	for _, p := range []string{"var", "var/lib", "var/lib/open-card", "var/lib/open-card/upgrade-transactions", "opt", "opt/open-card"} {
+	for _, p := range []string{"var", "var/lib", "var/lib/open-card", "var/lib/open-card/upgrade-transactions", "opt", "opt/open-card", "etc", "etc/open-card", "etc/systemd", "etc/systemd/system"} {
 		if err := os.Mkdir(filepath.Join(root, p), 0700); err != nil {
 			t.Fatal(err)
 		}
@@ -48,7 +130,7 @@ func TestUpgradeStoreLockMarkerAndStubs(t *testing.T) {
 
 func TestUpgradeStoreMarkerRequiresOwnedLock(t *testing.T) {
 	root := t.TempDir()
-	for _, p := range []string{"var", "var/lib", "var/lib/open-card", "var/lib/open-card/upgrade-transactions", "opt", "opt/open-card"} {
+	for _, p := range []string{"var", "var/lib", "var/lib/open-card", "var/lib/open-card/upgrade-transactions", "opt", "opt/open-card", "etc", "etc/open-card", "etc/systemd", "etc/systemd/system"} {
 		if err := os.MkdirAll(filepath.Join(root, p), 0700); err != nil {
 			t.Fatal(err)
 		}
@@ -74,6 +156,302 @@ func TestUpgradeStoreMarkerRequiresOwnedLock(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = lock.Release()
+}
+
+func TestStoreReturnsUnknownWhenMarkerOrPointerPublishesIntoReplacedRoot(t *testing.T) {
+	t.Run("marker", func(t *testing.T) {
+		store, root, _, _, cleanup := candidateStore(t)
+		defer cleanup()
+		lock := acquireCandidate(t, store)
+		defer lock.Release()
+		live := filepath.Join(root, "var", "lib", "open-card")
+		writer, fault := renameHookWriter(t, live)
+		store.dataWriter = writer
+		fault.afterRename = func() error {
+			if err := os.Rename(live, live+"-detached"); err != nil {
+				return err
+			}
+			return os.Mkdir(live, durableDirMode)
+		}
+		if err := store.Marker(context.Background(), true); !errors.Is(err, ErrDurableCommitUnknown) {
+			t.Fatalf("marker err=%v", err)
+		}
+	})
+	t.Run("pointer", func(t *testing.T) {
+		store, root, old, _, _, lock, cleanup := seededPointerStore(t)
+		defer cleanup()
+		defer lock.Release()
+		live := filepath.Join(root, "opt", "open-card")
+		writer, fault := renameHookWriter(t, live)
+		store.activationWriter = writer
+		fault.afterRename = func() error {
+			if err := os.Rename(live, live+"-detached"); err != nil {
+				return err
+			}
+			return os.Mkdir(live, durableDirMode)
+		}
+		if err := store.SetPrevious(context.Background(), old.ActivationID); !errors.Is(err, ErrDurableCommitUnknown) {
+			t.Fatalf("pointer err=%v", err)
+		}
+	})
+}
+
+func TestUpgradeStoreRejectsReplacedPinnedRoots(t *testing.T) {
+	root := t.TempDir()
+	for _, p := range []string{"var/lib/open-card/upgrade-transactions", "opt/open-card/activations", "etc/open-card", "etc/systemd/system"} {
+		if err := os.MkdirAll(filepath.Join(root, p), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Chmod(filepath.Join(root, "opt/open-card/activations"), activationSlotDirMode); err != nil {
+		t.Fatal(err)
+	}
+	s, err := TaskUpgradeStore(root, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	lock, err := s.Acquire(context.Background(), "txn-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Release()
+	for _, relative := range []string{"opt/open-card", "etc/open-card", "etc/systemd/system", "var/lib/open-card"} {
+		sub := filepath.Join(root, relative)
+		moved := sub + "-old"
+		if err := os.Rename(sub, moved); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(sub, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.verifyLiveRoots(); !errors.Is(err, ErrUpgradeJournalConflict) {
+			t.Fatalf("root %s replacement err=%v", relative, err)
+		}
+		if relative == "opt/open-card" {
+			if _, err := s.createActivationDirectory("act-replaced"); err == nil {
+				t.Fatal("activation slot was created in replacement root")
+			}
+			if _, err := os.Lstat(filepath.Join(sub, "activations", "act-replaced")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("replacement activation root was mutated: %v", err)
+			}
+		}
+		// Recreate the store each loop so each root is independently pinned.
+		_ = lock.Release()
+		s.Close()
+		s, err = TaskUpgradeStore(root, os.Getuid(), os.Getgid())
+		if err != nil {
+			t.Fatal(err)
+		}
+		lock, err = s.Acquire(context.Background(), "txn-1")
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestSecureReleaseFileRejectsLinksModesAndParentEscape(t *testing.T) {
+	root := t.TempDir()
+	writer, err := TaskDurableWriter(root, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	for _, path := range []string{"releases", "releases/release-1", "releases/release-1/systemd"} {
+		if err := os.MkdirAll(filepath.Join(root, path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	manifest := filepath.Join(root, "releases/release-1/manifest.json")
+	unit := filepath.Join(root, "releases/release-1/systemd/open-card-server.service")
+	if err := os.WriteFile(manifest, []byte("manifest"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(unit, []byte("unit"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := secureReleaseFile(writer, "release-1", "manifest.json", 0o644); err != nil || string(got) != "manifest" {
+		t.Fatalf("read=%q err=%v", got, err)
+	}
+	if err := os.Remove(manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/outside", manifest); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := secureReleaseFile(writer, "release-1", "manifest.json", 0o644); err == nil {
+		t.Fatal("manifest symlink accepted")
+	}
+	if err := os.Remove(manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifest, []byte("manifest"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := secureReleaseFile(writer, "release-1", "manifest.json", 0o644); err == nil {
+		t.Fatal("wrong manifest mode accepted")
+	}
+	if err := os.Chmod(manifest, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(unit); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/outside", unit); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := secureReleaseFile(writer, "release-1", "systemd/open-card-server.service", 0o644); err == nil {
+		t.Fatal("unit symlink accepted")
+	}
+	if err := os.RemoveAll(filepath.Join(root, "releases/release-1/systemd")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/outside", filepath.Join(root, "releases/release-1/systemd")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := secureReleaseFile(writer, "release-1", "systemd/open-card-server.service", 0o644); err == nil {
+		t.Fatal("parent symlink accepted")
+	}
+}
+
+func TestSecureReleaseFileRejectsOwnerMismatchForLeafAndParent(t *testing.T) {
+	root := t.TempDir()
+	writer, err := TaskDurableWriter(root, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	for _, path := range []string{"releases/release-1/systemd"} {
+		if err := os.MkdirAll(filepath.Join(root, path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	manifest := filepath.Join(root, "releases/release-1/manifest.json")
+	unit := filepath.Join(root, "releases/release-1/systemd/open-card-server.service")
+	if err := os.WriteFile(manifest, []byte("manifest"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(unit, []byte("unit"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ownerMismatch := func(name string) func(os.FileInfo, int, int) error {
+		return func(info os.FileInfo, uid, gid int) error {
+			if info.Name() == name {
+				return errors.New("synthetic owner mismatch")
+			}
+			return verifyOwner(info, uid, gid)
+		}
+	}
+	if _, err := secureReleaseFileWithOwnerCheck(writer, "release-1", "manifest.json", 0o644, ownerMismatch("manifest.json")); err == nil {
+		t.Fatal("wrong leaf owner accepted")
+	}
+	if _, err := secureReleaseFileWithOwnerCheck(writer, "release-1", "systemd/open-card-server.service", 0o644, ownerMismatch("systemd")); err == nil {
+		t.Fatal("wrong nested parent owner accepted")
+	}
+}
+
+func TestSecureReleaseFileBindsDescriptorAcrossReplacement(t *testing.T) {
+	root := t.TempDir()
+	writer, err := TaskDurableWriter(root, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	if err := os.MkdirAll(filepath.Join(root, "releases/release-1"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "releases/release-1/manifest.json")
+	if err := os.WriteFile(path, []byte("before"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	replaced := false
+	check := func(info os.FileInfo, uid, gid int) error {
+		if info.Name() == "manifest.json" && !replaced {
+			replaced = true
+			if err := os.Rename(path, filepath.Join(root, "releases/release-1/manifest.old")); err != nil {
+				return err
+			}
+			if err := os.WriteFile(path, []byte("after"), 0o644); err != nil {
+				return err
+			}
+		}
+		return verifyOwner(info, uid, gid)
+	}
+	got, err := secureReleaseFileWithOwnerCheck(writer, "release-1", "manifest.json", 0o644, check)
+	if err != nil || string(got) != "before" {
+		t.Fatalf("descriptor content=%q err=%v", got, err)
+	}
+}
+
+func TestVerifySecureReleaseRejectsExactSetViolations(t *testing.T) {
+	store, root, activation, _, cleanup := candidateStore(t)
+	defer cleanup()
+	if err := store.verifyCandidateRelease(activation); err != nil {
+		t.Fatalf("baseline release rejected: %v", err)
+	}
+	extra := filepath.Join(root, "opt/open-card/releases", activation.Release.ID, "unexpected")
+	if err := os.WriteFile(extra, []byte("extra"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.verifyCandidateRelease(activation); err == nil {
+		t.Fatal("extra release file accepted")
+	}
+}
+
+func TestValidateLegacyCandidateUnitAcceptsProductionSemanticsAndRejectsUnsafeEnvironmentFiles(t *testing.T) {
+	golden, err := os.ReadFile(filepath.Join("..", "..", "deploy", "systemd", "open-card-server.service"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateLegacyCandidateUnit(golden); err != nil {
+		t.Fatalf("production unit rejected: %v", err)
+	}
+	valid := []byte("# signed production fragment\n[Unit]\nDescription=Open Card\nAfter=network-online.target\n\n[Service]\nUser=opencard\nEnvironmentFile=-/etc/open-card/server.env\nExecStart=/opt/open-card/current/bin/open-card-server\nEnvironmentFile=/opt/open-card/active/database.env\nRestart=always\n\n[Install]\nWantedBy=multi-user.target\n")
+	if err := validateLegacyCandidateUnit(valid); err != nil {
+		t.Fatalf("canonical unit rejected: %v", err)
+	}
+	for name, raw := range map[string][]byte{
+		"duplicate":   []byte("[Service]\nEnvironmentFile=-/etc/open-card/server.env\nEnvironmentFile=-/etc/open-card/server.env\nEnvironmentFile=/opt/open-card/active/database.env\n"),
+		"wrong-order": []byte("[Service]\nEnvironmentFile=/opt/open-card/active/database.env\nEnvironmentFile=-/etc/open-card/server.env\n"),
+		"alternate":   []byte("[Service]\nEnvironmentFile=-/etc/open-card/server.env\nEnvironmentFile=/tmp/not-the-active-database.env\n"),
+		"outside":     []byte("[Unit]\nEnvironmentFile=-/etc/open-card/server.env\n[Service]\nEnvironmentFile=/opt/open-card/active/database.env\n"),
+		"missing":     []byte("[Service]\nExecStart=/bin/true\n"),
+		"environment": []byte("[Service]\nEnvironmentFile=-/etc/open-card/server.env\nEnvironmentFile=/opt/open-card/active/database.env\nEnvironment=OPEN_CARD_DATABASE_URL=postgresql://override\n"),
+		"unset":       []byte("[Service]\nEnvironmentFile=-/etc/open-card/server.env\nEnvironmentFile=/opt/open-card/active/database.env\nUnsetEnvironment=OPEN_CARD_DATABASE_URL\n"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := validateLegacyCandidateUnit(raw); err == nil {
+				t.Fatalf("unsafe unit accepted: %q", raw)
+			}
+		})
+	}
+}
+
+func TestDescriptorReadBindsOpenedFileAcrossReplacement(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "evidence"), []byte("before"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r, err := os.OpenRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	f, err := r.OpenFile("evidence", os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if err := os.Rename(filepath.Join(root, "evidence"), filepath.Join(root, "old")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "evidence"), []byte("after"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, len("before"))
+	if _, err := io.ReadFull(f, buf); err != nil || string(buf) != "before" {
+		t.Fatalf("descriptor changed=%q err=%v", buf, err)
+	}
 }
 
 func TestUpgradeStoreJournalMutationRequiresMatchingLock(t *testing.T) {
@@ -126,10 +504,23 @@ func TestUpgradeStoreJournalMutationRequiresMatchingLock(t *testing.T) {
 	}
 }
 
+func TestUpgradeStorePreflightPlanRequiresOwnedLockAndIsReadOnly(t *testing.T) {
+	store, root, activation, _, cleanup := candidateStore(t)
+	defer cleanup()
+	request := UpgradePreflightRequest{TransactionID: "txn-1", CandidateRelease: activation.Release}
+	before := filepath.Join(root, "opt/open-card")
+	if _, err := store.PreflightPlan(context.Background(), request); !errors.Is(err, ErrUpgradeJournalConflict) {
+		t.Fatalf("preflight without lock accepted: %v", err)
+	}
+	if _, err := os.Stat(before); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func candidateStore(t *testing.T) (*UpgradeStore, string, ActivationV1, []byte, func()) {
 	t.Helper()
 	root := t.TempDir()
-	for _, p := range []string{"var/lib/open-card/upgrade-transactions", "run/lock"} {
+	for _, p := range []string{"var/lib/open-card/upgrade-transactions", "run/lock", "etc/open-card", "etc/systemd/system"} {
 		if err := os.MkdirAll(filepath.Join(root, p), durableDirMode); err != nil {
 			t.Fatal(err)
 		}
@@ -195,6 +586,90 @@ func candidateStore(t *testing.T) (*UpgradeStore, string, ActivationV1, []byte, 
 	}
 	cleanup := func() { _ = store.Close() }
 	return store, root, activation, env, cleanup
+}
+
+func productionCandidateUnitFixture(t *testing.T) (*UpgradeStore, ReleaseV1, Manifest, string, func()) {
+	t.Helper()
+	store, root, _, _, cleanup := candidateStore(t)
+	releaseID := "candidate-rc1"
+	releaseDir := filepath.Join(root, "opt", "open-card", "releases", releaseID)
+	files := map[string]struct {
+		body []byte
+		mode os.FileMode
+	}{
+		"bin/open-card-admin":                                 {[]byte("admin\n"), 0o755},
+		"systemd/open-card-server.service":                    {[]byte("[Unit]\nDescription=Open Card\n[Service]\nEnvironmentFile=-/etc/open-card/server.env\nEnvironmentFile=/opt/open-card/active/database.env\nExecStart=/opt/open-card/current/bin/open-card-server\n[Install]\nWantedBy=multi-user.target\n"), 0o644},
+		"systemd/open-card-edge.service":                      {[]byte("edge\n"), 0o644},
+		"caddy/open-card-edge.Caddyfile.example":              {[]byte("edge\n"), 0o644},
+		"migrations/control-plane/0024_dns_change_ledger.sql": {[]byte("migration\n"), 0o644},
+		"web/dist/index.html":                                 {[]byte("web\n"), 0o644},
+		"docs/licenses/licenses-manifest.json":                {[]byte("{}\n"), 0o644},
+		"sbom.spdx.json":                                      {[]byte("{}\n"), 0o644},
+		"source-manifest.sha256":                              {[]byte("source\n"), 0o644},
+	}
+	manifest := Manifest{SchemaVersion: ManifestSchemaVersion, Product: ManifestProduct, Version: ProductionCandidateVersion, ReleaseID: releaseID, Architecture: "amd64", MigrationVersion: CurrentMigrationVersion, SourceCommit: strings.Repeat("a", 40), NMinusOne: &NMinusOne{Version: ProductionNMinusOneVersion, MigrationVersion: "0023", SourceCommit: RC0SourceCommit, ReleaseManifestSHA256: RC0ReleaseManifestSHA256, ArchiveSHA256: RC0ArchiveSHA256, BundleManifestSHA256: RC0BundleManifestSHA256}, Protocol: AgentProtocolVersion, ConfigDir: DefaultConfigDir, DataDir: DefaultDataDir, Compatibility: Compatibility{MinDataVersion: 1, MaxDataVersion: 8, MinAgentProtocol: PreviousAgentProtocol, MaxAgentProtocol: AgentProtocolVersion}}
+	for path, value := range files {
+		full := filepath.Join(releaseDir, filepath.FromSlash(path))
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, value.body, value.mode); err != nil {
+			t.Fatal(err)
+		}
+		digest, err := SHA256File(full)
+		if err != nil {
+			t.Fatal(err)
+		}
+		manifest.Files = append(manifest.Files, FileDigest{Path: path, SHA256: digest, Mode: uint32(value.mode)})
+	}
+	manifestPath := filepath.Join(releaseDir, "manifest.json")
+	if err := SaveManifest(manifestPath, manifest); err != nil {
+		t.Fatal(err)
+	}
+	digest, err := SHA256File(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release := ReleaseV1{ID: releaseID, Version: manifest.Version, SourceCommit: manifest.SourceCommit, Architecture: manifest.Architecture, ManifestSHA256: digest}
+	return store, release, manifest, manifestPath, cleanup
+}
+
+func TestCandidateServerUnitRequiresExactProductionCandidateManifest(t *testing.T) {
+	for name, mutate := range map[string]func(*Manifest){
+		"valid": func(*Manifest) {},
+		"wrong-version": func(m *Manifest) {
+			m.Version, m.MigrationVersion, m.SourceCommit, m.NMinusOne = ProductionNMinusOneVersion, "0023", RC0SourceCommit, nil
+		},
+		"wrong-migration":   func(m *Manifest) { m.MigrationVersion = "0023" },
+		"wrong-n-minus-one": func(m *Manifest) { m.NMinusOne.BundleManifestSHA256 = strings.Repeat("0", 64) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			store, release, manifest, manifestPath, cleanup := productionCandidateUnitFixture(t)
+			defer cleanup()
+			mutate(&manifest)
+			if name != "valid" {
+				raw, err := json.Marshal(manifest)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(manifestPath, append(raw, '\n'), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				digest, err := SHA256File(manifestPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				release.ManifestSHA256 = digest
+			}
+			_, err := (fixedLegacyReleaseVerifier{writer: store.activationWriter}).CandidateServerUnit(release)
+			if name == "valid" && err != nil {
+				t.Fatalf("valid production candidate rejected: %v", err)
+			}
+			if name != "valid" && !errors.Is(err, ErrUpgradeJournalConflict) {
+				t.Fatalf("invalid %s candidate err=%v", name, err)
+			}
+		})
+	}
 }
 
 func acquireCandidate(t *testing.T, store *UpgradeStore) UpgradeLock {
@@ -558,4 +1033,397 @@ func TestUpgradeStoreWriteCandidateActivationRejectsPartialAndConflictingExistin
 	if raw, err := os.ReadFile(filepath.Join(root, "opt/open-card/activations", activation.ActivationID, "database.env")); err != nil || string(raw) != string(env) {
 		t.Fatalf("candidate env overwritten: %q %v", raw, err)
 	}
+}
+
+// legacyStoreForProjectionFixture creates the real on-disk legacy layout.  The
+// fake only supplies the immutable RC0 and candidate-unit evidence; all
+// projection methods below operate on the DurableWriter-backed files.
+func legacyStoreForProjectionFixture(t *testing.T, withPrevious bool) (*UpgradeStore, string, UpgradePreflight, ActivationV1, []byte, []byte, func()) {
+	t.Helper()
+	store, root, old, env, cleanup := candidateStore(t)
+	legacyRelease := ReleaseV1{ID: old.Release.ID, Version: ProductionNMinusOneVersion, SourceCommit: RC0SourceCommit, Architecture: "amd64", ManifestSHA256: RC0ReleaseManifestSHA256}
+	candidate := old.Release
+	candidate.ID = "rc1"
+	candidate.Version = ProductionCandidateVersion
+	candidate.SourceCommit = strings.Repeat("a", 40)
+	unitBefore := []byte("[Service]\nEnvironmentFile=-/etc/open-card/server.env\n")
+	unitAfter := []byte("[Service]\nEnvironmentFile=-/etc/open-card/server.env\nEnvironmentFile=/opt/open-card/active/database.env\n")
+	candidateUnitDir := filepath.Join(root, "opt/open-card/releases", candidate.ID, "systemd")
+	if err := os.MkdirAll(candidateUnitDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	candidateUnitPath := filepath.Join(candidateUnitDir, "open-card-server.service")
+	if err := os.WriteFile(candidateUnitPath, unitAfter, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	candidateManifest := Manifest{
+		SchemaVersion: ManifestSchemaVersion, Product: ManifestProduct, Version: ProductionCandidateVersion, ReleaseID: candidate.ID,
+		Architecture: "amd64", MigrationVersion: CurrentMigrationVersion, SourceCommit: candidate.SourceCommit,
+		NMinusOne: &NMinusOne{Version: ProductionNMinusOneVersion, MigrationVersion: "0023", SourceCommit: RC0SourceCommit, ReleaseManifestSHA256: RC0ReleaseManifestSHA256, ArchiveSHA256: RC0ArchiveSHA256, BundleManifestSHA256: RC0BundleManifestSHA256},
+		Protocol:  AgentProtocolVersion, ConfigDir: DefaultConfigDir, DataDir: DefaultDataDir,
+		Compatibility: Compatibility{MinDataVersion: 1, MaxDataVersion: 8, MinAgentProtocol: PreviousAgentProtocol, MaxAgentProtocol: AgentProtocolVersion},
+		Files:         []FileDigest{{Path: "systemd/open-card-server.service", SHA256: sha256Bytes(unitAfter), Mode: 0o644}},
+	}
+	candidateManifestPath := filepath.Join(root, "opt/open-card/releases", candidate.ID, "manifest.json")
+	if err := SaveManifest(candidateManifestPath, candidateManifest); err != nil {
+		t.Fatal(err)
+	}
+	var err error
+	candidate.ManifestSHA256, err = SHA256File(candidateManifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "etc/open-card/server.env"), env, durableFileMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "etc/systemd/system/open-card-server.service"), unitBefore, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("releases/"+legacyRelease.ID, filepath.Join(root, "opt/open-card/current")); err != nil {
+		t.Fatal(err)
+	}
+	store.legacyVerifier = legacyVerifierFake{release: legacyRelease, rows: migrationRows(23), unit: unitAfter}
+	lock := acquireCandidate(t, store)
+	if withPrevious {
+		if _, err := store.WriteCandidateActivation(context.Background(), old, env); err != nil {
+			t.Fatalf("previous activation: %v", err)
+		}
+		if err := store.activationWriter.SwapActivationLink(ActivationLinkActive, old.ActivationID, ""); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.activationWriter.SwapActivationLink(ActivationLinkCurrent, "", ""); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.SetPrevious(context.Background(), old.ActivationID); err != nil {
+			t.Fatalf("set previous: %v", err)
+		}
+		if err := os.Remove(filepath.Join(root, "opt/open-card/active")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(filepath.Join(root, "opt/open-card/current")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink("releases/"+legacyRelease.ID, filepath.Join(root, "opt/open-card/current")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	preflight, err := store.PreflightPlan(context.Background(), UpgradePreflightRequest{TransactionID: "txn-1", CandidateRelease: candidate})
+	if err != nil || preflight.Legacy == nil {
+		request := UpgradePreflightRequest{TransactionID: "txn-1", CandidateRelease: candidate}
+		t.Fatalf("preflight=%#v err=%v direct=%v", preflight, err, func() error { _, e := store.readLegacyPlan(request); return e }())
+	}
+	plan := *preflight.Legacy
+	activation := ActivationV1{SchemaVersion: ActivationSchemaVersion, ActivationID: plan.ActivationID, Origin: "rc0_compat_projection", Release: plan.Release, Database: DatabaseV1{Name: "open_card", Migration: "0023", SchemaMigrationsSHA256: plan.ExpectedRowsSHA256}, DatabaseEnvSHA256: plan.DatabaseEnvSHA256, CreatedAt: time.Unix(1, 0).UTC(), CreatedByTransactionID: plan.TransactionID, LegacyProjection: &LegacyProjectionV1{Target: plan.CurrentTarget, ServerEnvBeforeSHA256: plan.ServerEnvBeforeSHA256, ServerEnvAfterSHA256: plan.ServerEnvAfterSHA256, ServerUnitBeforeSHA256: plan.ServerUnitBeforeSHA256, ServerUnitAfterSHA256: plan.ServerUnitAfterSHA256, ServerUnitReleaseID: plan.ServerUnitReleaseID}}
+	if withPrevious {
+		activation.LegacyProjection.Target = plan.CurrentTarget
+	}
+	_ = lock
+	return store, root, preflight, activation, env, unitAfter, func() { _ = lock.Release(); cleanup() }
+}
+
+func TestLegacyPrepareFinalizeEndToEnd(t *testing.T) {
+	store, root, preflight, activation, beforeEnv, afterUnit, cleanup := legacyStoreForProjectionFixture(t, false)
+	defer cleanup()
+	plan := *preflight.Legacy
+	if _, err := store.WriteCandidateActivation(context.Background(), activation, plan.DatabaseEnv); err == nil {
+		t.Fatal("public writer accepted legacy activation")
+	}
+	beforeJSON, err := os.ReadFile(filepath.Join(root, "etc/open-card/server.env"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.PrepareLegacyProjection(context.Background(), plan, activation); err != nil {
+		t.Fatalf("prepare: %v plan=%v activation=%v state=%v", err, plan.Validate(), activation.Validate(), store.validateLegacyMutationState(plan, activation, true))
+	}
+	if got, _ := os.ReadFile(filepath.Join(root, "etc/open-card/server.env")); !bytes.Equal(got, beforeEnv) || !bytes.Contains(got, []byte("OPEN_CARD_DATABASE_URL=")) {
+		t.Fatalf("prepare changed global env: %q", got)
+	}
+	if got, err := os.ReadFile(filepath.Join(root, "etc/systemd/system/open-card-server.service")); err != nil || !bytes.Equal(got, afterUnit) {
+		t.Fatalf("unit=%q err=%v", got, err)
+	}
+	if _, err := store.FinalizeLegacyProjection(context.Background(), plan, activation); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(root, "etc/open-card/server.env"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, expectedAfter, _ := splitLegacyServerEnv(beforeJSON)
+	if !bytes.Equal(got, expectedAfter) {
+		t.Fatalf("final env=%q want=%q", got, expectedAfter)
+	}
+	obs, err := store.ReadLegacyProjection(context.Background(), plan, activation)
+	if err != nil || obs.ActivationID != activation.ActivationID {
+		t.Fatalf("obs=%#v err=%v", obs, err)
+	}
+	if _, err := store.PrepareLegacyProjection(context.Background(), plan, activation); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.FinalizeLegacyProjection(context.Background(), plan, activation); err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range []any{plan, activation, UpgradeJournalV1{PlannedOldActivation: &activation}} {
+		raw, _ := json.Marshal(v)
+		if strings.Contains(string(raw), "postgresql://") || strings.Contains(string(raw), "user:pass") {
+			t.Fatal("secret leaked in JSON")
+		}
+	}
+}
+
+func TestLegacyProjectionRejectsReplacedLiveRootsBeforeFinalize(t *testing.T) {
+	for _, relative := range []string{"opt/open-card", "etc/open-card", "etc/systemd/system", "var/lib/open-card"} {
+		t.Run(strings.ReplaceAll(relative, "/", "-"), func(t *testing.T) {
+			store, root, preflight, activation, beforeEnv, _, cleanup := legacyStoreForProjectionFixture(t, false)
+			defer cleanup()
+			plan := *preflight.Legacy
+			if _, err := store.PrepareLegacyProjection(context.Background(), plan, activation); err != nil {
+				t.Fatal(err)
+			}
+			live := filepath.Join(root, relative)
+			if err := os.Rename(live, live+"-detached"); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(live, durableDirMode); err != nil {
+				t.Fatal(err)
+			}
+			if relative == "etc/open-card" {
+				if err := os.WriteFile(filepath.Join(live, "server.env"), beforeEnv, durableFileMode); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := store.FinalizeLegacyProjection(context.Background(), plan, activation); !errors.Is(err, ErrUpgradeJournalConflict) {
+				t.Fatalf("finalize after replacing %s: %v", relative, err)
+			}
+			if relative == "etc/open-card" {
+				got, err := os.ReadFile(filepath.Join(live, "server.env"))
+				if err != nil || !bytes.Equal(got, beforeEnv) {
+					t.Fatalf("replacement server.env changed=%q err=%v", got, err)
+				}
+			}
+		})
+	}
+}
+
+func TestPreflightPlanRejectsActivationRootReplacement(t *testing.T) {
+	store, root, preflight, _, _, _, cleanup := legacyStoreForProjectionFixture(t, false)
+	defer cleanup()
+	live := filepath.Join(root, "opt", "open-card")
+	if err := os.Rename(live, live+"-detached"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(live, durableDirMode); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.PreflightPlan(context.Background(), UpgradePreflightRequest{TransactionID: preflight.Legacy.TransactionID, CandidateRelease: ReleaseV1{ID: "rc1", Version: ProductionCandidateVersion, SourceCommit: strings.Repeat("a", 40), Architecture: "amd64", ManifestSHA256: strings.Repeat("b", 64)}}); !errors.Is(err, ErrUpgradeJournalConflict) {
+		t.Fatalf("preflight accepted replacement root: %v", err)
+	}
+}
+
+func TestFinalizeLegacyProjectionRejectsForeignTransactionBeforeServerEnvWrite(t *testing.T) {
+	store, root, preflight, activation, beforeEnv, _, cleanup := legacyStoreForProjectionFixture(t, false)
+	defer cleanup()
+	plan := *preflight.Legacy
+	if _, err := store.PrepareLegacyProjection(context.Background(), plan, activation); err != nil {
+		t.Fatal(err)
+	}
+	foreign := plan
+	foreign.TransactionID = "txn-foreign"
+	if _, err := store.FinalizeLegacyProjection(context.Background(), foreign, activation); err == nil {
+		t.Fatal("foreign transaction finalized legacy projection")
+	}
+	got, err := os.ReadFile(filepath.Join(root, "etc/open-card/server.env"))
+	if err != nil || !bytes.Equal(got, beforeEnv) {
+		t.Fatalf("foreign transaction changed server.env=%q err=%v", got, err)
+	}
+}
+
+func TestLegacyProjectionPartialStatesConverge(t *testing.T) {
+	for _, withPrevious := range []bool{false, true} {
+		t.Run(map[bool]string{false: "previous-absent", true: "previous-present"}[withPrevious], func(t *testing.T) {
+			store, _, preflight, activation, _, _, cleanup := legacyStoreForProjectionFixture(t, withPrevious)
+			defer cleanup()
+			plan := *preflight.Legacy
+			if _, err := store.PrepareLegacyProjection(context.Background(), plan, activation); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.FinalizeLegacyProjection(context.Background(), plan, activation); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.PrepareLegacyProjection(context.Background(), plan, activation); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.FinalizeLegacyProjection(context.Background(), plan, activation); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestPrepareLegacyProjectionConvergesExactSlotPrefixes(t *testing.T) {
+	for _, boundary := range []string{"slot", "release", "database-env", "activation-json"} {
+		t.Run(boundary, func(t *testing.T) {
+			store, root, preflight, activation, _, _, cleanup := legacyStoreForProjectionFixture(t, false)
+			defer cleanup()
+			plan := *preflight.Legacy
+			slot := filepath.Join(root, "opt/open-card/activations", activation.ActivationID)
+			if err := os.Mkdir(slot, activationSlotDirMode); err != nil {
+				t.Fatal(err)
+			}
+			if boundary != "slot" {
+				if err := os.Symlink(filepath.ToSlash(filepath.Join("..", "..", "releases", activation.Release.ID)), filepath.Join(slot, "release")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if boundary == "database-env" || boundary == "activation-json" {
+				if err := os.WriteFile(filepath.Join(slot, "database.env"), plan.DatabaseEnv, durableFileMode); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if boundary == "activation-json" {
+				raw, err := MarshalActivationV1(activation)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(slot, "activation.json"), raw, durableFileMode); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if observation, err := store.PrepareLegacyProjection(context.Background(), plan, activation); err != nil || observation.ActivationID != activation.ActivationID {
+				t.Fatalf("prepare after %s prefix: %v", boundary, err)
+			}
+		})
+	}
+}
+
+func TestPrepareLegacyProjectionRejectsConflictingSlotPrefix(t *testing.T) {
+	for _, conflict := range []string{"release", "database-env", "activation-json"} {
+		t.Run(conflict, func(t *testing.T) {
+			store, root, preflight, activation, _, _, cleanup := legacyStoreForProjectionFixture(t, false)
+			defer cleanup()
+			plan := *preflight.Legacy
+			slot := filepath.Join(root, "opt/open-card/activations", activation.ActivationID)
+			if err := os.Mkdir(slot, activationSlotDirMode); err != nil {
+				t.Fatal(err)
+			}
+			switch conflict {
+			case "release":
+				if err := os.Symlink("../../releases/foreign", filepath.Join(slot, "release")); err != nil {
+					t.Fatal(err)
+				}
+			case "database-env":
+				if err := os.WriteFile(filepath.Join(slot, "database.env"), []byte("OPEN_CARD_DATABASE_URL=postgresql://bad@localhost/foreign\n"), durableFileMode); err != nil {
+					t.Fatal(err)
+				}
+			case "activation-json":
+				if err := os.WriteFile(filepath.Join(slot, "activation.json"), []byte("{}\n"), durableFileMode); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := store.PrepareLegacyProjection(context.Background(), plan, activation); !errors.Is(err, ErrUpgradeJournalConflict) {
+				t.Fatalf("conflicting %s prefix err=%v", conflict, err)
+			}
+		})
+	}
+}
+
+func TestSecureReleaseFileKeepsPinnedRootAfterPathReplacement(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "open-card")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"releases", "releases/release-1"} {
+		if err := os.MkdirAll(filepath.Join(root, path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	manifest := filepath.Join(root, "releases/release-1/manifest.json")
+	if err := os.WriteFile(manifest, []byte("trusted"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writer, err := TaskDurableWriter(root, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	if err := os.Rename(root, filepath.Join(parent, "old-open-card")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "releases/release-1"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "releases/release-1/manifest.json"), []byte("replacement"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := secureReleaseFile(writer, "release-1", "manifest.json", 0o644)
+	if err != nil || string(got) != "trusted" {
+		t.Fatalf("pinned descriptor trusted=%q err=%v", got, err)
+	}
+}
+
+func TestRecoverLegacyPlanBeforeAndAfterPreservesSecretsInMemory(t *testing.T) {
+	store, root, preflight, activation, _, _, cleanup := legacyStoreForProjectionFixture(t, false)
+	defer cleanup()
+	plan := *preflight.Legacy
+	if plan.Release.ID == plan.ServerUnitReleaseID {
+		t.Fatal("fixture must use distinct RC0 and RC1 release IDs")
+	}
+	manifestSHA, err := SHA256File(filepath.Join(root, "opt/open-card/releases", plan.ServerUnitReleaseID, "manifest.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := store.RecoverLegacyPlan(context.Background(), activation, manifestSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before.DatabaseEnv, plan.DatabaseEnv) {
+		t.Fatal("recovered secret differs before projection")
+	}
+	if _, err := store.PrepareLegacyProjection(context.Background(), plan, activation); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.FinalizeLegacyProjection(context.Background(), plan, activation); err != nil {
+		t.Fatal(err)
+	}
+	after, err := store.RecoverLegacyPlan(context.Background(), activation, manifestSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before.DatabaseEnv = nil
+	after.DatabaseEnv = nil
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("recovered nonsecret plan differs: before=%#v after=%#v", before, after)
+	}
+	for _, name := range []string{"foreign-unit", "foreign-env", "foreign-current", "foreign-previous"} {
+		t.Run(name, func(t *testing.T) {
+			driftStore, driftRoot, driftPreflight, driftActivation, _, _, driftCleanup := legacyStoreForProjectionFixture(t, name == "foreign-previous")
+			defer driftCleanup()
+			driftPlan := *driftPreflight.Legacy
+			if name == "foreign-unit" {
+				_ = os.WriteFile(filepath.Join(driftRoot, "etc/systemd/system/open-card-server.service"), []byte("foreign\n"), durableFileMode)
+			}
+			if name == "foreign-env" {
+				_ = os.WriteFile(filepath.Join(driftRoot, "etc/open-card/server.env"), []byte("OPEN_CARD_DATABASE_URL=postgresql://foreign\n"), durableFileMode)
+			}
+			if name == "foreign-current" {
+				_ = os.Remove(filepath.Join(driftRoot, "opt/open-card/current"))
+				_ = os.Symlink("releases/foreign", filepath.Join(driftRoot, "opt/open-card/current"))
+			}
+			if name == "foreign-previous" {
+				_ = driftStore.activationWriter.SwapActivationLink(ActivationLinkPreviousActive, "foreign", "")
+			}
+			if _, err := driftStore.RecoverLegacyPlan(context.Background(), driftActivation, manifestSHAForTest(t, driftRoot, driftPlan.ServerUnitReleaseID)); err == nil {
+				t.Fatal("foreign state accepted")
+			}
+		})
+	}
+}
+
+func manifestSHAForTest(t *testing.T, root, releaseID string) string {
+	t.Helper()
+	digest, err := SHA256File(filepath.Join(root, "opt/open-card/releases", releaseID, "manifest.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return digest
 }
