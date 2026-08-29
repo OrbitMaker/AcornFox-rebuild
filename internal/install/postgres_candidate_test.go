@@ -581,9 +581,11 @@ func TestSnapshot(t *testing.T) {
 	s := snap(t, r)
 	d := t.TempDir()
 	_ = os.Chmod(d, 0700)
-	r.write = func(a []string) { _ = os.WriteFile(a[3], []byte("dump"), 0600) }
+	// pg_dump's creation mode is host/umask dependent; Snapshot must enforce
+	// the contract before it hashes and publishes the artifact.
+	r.write = func(a []string) { _ = os.WriteFile(a[3], []byte("dump"), 0644) }
 	x, e := s.Snapshot(context.Background(), "txn-1", d, env(t), nil)
-	if e != nil || x.Size != 4 || r.argv[0] == "postgresql" || strings.Contains(strings.Join(r.argv, " "), "p/ass") {
+	if e != nil || x.Size != 4 || r.argv[0] == "postgresql" || strings.Contains(strings.Join(r.argv, " "), "p/ass") || strings.Contains(strings.Join(r.argv, " "), "--exit-on-error") {
 		t.Fatal(e)
 	}
 	if _, e = s.Snapshot(context.Background(), "txn-1", d, env(t), nil); !errors.Is(e, ErrSnapshotConflict) {

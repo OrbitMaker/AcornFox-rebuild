@@ -566,9 +566,14 @@ func (s *PostgresSnapshotter) Snapshot(ctx context.Context, tx, dir string, env 
 		}
 		return x, nil
 	}
-	res := s.runner.Run(ctx, []string{s.tool, "--format=custom", "--file", p, "--no-owner", "--no-acl", "--exit-on-error"}, append([]string(nil), env.ChildEnv...))
+	// pg_dump has no --exit-on-error option (unlike pg_restore).  A non-zero
+	// process result is already a fail-closed snapshot outcome.
+	res := s.runner.Run(ctx, []string{s.tool, "--format=custom", "--file", p, "--no-owner", "--no-acl"}, append([]string(nil), env.ChildEnv...))
 	if res.Err != nil || res.ExitCode != 0 {
 		return SnapshotEvidence{}, fmt.Errorf("%w: pg_dump", ErrPostgresOutcomeUnknown)
+	}
+	if e = os.Chmod(p, 0o600); e != nil {
+		return SnapshotEvidence{}, fmt.Errorf("%w: snapshot permissions", ErrPostgresOutcomeUnknown)
 	}
 	x, e := snapshotEvidence(p)
 	if e != nil {

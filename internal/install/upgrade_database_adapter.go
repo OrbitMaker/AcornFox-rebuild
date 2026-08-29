@@ -672,7 +672,10 @@ func migrationInput(releaseRoot string, manifest Manifest) ([]MigrationRow, stri
 		if matches != 1 || match.Mode != 0o644 {
 			return nil, "", ErrPostgresOutcomeUnknown
 		}
-		rows = append(rows, MigrationRow{Version: formatMigrationVersion(version), Checksum: match.SHA256})
+		// control-plane-migrate.sh records the canonical filename stem (for
+		// example 0001_foundation), not just its four-digit prefix. Keep the
+		// driver evidence byte-for-byte compatible with the live ledger.
+		rows = append(rows, MigrationRow{Version: strings.TrimSuffix(filepath.Base(match.Path), ".sql"), Checksum: match.SHA256})
 		if version == 24 {
 			raw, err := os.ReadFile(filepath.Join(releaseRoot, filepath.FromSlash(match.Path)))
 			if err != nil || sha256TextFrom(string(raw)) != match.SHA256 {
