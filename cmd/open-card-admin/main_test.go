@@ -4,19 +4,148 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/open-card/open-card/internal/auth"
+	"github.com/open-card/open-card/internal/install"
 	"github.com/open-card/open-card/internal/persistence/postgres"
 )
 
+type ownerOverrideInfo struct {
+	os.FileInfo
+	stat syscall.Stat_t
+}
+
+func (i ownerOverrideInfo) Sys() any { return &i.stat }
+
+func secureTaskRoot(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return root
+}
+
+func testResolve(calls *int) adminResolveFunc {
+	return func(config commandConfig) (install.ActiveDatabase, error) {
+		*calls++
+		return install.ActiveDatabase{Activation: install.ActivationV1{ActivationID: config.activationID}}, nil
+	}
+}
+
+func TestNonRootPrivilegeGateRejectsUnsafeCommandsBeforeDatabaseResolution(t *testing.T) {
+	for _, args := range [][]string{{"bootstrap", "--password-file", "/tmp/password"}, {"candidate", "validate", "--activation-id", "activation-1"}, {"activation", "validate", "--activation-id", "activation-1", "--task-root", "/opt/open-card"}} {
+		if err := runWithEUID(args, io.Discard, func() int { return 501 }); err == nil {
+			t.Fatalf("non-root accepted %v", args)
+		}
+	}
+}
+
+func TestNonRootSecureTaskRootReachesResolverAndValidator(t *testing.T) {
+	for _, command := range [][]string{{"candidate", "validate", "--activation-id", "activation-1"}, {"activation", "validate", "--activation-id", "activation-1"}} {
+		t.Run(command[0], func(t *testing.T) {
+			root := secureTaskRoot(t)
+			args := append(append([]string{}, command...), "--task-root", root)
+			resolved, validated := 0, 0
+			err := runWithDependencies(args, io.Discard, func() int { return 501 }, os.Lstat, testResolve(&resolved), func(config commandConfig, active install.ActiveDatabase) error {
+				validated++
+				if config.taskRoot != root || active.Activation.ActivationID != "activation-1" {
+					t.Fatal("task-root validation did not preserve parsed identity")
+				}
+				return nil
+			})
+			if err != nil || resolved != 1 || validated != 1 {
+				t.Fatalf("err=%v resolver=%d validator=%d", err, resolved, validated)
+			}
+		})
+	}
+}
+
+func TestNonRootTaskRootRejectsUnsafePathsModesLinksAndOwners(t *testing.T) {
+	root := secureTaskRoot(t)
+	base := []string{"candidate", "validate", "--activation-id", "activation-1", "--task-root"}
+	for _, taskRoot := range []string{"relative", root + "/../" + filepath.Base(root), "/opt/open-card"} {
+		args := append(append([]string{}, base...), taskRoot)
+		resolved := 0
+		if err := runWithDependencies(args, io.Discard, func() int { return 501 }, os.Lstat, testResolve(&resolved), nil); err == nil || resolved != 0 {
+			t.Fatalf("non-root accepted unsafe task root %q", taskRoot)
+		}
+	}
+	for _, mode := range []os.FileMode{0o770, 0o755} {
+		t.Run(mode.String(), func(t *testing.T) {
+			root := t.TempDir()
+			if err := os.Chmod(root, mode); err != nil {
+				t.Fatal(err)
+			}
+			args := append(append([]string{}, base...), root)
+			if err := runWithDependencies(args, io.Discard, func() int { return 501 }, os.Lstat, testResolve(new(int)), nil); err == nil {
+				t.Fatal("non-root accepted unsafe task-root mode")
+			}
+		})
+	}
+	link := filepath.Join(t.TempDir(), "task-root-link")
+	if err := os.Symlink(root, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := runWithDependencies(append(append([]string{}, base...), link), io.Discard, func() int { return 501 }, os.Lstat, testResolve(new(int)), nil); err == nil {
+		t.Fatal("non-root accepted task-root symlink")
+	}
+	info, err := os.Lstat(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mutate := range []func(*syscall.Stat_t){func(stat *syscall.Stat_t) { stat.Uid++ }, func(stat *syscall.Stat_t) { stat.Gid++ }} {
+		stat := *info.Sys().(*syscall.Stat_t)
+		mutate(&stat)
+		lstat := func(string) (os.FileInfo, error) { return ownerOverrideInfo{FileInfo: info, stat: stat}, nil }
+		if err := runWithDependencies(append(append([]string{}, base...), root), io.Discard, func() int { return 501 }, lstat, testResolve(new(int)), nil); err == nil {
+			t.Fatal("non-root accepted mismatched task-root owner")
+		}
+	}
+}
+
+func TestRootPrivilegeRetainsCredentialAndValidationRoutes(t *testing.T) {
+	validated, resolved := 0, 0
+	if err := runWithDependencies([]string{"candidate", "validate", "--activation-id", "activation-1"}, io.Discard, func() int { return 0 }, os.Lstat, testResolve(&resolved), func(commandConfig, install.ActiveDatabase) error { validated++; return nil }); err != nil || resolved != 1 || validated != 1 {
+		t.Fatalf("root validation route err=%v resolver=%d validator=%d", err, resolved, validated)
+	}
+	for _, command := range []string{"bootstrap", "reset-password"} {
+		resolved = 0
+		err := runWithDependencies([]string{command, "--password-file", "/tmp/missing-password"}, io.Discard, func() int { return 0 }, os.Lstat, testResolve(&resolved), nil)
+		if err == nil || strings.Contains(err.Error(), "root is required") || resolved != 1 {
+			t.Fatalf("root %s route was not retained: err=%v resolver=%d", command, err, resolved)
+		}
+	}
+}
+
+func TestValidationSeamNeverLeaksAmbientDatabaseURL(t *testing.T) {
+	t.Setenv("OPEN_CARD_DATABASE_URL", "postgresql://admin:ambient-secret@db.example/open_card")
+	root := secureTaskRoot(t)
+	err := runWithDependencies(
+		[]string{"candidate", "validate", "--activation-id", "activation-1", "--task-root", root},
+		io.Discard,
+		func() int { return 501 },
+		os.Lstat,
+		func(commandConfig) (install.ActiveDatabase, error) {
+			return install.ActiveDatabase{Activation: install.ActivationV1{ActivationID: "activation-1"}, DatabaseURL: "postgresql://admin:resolver-secret@db.example/open_card"}, nil
+		},
+		func(commandConfig, install.ActiveDatabase) error { return errors.New("validation failed") },
+	)
+	if err == nil || strings.Contains(err.Error(), "secret") || strings.Contains(err.Error(), "postgres") {
+		t.Fatalf("validation error leaked a database URL: %v", err)
+	}
+}
+
 func TestParseArgsRejectsPasswordArgumentsAndEnvironment(t *testing.T) {
-	for _, args := range [][]string{{"bootstrap"}, {"bootstrap", "--password", "secret"}, {"reset-password", "--password-file", "relative"}, {"bootstrap", "--password-file", "/tmp/password", "--server-env", "/etc/open-card/server.env"}, {"activation", "validate"}, {"candidate", "validate", "--activation-id", "../../escape"}} {
+	for _, args := range [][]string{{"bootstrap"}, {"bootstrap", "--password", "secret"}, {"reset-password", "--password-file", "relative"}, {"bootstrap", "--password-file", "/tmp/password", "--server-env", "/etc/open-card/server.env"}, {"activation", "validate"}, {"candidate", "validate", "--activation-id", "../../escape"}, {"candidate", "validate", "--activation-id", "activation-1", "--task-root", "/tmp/a/../b"}, {"candidate", "validate", "--activation-id", "activation-1", "--password-file", "/tmp/password"}} {
 		if _, err := parseArgs(args); err == nil {
 			t.Fatalf("expected rejected arguments: %#v", args)
 		}

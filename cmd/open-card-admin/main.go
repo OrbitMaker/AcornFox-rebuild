@@ -31,25 +31,51 @@ type commandConfig struct {
 	taskRoot     string
 }
 
+type adminValidationFunc func(commandConfig, install.ActiveDatabase) error
+type adminResolveFunc func(commandConfig) (install.ActiveDatabase, error)
+type adminLstatFunc func(string) (os.FileInfo, error)
+
 func main() {
-	if os.Geteuid() != 0 {
-		fmt.Fprintln(os.Stderr, "open-card-admin: root is required")
-		os.Exit(1)
-	}
-	if err := run(os.Args[1:], os.Stderr); err != nil {
+	if err := runWithEUID(os.Args[1:], os.Stderr, os.Geteuid); err != nil {
 		fmt.Fprintln(os.Stderr, "open-card-admin:", err)
 		os.Exit(1)
 	}
 }
 
 func run(args []string, stderr io.Writer) error {
+	return runWithEUID(args, stderr, os.Geteuid)
+}
+
+func runWithEUID(args []string, stderr io.Writer, euid func() int) error {
+	return runWithDependencies(args, stderr, euid, os.Lstat, resolveActiveDatabase, nil)
+}
+
+func runWithDependencies(
+	args []string,
+	stderr io.Writer,
+	euid func() int,
+	lstat adminLstatFunc,
+	resolve adminResolveFunc,
+	validate adminValidationFunc,
+) error {
 	config, err := parseArgs(args)
 	if err != nil {
 		return err
 	}
-	resolved, err := resolveActiveDatabase(config)
+	if euid() != 0 {
+		if (config.command != "activation-validate" && config.command != "candidate-validate") || config.taskRoot == "" {
+			return errors.New("root is required")
+		}
+		if err := validateNonRootTaskRoot(config.taskRoot, lstat); err != nil {
+			return err
+		}
+	}
+	resolved, err := resolve(config)
 	if err != nil {
 		return err
+	}
+	if (config.command == "activation-validate" || config.command == "candidate-validate") && validate != nil {
+		return validate(config, resolved)
 	}
 	database, err := sql.Open("pgx", resolved.DatabaseURL)
 	if err != nil {
@@ -70,6 +96,21 @@ func run(args []string, stderr io.Writer) error {
 	}
 	defer zero(password)
 	return applyCredential(ctx, postgres.NewStore(database), config.command, password, time.Now().UTC())
+}
+
+func validateNonRootTaskRoot(root string, lstat adminLstatFunc) error {
+	if !filepath.IsAbs(root) || filepath.Clean(root) != root || strings.Contains(root, "\x00") {
+		return errors.New("task-root is unsafe")
+	}
+	info, err := lstat(root)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o700 {
+		return errors.New("task-root is unsafe")
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || int(stat.Uid) != os.Getuid() || int(stat.Gid) != os.Getgid() {
+		return errors.New("task-root is unsafe")
+	}
+	return nil
 }
 
 func resolveActiveDatabase(config commandConfig) (install.ActiveDatabase, error) {
@@ -191,8 +232,8 @@ func parseArgs(args []string) (commandConfig, error) {
 	if (config.command == "bootstrap" || config.command == "reset-password") && (config.passwordFile == "" || !filepath.IsAbs(config.passwordFile)) {
 		return commandConfig{}, errors.New("--password-file must be an absolute path")
 	}
-	if config.taskRoot != "" && !filepath.IsAbs(config.taskRoot) {
-		return commandConfig{}, errors.New("--task-root must be an absolute path")
+	if config.taskRoot != "" && (!filepath.IsAbs(config.taskRoot) || filepath.Clean(config.taskRoot) != config.taskRoot || strings.Contains(config.taskRoot, "\x00")) {
+		return commandConfig{}, errors.New("--task-root must be a clean absolute path")
 	}
 	if (config.command == "activation-validate" || config.command == "candidate-validate") && !validActivationID(config.activationID) {
 		return commandConfig{}, errors.New("--activation-id must be valid")
