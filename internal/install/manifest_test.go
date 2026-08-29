@@ -101,7 +101,9 @@ func TestProductionCandidateRequires0024PayloadAndRejectsFixtures(t *testing.T) 
 	manifest.SourceCommit = strings.Repeat("a", 40)
 	manifest.NMinusOne = &NMinusOne{Version: "0.8.0-rc.0", MigrationVersion: "0023", SourceCommit: RC0SourceCommit, ReleaseManifestSHA256: RC0ReleaseManifestSHA256, ArchiveSHA256: RC0ArchiveSHA256, BundleManifestSHA256: RC0BundleManifestSHA256}
 	manifest.Files = append(manifest.Files,
+		FileDigest{Path: "bin/open-card-upgrade", SHA256: strings.Repeat("9", 64), Mode: 0o755},
 		FileDigest{Path: "systemd/open-card-edge.service", SHA256: strings.Repeat("a", 64), Mode: 0o644},
+		FileDigest{Path: "systemd/open-card-upgrade-recover.service", SHA256: strings.Repeat("0", 64), Mode: 0o644},
 		FileDigest{Path: "caddy/open-card-edge.Caddyfile.example", SHA256: strings.Repeat("b", 64), Mode: 0o644},
 		FileDigest{Path: "migrations/control-plane/0024_dns_change_ledger.sql", SHA256: strings.Repeat("c", 64), Mode: 0o644},
 		FileDigest{Path: "web/dist/index.html", SHA256: strings.Repeat("d", 64), Mode: 0o644},

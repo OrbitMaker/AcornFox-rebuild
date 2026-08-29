@@ -113,7 +113,7 @@ func (ProductionUpgradeDatabaseFactory) Open(_ context.Context, request UpgradeD
 		CandidateActivationID:  request.CandidateActivationID,
 		CandidateDatabaseEnv:   candidateEnv,
 		CandidateRelease:       request.CandidateRelease,
-		RecoveryEvidenceSHA256: sha256TextFrom(request.TransactionID + "\n" + request.CandidateActivationID + "\n" + request.CandidateRelease.ManifestSHA256),
+		RecoveryEvidenceSHA256: request.RecoveryEvidenceSHA256,
 	})
 	if err != nil {
 		return nil, ErrPostgresOutcomeUnknown

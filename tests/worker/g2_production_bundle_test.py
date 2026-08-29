@@ -37,6 +37,7 @@ def minimal_repo(root: Path, migration_version: str) -> tuple[Path, str]:
         "deploy/systemd/open-card-buildkit.service": "[Service]\n",
         "deploy/systemd/open-card-caddy.service": "[Service]\n",
         "deploy/systemd/open-card-edge.service": "[Service]\n",
+        "deploy/systemd/open-card-upgrade-recover.service": "[Service]\n",
         "deploy/caddy/open-card-edge.Caddyfile.example": "{}\n",
         "deploy/caddy/open-card-edge.env.example": "# env\n",
         "docs/licenses/licenses-manifest.json": "{}\n",
@@ -130,6 +131,31 @@ class ProductionBundleTests(unittest.TestCase):
             self.assertFalse((output / "release/manifest.json").exists())
             self.assertFalse(list(output.glob("*.tar.gz")))
 
+    def test_recovery_unit_is_canonical_and_included_in_release_contract(self) -> None:
+        tool = load_tool()
+        expected = """[Unit]
+Description=Recover interrupted Open Card upgrade
+Wants=network-online.target
+After=local-fs.target network-online.target
+ConditionPathExists=/var/lib/open-card/upgrade-in-progress
+
+[Service]
+Type=oneshot
+ExecStart=/opt/open-card/upgrade-tools/open-card-upgrade recover --pending
+TimeoutStartSec=15min
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/open-card /var/lib/open-card /run/lock /etc/open-card /etc/systemd/system
+
+[Install]
+WantedBy=multi-user.target
+"""
+        self.assertEqual((ROOT / "deploy/systemd/open-card-upgrade-recover.service").read_text(encoding="utf-8"), expected)
+        self.assertIn("open-card-upgrade", tool.BINARIES)
+        self.assertIn("open-card-upgrade-recover.service", tool.UNITS)
+
     def test_rc0_bootstrap_build_contains_provenance_and_installers(self) -> None:
         tool = load_tool()
         with tempfile.TemporaryDirectory() as raw:
@@ -189,6 +215,13 @@ class ProductionBundleTests(unittest.TestCase):
             output = root / "rc1-output"
             metadata = tool.assemble(self.stage(root / "rc1"), rc1_repo, output, "amd64", rc0_output / "release", checksum, rc1_dist, version="0.8.0-rc.1", migration_version="0024", source_commit=rc1_commit, live_attestation=rc1_attestation, live_attestation_sha256=self.attestation_digest(rc1_attestation), n_minus_one_archive_sha256=archive_digest, n_minus_one_bundle_manifest_sha256=bundle_digest)
             self.assertEqual(metadata["n_minus_one"]["status"], "verified_local_candidate")
+            manifest = json.loads((output / "release/manifest.json").read_text(encoding="utf-8"))
+            paths = {item["path"] for item in manifest["files"]}
+            self.assertTrue({"bin/open-card-upgrade", "systemd/open-card-upgrade-recover.service"} <= paths)
+            sbom = json.loads((output / "release/sbom.spdx.json").read_text(encoding="utf-8"))
+            sbom_names = {package["name"] for package in sbom["packages"]}
+            self.assertIn("bin/open-card-upgrade", sbom_names)
+            self.assertIn("systemd/open-card-upgrade-recover.service", sbom_names)
             bad = root / "bad-output"
             with self.assertRaises(tool.ProductionBundleError):
                 tool.assemble(self.stage(root / "rc1"), rc1_repo, bad, "amd64", rc0_output / "release", "0" * 64, rc1_dist, version="0.8.0-rc.1", migration_version="0024", source_commit=rc1_commit, live_attestation=rc1_attestation, live_attestation_sha256=self.attestation_digest(rc1_attestation))

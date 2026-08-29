@@ -43,6 +43,7 @@ type UpgradeRequest struct {
 	CandidateRelease        ReleaseV1
 	CandidateActivationID   string
 	CandidateDatabaseName   string
+	RecoveryEvidenceSHA256  string
 	RequestedManifestSHA256 string
 	ExpectedLegacy          bool
 }
@@ -99,11 +100,12 @@ type UpgradeDatabaseDriver interface {
 // database session may use.  The active environment is supplied only from a
 // validated preflight result and remains in memory.
 type UpgradeDatabaseOpenRequest struct {
-	TransactionID         string
-	CandidateRelease      ReleaseV1
-	CandidateActivationID string
-	CandidateDatabaseName string
-	ActiveDatabaseEnv     []byte `json:"-"`
+	TransactionID          string
+	CandidateRelease       ReleaseV1
+	CandidateActivationID  string
+	CandidateDatabaseName  string
+	RecoveryEvidenceSHA256 string
+	ActiveDatabaseEnv      []byte `json:"-"`
 }
 
 func (r UpgradeDatabaseOpenRequest) Validate() error {
@@ -114,8 +116,11 @@ func (r UpgradeDatabaseOpenRequest) Validate() error {
 	if err != nil || name != r.CandidateDatabaseName {
 		return errors.New("invalid upgrade database candidate")
 	}
-	if r.CandidateRelease.ID != "" && !r.CandidateRelease.valid() {
+	if r.CandidateRelease.ID != "" && (!r.CandidateRelease.valid() || !validSHA(r.RecoveryEvidenceSHA256)) {
 		return errors.New("invalid upgrade database release")
+	}
+	if r.CandidateRelease.ID == "" && r.RecoveryEvidenceSHA256 != "" {
+		return errors.New("invalid upgrade database recovery evidence")
 	}
 	_, err = ParseDatabaseEnv(r.ActiveDatabaseEnv)
 	return err
@@ -355,7 +360,7 @@ func sha256Bytes(raw []byte) string {
 }
 
 func validUpgradeRequest(r UpgradeRequest) bool {
-	if !validID(r.TransactionID) || !r.CandidateRelease.valid() || !validID(r.CandidateActivationID) || !candidateDatabaseName.MatchString(r.CandidateDatabaseName) || !validSHA(r.RequestedManifestSHA256) || r.CandidateRelease.ManifestSHA256 != r.RequestedManifestSHA256 {
+	if !validID(r.TransactionID) || !r.CandidateRelease.valid() || !validID(r.CandidateActivationID) || !candidateDatabaseName.MatchString(r.CandidateDatabaseName) || !validSHA(r.RecoveryEvidenceSHA256) || !validSHA(r.RequestedManifestSHA256) || r.CandidateRelease.ManifestSHA256 != r.RequestedManifestSHA256 {
 		return false
 	}
 	return true
@@ -662,7 +667,7 @@ func (e *UpgradeEngine) RunNew(ctx context.Context, r UpgradeRequest) (result er
 		activeDatabaseEnv = append([]byte(nil), preflight.Legacy.DatabaseEnv...)
 		request := ActiveDatabaseInspectionRequest{DatabaseEnv: activeDatabaseEnv, ExpectedMigration: preflight.Legacy.ExpectedMigration, ExpectedRowsSHA256: preflight.Legacy.ExpectedRowsSHA256, ExpectedRowCount: 23}
 		var openErr error
-		database, openErr = e.DatabaseFactory.Open(ctx, UpgradeDatabaseOpenRequest{TransactionID: r.TransactionID, CandidateRelease: r.CandidateRelease, CandidateActivationID: r.CandidateActivationID, CandidateDatabaseName: r.CandidateDatabaseName, ActiveDatabaseEnv: activeDatabaseEnv})
+		database, openErr = e.DatabaseFactory.Open(ctx, UpgradeDatabaseOpenRequest{TransactionID: r.TransactionID, CandidateRelease: r.CandidateRelease, CandidateActivationID: r.CandidateActivationID, CandidateDatabaseName: r.CandidateDatabaseName, RecoveryEvidenceSHA256: r.RecoveryEvidenceSHA256, ActiveDatabaseEnv: activeDatabaseEnv})
 		if openErr != nil || database == nil {
 			return upgradeError(JournalPreflighted, "database_open_failed")
 		}
@@ -688,7 +693,7 @@ func (e *UpgradeEngine) RunNew(ctx context.Context, r UpgradeRequest) (result er
 		// planned old activation can be journaled before any host mutation.
 		// Re-open below only for the common continuation is intentionally avoided.
 	} else {
-		database, err = e.DatabaseFactory.Open(ctx, UpgradeDatabaseOpenRequest{TransactionID: r.TransactionID, CandidateRelease: r.CandidateRelease, CandidateActivationID: r.CandidateActivationID, CandidateDatabaseName: r.CandidateDatabaseName, ActiveDatabaseEnv: activeDatabaseEnv})
+		database, err = e.DatabaseFactory.Open(ctx, UpgradeDatabaseOpenRequest{TransactionID: r.TransactionID, CandidateRelease: r.CandidateRelease, CandidateActivationID: r.CandidateActivationID, CandidateDatabaseName: r.CandidateDatabaseName, RecoveryEvidenceSHA256: r.RecoveryEvidenceSHA256, ActiveDatabaseEnv: activeDatabaseEnv})
 		if err != nil || database == nil {
 			return upgradeError(JournalPreflighted, "database_open_failed")
 		}

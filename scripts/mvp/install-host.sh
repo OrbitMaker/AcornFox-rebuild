@@ -99,7 +99,7 @@ fi
 
 installer=("$script_dir/install.sh" --root / --activate --expected-manifest-sha256 "$expected")
 installer+=("${forward[@]}")
-preflight=("$script_dir/install.sh" --root / --dry-run --expected-manifest-sha256 "$expected")
+preflight=("$script_dir/install.sh" --root / --dry-run --validate-activation-intent --expected-manifest-sha256 "$expected")
 preflight+=("${forward[@]}")
 "${preflight[@]}" >/tmp/open-card-install-host-preflight-$$.log 2>&1 || {
   status=$?
@@ -165,7 +165,8 @@ PY
   done
   grep -Eq '^opencard-buildkit:' /etc/subuid || printf '%s\n' 'opencard-buildkit:231072:65536' >>/etc/subuid
   grep -Eq '^opencard-buildkit:' /etc/subgid || printf '%s\n' 'opencard-buildkit:231072:65536' >>/etc/subgid
-  install -d -m 0750 -o opencard -g opencard /var/lib/open-card /var/log/open-card /var/lib/open-card/uploads /var/lib/open-card/workspaces /var/lib/open-card/build-work /var/lib/open-card/oci /var/lib/open-card/secrets /var/lib/open-card/secret-materials
+  install -d -m 0711 -o root -g root /var/lib/open-card
+  install -d -m 0750 -o opencard -g opencard /var/log/open-card /var/lib/open-card/uploads /var/lib/open-card/workspaces /var/lib/open-card/build-work /var/lib/open-card/oci /var/lib/open-card/secrets /var/lib/open-card/secret-materials
   install -d -m 0750 -o opencard-agent -g opencard-agent /var/lib/open-card-agent /var/log/open-card-agent /var/lib/open-card-agent/runtime
   install -d -m 0700 -o opencard-buildkit -g opencard-buildkit /var/lib/open-card-buildkit /run/open-card-buildkit
   install -d -m 0750 -o opencard-caddy -g opencard-caddy /var/lib/open-card-caddy /var/log/open-card-caddy
@@ -197,10 +198,6 @@ EOF
   if command -v apparmor_parser >/dev/null 2>&1; then apparmor_parser -r /etc/apparmor.d/opencard-rootlesskit || die "failed to load Open Card AppArmor profile"; fi
 
   install -d -m 0750 /etc/open-card /var/lib/open-card/evidence
-  installation_id=/var/lib/open-card/installation-id
-  if [[ ! -e "$installation_id" ]]; then openssl rand -hex 24 >"$installation_id"; fi
-  [[ -f "$installation_id" && ! -L "$installation_id" ]] || die "installation id is unsafe"
-  chown root:root "$installation_id" && chmod 0600 "$installation_id"
   if [[ ! -f /etc/open-card/agent-ca.crt ]]; then
     openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 365 -subj "/CN=Open Card CA" -keyout /etc/open-card/agent-ca.key -out /etc/open-card/agent-ca.crt >/dev/null 2>&1
     cat >/etc/open-card/agent-cert.ext <<'EOF'
@@ -370,6 +367,10 @@ SQL
 fi
 
 "${installer[@]}"
+installation_id=/var/lib/open-card/installation-id
+if [[ ! -e "$installation_id" ]]; then openssl rand -hex 24 >"$installation_id"; fi
+[[ -f "$installation_id" && ! -L "$installation_id" ]] || die "installation id is unsafe"
+chown root:root "$installation_id" && chmod 0600 "$installation_id"
 static_binary=/opt/open-card/current/bin/open-card-static-server
 if [[ -x "$static_binary" ]]; then
   if command -v sha256sum >/dev/null 2>&1; then static_digest="sha256:$(sha256sum -- "$static_binary" | awk '{print $1}')"; else static_digest="sha256:$(shasum -a 256 -- "$static_binary" | awk '{print $1}')"; fi

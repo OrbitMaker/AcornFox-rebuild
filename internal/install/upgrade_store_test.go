@@ -134,6 +134,29 @@ func TestUpgradeStoreLockMarkerAndStubs(t *testing.T) {
 	}
 }
 
+func TestUpgradeStoreAcceptsInstallerRecoverySubstrateModes(t *testing.T) {
+	root := t.TempDir()
+	for _, item := range []struct {
+		path string
+		mode os.FileMode
+	}{
+		{"var", 0o711}, {"var/lib", 0o711}, {"var/lib/open-card", 0o711},
+		{"var/lib/open-card/upgrade-transactions", 0o700}, {"var/lib/open-card/upgrade-artifacts", 0o700},
+		{"opt", 0o711}, {"opt/open-card", 0o711}, {"opt/open-card/activations", 0o711},
+		{"etc", 0o711}, {"etc/open-card", 0o700}, {"etc/systemd", 0o711}, {"etc/systemd/system", 0o755},
+	} {
+		if err := os.Mkdir(filepath.Join(root, item.path), item.mode); err != nil {
+			t.Fatalf("mkdir %s: %v", item.path, err)
+		}
+	}
+	prepareTaskLock(t, root)
+	store, err := TaskUpgradeStore(root, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatalf("installer substrate modes rejected: %v", err)
+	}
+	defer store.Close()
+}
+
 func TestUpgradeStoreCloseReleasesLockAndAttemptsWritersInReverseOrder(t *testing.T) {
 	root := t.TempDir()
 	for _, p := range []string{"var", "var/lib", "var/lib/open-card", "var/lib/open-card/upgrade-transactions", "opt", "opt/open-card", "etc", "etc/open-card", "etc/systemd", "etc/systemd/system"} {
@@ -796,8 +819,10 @@ func productionCandidateUnitFixture(t *testing.T) (*UpgradeStore, ReleaseV1, Man
 		mode os.FileMode
 	}{
 		"bin/open-card-admin":                                 {[]byte("admin\n"), 0o755},
+		"bin/open-card-upgrade":                               {[]byte("upgrade\n"), 0o755},
 		"systemd/open-card-server.service":                    {[]byte("[Unit]\nDescription=Open Card\n[Service]\nEnvironmentFile=-/etc/open-card/server.env\nEnvironmentFile=/opt/open-card/active/database.env\nExecStart=/opt/open-card/current/bin/open-card-server\n[Install]\nWantedBy=multi-user.target\n"), 0o644},
 		"systemd/open-card-edge.service":                      {[]byte("edge\n"), 0o644},
+		"systemd/open-card-upgrade-recover.service":           {ProductionUpgradeRecoveryUnitBytes(), 0o644},
 		"caddy/open-card-edge.Caddyfile.example":              {[]byte("edge\n"), 0o644},
 		"migrations/control-plane/0024_dns_change_ledger.sql": {[]byte("migration\n"), 0o644},
 		"web/dist/index.html":                                 {[]byte("web\n"), 0o644},

@@ -192,20 +192,22 @@ func adapterRelease(t *testing.T) (ReleaseV1, string) {
 		files = append(files, FileDigest{Path: "migrations/control-plane/" + name, SHA256: adapterDigest(raw), Mode: 0o644})
 	}
 	for path, raw := range map[string][]byte{
-		"bin/open-card-admin":                    []byte("admin\n"),
-		"systemd/open-card-edge.service":         []byte("edge\n"),
-		"caddy/open-card-edge.Caddyfile.example": []byte("edge\n"),
-		"web/dist/index.html":                    []byte("web\n"),
-		"docs/licenses/licenses-manifest.json":   []byte("{}\n"),
-		"sbom.spdx.json":                         []byte("{}\n"),
-		"source-manifest.sha256":                 []byte("source\n"),
+		"bin/open-card-admin":                       []byte("admin\n"),
+		"bin/open-card-upgrade":                     []byte("upgrade\n"),
+		"systemd/open-card-edge.service":            []byte("edge\n"),
+		"systemd/open-card-upgrade-recover.service": ProductionUpgradeRecoveryUnitBytes(),
+		"caddy/open-card-edge.Caddyfile.example":    []byte("edge\n"),
+		"web/dist/index.html":                       []byte("web\n"),
+		"docs/licenses/licenses-manifest.json":      []byte("{}\n"),
+		"sbom.spdx.json":                            []byte("{}\n"),
+		"source-manifest.sha256":                    []byte("source\n"),
 	} {
 		full := filepath.Join(root, filepath.FromSlash(path))
 		if err := os.MkdirAll(filepath.Dir(full), 0o700); err != nil {
 			t.Fatal(err)
 		}
 		mode := os.FileMode(0o644)
-		if path == "bin/open-card-admin" {
+		if path == "bin/open-card-admin" || path == "bin/open-card-upgrade" {
 			mode = 0o755
 		}
 		if err := os.WriteFile(full, raw, mode); err != nil {

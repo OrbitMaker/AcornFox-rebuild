@@ -373,7 +373,7 @@ func engineRequest() UpgradeRequest {
 	if err != nil {
 		panic(err)
 	}
-	return UpgradeRequest{TransactionID: "txn-1", CandidateRelease: ReleaseV1{ID: "release-new", Version: "0.8.0-rc.1", SourceCommit: strings.Repeat("e", 40), Architecture: "amd64", ManifestSHA256: strings.Repeat("f", 64)}, CandidateActivationID: "activation-new", CandidateDatabaseName: name, RequestedManifestSHA256: strings.Repeat("f", 64)}
+	return UpgradeRequest{TransactionID: "txn-1", CandidateRelease: ReleaseV1{ID: "release-new", Version: "0.8.0-rc.1", SourceCommit: strings.Repeat("e", 40), Architecture: "amd64", ManifestSHA256: strings.Repeat("f", 64)}, CandidateActivationID: "activation-new", CandidateDatabaseName: name, RecoveryEvidenceSHA256: strings.Repeat("d", 64), RequestedManifestSHA256: strings.Repeat("f", 64)}
 }
 func engineFixture(legacy bool) (*UpgradeEngine, *engineStoreFake, *engineDBFake, *engineServiceFake, *[]string) {
 	events := []string{}
@@ -395,6 +395,9 @@ func engineFixture(legacy bool) (*UpgradeEngine, *engineStoreFake, *engineDBFake
 	d.candidateEnv = candidateEnv
 	factory := UpgradeDatabaseOpenFunc(func(_ context.Context, request UpgradeDatabaseOpenRequest) (UpgradeDatabaseSession, error) {
 		if request.Validate() != nil {
+			return nil, errEngineFake
+		}
+		if request.CandidateRelease.ID != "" && request.RecoveryEvidenceSHA256 != engineRequest().RecoveryEvidenceSHA256 {
 			return nil, errEngineFake
 		}
 		return d, nil

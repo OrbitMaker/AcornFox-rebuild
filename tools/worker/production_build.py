@@ -76,6 +76,7 @@ GO_TARGETS = {
     "open-card-security-probe": "./cmd/open-card-security-probe",
     "open-card-imagegc": "./cmd/open-card-imagegc",
     "open-card-admin": "./cmd/open-card-admin",
+    "open-card-upgrade": "./cmd/open-card-upgrade",
 }
 RUNTIME_LAYOUT = {
     "buildkit": {

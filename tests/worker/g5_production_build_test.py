@@ -33,6 +33,10 @@ def digest(path: Path) -> str:
 
 
 class ProductionBuildTests(unittest.TestCase):
+    def test_recovery_binary_is_a_fixed_go_build_target(self) -> None:
+        tool = load_tool()
+        self.assertEqual(tool.GO_TARGETS["open-card-upgrade"], "./cmd/open-card-upgrade")
+
     def n_minus_one_candidate(self, tool, root: Path) -> tuple[Path, dict[str, object]]:
         candidate = root / "n-minus-one"
         release = candidate / "release"

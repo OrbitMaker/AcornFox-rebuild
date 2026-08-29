@@ -7,7 +7,8 @@ usage: install.sh --root TASK_ROOT --bundle BUNDLE [--url URL] [--offline]
                   [--health-command EXECUTABLE] [--migration-command EXECUTABLE]
                   [--migration-dir DIRECTORY] [--allow-downgrade]
                   [--expected-manifest-sha256 HEX]
-                  [--test-safe-prefix PATH] [--activate] [--dry-run]
+                  [--test-safe-prefix PATH] [--activate] [--stage-upgrade-substrate]
+                  [--validate-activation-intent] [--dry-run]
 
 `--root /` requires root plus either the legacy clean-worker gate or
 OPEN_CARD_INSTALL_CONFIRMATION=OPEN-CARD-INSTALL. System-root and URL installs
@@ -19,7 +20,7 @@ die() { echo "open-card install: $*" >&2; exit 1; }
 say() { echo "open-card install: $*"; }
 
 root= bundle= bundle_url= health_command= migration_command= migration_dir= expected_manifest_sha256= safe_prefix=
-offline=0 dry_run=0 activate=0 allow_downgrade=0
+offline=0 dry_run=0 activate=0 stage_upgrade_substrate=0 validate_activation_intent=0 allow_downgrade=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --root) [[ $# -gt 1 ]] || die "--root requires a value"; root=$2; shift 2 ;;
@@ -32,6 +33,8 @@ while [[ $# -gt 0 ]]; do
     --expected-manifest-sha256) [[ $# -gt 1 ]] || die "--expected-manifest-sha256 requires a value"; expected_manifest_sha256=$2; shift 2 ;;
     --test-safe-prefix) [[ $# -gt 1 ]] || die "--test-safe-prefix requires a value"; safe_prefix=$2; shift 2 ;;
     --activate) activate=1; shift ;;
+    --stage-upgrade-substrate) stage_upgrade_substrate=1; shift ;;
+    --validate-activation-intent) validate_activation_intent=1; shift ;;
     --offline) offline=1; shift ;;
     --dry-run) dry_run=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -65,7 +68,7 @@ if [[ "$root" = "/" ]]; then
   else
     die "--root / requires clean-worker authorization or OPEN_CARD_INSTALL_CONFIRMATION=OPEN-CARD-INSTALL"
   fi
-  if (( production_root && ! activate && ! dry_run )); then
+  if (( production_root && ! activate && ! dry_run && ! stage_upgrade_substrate )); then
     die "production system-root install requires --activate"
   fi
   if (( production_root )) && [[ "${OPEN_CARD_M6_ENABLED:-false}" = "true" || "${OPEN_CARD_AI_ENABLED:-false}" = "true" ]]; then
@@ -78,6 +81,15 @@ else
   production_root=0
   [[ "$root" != "$HOME" && "$root" != "$HOME"/* ]] || die "refusing HOME or a path below HOME"
   (( ! activate )) || die "--activate requires --root / and clean-worker authorization"
+fi
+if (( stage_upgrade_substrate )); then
+  (( ! activate )) || die "--stage-upgrade-substrate cannot be combined with --activate"
+  [[ -z "$health_command" && -z "$migration_command" && -z "$migration_dir" ]] || die "--stage-upgrade-substrate refuses health and migration commands"
+  (( ! allow_downgrade )) || die "--stage-upgrade-substrate refuses --allow-downgrade"
+fi
+if (( validate_activation_intent )); then
+  (( dry_run )) || die "--validate-activation-intent requires --dry-run"
+  (( ! stage_upgrade_substrate && ! activate )) || die "--validate-activation-intent is a preflight-only flag"
 fi
 if [[ -n "$safe_prefix" ]]; then
   [[ "$safe_prefix" = /* && "$safe_prefix" != "/" ]] || die "--test-safe-prefix must be absolute and non-root"
@@ -140,6 +152,9 @@ previous="$prefix/previous"
 backups="$data_dir/backups"
 evidence="$data_dir/evidence"
 systemd_dir="$root_real/etc/systemd/system"
+upgrade_tools="$prefix/upgrade-tools"
+upgrade_lock_dir="$root_real/run/lock"
+upgrade_lock="$upgrade_lock_dir/open-card-upgrade.lock"
 
 assert_no_symlink_components() {
   local value=$1 current_path=/ component
@@ -174,6 +189,203 @@ atomic_replace() {
 import os, sys
 os.replace(sys.argv[1], sys.argv[2])
 PY
+}
+durable_sync_file_and_parent() {
+  local path=$1
+  if (( ! system_root )) && [[ "${OPEN_CARD_INSTALL_TEST_FAIL_DURABLE_SYNC:-}" = "1" ]]; then
+    return 1
+  fi
+  python3 - "$path" <<'PY'
+import os, stat, sys
+path = sys.argv[1]
+flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+fd = os.open(path, flags)
+try:
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        raise OSError("durable target is not regular")
+    os.fsync(fd)
+finally:
+    os.close(fd)
+parent_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+parent = os.open(os.path.dirname(path), parent_flags)
+try:
+    os.fsync(parent)
+finally:
+    os.close(parent)
+PY
+}
+durable_sync_directory_and_parent() {
+  local path=$1
+  if (( ! system_root )) && [[ "${OPEN_CARD_INSTALL_TEST_FAIL_DURABLE_SYNC:-}" = "1" ]]; then
+    return 1
+  fi
+  python3 - "$path" <<'PY'
+import os, stat, sys
+path = sys.argv[1]
+flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+fd = os.open(path, flags)
+try:
+    if not stat.S_ISDIR(os.fstat(fd).st_mode):
+        raise OSError("durable target is not a directory")
+    os.fsync(fd)
+finally:
+    os.close(fd)
+parent = os.open(os.path.dirname(path), flags)
+try:
+    os.fsync(parent)
+finally:
+    os.close(parent)
+PY
+}
+file_mode() {
+  if stat -c '%a' "$1" >/dev/null 2>&1; then stat -c '%a' "$1"; else stat -f '%Lp' "$1"; fi
+}
+file_owner() {
+  if stat -c '%u' "$1" >/dev/null 2>&1; then stat -c '%u' "$1"; else stat -f '%u' "$1"; fi
+}
+require_stable_directory() {
+  local path=$1 expected_owner=$2 expected_mode=$3 actual_mode actual_owner
+  if [[ ! -e "$path" && ! -L "$path" ]]; then
+    mkdir -p -- "$path"
+    chmod "$expected_mode" "$path" || die "could not set stable path mode: $path"
+  fi
+  [[ -d "$path" && ! -L "$path" ]] || die "stable path is not a real directory: $path"
+  actual_mode=$(file_mode "$path")
+  actual_owner=$(file_owner "$path")
+  [[ "$actual_owner" = "$expected_owner" ]] || die "stable path owner mismatch: $path"
+  [[ "$actual_mode" = "$expected_mode" ]] || die "stable path mode mismatch: $path"
+  (( (8#$actual_mode & 8#022) == 0 )) || die "stable path is writable by group or others: $path"
+}
+require_stable_file() {
+  local path=$1 expected_owner=$2 expected_mode=$3 actual_mode actual_owner
+  [[ -f "$path" && ! -L "$path" ]] || die "stable file is missing or unsafe: $path"
+  actual_mode=$(file_mode "$path")
+  actual_owner=$(file_owner "$path")
+  [[ "$actual_owner" = "$expected_owner" ]] || die "stable file owner mismatch: $path"
+  [[ "$actual_mode" = "$expected_mode" ]] || die "stable file mode mismatch: $path"
+}
+install_stable_file() {
+  local source=$1 destination=$2 expected_owner=$3 expected_mode=$4 label=$5 parent base temporary source_digest destination_digest
+  parent=$(dirname -- "$destination")
+  base=$(basename -- "$destination")
+  [[ -f "$source" && ! -L "$source" ]] || die "$label source is missing or unsafe"
+  require_stable_file "$source" "$expected_owner" "$expected_mode"
+  require_stable_directory "$parent" "$expected_owner" 755
+  source_digest=$(sha256_file "$source")
+  if [[ -e "$destination" || -L "$destination" ]]; then
+    require_stable_file "$destination" "$expected_owner" "$expected_mode"
+    destination_digest=$(sha256_file "$destination")
+    [[ "$destination_digest" = "$source_digest" ]] || die "$label conflicts with an existing stable file"
+    durable_sync_file_and_parent "$destination" || die "$label durability outcome is unknown"
+    return
+  fi
+  temporary=$(mktemp "$parent/.${base}.next.XXXXXX")
+  if ! cp -- "$source" "$temporary"; then rm -f -- "$temporary"; die "could not stage $label"; fi
+  chmod "$expected_mode" "$temporary" || { rm -f -- "$temporary"; die "could not set $label mode"; }
+  require_stable_file "$temporary" "$expected_owner" "$expected_mode"
+  if ! ln -- "$temporary" "$destination"; then
+    rm -f -- "$temporary"
+    require_stable_file "$destination" "$expected_owner" "$expected_mode"
+    destination_digest=$(sha256_file "$destination")
+    [[ "$destination_digest" = "$source_digest" ]] || die "$label conflicts with an existing stable file"
+    durable_sync_file_and_parent "$destination" || die "$label durability outcome is unknown"
+    return
+  fi
+  rm -f -- "$temporary"
+  require_stable_file "$destination" "$expected_owner" "$expected_mode"
+  destination_digest=$(sha256_file "$destination")
+  [[ "$destination_digest" = "$source_digest" ]] || die "$label verification failed"
+  durable_sync_file_and_parent "$destination" || die "$label durability outcome is unknown"
+}
+prepare_upgrade_lock() {
+  local expected_owner=$1 temporary run_dir
+  assert_no_symlink_components "$upgrade_lock_dir"
+  run_dir=$(dirname -- "$upgrade_lock_dir")
+  require_stable_directory "$run_dir" "$expected_owner" 755
+  require_stable_directory "$upgrade_lock_dir" "$expected_owner" 755
+  if [[ -e "$upgrade_lock" || -L "$upgrade_lock" ]]; then
+    require_stable_file "$upgrade_lock" "$expected_owner" 600
+    durable_sync_file_and_parent "$upgrade_lock" || die "upgrade lock durability outcome is unknown"
+    return
+  fi
+  temporary=$(mktemp "$upgrade_lock_dir/.open-card-upgrade.lock.next.XXXXXX")
+  chmod 600 "$temporary" || { rm -f -- "$temporary"; die "could not set upgrade lock mode"; }
+  require_stable_file "$temporary" "$expected_owner" 600
+  if ! ln -- "$temporary" "$upgrade_lock"; then
+    rm -f -- "$temporary"
+    require_stable_file "$upgrade_lock" "$expected_owner" 600
+    durable_sync_file_and_parent "$upgrade_lock" || die "upgrade lock durability outcome is unknown"
+    return
+  fi
+  rm -f -- "$temporary"
+  require_stable_file "$upgrade_lock" "$expected_owner" 600
+  durable_sync_file_and_parent "$upgrade_lock" || die "upgrade lock durability outcome is unknown"
+}
+prepare_upgrade_layout_directory() {
+  local path=$1 expected_owner=$2 expected_mode=$3 actual_owner actual_mode
+  if [[ ! -e "$path" && ! -L "$path" ]]; then
+    mkdir -p -- "$path"
+  fi
+  [[ -d "$path" && ! -L "$path" ]] || die "upgrade layout path is not a real directory: $path"
+  actual_owner=$(file_owner "$path")
+  actual_mode=$(file_mode "$path")
+  (( (8#$actual_mode & 8#022) == 0 )) || die "upgrade layout path is writable by group or others: $path"
+  if [[ "$actual_owner" != "$expected_owner" ]]; then
+    if (( system_root && EUID == 0 && expected_owner == 0 )); then
+      chown 0:0 "$path" || die "could not normalize upgrade layout owner: $path"
+    else
+      die "upgrade layout owner mismatch: $path"
+    fi
+  fi
+  chmod "$expected_mode" "$path" || die "could not normalize upgrade layout mode: $path"
+  require_stable_directory "$path" "$expected_owner" "$expected_mode"
+  durable_sync_directory_and_parent "$path" || die "upgrade layout durability outcome is unknown"
+}
+data_root_fault() {
+  local phase=$1
+  (( ! system_root )) && [[ -n "$safe_prefix" && "${OPEN_CARD_INSTALL_TEST_DATA_ROOT_FAULT:-}" = "$phase" ]]
+}
+data_root_force_transition() {
+  (( ! system_root )) && [[ -n "$safe_prefix" && "${OPEN_CARD_INSTALL_TEST_DATA_ROOT_FORCE_TRANSITION:-}" = "1" ]]
+}
+prepare_upgrade_data_root() {
+  local expected_owner=$1 actual_owner actual_mode
+  if [[ ! -e "$data_dir" && ! -L "$data_dir" ]]; then
+    mkdir -p -- "$data_dir"
+  fi
+  [[ -d "$data_dir" && ! -L "$data_dir" ]] || die "upgrade data root is not a real directory"
+  actual_owner=$(file_owner "$data_dir")
+  actual_mode=$(file_mode "$data_dir")
+  (( (8#$actual_mode & 8#022) == 0 )) || die "upgrade data root is writable by group or others"
+  data_root_fault before-chmod && die "upgrade data root fault before chmod"
+  chmod 711 "$data_dir" || die "could not normalize upgrade data root mode"
+  [[ "$(file_mode "$data_dir")" = "711" && "$(file_owner "$data_dir")" = "$actual_owner" ]] || die "upgrade data root mode verification failed"
+  durable_sync_directory_and_parent "$data_dir" || die "upgrade data root durability outcome is unknown"
+  data_root_fault after-chmod-before-chown && die "upgrade data root fault after chmod before chown"
+  data_root_fault chown && die "upgrade data root fault before chown"
+  if [[ "$actual_owner" != "$expected_owner" ]] || data_root_force_transition; then
+    if (( system_root && EUID == 0 && expected_owner == 0 )); then
+      chown 0:0 "$data_dir" || die "could not normalize upgrade data root owner"
+    elif data_root_force_transition; then
+      chown "$expected_owner" "$data_dir" || die "could not verify upgrade data root owner transition"
+    else
+      die "upgrade data root owner mismatch"
+    fi
+  fi
+  [[ "$(file_mode "$data_dir")" = "711" && "$(file_owner "$data_dir")" = "$expected_owner" ]] || die "upgrade data root ownership verification failed"
+  data_root_fault post-chown-sync && die "upgrade data root fault before post-chown sync"
+  durable_sync_directory_and_parent "$data_dir" || die "upgrade data root post-chown durability outcome is unknown"
+}
+prepare_upgrade_substrate() {
+  local expected_owner=$1
+  prepare_upgrade_data_root "$expected_owner"
+  prepare_upgrade_layout_directory "$prefix/activations" "$expected_owner" 711
+  prepare_upgrade_layout_directory "$data_dir/upgrade-transactions" "$expected_owner" 700
+  prepare_upgrade_layout_directory "$data_dir/upgrade-artifacts" "$expected_owner" 700
+  install_stable_file "$release_dir/bin/open-card-upgrade" "$upgrade_tools/open-card-upgrade" "$expected_owner" 755 "upgrade recovery binary"
+  require_stable_directory "$systemd_dir" "$expected_owner" 755
+  install_stable_file "$release_dir/systemd/open-card-upgrade-recover.service" "$systemd_dir/open-card-upgrade-recover.service" "$expected_owner" 644 "upgrade recovery unit"
+  prepare_upgrade_lock "$expected_owner"
 }
 
 bundle_tmp=
@@ -277,7 +489,8 @@ if value["version"] == "0.8.0-rc.1":
     if value.get("n_minus_one") != expected_n_minus_one:
         raise SystemExit("0.8.0-rc.1 production candidate has invalid N-1 lineage")
     production_required = {
-        "bin/open-card-admin", "systemd/open-card-edge.service",
+        "bin/open-card-admin", "bin/open-card-upgrade",
+        "systemd/open-card-edge.service", "systemd/open-card-upgrade-recover.service",
         "caddy/open-card-edge.Caddyfile.example",
         "migrations/control-plane/0024_dns_change_ledger.sql", "web/dist/index.html",
         "docs/licenses/licenses-manifest.json", "sbom.spdx.json", "source-manifest.sha256",
@@ -328,6 +541,21 @@ version=$(sed -n '1p' <<< "$manifest_info")
 release_id=$(sed -n '2p' <<< "$manifest_info")
 release_name="$release_id"
 release_dir="$releases/$release_name"
+installation_id="$data_dir/installation-id"
+if (( stage_upgrade_substrate )) && [[ "$version" != "0.8.0-rc.1" ]]; then
+  die "--stage-upgrade-substrate requires the 0.8.0-rc.1 production candidate"
+fi
+if (( validate_activation_intent )) && [[ "$version" = "0.8.0-rc.1" ]]; then
+  die "0.8.0-rc.1 system-root activation requires native bootstrap activation support"
+fi
+if (( system_root && ! stage_upgrade_substrate )); then
+  if [[ -e "$current" || -L "$current" || -e "$installation_id" || -L "$installation_id" ]]; then
+    die "existing production installation requires upgrade.sh or --stage-upgrade-substrate"
+  fi
+  if [[ "$version" = "0.8.0-rc.1" && $activate -eq 1 ]]; then
+    die "0.8.0-rc.1 system-root activation requires native bootstrap activation support"
+  fi
+fi
 manifest_migration_version=$(python3 - "$manifest" <<'PY'
 import json, sys
 value = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -406,7 +634,11 @@ else
     verify_release "$bundle_dir"
     say "would create release $release_name"
   else
-    mkdir -p -- "$releases" "$config_dir" "$data_dir" "$backups" "$evidence"
+    if (( stage_upgrade_substrate )); then
+      mkdir -p -- "$releases" "$data_dir"
+    else
+      mkdir -p -- "$releases" "$config_dir" "$data_dir" "$backups" "$evidence"
+    fi
     assert_no_symlink_components "$releases"
     stage_dir=$(mktemp -d "$releases/.staging-$release_name.XXXXXX")
     cp -a -- "$bundle_dir"/. "$stage_dir"/
@@ -416,10 +648,34 @@ else
   fi
 fi
 
+if (( stage_upgrade_substrate )); then
+  if (( dry_run )); then
+    say "would stage verified upgrade recovery substrate for $release_name"
+    exit 0
+  fi
+  expected_owner=$(id -u)
+  prepare_upgrade_substrate "$expected_owner"
+  if (( system_root )); then
+    command -v systemctl >/dev/null 2>&1 || die "systemctl is required for system-root upgrade substrate staging"
+    systemctl daemon-reload
+  fi
+  # The recovery unit stays disabled until the E/F boot-safe activation gate
+  # owns CLI enablement and crash/reboot evidence. Staging must not start it.
+  say "staged verified upgrade recovery substrate for $release_name"
+  exit 0
+fi
+
 if (( ! dry_run )); then
-  mkdir -p -- "$config_dir" "$data_dir" "$backups" "$evidence"
-  chmod 0750 "$config_dir" "$data_dir" "$backups" "$evidence"
-  mkdir -p -- "$systemd_dir"
+  mkdir -p -- "$config_dir" "$backups" "$evidence"
+  chmod 0750 "$config_dir" "$backups" "$evidence"
+  if [[ "$version" = "0.8.0-rc.1" ]]; then
+    expected_owner=$(id -u)
+    prepare_upgrade_substrate "$expected_owner"
+  else
+    mkdir -p -- "$data_dir"
+    chmod 0750 "$data_dir"
+    mkdir -p -- "$systemd_dir"
+  fi
   units=(open-card-server.service open-card-agent.service open-card-buildkit.service open-card-caddy.service)
   if [[ -f "$bundle_dir/systemd/open-card-edge.service" && ! -L "$bundle_dir/systemd/open-card-edge.service" ]]; then
     units+=(open-card-edge.service)
@@ -571,7 +827,8 @@ if (( system_root && activate )); then
   done
   getent group docker >/dev/null || die "clean worker is missing the required docker group for opencard-agent"
   usermod -a -G docker opencard-agent
-  install -d -m 0750 -o opencard -g opencard /var/lib/open-card /var/log/open-card
+  install -d -m 0711 -o root -g root /var/lib/open-card
+  install -d -m 0750 -o opencard -g opencard /var/log/open-card /var/lib/open-card/uploads /var/lib/open-card/workspaces /var/lib/open-card/build-work /var/lib/open-card/oci /var/lib/open-card/secrets /var/lib/open-card/secret-materials
   install -d -m 0750 -o opencard-agent -g opencard-agent /var/lib/open-card-agent /var/log/open-card-agent
   install -d -m 0700 -o opencard-buildkit -g opencard-buildkit /var/lib/open-card-buildkit /run/open-card-buildkit
   install -d -m 0750 -o opencard-caddy -g opencard-caddy /var/lib/open-card-caddy /var/log/open-card-caddy

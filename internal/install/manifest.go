@@ -67,7 +67,9 @@ func ValidateProductionCandidate(manifest Manifest) error {
 	}
 	required := map[string]bool{
 		"bin/open-card-admin":                                 false,
+		"bin/open-card-upgrade":                               false,
 		"systemd/open-card-edge.service":                      false,
+		"systemd/open-card-upgrade-recover.service":           false,
 		"caddy/open-card-edge.Caddyfile.example":              false,
 		"migrations/control-plane/0024_dns_change_ledger.sql": false,
 		"web/dist/index.html":                                 false,

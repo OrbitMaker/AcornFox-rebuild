@@ -352,6 +352,50 @@ func TestG7ScriptsAreBashSyntaxValid(t *testing.T) {
 	}
 }
 
+func TestG5BRecoverySubstrateStaysStageOnlyAndBootDisabled(t *testing.T) {
+	root := scriptRoot(t)
+	installBytes, err := os.ReadFile(filepath.Join(root, "scripts", "mvp", "install.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostBytes, err := os.ReadFile(filepath.Join(root, "scripts", "mvp", "install-host.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	install := string(installBytes)
+	host := string(hostBytes)
+	for _, required := range []string{
+		"--stage-upgrade-substrate",
+		"--validate-activation-intent",
+		"prepare_upgrade_substrate",
+		"existing production installation requires upgrade.sh or --stage-upgrade-substrate",
+		"0.8.0-rc.1 system-root activation requires native bootstrap activation support",
+		"durable_sync_file_and_parent",
+		"durable_sync_directory_and_parent",
+		"prepare_upgrade_data_root",
+		"install -d -m 0711 -o root -g root /var/lib/open-card",
+	} {
+		if !strings.Contains(install, required) {
+			t.Fatalf("install substrate contract is missing %q", required)
+		}
+	}
+	if strings.Contains(install, "enable open-card-upgrade-recover.service") || strings.Contains(install, "start open-card-upgrade-recover.service") {
+		t.Fatal("installer enables or starts recovery before the boot-safe gate")
+	}
+	stage := strings.Index(install, "if (( stage_upgrade_substrate )); then\n  if (( dry_run ))")
+	units := strings.Index(install, "units=(open-card-server.service")
+	stageExit := strings.Index(install, "say \"staged verified upgrade recovery substrate for $release_name\"\n  exit 0")
+	if stage < 0 || units < 0 || stageExit < stage || stageExit > units {
+		t.Fatal("stage-only substrate path does not return before ordinary unit staging")
+	}
+	if !strings.Contains(host, "install -d -m 0711 -o root -g root /var/lib/open-card") || strings.Index(host, "\"${installer[@]}\"") > strings.Index(host, "installation_id=/var/lib/open-card/installation-id") {
+		t.Fatal("host installer does not establish a root-owned data parent before creating an installation id")
+	}
+	if preflight := strings.Index(host, "--validate-activation-intent"); preflight < 0 || preflight > strings.Index(host, "require_command()") {
+		t.Fatal("host activation-intent preflight does not precede mutable prerequisites")
+	}
+}
+
 func TestG7SystemdUnitsKeepPrivilegeAndSocketBoundaries(t *testing.T) {
 	serverBytes, err := os.ReadFile(filepath.Join(scriptRoot(t), "deploy", "systemd", "open-card-server.service"))
 	if err != nil {

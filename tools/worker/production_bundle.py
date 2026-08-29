@@ -36,6 +36,7 @@ BINARIES = (
     "open-card-security-probe",
     "open-card-imagegc",
     "open-card-admin",
+    "open-card-upgrade",
 )
 RUNTIME = (
     "buildkitd",
@@ -51,6 +52,7 @@ UNITS = (
     "open-card-buildkit.service",
     "open-card-caddy.service",
     "open-card-edge.service",
+    "open-card-upgrade-recover.service",
 )
 INSTALLER_SCRIPTS = (
     "install.sh",
