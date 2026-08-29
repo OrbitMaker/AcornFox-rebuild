@@ -2,6 +2,8 @@ package install
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -81,9 +83,22 @@ type FailureV1 struct {
 	MessageDigest string       `json:"message_digest"`
 }
 type JournalTransitionV1 struct {
-	From JournalState `json:"from"`
-	To   JournalState `json:"to"`
-	At   time.Time    `json:"at"`
+	Revision       int64        `json:"revision"`
+	From           JournalState `json:"from"`
+	To             JournalState `json:"to"`
+	At             time.Time    `json:"at"`
+	EvidenceSHA256 string       `json:"evidence_sha256"`
+}
+type UnitSnapshotV1 struct {
+	Active  bool `json:"active"`
+	Enabled bool `json:"enabled"`
+}
+type ServiceSnapshotV1 struct {
+	Edge     UnitSnapshotV1 `json:"edge"`
+	Agent    UnitSnapshotV1 `json:"agent"`
+	Server   UnitSnapshotV1 `json:"server"`
+	Caddy    UnitSnapshotV1 `json:"caddy"`
+	BuildKit UnitSnapshotV1 `json:"buildkit"`
 }
 type UpgradeJournalV1 struct {
 	SchemaVersion                 int                   `json:"schema_version"`
@@ -96,14 +111,24 @@ type UpgradeJournalV1 struct {
 	OldActivationID               string                `json:"old_activation_id"`
 	OldActivationJSONSHA256       string                `json:"old_activation_json_sha256"`
 	CandidateActivationID         string                `json:"candidate_activation_id"`
-	CandidateActivationJSONSHA256 string                `json:"candidate_activation_json_sha256"`
-	CandidateDatabase             DatabaseV1            `json:"candidate_database"`
-	Snapshot                      ArtifactV1            `json:"snapshot"`
-	Migration                     MigrationV1           `json:"migration"`
-	Validation                    ArtifactV1            `json:"validation"`
-	ServiceSnapshotSHA256         string                `json:"service_snapshot_sha256"`
-	Failure                       *FailureV1            `json:"failure"`
+	CandidateActivationJSONSHA256 string                `json:"candidate_activation_json_sha256,omitempty"`
+	CandidateDatabaseName         string                `json:"candidate_database_name"`
+	CandidateDatabase             *DatabaseV1           `json:"candidate_database,omitempty"`
+	Snapshot                      *ArtifactV1           `json:"snapshot,omitempty"`
+	Migration                     *MigrationV1          `json:"migration,omitempty"`
+	Validation                    *ArtifactV1           `json:"validation,omitempty"`
+	ServiceSnapshot               ServiceSnapshotV1     `json:"service_snapshot"`
+	Failure                       *FailureV1            `json:"failure,omitempty"`
 	History                       []JournalTransitionV1 `json:"history"`
+}
+
+// CanonicalServiceSnapshotSHA256 returns the digest of the fixed service
+// snapshot wire representation. ServiceSnapshotV1 deliberately uses a struct
+// (rather than a map) so this representation has a stable field order.
+func CanonicalServiceSnapshotSHA256(snapshot ServiceSnapshotV1) string {
+	raw, _ := json.Marshal(snapshot)
+	digest := sha256.Sum256(raw)
+	return hex.EncodeToString(digest[:])
 }
 
 func validID(v string) bool            { return installID.MatchString(v) }
@@ -128,6 +153,65 @@ func stateOK(v JournalState) bool {
 func terminal(v JournalState) bool {
 	return v == JournalCommitted || v == JournalAbortedPreSwitch || v == JournalRolledBack || v == JournalRecoveryRequired
 }
+
+func journalRank(v JournalState) (int, bool) {
+	switch v {
+	case JournalPreflighted, JournalLegacyProjected:
+		return 0, true
+	case JournalQuiesced:
+		return 1, true
+	case JournalSnapshotCreated:
+		return 2, true
+	case JournalCandidateDBReady:
+		return 3, true
+	case JournalMigrated:
+		return 4, true
+	case JournalValidated:
+		return 5, true
+	case JournalActiveSwitched, JournalRollbackSwitched, JournalRolledBack:
+		return 6, true
+	case JournalHealthy:
+		return 7, true
+	case JournalEdgeArmed:
+		return 8, true
+	case JournalCommitted:
+		return 9, true
+	}
+	return 0, false
+}
+
+func failureState(v JournalState) bool {
+	return v == JournalAbortedPreSwitch || v == JournalRollbackSwitched || v == JournalRolledBack || v == JournalRecoveryRequired
+}
+
+func validFailure(v *FailureV1) bool {
+	return v != nil && validID(v.Code) && stateOK(v.Phase) && validSHA(v.MessageDigest)
+}
+
+func validSnapshot(tx string, a *ArtifactV1) bool {
+	return a != nil && a.Path == artifactPath(tx, "control-plane.dump") && !strings.Contains(a.Path, "\x00") && validSHA(a.SHA256) && a.Size > 0 && validID(a.SourceDatabase)
+}
+
+func validValidation(tx string, a *ArtifactV1) bool {
+	return a != nil && a.Path == artifactPath(tx, "validation.json") && !strings.Contains(a.Path, "\x00") && validSHA(a.SHA256) && a.Size > 0 && a.SourceDatabase == ""
+}
+
+func (j UpgradeJournalV1) effectiveEvidenceRank() (int, error) {
+	if j.State == JournalAbortedPreSwitch || j.State == JournalRecoveryRequired {
+		if len(j.History) == 0 {
+			return 0, fmt.Errorf("terminal journal without history")
+		}
+		if rank, ok := journalRank(j.History[len(j.History)-1].From); ok {
+			return rank, nil
+		}
+		return 0, fmt.Errorf("invalid terminal evidence rank")
+	}
+	rank, ok := journalRank(j.State)
+	if !ok {
+		return 0, fmt.Errorf("invalid journal evidence rank")
+	}
+	return rank, nil
+}
 func (a ActivationV1) Validate() error {
 	if a.SchemaVersion != 1 || !validID(a.ActivationID) || !validID(a.Origin) || !a.Release.valid() || !a.Database.valid() || !validSHA(a.DatabaseEnvSHA256) || a.CreatedAt.IsZero() || !validID(a.CreatedByTransactionID) {
 		return fmt.Errorf("invalid activation v1")
@@ -138,16 +222,54 @@ func (a ActivationV1) Validate() error {
 	return nil
 }
 func (j UpgradeJournalV1) Validate() error {
-	if j.SchemaVersion != 1 || !validID(j.TransactionID) || j.Revision < 1 || !stateOK(j.State) || j.CreatedAt.IsZero() || j.UpdatedAt.IsZero() || !validSHA(j.RequestedManifestSHA256) || !validID(j.OldActivationID) || !validSHA(j.OldActivationJSONSHA256) || !validID(j.CandidateActivationID) || !validSHA(j.CandidateActivationJSONSHA256) || !j.CandidateDatabase.valid() || j.Snapshot.Path != artifactPath(j.TransactionID, "snapshot.sql.zst") || !validSHA(j.Snapshot.SHA256) || j.Snapshot.Size < 0 || !validID(j.Snapshot.SourceDatabase) || j.Validation.Path != artifactPath(j.TransactionID, "validation.json") || !validSHA(j.Validation.SHA256) || j.Validation.Size < 0 || !regexp.MustCompile(`^[0-9]{4}$`).MatchString(j.Migration.From) || !regexp.MustCompile(`^[0-9]{4}$`).MatchString(j.Migration.To) || !validSHA(j.Migration.ManifestSHA256) || !validSHA(j.ServiceSnapshotSHA256) {
+	if j.SchemaVersion != 1 || !validID(j.TransactionID) || j.History == nil || j.Revision != int64(len(j.History)+1) || !stateOK(j.State) || j.CreatedAt.IsZero() || j.UpdatedAt.Before(j.CreatedAt) || !validSHA(j.RequestedManifestSHA256) || !validID(j.OldActivationID) || !validSHA(j.OldActivationJSONSHA256) || !validID(j.CandidateActivationID) || !candidateDatabaseName.MatchString(j.CandidateDatabaseName) {
 		return fmt.Errorf("invalid upgrade journal v1")
 	}
-	if j.Failure != nil && (!validID(j.Failure.Code) || !stateOK(j.Failure.Phase) || !validSHA(j.Failure.MessageDigest)) {
-		return fmt.Errorf("invalid journal failure")
-	}
-	for _, h := range j.History {
-		if h.At.IsZero() || ValidateJournalTransition(h.From, h.To) != nil {
-			return fmt.Errorf("invalid journal history")
+	if len(j.History) == 0 {
+		if j.Revision != 1 || j.State != JournalPreflighted || !j.UpdatedAt.Equal(j.CreatedAt) {
+			return fmt.Errorf("invalid initial journal")
 		}
+	} else {
+		lastAt := j.CreatedAt
+		previous := JournalPreflighted
+		for i, h := range j.History {
+			if h.Revision != int64(i+2) || h.From != previous || h.At.IsZero() || h.At.Before(lastAt) || h.At.After(j.UpdatedAt) || !validSHA(h.EvidenceSHA256) || ValidateJournalTransition(h.From, h.To) != nil {
+				return fmt.Errorf("invalid journal history")
+			}
+			lastAt, previous = h.At, h.To
+		}
+		if j.State != previous || j.UpdatedAt.Before(lastAt) {
+			return fmt.Errorf("invalid journal history state")
+		}
+	}
+	rank, err := j.effectiveEvidenceRank()
+	if err != nil {
+		return err
+	}
+	if rank >= 2 && !validSnapshot(j.TransactionID, j.Snapshot) {
+		return fmt.Errorf("invalid progressive snapshot")
+	}
+	if rank < 2 && j.Snapshot != nil {
+		return fmt.Errorf("early snapshot")
+	}
+	if rank >= 4 && (j.CandidateDatabase == nil || !j.CandidateDatabase.valid() || j.CandidateDatabase.Name != j.CandidateDatabaseName || j.CandidateDatabase.Migration != "0024" || j.Migration == nil || j.Migration.From != "0023" || j.Migration.To != "0024" || !validSHA(j.Migration.ManifestSHA256)) {
+		return fmt.Errorf("invalid progressive candidate")
+	}
+	if rank < 4 && (j.CandidateDatabase != nil || j.Migration != nil) {
+		return fmt.Errorf("early progressive candidate")
+	}
+	if rank >= 5 && (j.CandidateActivationJSONSHA256 == "" || !validSHA(j.CandidateActivationJSONSHA256) || j.Validation == nil || j.Validation.Path != artifactPath(j.TransactionID, "validation.json") || !validSHA(j.Validation.SHA256) || j.Validation.Size <= 0 || j.Validation.SourceDatabase != "") {
+		return fmt.Errorf("invalid progressive validation")
+	}
+	if rank < 5 && (j.CandidateActivationJSONSHA256 != "" || j.Validation != nil) {
+		return fmt.Errorf("early progressive validation")
+	}
+	if failureState(j.State) {
+		if !validFailure(j.Failure) {
+			return fmt.Errorf("invalid journal failure")
+		}
+	} else if j.Failure != nil {
+		return fmt.Errorf("unexpected journal failure")
 	}
 	return nil
 }
@@ -163,6 +285,9 @@ func ValidateJournalTransition(f, t JournalState) error {
 		case JournalPreflighted, JournalLegacyProjected, JournalQuiesced, JournalSnapshotCreated, JournalCandidateDBReady, JournalMigrated, JournalValidated:
 			return nil
 		}
+	}
+	if f == JournalPreflighted && t == JournalQuiesced {
+		return nil
 	}
 	h := []JournalState{JournalPreflighted, JournalLegacyProjected, JournalQuiesced, JournalSnapshotCreated, JournalCandidateDBReady, JournalMigrated, JournalValidated, JournalActiveSwitched, JournalHealthy, JournalEdgeArmed, JournalCommitted}
 	for i := 0; i < len(h)-1; i++ {
@@ -227,6 +352,45 @@ func decodeStrict(raw []byte, v any) error {
 	d.DisallowUnknownFields()
 	return d.Decode(v)
 }
+
+func requireJournalFields(raw []byte, j UpgradeJournalV1) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return err
+	}
+	required := []string{"schema_version", "transaction_id", "revision", "state", "created_at", "updated_at", "requested_manifest_sha256", "old_activation_id", "old_activation_json_sha256", "candidate_activation_id", "candidate_database_name", "service_snapshot", "history"}
+	for _, name := range required {
+		value, ok := fields[name]
+		if !ok || bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			return fmt.Errorf("missing required journal field %q", name)
+		}
+	}
+	rank, err := j.effectiveEvidenceRank()
+	if err != nil {
+		return err
+	}
+	checks := []struct {
+		name     string
+		required bool
+	}{
+		{"snapshot", rank >= 2},
+		{"candidate_database", rank >= 4},
+		{"migration", rank >= 4},
+		{"candidate_activation_json_sha256", rank >= 5},
+		{"validation", rank >= 5},
+		{"failure", failureState(j.State)},
+	}
+	for _, check := range checks {
+		value, present := fields[check.name]
+		if check.required && (!present || bytes.Equal(bytes.TrimSpace(value), []byte("null"))) {
+			return fmt.Errorf("missing required progressive journal field %q", check.name)
+		}
+		if !check.required && present {
+			return fmt.Errorf("early or unexpected progressive journal field %q", check.name)
+		}
+	}
+	return nil
+}
 func ParseActivationV1(raw []byte) (ActivationV1, error) {
 	var a ActivationV1
 	if e := decodeStrict(raw, &a); e != nil {
@@ -239,7 +403,10 @@ func ParseUpgradeJournalV1(raw []byte) (UpgradeJournalV1, error) {
 	if e := decodeStrict(raw, &j); e != nil {
 		return j, e
 	}
-	return j, j.Validate()
+	if e := j.Validate(); e != nil {
+		return j, e
+	}
+	return j, requireJournalFields(raw, j)
 }
 func MarshalActivationV1(a ActivationV1) ([]byte, error) {
 	if e := a.Validate(); e != nil {
