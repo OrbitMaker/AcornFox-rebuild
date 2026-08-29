@@ -26,13 +26,13 @@ const (
 	AgentProtocolVersion       = "1.1"
 	PreviousAgentProtocol      = "1.0"
 	LegacyAgentProtocol        = "v1"
-	CurrentMigrationVersion    = "0023"
+	CurrentMigrationVersion    = "0024"
 	ProductionCandidateVersion = "0.8.0-rc.1"
-	ProductionNMinusOneVersion = "0.7.0-rc.1"
-	RC0SourceCommit = "35a2b198ac52949af3477475d89d4813b46a9490"
-	RC0ReleaseManifestSHA256 = "3b3953c0a26f8706151583ad6c9cad6b5502da18b28f11ed66ca92fe604aa253"
-	RC0ArchiveSHA256 = "abc034ed24e8e8dc74b8eabc84dd3071a66f166abe65135502911e9153c0b9fc"
-	RC0BundleManifestSHA256 = "960ab65526b890009e1770ad190a70b1589f825e0f59cf8d757634a0a8848392"
+	ProductionNMinusOneVersion = "0.8.0-rc.0"
+	RC0SourceCommit            = "35a2b198ac52949af3477475d89d4813b46a9490"
+	RC0ReleaseManifestSHA256   = "3b3953c0a26f8706151583ad6c9cad6b5502da18b28f11ed66ca92fe604aa253"
+	RC0ArchiveSHA256           = "abc034ed24e8e8dc74b8eabc84dd3071a66f166abe65135502911e9153c0b9fc"
+	RC0BundleManifestSHA256    = "960ab65526b890009e1770ad190a70b1589f825e0f59cf8d757634a0a8848392"
 	DefaultInstallPrefix       = "/opt/open-card"
 	DefaultConfigDir           = "/etc/open-card"
 	DefaultDataDir             = "/var/lib/open-card"
@@ -66,14 +66,14 @@ func ValidateProductionCandidate(manifest Manifest) error {
 		return errors.New("manifest is not the 0.8.0-rc.1 production candidate")
 	}
 	required := map[string]bool{
-		"bin/open-card-admin":                              false,
-		"systemd/open-card-edge.service":                   false,
-		"caddy/open-card-edge.Caddyfile.example":           false,
-		"migrations/control-plane/0023_source_uploads.sql": false,
-		"web/dist/index.html":                              false,
-		"docs/licenses/licenses-manifest.json":             false,
-		"sbom.spdx.json":                                   false,
-		"source-manifest.sha256":                           false,
+		"bin/open-card-admin":                                 false,
+		"systemd/open-card-edge.service":                      false,
+		"caddy/open-card-edge.Caddyfile.example":              false,
+		"migrations/control-plane/0024_dns_change_ledger.sql": false,
+		"web/dist/index.html":                                 false,
+		"docs/licenses/licenses-manifest.json":                false,
+		"sbom.spdx.json":                                      false,
+		"source-manifest.sha256":                              false,
 	}
 	for _, file := range manifest.Files {
 		if strings.Contains(file.Path, "fixture") || strings.Contains(file.Path, "/tests/") || strings.HasSuffix(file.Path, ".test") || strings.Contains(file.Path, "open-card-caddy-fixture") {
@@ -268,7 +268,7 @@ func CheckArchitecture(manifest Manifest, target string) error {
 }
 
 // ValidateMigrationVersion checks the four-digit migration identity used by
-// RC artifacts. The current development application schema is migration 0023.
+// RC artifacts. The current production application schema is migration 0024.
 func ValidateMigrationVersion(value string) error {
 	value = strings.TrimSpace(value)
 	if !migrationVersionPattern.MatchString(value) {
@@ -288,7 +288,7 @@ func CheckCurrentMigration(value string) error {
 }
 
 // LatestMigrationVersion returns the highest ordered migration filename in a
-// directory, e.g. 0023 for 0023_source_uploads.sql. It rejects malformed
+// directory, e.g. 0024 for 0024_dns_change_ledger.sql. It rejects malformed
 // migration names instead of silently skipping a file that could change the
 // schema contract.
 func LatestMigrationVersion(directory string) (string, error) {

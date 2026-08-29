@@ -33,7 +33,7 @@ func TestRCArchitectureAndMigrationContracts(t *testing.T) {
 
 func TestRCLatestMigrationRejectsMissingOrStaleDirectory(t *testing.T) {
 	directory := t.TempDir()
-	for _, name := range []string{"0001_foundation.sql", "0020_m5_usage.sql", "0021_m6_controlled_ai.sql", "0023_source_uploads.sql"} {
+	for _, name := range []string{"0001_foundation.sql", "0020_m5_usage.sql", "0021_m6_controlled_ai.sql", "0024_dns_change_ledger.sql"} {
 		if err := os.WriteFile(filepath.Join(directory, name), []byte("-- fixture\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -45,7 +45,7 @@ func TestRCLatestMigrationRejectsMissingOrStaleDirectory(t *testing.T) {
 	if err := install.RequireCurrentMigration(directory); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Remove(filepath.Join(directory, "0023_source_uploads.sql")); err != nil {
+	if err := os.Remove(filepath.Join(directory, "0024_dns_change_ledger.sql")); err != nil {
 		t.Fatal(err)
 	}
 	if err := install.RequireCurrentMigration(directory); err == nil {

@@ -227,7 +227,7 @@ import json, os, re, sys
 with open(sys.argv[1], encoding="utf-8") as stream:
     value = json.load(stream)
 required = {"schema_version","product","version","release_id","protocol","config_dir","data_dir","compatibility","files"}
-optional = {"architecture", "migration_version"}
+optional = {"architecture", "migration_version", "source_commit", "n_minus_one"}
 if not isinstance(value, dict) or not required <= set(value) or set(value) - required - optional:
     raise SystemExit("manifest fields are invalid")
 if value["schema_version"] != 1 or value["product"] != "open-card":
@@ -271,12 +271,15 @@ files = value["files"]
 if not isinstance(files, list) or not files:
     raise SystemExit("manifest files are empty")
 if value["version"] == "0.8.0-rc.1":
-    if migration_version != "0023":
-        raise SystemExit("0.8.0-rc.1 production candidate must declare migration 0023")
+    if migration_version != "0024" or not isinstance(value.get("source_commit"), str) or not re.fullmatch(r"[a-f0-9]{40}", value["source_commit"]):
+        raise SystemExit("0.8.0-rc.1 production candidate must declare source and migration 0024")
+    expected_n_minus_one = {"version":"0.8.0-rc.0","migration_version":"0023","source_commit":"35a2b198ac52949af3477475d89d4813b46a9490","release_manifest_sha256":"3b3953c0a26f8706151583ad6c9cad6b5502da18b28f11ed66ca92fe604aa253","archive_sha256":"abc034ed24e8e8dc74b8eabc84dd3071a66f166abe65135502911e9153c0b9fc","bundle_manifest_sha256":"960ab65526b890009e1770ad190a70b1589f825e0f59cf8d757634a0a8848392"}
+    if value.get("n_minus_one") != expected_n_minus_one:
+        raise SystemExit("0.8.0-rc.1 production candidate has invalid N-1 lineage")
     production_required = {
         "bin/open-card-admin", "systemd/open-card-edge.service",
         "caddy/open-card-edge.Caddyfile.example",
-        "migrations/control-plane/0023_source_uploads.sql", "web/dist/index.html",
+        "migrations/control-plane/0024_dns_change_ledger.sql", "web/dist/index.html",
         "docs/licenses/licenses-manifest.json", "sbom.spdx.json", "source-manifest.sha256",
     }
     candidate_paths = {item.get("path") for item in files if isinstance(item, dict)}
@@ -286,6 +289,11 @@ if value["version"] == "0.8.0-rc.1":
     forbidden = sorted(path for path in candidate_paths if isinstance(path, str) and ("fixture" in path.lower() or "/tests/" in "/" + path or path.endswith(".test") or "open-card-caddy-fixture" in path))
     if forbidden:
         raise SystemExit("0.8.0-rc.1 production manifest contains test-only payload")
+elif value["version"] == "0.8.0-rc.0":
+    if migration_version != "0023" or value.get("source_commit") != "35a2b198ac52949af3477475d89d4813b46a9490" or "n_minus_one" in value:
+        raise SystemExit("0.8.0-rc.0 bootstrap lineage is invalid")
+elif "source_commit" in value or "n_minus_one" in value:
+    raise SystemExit("historical manifest must not carry production lineage")
 seen = set()
 print(value["version"]); print(value["release_id"]); print(protocol)
 print(compat["min_data_version"]); print(compat["max_data_version"])
@@ -353,7 +361,7 @@ if not versions:
 print(max(versions))
 PY
 ) || die "migration directory validation failed"
-  expected_migration=${manifest_migration_version:-0023}
+  expected_migration=${manifest_migration_version:-0024}
   [[ "$latest_migration" = "$expected_migration" ]] || die "migration directory does not match candidate migration $expected_migration (got $latest_migration)"
 fi
 
@@ -488,12 +496,12 @@ fi
 if (( dry_run )); then
   say "would atomically switch current from ${old_release:-none} to $release_name"
   [[ -z "$health_command" ]] || say "would run health command $health_command"
-  [[ -z "$migration_command" ]] || say "would run migration command $migration_command (required current migration 0023)"
+  [[ -z "$migration_command" ]] || say "would run migration command $migration_command (required current migration 0024)"
   exit 0
 fi
 
 if [[ -n "$migration_command" ]]; then
-  required_migration_version=${manifest_migration_version:-0023}
+  required_migration_version=${manifest_migration_version:-0024}
   if [[ -n "$migration_dir" ]]; then
     migration_output=$(OPEN_CARD_RELEASE_DIR="$release_dir" OPEN_CARD_CONFIG_DIR="$config_dir" OPEN_CARD_DATA_DIR="$data_dir" OPEN_CARD_REQUIRED_MIGRATION_VERSION="$required_migration_version" "$migration_command" "$migration_dir" 2>&1) || die "migration failed; current pointer was not changed: $migration_output"
   else

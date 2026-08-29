@@ -138,7 +138,7 @@ func safeAbsPath(value string) bool {
 	return filepath.IsAbs(value) && filepath.Clean(value) == value && !strings.Contains(value, "\x00")
 }
 func (r ReleaseV1) valid() bool {
-	return validID(r.ID) && r.Version != "" && validSHA(r.SourceCommit) && validID(r.Architecture) && validSHA(r.ManifestSHA256)
+	return validID(r.ID) && r.Version != "" && regexp.MustCompile(`^[a-f0-9]{40}$`).MatchString(r.SourceCommit) && validID(r.Architecture) && validSHA(r.ManifestSHA256)
 }
 func (d DatabaseV1) valid() bool {
 	return validID(d.Name) && regexp.MustCompile(`^[0-9]{4}$`).MatchString(d.Migration) && validSHA(d.SchemaMigrationsSHA256)

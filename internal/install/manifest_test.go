@@ -95,13 +95,15 @@ func TestRCManifestLineageUsesOnlyFrozenTuplesAndDigests(t *testing.T) {
 	}
 }
 
-func TestProductionCandidateRequires0023PayloadAndRejectsFixtures(t *testing.T) {
+func TestProductionCandidateRequires0024PayloadAndRejectsFixtures(t *testing.T) {
 	manifest, _ := testManifest(t, ProductionCandidateVersion, "bin/open-card-admin", []byte("admin"))
 	manifest.MigrationVersion = CurrentMigrationVersion
+	manifest.SourceCommit = strings.Repeat("a", 40)
+	manifest.NMinusOne = &NMinusOne{Version: "0.8.0-rc.0", MigrationVersion: "0023", SourceCommit: RC0SourceCommit, ReleaseManifestSHA256: RC0ReleaseManifestSHA256, ArchiveSHA256: RC0ArchiveSHA256, BundleManifestSHA256: RC0BundleManifestSHA256}
 	manifest.Files = append(manifest.Files,
 		FileDigest{Path: "systemd/open-card-edge.service", SHA256: strings.Repeat("a", 64), Mode: 0o644},
 		FileDigest{Path: "caddy/open-card-edge.Caddyfile.example", SHA256: strings.Repeat("b", 64), Mode: 0o644},
-		FileDigest{Path: "migrations/control-plane/0023_source_uploads.sql", SHA256: strings.Repeat("c", 64), Mode: 0o644},
+		FileDigest{Path: "migrations/control-plane/0024_dns_change_ledger.sql", SHA256: strings.Repeat("c", 64), Mode: 0o644},
 		FileDigest{Path: "web/dist/index.html", SHA256: strings.Repeat("d", 64), Mode: 0o644},
 		FileDigest{Path: "docs/licenses/licenses-manifest.json", SHA256: strings.Repeat("e", 64), Mode: 0o644},
 		FileDigest{Path: "sbom.spdx.json", SHA256: strings.Repeat("f", 64), Mode: 0o644},
@@ -263,7 +265,7 @@ func TestCurrentProductionMigrationRemainsPresentWhenDevelopmentMigrationsFollow
 	if err != nil || latest < CurrentMigrationVersion {
 		t.Fatalf("latest development migration=%q err=%v", latest, err)
 	}
-	if _, err := os.Stat(filepath.Join(directory, CurrentMigrationVersion+"_source_uploads.sql")); err != nil {
+	if _, err := os.Stat(filepath.Join(directory, CurrentMigrationVersion+"_dns_change_ledger.sql")); err != nil {
 		t.Fatalf("frozen production migration is absent: %v", err)
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -31,7 +32,7 @@ func activeDatabaseFixture(t *testing.T) (*ActiveDatabaseResolver, string, strin
 		SchemaVersion:          ActivationSchemaVersion,
 		ActivationID:           activationID,
 		Origin:                 "install",
-		Release:                ReleaseV1{ID: releaseID, Version: "0.8.0-rc.1", SourceCommit: sha("a"), Architecture: "arm64", ManifestSHA256: sha("b")},
+		Release:                ReleaseV1{ID: releaseID, Version: "0.8.0-rc.1", SourceCommit: strings.Repeat("a", 40), Architecture: "arm64", ManifestSHA256: sha("b")},
 		Database:               DatabaseV1{Name: "open_card", Migration: "0024", SchemaMigrationsSHA256: sha("c")},
 		DatabaseEnvSHA256:      hex.EncodeToString(sum[:]),
 		CreatedAt:              time.Unix(1, 0).UTC(),

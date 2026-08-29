@@ -10,7 +10,7 @@ import (
 func sha(c string) string { return strings.Repeat(c, 64) }
 
 func activationFixture() ActivationV1 {
-	return ActivationV1{1, "activation-1", "install", ReleaseV1{"release-2", "1.2.3", sha("a"), "amd64", sha("b")}, DatabaseV1{"open_card", "0024", sha("c")}, sha("d"), time.Unix(1, 0).UTC(), "txn-1", &LegacyProjectionV1{"/opt/open-card/releases/release-2"}}
+	return ActivationV1{1, "activation-1", "install", ReleaseV1{"release-2", "1.2.3", strings.Repeat("a", 40), "amd64", sha("b")}, DatabaseV1{"open_card", "0024", sha("c")}, sha("d"), time.Unix(1, 0).UTC(), "txn-1", &LegacyProjectionV1{"/opt/open-card/releases/release-2"}}
 }
 
 func journalFixture() UpgradeJournalV1 {
