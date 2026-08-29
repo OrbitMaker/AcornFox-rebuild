@@ -178,11 +178,17 @@ class ProductionBundleTests(unittest.TestCase):
             rc0_output = root / "rc0-output"
             tool.assemble(self.stage(root / "rc0"), rc0_repo, rc0_output, "amd64", None, None, rc0_dist, version="0.8.0-rc.0", migration_version="0023", source_commit=rc0_commit, live_attestation=rc0_attestation, live_attestation_sha256=self.attestation_digest(rc0_attestation))
             checksum = hashlib.sha256((rc0_output / "release/manifest.json").read_bytes()).hexdigest()
+            archive_digest = hashlib.sha256(next(rc0_output.glob("*.tar.gz")).read_bytes()).hexdigest()
+            bundle_digest = hashlib.sha256((rc0_output / "bundle-manifest.sha256").read_bytes()).hexdigest()
+            tool.RC0_SOURCE_COMMIT = rc0_commit
+            tool.N_MINUS_ONE_RELEASE_MANIFEST_SHA256 = checksum
+            tool.N_MINUS_ONE_ARCHIVE_SHA256 = archive_digest
+            tool.N_MINUS_ONE_BUNDLE_MANIFEST_SHA256 = bundle_digest
             rc1_repo, rc1_commit = minimal_repo(root / "rc1", "0024")
             rc1_dist, rc1_attestation = self.live_web(root / "rc1", tool, rc1_commit)
             output = root / "rc1-output"
-            metadata = tool.assemble(self.stage(root / "rc1"), rc1_repo, output, "amd64", rc0_output / "release", checksum, rc1_dist, version="0.8.0-rc.1", migration_version="0024", source_commit=rc1_commit, live_attestation=rc1_attestation, live_attestation_sha256=self.attestation_digest(rc1_attestation))
-            self.assertEqual(metadata["n_minus_one"]["status"], "external_manifest_digest_pinned")
+            metadata = tool.assemble(self.stage(root / "rc1"), rc1_repo, output, "amd64", rc0_output / "release", checksum, rc1_dist, version="0.8.0-rc.1", migration_version="0024", source_commit=rc1_commit, live_attestation=rc1_attestation, live_attestation_sha256=self.attestation_digest(rc1_attestation), n_minus_one_archive_sha256=archive_digest, n_minus_one_bundle_manifest_sha256=bundle_digest)
+            self.assertEqual(metadata["n_minus_one"]["status"], "verified_local_candidate")
             bad = root / "bad-output"
             with self.assertRaises(tool.ProductionBundleError):
                 tool.assemble(self.stage(root / "rc1"), rc1_repo, bad, "amd64", rc0_output / "release", "0" * 64, rc1_dist, version="0.8.0-rc.1", migration_version="0024", source_commit=rc1_commit, live_attestation=rc1_attestation, live_attestation_sha256=self.attestation_digest(rc1_attestation))
@@ -249,9 +255,9 @@ class ProductionBundleTests(unittest.TestCase):
 
                 raced = root / "n-minus-one-snapshot"
                 with mock.patch.object(tool, "copy_tree", side_effect=copy_then_mutate):
-                    metadata = tool.assemble(self.stage(root / "rc1"), rc1_repo, raced, "amd64", rc0_output / "release", checksum, rc1_dist, version="0.8.0-rc.1", migration_version="0024", source_commit=rc1_commit, live_attestation=rc1_attestation, live_attestation_sha256=self.attestation_digest(rc1_attestation))
+                    metadata = tool.assemble(self.stage(root / "rc1"), rc1_repo, raced, "amd64", rc0_output / "release", checksum, rc1_dist, version="0.8.0-rc.1", migration_version="0024", source_commit=rc1_commit, live_attestation=rc1_attestation, live_attestation_sha256=self.attestation_digest(rc1_attestation), n_minus_one_archive_sha256=archive_digest, n_minus_one_bundle_manifest_sha256=bundle_digest)
                 self.assertTrue(changed)
-                self.assertEqual(metadata["n_minus_one"]["release_id"], "release-0.8.0-rc.0")
+                self.assertEqual(metadata["n_minus_one"]["source_commit"], rc0_commit)
 
     def test_rc0_rejects_missing_binary_and_test_only_payload(self) -> None:
         tool = load_tool()

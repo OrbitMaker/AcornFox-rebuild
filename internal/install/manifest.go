@@ -29,6 +29,10 @@ const (
 	CurrentMigrationVersion    = "0023"
 	ProductionCandidateVersion = "0.8.0-rc.1"
 	ProductionNMinusOneVersion = "0.7.0-rc.1"
+	RC0SourceCommit = "35a2b198ac52949af3477475d89d4813b46a9490"
+	RC0ReleaseManifestSHA256 = "3b3953c0a26f8706151583ad6c9cad6b5502da18b28f11ed66ca92fe604aa253"
+	RC0ArchiveSHA256 = "abc034ed24e8e8dc74b8eabc84dd3071a66f166abe65135502911e9153c0b9fc"
+	RC0BundleManifestSHA256 = "960ab65526b890009e1770ad190a70b1589f825e0f59cf8d757634a0a8848392"
 	DefaultInstallPrefix       = "/opt/open-card"
 	DefaultConfigDir           = "/etc/open-card"
 	DefaultDataDir             = "/var/lib/open-card"
@@ -62,14 +66,14 @@ func ValidateProductionCandidate(manifest Manifest) error {
 		return errors.New("manifest is not the 0.8.0-rc.1 production candidate")
 	}
 	required := map[string]bool{
-		"bin/open-card-admin":                          false,
-		"systemd/open-card-edge.service":               false,
-		"caddy/open-card-edge.Caddyfile.example":       false,
+		"bin/open-card-admin":                              false,
+		"systemd/open-card-edge.service":                   false,
+		"caddy/open-card-edge.Caddyfile.example":           false,
 		"migrations/control-plane/0023_source_uploads.sql": false,
-		"web/dist/index.html":                          false,
-		"docs/licenses/licenses-manifest.json":         false,
-		"sbom.spdx.json":                               false,
-		"source-manifest.sha256":                       false,
+		"web/dist/index.html":                              false,
+		"docs/licenses/licenses-manifest.json":             false,
+		"sbom.spdx.json":                                   false,
+		"source-manifest.sha256":                           false,
 	}
 	for _, file := range manifest.Files {
 		if strings.Contains(file.Path, "fixture") || strings.Contains(file.Path, "/tests/") || strings.HasSuffix(file.Path, ".test") || strings.Contains(file.Path, "open-card-caddy-fixture") {
@@ -108,11 +112,22 @@ type Manifest struct {
 	ReleaseID        string        `json:"release_id"`
 	Architecture     string        `json:"architecture,omitempty"`
 	MigrationVersion string        `json:"migration_version,omitempty"`
+	SourceCommit     string        `json:"source_commit,omitempty"`
+	NMinusOne        *NMinusOne    `json:"n_minus_one,omitempty"`
 	Protocol         string        `json:"protocol"`
 	ConfigDir        string        `json:"config_dir"`
 	DataDir          string        `json:"data_dir"`
 	Compatibility    Compatibility `json:"compatibility"`
 	Files            []FileDigest  `json:"files"`
+}
+
+type NMinusOne struct {
+	Version               string `json:"version"`
+	MigrationVersion      string `json:"migration_version"`
+	SourceCommit          string `json:"source_commit"`
+	ReleaseManifestSHA256 string `json:"release_manifest_sha256"`
+	ArchiveSHA256         string `json:"archive_sha256"`
+	BundleManifestSHA256  string `json:"bundle_manifest_sha256"`
 }
 
 // Directories is the complete path contract. Root is only used by tests and
@@ -382,6 +397,26 @@ func (m Manifest) Validate() error {
 		if err := ValidateMigrationVersion(m.MigrationVersion); err != nil {
 			return err
 		}
+	}
+	if m.SourceCommit != "" && !regexp.MustCompile(`^[a-f0-9]{40}$`).MatchString(m.SourceCommit) {
+		return errors.New("manifest source_commit is invalid")
+	}
+	if m.Version == "0.8.0-rc.0" && m.MigrationVersion == "0023" {
+		if m.SourceCommit != RC0SourceCommit || m.NMinusOne != nil {
+			return errors.New("rc0 manifest lineage is invalid")
+		}
+	} else if m.Version == "0.8.0-rc.1" && m.MigrationVersion == "0024" {
+		if m.SourceCommit == "" || m.NMinusOne == nil {
+			return errors.New("rc1 manifest lineage is required")
+		}
+		n := m.NMinusOne
+		if n.Version != "0.8.0-rc.0" || n.MigrationVersion != "0023" || n.SourceCommit != RC0SourceCommit || n.ReleaseManifestSHA256 != RC0ReleaseManifestSHA256 || n.ArchiveSHA256 != RC0ArchiveSHA256 || n.BundleManifestSHA256 != RC0BundleManifestSHA256 {
+			return errors.New("rc1 n_minus_one lineage is invalid")
+		}
+	} else if m.NMinusOne != nil {
+		return errors.New("only rc1/0024 manifests may carry n_minus_one lineage")
+	} else if m.SourceCommit != "" {
+		return errors.New("only rc0/0023 and rc1/0024 manifests may carry source_commit")
 	}
 	if _, err := NormalizeProtocolVersion(m.Protocol); err != nil {
 		return errors.New("manifest protocol is invalid")

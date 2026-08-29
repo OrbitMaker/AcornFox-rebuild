@@ -47,6 +47,54 @@ func TestManifestValidateAndVerifyRelease(t *testing.T) {
 	}
 }
 
+func TestRCManifestLineageUsesOnlyFrozenTuplesAndDigests(t *testing.T) {
+	rc0, _ := testManifest(t, "0.8.0-rc.0", "bin/open-card-server", []byte("server"))
+	rc0.MigrationVersion = "0023"
+	rc0.SourceCommit = RC0SourceCommit
+	if err := rc0.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	rc0.NMinusOne = &NMinusOne{}
+	if err := rc0.Validate(); err == nil {
+		t.Fatal("rc0 accepted N-1 lineage")
+	}
+
+	rc1, _ := testManifest(t, "0.8.0-rc.1", "bin/open-card-server", []byte("server"))
+	rc1.MigrationVersion = "0024"
+	rc1.SourceCommit = strings.Repeat("a", 40)
+	rc1.NMinusOne = &NMinusOne{Version: "0.8.0-rc.0", MigrationVersion: "0023", SourceCommit: RC0SourceCommit, ReleaseManifestSHA256: RC0ReleaseManifestSHA256, ArchiveSHA256: RC0ArchiveSHA256, BundleManifestSHA256: RC0BundleManifestSHA256}
+	if err := rc1.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := filepath.Join(t.TempDir(), "manifest.json")
+	if err := SaveManifest(manifestPath, rc1); err != nil {
+		t.Fatal(err)
+	}
+	if loaded, err := LoadManifest(manifestPath); err != nil || loaded.NMinusOne == nil || *loaded.NMinusOne != *rc1.NMinusOne {
+		t.Fatalf("strict RC1 manifest round trip failed: %#v %v", loaded, err)
+	}
+	if err := os.WriteFile(manifestPath, append([]byte(`{"unknown":true}`), '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadManifest(manifestPath); err == nil {
+		t.Fatal("strict manifest loader accepted unknown RC1 fields")
+	}
+	rc1.NMinusOne.ArchiveSHA256 = strings.Repeat("0", 64)
+	if err := rc1.Validate(); err == nil {
+		t.Fatal("rc1 accepted an unpinned N-1 digest")
+	}
+	rc1.NMinusOne = nil
+	if err := rc1.Validate(); err == nil {
+		t.Fatal("rc1 accepted missing N-1 lineage")
+	}
+
+	other, _ := testManifest(t, "1.2.3", "bin/open-card-server", []byte("server"))
+	other.SourceCommit = strings.Repeat("a", 40)
+	if err := other.Validate(); err == nil {
+		t.Fatal("non-RC manifest accepted source lineage")
+	}
+}
+
 func TestProductionCandidateRequires0023PayloadAndRejectsFixtures(t *testing.T) {
 	manifest, _ := testManifest(t, ProductionCandidateVersion, "bin/open-card-admin", []byte("admin"))
 	manifest.MigrationVersion = CurrentMigrationVersion

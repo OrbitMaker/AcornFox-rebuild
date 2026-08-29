@@ -6,9 +6,11 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
@@ -21,6 +23,7 @@ def load_tool():
     spec = importlib.util.spec_from_file_location("production_build", TOOL)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -30,6 +33,190 @@ def digest(path: Path) -> str:
 
 
 class ProductionBuildTests(unittest.TestCase):
+    def n_minus_one_candidate(self, tool, root: Path) -> tuple[Path, dict[str, object]]:
+        candidate = root / "n-minus-one"
+        release = candidate / "release"
+        release.mkdir(parents=True)
+        files = []
+        for index in range(62):
+            relative = f"payload/file-{index:02d}"
+            payload = f"payload-{index}".encode()
+            path = release / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(payload)
+            path.chmod(0o644)
+            files.append({"path": relative, "sha256": hashlib.sha256(payload).hexdigest(), "mode": 0o644})
+        manifest = {
+            "version": tool.RC0_SPEC.version,
+            "migration_version": tool.RC0_SPEC.migration,
+            "architecture": tool.ARCHITECTURE,
+            "source_commit": tool.RC0_SOURCE_COMMIT,
+            "files": files,
+        }
+        manifest_path = release / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+        manifest_path.chmod(0o644)
+        archive = candidate / "open-card-0.8.0-rc.0-production.tar.gz"
+        archive.write_bytes(b"frozen archive")
+        archive.chmod(0o644)
+        manifest_digest, archive_digest = digest(manifest_path), digest(archive)
+        bundle_manifest = candidate / "bundle-manifest.sha256"
+        bundle_manifest.write_text(
+            f"{archive_digest}  {archive.name}\n{manifest_digest}  release/manifest.json\n",
+            encoding="utf-8",
+        )
+        bundle_manifest.chmod(0o640)
+        bundle_digest = digest(bundle_manifest)
+        build_record = {
+            "production_accepted": False,
+            "candidate": {
+                "version": tool.RC0_SPEC.version,
+                "migration_version": tool.RC0_SPEC.migration,
+                "architecture": tool.ARCHITECTURE,
+                "source_commit": tool.RC0_SOURCE_COMMIT,
+            },
+            "bundle": {
+                "archive": archive.name,
+                "archive_sha256": archive_digest,
+                "manifest_sha256": manifest_digest,
+                "bundle_manifest_sha256": bundle_digest,
+            },
+        }
+        (candidate / "build-record.json").write_text(json.dumps(build_record), encoding="utf-8")
+        (candidate / "build-record.json").chmod(0o640)
+        production_bundle = {
+            "candidate_status": "bootstrap_baseline",
+            "production_accepted": False,
+            "source_commit": tool.RC0_SOURCE_COMMIT,
+            "version": tool.RC0_SPEC.version,
+            "migration_version": tool.RC0_SPEC.migration,
+            "n_minus_one": {
+                "manifest_sha256": None,
+                "release_embedded": False,
+                "release_id": None,
+                "status": "not_required_bootstrap",
+                "version": None,
+            },
+        }
+        (candidate / "production-bundle.json").write_text(json.dumps(production_bundle), encoding="utf-8")
+        (candidate / "production-bundle.json").chmod(0o640)
+        return candidate, {
+            "N_MINUS_ONE_RELEASE_MANIFEST_SHA256": manifest_digest,
+            "N_MINUS_ONE_ARCHIVE_SHA256": archive_digest,
+            "N_MINUS_ONE_BUNDLE_MANIFEST_SHA256": bundle_digest,
+            "N_MINUS_ONE_DECLARED_FILE_COUNT": len(files),
+        }
+
+    @contextmanager
+    def pinned_n_minus_one(self, tool, pins: dict[str, object]):
+        with mock.patch.multiple(tool, **pins):
+            yield
+
+    def test_n_minus_one_candidate_is_complete_and_returns_frozen_evidence(self) -> None:
+        tool = load_tool()
+        with tempfile.TemporaryDirectory() as raw:
+            candidate, pins = self.n_minus_one_candidate(tool, Path(raw))
+            with self.pinned_n_minus_one(tool, pins):
+                evidence = tool.verify_n_minus_one_candidate_root(candidate)
+            self.assertIsInstance(evidence, tool.NMinusOneEvidence)
+            self.assertEqual(evidence.candidate_root, candidate.resolve())
+            self.assertEqual(evidence.release_path, (candidate / "release").resolve())
+            self.assertEqual((evidence.version, evidence.migration, evidence.source_commit), ("0.8.0-rc.0", "0023", tool.RC0_SOURCE_COMMIT))
+            self.assertEqual(evidence.archive_sha256, pins["N_MINUS_ONE_ARCHIVE_SHA256"])
+
+    def test_n_minus_one_candidate_rejects_every_frozen_boundary(self) -> None:
+        tool = load_tool()
+        for mutation in ("missing", "extra", "symlink", "mode", "file-hash", "archive", "bundle-line", "bundle-file-hash", "build-record", "production-metadata", "source"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as raw:
+                candidate, pins = self.n_minus_one_candidate(tool, Path(raw))
+                release = candidate / "release"
+                if mutation == "missing":
+                    (candidate / "build-record.json").unlink()
+                elif mutation == "extra":
+                    (candidate / "unexpected").write_text("x", encoding="utf-8")
+                elif mutation == "symlink":
+                    (release / "payload" / "file-00").unlink()
+                    os.symlink("file-01", release / "payload" / "file-00")
+                elif mutation == "mode":
+                    (candidate / "production-bundle.json").chmod(0o644)
+                elif mutation == "file-hash":
+                    (release / "payload" / "file-00").write_text("tampered", encoding="utf-8")
+                elif mutation == "archive":
+                    (candidate / "open-card-0.8.0-rc.0-production.tar.gz").write_bytes(b"tampered")
+                elif mutation == "bundle-line":
+                    (candidate / "bundle-manifest.sha256").write_text("wrong\n", encoding="utf-8")
+                    pins["N_MINUS_ONE_BUNDLE_MANIFEST_SHA256"] = digest(candidate / "bundle-manifest.sha256")
+                elif mutation == "bundle-file-hash":
+                    pins["N_MINUS_ONE_BUNDLE_MANIFEST_SHA256"] = "0" * 64
+                elif mutation == "build-record":
+                    record = json.loads((candidate / "build-record.json").read_text(encoding="utf-8"))
+                    record["production_accepted"] = True
+                    (candidate / "build-record.json").write_text(json.dumps(record), encoding="utf-8")
+                elif mutation == "production-metadata":
+                    metadata = json.loads((candidate / "production-bundle.json").read_text(encoding="utf-8"))
+                    metadata["candidate_status"] = "accepted"
+                    (candidate / "production-bundle.json").write_text(json.dumps(metadata), encoding="utf-8")
+                elif mutation == "source":
+                    manifest = json.loads((release / "manifest.json").read_text(encoding="utf-8"))
+                    manifest["source_commit"] = "0" * 40
+                    (release / "manifest.json").write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+                    manifest_digest = digest(release / "manifest.json")
+                    archive_digest = pins["N_MINUS_ONE_ARCHIVE_SHA256"]
+                    bundle_manifest = candidate / "bundle-manifest.sha256"
+                    bundle_manifest.write_text(
+                        f"{archive_digest}  open-card-0.8.0-rc.0-production.tar.gz\n{manifest_digest}  release/manifest.json\n",
+                        encoding="utf-8",
+                    )
+                    bundle_manifest.chmod(0o640)
+                    bundle_digest = digest(bundle_manifest)
+                    record = json.loads((candidate / "build-record.json").read_text(encoding="utf-8"))
+                    record["bundle"]["manifest_sha256"] = manifest_digest
+                    record["bundle"]["bundle_manifest_sha256"] = bundle_digest
+                    (candidate / "build-record.json").write_text(json.dumps(record), encoding="utf-8")
+                    pins["N_MINUS_ONE_RELEASE_MANIFEST_SHA256"] = manifest_digest
+                    pins["N_MINUS_ONE_BUNDLE_MANIFEST_SHA256"] = bundle_digest
+                with self.pinned_n_minus_one(tool, pins):
+                    with self.assertRaises(tool.ProductionBuildError):
+                        tool.verify_n_minus_one_candidate_root(candidate)
+
+    def test_rc1_checks_n_minus_one_before_any_output_mutation_and_rc0_forbids_it(self) -> None:
+        tool = load_tool()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            output = root / "output"
+            invalid_n_minus_one = root / "invalid-n-minus-one"
+            invalid_n_minus_one.mkdir()
+            with self.assertRaisesRegex(tool.ProductionBuildError, "N-1"):
+                tool.build_candidate(
+                    source_worktree=root,
+                    source_commit="a" * 40,
+                    runtime_inputs=root / "inputs.json",
+                    runtime_inputs_sha256="0" * 64,
+                    runtime_dir=root,
+                    output=output,
+                    bundle_tool=root / "bundle.py",
+                    bundle_tool_sha256="0" * 64,
+                    driver_sha256="0" * 64,
+                    version=tool.RC1_SPEC.version,
+                    n_minus_one_candidate_root=invalid_n_minus_one,
+                )
+            self.assertFalse(output.exists())
+            with self.assertRaisesRegex(tool.ProductionBuildError, "RC0 bootstrap must not accept"):
+                tool.build_candidate(
+                    source_worktree=root,
+                    source_commit=tool.RC0_SOURCE_COMMIT,
+                    runtime_inputs=root / "inputs.json",
+                    runtime_inputs_sha256="0" * 64,
+                    runtime_dir=root,
+                    output=output,
+                    bundle_tool=root / "bundle.py",
+                    bundle_tool_sha256="0" * 64,
+                    driver_sha256="0" * 64,
+                    version=tool.RC0_SPEC.version,
+                    n_minus_one_candidate_root=invalid_n_minus_one,
+                )
+            self.assertFalse(output.exists())
+
     def snapshot_manifest(self, tool, manifest: Path, root: Path) -> Path:
         snapshot = root / "runtime-inputs.snapshot.json"
         tool.snapshot_pinned_file(

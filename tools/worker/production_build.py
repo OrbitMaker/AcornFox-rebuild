@@ -25,13 +25,43 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from typing import NamedTuple
 
 
 VERSION = "0.8.0-rc.0"
 MIGRATION_VERSION = "0023"
 ARCHITECTURE = "amd64"
 RC0_SOURCE_COMMIT = "35a2b198ac52949af3477475d89d4813b46a9490"
+N_MINUS_ONE_RELEASE_MANIFEST_SHA256 = "3b3953c0a26f8706151583ad6c9cad6b5502da18b28f11ed66ca92fe604aa253"
+N_MINUS_ONE_ARCHIVE_SHA256 = "abc034ed24e8e8dc74b8eabc84dd3071a66f166abe65135502911e9153c0b9fc"
+N_MINUS_ONE_BUNDLE_MANIFEST_SHA256 = "960ab65526b890009e1770ad190a70b1589f825e0f59cf8d757634a0a8848392"
+N_MINUS_ONE_DECLARED_FILE_COUNT = 62
+
+
+@dataclass(frozen=True)
+class NMinusOneEvidence:
+    candidate_root: Path
+    release_path: Path
+    version: str
+    migration: str
+    source_commit: str
+    release_manifest_sha256: str
+    archive_sha256: str
+    bundle_manifest_sha256: str
+
+
+class ReleaseSpec(NamedTuple):
+    version: str
+    migration: str
+    bootstrap: bool
+RC0_SPEC = ReleaseSpec("0.8.0-rc.0", "0023", True)
+RC1_SPEC = ReleaseSpec("0.8.0-rc.1", "0024", False)
+def release_spec(version: str) -> ReleaseSpec:
+    if version == RC0_SPEC.version: return RC0_SPEC
+    if version == RC1_SPEC.version: return RC1_SPEC
+    raise ProductionBuildError("unsupported release specification")
 GATE3_STATUS = "pass_limited_external_linux_required"
 LIVE_METADATA = {
     "mode": "live",
@@ -444,10 +474,12 @@ def isolated_build_environments(root: Path) -> tuple[dict[str, str], dict[str, s
     return base, go_env, npm_env
 
 
-def verify_clean_detached_worktree(worktree: Path, source_commit: str) -> None:
+def verify_clean_detached_worktree(worktree: Path, source_commit: str, spec: ReleaseSpec = RC0_SPEC) -> None:
     directory(worktree, "source worktree")
-    if source_commit != RC0_SOURCE_COMMIT:
+    if spec.bootstrap and source_commit != RC0_SOURCE_COMMIT:
         raise ProductionBuildError("RC0 build must use the frozen installable bootstrap source commit")
+    if not spec.bootstrap and not re.fullmatch(r"[a-f0-9]{40}", source_commit):
+        raise ProductionBuildError("RC1 build must use a lowercase source commit")
     try:
         head = subprocess.run(
             ["git", "-C", str(worktree), "rev-parse", "HEAD"],
@@ -480,6 +512,97 @@ def verify_clean_detached_worktree(worktree: Path, source_commit: str) -> None:
         raise ProductionBuildError("source worktree detached-head verification failed")
     if head != source_commit or detached_result.returncode != 1 or dirty:
         raise ProductionBuildError("source worktree must be clean, detached, and fixed at source commit")
+
+
+def exact_regular(path: Path, label: str, mode: int) -> None:
+    regular(path, label)
+    if stat.S_IMODE(path.stat().st_mode) != mode:
+        raise ProductionBuildError(f"{label} has an unsafe mode")
+
+
+def load_strict_json(path: Path, label: str) -> dict[str, object]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ProductionBuildError(f"{label} is invalid JSON") from error
+    if not isinstance(value, dict):
+        raise ProductionBuildError(f"{label} must be a JSON object")
+    return value
+
+
+def verify_n_minus_one_candidate_root(root: Path) -> NMinusOneEvidence:
+    directory(root, "N-1 candidate root")
+    archive_name = "open-card-0.8.0-rc.0-production.tar.gz"
+    expected_root = {"release", "bundle-manifest.sha256", "production-bundle.json", "build-record.json", archive_name}
+    actual_root = {path.name for path in root.iterdir()}
+    if actual_root != expected_root:
+        raise ProductionBuildError("N-1 candidate root does not contain exactly the required evidence")
+    release = root / "release"
+    directory(release, "N-1 release")
+    bundle_manifest = root / "bundle-manifest.sha256"
+    production_bundle = root / "production-bundle.json"
+    build_record_path = root / "build-record.json"
+    archive = root / archive_name
+    exact_regular(bundle_manifest, "N-1 bundle manifest", 0o640)
+    exact_regular(production_bundle, "N-1 production bundle metadata", 0o640)
+    exact_regular(build_record_path, "N-1 build record", 0o640)
+    exact_regular(archive, "N-1 archive", 0o644)
+    manifest = root / "release" / "manifest.json"
+    exact_regular(manifest, "N-1 release manifest", 0o644)
+    manifest_digest = sha256(manifest)
+    if manifest_digest != N_MINUS_ONE_RELEASE_MANIFEST_SHA256:
+        raise ProductionBuildError("N-1 release manifest digest is not pinned")
+    archive_digest = sha256(archive)
+    if archive_digest != N_MINUS_ONE_ARCHIVE_SHA256:
+        raise ProductionBuildError("N-1 archive digest is not pinned")
+    bundle_digest = sha256(bundle_manifest)
+    if bundle_digest != N_MINUS_ONE_BUNDLE_MANIFEST_SHA256:
+        raise ProductionBuildError("N-1 bundle manifest digest is not pinned")
+    expected_lines = (
+        f"{N_MINUS_ONE_ARCHIVE_SHA256}  {archive_name}",
+        f"{N_MINUS_ONE_RELEASE_MANIFEST_SHA256}  release/manifest.json",
+    )
+    if bundle_manifest.read_text(encoding="utf-8") != "\n".join(expected_lines) + "\n":
+        raise ProductionBuildError("N-1 bundle manifest must contain exactly the pinned archive and release manifest")
+    release_document = load_strict_json(manifest, "N-1 release manifest")
+    build_record = load_strict_json(build_record_path, "N-1 build record")
+    metadata = load_strict_json(production_bundle, "N-1 bundle metadata")
+    if (release_document.get("version"), release_document.get("migration_version"), release_document.get("architecture"), release_document.get("source_commit")) != (RC0_SPEC.version, RC0_SPEC.migration, ARCHITECTURE, RC0_SOURCE_COMMIT):
+        raise ProductionBuildError("N-1 release manifest metadata is invalid")
+    files = release_document.get("files")
+    if not isinstance(files, list) or len(files) != N_MINUS_ONE_DECLARED_FILE_COUNT:
+        raise ProductionBuildError("N-1 release manifest must declare exactly the frozen file set")
+    if validate_release(release, version=RC0_SPEC.version, migration_version=RC0_SPEC.migration, arch=ARCHITECTURE, source_commit=RC0_SOURCE_COMMIT) != manifest_digest:
+        raise ProductionBuildError("N-1 release validation did not preserve its pinned manifest")
+    bundle = build_record.get("bundle")
+    candidate = build_record.get("candidate")
+    if (
+        build_record.get("production_accepted") is not False
+        or not isinstance(candidate, dict)
+        or not isinstance(bundle, dict)
+        or (candidate.get("version"), candidate.get("migration_version"), candidate.get("architecture"), candidate.get("source_commit")) != (RC0_SPEC.version, RC0_SPEC.migration, ARCHITECTURE, RC0_SOURCE_COMMIT)
+        or (bundle.get("archive"), bundle.get("archive_sha256"), bundle.get("manifest_sha256"), bundle.get("bundle_manifest_sha256")) != (archive_name, archive_digest, manifest_digest, bundle_digest)
+    ):
+        raise ProductionBuildError("N-1 build record is not bootstrap-only")
+    n_minus_one = metadata.get("n_minus_one")
+    if (
+        metadata.get("candidate_status") != "bootstrap_baseline"
+        or metadata.get("production_accepted") is not False
+        or (metadata.get("source_commit"), metadata.get("version"), metadata.get("migration_version")) != (RC0_SOURCE_COMMIT, RC0_SPEC.version, RC0_SPEC.migration)
+        or not isinstance(n_minus_one, dict)
+        or n_minus_one != {"manifest_sha256": None, "release_embedded": False, "release_id": None, "status": "not_required_bootstrap", "version": None}
+    ):
+        raise ProductionBuildError("N-1 bundle metadata is invalid")
+    return NMinusOneEvidence(
+        candidate_root=root.resolve(),
+        release_path=release.resolve(),
+        version=RC0_SPEC.version,
+        migration=RC0_SPEC.migration,
+        source_commit=RC0_SOURCE_COMMIT,
+        release_manifest_sha256=manifest_digest,
+        archive_sha256=archive_digest,
+        bundle_manifest_sha256=bundle_digest,
+    )
 
 
 def verify_clean_tracked_tool(
@@ -640,6 +763,19 @@ def validate_release(
         or manifest.get("source_commit") != source_commit
     ):
         raise ProductionBuildError("release manifest does not match the candidate contract")
+    expected_lineage = {
+        "version": RC0_SPEC.version,
+        "migration_version": RC0_SPEC.migration,
+        "source_commit": RC0_SOURCE_COMMIT,
+        "release_manifest_sha256": N_MINUS_ONE_RELEASE_MANIFEST_SHA256,
+        "archive_sha256": N_MINUS_ONE_ARCHIVE_SHA256,
+        "bundle_manifest_sha256": N_MINUS_ONE_BUNDLE_MANIFEST_SHA256,
+    }
+    if version == RC1_SPEC.version:
+        if manifest.get("n_minus_one") != expected_lineage:
+            raise ProductionBuildError("RC1 release manifest has invalid frozen N-1 lineage")
+    elif "n_minus_one" in manifest:
+        raise ProductionBuildError("RC0 release manifest must not carry N-1 lineage")
     files = manifest.get("files")
     if not isinstance(files, list) or not files:
         raise ProductionBuildError("release manifest has no files")
@@ -842,11 +978,23 @@ def build_candidate(
     bundle_tool: Path,
     bundle_tool_sha256: str,
     driver_sha256: str,
+    version: str = RC0_SPEC.version,
+    n_minus_one_candidate_root: Path | None = None,
 ) -> dict[str, object]:
+    spec = release_spec(version)
+    if not spec.bootstrap and n_minus_one_candidate_root is None:
+        raise ProductionBuildError("RC1 build requires verified local N-1 evidence")
+    if spec.bootstrap and n_minus_one_candidate_root is not None:
+        raise ProductionBuildError("RC0 bootstrap must not accept N-1 evidence")
+    n_minus_one_evidence = (
+        verify_n_minus_one_candidate_root(n_minus_one_candidate_root)
+        if n_minus_one_candidate_root is not None
+        else None
+    )
     if output.exists():
         raise ProductionBuildError("refusing to overwrite candidate output")
     directory(output.parent, "candidate output parent")
-    verify_clean_detached_worktree(source_worktree, source_commit)
+    verify_clean_detached_worktree(source_worktree, source_commit, spec)
     driver_path = Path(__file__).resolve()
     driver_repo, driver_metadata = verify_clean_tracked_tool(
         driver_path,
@@ -973,11 +1121,25 @@ def build_candidate(
                 "--arch",
                 ARCHITECTURE,
                 "--version",
-                VERSION,
+                spec.version,
                 "--migration-version",
-                MIGRATION_VERSION,
+                spec.migration,
                 "--source-commit",
                 source_commit,
+                *(
+                    [
+                        "--n-minus-one-release",
+                        str(n_minus_one_evidence.release_path),
+                        "--n-minus-one-manifest-sha256",
+                        n_minus_one_evidence.release_manifest_sha256,
+                        "--n-minus-one-archive-sha256",
+                        n_minus_one_evidence.archive_sha256,
+                        "--n-minus-one-bundle-manifest-sha256",
+                        n_minus_one_evidence.bundle_manifest_sha256,
+                    ]
+                    if n_minus_one_evidence is not None
+                    else []
+                ),
                 "--live-attestation",
                 str(attestation_path),
                 "--live-attestation-sha256",
@@ -989,12 +1151,12 @@ def build_candidate(
         )
         manifest_digest = validate_release(
             candidate / "release",
-            version=VERSION,
-            migration_version=MIGRATION_VERSION,
+            version=spec.version,
+            migration_version=spec.migration,
             arch=ARCHITECTURE,
             source_commit=source_commit,
         )
-        archive = candidate / f"open-card-{VERSION}-production.tar.gz"
+        archive = candidate / f"open-card-{spec.version}-production.tar.gz"
         regular(archive, "candidate archive")
         archive_digest = sha256(archive)
         bundle_manifest = candidate / "bundle-manifest.sha256"
@@ -1010,8 +1172,8 @@ def build_candidate(
             "schema_version": "open-card-production-build.v1",
             "production_accepted": False,
             "candidate": {
-                "version": VERSION,
-                "migration_version": MIGRATION_VERSION,
+                "version": spec.version,
+                "migration_version": spec.migration,
                 "architecture": ARCHITECTURE,
                 "source_commit": source_commit,
             },
@@ -1048,6 +1210,20 @@ def build_candidate(
                 "manifest_sha256": manifest_digest,
                 "bundle_manifest_sha256": bundle_manifest_digest,
             },
+            "n_minus_one": (
+                {
+                    "version": n_minus_one_evidence.version,
+                    "migration_version": n_minus_one_evidence.migration,
+                    "source_commit": n_minus_one_evidence.source_commit,
+                    "release_manifest_sha256": n_minus_one_evidence.release_manifest_sha256,
+                    "archive_sha256": n_minus_one_evidence.archive_sha256,
+                    "bundle_manifest_sha256": n_minus_one_evidence.bundle_manifest_sha256,
+                    "status": "verified_local_candidate",
+                    "release_embedded": False,
+                }
+                if n_minus_one_evidence is not None
+                else None
+            ),
         }
         (candidate / "build-record.json").write_bytes(canonical_json(record))
         (candidate / "build-record.json").chmod(0o640)
@@ -1055,8 +1231,8 @@ def build_candidate(
         publish_no_replace(candidate, output)
         verify_published_candidate(
             output,
-            version=VERSION,
-            migration_version=MIGRATION_VERSION,
+            version=spec.version,
+            migration_version=spec.migration,
             arch=ARCHITECTURE,
             source_commit=source_commit,
             manifest_digest=manifest_digest,
@@ -1072,6 +1248,8 @@ def main() -> int:
     parser.add_argument("build", nargs="?")
     parser.add_argument("--source-worktree", required=True, type=Path)
     parser.add_argument("--source-commit", required=True)
+    parser.add_argument("--version", default=RC0_SPEC.version, choices=(RC0_SPEC.version, RC1_SPEC.version))
+    parser.add_argument("--n-minus-one-candidate-root", type=Path)
     parser.add_argument("--runtime-inputs", required=True, type=Path)
     parser.add_argument("--runtime-inputs-sha256", required=True)
     parser.add_argument("--runtime-dir", required=True, type=Path)
@@ -1095,6 +1273,8 @@ def main() -> int:
             bundle_tool=args.bundle_tool.resolve(),
             bundle_tool_sha256=args.bundle_tool_sha256,
             driver_sha256=args.driver_sha256,
+            version=args.version,
+            n_minus_one_candidate_root=args.n_minus_one_candidate_root.resolve() if args.n_minus_one_candidate_root else None,
         )
     except ProductionBuildError as error:
         print(f"production build: {error}", file=sys.stderr)

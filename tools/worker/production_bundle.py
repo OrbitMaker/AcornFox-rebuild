@@ -22,6 +22,11 @@ import tarfile
 import tempfile
 from pathlib import Path
 
+RC0_SOURCE_COMMIT = "35a2b198ac52949af3477475d89d4813b46a9490"
+N_MINUS_ONE_RELEASE_MANIFEST_SHA256 = "3b3953c0a26f8706151583ad6c9cad6b5502da18b28f11ed66ca92fe604aa253"
+N_MINUS_ONE_ARCHIVE_SHA256 = "abc034ed24e8e8dc74b8eabc84dd3071a66f166abe65135502911e9153c0b9fc"
+N_MINUS_ONE_BUNDLE_MANIFEST_SHA256 = "960ab65526b890009e1770ad190a70b1589f825e0f59cf8d757634a0a8848392"
+
 ARCHES = ("amd64", "arm64")
 BINARIES = (
     "open-card-server",
@@ -414,6 +419,8 @@ def release_spec(version: str, migration_version: str) -> dict[str, str | None]:
 def verify_n_minus_one(
     release: Path,
     expected_manifest_sha256: str,
+    expected_archive_sha256: str,
+    expected_bundle_manifest_sha256: str,
     arch: str,
     expected_version: str,
     expected_migration: str,
@@ -422,7 +429,12 @@ def verify_n_minus_one(
     manifest_path = release / "manifest.json"
     regular(manifest_path)
     manifest_bytes = manifest_path.read_bytes()
-    if expected_manifest_sha256 != hashlib.sha256(manifest_bytes).hexdigest():
+    if (
+        expected_manifest_sha256 != N_MINUS_ONE_RELEASE_MANIFEST_SHA256
+        or expected_archive_sha256 != N_MINUS_ONE_ARCHIVE_SHA256
+        or expected_bundle_manifest_sha256 != N_MINUS_ONE_BUNDLE_MANIFEST_SHA256
+        or expected_manifest_sha256 != hashlib.sha256(manifest_bytes).hexdigest()
+    ):
         raise ProductionBundleError("N-1 manifest checksum does not match the supplied expectation")
     try:
         manifest = json.loads(manifest_bytes.decode("utf-8"))
@@ -436,7 +448,7 @@ def verify_n_minus_one(
     ):
         raise ProductionBundleError("N-1 release manifest does not match the expected version/migration/architecture")
     source_commit = manifest.get("source_commit")
-    if not lowercase_hex(source_commit, 40):
+    if source_commit != RC0_SOURCE_COMMIT:
         raise ProductionBundleError("N-1 release manifest has an invalid source commit")
     files = manifest.get("files")
     if not isinstance(files, list) or not files:
@@ -544,6 +556,8 @@ def assemble(
     source_commit: str,
     live_attestation: Path | None = None,
     live_attestation_sha256: str | None = None,
+    n_minus_one_archive_sha256: str | None = None,
+    n_minus_one_bundle_manifest_sha256: str | None = None,
     structure_only: bool = False,
 ) -> dict[str, object]:
     if not lowercase_hex(source_commit, 40):
@@ -560,14 +574,19 @@ def assemble(
     tracked = verify_repo(repo, source_commit, migration_version)
     needs_n_minus_one = spec["expected_n_minus_one_version"] is not None
     if not needs_n_minus_one and (
-        n_minus_one_release is not None or n_minus_one_manifest_sha256 is not None
+        n_minus_one_release is not None or n_minus_one_manifest_sha256 is not None or n_minus_one_archive_sha256 is not None or n_minus_one_bundle_manifest_sha256 is not None
     ):
         raise ProductionBundleError("bootstrap release must not accept an N-1 artifact")
 
     n_minus_one: dict[str, object] | None = None
     if not structure_only and needs_n_minus_one:
-        if n_minus_one_release is None or not lowercase_hex(n_minus_one_manifest_sha256, 64):
-            raise ProductionBundleError("N-1 manifest checksum must be lowercase SHA-256")
+        if (
+            n_minus_one_release is None
+            or n_minus_one_manifest_sha256 != N_MINUS_ONE_RELEASE_MANIFEST_SHA256
+            or n_minus_one_archive_sha256 != N_MINUS_ONE_ARCHIVE_SHA256
+            or n_minus_one_bundle_manifest_sha256 != N_MINUS_ONE_BUNDLE_MANIFEST_SHA256
+        ):
+            raise ProductionBundleError("N-1 lineage digests must match the frozen local candidate")
     if not structure_only and (
         live_attestation is None
         or not lowercase_hex(live_attestation_sha256, 64)
@@ -586,11 +605,15 @@ def assemble(
         if not structure_only and needs_n_minus_one:
             assert n_minus_one_release is not None
             assert n_minus_one_manifest_sha256 is not None
+            assert n_minus_one_archive_sha256 is not None
+            assert n_minus_one_bundle_manifest_sha256 is not None
             n_minus_one_snapshot = inputs / "n-minus-one"
             copy_tree(n_minus_one_release, n_minus_one_snapshot, preserve_mode=True)
             n_minus_one = verify_n_minus_one(
                 n_minus_one_snapshot,
                 n_minus_one_manifest_sha256,
+                n_minus_one_archive_sha256,
+                n_minus_one_bundle_manifest_sha256,
                 arch,
                 str(spec["expected_n_minus_one_version"]),
                 str(spec["expected_n_minus_one_migration"]),
@@ -752,6 +775,20 @@ def assemble(
                         "max_agent_protocol": "1.1",
                         "requires_data_backup": True,
                     },
+                    **(
+                        {
+                            "n_minus_one": {
+                                "version": "0.8.0-rc.0",
+                                "migration_version": "0023",
+                                "source_commit": RC0_SOURCE_COMMIT,
+                                "release_manifest_sha256": N_MINUS_ONE_RELEASE_MANIFEST_SHA256,
+                                "archive_sha256": N_MINUS_ONE_ARCHIVE_SHA256,
+                                "bundle_manifest_sha256": N_MINUS_ONE_BUNDLE_MANIFEST_SHA256,
+                            }
+                        }
+                        if needs_n_minus_one
+                        else {}
+                    ),
                     "files": release_files(release),
                 }
                 write_json(release / "manifest.json", manifest, 0o644)
@@ -772,16 +809,20 @@ def assemble(
                     "candidate_status": candidate_status,
                     "n_minus_one": {
                         "version": spec["expected_n_minus_one_version"],
+                        "migration_version": spec["expected_n_minus_one_migration"],
+                        "source_commit": RC0_SOURCE_COMMIT if needs_n_minus_one else None,
                         "status": (
                             "not_required_bootstrap"
                             if not needs_n_minus_one
-                            else "external_manifest_digest_pinned"
+                            else "verified_local_candidate"
                         ),
                         "release_embedded": False,
                         "manifest_sha256": (
                             n_minus_one_manifest_sha256 if n_minus_one else None
                         ),
-                        "release_id": n_minus_one.get("release_id") if n_minus_one else None,
+                        "archive_sha256": n_minus_one_archive_sha256 if n_minus_one else None,
+                        "bundle_manifest_sha256": n_minus_one_bundle_manifest_sha256 if n_minus_one else None,
+                        "release_embedded": False,
                     },
                     "migration_version": migration_version,
                     "live_web": {
@@ -813,6 +854,8 @@ def main() -> int:
     parser.add_argument("--output-root", required=True, type=Path)
     parser.add_argument("--n-minus-one-release", type=Path)
     parser.add_argument("--n-minus-one-manifest-sha256")
+    parser.add_argument("--n-minus-one-archive-sha256")
+    parser.add_argument("--n-minus-one-bundle-manifest-sha256")
     parser.add_argument("--web-dist", required=True, type=Path)
     parser.add_argument("--arch", default="amd64")
     parser.add_argument("--version", required=True)
@@ -838,6 +881,8 @@ def main() -> int:
             source_commit=args.source_commit,
             live_attestation=live_attestation,
             live_attestation_sha256=args.live_attestation_sha256,
+            n_minus_one_archive_sha256=args.n_minus_one_archive_sha256,
+            n_minus_one_bundle_manifest_sha256=args.n_minus_one_bundle_manifest_sha256,
             structure_only=args.structure_only,
         )
     except ProductionBundleError as error:
