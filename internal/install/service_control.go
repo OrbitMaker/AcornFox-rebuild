@@ -12,12 +12,29 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/user"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 )
 
 const productionServerUnitPath = "/etc/systemd/system/open-card-server.service"
+
+const (
+	productionCaddyPrivilegeDropPath = "/usr/bin/setpriv"
+	productionCaddyUser              = "opencard-edge"
+	productionEdgeEnvPath            = "/etc/open-card/open-card-edge.env"
+	edgeConfigArtifactName           = "open-card-edge.Caddyfile"
+	edgeCaddyRelativePath            = "bin/caddy"
+	edgeTemplateRelativePath         = "caddy/open-card-edge.Caddyfile.example"
+	edgeRuntimeHome                  = "/var/lib/open-card-edge/home"
+	edgeRuntimeData                  = "/var/lib/open-card-edge/data"
+	edgeRuntimeConfig                = "/var/lib/open-card-edge/config"
+	edgeRuntimeLog                   = "/var/log/open-card-edge"
+	edgeEnvCanonicalComment          = "# Edge runtime state; no domain, certificate, password, token, or cloud credential belongs here."
+)
 
 type ServiceUnit string
 
@@ -45,6 +62,139 @@ type ServiceRunner interface {
 	Run(context.Context, ...string) CommandResult
 }
 type markerProbe func() (bool, error)
+
+// EdgeConfigCommand is deliberately data-only and is passed only to a
+// fixed-runner boundary. Callers cannot select a privilege-drop program,
+// executable, environment, or command shape.
+type EdgeConfigCommand struct {
+	Executable  string
+	Arguments   []string
+	User        string
+	UID         int
+	GID         int
+	Environment []string
+}
+
+type EdgeConfigRunner interface {
+	RunEdgeConfig(context.Context, EdgeConfigCommand) CommandResult
+}
+
+// edgeConfigValidationInput is private to the fixed execution boundary. It
+// keeps every physical path derived from typed identities and never accepts a
+// caller-selected filename or argv.
+type edgeConfigValidationInput struct {
+	Transition   EdgeConfigTransitionV1
+	ConfigSHA256 string
+}
+
+type edgeConfigValidationResult struct {
+	ConfigSHA256         string
+	CandidateCaddySHA256 string
+	EvidenceSHA256       string
+}
+
+// EdgeConfigValidator validates a prepared candidate Edge config using only
+// descriptor-rooted release/artifact paths. It does not bind a listener,
+// alter a unit, or persist tool output.
+type EdgeConfigValidator struct {
+	activeRoot  string
+	dataRoot    string
+	ownerUID    int
+	ownerGID    int
+	edgeUID     int
+	edgeGID     int
+	edgeEnvPath string
+	runtime     edgeRuntimePaths
+	runner      EdgeConfigRunner
+	timeout     time.Duration
+}
+
+type edgeRuntimePaths struct{ home, data, config, log string }
+
+var productionEdgeRuntimePaths = edgeRuntimePaths{
+	home: edgeRuntimeHome, data: edgeRuntimeData, config: edgeRuntimeConfig, log: edgeRuntimeLog,
+}
+
+type productionEdgeConfigRunner struct {
+	command productionCommandFactory
+	verify  func(string) (os.FileInfo, error)
+}
+
+func (r productionEdgeConfigRunner) RunEdgeConfig(ctx context.Context, request EdgeConfigCommand) CommandResult {
+	if request.User != productionCaddyUser || request.UID < 0 || request.GID < 0 || request.Executable == "" || len(request.Arguments) == 0 {
+		return CommandResult{ExitCode: -1, Err: errors.New("unsafe edge config command")}
+	}
+	if !productionEdgeConfigEnvironmentValid(request.Environment) {
+		return CommandResult{ExitCode: -1, Err: errors.New("unsafe edge config environment")}
+	}
+	verify := r.verify
+	if verify == nil {
+		verify = safeProductionExecutable
+	}
+	if _, err := verify(productionCaddyPrivilegeDropPath); err != nil {
+		return CommandResult{ExitCode: -1, Err: errors.New("unsafe edge config privilege boundary")}
+	}
+	commandFactory := r.command
+	if commandFactory == nil {
+		commandFactory = exec.CommandContext
+	}
+	args := []string{
+		"--reuid=" + strconv.Itoa(request.UID),
+		"--regid=" + strconv.Itoa(request.GID),
+		"--clear-groups",
+		"--",
+		request.Executable,
+	}
+	args = append(args, request.Arguments...)
+	command := commandFactory(ctx, productionCaddyPrivilegeDropPath, args...)
+	command.Env = append([]string(nil), request.Environment...)
+	output, err := command.CombinedOutput()
+	if err == nil {
+		return CommandResult{Output: string(output)}
+	}
+	if exit, ok := err.(*exec.ExitError); ok {
+		return CommandResult{ExitCode: exit.ExitCode(), Output: string(output), Err: err}
+	}
+	return CommandResult{ExitCode: -1, Output: string(output), Err: err}
+}
+
+func ProductionEdgeConfigValidator() (*EdgeConfigValidator, error) {
+	tool, err := safeProductionExecutable(productionCaddyPrivilegeDropPath)
+	if err != nil || tool == nil {
+		return nil, errors.New("production caddy privilege boundary is unsafe")
+	}
+	edge, err := user.Lookup(productionCaddyUser)
+	if err != nil {
+		return nil, errors.New("production caddy user is unavailable")
+	}
+	uid, err := strconv.Atoi(edge.Uid)
+	if err != nil {
+		return nil, errors.New("production caddy user is unavailable")
+	}
+	gid, err := strconv.Atoi(edge.Gid)
+	if err != nil {
+		return nil, errors.New("production caddy user is unavailable")
+	}
+	return newEdgeConfigValidator(productionActiveRoot, DefaultDataDir, productionEdgeEnvPath, 0, 0, uid, gid, productionEdgeRuntimePaths, productionEdgeConfigRunner{}, 15*time.Second)
+}
+
+// TaskEdgeConfigValidator is a test-only constructor. It requires explicit
+// roots, ownership and runner; production callers cannot replace any of them.
+func TaskEdgeConfigValidator(activeRoot, dataRoot string, uid, gid, edgeUID, edgeGID int, runner EdgeConfigRunner) (*EdgeConfigValidator, error) {
+	runtimeRoot := filepath.Join(dataRoot, "edge-runtime")
+	return newEdgeConfigValidator(activeRoot, dataRoot, filepath.Join(dataRoot, "open-card-edge.env"), uid, gid, edgeUID, edgeGID, edgeRuntimePaths{home: filepath.Join(runtimeRoot, "home"), data: filepath.Join(runtimeRoot, "data"), config: filepath.Join(runtimeRoot, "config"), log: filepath.Join(runtimeRoot, "log")}, runner, time.Second)
+}
+
+func newEdgeConfigValidator(activeRoot, dataRoot, edgeEnvPath string, uid, gid, edgeUID, edgeGID int, runtime edgeRuntimePaths, runner EdgeConfigRunner, timeout time.Duration) (*EdgeConfigValidator, error) {
+	if !safeAbsPath(activeRoot) || !safeAbsPath(dataRoot) || !safeAbsPath(edgeEnvPath) || !runtime.valid() || uid < 0 || gid < 0 || edgeUID < 0 || edgeGID < 0 || runner == nil || timeout <= 0 {
+		return nil, ErrServiceOutcomeUnknown
+	}
+	return &EdgeConfigValidator{activeRoot: activeRoot, dataRoot: dataRoot, edgeEnvPath: edgeEnvPath, ownerUID: uid, ownerGID: gid, edgeUID: edgeUID, edgeGID: edgeGID, runtime: runtime, runner: runner, timeout: timeout}, nil
+}
+
+func (p edgeRuntimePaths) valid() bool {
+	return safeAbsPath(p.home) && safeAbsPath(p.data) && safeAbsPath(p.config) && safeAbsPath(p.log)
+}
 
 // ServiceUnitFileReader supplies the canonical unit file to task-scoped
 // controllers. ReloadServerUnit still rejects every path but the fixed one.
@@ -110,12 +260,7 @@ func (c *ServiceController) Close() error {
 }
 
 func ProductionServiceController() (*ServiceController, error) {
-	info, err := os.Lstat("/usr/bin/systemctl")
-	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o022 != 0 {
-		return nil, errors.New("production systemctl is unsafe")
-	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok || stat.Uid != 0 || stat.Gid != 0 {
+	if _, err := safeProductionExecutable("/usr/bin/systemctl"); err != nil {
 		return nil, errors.New("production systemctl is unsafe")
 	}
 	unitWriter, err := ProductionDurableWriter("/etc/systemd/system")
@@ -129,6 +274,51 @@ func ProductionServiceController() (*ServiceController, error) {
 		}
 		return err == nil, err
 	}, client: &http.Client{Timeout: 5 * time.Second}, serverUnitPath: productionServerUnitPath, unitWriter: unitWriter}, nil
+}
+
+func safeProductionExecutable(path string) (os.FileInfo, error) {
+	return safeExecutablePath(path, 0, 0, os.Lstat)
+}
+
+type executableLstat func(string) (os.FileInfo, error)
+
+// safeExecutablePath verifies every pathname component before trusting an
+// executable. A secure leaf under a writable or symlinked parent is not a
+// production trust boundary: exec would resolve that parent again later.
+func safeExecutablePath(path string, uid, gid int, lstat executableLstat) (os.FileInfo, error) {
+	if !safeAbsPath(path) || uid < 0 || gid < 0 || lstat == nil {
+		return nil, errors.New("production executable is unsafe")
+	}
+	parts := strings.Split(strings.TrimPrefix(path, string(filepath.Separator)), string(filepath.Separator))
+	if len(parts) == 0 || parts[0] == "" {
+		return nil, errors.New("production executable is unsafe")
+	}
+	current := string(filepath.Separator)
+	if err := safeExecutableDirectory(current, uid, gid, lstat); err != nil {
+		return nil, err
+	}
+	for _, part := range parts[:len(parts)-1] {
+		if part == "" || part == "." || part == ".." {
+			return nil, errors.New("production executable is unsafe")
+		}
+		current = filepath.Join(current, part)
+		if err := safeExecutableDirectory(current, uid, gid, lstat); err != nil {
+			return nil, err
+		}
+	}
+	info, err := lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o022 != 0 || info.Mode().Perm()&0o111 == 0 || verifyOwner(info, uid, gid) != nil {
+		return nil, errors.New("production executable is unsafe")
+	}
+	return info, nil
+}
+
+func safeExecutableDirectory(path string, uid, gid int, lstat executableLstat) error {
+	info, err := lstat(path)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o022 != 0 || verifyOwner(info, uid, gid) != nil {
+		return errors.New("production executable is unsafe")
+	}
+	return nil
 }
 
 func TaskServiceController(runner ServiceRunner, marker markerProbe, client *http.Client) (*ServiceController, error) {
@@ -529,4 +719,316 @@ func (c *ServiceController) ProbeHealth(ctx context.Context, rawURL string) (Hea
 		return HealthResult{Code: "unhealthy"}, errors.New("health response was not ready")
 	}
 	return HealthResult{Code: "healthy"}, nil
+}
+
+func (v *EdgeConfigValidator) validate(ctx context.Context, input edgeConfigValidationInput) (edgeConfigValidationResult, error) {
+	if v == nil || v.runner == nil || !input.Transition.valid() || !validSHA(input.ConfigSHA256) || input.ConfigSHA256 != input.Transition.InstalledAfterSHA256 {
+		return edgeConfigValidationResult{}, ErrServiceOutcomeUnknown
+	}
+	if err := v.verifyRoots(); err != nil {
+		return edgeConfigValidationResult{}, ErrServiceOutcomeUnknown
+	}
+	releaseRel := filepath.ToSlash(filepath.Join("releases", input.Transition.CandidateReleaseID))
+	manifestRaw, err := v.readOwnedFile(v.activeRoot, filepath.ToSlash(filepath.Join(releaseRel, "manifest.json")), 0o644, v.ownerUID, v.ownerGID, false)
+	if err != nil {
+		return edgeConfigValidationResult{}, ErrServiceOutcomeUnknown
+	}
+	manifest, err := parseReleaseManifest(manifestRaw)
+	if err != nil || manifest.ReleaseID != input.Transition.CandidateReleaseID || ValidateProductionCandidate(manifest) != nil {
+		return edgeConfigValidationResult{}, ErrServiceOutcomeUnknown
+	}
+	if err := edgeManifestFileDigest(manifest, edgeCaddyRelativePath, 0o755, input.Transition.CandidateCaddySHA256); err != nil {
+		return edgeConfigValidationResult{}, ErrServiceOutcomeUnknown
+	}
+	if err := edgeManifestFileDigest(manifest, edgeTemplateRelativePath, 0o644, input.Transition.CandidateTemplateSHA256); err != nil {
+		return edgeConfigValidationResult{}, ErrServiceOutcomeUnknown
+	}
+	caddyPath := filepath.Join(v.activeRoot, filepath.FromSlash(releaseRel), filepath.FromSlash(edgeCaddyRelativePath))
+	caddyRaw, err := v.readOwnedFile(v.activeRoot, filepath.ToSlash(filepath.Join(releaseRel, edgeCaddyRelativePath)), 0o755, v.ownerUID, v.ownerGID, false)
+	if err != nil || sha256Bytes(caddyRaw) != input.Transition.CandidateCaddySHA256 {
+		return edgeConfigValidationResult{}, ErrServiceOutcomeUnknown
+	}
+	// The template is read through the same pinned root even though only its
+	// digest enters the command evidence. This prevents a valid manifest from
+	// being paired with a different candidate release tree after verification.
+	templateRaw, err := v.readOwnedFile(v.activeRoot, filepath.ToSlash(filepath.Join(releaseRel, edgeTemplateRelativePath)), 0o644, v.ownerUID, v.ownerGID, false)
+	if err != nil || sha256Bytes(templateRaw) != input.Transition.CandidateTemplateSHA256 {
+		return edgeConfigValidationResult{}, ErrServiceOutcomeUnknown
+	}
+	configRel := filepath.ToSlash(filepath.Join("upgrade-artifacts", input.Transition.TransactionID, edgeConfigArtifactName))
+	configPath := filepath.Join(v.dataRoot, filepath.FromSlash(configRel))
+	configRaw, err := v.readOwnedFile(v.dataRoot, configRel, 0o640, v.ownerUID, v.edgeGID, true)
+	if err != nil || sha256Bytes(configRaw) != input.ConfigSHA256 {
+		return edgeConfigValidationResult{}, ErrServiceOutcomeUnknown
+	}
+	edgeEnvironment, err := v.readEdgeServiceEnvironment()
+	if err != nil {
+		return edgeConfigValidationResult{}, ErrServiceOutcomeUnknown
+	}
+
+	commandCtx, cancel := context.WithTimeout(ctx, v.timeout)
+	defer cancel()
+	if err := v.run(commandCtx, caddyPath, []string{"validate", "--config", configPath, "--adapter", "caddyfile"}, edgeEnvironment); err != nil {
+		return edgeConfigValidationResult{}, ErrServiceOutcomeUnknown
+	}
+	if err := v.run(commandCtx, caddyPath, []string{"adapt", "--config", configPath, "--adapter", "caddyfile", "--validate"}, edgeEnvironment); err != nil {
+		return edgeConfigValidationResult{}, ErrServiceOutcomeUnknown
+	}
+	if commandCtx.Err() != nil {
+		return edgeConfigValidationResult{}, ErrServiceOutcomeUnknown
+	}
+	// Re-read every command input after execution. A renamed root or altered
+	// file is an unknown outcome, never a successful validation.
+	if raw, e := v.readOwnedFile(v.activeRoot, filepath.ToSlash(filepath.Join(releaseRel, edgeCaddyRelativePath)), 0o755, v.ownerUID, v.ownerGID, false); e != nil || sha256Bytes(raw) != input.Transition.CandidateCaddySHA256 {
+		return edgeConfigValidationResult{}, ErrServiceOutcomeUnknown
+	}
+	if raw, e := v.readOwnedFile(v.activeRoot, filepath.ToSlash(filepath.Join(releaseRel, edgeTemplateRelativePath)), 0o644, v.ownerUID, v.ownerGID, false); e != nil || sha256Bytes(raw) != input.Transition.CandidateTemplateSHA256 {
+		return edgeConfigValidationResult{}, ErrServiceOutcomeUnknown
+	}
+	if raw, e := v.readOwnedFile(v.dataRoot, configRel, 0o640, v.ownerUID, v.edgeGID, true); e != nil || sha256Bytes(raw) != input.ConfigSHA256 {
+		return edgeConfigValidationResult{}, ErrServiceOutcomeUnknown
+	}
+	if after, e := v.readEdgeServiceEnvironment(); e != nil || !sameStringSlice(after, edgeEnvironment) {
+		return edgeConfigValidationResult{}, ErrServiceOutcomeUnknown
+	}
+	evidence := edgeConfigEvidenceSHA256(input)
+	return edgeConfigValidationResult{ConfigSHA256: input.ConfigSHA256, CandidateCaddySHA256: input.Transition.CandidateCaddySHA256, EvidenceSHA256: evidence}, nil
+}
+
+func (v *EdgeConfigValidator) run(ctx context.Context, executable string, args, environment []string) error {
+	if ctx.Err() != nil || !safeAbsPath(executable) || len(args) == 0 {
+		return ErrServiceOutcomeUnknown
+	}
+	result := v.runner.RunEdgeConfig(ctx, EdgeConfigCommand{Executable: executable, Arguments: append([]string(nil), args...), User: productionCaddyUser, UID: v.edgeUID, GID: v.edgeGID, Environment: append([]string(nil), environment...)})
+	if ctx.Err() != nil || result.Err != nil || result.ExitCode != 0 {
+		return ErrServiceOutcomeUnknown
+	}
+	return nil
+}
+
+func (p edgeRuntimePaths) environment() []string {
+	return append(append([]string(nil), productionSubprocessBaseEnv...),
+		"HOME="+p.home,
+		"XDG_DATA_HOME="+p.data,
+		"XDG_CONFIG_HOME="+p.config,
+		"OPEN_CARD_EDGE_LOG_DIR="+p.log,
+	)
+}
+
+func productionEdgeConfigEnvironmentValid(environment []string) bool {
+	return sameStringSlice(environment, productionEdgeRuntimePaths.environment())
+}
+
+func sameStringSlice(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func (v *EdgeConfigValidator) readEdgeServiceEnvironment() ([]string, error) {
+	if v == nil || !safeAbsPath(v.edgeEnvPath) || filepath.Base(v.edgeEnvPath) != "open-card-edge.env" {
+		return nil, ErrServiceOutcomeUnknown
+	}
+	parent := filepath.Dir(v.edgeEnvPath)
+	if err := edgeSecureDirectory(parent, v.ownerUID, v.ownerGID, false); err != nil {
+		return nil, ErrServiceOutcomeUnknown
+	}
+	file, err := os.OpenFile(v.edgeEnvPath, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, ErrServiceOutcomeUnknown
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o640 || verifyOwner(info, v.ownerUID, v.edgeGID) != nil {
+		return nil, ErrServiceOutcomeUnknown
+	}
+	raw, err := io.ReadAll(file)
+	if err != nil {
+		return nil, ErrServiceOutcomeUnknown
+	}
+	environment, err := parseEdgeServiceEnvironment(raw, v.runtime)
+	if err != nil || !sameStringSlice(environment, v.runtime.environment()) {
+		return nil, ErrServiceOutcomeUnknown
+	}
+	if err := edgeSecureDirectory(parent, v.ownerUID, v.ownerGID, false); err != nil {
+		return nil, ErrServiceOutcomeUnknown
+	}
+	info, err = file.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o640 || verifyOwner(info, v.ownerUID, v.edgeGID) != nil {
+		return nil, ErrServiceOutcomeUnknown
+	}
+	if err := verifyEdgeRuntimeDirectories(v); err != nil {
+		return nil, ErrServiceOutcomeUnknown
+	}
+	return environment, nil
+}
+
+func parseEdgeServiceEnvironment(raw []byte, runtime edgeRuntimePaths) ([]string, error) {
+	if len(raw) == 0 || raw[len(raw)-1] != '\n' || strings.ContainsAny(string(raw), "\x00\r") {
+		return nil, ErrServiceOutcomeUnknown
+	}
+	values := map[string]string{}
+	commentSeen := false
+	for index, line := range strings.Split(strings.TrimSuffix(string(raw), "\n"), "\n") {
+		if line == edgeEnvCanonicalComment {
+			if index != 0 || commentSeen {
+				return nil, ErrServiceOutcomeUnknown
+			}
+			commentSeen = true
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok || key == "" || value == "" || strings.ContainsAny(key+value, " \t\\\"'$") {
+			return nil, ErrServiceOutcomeUnknown
+		}
+		if _, exists := values[key]; exists {
+			return nil, ErrServiceOutcomeUnknown
+		}
+		values[key] = value
+	}
+	expected := []string{
+		"HOME=" + runtime.home,
+		"XDG_DATA_HOME=" + runtime.data,
+		"XDG_CONFIG_HOME=" + runtime.config,
+		"OPEN_CARD_EDGE_LOG_DIR=" + runtime.log,
+	}
+	if len(values) != len(expected) {
+		return nil, ErrServiceOutcomeUnknown
+	}
+	for _, entry := range expected {
+		key, value, _ := strings.Cut(entry, "=")
+		if values[key] != value {
+			return nil, ErrServiceOutcomeUnknown
+		}
+	}
+	return runtime.environment(), nil
+}
+
+func verifyEdgeRuntimeDirectories(v *EdgeConfigValidator) error {
+	if v == nil {
+		return ErrServiceOutcomeUnknown
+	}
+	for _, path := range []string{v.runtime.home, v.runtime.data, v.runtime.config, v.runtime.log} {
+		if err := edgeRuntimeDirectory(path, v.edgeUID, v.edgeGID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func edgeRuntimeDirectory(path string, uid, gid int) error {
+	info, err := os.Lstat(path)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm()&0o022 != 0 || info.Mode().Perm()&0o100 == 0 || verifyOwner(info, uid, gid) != nil {
+		return ErrServiceOutcomeUnknown
+	}
+	return nil
+}
+
+func edgeManifestFileDigest(manifest Manifest, path string, mode uint32, expectedSHA256 string) error {
+	for _, file := range manifest.Files {
+		if file.Path == path && file.Mode == mode && file.SHA256 == expectedSHA256 {
+			return nil
+		}
+	}
+	return ErrServiceOutcomeUnknown
+}
+
+func edgeConfigEvidenceSHA256(input edgeConfigValidationInput) string {
+	// This intentionally binds the two exact command identities but omits all
+	// paths: their only values are fixed derivations from the transaction and
+	// release IDs, while persisting paths would expand the public API surface.
+	raw := strings.Join([]string{
+		"edge-config-validation-v1",
+		input.Transition.TransactionID,
+		input.Transition.SourceReleaseID,
+		input.Transition.CandidateReleaseID,
+		input.Transition.ConsoleHostname,
+		input.Transition.SourceTemplateSHA256,
+		input.Transition.CandidateTemplateSHA256,
+		input.Transition.InstalledBeforeSHA256,
+		input.Transition.InstalledAfterSHA256,
+		input.Transition.CandidateCaddySHA256,
+		input.ConfigSHA256,
+		"caddy validate --config --adapter caddyfile",
+		"caddy adapt --config --adapter caddyfile --validate",
+	}, "\n")
+	return sha256Bytes([]byte(raw))
+}
+
+func (v *EdgeConfigValidator) verifyRoots() error {
+	if v == nil || !safeAbsPath(v.activeRoot) || !safeAbsPath(v.dataRoot) {
+		return ErrServiceOutcomeUnknown
+	}
+	if err := edgeSecureDirectory(v.activeRoot, v.ownerUID, v.ownerGID, false); err != nil {
+		return err
+	}
+	return edgeSecureDirectory(v.dataRoot, v.ownerUID, v.ownerGID, false)
+}
+
+func edgeSecureDirectory(path string, uid, gid int, requireTraverse bool) error {
+	info, err := os.Lstat(path)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm()&0o022 != 0 || verifyOwner(info, uid, gid) != nil {
+		return ErrServiceOutcomeUnknown
+	}
+	if requireTraverse && info.Mode().Perm()&0o001 == 0 {
+		return ErrServiceOutcomeUnknown
+	}
+	return nil
+}
+
+func (v *EdgeConfigValidator) readOwnedFile(rootPath, relative string, mode os.FileMode, uid, gid int, edgeReadable bool) ([]byte, error) {
+	if err := cleanRelative(relative); err != nil || strings.Contains(relative, "\\") {
+		return nil, ErrServiceOutcomeUnknown
+	}
+	if err := edgeSecureDirectory(rootPath, v.ownerUID, v.ownerGID, edgeReadable); err != nil {
+		return nil, err
+	}
+	root, err := os.OpenRoot(rootPath)
+	if err != nil {
+		return nil, ErrServiceOutcomeUnknown
+	}
+	defer root.Close()
+	parts := strings.Split(filepath.ToSlash(relative), "/")
+	current := ""
+	for _, part := range parts[:len(parts)-1] {
+		if part == "" || part == "." || part == ".." {
+			return nil, ErrServiceOutcomeUnknown
+		}
+		current = filepath.ToSlash(filepath.Join(current, part))
+		info, err := root.Lstat(current)
+		if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm()&0o022 != 0 || verifyOwner(info, v.ownerUID, v.ownerGID) != nil || edgeReadable && info.Mode().Perm()&0o001 == 0 {
+			return nil, ErrServiceOutcomeUnknown
+		}
+	}
+	file, err := root.OpenFile(relative, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, ErrServiceOutcomeUnknown
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != mode || verifyOwner(info, uid, gid) != nil {
+		return nil, ErrServiceOutcomeUnknown
+	}
+	if edgeReadable && info.Mode().Perm()&0o040 == 0 {
+		return nil, ErrServiceOutcomeUnknown
+	}
+	raw, err := io.ReadAll(file)
+	if err != nil {
+		return nil, ErrServiceOutcomeUnknown
+	}
+	// Descriptor and named root are both revalidated after bytes are read.
+	if err := edgeSecureDirectory(rootPath, v.ownerUID, v.ownerGID, edgeReadable); err != nil {
+		return nil, ErrServiceOutcomeUnknown
+	}
+	info, err = file.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != mode || verifyOwner(info, uid, gid) != nil {
+		return nil, ErrServiceOutcomeUnknown
+	}
+	return raw, nil
 }

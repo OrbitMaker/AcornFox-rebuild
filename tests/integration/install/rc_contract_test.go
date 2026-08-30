@@ -351,6 +351,42 @@ func TestManifestDigestIsRequiredForURLAndHostEntryPoint(t *testing.T) {
 	}
 }
 
+func TestSystemRootUpgradeUsesStagedRC1DelegationInsteadOfLegacyMutation(t *testing.T) {
+	_, sourceFile, _, _ := runtime.Caller(0)
+	repoRoot := filepath.Clean(filepath.Join(filepath.Dir(sourceFile), "..", "..", ".."))
+	raw, err := os.ReadFile(filepath.Join(repoRoot, "scripts", "mvp", "upgrade.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	upgrade := string(raw)
+	for _, required := range []string{
+		"PATH=/usr/sbin:/usr/bin:/sbin:/bin",
+		"OPEN_CARD_ALLOW_SYSTEM_ROOT=1 OPEN_CARD_INSTALL_CONFIRMATION=OPEN-CARD-INSTALL",
+		"--stage-upgrade-substrate",
+		"run_upgrade_helper prepare-control",
+		"/usr/bin/systemctl enable --now open-card-upgrade-safe.target",
+		"is-enabled --quiet open-card-upgrade-safe.target",
+		"is-active --quiet open-card-upgrade-safe.target",
+		"verified_production_program /usr/bin/python3",
+		"open-card-buildkit.service open-card-caddy.service open-card-server.service open-card-agent.service open-card-edge.service",
+		"candidate manifest identity is ambiguous",
+		"--expect-layout rc0-legacy",
+	} {
+		if !strings.Contains(upgrade, required) {
+			t.Fatalf("missing system-root upgrade delegation %q", required)
+		}
+	}
+	if strings.Contains(upgrade, "production upgrade is blocked") {
+		t.Fatal("obsolete system-root refusal remains after verified delegation was added")
+	}
+	branch := strings.Index(upgrade, "if [[ \"$root\" = \"/\" ]]; then\n  (( activate ))")
+	branchExit := strings.Index(upgrade, "  exit 0\nfi\n\n# First ask the installer")
+	legacy := strings.Index(upgrade, "backup_args=(--root \"$root\"")
+	if branch < 0 || branchExit < branch || legacy < branchExit {
+		t.Fatal("system-root path can enter the legacy backup/migration implementation")
+	}
+}
+
 func TestUninstallRemovesProgramRuntimeResidueButPreservesData(t *testing.T) {
 	directory := t.TempDir()
 	root := filepath.Join(directory, "root")

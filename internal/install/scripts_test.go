@@ -401,6 +401,66 @@ func TestG5BRecoverySubstrateStaysStageOnlyAndBootDisabled(t *testing.T) {
 	}
 }
 
+func TestG5BSystemRootUpgradeUsesOnlyVerifiedEngineDelegation(t *testing.T) {
+	root := scriptRoot(t)
+	raw, err := os.ReadFile(filepath.Join(root, "scripts", "mvp", "upgrade.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	upgrade := string(raw)
+	for _, required := range []string{
+		"PATH=/usr/sbin:/usr/bin:/sbin:/bin",
+		"--root / requires --activate",
+		"--root / requires --expected-manifest-sha256",
+		"--root / refuses --health-command, --database-dump-command, --database-restore-command, --migration-command, and --migration-dir",
+		"--root / refuses --allow-downgrade",
+		"--stage-upgrade-substrate",
+		"OPEN_CARD_INSTALL_CONFIRMATION=OPEN-CARD-INSTALL",
+		"run_upgrade_helper prepare-control",
+		"/usr/bin/systemctl enable --now open-card-upgrade-safe.target",
+		"is-enabled --quiet open-card-upgrade-safe.target",
+		"is-active --quiet open-card-upgrade-safe.target",
+		"upgrade-safe target RequiredBy link is missing",
+		"upgrade-safe target RequiredBy link is unsafe",
+		"verified_production_program /usr/bin/python3",
+		"/proc/sys/kernel/random/uuid",
+		"--expect-layout rc0-legacy",
+		"candidate manifest identity is ambiguous",
+	} {
+		if !strings.Contains(upgrade, required) {
+			t.Fatalf("system-root delegation contract is missing %q", required)
+		}
+	}
+	if strings.Contains(upgrade, "production upgrade is blocked") {
+		t.Fatal("obsolete production hard refusal remains")
+	}
+	rootBranch := strings.Index(upgrade, "if [[ \"$root\" = \"/\" ]]; then\n  (( activate ))")
+	legacyBackup := strings.Index(upgrade, "backup_args=(--root \"$root\"")
+	productionExit := strings.Index(upgrade, "  exit 0\nfi\n\n# First ask the installer")
+	if rootBranch < 0 || legacyBackup < 0 || productionExit < rootBranch || productionExit > legacyBackup {
+		t.Fatal("system-root branch can reach legacy backup/migration flow")
+	}
+}
+
+func TestG5BSystemRootUpgradeResetsCallerPATHBeforeAnyCommandLookup(t *testing.T) {
+	directory := t.TempDir()
+	canary := filepath.Join(directory, "caller-path-canary")
+	for _, name := range []string{"cat", "dirname", "env", "python3", "readlink", "stat", "systemctl", "tr"} {
+		path := filepath.Join(directory, name)
+		if err := os.WriteFile(path, []byte("#!/usr/bin/env bash\nprintf hijacked >> \"$CANARY\"\nexit 97\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	script := filepath.Join(scriptRoot(t), "scripts", "mvp", "upgrade.sh")
+	output, err := runScriptEnv(t, []string{"PATH=" + directory, "CANARY=" + canary, "OPEN_CARD_ALLOW_SYSTEM_ROOT="}, script, "--root", "/", "--bundle", filepath.Join(directory, "missing"))
+	if err == nil || !strings.Contains(output, "--root / requires") {
+		t.Fatalf("root wrapper did not reach its authorization boundary: %v\n%s", err, output)
+	}
+	if _, statErr := os.Stat(canary); !os.IsNotExist(statErr) {
+		t.Fatalf("caller PATH command ran before wrapper verification: %v", statErr)
+	}
+}
+
 func TestG7SystemdUnitsKeepPrivilegeAndSocketBoundaries(t *testing.T) {
 	serverBytes, err := os.ReadFile(filepath.Join(scriptRoot(t), "deploy", "systemd", "open-card-server.service"))
 	if err != nil {

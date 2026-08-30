@@ -16,14 +16,14 @@ import (
 
 type candidateFake struct {
 	exists             bool
-	evidence           string
+	evidence, owner    string
 	err, execErr       error
 	name, sql, comment string
 }
 
-func (f *candidateFake) CandidateEvidence(_ context.Context, name string) (bool, string, error) {
+func (f *candidateFake) CandidateEvidence(_ context.Context, name string) (CandidateDatabaseIdentity, error) {
 	f.name = name
-	return f.exists, f.evidence, f.err
+	return CandidateDatabaseIdentity{Exists: f.exists, Evidence: f.evidence, Owner: f.owner}, f.err
 }
 func (f *candidateFake) CreateCandidate(_ context.Context, name, evidence string) error {
 	f.sql = "CREATE DATABASE " + name
@@ -57,11 +57,11 @@ func (f *migrationFake) BeginMigration(context.Context) (MigrationTx, error) {
 	return &migrationTxFake{f}, nil
 }
 func candidateRequest(id string) CreateCandidateRequest {
-	return CreateCandidateRequest{ActivationID: id, RecoveryEvidence: strings.Repeat("a", 64)}
+	return CreateCandidateRequest{ActivationID: id, ExpectedExistingOwner: "opencard", RecoveryEvidence: strings.Repeat("a", 64)}
 }
 func recoveryRequest(id string) CreateCandidateRequest {
 	name, _ := CandidateDatabaseName(id)
-	return CreateCandidateRequest{ActivationID: id, ExpectedExistingName: name, RecoveryEvidence: strings.Repeat("a", 64)}
+	return CreateCandidateRequest{ActivationID: id, ExpectedExistingName: name, ExpectedExistingOwner: "opencard", RecoveryEvidence: strings.Repeat("a", 64)}
 }
 
 type validatorFake struct {
@@ -241,19 +241,19 @@ func TestPGEnvAndSessions(t *testing.T) {
 }
 
 func TestProductionControlReadsParameterizedCandidateEvidence(t *testing.T) {
-	db := &adapterDB{row: adapterRow{values: []any{true, "open-card-upgrade:" + strings.Repeat("a", 64)}}}
+	db := &adapterDB{row: adapterRow{values: []any{true, "open-card-upgrade:" + strings.Repeat("a", 64), "opencard"}}}
 	p := &ProductionPostgresControl{admin: db}
-	ok, evidence, err := p.CandidateEvidence(context.Background(), "open_card_act_0123456789abcdef")
-	if err != nil || !ok || evidence != "open-card-upgrade:"+strings.Repeat("a", 64) || db.query != "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1), COALESCE((SELECT obj_description(oid, 'pg_database') FROM pg_database WHERE datname = $1), '')" || len(db.args) != 1 {
-		t.Fatalf("ok=%v evidence=%q err=%v query=%q args=%v", ok, evidence, err, db.query, db.args)
+	identity, err := p.CandidateEvidence(context.Background(), "open_card_act_0123456789abcdef")
+	if err != nil || !identity.Exists || identity.Evidence != "open-card-upgrade:"+strings.Repeat("a", 64) || identity.Owner != "opencard" || !strings.Contains(db.query, "shobj_description") || !strings.Contains(db.query, "pg_get_userbyid(datdba)") || len(db.args) != 1 {
+		t.Fatalf("identity=%#v err=%v query=%q args=%v", identity, err, db.query, db.args)
 	}
 }
 
 func TestProductionControlCreateStoresFixedCandidateEvidence(t *testing.T) {
-	db := &adapterDB{}
-	p := &ProductionPostgresControl{admin: db}
+	db := &adapterDB{row: adapterRow{values: []any{true, "open-card-upgrade:" + strings.Repeat("a", 64), "opencard"}}}
+	p := &ProductionPostgresControl{admin: db, runtimeRole: "opencard"}
 	evidence := strings.Repeat("a", 64)
-	if err := p.CreateCandidate(context.Background(), "open_card_act_0123456789abcdef", evidence); err != nil || len(db.execs) != 2 || db.execs[0] != "CREATE DATABASE open_card_act_0123456789abcdef" || db.execs[1] != "COMMENT ON DATABASE open_card_act_0123456789abcdef IS 'open-card-upgrade:"+evidence+"'" {
+	if err := p.CreateCandidate(context.Background(), "open_card_act_0123456789abcdef", evidence); err != nil || len(db.execs) != 2 || db.execs[0] != "CREATE DATABASE open_card_act_0123456789abcdef OWNER opencard" || db.execs[1] != "COMMENT ON DATABASE open_card_act_0123456789abcdef IS 'open-card-upgrade:"+evidence+"'" {
 		t.Fatalf("err=%v sql=%q all=%q", err, db.exec, db.execs)
 	}
 	if err := p.CreateCandidate(context.Background(), "bad; DROP DATABASE x", evidence); !errors.Is(err, ErrPostgresOutcomeUnknown) {
@@ -277,13 +277,48 @@ func TestSelectedPostgresDatabaseNeverRewritesActiveDatabaseToPostgres(t *testin
 		t.Fatal(err)
 	}
 	defer selected.Close()
-	control, err := NewProductionPostgresControl(raw)
+	control, err := TaskPostgresControl(raw, []byte("OPEN_CARD_DATABASE_URL=postgresql://upgrade:password@127.0.0.1:5432/postgres?sslmode=require\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer control.Close()
-	if selected.environment.Descriptor.Database != "open_card_active" || control.base == nil || control.base.Database != "open_card_active" {
-		t.Fatalf("selected=%q control=%#v", selected.environment.Descriptor.Database, control.base)
+	if selected.environment.Descriptor.Database != "open_card_active" || control.runtimeBase == nil || control.runtimeBase.Database != "open_card_active" || control.runtimeRole != "user" || control.controlRole != "upgrade" {
+		t.Fatalf("selected=%q control=%#v", selected.environment.Descriptor.Database, control)
+	}
+}
+
+func TestProductionControlUsesFixedSeparateControlIdentity(t *testing.T) {
+	runtime := []byte("OPEN_CARD_DATABASE_URL=postgresql://opencard:runtime-password@127.0.0.1:5432/open_card_active?sslmode=require\n")
+	control := []byte("OPEN_CARD_DATABASE_URL=postgresql://open_card_upgrade_control:control-password@127.0.0.1:5432/postgres?sslmode=require\n")
+	original := readProductionUpgradeDatabaseEnv
+	called := 0
+	readProductionUpgradeDatabaseEnv = func() ([]byte, error) { called++; return append([]byte(nil), control...), nil }
+	t.Cleanup(func() { readProductionUpgradeDatabaseEnv = original })
+	value, err := NewProductionPostgresControl(runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer value.Close()
+	wantDigest := sha256.Sum256(control)
+	if called != 1 || value.runtimeRole != "opencard" || value.controlRole != "open_card_upgrade_control" || value.runtimeBase == nil || value.runtimeBase.Database != "open_card_active" || value.ControlIdentitySHA256() != hex.EncodeToString(wantDigest[:]) {
+		t.Fatalf("fixed control identity was not isolated: %#v", value)
+	}
+	task, err := TaskPostgresControl(runtime, control)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer task.Close()
+	if task.ControlIdentitySHA256() != value.ControlIdentitySHA256() {
+		t.Fatal("task control digest differs from fixed production control bytes")
+	}
+	for _, bad := range [][]byte{
+		[]byte("OPEN_CARD_DATABASE_URL=postgresql://opencard:control-password@127.0.0.1:5432/postgres?sslmode=require\n"),
+		[]byte("OPEN_CARD_DATABASE_URL=postgresql://open_card_upgrade_control:control-password@127.0.0.1:5433/postgres?sslmode=require\n"),
+		[]byte("OPEN_CARD_DATABASE_URL=postgresql://open_card_upgrade_control:control-password@127.0.0.1:5432/not_postgres?sslmode=require\n"),
+	} {
+		if _, err := TaskPostgresControl(runtime, bad); err == nil {
+			t.Fatalf("invalid control identity was accepted: %q", bad)
+		}
 	}
 }
 
@@ -313,7 +348,7 @@ func TestProductionConnectionsRejectAmbientPGConfiguration(t *testing.T) {
 	for _, key := range []string{"PGSERVICE", "PGSERVICEFILE", "PGSSLKEY", "PGSSLROOTCERT", "PGOPTIONS", "PGTARGETSESSIONATTRS"} {
 		t.Run(key, func(t *testing.T) {
 			t.Setenv(key, "ambient-canary")
-			if _, err := NewProductionPostgresControl(raw); err == nil {
+			if _, err := TaskPostgresControl(raw, []byte("OPEN_CARD_DATABASE_URL=postgresql://upgrade:password@127.0.0.1:5432/postgres?sslmode=require\n")); err == nil {
 				t.Fatalf("production control accepted %s", key)
 			}
 			if _, err := NewSelectedPostgresDatabase(raw); err == nil {
@@ -321,7 +356,7 @@ func TestProductionConnectionsRejectAmbientPGConfiguration(t *testing.T) {
 			}
 		})
 	}
-	control, err := NewProductionPostgresControl(raw)
+	control, err := TaskPostgresControl(raw, []byte("OPEN_CARD_DATABASE_URL=postgresql://upgrade:password@127.0.0.1:5432/postgres?sslmode=require\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -397,7 +432,7 @@ func TestCreateCandidateUsesDerivedSafeNameAndExactSQL(t *testing.T) {
 }
 
 func TestCreateCandidateAllowsExistingOnlyWithExactPersistentEvidence(t *testing.T) {
-	f := &candidateFake{exists: true, evidence: candidateDatabaseEvidence(strings.Repeat("a", 64))}
+	f := &candidateFake{exists: true, evidence: candidateDatabaseEvidence(strings.Repeat("a", 64)), owner: "opencard"}
 	name, err := CreateCandidate(context.Background(), f, recoveryRequest("activation-1"))
 	if err != nil || name == "" || f.sql != "" {
 		t.Fatalf("name=%q err=%v sql=%q", name, err, f.sql)
@@ -406,10 +441,14 @@ func TestCreateCandidateAllowsExistingOnlyWithExactPersistentEvidence(t *testing
 
 func TestCreateCandidateRejectsExistingConflict(t *testing.T) {
 	for _, evidence := range []string{"", "open-card-upgrade:" + strings.Repeat("b", 64)} {
-		_, err := CreateCandidate(context.Background(), &candidateFake{exists: true, evidence: evidence}, recoveryRequest("activation-1"))
+		_, err := CreateCandidate(context.Background(), &candidateFake{exists: true, evidence: evidence, owner: "opencard"}, recoveryRequest("activation-1"))
 		if !errors.Is(err, ErrCandidateConflict) {
 			t.Fatalf("evidence=%q err=%v", evidence, err)
 		}
+	}
+	_, err := CreateCandidate(context.Background(), &candidateFake{exists: true, evidence: candidateDatabaseEvidence(strings.Repeat("a", 64)), owner: "different_role"}, recoveryRequest("activation-1"))
+	if !errors.Is(err, ErrCandidateConflict) {
+		t.Fatalf("wrong candidate owner was accepted: %v", err)
 	}
 }
 

@@ -38,6 +38,9 @@ func TestGate5BTaskPostgresRC0ToRC1Matrix(t *testing.T) {
 	binaries := gate5BBinaries(t)
 	h := startGate5BPostgres(t, binaries)
 	defer h.close(t)
+	if err := runGate5B(context.Background(), h.bin.psql, []string{"-X", "-v", "ON_ERROR_STOP=1", "-d", "postgres", "-c", "CREATE DATABASE open_card_runtime_must_not_create"}, h.runtimeEnv("postgres")); err == nil {
+		t.Fatal("runtime role unexpectedly has CREATEDB")
+	}
 	if os.Getenv("OPEN_CARD_G5B_REQUIRE_PG") == "1" {
 		if _, err := os.Stat(filepath.Join(h.root, "executed")); err != nil {
 			t.Fatal("required task PostgreSQL execution sentinel is missing")
@@ -67,6 +70,14 @@ func TestGate5BTaskPostgresRC0ToRC1Matrix(t *testing.T) {
 		}
 		if store.candidate.Database.Name != session.candidateDB || string(store.candidateEnv) != string(session.CandidateDatabaseEnv()) {
 			t.Fatal("candidate activation did not retain the candidate database environment")
+		}
+		if owner := h.queryRow(t, ctx, "postgres", "SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = '"+session.candidateDB+"'"); owner != h.runtimeRole {
+			t.Fatalf("candidate database owner = %q, want runtime role %q", owner, h.runtimeRole)
+		}
+		controlDigest, ok := session.adapter.(interface{ ControlIdentitySHA256() string })
+		controlEnv, err := install.FormatDatabaseEnv(h.controlURL())
+		if !ok || err != nil || controlDigest.ControlIdentitySHA256() != hashGate5B(controlEnv) {
+			t.Fatal("database session did not retain the exact task control identity digest")
 		}
 		if store.journal.CandidateDatabase == nil || store.journal.Migration == nil || store.journal.CandidateDatabase.SchemaMigrationsSHA256 == store.journal.Migration.ManifestSHA256 {
 			t.Fatal("schema-row evidence was not kept distinct from release-manifest evidence")
@@ -222,12 +233,14 @@ func gate5BBinaries(t *testing.T) gate5BBinarySet {
 }
 
 type gate5BPostgres struct {
-	root string
-	port int
-	pid  int
-	bin  gate5BBinarySet
-	mu   sync.Mutex
-	dead bool
+	root        string
+	port        int
+	pid         int
+	bin         gate5BBinarySet
+	runtimeRole string
+	controlRole string
+	mu          sync.Mutex
+	dead        bool
 }
 
 func startGate5BPostgres(t *testing.T, bin gate5BBinarySet) *gate5BPostgres {
@@ -241,7 +254,7 @@ func startGate5BPostgres(t *testing.T, bin gate5BBinarySet) *gate5BPostgres {
 	if err := os.Mkdir(socket, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := runGate5B(context.Background(), bin.initdb, []string{"-D", data, "--auth=trust", "--no-locale", "--encoding=UTF8", "-U", "opencard"}, nil); err != nil {
+	if err := runGate5B(context.Background(), bin.initdb, []string{"-D", data, "--auth=trust", "--no-locale", "--encoding=UTF8", "-U", "g5badmin"}, nil); err != nil {
 		_ = os.RemoveAll(root)
 		t.Fatalf("task initdb failed: %v", err)
 	}
@@ -260,7 +273,24 @@ func startGate5BPostgres(t *testing.T, bin gate5BBinarySet) *gate5BPostgres {
 		_ = os.RemoveAll(root)
 		t.Fatal("task PostgreSQL start failed")
 	}
-	h := &gate5BPostgres{root: root, port: port, bin: bin}
+	h := &gate5BPostgres{root: root, port: port, bin: bin, runtimeRole: "opencard", controlRole: "open_card_upgrade_control"}
+	h.exec(t, context.Background(), "postgres", "CREATE ROLE opencard LOGIN PASSWORD 'g5b-runtime-password-sentinel' NOCREATEDB NOSUPERUSER NOREPLICATION NOBYPASSRLS")
+	h.exec(t, context.Background(), "postgres", "CREATE ROLE open_card_upgrade_control LOGIN PASSWORD 'g5b-control-password-sentinel' CREATEDB NOSUPERUSER NOREPLICATION NOBYPASSRLS")
+	// PostgreSQL requires a CREATEDB role to be a member of the requested
+	// OWNER role. Membership is deliberately one-way: runtime cannot inherit
+	// the control role or acquire CREATEDB through it.
+	h.exec(t, context.Background(), "postgres", "GRANT opencard TO open_card_upgrade_control")
+	// Session draining must see runtime sessions after the service quiesce;
+	// grant that observability only to the root-secret control role.
+	h.exec(t, context.Background(), "postgres", "GRANT pg_read_all_stats TO open_card_upgrade_control")
+	if h.queryRow(t, context.Background(), "postgres", "SELECT pg_has_role('opencard', 'open_card_upgrade_control', 'member') || ',' || pg_has_role('open_card_upgrade_control', 'opencard', 'member')") != "false,true" {
+		h.close(t)
+		t.Fatal("PostgreSQL control membership is not one-way")
+	}
+	if visibility := h.queryRow(t, context.Background(), "postgres", "SELECT pg_has_role('open_card_upgrade_control', 'pg_read_all_stats', 'member')"); visibility != "t" {
+		h.close(t)
+		t.Fatalf("control role lacks the required runtime-session visibility: %q", visibility)
+	}
 	row := h.queryRow(t, context.Background(), "postgres", "SELECT pg_backend_pid()")
 	if _, err := fmt.Sscan(row, &h.pid); err != nil || h.pid <= 1 {
 		h.close(t)
@@ -323,11 +353,19 @@ func (h *gate5BPostgres) url(database string) string {
 	// The isolated cluster uses trust authentication, but the production parser
 	// requires an encoded password component. This task-only value is never
 	// journaled, logged, or passed on argv.
-	return fmt.Sprintf("postgresql://opencard:g5b-pg-password-sentinel@127.0.0.1:%d/%s?sslmode=disable", h.port, database)
+	return fmt.Sprintf("postgresql://%s:g5b-runtime-password-sentinel@127.0.0.1:%d/%s?sslmode=disable", h.runtimeRole, h.port, database)
+}
+
+func (h *gate5BPostgres) controlURL() string {
+	return fmt.Sprintf("postgresql://%s:g5b-control-password-sentinel@127.0.0.1:%d/postgres?sslmode=disable", h.controlRole, h.port)
 }
 
 func (h *gate5BPostgres) env(database string) []string {
-	return []string{"PGHOST=127.0.0.1", fmt.Sprintf("PGPORT=%d", h.port), "PGUSER=opencard", "PGDATABASE=" + database, "PGSSLMODE=disable"}
+	return []string{"PGHOST=127.0.0.1", fmt.Sprintf("PGPORT=%d", h.port), "PGUSER=g5badmin", "PGDATABASE=" + database, "PGSSLMODE=disable"}
+}
+
+func (h *gate5BPostgres) runtimeEnv(database string) []string {
+	return []string{"PGHOST=127.0.0.1", fmt.Sprintf("PGPORT=%d", h.port), "PGUSER=" + h.runtimeRole, "PGDATABASE=" + database, "PGSSLMODE=disable"}
 }
 
 func (h *gate5BPostgres) exec(t *testing.T, ctx context.Context, database, sql string) {
@@ -370,7 +408,7 @@ func (h *gate5BPostgres) fixture(t *testing.T, ctx context.Context, suffix strin
 	t.Helper()
 	safe := strings.ReplaceAll(suffix, "_", "")
 	active := "open_card_active_" + safe
-	h.exec(t, ctx, "postgres", "CREATE DATABASE "+active)
+	h.exec(t, ctx, "postgres", "CREATE DATABASE "+active+" OWNER "+h.runtimeRole)
 	root := filepath.Join(h.root, "fixture-"+safe)
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		t.Fatal(err)
@@ -438,7 +476,11 @@ func (f *gate5BFixture) databaseSession(tx, activationID, candidate string, rele
 	if err != nil {
 		f.t.Fatal(err)
 	}
-	control, err := install.NewProductionPostgresControl(f.activeEnv)
+	controlEnv, err := install.FormatDatabaseEnv(f.h.controlURL())
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	control, err := install.TaskPostgresControl(f.activeEnv, controlEnv)
 	if err != nil {
 		f.t.Fatal(err)
 	}
@@ -623,6 +665,15 @@ func (s *gate5BStore) ReadLegacyProjection(context.Context, install.LegacyProjec
 func (s *gate5BStore) RecoverLegacyPlan(context.Context, install.ActivationV1, string) (install.LegacyProjectionPlan, error) {
 	return install.LegacyProjectionPlan{}, install.ErrUpgradeLocked
 }
+func (s *gate5BStore) PrepareEdgeConfig(context.Context, install.EdgeConfigTransitionPlan) (install.EdgeConfigObservationV1, error) {
+	return install.EdgeConfigObservationV1{}, install.ErrUpgradeLocked
+}
+func (s *gate5BStore) FinalizeEdgeConfig(context.Context, install.EdgeConfigTransitionPlan) (install.EdgeConfigObservationV1, error) {
+	return install.EdgeConfigObservationV1{}, install.ErrUpgradeLocked
+}
+func (s *gate5BStore) ReadEdgeConfig(context.Context, install.EdgeConfigTransitionPlan) (install.EdgeConfigObservationV1, error) {
+	return install.EdgeConfigObservationV1{}, install.ErrUpgradeLocked
+}
 func (s *gate5BStore) ReadActivationState(context.Context) (install.UpgradeActivationState, error) {
 	return install.UpgradeActivationState{ActiveID: s.activeID, PreviousID: s.previousID, ActiveActivationJSONSHA256: s.activeDigest, PreviousJSONSHA256: s.previousDigest, Marker: s.marker}, nil
 }
@@ -694,8 +745,9 @@ func (s *gate5BSession) Migrate(ctx context.Context) (install.UpgradeMigrationEv
 func (s *gate5BSession) Validate(ctx context.Context, id string) (install.ArtifactV1, error) {
 	return s.adapter.Validate(ctx, id)
 }
-func (s *gate5BSession) CandidateDatabaseEnv() []byte { return s.adapter.CandidateDatabaseEnv() }
-func (s *gate5BSession) Close() error                 { return s.adapter.Close() }
+func (s *gate5BSession) CandidateDatabaseEnv() []byte  { return s.adapter.CandidateDatabaseEnv() }
+func (s *gate5BSession) ControlIdentitySHA256() string { return s.adapter.ControlIdentitySHA256() }
+func (s *gate5BSession) Close() error                  { return s.adapter.Close() }
 func (s *gate5BSession) snapshotPath() string {
 	return filepath.Join(s.artifactDir, "control-plane.dump")
 }
@@ -840,6 +892,12 @@ func (*gate5BServices) StartEdge(context.Context) error                { return 
 func (*gate5BServices) HealthEdge(context.Context) error               { return nil }
 func (s *gate5BServices) GuardEdge(context.Context) error              { s.guarded = true; return nil }
 func (*gate5BServices) ReloadServerUnit(context.Context, string) error { return nil }
+func (*gate5BServices) ValidateEdgeConfig(_ context.Context, transition install.EdgeConfigTransitionV1, artifact install.ArtifactV1) (install.EdgeConfigValidationV1, error) {
+	if transition.InstalledAfterSHA256 == "" || transition.CandidateCaddySHA256 == "" || artifact.SHA256 != transition.InstalledAfterSHA256 {
+		return install.EdgeConfigValidationV1{}, errors.New("invalid edge validation")
+	}
+	return install.EdgeConfigValidationV1{ConfigSHA256: transition.InstalledAfterSHA256, CaddySHA256: transition.CandidateCaddySHA256, EvidenceSHA256: strings.Repeat("f", 64)}, nil
+}
 func (s *gate5BServices) RestoreSnapshot(context.Context, install.ServiceSnapshotV1) error {
 	s.restored = true
 	return nil

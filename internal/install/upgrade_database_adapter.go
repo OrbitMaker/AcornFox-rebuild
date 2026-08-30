@@ -8,12 +8,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -68,6 +73,7 @@ type UpgradeDatabaseAdapter struct {
 	snapshotter   *PostgresSnapshotter
 	activeEnv     PostgresProcessEnvironment
 	activeEnvSHA  string
+	controlEnvSHA string
 	snapshot      *SnapshotEvidence
 	activeFactory ActiveDatabaseInspectionFactory
 	candidateOpen func(string) (*SQLMigrationControl, error)
@@ -145,8 +151,9 @@ func (s *activeInspectionSession) InspectActive(ctx context.Context, request Act
 func (s *activeInspectionSession) CandidateDatabaseEnv() []byte {
 	return append([]byte(nil), s.candidateEnv...)
 }
-func (*activeInspectionSession) Close() error                { return nil }
-func (*activeInspectionSession) Drain(context.Context) error { return ErrPostgresOutcomeUnknown }
+func (*activeInspectionSession) ControlIdentitySHA256() string { return "" }
+func (*activeInspectionSession) Close() error                  { return nil }
+func (*activeInspectionSession) Drain(context.Context) error   { return ErrPostgresOutcomeUnknown }
 func (*activeInspectionSession) Snapshot(context.Context) (SnapshotEvidence, string, error) {
 	return SnapshotEvidence{}, "", ErrPostgresOutcomeUnknown
 }
@@ -200,8 +207,12 @@ func ProductionUpgradeDatabaseAdapter(input ProductionUpgradeDatabaseInput) (*Up
 		CandidateReleaseRoot:      filepath.Join(productionActiveRoot, "releases", input.CandidateRelease.ID),
 		CandidateRecoveryEvidence: input.RecoveryEvidenceSHA256,
 		DrainInterval:             time.Second,
-		Validator:                 productionCandidateValidator{path: filepath.Join(productionActiveRoot, "releases", input.CandidateRelease.ID, "bin/open-card-admin")},
-		ArtifactWriter:            writer,
+		Validator: productionCandidateValidator{
+			adminPath:  filepath.Join(productionActiveRoot, "releases", input.CandidateRelease.ID, "bin/open-card-admin"),
+			serverPath: filepath.Join(productionActiveRoot, "releases", input.CandidateRelease.ID, "bin/open-card-server"),
+			releaseID:  input.CandidateRelease.ID,
+		},
+		ArtifactWriter: writer,
 	}
 	control, err := NewProductionPostgresControl(plan.ActiveDatabaseEnv)
 	if err != nil {
@@ -232,27 +243,292 @@ func ProductionUpgradeDatabaseAdapter(input ProductionUpgradeDatabaseInput) (*Up
 }
 
 type productionCandidateValidator struct {
-	path string
-	run  func(context.Context, string, []string, []string) error
+	adminPath, serverPath string
+	releaseID             string
+	setprivPath           string
+	lookupUser            func(string) (*user.User, error)
+	verifyExecutable      func(string) error
+	effectiveUID          func() int
+	resolve               func(string) (ActiveDatabase, error)
+	listen                func(string, string) (net.Listener, error)
+	start                 func(context.Context, string, []string, []string, *os.File) (candidateServerProcess, error)
+	probe                 func(context.Context, string) error
+	runAdmin              func(context.Context, string, []string, []string) error
+	probeTimeout          time.Duration
+	terminationTimeout    time.Duration
+}
+
+type candidateServerProcess interface {
+	Signal(os.Signal) error
+	Wait() error
+}
+
+var errCandidateServerExited = errors.New("candidate server exited")
+
+type execCandidateServerProcess struct{ command *exec.Cmd }
+
+func (p execCandidateServerProcess) Signal(signal os.Signal) error {
+	if p.command == nil || p.command.Process == nil {
+		return ErrPostgresOutcomeUnknown
+	}
+	return p.command.Process.Signal(signal)
+}
+func (p execCandidateServerProcess) Wait() error {
+	if p.command == nil {
+		return ErrPostgresOutcomeUnknown
+	}
+	return p.command.Wait()
 }
 
 func (v productionCandidateValidator) ValidateCandidate(ctx context.Context, activationID string) error {
-	if !validID(activationID) || !safeAbsPath(v.path) {
+	if !validID(activationID) || !safeAbsPath(v.adminPath) || !safeAbsPath(v.serverPath) || !validID(v.releaseID) {
 		return ErrPostgresOutcomeUnknown
 	}
-	run := v.run
-	if run == nil {
-		run = runProductionCandidateValidation
+	resolve := v.resolve
+	if resolve == nil {
+		resolver, err := ProductionActiveDatabaseResolver()
+		if err != nil {
+			return ErrPostgresOutcomeUnknown
+		}
+		resolve = resolver.ResolveActivation
 	}
-	return run(ctx, v.path, []string{"candidate", "validate", "--activation-id", activationID}, append([]string(nil), productionSubprocessBaseEnv...))
+	candidate, err := resolve(activationID)
+	if err != nil || candidate.Activation.ActivationID != activationID || candidate.Activation.Release.ID != v.releaseID || candidate.DatabaseURL == "" {
+		return ErrPostgresOutcomeUnknown
+	}
+	setprivPath := v.setprivPath
+	if setprivPath == "" {
+		setprivPath = productionCandidatePrivilegeDropPath
+	}
+	verifyExecutable := v.verifyExecutable
+	if verifyExecutable == nil {
+		verifyExecutable = func(path string) error {
+			_, err := safeProductionExecutable(path)
+			return err
+		}
+	}
+	effectiveUID := v.effectiveUID
+	if effectiveUID == nil {
+		effectiveUID = os.Geteuid
+	}
+	lookupUser := v.lookupUser
+	if lookupUser == nil {
+		lookupUser = user.Lookup
+	}
+	if effectiveUID() != 0 || setprivPath != productionCandidatePrivilegeDropPath || verifyExecutable(setprivPath) != nil {
+		return ErrPostgresOutcomeUnknown
+	}
+	runtimeUser, err := lookupUser(productionCandidateRuntimeUser)
+	if err != nil || runtimeUser == nil {
+		return ErrPostgresOutcomeUnknown
+	}
+	uid, uidErr := strconv.Atoi(runtimeUser.Uid)
+	gid, gidErr := strconv.Atoi(runtimeUser.Gid)
+	if uidErr != nil || gidErr != nil || uid < 0 || gid < 0 {
+		return ErrPostgresOutcomeUnknown
+	}
+	listenerFactory := v.listen
+	if listenerFactory == nil {
+		listenerFactory = net.Listen
+	}
+	listener, err := listenerFactory("tcp", "127.0.0.1:0")
+	if err != nil {
+		return ErrPostgresOutcomeUnknown
+	}
+	listenerClosed := false
+	defer func() {
+		if !listenerClosed {
+			_ = listener.Close()
+		}
+	}()
+	tcp, ok := listener.(*net.TCPListener)
+	if !ok || tcp == nil {
+		return ErrPostgresOutcomeUnknown
+	}
+	address, ok := candidateLoopbackAddress(tcp.Addr())
+	if !ok {
+		return ErrPostgresOutcomeUnknown
+	}
+	listenerFile, err := tcp.File()
+	if err != nil {
+		return ErrPostgresOutcomeUnknown
+	}
+	fileClosed := false
+	defer func() {
+		if !fileClosed {
+			_ = listenerFile.Close()
+		}
+	}()
+	start := v.start
+	if start == nil {
+		start = startProductionCandidateServer
+	}
+	process, err := start(ctx, setprivPath, candidateServerLaunchArguments(uid, gid, v.serverPath), candidateServerEnvironment(candidate.DatabaseURL, address), listenerFile)
+	if err != nil || process == nil {
+		return ErrPostgresOutcomeUnknown
+	}
+	wait := make(chan error, 1)
+	go func() { wait <- process.Wait() }()
+	if err := listenerFile.Close(); err != nil {
+		_ = terminateCandidateProcess(process, wait, v.terminationTimeout)
+		return ErrPostgresOutcomeUnknown
+	}
+	fileClosed = true
+	if err := listener.Close(); err != nil {
+		_ = terminateCandidateProcess(process, wait, v.terminationTimeout)
+		return ErrPostgresOutcomeUnknown
+	}
+	listenerClosed = true
+	probe := v.probe
+	if probe == nil {
+		probe = probeProductionCandidate
+	}
+	for _, path := range []string{"/healthz", "/readyz"} {
+		if err := waitForCandidateProbe(ctx, probe, wait, "http://"+address+path, v.probeTimeout); err != nil {
+			if errors.Is(err, errCandidateServerExited) {
+				return ErrPostgresOutcomeUnknown
+			}
+			_ = terminateCandidateProcess(process, wait, v.terminationTimeout)
+			return ErrPostgresOutcomeUnknown
+		}
+	}
+	runAdmin := v.runAdmin
+	if runAdmin == nil {
+		runAdmin = runProductionCandidateValidation
+	}
+	if err := runAdmin(ctx, v.adminPath, []string{"candidate", "validate", "--activation-id", activationID}, append([]string(nil), productionSubprocessBaseEnv...)); err != nil {
+		_ = terminateCandidateProcess(process, wait, v.terminationTimeout)
+		return ErrPostgresOutcomeUnknown
+	}
+	if err := terminateCandidateProcess(process, wait, v.terminationTimeout); err != nil {
+		return ErrPostgresOutcomeUnknown
+	}
+	return nil
+}
+
+const (
+	productionCandidatePrivilegeDropPath = "/usr/bin/setpriv"
+	productionCandidateRuntimeUser       = "opencard"
+)
+
+func candidateServerLaunchArguments(uid, gid int, serverPath string) []string {
+	return []string{
+		"--reuid=" + strconv.Itoa(uid),
+		"--regid=" + strconv.Itoa(gid),
+		"--clear-groups",
+		"--",
+		serverPath,
+		"--candidate-validate",
+	}
+}
+
+func candidateLoopbackAddress(address net.Addr) (string, bool) {
+	tcp, ok := address.(*net.TCPAddr)
+	if !ok || tcp == nil || !tcp.IP.IsLoopback() || tcp.Port < 1 || tcp.Port > 65535 {
+		return "", false
+	}
+	return net.JoinHostPort("127.0.0.1", strconv.Itoa(tcp.Port)), true
+}
+
+func candidateServerEnvironment(databaseURL, address string) []string {
+	return append(append([]string(nil), productionSubprocessBaseEnv...),
+		"OPEN_CARD_DATABASE_URL="+databaseURL,
+		"OPEN_CARD_SERVER_ADDR="+address,
+		"OPEN_CARD_CANDIDATE_LISTEN_FD=3",
+		"OPEN_CARD_M1_ENABLED=false",
+		"OPEN_CARD_M2_ENABLED=false",
+		"OPEN_CARD_M3_ENABLED=false",
+		"OPEN_CARD_M4_ENABLED=false",
+		"OPEN_CARD_M4_ROLLOUT_ENABLED=false",
+		"OPEN_CARD_M5_ENABLED=false",
+		"OPEN_CARD_M6_ENABLED=false",
+	)
+}
+
+func startProductionCandidateServer(_ context.Context, path string, args, env []string, listener *os.File) (candidateServerProcess, error) {
+	if listener == nil || path != productionCandidatePrivilegeDropPath || len(args) != 6 || !strings.HasPrefix(args[0], "--reuid=") || !strings.HasPrefix(args[1], "--regid=") || args[2] != "--clear-groups" || args[3] != "--" || !safeAbsPath(args[4]) || args[5] != "--candidate-validate" {
+		return nil, ErrPostgresOutcomeUnknown
+	}
+	command := exec.Command(path, args...)
+	command.Env = append([]string(nil), env...)
+	command.ExtraFiles = []*os.File{listener}
+	command.Stdout = io.Discard
+	command.Stderr = io.Discard
+	if err := command.Start(); err != nil {
+		return nil, ErrPostgresOutcomeUnknown
+	}
+	return execCandidateServerProcess{command: command}, nil
+}
+
+func probeProductionCandidate(ctx context.Context, target string) error {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		return ErrPostgresOutcomeUnknown
+	}
+	client := &http.Client{Timeout: 2 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	response, err := client.Do(request)
+	if err != nil {
+		return ErrPostgresOutcomeUnknown
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return ErrPostgresOutcomeUnknown
+	}
+	return nil
+}
+
+func waitForCandidateProbe(ctx context.Context, probe func(context.Context, string) error, wait <-chan error, target string, timeout time.Duration) error {
+	if probe == nil {
+		return ErrPostgresOutcomeUnknown
+	}
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	deadline, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if err := probe(deadline, target); err == nil {
+			return nil
+		}
+		select {
+		case <-deadline.Done():
+			return ErrPostgresOutcomeUnknown
+		case <-ticker.C:
+		case <-wait:
+			return errCandidateServerExited
+		}
+	}
+}
+
+func terminateCandidateProcess(process candidateServerProcess, wait <-chan error, timeout time.Duration) error {
+	if process == nil || process.Signal(syscall.SIGTERM) != nil {
+		return ErrPostgresOutcomeUnknown
+	}
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	select {
+	case err := <-wait:
+		if err != nil {
+			return ErrPostgresOutcomeUnknown
+		}
+		return nil
+	case <-time.After(timeout):
+		return ErrPostgresOutcomeUnknown
+	}
 }
 
 func runProductionCandidateValidation(ctx context.Context, path string, args, env []string) error {
 	command := exec.CommandContext(ctx, path, args...)
-	// Candidate validation resolves its database.env from the candidate
-	// activation; its argv and environment never carry a DSN.
 	command.Env = append([]string(nil), env...)
-	return command.Run()
+	command.Stdout = io.Discard
+	command.Stderr = io.Discard
+	if err := command.Run(); err != nil {
+		return ErrPostgresOutcomeUnknown
+	}
+	return nil
 }
 
 type productionCommandFactory func(context.Context, string, ...string) *exec.Cmd
@@ -391,24 +667,46 @@ func newUpgradeDatabaseAdapter(plan UpgradeDatabasePlan, control *ProductionPost
 	if err != nil {
 		return nil, ErrPostgresOutcomeUnknown
 	}
-	if validator, ok := plan.Validator.(productionCandidateValidator); ok && !verifiedProductionValidator(plan.CandidateReleaseRoot, manifest, validator.path) {
+	if validator, ok := plan.Validator.(productionCandidateValidator); ok && !verifiedProductionValidator(plan.CandidateReleaseRoot, manifest, validator) {
 		return nil, ErrPostgresOutcomeUnknown
 	}
 	digest := sha256.Sum256(plan.ActiveDatabaseEnv)
-	return &UpgradeDatabaseAdapter{plan: cloneUpgradeDatabasePlan(plan), control: control, snapshotter: snapshotter, activeEnv: activeEnv, activeEnvSHA: hex.EncodeToString(digest[:]), candidateOpen: control.ForCandidate}, nil
+	controlDigest := control.ControlIdentitySHA256()
+	if !validSHA(controlDigest) {
+		return nil, ErrPostgresOutcomeUnknown
+	}
+	return &UpgradeDatabaseAdapter{plan: cloneUpgradeDatabasePlan(plan), control: control, snapshotter: snapshotter, activeEnv: activeEnv, activeEnvSHA: hex.EncodeToString(digest[:]), controlEnvSHA: controlDigest, candidateOpen: control.ForCandidate}, nil
 }
 
-func verifiedProductionValidator(releaseRoot string, manifest Manifest, path string) bool {
-	want := filepath.Join(releaseRoot, "bin/open-card-admin")
-	if path != want {
+func verifiedProductionValidator(releaseRoot string, manifest Manifest, validator productionCandidateValidator) bool {
+	if validator.releaseID != manifest.ReleaseID || validator.adminPath != filepath.Join(releaseRoot, "bin/open-card-admin") || validator.serverPath != filepath.Join(releaseRoot, "bin/open-card-server") {
 		return false
 	}
-	for _, file := range manifest.Files {
-		if file.Path == "bin/open-card-admin" {
-			return file.Mode == 0o755
+	expected := map[string]string{
+		"bin/open-card-admin":  validator.adminPath,
+		"bin/open-card-server": validator.serverPath,
+	}
+	for path, absolute := range expected {
+		var declared *FileDigest
+		for index := range manifest.Files {
+			if manifest.Files[index].Path == path {
+				declared = &manifest.Files[index]
+				break
+			}
+		}
+		if declared == nil || declared.Mode != 0o755 || !validSHA(declared.SHA256) {
+			return false
+		}
+		info, err := os.Lstat(absolute)
+		if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o755 {
+			return false
+		}
+		digest, err := SHA256File(absolute)
+		if err != nil || digest != declared.SHA256 {
+			return false
 		}
 	}
-	return false
+	return true
 }
 
 func cloneUpgradeDatabasePlan(plan UpgradeDatabasePlan) UpgradeDatabasePlan {
@@ -517,9 +815,10 @@ func (a *UpgradeDatabaseAdapter) CreateRestore(ctx context.Context, candidate st
 		return ErrPostgresOutcomeUnknown
 	}
 	if _, err := CreateCandidate(ctx, a.control, CreateCandidateRequest{
-		ActivationID:         a.plan.CandidateActivationID,
-		ExpectedExistingName: a.plan.CandidateDatabaseName,
-		RecoveryEvidence:     a.recoveryEvidence(),
+		ActivationID:          a.plan.CandidateActivationID,
+		ExpectedExistingName:  a.plan.CandidateDatabaseName,
+		ExpectedExistingOwner: a.activeRole(),
+		RecoveryEvidence:      a.recoveryEvidence(),
 	}); err != nil {
 		return upgradeDatabaseError(err)
 	}
@@ -527,6 +826,14 @@ func (a *UpgradeDatabaseAdapter) CreateRestore(ctx context.Context, candidate st
 		return upgradeDatabaseError(err)
 	}
 	return nil
+}
+
+func (a *UpgradeDatabaseAdapter) activeRole() string {
+	role, err := postgresRole(a.plan.ActiveDatabaseEnv)
+	if err != nil {
+		return ""
+	}
+	return role
 }
 
 func (a *UpgradeDatabaseAdapter) recoveryEvidence() string {
@@ -620,6 +927,16 @@ func (a *UpgradeDatabaseAdapter) CandidateDatabaseEnv() []byte {
 		return nil
 	}
 	return append([]byte(nil), a.plan.CandidateDatabaseEnv...)
+}
+
+// ControlIdentitySHA256 exposes the fixed control-env identity as a digest
+// only. The value is retained for a later journal binding; runtime and
+// candidate database.env bytes are intentionally not substituted here.
+func (a *UpgradeDatabaseAdapter) ControlIdentitySHA256() string {
+	if a == nil || !validSHA(a.controlEnvSHA) {
+		return ""
+	}
+	return a.controlEnvSHA
 }
 
 func secureArtifactDirectory(path string) bool {

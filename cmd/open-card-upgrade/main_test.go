@@ -67,6 +67,14 @@ func TestParseUpgradeArgsIsExactAndForbidsDangerousInputs(t *testing.T) {
 	if config, err := parseUpgradeArgs([]string{"recover", "--pending"}); err != nil || !config.pending {
 		t.Fatalf("pending parse failed: %#v %v", config, err)
 	}
+	if config, err := parseUpgradeArgs([]string{"prepare-control"}); err != nil || config.command != "prepare-control" {
+		t.Fatalf("prepare-control parse failed: %#v %v", config, err)
+	}
+	for _, args := range [][]string{{"prepare-control", "--task-root", "/tmp/x"}, {"prepare-control", "--transaction-id", testTransaction}} {
+		if _, err := parseUpgradeArgs(args); err == nil {
+			t.Fatalf("prepare-control accepted flags %#v", args)
+		}
+	}
 	for _, command := range []string{"recover-prepare", "recover-finalize"} {
 		config, err := parseUpgradeArgs([]string{command, "--pending"})
 		if err != nil || !config.pending || config.transactionID != "" {
@@ -77,6 +85,33 @@ func TestParseUpgradeArgsIsExactAndForbidsDangerousInputs(t *testing.T) {
 				t.Fatalf("accepted unsafe boot args %#v", invalid)
 			}
 		}
+	}
+}
+
+func TestPrepareControlIsRootOnlyAndDoesNotConstructRuntime(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	constructed, prepared := false, false
+	deps := upgradeDependencies{
+		euid:             func() int { return 0 },
+		verifyExecutable: func() error { return nil },
+		prepareControl: func(context.Context) (string, error) {
+			prepared = true
+			return testManifest, nil
+		},
+		newRuntime: func(context.Context) (upgradeRuntime, error) {
+			constructed = true
+			return upgradeRuntime{}, nil
+		},
+	}
+	if code := runWithDependencies(context.Background(), []string{"prepare-control"}, &stdout, &stderr, deps); code != exitOK || !prepared || constructed || stderr.Len() != 0 || !strings.Contains(stdout.String(), "control_identity_sha256") || strings.Contains(stdout.String(), "postgres") {
+		t.Fatalf("prepare-control escaped its narrow boundary: code=%d prepared=%v constructed=%v out=%q err=%q", code, prepared, constructed, stdout.String(), stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	prepared = false
+	deps.euid = func() int { return 99 }
+	if code := runWithDependencies(context.Background(), []string{"prepare-control"}, &stdout, &stderr, deps); code != exitPrivilege || prepared || strings.Contains(stderr.String(), "postgres") {
+		t.Fatalf("non-root prepare-control was accepted/leaked: code=%d prepared=%v out=%q err=%q", code, prepared, stdout.String(), stderr.String())
 	}
 }
 
@@ -579,6 +614,15 @@ func (*cliStoreFake) ReadLegacyProjection(context.Context, install.LegacyProject
 func (*cliStoreFake) RecoverLegacyPlan(context.Context, install.ActivationV1, string) (install.LegacyProjectionPlan, error) {
 	return install.LegacyProjectionPlan{}, errors.New("not used")
 }
+func (*cliStoreFake) PrepareEdgeConfig(context.Context, install.EdgeConfigTransitionPlan) (install.EdgeConfigObservationV1, error) {
+	return install.EdgeConfigObservationV1{}, errors.New("not used")
+}
+func (*cliStoreFake) FinalizeEdgeConfig(context.Context, install.EdgeConfigTransitionPlan) (install.EdgeConfigObservationV1, error) {
+	return install.EdgeConfigObservationV1{}, errors.New("not used")
+}
+func (*cliStoreFake) ReadEdgeConfig(context.Context, install.EdgeConfigTransitionPlan) (install.EdgeConfigObservationV1, error) {
+	return install.EdgeConfigObservationV1{}, errors.New("not used")
+}
 func (*cliStoreFake) ReadActivationState(context.Context) (install.UpgradeActivationState, error) {
 	return install.UpgradeActivationState{}, errors.New("not used")
 }
@@ -606,12 +650,15 @@ type cliServiceFake struct{}
 func (*cliServiceFake) Capture(context.Context) (install.ServiceSnapshotV1, error) {
 	return install.ServiceSnapshotV1{}, errors.New("not used")
 }
-func (*cliServiceFake) Quiesce(context.Context) error                  { return errors.New("not used") }
-func (*cliServiceFake) StartInternal(context.Context) error            { return errors.New("not used") }
-func (*cliServiceFake) HealthInternal(context.Context) error           { return errors.New("not used") }
-func (*cliServiceFake) StartEdge(context.Context) error                { return errors.New("not used") }
-func (*cliServiceFake) HealthEdge(context.Context) error               { return errors.New("not used") }
-func (*cliServiceFake) GuardEdge(context.Context) error                { return errors.New("not used") }
+func (*cliServiceFake) Quiesce(context.Context) error        { return errors.New("not used") }
+func (*cliServiceFake) StartInternal(context.Context) error  { return errors.New("not used") }
+func (*cliServiceFake) HealthInternal(context.Context) error { return errors.New("not used") }
+func (*cliServiceFake) StartEdge(context.Context) error      { return errors.New("not used") }
+func (*cliServiceFake) HealthEdge(context.Context) error     { return errors.New("not used") }
+func (*cliServiceFake) GuardEdge(context.Context) error      { return errors.New("not used") }
+func (*cliServiceFake) ValidateEdgeConfig(context.Context, install.EdgeConfigTransitionV1, install.ArtifactV1) (install.EdgeConfigValidationV1, error) {
+	return install.EdgeConfigValidationV1{}, errors.New("not used")
+}
 func (*cliServiceFake) ReloadServerUnit(context.Context, string) error { return errors.New("not used") }
 func (*cliServiceFake) RestoreSnapshot(context.Context, install.ServiceSnapshotV1) error {
 	return errors.New("not used")

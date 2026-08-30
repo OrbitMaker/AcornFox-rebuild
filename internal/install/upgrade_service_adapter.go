@@ -24,6 +24,7 @@ type UpgradeServiceAdapter struct {
 	controller       *ServiceController
 	probes           UpgradeServiceProbeConfig
 	restoredInternal ServiceSnapshotV1
+	edgeValidator    *EdgeConfigValidator
 }
 
 func ProductionUpgradeServiceAdapter() (*UpgradeServiceAdapter, error) {
@@ -31,11 +32,16 @@ func ProductionUpgradeServiceAdapter() (*UpgradeServiceAdapter, error) {
 	if err != nil {
 		return nil, err
 	}
-	adapter, err := TaskUpgradeServiceAdapter(controller, UpgradeServiceProbeConfig{
+	validator, err := ProductionEdgeConfigValidator()
+	if err != nil {
+		_ = controller.Close()
+		return nil, err
+	}
+	adapter, err := TaskUpgradeServiceAdapterWithEdgeConfigValidator(controller, UpgradeServiceProbeConfig{
 		ServerHealth: productionServerHealthURL,
 		ServerReady:  productionServerReadyURL,
 		EdgeHealth:   productionEdgeHealthURL,
-	})
+	}, validator)
 	if err != nil {
 		_ = controller.Close()
 		return nil, err
@@ -44,10 +50,17 @@ func ProductionUpgradeServiceAdapter() (*UpgradeServiceAdapter, error) {
 }
 
 func TaskUpgradeServiceAdapter(controller *ServiceController, probes UpgradeServiceProbeConfig) (*UpgradeServiceAdapter, error) {
+	return TaskUpgradeServiceAdapterWithEdgeConfigValidator(controller, probes, nil)
+}
+
+// TaskUpgradeServiceAdapterWithEdgeConfigValidator is the explicit task-only
+// seam for Caddy validation tests. The production constructor supplies the
+// fixed-root validator itself.
+func TaskUpgradeServiceAdapterWithEdgeConfigValidator(controller *ServiceController, probes UpgradeServiceProbeConfig, validator *EdgeConfigValidator) (*UpgradeServiceAdapter, error) {
 	if controller == nil {
 		return nil, ErrServiceOutcomeUnknown
 	}
-	return &UpgradeServiceAdapter{controller: controller, probes: probes}, nil
+	return &UpgradeServiceAdapter{controller: controller, probes: probes, edgeValidator: validator}, nil
 }
 
 func (a *UpgradeServiceAdapter) Close() error {
@@ -137,6 +150,25 @@ func (a *UpgradeServiceAdapter) ReloadServerUnit(ctx context.Context, expectedFr
 		return ErrServiceOutcomeUnknown
 	}
 	return a.controller.ReloadServerUnit(ctx, expectedFragmentSHA256)
+}
+
+// ValidateEdgeConfig accepts typed non-secret transition evidence and a
+// prepared artifact. It derives every filesystem path and both Caddy argv
+// forms from the transaction/release identities; neither callers nor journals
+// carry an executable or config path.
+func (a *UpgradeServiceAdapter) ValidateEdgeConfig(ctx context.Context, transition EdgeConfigTransitionV1, artifact ArtifactV1) (EdgeConfigValidationV1, error) {
+	if a == nil || a.edgeValidator == nil || !transition.valid() || artifact.Path != edgeConfigPreparedArtifactPath(transition.TransactionID) || artifact.Size < 1 || artifact.SourceDatabase != "" || !validSHA(artifact.SHA256) || artifact.SHA256 != transition.InstalledAfterSHA256 {
+		return EdgeConfigValidationV1{}, ErrServiceOutcomeUnknown
+	}
+	result, err := a.edgeValidator.validate(ctx, edgeConfigValidationInput{Transition: transition, ConfigSHA256: artifact.SHA256})
+	if err != nil {
+		return EdgeConfigValidationV1{}, ErrServiceOutcomeUnknown
+	}
+	validation := EdgeConfigValidationV1{ConfigSHA256: result.ConfigSHA256, CaddySHA256: result.CandidateCaddySHA256, EvidenceSHA256: result.EvidenceSHA256}
+	if !validation.valid() || validation.ConfigSHA256 != transition.InstalledAfterSHA256 || validation.CaddySHA256 != transition.CandidateCaddySHA256 {
+		return EdgeConfigValidationV1{}, ErrServiceOutcomeUnknown
+	}
+	return validation, nil
 }
 
 // RestoreSnapshot deliberately excludes Edge. The engine clears the upgrade

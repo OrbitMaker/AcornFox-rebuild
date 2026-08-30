@@ -15,7 +15,22 @@ func activationFixture() ActivationV1 {
 
 func journalFixture() UpgradeJournalV1 {
 	now := time.Unix(1, 0).UTC()
-	return UpgradeJournalV1{SchemaVersion: 1, TransactionID: "txn-1", Revision: 1, State: JournalPreflighted, CreatedAt: now, UpdatedAt: now, RequestedManifestSHA256: sha("e"), OldActivationID: "activation-old", OldActivationJSONSHA256: sha("f"), CandidateActivationID: "activation-1", CandidateDatabaseName: "open_card_act_0123456789abcdef", ServiceSnapshot: ServiceSnapshotV1{Edge: UnitSnapshotV1{Active: true, Enabled: true}, Agent: UnitSnapshotV1{Active: true}, Server: UnitSnapshotV1{Enabled: true}, Caddy: UnitSnapshotV1{Active: true, Enabled: true}}, History: []JournalTransitionV1{}}
+	return UpgradeJournalV1{SchemaVersion: 1, TransactionID: "txn-1", Revision: 1, State: JournalPreflighted, CreatedAt: now, UpdatedAt: now, RequestedManifestSHA256: sha("e"), UpgradeControlDatabaseEnvSHA256: sha("9"), OldActivationID: "activation-old", OldActivationJSONSHA256: sha("f"), CandidateActivationID: "activation-1", CandidateDatabaseName: "open_card_act_0123456789abcdef", ServiceSnapshot: ServiceSnapshotV1{Edge: UnitSnapshotV1{Active: true, Enabled: true}, Agent: UnitSnapshotV1{Active: true}, Server: UnitSnapshotV1{Enabled: true}, Caddy: UnitSnapshotV1{Active: true, Enabled: true}}, History: []JournalTransitionV1{}}
+}
+
+func edgeTransitionFixture(transactionID, sourceReleaseID, candidateReleaseID string) EdgeConfigTransitionV1 {
+	return EdgeConfigTransitionV1{
+		SchemaVersion:           1,
+		TransactionID:           transactionID,
+		SourceReleaseID:         sourceReleaseID,
+		CandidateReleaseID:      candidateReleaseID,
+		ConsoleHostname:         "console.example.test",
+		SourceTemplateSHA256:    sha("1"),
+		CandidateTemplateSHA256: sha("2"),
+		InstalledBeforeSHA256:   sha("3"),
+		InstalledAfterSHA256:    sha("4"),
+		CandidateCaddySHA256:    sha("5"),
+	}
 }
 
 func appendTransition(j *UpgradeJournalV1, to JournalState) {
@@ -39,6 +54,9 @@ func addEvidence(j *UpgradeJournalV1) {
 	if rank >= 5 {
 		j.CandidateActivationJSONSHA256 = sha("e")
 		j.Validation = &ArtifactV1{Path: artifactPath(j.TransactionID, "validation.json"), SHA256: sha("f"), Size: 1}
+		if j.EdgeConfigTransition != nil {
+			j.EdgeConfigValidation = &EdgeConfigValidationV1{ConfigSHA256: j.EdgeConfigTransition.InstalledAfterSHA256, CaddySHA256: j.EdgeConfigTransition.CandidateCaddySHA256, EvidenceSHA256: sha("6")}
+		}
 	}
 	if failureState(j.State) {
 		j.Failure = &FailureV1{Code: "upgrade_failed", Phase: j.History[len(j.History)-1].From, MessageDigest: sha("a")}
@@ -47,6 +65,19 @@ func addEvidence(j *UpgradeJournalV1) {
 
 func journalAt(state JournalState, legacy bool) UpgradeJournalV1 {
 	j := journalFixture()
+	if legacy {
+		plan := legacyPlanFixture()
+		planned := legacyActivationFixture()
+		digest, err := CanonicalActivationJSONSHA256(planned)
+		if err != nil {
+			panic(err)
+		}
+		j.OldActivationID = planned.ActivationID
+		j.OldActivationJSONSHA256 = digest
+		j.PlannedOldActivation = &planned
+		transition := plan.EdgeConfigTransition.Evidence
+		j.EdgeConfigTransition = &transition
+	}
 	if state == JournalPreflighted {
 		return j
 	}
@@ -157,6 +188,21 @@ func TestUpgradeJournalRejectsMissingAndEarlyEvidence(t *testing.T) {
 			j.CandidateActivationJSONSHA256 = sha("z")
 			return j
 		}()},
+		{"missing edge config validation", func() UpgradeJournalV1 {
+			j := journalAt(JournalValidated, true)
+			j.EdgeConfigValidation = nil
+			return j
+		}()},
+		{"early edge config validation", func() UpgradeJournalV1 {
+			j := journalAt(JournalMigrated, false)
+			j.EdgeConfigValidation = &EdgeConfigValidationV1{ConfigSHA256: sha("4"), CaddySHA256: sha("5"), EvidenceSHA256: sha("6")}
+			return j
+		}()},
+		{"legacy missing edge transition", func() UpgradeJournalV1 {
+			j := journalAt(JournalPreflighted, true)
+			j.EdgeConfigTransition = nil
+			return j
+		}()},
 		{"happy failure", func() UpgradeJournalV1 { j := journalAt(JournalValidated, false); j.Failure = &FailureV1{}; return j }()},
 		{"missing terminal failure", func() UpgradeJournalV1 {
 			j := terminalJournal(JournalAbortedPreSwitch, JournalQuiesced, false)
@@ -168,12 +214,83 @@ func TestUpgradeJournalRejectsMissingAndEarlyEvidence(t *testing.T) {
 			j.History = nil
 			return j
 		}()},
+		{"missing upgrade control identity", func() UpgradeJournalV1 {
+			j := journalAt(JournalPreflighted, false)
+			j.UpgradeControlDatabaseEnvSHA256 = ""
+			return j
+		}()},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if err := tc.j.Validate(); err == nil {
 				t.Fatal("invalid journal accepted")
 			}
 		})
+	}
+}
+
+func TestTransitionEvidenceBindsUpgradeControlIdentity(t *testing.T) {
+	j := journalAt(JournalQuiesced, false)
+	first := transitionEvidenceSHA256(j, JournalPreflighted, JournalQuiesced)
+	j.UpgradeControlDatabaseEnvSHA256 = sha("8")
+	if second := transitionEvidenceSHA256(j, JournalPreflighted, JournalQuiesced); first == second {
+		t.Fatal("control identity did not bind transition evidence")
+	}
+}
+
+func TestEdgeConfigJournalContractsAreStrictAndProgressive(t *testing.T) {
+	legacy := journalAt(JournalValidated, true)
+	if err := legacy.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := MarshalUpgradeJournalV1(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ParseUpgradeJournalV1(raw); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"edge_config_transition"`) || !strings.Contains(string(raw), `"edge_config_validation"`) {
+		t.Fatal("edge configuration evidence did not serialize")
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatal(err)
+	}
+	for _, edit := range []func(map[string]json.RawMessage){
+		func(v map[string]json.RawMessage) { v["edge_config_transition"] = json.RawMessage("null") },
+		func(v map[string]json.RawMessage) { v["edge_config_validation"] = json.RawMessage("null") },
+		func(v map[string]json.RawMessage) {
+			v["edge_config_transition"] = json.RawMessage(`{"schema_version":1,"schema_version":1}`)
+		},
+		func(v map[string]json.RawMessage) { v["edge_config_transition"] = json.RawMessage(`{"unknown":true}`) },
+	} {
+		copyFields := make(map[string]json.RawMessage, len(fields))
+		for k, v := range fields {
+			copyFields[k] = v
+		}
+		edit(copyFields)
+		bad, err := json.Marshal(copyFields)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ParseUpgradeJournalV1(bad); err == nil {
+			t.Fatal("unsafe edge configuration journal accepted")
+		}
+	}
+	for _, edit := range []func(*UpgradeJournalV1){
+		func(j *UpgradeJournalV1) { j.EdgeConfigTransition.TransactionID = "txn-other" },
+		func(j *UpgradeJournalV1) { j.EdgeConfigTransition.ConsoleHostname = "Console.Example.Test" },
+		func(j *UpgradeJournalV1) { j.EdgeConfigTransition.SourceReleaseID = "other-release" },
+		func(j *UpgradeJournalV1) { j.EdgeConfigValidation.ConfigSHA256 = sha("0") },
+	} {
+		broken := legacy
+		transition := *legacy.EdgeConfigTransition
+		validation := *legacy.EdgeConfigValidation
+		broken.EdgeConfigTransition, broken.EdgeConfigValidation = &transition, &validation
+		edit(&broken)
+		if err := broken.Validate(); err == nil {
+			t.Fatal("invalid edge configuration evidence accepted")
+		}
 	}
 }
 

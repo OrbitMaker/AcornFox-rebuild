@@ -25,6 +25,31 @@ type ownerOverrideInfo struct {
 
 func (i ownerOverrideInfo) Sys() any { return &i.stat }
 
+type candidateValidationResult struct{}
+
+func (candidateValidationResult) LastInsertId() (int64, error) { return 0, nil }
+func (candidateValidationResult) RowsAffected() (int64, error) { return 1, nil }
+
+type candidateValidationTestRow struct {
+	value string
+	err   error
+}
+
+func (r candidateValidationTestRow) Scan(destinations ...any) error {
+	if r.err != nil {
+		return r.err
+	}
+	if len(destinations) != 1 {
+		return errors.New("unexpected destination count")
+	}
+	value, ok := destinations[0].(*string)
+	if !ok {
+		return errors.New("unexpected destination")
+	}
+	*value = r.value
+	return nil
+}
+
 func secureTaskRoot(t *testing.T) string {
 	t.Helper()
 	root := t.TempDir()
@@ -190,6 +215,34 @@ func TestAdminRejectsLegacyServerEnvAndRedactsActiveResolutionErrors(t *testing.
 	}
 }
 
+func TestCandidateValidationWriteIsTransactionalAndSanitized(t *testing.T) {
+	var statements []string
+	err := validateCandidateRollbackWrite(
+		context.Background(),
+		func(_ context.Context, statement string, _ ...any) (sql.Result, error) {
+			statements = append(statements, statement)
+			return candidateValidationResult{}, nil
+		},
+		func(_ context.Context, statement string, _ ...any) candidateValidationRow {
+			statements = append(statements, statement)
+			return candidateValidationTestRow{value: "candidate-validation"}
+		},
+	)
+	if err != nil || len(statements) != 3 || !strings.Contains(statements[0], "CREATE TEMPORARY TABLE") || !strings.Contains(statements[1], "INSERT INTO") || !strings.Contains(statements[2], "SELECT value") {
+		t.Fatalf("err=%v statements=%#v", err, statements)
+	}
+	err = validateCandidateRollbackWrite(
+		context.Background(),
+		func(context.Context, string, ...any) (sql.Result, error) {
+			return nil, errors.New("postgresql://candidate:never-log-this@db.example/open_card")
+		},
+		func(context.Context, string, ...any) candidateValidationRow { return candidateValidationTestRow{} },
+	)
+	if err == nil || strings.Contains(err.Error(), "never-log-this") || strings.Contains(err.Error(), "postgres") {
+		t.Fatalf("candidate validation leaked driver error: %v", err)
+	}
+}
+
 func TestAdminBootstrapAndResetOnTaskScopedPostgres(t *testing.T) {
 	dsn := strings.TrimSpace(os.Getenv("OPEN_CARD_ADMIN_TEST_DATABASE_URL"))
 	if dsn == "" {
@@ -210,6 +263,25 @@ func TestAdminBootstrapAndResetOnTaskScopedPostgres(t *testing.T) {
 	}
 	if _, err := database.ExecContext(ctx, string(migration)); err != nil {
 		t.Fatal(err)
+	}
+	tx, err := database.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateCandidateRollbackWrite(ctx, tx.ExecContext, func(ctx context.Context, query string, args ...any) candidateValidationRow {
+		return tx.QueryRowContext(ctx, query, args...)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	var probeExists bool
+	if err := database.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM pg_class WHERE relname = 'open_card_candidate_validation_probe')`).Scan(&probeExists); err != nil {
+		t.Fatal(err)
+	}
+	if probeExists {
+		t.Fatal("candidate validation left a persistent probe table")
 	}
 	store := postgres.NewStore(database)
 	now := time.Unix(1_700_000_000, 0).UTC()

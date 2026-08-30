@@ -8,9 +8,11 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -18,6 +20,16 @@ import (
 type adapterValidationFake struct {
 	got string
 	err error
+}
+
+func TestInspectionOnlySessionHasNoControlIdentityDigest(t *testing.T) {
+	session := newActiveInspectionSession(
+		[]byte("OPEN_CARD_DATABASE_URL=postgresql://user:password@127.0.0.1:5432/open_card?sslmode=require\n"),
+		[]byte("OPEN_CARD_DATABASE_URL=postgresql://user:password@127.0.0.1:5432/open_card_candidate?sslmode=require\n"),
+	)
+	if session.ControlIdentitySHA256() != "" {
+		t.Fatal("inspection-only session exposed a control identity digest")
+	}
 }
 
 func TestProductionPostgresRunnerUsesOnlyValidatedChildEnvironment(t *testing.T) {
@@ -153,13 +165,14 @@ type upgradeAdapterDB struct {
 	*adapterDB
 	exists   bool
 	evidence string
+	owner    string
 }
 
 func (d *upgradeAdapterDB) QueryRowContext(_ context.Context, query string, _ ...any) postgresRow {
 	if query == WaitForNoOpenCardSessionsSQL {
 		return adapterRow{values: []any{0}}
 	}
-	return adapterRow{values: []any{d.exists, d.evidence}}
+	return adapterRow{values: []any{d.exists, d.evidence, d.owner}}
 }
 
 func (f *adapterValidationFake) ValidateCandidate(_ context.Context, id string) error {
@@ -193,6 +206,7 @@ func adapterRelease(t *testing.T) (ReleaseV1, string) {
 	}
 	for path, raw := range map[string][]byte{
 		"bin/open-card-admin":                                     []byte("admin\n"),
+		"bin/open-card-server":                                    []byte("server\n"),
 		"bin/open-card-upgrade":                                   []byte("upgrade\n"),
 		"systemd/open-card-edge.service":                          []byte("edge\n"),
 		"systemd/open-card-upgrade-recover.service":               ProductionUpgradeRecoveryUnitBytes(),
@@ -210,7 +224,7 @@ func adapterRelease(t *testing.T) (ReleaseV1, string) {
 			t.Fatal(err)
 		}
 		mode := os.FileMode(0o644)
-		if path == "bin/open-card-admin" || path == "bin/open-card-upgrade" {
+		if path == "bin/open-card-admin" || path == "bin/open-card-server" || path == "bin/open-card-upgrade" {
 			mode = 0o755
 		}
 		if err := os.WriteFile(full, raw, mode); err != nil {
@@ -304,11 +318,11 @@ func adapterSnapshotter(t *testing.T, pg *fakePG) *PostgresSnapshotter {
 }
 
 func adapterControl(env PostgresProcessEnvironment) *ProductionPostgresControl {
-	return &ProductionPostgresControl{admin: &upgradeAdapterDB{adapterDB: &adapterDB{}}, environment: env}
+	return &ProductionPostgresControl{admin: &upgradeAdapterDB{adapterDB: &adapterDB{}, exists: true, evidence: candidateDatabaseEvidence(strings.Repeat("a", 64)), owner: "user"}, runtimeEnv: env, runtimeRole: "user", controlIdentitySHA: strings.Repeat("b", 64)}
 }
 
 func existingAdapterControl(env PostgresProcessEnvironment) *ProductionPostgresControl {
-	return &ProductionPostgresControl{admin: &upgradeAdapterDB{adapterDB: &adapterDB{}, exists: true, evidence: candidateDatabaseEvidence(strings.Repeat("a", 64))}, environment: env}
+	return &ProductionPostgresControl{admin: &upgradeAdapterDB{adapterDB: &adapterDB{}, exists: true, evidence: candidateDatabaseEvidence(strings.Repeat("a", 64)), owner: "user"}, runtimeEnv: env, runtimeRole: "user", controlIdentitySHA: strings.Repeat("b", 64)}
 }
 
 func TestUpgradeDatabaseAdapterSnapshotRestoreAndValidationAreBound(t *testing.T) {
@@ -322,6 +336,9 @@ func TestUpgradeDatabaseAdapterSnapshotRestoreAndValidationAreBound(t *testing.T
 		t.Fatal(err)
 	}
 	defer adapter.Close()
+	if adapter.ControlIdentitySHA256() != strings.Repeat("b", 64) {
+		t.Fatal("adapter did not retain control identity digest")
+	}
 	if err := adapter.Drain(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -448,18 +465,173 @@ func TestUpgradeDatabaseAdapterRestoresKnownExistingCandidateAndRejectsReleaseSy
 	}
 }
 
-func TestProductionCandidateValidatorUsesFixedSafeInvocation(t *testing.T) {
-	var path string
-	var args, env []string
-	validator := productionCandidateValidator{path: "/opt/open-card/releases/release-rc1/bin/open-card-admin", run: func(_ context.Context, gotPath string, gotArgs, gotEnv []string) error {
-		path, args, env = gotPath, append([]string(nil), gotArgs...), append([]string(nil), gotEnv...)
-		return nil
-	}}
+type candidateProcessFake struct {
+	wait    chan error
+	signals []os.Signal
+}
+
+func (p *candidateProcessFake) Signal(signal os.Signal) error {
+	p.signals = append(p.signals, signal)
+	select {
+	case p.wait <- nil:
+	default:
+	}
+	return nil
+}
+func (p *candidateProcessFake) Wait() error { return <-p.wait }
+
+func candidatePrivilegeSeams() (func(string) (*user.User, error), func(string) error, func() int) {
+	return func(name string) (*user.User, error) {
+			if name != productionCandidateRuntimeUser {
+				return nil, errors.New("unexpected user")
+			}
+			return &user.User{Uid: "123", Gid: "456", Username: productionCandidateRuntimeUser}, nil
+		}, func(path string) error {
+			if path != productionCandidatePrivilegeDropPath {
+				return errors.New("unexpected setpriv")
+			}
+			return nil
+		}, func() int { return 0 }
+}
+
+func TestProductionCandidateValidatorUsesFD3AndSafeInvocation(t *testing.T) {
+	process := &candidateProcessFake{wait: make(chan error, 1)}
+	var serverPath string
+	var serverArgs, serverEnv, probeTargets, adminArgs, adminEnv []string
+	var adminPath string
+	lookup, verify, euid := candidatePrivilegeSeams()
+	validator := productionCandidateValidator{
+		adminPath:        "/opt/open-card/releases/release-rc1/bin/open-card-admin",
+		serverPath:       "/opt/open-card/releases/release-rc1/bin/open-card-server",
+		releaseID:        "release-rc1",
+		setprivPath:      productionCandidatePrivilegeDropPath,
+		lookupUser:       lookup,
+		verifyExecutable: verify,
+		effectiveUID:     euid,
+		resolve: func(id string) (ActiveDatabase, error) {
+			return ActiveDatabase{Activation: ActivationV1{ActivationID: id, Release: ReleaseV1{ID: "release-rc1"}}, DatabaseURL: "postgresql://candidate:never-log-this@127.0.0.1:5432/open_card_candidate?sslmode=require"}, nil
+		},
+		start: func(_ context.Context, path string, args, env []string, fd *os.File) (candidateServerProcess, error) {
+			if fd == nil || fd.Fd() < 3 {
+				t.Fatal("candidate listener FD was not inherited")
+			}
+			serverPath, serverArgs, serverEnv = path, append([]string(nil), args...), append([]string(nil), env...)
+			return process, nil
+		},
+		probe: func(_ context.Context, target string) error {
+			probeTargets = append(probeTargets, target)
+			return nil
+		},
+		runAdmin: func(_ context.Context, path string, args, env []string) error {
+			adminPath, adminArgs, adminEnv = path, append([]string(nil), args...), append([]string(nil), env...)
+			return nil
+		},
+		probeTimeout:       time.Second,
+		terminationTimeout: time.Second,
+	}
 	if err := validator.ValidateCandidate(context.Background(), "activation-new"); err != nil {
 		t.Fatal(err)
 	}
-	if path != "/opt/open-card/releases/release-rc1/bin/open-card-admin" || strings.Join(args, " ") != "candidate validate --activation-id activation-new" || !reflect.DeepEqual(env, productionSubprocessBaseEnv) || strings.Contains(strings.Join(args, "\n")+strings.Join(env, "\n"), "postgres") {
-		t.Fatalf("path=%q args=%v env=%v", path, args, env)
+	if serverPath != productionCandidatePrivilegeDropPath || !reflect.DeepEqual(serverArgs, []string{"--reuid=123", "--regid=456", "--clear-groups", "--", validator.serverPath, "--candidate-validate"}) || adminPath != validator.adminPath || !reflect.DeepEqual(adminArgs, []string{"candidate", "validate", "--activation-id", "activation-new"}) || !reflect.DeepEqual(adminEnv, productionSubprocessBaseEnv) || len(probeTargets) != 2 || !strings.HasSuffix(probeTargets[0], "/healthz") || !strings.HasSuffix(probeTargets[1], "/readyz") || !reflect.DeepEqual(process.signals, []os.Signal{syscall.SIGTERM}) {
+		t.Fatalf("server=%q %v admin=%q %v probes=%v signals=%v", serverPath, serverArgs, adminPath, adminArgs, probeTargets, process.signals)
+	}
+	joined := strings.Join(append(append([]string(nil), serverArgs...), serverEnv...), "\n")
+	for _, forbidden := range []string{"PGPASSWORD=", "PGHOST=", "OPEN_CARD_AGENT_GATEWAY_ADDR", "OPEN_CARD_AUTH_ORIGIN", "HTTP_PROXY", "TENCENT", "AWS_"} {
+		if strings.Contains(joined, forbidden) {
+			t.Fatalf("candidate server leaked forbidden environment %q: %v", forbidden, serverEnv)
+		}
+	}
+	if !strings.Contains(strings.Join(serverEnv, "\n"), "OPEN_CARD_DATABASE_URL=postgresql://candidate:never-log-this") || !strings.Contains(strings.Join(serverEnv, "\n"), "OPEN_CARD_CANDIDATE_LISTEN_FD=3") || !strings.Contains(strings.Join(serverEnv, "\n"), "OPEN_CARD_M6_ENABLED=false") {
+		t.Fatalf("candidate environment is incomplete: %v", serverEnv)
+	}
+}
+
+func candidateValidatorForFailure(process *candidateProcessFake) productionCandidateValidator {
+	lookup, verify, euid := candidatePrivilegeSeams()
+	return productionCandidateValidator{
+		adminPath:        "/opt/open-card/releases/release-rc1/bin/open-card-admin",
+		serverPath:       "/opt/open-card/releases/release-rc1/bin/open-card-server",
+		releaseID:        "release-rc1",
+		setprivPath:      productionCandidatePrivilegeDropPath,
+		lookupUser:       lookup,
+		verifyExecutable: verify,
+		effectiveUID:     euid,
+		resolve: func(id string) (ActiveDatabase, error) {
+			return ActiveDatabase{Activation: ActivationV1{ActivationID: id, Release: ReleaseV1{ID: "release-rc1"}}, DatabaseURL: "postgresql://candidate:never-log-this@127.0.0.1:5432/open_card_candidate?sslmode=require"}, nil
+		},
+		start: func(_ context.Context, _ string, _ []string, _ []string, _ *os.File) (candidateServerProcess, error) {
+			return process, nil
+		},
+		probeTimeout:       100 * time.Millisecond,
+		terminationTimeout: time.Second,
+	}
+}
+
+func TestProductionCandidateValidatorFailsClosedAndCleansProcess(t *testing.T) {
+	t.Run("nonroot cannot launch candidate server", func(t *testing.T) {
+		process := &candidateProcessFake{wait: make(chan error, 1)}
+		validator := candidateValidatorForFailure(process)
+		started := false
+		validator.effectiveUID = func() int { return 501 }
+		validator.start = func(context.Context, string, []string, []string, *os.File) (candidateServerProcess, error) {
+			started = true
+			return process, nil
+		}
+		if err := validator.ValidateCandidate(context.Background(), "activation-new"); !errors.Is(err, ErrPostgresOutcomeUnknown) || started {
+			t.Fatalf("nonroot launch result=%v started=%v", err, started)
+		}
+	})
+	t.Run("server exits before health", func(t *testing.T) {
+		process := &candidateProcessFake{wait: make(chan error, 1)}
+		process.wait <- errors.New("candidate exited")
+		validator := candidateValidatorForFailure(process)
+		validator.probe = func(context.Context, string) error { return ErrPostgresOutcomeUnknown }
+		if err := validator.ValidateCandidate(context.Background(), "activation-new"); !errors.Is(err, ErrPostgresOutcomeUnknown) || len(process.signals) != 0 {
+			t.Fatalf("early exit result=%v signals=%v", err, process.signals)
+		}
+	})
+	t.Run("admin failure terminates candidate", func(t *testing.T) {
+		process := &candidateProcessFake{wait: make(chan error, 1)}
+		validator := candidateValidatorForFailure(process)
+		validator.probe = func(context.Context, string) error { return nil }
+		validator.runAdmin = func(context.Context, string, []string, []string) error {
+			return errors.New("postgresql://candidate:never-log-this")
+		}
+		if err := validator.ValidateCandidate(context.Background(), "activation-new"); !errors.Is(err, ErrPostgresOutcomeUnknown) || !reflect.DeepEqual(process.signals, []os.Signal{syscall.SIGTERM}) || strings.Contains(err.Error(), "never-log-this") {
+			t.Fatalf("admin failure result=%v signals=%v", err, process.signals)
+		}
+	})
+	t.Run("cancelled probe terminates candidate", func(t *testing.T) {
+		process := &candidateProcessFake{wait: make(chan error, 1)}
+		validator := candidateValidatorForFailure(process)
+		validator.probe = func(context.Context, string) error { return ErrPostgresOutcomeUnknown }
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if err := validator.ValidateCandidate(ctx, "activation-new"); !errors.Is(err, ErrPostgresOutcomeUnknown) || !reflect.DeepEqual(process.signals, []os.Signal{syscall.SIGTERM}) {
+			t.Fatalf("cancel result=%v signals=%v", err, process.signals)
+		}
+	})
+}
+
+func TestProductionCandidateValidatorRequiresManifestBoundServerAndAdmin(t *testing.T) {
+	release, root := adapterRelease(t)
+	manifest, err := LoadManifest(filepath.Join(root, "manifest.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	validator := productionCandidateValidator{
+		adminPath:  filepath.Join(root, "bin/open-card-admin"),
+		serverPath: filepath.Join(root, "bin/open-card-server"),
+		releaseID:  release.ID,
+	}
+	if !verifiedProductionValidator(root, manifest, validator) {
+		t.Fatal("manifest-bound candidate executables were rejected")
+	}
+	if err := os.WriteFile(validator.serverPath, []byte("tampered\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if verifiedProductionValidator(root, manifest, validator) {
+		t.Fatal("tampered candidate server was accepted")
 	}
 }
 

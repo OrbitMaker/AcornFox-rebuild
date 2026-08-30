@@ -10,7 +10,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 )
@@ -32,6 +34,7 @@ type UpgradeStore struct {
 	activationWriter *DurableWriter
 	configDurable    *DurableWriter
 	unitDurable      *DurableWriter
+	edgeGID          int
 	legacyVerifier   LegacyReleaseVerifier
 	lock             *upgradeStoreLock
 	// statusReadHook is a task-only test seam used to prove that the
@@ -46,6 +49,14 @@ type UpgradeStore struct {
 type LegacyReleaseVerifier interface {
 	VerifyRC0(releaseID string) (ReleaseV1, []MigrationRow, error)
 	CandidateServerUnit(candidate ReleaseV1) ([]byte, error)
+}
+
+// legacyEdgeConfigVerifier binds both release templates and the candidate
+// Caddy binary to their manifests. It is intentionally optional only for old
+// test fakes; production always uses the fixed implementation below.
+type legacyEdgeConfigVerifier interface {
+	RC0EdgeTemplate(release ReleaseV1) ([]byte, error)
+	CandidateEdgeConfig(candidate ReleaseV1) ([]byte, []byte, error)
 }
 
 type fixedLegacyReleaseVerifier struct {
@@ -261,6 +272,54 @@ func (v fixedLegacyReleaseVerifier) CandidateServerUnit(candidate ReleaseV1) ([]
 	return nil, ErrUpgradeJournalConflict
 }
 
+func edgeManifestFile(manifest Manifest, path string, mode uint32, raw []byte) error {
+	for _, file := range manifest.Files {
+		if file.Path == path && file.Mode == mode && file.SHA256 == sha256Bytes(raw) {
+			return nil
+		}
+	}
+	return ErrUpgradeJournalConflict
+}
+
+func (v fixedLegacyReleaseVerifier) RC0EdgeTemplate(release ReleaseV1) ([]byte, error) {
+	if !validRC0Release(release) {
+		return nil, ErrUpgradeJournalConflict
+	}
+	manifestRaw, err := secureReleaseFile(v.writer, release.ID, "manifest.json", 0o644)
+	if err != nil {
+		return nil, ErrUpgradeJournalConflict
+	}
+	manifest, err := parseReleaseManifest(manifestRaw)
+	if err != nil || sha256Bytes(manifestRaw) != release.ManifestSHA256 || manifest.ReleaseID != release.ID || verifySecureRelease(v.writer, release.ID, manifest) != nil {
+		return nil, ErrUpgradeJournalConflict
+	}
+	raw, err := secureReleaseFile(v.writer, release.ID, edgeTemplateRelativePath, 0o644)
+	if err != nil || edgeManifestFile(manifest, edgeTemplateRelativePath, 0o644, raw) != nil {
+		return nil, ErrUpgradeJournalConflict
+	}
+	return raw, nil
+}
+
+func (v fixedLegacyReleaseVerifier) CandidateEdgeConfig(candidate ReleaseV1) ([]byte, []byte, error) {
+	manifestRaw, err := secureReleaseFile(v.writer, candidate.ID, "manifest.json", 0o644)
+	if err != nil {
+		return nil, nil, ErrUpgradeJournalConflict
+	}
+	manifest, err := parseReleaseManifest(manifestRaw)
+	if err != nil || ValidateProductionCandidate(manifest) != nil || manifest.ReleaseID != candidate.ID || manifest.Version != candidate.Version || manifest.SourceCommit != candidate.SourceCommit || manifest.Architecture != candidate.Architecture || sha256Bytes(manifestRaw) != candidate.ManifestSHA256 || verifySecureRelease(v.writer, candidate.ID, manifest) != nil {
+		return nil, nil, ErrUpgradeJournalConflict
+	}
+	template, err := secureReleaseFile(v.writer, candidate.ID, edgeTemplateRelativePath, 0o644)
+	if err != nil || edgeManifestFile(manifest, edgeTemplateRelativePath, 0o644, template) != nil {
+		return nil, nil, ErrUpgradeJournalConflict
+	}
+	caddy, err := secureReleaseFile(v.writer, candidate.ID, edgeCaddyRelativePath, 0o755)
+	if err != nil || edgeManifestFile(manifest, edgeCaddyRelativePath, 0o755, caddy) != nil {
+		return nil, nil, ErrUpgradeJournalConflict
+	}
+	return template, caddy, nil
+}
+
 type upgradeStoreLock struct {
 	file  *os.File
 	tx    string
@@ -280,6 +339,14 @@ func (l *upgradeStoreLock) Release() error {
 }
 
 func ProductionUpgradeStore() (*UpgradeStore, error) {
+	edge, err := user.LookupGroup(productionCaddyUser)
+	if err != nil {
+		return nil, ErrUpgradeJournalConflict
+	}
+	edgeGID, err := strconv.Atoi(edge.Gid)
+	if err != nil || edgeGID < 0 {
+		return nil, ErrUpgradeJournalConflict
+	}
 	d, e := ProductionDurableWriter("/var/lib/open-card")
 	if e != nil {
 		return nil, e
@@ -302,9 +369,18 @@ func ProductionUpgradeStore() (*UpgradeStore, error) {
 		_ = c.Close()
 		return nil, e
 	}
-	return &UpgradeStore{root: "/", lockPath: "/run/lock/open-card-upgrade.lock", production: true, dataWriter: d, activationWriter: a, configDurable: c, unitDurable: u, legacyVerifier: fixedLegacyReleaseVerifier{writer: a}}, nil
+	return &UpgradeStore{root: "/", lockPath: "/run/lock/open-card-upgrade.lock", production: true, dataWriter: d, activationWriter: a, configDurable: c, unitDurable: u, edgeGID: edgeGID, legacyVerifier: fixedLegacyReleaseVerifier{writer: a}}, nil
 }
 func TaskUpgradeStore(root string, uid, gid int) (*UpgradeStore, error) {
+	return TaskUpgradeStoreWithEdgeOwner(root, uid, gid, gid)
+}
+
+// TaskUpgradeStoreWithEdgeOwner is a task-only owner seam. Production never
+// accepts a caller-selected Edge principal.
+func TaskUpgradeStoreWithEdgeOwner(root string, uid, gid, edgeGID int) (*UpgradeStore, error) {
+	if edgeGID < 0 {
+		return nil, ErrUpgradeJournalConflict
+	}
 	if err := verifyPreparedTaskUpgradeLock(root, uid, gid); err != nil {
 		return nil, err
 	}
@@ -330,7 +406,7 @@ func TaskUpgradeStore(root string, uid, gid int) (*UpgradeStore, error) {
 		_ = c.Close()
 		return nil, e
 	}
-	return &UpgradeStore{root: root, lockPath: filepath.Join(root, "run/lock/open-card-upgrade.lock"), dataWriter: d, activationWriter: a, configDurable: c, unitDurable: u, legacyVerifier: fixedLegacyReleaseVerifier{writer: a}}, nil
+	return &UpgradeStore{root: root, lockPath: filepath.Join(root, "run/lock/open-card-upgrade.lock"), dataWriter: d, activationWriter: a, configDurable: c, unitDurable: u, edgeGID: edgeGID, legacyVerifier: fixedLegacyReleaseVerifier{writer: a}}, nil
 }
 
 // PrepareTaskUpgradeLock is the explicit task-root setup surface for tests.
@@ -1332,12 +1408,39 @@ func (s *UpgradeStore) readLegacyPlan(request UpgradePreflightRequest) (LegacyPr
 	if validateLegacyCandidateUnit(candidateUnit) != nil {
 		return LegacyProjectionPlan{}, ErrUpgradeJournalConflict
 	}
+	edge, err := s.readLegacyEdgePlan(request.TransactionID, release, request.CandidateRelease)
+	if err != nil {
+		return LegacyProjectionPlan{}, ErrUpgradeJournalConflict
+	}
 	previous, err := s.legacyPrevious()
 	if err != nil {
 		return LegacyProjectionPlan{}, ErrUpgradeJournalConflict
 	}
 	activationID := "legacy-" + sha256Bytes([]byte(request.TransactionID))[:24]
-	return LegacyProjectionPlan{TransactionID: request.TransactionID, ActivationID: activationID, Release: release, CurrentTarget: legacyReleaseTarget(release), ExpectedMigration: "0023", ExpectedRowsSHA256: evidence.RowsSHA256, DatabaseEnv: databaseEnv, DatabaseEnvSHA256: sha256Bytes(databaseEnv), ServerEnvBeforeSHA256: sha256Bytes(envRaw), ServerEnvAfterSHA256: sha256Bytes(afterRaw), ServerUnitBeforeSHA256: sha256Bytes(unitBefore), ServerUnitAfterSHA256: sha256Bytes(candidateUnit), ServerUnitReleaseID: request.CandidateRelease.ID, Previous: previous}, nil
+	return LegacyProjectionPlan{TransactionID: request.TransactionID, ActivationID: activationID, Release: release, CurrentTarget: legacyReleaseTarget(release), ExpectedMigration: "0023", ExpectedRowsSHA256: evidence.RowsSHA256, DatabaseEnv: databaseEnv, DatabaseEnvSHA256: sha256Bytes(databaseEnv), ServerEnvBeforeSHA256: sha256Bytes(envRaw), ServerEnvAfterSHA256: sha256Bytes(afterRaw), ServerUnitBeforeSHA256: sha256Bytes(unitBefore), ServerUnitAfterSHA256: sha256Bytes(candidateUnit), ServerUnitReleaseID: request.CandidateRelease.ID, EdgeConfigTransition: edge, Previous: previous}, nil
+}
+
+func (s *UpgradeStore) readLegacyEdgePlan(tx string, source, candidate ReleaseV1) (*EdgeConfigTransitionPlan, error) {
+	if s == nil || !validID(tx) {
+		return nil, ErrUpgradeJournalConflict
+	}
+	verifier, ok := s.legacyVerifier.(legacyEdgeConfigVerifier)
+	if !ok {
+		return nil, ErrUpgradeJournalConflict
+	}
+	sourceTemplate, err := verifier.RC0EdgeTemplate(source)
+	if err != nil {
+		return nil, ErrUpgradeJournalConflict
+	}
+	candidateTemplate, caddy, err := verifier.CandidateEdgeConfig(candidate)
+	if err != nil {
+		return nil, ErrUpgradeJournalConflict
+	}
+	installed, err := s.readInstalledEdgeConfig()
+	if err != nil {
+		return nil, ErrUpgradeJournalConflict
+	}
+	return edgeConfigTransitionPlan(tx, source, candidate, sourceTemplate, installed, candidateTemplate, caddy)
 }
 
 func legacyMigrationRows(manifest Manifest) ([]MigrationRow, error) {
@@ -1430,12 +1533,220 @@ func (s *UpgradeStore) readLegacyServerEnv() ([]byte, error) {
 	}
 	return w.ReadMetadata("server.env")
 }
+
+const installedEdgeConfigName = "open-card-edge.Caddyfile"
+
+// readFixedOwnedFile deliberately does not expose a generic public file API.
+// Edge configuration is the sole non-root-readable deployment file in the
+// upgrade store, so its fixed name/mode/owner remain local to this package.
+func readFixedOwnedFile(w *DurableWriter, name string, mode os.FileMode, uid, gid int) ([]byte, error) {
+	if w == nil || w.ops == nil || w.VerifyLiveRoot() != nil || cleanRelative(name) != nil || w.requireSecureParents(filepath.Dir(name)) != nil {
+		return nil, ErrUpgradeJournalConflict
+	}
+	file, err := w.ops.OpenFile(name, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, ErrUpgradeJournalConflict
+	}
+	defer w.ops.CloseFile(file)
+	info, err := w.ops.Stat(file)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != mode || verifyOwner(info, uid, gid) != nil {
+		return nil, ErrUpgradeJournalConflict
+	}
+	raw, err := io.ReadAll(file)
+	if err != nil {
+		return nil, ErrUpgradeJournalConflict
+	}
+	info, err = w.ops.Stat(file)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != mode || verifyOwner(info, uid, gid) != nil || w.VerifyLiveRoot() != nil {
+		return nil, ErrUpgradeJournalConflict
+	}
+	return raw, nil
+}
+
+func writeFixedOwnedFile(w *DurableWriter, name string, value []byte, mode os.FileMode, uid, gid int) error {
+	if w == nil || w.ops == nil || w.VerifyLiveRoot() != nil || cleanRelative(name) != nil || w.requireSecureParents(filepath.Dir(name)) != nil || uid < 0 || gid < 0 {
+		return ErrUpgradeJournalConflict
+	}
+	temporary, err := durableTempName(filepath.Dir(name), ".open-card-edge-")
+	if err != nil {
+		return ErrUpgradeJournalConflict
+	}
+	file, err := w.ops.OpenFile(temporary, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, mode)
+	if err != nil {
+		return ErrUpgradeJournalConflict
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			_ = w.ops.CloseFile(file)
+		}
+		_ = w.ops.Remove(temporary)
+	}()
+	if _, err = w.ops.Write(file, value); err != nil || w.ops.Sync(file) != nil || w.ops.Chmod(file, mode) != nil || w.ops.Chown(file, uid, gid) != nil {
+		return ErrUpgradeJournalConflict
+	}
+	info, err := w.ops.Stat(file)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != mode || verifyOwner(info, uid, gid) != nil || w.ops.Sync(file) != nil || w.ops.CloseFile(file) != nil {
+		return ErrUpgradeJournalConflict
+	}
+	closed = true
+	if err := w.ops.Rename(temporary, name); err != nil {
+		return ErrUpgradeJournalConflict
+	}
+	if err := w.syncParent(filepath.Dir(name)); err != nil {
+		return fmt.Errorf("%w: %v", ErrDurableCommitUnknown, err)
+	}
+	if err := w.VerifyLiveRoot(); err != nil {
+		return fmt.Errorf("%w: %v", ErrDurableCommitUnknown, err)
+	}
+	return nil
+}
+
+func (s *UpgradeStore) readInstalledEdgeConfig() ([]byte, error) {
+	w, err := s.configWriter()
+	if err != nil || s.edgeGID < 0 {
+		return nil, ErrUpgradeJournalConflict
+	}
+	return readFixedOwnedFile(w, installedEdgeConfigName, 0o640, w.uid, s.edgeGID)
+}
+
+func (s *UpgradeStore) edgeArtifactWriter(tx string, create bool) (*DurableWriter, error) {
+	if s == nil || s.dataWriter == nil || !validID(tx) {
+		return nil, ErrUpgradeJournalConflict
+	}
+	if create {
+		if _, err := s.dataWriter.CreateChildDirectory("upgrade-artifacts", activationSlotDirMode); err != nil && !errors.Is(err, ErrDurableCommitUnknown) {
+			return nil, ErrUpgradeJournalConflict
+		}
+	}
+	artifacts, err := s.dataWriter.OpenChildWriter("upgrade-artifacts", activationSlotDirMode)
+	if err != nil {
+		return nil, ErrUpgradeJournalConflict
+	}
+	if create {
+		if _, err := artifacts.CreateChildDirectory(tx, activationSlotDirMode); err != nil && !errors.Is(err, ErrDurableCommitUnknown) {
+			_ = artifacts.Close()
+			return nil, ErrUpgradeJournalConflict
+		}
+	}
+	child, openErr := artifacts.OpenChildWriter(tx, activationSlotDirMode)
+	closeErr := artifacts.Close()
+	if openErr != nil || closeErr != nil {
+		if child != nil {
+			_ = child.Close()
+		}
+		return nil, ErrUpgradeJournalConflict
+	}
+	return child, nil
+}
 func (s *UpgradeStore) readSystemdUnit() ([]byte, error) {
 	w, err := s.unitWriter()
 	if err != nil {
 		return nil, err
 	}
 	return w.ReadSystemdServerUnit()
+}
+
+// PrepareEdgeConfig publishes only the transaction-owned candidate artifact.
+// The installed Caddyfile is deliberately read but never changed here.
+func (s *UpgradeStore) PrepareEdgeConfig(_ context.Context, plan EdgeConfigTransitionPlan) (EdgeConfigObservationV1, error) {
+	if !s.ownsLock() || s.lock.tx != plan.Evidence.TransactionID || plan.Validate() != nil || s.edgeGID < 0 {
+		return EdgeConfigObservationV1{}, ErrUpgradeJournalConflict
+	}
+	installed, err := s.readInstalledEdgeConfig()
+	if err != nil || bytesSHA256(installed) != plan.Evidence.InstalledBeforeSHA256 {
+		return EdgeConfigObservationV1{}, ErrUpgradeJournalConflict
+	}
+	artifact, err := s.edgeArtifactWriter(plan.Evidence.TransactionID, true)
+	if err != nil {
+		return EdgeConfigObservationV1{}, err
+	}
+	defer artifact.Close()
+	if raw, readErr := readFixedOwnedFile(artifact, edgeConfigArtifactName, 0o640, artifact.uid, s.edgeGID); readErr == nil {
+		if !bytes.Equal(raw, plan.Target) {
+			return EdgeConfigObservationV1{}, ErrUpgradeJournalConflict
+		}
+	} else if !errors.Is(readErr, os.ErrNotExist) {
+		// readFixedOwnedFile deliberately sanitizes failures; an absent artifact
+		// is the only condition that permits the no-replace write.
+		info, lstatErr := artifact.ops.Lstat(edgeConfigArtifactName)
+		if !errors.Is(lstatErr, os.ErrNotExist) || info != nil {
+			return EdgeConfigObservationV1{}, ErrUpgradeJournalConflict
+		}
+		if writeErr := writeFixedOwnedFile(artifact, edgeConfigArtifactName, plan.Target, 0o640, artifact.uid, s.edgeGID); writeErr != nil {
+			if !errors.Is(writeErr, ErrDurableCommitUnknown) {
+				return EdgeConfigObservationV1{}, writeErr
+			}
+			// A post-rename uncertainty is reconciled by the exact reread below.
+		}
+	}
+	prepared, err := readFixedOwnedFile(artifact, edgeConfigArtifactName, 0o640, artifact.uid, s.edgeGID)
+	if err != nil || !bytes.Equal(prepared, plan.Target) {
+		return EdgeConfigObservationV1{}, ErrUpgradeJournalConflict
+	}
+	if after, err := s.readInstalledEdgeConfig(); err != nil || !bytes.Equal(after, installed) {
+		return EdgeConfigObservationV1{}, ErrUpgradeJournalConflict
+	}
+	observation := EdgeConfigObservationV1{PreparedConfigSHA256: bytesSHA256(prepared), InstalledConfigSHA256: bytesSHA256(installed), CaddySHA256: plan.Evidence.CandidateCaddySHA256}
+	if observation.Validate() != nil || observation.PreparedConfigSHA256 != plan.Evidence.InstalledAfterSHA256 || observation.InstalledConfigSHA256 != plan.Evidence.InstalledBeforeSHA256 {
+		return EdgeConfigObservationV1{}, ErrUpgradeJournalConflict
+	}
+	return observation, nil
+}
+
+// FinalizeEdgeConfig performs the fixed installed-file before/after CAS after
+// Caddy has validated the prepared artifact. Exact replay is a no-op; every
+// other installed value is a conflict.
+func (s *UpgradeStore) FinalizeEdgeConfig(_ context.Context, plan EdgeConfigTransitionPlan) (EdgeConfigObservationV1, error) {
+	if !s.ownsLock() || s.lock.tx != plan.Evidence.TransactionID || plan.Validate() != nil || s.edgeGID < 0 {
+		return EdgeConfigObservationV1{}, ErrUpgradeJournalConflict
+	}
+	artifact, err := s.edgeArtifactWriter(plan.Evidence.TransactionID, false)
+	if err != nil {
+		return EdgeConfigObservationV1{}, err
+	}
+	prepared, readErr := readFixedOwnedFile(artifact, edgeConfigArtifactName, 0o640, artifact.uid, s.edgeGID)
+	closeErr := artifact.Close()
+	if readErr != nil || closeErr != nil || !bytes.Equal(prepared, plan.Target) {
+		return EdgeConfigObservationV1{}, ErrUpgradeJournalConflict
+	}
+	installed, err := s.readInstalledEdgeConfig()
+	if err != nil {
+		return EdgeConfigObservationV1{}, ErrUpgradeJournalConflict
+	}
+	if bytesSHA256(installed) == plan.Evidence.InstalledBeforeSHA256 {
+		w, err := s.configWriter()
+		if err != nil {
+			return EdgeConfigObservationV1{}, ErrUpgradeJournalConflict
+		}
+		if writeErr := writeFixedOwnedFile(w, installedEdgeConfigName, plan.Target, 0o640, w.uid, s.edgeGID); writeErr != nil && !errors.Is(writeErr, ErrDurableCommitUnknown) {
+			return EdgeConfigObservationV1{}, writeErr
+		}
+	} else if bytesSHA256(installed) != plan.Evidence.InstalledAfterSHA256 {
+		return EdgeConfigObservationV1{}, ErrUpgradeJournalConflict
+	}
+	return s.ReadEdgeConfig(context.Background(), plan)
+}
+
+func (s *UpgradeStore) ReadEdgeConfig(_ context.Context, plan EdgeConfigTransitionPlan) (EdgeConfigObservationV1, error) {
+	if s == nil || plan.Validate() != nil || s.edgeGID < 0 {
+		return EdgeConfigObservationV1{}, ErrUpgradeJournalConflict
+	}
+	artifact, err := s.edgeArtifactWriter(plan.Evidence.TransactionID, false)
+	if err != nil {
+		return EdgeConfigObservationV1{}, err
+	}
+	prepared, readErr := readFixedOwnedFile(artifact, edgeConfigArtifactName, 0o640, artifact.uid, s.edgeGID)
+	closeErr := artifact.Close()
+	installed, installedErr := s.readInstalledEdgeConfig()
+	if readErr != nil || closeErr != nil || installedErr != nil || !bytes.Equal(prepared, plan.Target) || bytesSHA256(installed) != plan.Evidence.InstalledAfterSHA256 {
+		return EdgeConfigObservationV1{}, ErrUpgradeJournalConflict
+	}
+	observation := EdgeConfigObservationV1{PreparedConfigSHA256: bytesSHA256(prepared), InstalledConfigSHA256: bytesSHA256(installed), CaddySHA256: plan.Evidence.CandidateCaddySHA256}
+	if observation.Validate() != nil {
+		return EdgeConfigObservationV1{}, ErrUpgradeJournalConflict
+	}
+	return observation, nil
 }
 
 func (s *UpgradeStore) candidateServerUnit(release ReleaseV1) ([]byte, error) {
@@ -1736,6 +2047,14 @@ func (s *UpgradeStore) RecoverLegacyPlan(_ context.Context, plannedOld Activatio
 	if sha256Bytes(manifestRaw) != requestedManifestSHA || manifest.ReleaseID != lp.ServerUnitReleaseID {
 		return LegacyProjectionPlan{}, ErrUpgradeJournalConflict
 	}
+	candidate := ReleaseV1{ID: manifest.ReleaseID, Version: manifest.Version, SourceCommit: manifest.SourceCommit, Architecture: manifest.Architecture, ManifestSHA256: sha256Bytes(manifestRaw)}
+	if !candidate.valid() {
+		return LegacyProjectionPlan{}, ErrUpgradeJournalConflict
+	}
+	edge, err := s.readLegacyEdgePlan(plannedOld.CreatedByTransactionID, plannedOld.Release, candidate)
+	if err != nil {
+		return LegacyProjectionPlan{}, ErrUpgradeJournalConflict
+	}
 	previous, err := s.legacyPrevious()
 	if err != nil {
 		return LegacyProjectionPlan{}, ErrUpgradeJournalConflict
@@ -1768,7 +2087,7 @@ func (s *UpgradeStore) RecoverLegacyPlan(_ context.Context, plannedOld Activatio
 	if err != nil {
 		return LegacyProjectionPlan{}, ErrUpgradeJournalConflict
 	}
-	plan := LegacyProjectionPlan{TransactionID: plannedOld.CreatedByTransactionID, ActivationID: plannedOld.ActivationID, Release: plannedOld.Release, CurrentTarget: lp.Target, ExpectedMigration: plannedOld.Database.Migration, ExpectedRowsSHA256: plannedOld.Database.SchemaMigrationsSHA256, DatabaseEnv: databaseEnv, DatabaseEnvSHA256: plannedOld.DatabaseEnvSHA256, ServerEnvBeforeSHA256: lp.ServerEnvBeforeSHA256, ServerEnvAfterSHA256: lp.ServerEnvAfterSHA256, ServerUnitBeforeSHA256: lp.ServerUnitBeforeSHA256, ServerUnitAfterSHA256: lp.ServerUnitAfterSHA256, ServerUnitReleaseID: lp.ServerUnitReleaseID, Previous: previous}
+	plan := LegacyProjectionPlan{TransactionID: plannedOld.CreatedByTransactionID, ActivationID: plannedOld.ActivationID, Release: plannedOld.Release, CurrentTarget: lp.Target, ExpectedMigration: plannedOld.Database.Migration, ExpectedRowsSHA256: plannedOld.Database.SchemaMigrationsSHA256, DatabaseEnv: databaseEnv, DatabaseEnvSHA256: plannedOld.DatabaseEnvSHA256, ServerEnvBeforeSHA256: lp.ServerEnvBeforeSHA256, ServerEnvAfterSHA256: lp.ServerEnvAfterSHA256, ServerUnitBeforeSHA256: lp.ServerUnitBeforeSHA256, ServerUnitAfterSHA256: lp.ServerUnitAfterSHA256, ServerUnitReleaseID: lp.ServerUnitReleaseID, EdgeConfigTransition: edge, Previous: previous}
 	if plan.Validate() != nil || sha256Bytes(databaseEnv) != plan.DatabaseEnvSHA256 || (sha256Bytes(envRaw) != plan.ServerEnvBeforeSHA256 && sha256Bytes(envRaw) != plan.ServerEnvAfterSHA256) || (sha256Bytes(afterRaw) != plan.ServerEnvAfterSHA256 && sha256Bytes(envRaw) != plan.ServerEnvAfterSHA256) || (sha256Bytes(unit) != plan.ServerUnitBeforeSHA256 && sha256Bytes(unit) != plan.ServerUnitAfterSHA256) {
 		return LegacyProjectionPlan{}, ErrUpgradeJournalConflict
 	}

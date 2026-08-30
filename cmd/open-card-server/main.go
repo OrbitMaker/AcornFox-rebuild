@@ -39,6 +39,13 @@ import (
 func main() {
 	lifecycleContext, lifecycleCancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer lifecycleCancel()
+	if len(os.Args) > 1 {
+		if err := runCandidateValidation(lifecycleContext, os.Args[1:], os.Getenv); err != nil {
+			log.Printf("open-card candidate validation: %v", err)
+			os.Exit(1)
+		}
+		return
+	}
 	address := os.Getenv("OPEN_CARD_SERVER_ADDR")
 	if address == "" {
 		address = "127.0.0.1:8080"

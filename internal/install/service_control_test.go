@@ -57,6 +57,347 @@ func TestProductionServiceRunnerDoesNotInheritAmbientEnvironment(t *testing.T) {
 	}
 }
 
+type fakeEdgeConfigRunner struct {
+	commands []EdgeConfigCommand
+	run      func(context.Context, EdgeConfigCommand) CommandResult
+}
+
+func (r *fakeEdgeConfigRunner) RunEdgeConfig(ctx context.Context, command EdgeConfigCommand) CommandResult {
+	r.commands = append(r.commands, EdgeConfigCommand{Executable: command.Executable, Arguments: append([]string(nil), command.Arguments...), User: command.User, UID: command.UID, GID: command.GID, Environment: append([]string(nil), command.Environment...)})
+	if r.run != nil {
+		return r.run(ctx, command)
+	}
+	return CommandResult{}
+}
+
+func TestProductionEdgeConfigRunnerUsesFixedPrivilegeBoundaryAndEnvironment(t *testing.T) {
+	for key, value := range map[string]string{
+		"OPEN_CARD_DATABASE_URL": "postgresql://ambient:secret@example.invalid/open_card",
+		"PGPASSWORD":             "ambient-secret",
+		"HTTP_PROXY":             "http://proxy.invalid",
+		"TENCENT_SECRET_ID":      "cloud-secret",
+		"ACCESS_TOKEN":           "token-secret",
+	} {
+		t.Setenv(key, value)
+	}
+	var captured *exec.Cmd
+	runner := productionEdgeConfigRunner{verify: func(path string) (os.FileInfo, error) {
+		if path != productionCaddyPrivilegeDropPath {
+			t.Fatalf("verified path = %q", path)
+		}
+		return serverUnitFileInfo{mode: 0o755, uid: 0, gid: 0}, nil
+	}, command: func(ctx context.Context, path string, args ...string) *exec.Cmd {
+		if path != productionCaddyPrivilegeDropPath {
+			t.Fatalf("privilege path = %q", path)
+		}
+		want := []string{"--reuid=123", "--regid=456", "--clear-groups", "--", "/opt/open-card/releases/release-new/bin/caddy", "validate", "--config", "/var/lib/open-card/upgrade-artifacts/txn-1/open-card-edge.Caddyfile", "--adapter", "caddyfile"}
+		if !reflect.DeepEqual(args, want) {
+			t.Fatalf("privilege argv = %#v, want %#v", args, want)
+		}
+		captured = exec.CommandContext(ctx, "/usr/bin/true")
+		return captured
+	}}
+	result := runner.RunEdgeConfig(context.Background(), EdgeConfigCommand{Executable: "/opt/open-card/releases/release-new/bin/caddy", Arguments: []string{"validate", "--config", "/var/lib/open-card/upgrade-artifacts/txn-1/open-card-edge.Caddyfile", "--adapter", "caddyfile"}, User: productionCaddyUser, UID: 123, GID: 456, Environment: productionEdgeRuntimePaths.environment()})
+	if result.Err != nil || result.ExitCode != 0 {
+		t.Fatalf("runner result = %#v", result)
+	}
+	if captured == nil || !reflect.DeepEqual(captured.Env, productionEdgeRuntimePaths.environment()) {
+		t.Fatalf("child env = %#v", captured)
+	}
+	for _, entry := range captured.Env {
+		if strings.Contains(entry, "secret") || strings.Contains(entry, "proxy") || strings.Contains(entry, "token") || strings.Contains(entry, "postgres") {
+			t.Fatalf("ambient value leaked into child env: %q", entry)
+		}
+	}
+	if unsafe := runner.RunEdgeConfig(context.Background(), EdgeConfigCommand{Executable: "/opt/open-card/releases/release-new/bin/caddy", Arguments: []string{"validate"}, User: productionCaddyUser, UID: 123, GID: 456, Environment: append(productionSubprocessBaseEnv, "OPEN_CARD_DATABASE_URL=postgresql://secret@invalid")}); unsafe.Err == nil {
+		t.Fatal("production runner accepted a caller-selected environment")
+	}
+}
+
+func TestSafeProductionExecutableRequiresSecureAncestorsAndRereadsLeaf(t *testing.T) {
+	const executable = "/secure/root/bin/tool"
+	entries := map[string]os.FileInfo{
+		"/":                serverUnitFileInfo{mode: os.ModeDir | 0o755, uid: 0, gid: 0, directory: true},
+		"/secure":          serverUnitFileInfo{mode: os.ModeDir | 0o755, uid: 0, gid: 0, directory: true},
+		"/secure/root":     serverUnitFileInfo{mode: os.ModeDir | 0o755, uid: 0, gid: 0, directory: true},
+		"/secure/root/bin": serverUnitFileInfo{mode: os.ModeDir | 0o755, uid: 0, gid: 0, directory: true},
+		executable:         serverUnitFileInfo{mode: 0o755, uid: 0, gid: 0},
+	}
+	lstat := func(path string) (os.FileInfo, error) {
+		info, ok := entries[path]
+		if !ok {
+			return nil, os.ErrNotExist
+		}
+		return info, nil
+	}
+	if _, err := safeExecutablePath(executable, 0, 0, lstat); err != nil {
+		t.Fatalf("safe path rejected: %v", err)
+	}
+	for name, replace := range map[string]os.FileInfo{
+		"writable ancestor": serverUnitFileInfo{mode: os.ModeDir | 0o775, uid: 0, gid: 0, directory: true},
+		"symlink ancestor":  serverUnitFileInfo{mode: os.ModeSymlink | 0o777, uid: 0, gid: 0},
+		"nonroot ancestor":  serverUnitFileInfo{mode: os.ModeDir | 0o755, uid: 1, gid: 0, directory: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			original := entries["/secure/root"]
+			entries["/secure/root"] = replace
+			t.Cleanup(func() { entries["/secure/root"] = original })
+			if _, err := safeExecutablePath(executable, 0, 0, lstat); err == nil {
+				t.Fatal("unsafe ancestor accepted")
+			}
+		})
+	}
+	// Rechecking at use time rejects a leaf replacement after a prior success.
+	entries[executable] = serverUnitFileInfo{mode: 0o777, uid: 0, gid: 0}
+	if _, err := safeExecutablePath(executable, 0, 0, lstat); err == nil {
+		t.Fatal("replaced executable leaf accepted")
+	}
+}
+
+func TestEdgeConfigValidatorFixedInputsAndEvidence(t *testing.T) {
+	validator, input, roots := edgeValidatorFixture(t)
+	runner := validator.runner.(*fakeEdgeConfigRunner)
+	result, err := validator.validate(context.Background(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ConfigSHA256 != input.ConfigSHA256 || result.CandidateCaddySHA256 != input.Transition.CandidateCaddySHA256 || result.EvidenceSHA256 != edgeConfigEvidenceSHA256(input) {
+		t.Fatalf("validation result = %#v", result)
+	}
+	want := []EdgeConfigCommand{
+		{Executable: filepath.Join(roots.active, "releases", input.Transition.CandidateReleaseID, "bin/caddy"), Arguments: []string{"validate", "--config", filepath.Join(roots.data, "upgrade-artifacts", input.Transition.TransactionID, edgeConfigArtifactName), "--adapter", "caddyfile"}, User: productionCaddyUser, UID: os.Getuid(), GID: os.Getgid(), Environment: validator.runtime.environment()},
+		{Executable: filepath.Join(roots.active, "releases", input.Transition.CandidateReleaseID, "bin/caddy"), Arguments: []string{"adapt", "--config", filepath.Join(roots.data, "upgrade-artifacts", input.Transition.TransactionID, edgeConfigArtifactName), "--adapter", "caddyfile", "--validate"}, User: productionCaddyUser, UID: os.Getuid(), GID: os.Getgid(), Environment: validator.runtime.environment()},
+	}
+	if !reflect.DeepEqual(runner.commands, want) {
+		t.Fatalf("edge commands = %#v, want %#v", runner.commands, want)
+	}
+}
+
+func TestEdgeConfigValidatorRejectsUnsafeInputsAndUnknownOutcomes(t *testing.T) {
+	t.Run("symlink config", func(t *testing.T) {
+		validator, input, roots := edgeValidatorFixture(t)
+		config := filepath.Join(roots.data, "upgrade-artifacts", input.Transition.TransactionID, edgeConfigArtifactName)
+		outside := filepath.Join(t.TempDir(), "outside")
+		if err := os.WriteFile(outside, []byte("outside"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(config); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outside, config); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := validator.validate(context.Background(), input); !errors.Is(err, ErrServiceOutcomeUnknown) {
+			t.Fatalf("symlink error = %v", err)
+		}
+		if len(validator.runner.(*fakeEdgeConfigRunner).commands) != 0 {
+			t.Fatal("symlink config reached caddy runner")
+		}
+	})
+	t.Run("unsafe caddy mode", func(t *testing.T) {
+		validator, input, roots := edgeValidatorFixture(t)
+		if err := os.Chmod(filepath.Join(roots.active, "releases", input.Transition.CandidateReleaseID, edgeCaddyRelativePath), 0o777); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := validator.validate(context.Background(), input); !errors.Is(err, ErrServiceOutcomeUnknown) {
+			t.Fatalf("mode error = %v", err)
+		}
+	})
+	t.Run("unsafe config mode", func(t *testing.T) {
+		validator, input, roots := edgeValidatorFixture(t)
+		if err := os.Chmod(filepath.Join(roots.data, "upgrade-artifacts", input.Transition.TransactionID, edgeConfigArtifactName), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := validator.validate(context.Background(), input); !errors.Is(err, ErrServiceOutcomeUnknown) {
+			t.Fatalf("config mode error = %v", err)
+		}
+	})
+	t.Run("edge service env rejects path mode owner and grammar drift", func(t *testing.T) {
+		tests := []struct {
+			name   string
+			mutate func(*testing.T, *EdgeConfigValidator, edgeConfigValidationInput, edgeValidatorRoots)
+		}{
+			{"symlink", func(t *testing.T, validator *EdgeConfigValidator, _ edgeConfigValidationInput, roots edgeValidatorRoots) {
+				path := filepath.Join(roots.data, "open-card-edge.env")
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(filepath.Join(roots.data, "missing.env"), path); err != nil {
+					t.Fatal(err)
+				}
+			}},
+			{"mode", func(t *testing.T, _ *EdgeConfigValidator, _ edgeConfigValidationInput, roots edgeValidatorRoots) {
+				if err := os.Chmod(filepath.Join(roots.data, "open-card-edge.env"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}},
+			{"owner", func(t *testing.T, validator *EdgeConfigValidator, _ edgeConfigValidationInput, _ edgeValidatorRoots) {
+				validator.edgeGID++
+			}},
+			{"extra", func(t *testing.T, validator *EdgeConfigValidator, _ edgeConfigValidationInput, roots edgeValidatorRoots) {
+				writeEdgeEnvFixture(t, validator, filepath.Join(roots.data, "open-card-edge.env"), "UNRELATED=value\n")
+			}},
+			{"duplicate", func(t *testing.T, validator *EdgeConfigValidator, _ edgeConfigValidationInput, roots edgeValidatorRoots) {
+				writeEdgeEnvFixture(t, validator, filepath.Join(roots.data, "open-card-edge.env"), "HOME="+validator.runtime.home+"\n")
+			}},
+			{"comment", func(t *testing.T, validator *EdgeConfigValidator, _ edgeConfigValidationInput, roots edgeValidatorRoots) {
+				writeEdgeEnvFixture(t, validator, filepath.Join(roots.data, "open-card-edge.env"), edgeEnvCanonicalComment+"\n")
+			}},
+			{"runtime-dir", func(t *testing.T, validator *EdgeConfigValidator, _ edgeConfigValidationInput, _ edgeValidatorRoots) {
+				if err := os.Chmod(validator.runtime.log, 0o777); err != nil {
+					t.Fatal(err)
+				}
+			}},
+		}
+		for _, test := range tests {
+			t.Run(test.name, func(t *testing.T) {
+				validator, input, roots := edgeValidatorFixture(t)
+				test.mutate(t, validator, input, roots)
+				if _, err := validator.validate(context.Background(), input); !errors.Is(err, ErrServiceOutcomeUnknown) {
+					t.Fatalf("%s error = %v", test.name, err)
+				}
+				if len(validator.runner.(*fakeEdgeConfigRunner).commands) != 0 {
+					t.Fatalf("%s reached caddy runner", test.name)
+				}
+			})
+		}
+	})
+	t.Run("runner output is never surfaced", func(t *testing.T) {
+		validator, input, _ := edgeValidatorFixture(t)
+		validator.runner.(*fakeEdgeConfigRunner).run = func(context.Context, EdgeConfigCommand) CommandResult {
+			return CommandResult{ExitCode: 1, Output: "postgresql://secret@invalid", Err: errors.New("token-secret")}
+		}
+		if _, err := validator.validate(context.Background(), input); !errors.Is(err, ErrServiceOutcomeUnknown) || strings.Contains(err.Error(), "secret") || strings.Contains(err.Error(), "postgres") {
+			t.Fatalf("runner error = %v", err)
+		}
+	})
+	t.Run("timeout is unknown", func(t *testing.T) {
+		validator, input, _ := edgeValidatorFixture(t)
+		validator.timeout = 10 * time.Millisecond
+		validator.runner.(*fakeEdgeConfigRunner).run = func(ctx context.Context, _ EdgeConfigCommand) CommandResult {
+			return CommandResult{ExitCode: -1, Output: "secret", Err: ctx.Err()}
+		}
+		if _, err := validator.validate(context.Background(), input); !errors.Is(err, ErrServiceOutcomeUnknown) {
+			t.Fatalf("timeout error = %v", err)
+		}
+	})
+	t.Run("post command drift is rejected", func(t *testing.T) {
+		validator, input, roots := edgeValidatorFixture(t)
+		calls := 0
+		validator.runner.(*fakeEdgeConfigRunner).run = func(context.Context, EdgeConfigCommand) CommandResult {
+			calls++
+			if calls == 1 {
+				_ = os.WriteFile(filepath.Join(roots.data, "upgrade-artifacts", input.Transition.TransactionID, edgeConfigArtifactName), []byte("changed"), 0o644)
+			}
+			return CommandResult{}
+		}
+		if _, err := validator.validate(context.Background(), input); !errors.Is(err, ErrServiceOutcomeUnknown) {
+			t.Fatalf("post-command drift error = %v", err)
+		}
+	})
+	t.Run("service environment drift is rejected after command", func(t *testing.T) {
+		validator, input, roots := edgeValidatorFixture(t)
+		calls := 0
+		validator.runner.(*fakeEdgeConfigRunner).run = func(context.Context, EdgeConfigCommand) CommandResult {
+			calls++
+			if calls == 1 {
+				writeEdgeEnvFixture(t, validator, filepath.Join(roots.data, "open-card-edge.env"), "# changed\n")
+			}
+			return CommandResult{}
+		}
+		if _, err := validator.validate(context.Background(), input); !errors.Is(err, ErrServiceOutcomeUnknown) {
+			t.Fatalf("service environment drift error = %v", err)
+		}
+	})
+}
+
+type edgeValidatorRoots struct{ active, data string }
+
+func edgeValidatorFixture(t *testing.T) (*EdgeConfigValidator, edgeConfigValidationInput, edgeValidatorRoots) {
+	t.Helper()
+	base := t.TempDir()
+	roots := edgeValidatorRoots{active: filepath.Join(base, "active"), data: filepath.Join(base, "data")}
+	if err := os.Mkdir(roots.active, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(roots.data, 0o711); err != nil {
+		t.Fatal(err)
+	}
+	tx, releaseID := "txn-edge-1", "release-edge-1"
+	release := filepath.Join(roots.active, "releases", releaseID)
+	if err := os.MkdirAll(release, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]struct {
+		raw  []byte
+		mode os.FileMode
+	}{
+		edgeCaddyRelativePath:                                     {[]byte("caddy-binary\n"), 0o755},
+		edgeTemplateRelativePath:                                  {[]byte("edge template\n"), 0o644},
+		"bin/open-card-admin":                                     {[]byte("admin\n"), 0o755},
+		"bin/open-card-upgrade":                                   {[]byte("upgrade\n"), 0o755},
+		"systemd/open-card-edge.service":                          {[]byte("edge\n"), 0o644},
+		"systemd/open-card-upgrade-recover.service":               {ProductionUpgradeRecoveryUnitBytes(), 0o644},
+		"systemd/open-card-upgrade-safe.target":                   {ProductionUpgradeSafeBootTargetBytes(), 0o644},
+		"systemd/open-card-upgrade-finalize.service":              {ProductionUpgradeFinalizeUnitBytes(), 0o644},
+		"systemd/open-card-edge.service.d/10-upgrade-marker.conf": {ProductionUpgradeEdgeMarkerDropInBytes(), 0o644},
+		"migrations/control-plane/0024_dns_change_ledger.sql":     {[]byte("-- migration\n"), 0o644},
+		"web/dist/index.html":                                     {[]byte("web\n"), 0o644},
+		"docs/licenses/licenses-manifest.json":                    {[]byte("{}\n"), 0o644},
+		"sbom.spdx.json":                                          {[]byte("{}\n"), 0o644},
+		"source-manifest.sha256":                                  {[]byte("source\n"), 0o644},
+	}
+	manifestFiles := make([]FileDigest, 0, len(files))
+	for path, file := range files {
+		full := filepath.Join(release, filepath.FromSlash(path))
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, file.raw, file.mode); err != nil {
+			t.Fatal(err)
+		}
+		manifestFiles = append(manifestFiles, FileDigest{Path: path, SHA256: sha256Bytes(file.raw), Mode: uint32(file.mode)})
+	}
+	manifest := Manifest{SchemaVersion: ManifestSchemaVersion, Product: ManifestProduct, Version: ProductionCandidateVersion, ReleaseID: releaseID, Architecture: "amd64", MigrationVersion: CurrentMigrationVersion, SourceCommit: strings.Repeat("a", 40), NMinusOne: &NMinusOne{Version: ProductionNMinusOneVersion, MigrationVersion: "0023", SourceCommit: RC0SourceCommit, ReleaseManifestSHA256: RC0ReleaseManifestSHA256, ArchiveSHA256: RC0ArchiveSHA256, BundleManifestSHA256: RC0BundleManifestSHA256}, Protocol: AgentProtocolVersion, ConfigDir: DefaultConfigDir, DataDir: DefaultDataDir, Compatibility: Compatibility{MinDataVersion: 23, MaxDataVersion: 24, MinAgentProtocol: PreviousAgentProtocol, MaxAgentProtocol: AgentProtocolVersion}, Files: manifestFiles}
+	if err := SaveManifest(filepath.Join(release, "manifest.json"), manifest); err != nil {
+		t.Fatal(err)
+	}
+	artifactDir := filepath.Join(roots.data, "upgrade-artifacts", tx)
+	if err := os.MkdirAll(artifactDir, 0o711); err != nil {
+		t.Fatal(err)
+	}
+	config := []byte("example.test {\n respond \"ok\"\n}\n")
+	if err := os.WriteFile(filepath.Join(artifactDir, edgeConfigArtifactName), config, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	input := edgeConfigValidationInput{Transition: EdgeConfigTransitionV1{SchemaVersion: 1, TransactionID: tx, SourceReleaseID: "release-old", CandidateReleaseID: releaseID, ConsoleHostname: "console.example.test", SourceTemplateSHA256: strings.Repeat("1", 64), CandidateTemplateSHA256: sha256Bytes(files[edgeTemplateRelativePath].raw), InstalledBeforeSHA256: strings.Repeat("2", 64), InstalledAfterSHA256: sha256Bytes(config), CandidateCaddySHA256: sha256Bytes(files[edgeCaddyRelativePath].raw)}, ConfigSHA256: sha256Bytes(config)}
+	runner := &fakeEdgeConfigRunner{}
+	validator, err := TaskEdgeConfigValidator(roots.active, roots.data, os.Getuid(), os.Getgid(), os.Getuid(), os.Getgid(), runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{validator.runtime.home, validator.runtime.data, validator.runtime.config, validator.runtime.log} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeEdgeEnvFixture(t, validator, filepath.Join(roots.data, "open-card-edge.env"), "")
+	return validator, input, roots
+}
+
+func writeEdgeEnvFixture(t *testing.T, validator *EdgeConfigValidator, path, suffix string) {
+	t.Helper()
+	env := edgeEnvCanonicalComment + "\n" + strings.Join([]string{
+		"HOME=" + validator.runtime.home,
+		"XDG_DATA_HOME=" + validator.runtime.data,
+		"XDG_CONFIG_HOME=" + validator.runtime.config,
+		"OPEN_CARD_EDGE_LOG_DIR=" + validator.runtime.log,
+	}, "\n") + "\n" + suffix
+	if err := os.WriteFile(path, []byte(env), 0o640); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestServiceControllerAndAdapterCloseAreIdempotent(t *testing.T) {
 	writerOps := &serviceCloseOps{err: errors.New("unit writer close")}
 	controller := &ServiceController{unitWriter: &DurableWriter{ops: writerOps}}

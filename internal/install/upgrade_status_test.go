@@ -154,6 +154,8 @@ func TestUpgradeStatusTerminalPointerMatrixAndStableRead(t *testing.T) {
 		journal.OldActivationID = planned.ActivationID
 		journal.OldActivationJSONSHA256 = activationDigest(t, planned)
 		journal.PlannedOldActivation = &planned
+		transition := edgeTransitionFixture(journal.TransactionID, planned.Release.ID, "release-status-candidate")
+		journal.EdgeConfigTransition = &transition
 		writeStatusJournal(t, store, journal)
 		status, err := store.ReadUpgradeStatus(context.Background(), journal.TransactionID)
 		if err != nil || status.Disposition != UpgradeStatusRecoveryRequired || status.ActiveID != "" || !status.Recovery {

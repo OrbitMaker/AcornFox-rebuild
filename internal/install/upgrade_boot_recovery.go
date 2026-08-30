@@ -146,6 +146,9 @@ func (e *UpgradeEngine) bootReconcileLegacy(ctx context.Context, j *UpgradeJourn
 		return errors.New("legacy database session unavailable")
 	}
 	defer database.Close() // Close is not a service action; the journal remains recoverable on failure.
+	if !recoveryControlIdentityMatches(*j, database) {
+		return errors.New("upgrade control identity mismatch")
+	}
 	request := ActiveDatabaseInspectionRequest{DatabaseEnv: plan.DatabaseEnv, ExpectedMigration: plan.ExpectedMigration, ExpectedRowsSHA256: plan.ExpectedRowsSHA256, ExpectedRowCount: 23}
 	inspected, err := database.InspectActive(ctx, request)
 	if err != nil || !sameDatabase(inspected, old.Database) {

@@ -169,6 +169,30 @@ func TestUpgradeServiceAdapterStartEdgePreservesEnabledPolicy(t *testing.T) {
 	}
 }
 
+func TestUpgradeServiceAdapterValidatesOnlyPreparedCandidateEdgeConfig(t *testing.T) {
+	validator, input, _ := edgeValidatorFixture(t)
+	adapter, err := TaskUpgradeServiceAdapterWithEdgeConfigValidator(taskController(t, newFakeServiceRunner(), func() (bool, error) { return false, nil }), UpgradeServiceProbeConfig{}, validator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact := ArtifactV1{Path: edgeConfigPreparedArtifactPath(input.Transition.TransactionID), SHA256: input.ConfigSHA256, Size: 1}
+	validation, err := adapter.ValidateEdgeConfig(context.Background(), input.Transition, artifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if validation.ConfigSHA256 != input.Transition.InstalledAfterSHA256 || validation.CaddySHA256 != input.Transition.CandidateCaddySHA256 || !validSHA(validation.EvidenceSHA256) {
+		t.Fatalf("validation = %#v", validation)
+	}
+	artifact.Path = "/tmp/caller-selected.Caddyfile"
+	if _, err := adapter.ValidateEdgeConfig(context.Background(), input.Transition, artifact); !errors.Is(err, ErrServiceOutcomeUnknown) {
+		t.Fatalf("unsafe artifact path error = %v", err)
+	}
+	withoutValidator := adapterForTest(t, newFakeServiceRunner(), func() (bool, error) { return false, nil }, UpgradeServiceProbeConfig{})
+	if _, err := withoutValidator.ValidateEdgeConfig(context.Background(), input.Transition, ArtifactV1{}); !errors.Is(err, ErrServiceOutcomeUnknown) {
+		t.Fatalf("missing validator error = %v", err)
+	}
+}
+
 func TestUpgradeServiceAdapterReloadServerUnitForwardsOnlyFixedControllerOperation(t *testing.T) {
 	raw := []byte("[Service]\nExecStart=/opt/open-card/current/bin/open-card-server\n")
 	reader := &serverUnitReaderFixture{results: []serverUnitReadResult{{raw: raw, info: safeServerUnitInfoFixture()}, {raw: raw, info: safeServerUnitInfoFixture()}}}

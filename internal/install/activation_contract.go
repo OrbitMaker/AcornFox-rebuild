@@ -105,29 +105,59 @@ type ServiceSnapshotV1 struct {
 	Caddy    UnitSnapshotV1 `json:"caddy"`
 	BuildKit UnitSnapshotV1 `json:"buildkit"`
 }
+
+// EdgeConfigTransitionV1 binds the non-secret Caddy configuration transition
+// to one upgrade transaction. The prepared configuration path is deliberately
+// not serialized or caller-provided; it is derived from TransactionID.
+type EdgeConfigTransitionV1 struct {
+	SchemaVersion           int    `json:"schema_version"`
+	TransactionID           string `json:"transaction_id"`
+	SourceReleaseID         string `json:"source_release_id"`
+	CandidateReleaseID      string `json:"candidate_release_id"`
+	ConsoleHostname         string `json:"console_hostname"`
+	SourceTemplateSHA256    string `json:"source_template_sha256"`
+	CandidateTemplateSHA256 string `json:"candidate_template_sha256"`
+	InstalledBeforeSHA256   string `json:"installed_before_sha256"`
+	InstalledAfterSHA256    string `json:"installed_after_sha256"`
+	CandidateCaddySHA256    string `json:"candidate_caddy_sha256"`
+}
+
+// EdgeConfigValidationV1 records only stable digests from Caddy validation;
+// command output and configuration bytes never enter the journal.
+type EdgeConfigValidationV1 struct {
+	ConfigSHA256   string `json:"config_sha256"`
+	CaddySHA256    string `json:"caddy_sha256"`
+	EvidenceSHA256 string `json:"evidence_sha256"`
+}
 type UpgradeJournalV1 struct {
-	SchemaVersion                          int                   `json:"schema_version"`
-	TransactionID                          string                `json:"transaction_id"`
-	Revision                               int64                 `json:"revision"`
-	State                                  JournalState          `json:"state"`
-	CreatedAt                              time.Time             `json:"created_at"`
-	UpdatedAt                              time.Time             `json:"updated_at"`
-	RequestedManifestSHA256                string                `json:"requested_manifest_sha256"`
-	OldActivationID                        string                `json:"old_activation_id"`
-	OldActivationJSONSHA256                string                `json:"old_activation_json_sha256"`
-	PreUpgradePreviousActivationID         string                `json:"pre_upgrade_previous_activation_id,omitempty"`
-	PreUpgradePreviousActivationJSONSHA256 string                `json:"pre_upgrade_previous_activation_json_sha256,omitempty"`
-	PlannedOldActivation                   *ActivationV1         `json:"planned_old_activation,omitempty"`
-	CandidateActivationID                  string                `json:"candidate_activation_id"`
-	CandidateActivationJSONSHA256          string                `json:"candidate_activation_json_sha256,omitempty"`
-	CandidateDatabaseName                  string                `json:"candidate_database_name"`
-	CandidateDatabase                      *DatabaseV1           `json:"candidate_database,omitempty"`
-	Snapshot                               *ArtifactV1           `json:"snapshot,omitempty"`
-	Migration                              *MigrationV1          `json:"migration,omitempty"`
-	Validation                             *ArtifactV1           `json:"validation,omitempty"`
-	ServiceSnapshot                        ServiceSnapshotV1     `json:"service_snapshot"`
-	Failure                                *FailureV1            `json:"failure,omitempty"`
-	History                                []JournalTransitionV1 `json:"history"`
+	SchemaVersion           int          `json:"schema_version"`
+	TransactionID           string       `json:"transaction_id"`
+	Revision                int64        `json:"revision"`
+	State                   JournalState `json:"state"`
+	CreatedAt               time.Time    `json:"created_at"`
+	UpdatedAt               time.Time    `json:"updated_at"`
+	RequestedManifestSHA256 string       `json:"requested_manifest_sha256"`
+	// UpgradeControlDatabaseEnvSHA256 binds a mutable upgrade transaction to
+	// the separately-authenticated control database environment without ever
+	// serializing its bytes or DSN.
+	UpgradeControlDatabaseEnvSHA256        string                  `json:"upgrade_control_database_env_sha256"`
+	OldActivationID                        string                  `json:"old_activation_id"`
+	OldActivationJSONSHA256                string                  `json:"old_activation_json_sha256"`
+	PreUpgradePreviousActivationID         string                  `json:"pre_upgrade_previous_activation_id,omitempty"`
+	PreUpgradePreviousActivationJSONSHA256 string                  `json:"pre_upgrade_previous_activation_json_sha256,omitempty"`
+	PlannedOldActivation                   *ActivationV1           `json:"planned_old_activation,omitempty"`
+	CandidateActivationID                  string                  `json:"candidate_activation_id"`
+	CandidateActivationJSONSHA256          string                  `json:"candidate_activation_json_sha256,omitempty"`
+	CandidateDatabaseName                  string                  `json:"candidate_database_name"`
+	CandidateDatabase                      *DatabaseV1             `json:"candidate_database,omitempty"`
+	Snapshot                               *ArtifactV1             `json:"snapshot,omitempty"`
+	Migration                              *MigrationV1            `json:"migration,omitempty"`
+	Validation                             *ArtifactV1             `json:"validation,omitempty"`
+	EdgeConfigTransition                   *EdgeConfigTransitionV1 `json:"edge_config_transition,omitempty"`
+	EdgeConfigValidation                   *EdgeConfigValidationV1 `json:"edge_config_validation,omitempty"`
+	ServiceSnapshot                        ServiceSnapshotV1       `json:"service_snapshot"`
+	Failure                                *FailureV1              `json:"failure,omitempty"`
+	History                                []JournalTransitionV1   `json:"history"`
 }
 
 // CanonicalServiceSnapshotSHA256 returns the digest of the fixed service
@@ -142,6 +172,9 @@ func CanonicalServiceSnapshotSHA256(snapshot ServiceSnapshotV1) string {
 func validID(v string) bool            { return installID.MatchString(v) }
 func validSHA(v string) bool           { return sha256Text.MatchString(v) }
 func artifactPath(tx, n string) string { return filepath.Join(upgradeArtifactsRoot, tx, n) }
+func edgeConfigPreparedArtifactPath(tx string) string {
+	return artifactPath(tx, "open-card-edge.Caddyfile")
+}
 func safeAbsPath(value string) bool {
 	return filepath.IsAbs(value) && filepath.Clean(value) == value && !strings.Contains(value, "\x00")
 }
@@ -150,6 +183,28 @@ func (r ReleaseV1) valid() bool {
 }
 func (d DatabaseV1) valid() bool {
 	return validID(d.Name) && regexp.MustCompile(`^[0-9]{4}$`).MatchString(d.Migration) && validSHA(d.SchemaMigrationsSHA256)
+}
+func normalizedConsoleHostname(value string) bool {
+	if value == "" || len(value) > 253 || value != strings.ToLower(value) || strings.HasSuffix(value, ".") || strings.ContainsAny(value, " \t\r\n\x00/:@") {
+		return false
+	}
+	for _, label := range strings.Split(value, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, r := range label {
+			if !((r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-') {
+				return false
+			}
+		}
+	}
+	return true
+}
+func (e EdgeConfigTransitionV1) valid() bool {
+	return e.SchemaVersion == 1 && validID(e.TransactionID) && validID(e.SourceReleaseID) && validID(e.CandidateReleaseID) && e.SourceReleaseID != e.CandidateReleaseID && normalizedConsoleHostname(e.ConsoleHostname) && validSHA(e.SourceTemplateSHA256) && validSHA(e.CandidateTemplateSHA256) && validSHA(e.InstalledBeforeSHA256) && validSHA(e.InstalledAfterSHA256) && validSHA(e.CandidateCaddySHA256)
+}
+func (e EdgeConfigValidationV1) valid() bool {
+	return validSHA(e.ConfigSHA256) && validSHA(e.CaddySHA256) && validSHA(e.EvidenceSHA256)
 }
 func stateOK(v JournalState) bool {
 	switch v {
@@ -247,7 +302,7 @@ func CanonicalActivationJSONSHA256(a ActivationV1) (string, error) {
 	return hex.EncodeToString(digest[:]), nil
 }
 func (j UpgradeJournalV1) Validate() error {
-	if j.SchemaVersion != 1 || !validID(j.TransactionID) || j.History == nil || j.Revision != int64(len(j.History)+1) || !stateOK(j.State) || j.CreatedAt.IsZero() || j.UpdatedAt.Before(j.CreatedAt) || !validSHA(j.RequestedManifestSHA256) || !validID(j.OldActivationID) || !validSHA(j.OldActivationJSONSHA256) || !validID(j.CandidateActivationID) || !candidateDatabaseName.MatchString(j.CandidateDatabaseName) {
+	if j.SchemaVersion != 1 || !validID(j.TransactionID) || j.History == nil || j.Revision != int64(len(j.History)+1) || !stateOK(j.State) || j.CreatedAt.IsZero() || j.UpdatedAt.Before(j.CreatedAt) || !validSHA(j.RequestedManifestSHA256) || !validSHA(j.UpgradeControlDatabaseEnvSHA256) || !validID(j.OldActivationID) || !validSHA(j.OldActivationJSONSHA256) || !validID(j.CandidateActivationID) || !candidateDatabaseName.MatchString(j.CandidateDatabaseName) {
 		return fmt.Errorf("invalid upgrade journal v1")
 	}
 	if (j.PreUpgradePreviousActivationID == "") != (j.PreUpgradePreviousActivationJSONSHA256 == "") || j.PreUpgradePreviousActivationID != "" && (!validID(j.PreUpgradePreviousActivationID) || !validSHA(j.PreUpgradePreviousActivationJSONSHA256)) {
@@ -262,6 +317,16 @@ func (j UpgradeJournalV1) Validate() error {
 		if err != nil || digest != j.OldActivationJSONSHA256 {
 			return fmt.Errorf("invalid planned old activation digest")
 		}
+	}
+	if j.EdgeConfigTransition != nil {
+		if !j.EdgeConfigTransition.valid() || j.EdgeConfigTransition.TransactionID != j.TransactionID {
+			return fmt.Errorf("invalid edge configuration transition")
+		}
+		if j.PlannedOldActivation != nil && j.EdgeConfigTransition.SourceReleaseID != j.PlannedOldActivation.Release.ID {
+			return fmt.Errorf("legacy edge configuration source release mismatch")
+		}
+	} else if j.PlannedOldActivation != nil {
+		return fmt.Errorf("missing legacy edge configuration transition")
 	}
 	if len(j.History) == 0 {
 		if j.Revision != 1 || j.State != JournalPreflighted || !j.UpdatedAt.Equal(j.CreatedAt) {
@@ -301,6 +366,13 @@ func (j UpgradeJournalV1) Validate() error {
 	}
 	if rank < 5 && (j.CandidateActivationJSONSHA256 != "" || j.Validation != nil) {
 		return fmt.Errorf("early progressive validation")
+	}
+	if rank >= 5 && j.EdgeConfigTransition != nil {
+		if j.EdgeConfigValidation == nil || !j.EdgeConfigValidation.valid() || j.EdgeConfigValidation.ConfigSHA256 != j.EdgeConfigTransition.InstalledAfterSHA256 || j.EdgeConfigValidation.CaddySHA256 != j.EdgeConfigTransition.CandidateCaddySHA256 {
+			return fmt.Errorf("invalid progressive edge configuration validation")
+		}
+	} else if j.EdgeConfigValidation != nil {
+		return fmt.Errorf("early edge configuration validation")
 	}
 	if failureState(j.State) {
 		if !validFailure(j.Failure) {
@@ -396,7 +468,7 @@ func requireJournalFields(raw []byte, j UpgradeJournalV1) error {
 	if err := json.Unmarshal(raw, &fields); err != nil {
 		return err
 	}
-	required := []string{"schema_version", "transaction_id", "revision", "state", "created_at", "updated_at", "requested_manifest_sha256", "old_activation_id", "old_activation_json_sha256", "candidate_activation_id", "candidate_database_name", "service_snapshot", "history"}
+	required := []string{"schema_version", "transaction_id", "revision", "state", "created_at", "updated_at", "requested_manifest_sha256", "upgrade_control_database_env_sha256", "old_activation_id", "old_activation_json_sha256", "candidate_activation_id", "candidate_database_name", "service_snapshot", "history"}
 	for _, name := range required {
 		value, ok := fields[name]
 		if !ok || bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
@@ -405,6 +477,11 @@ func requireJournalFields(raw []byte, j UpgradeJournalV1) error {
 	}
 	if value, present := fields["planned_old_activation"]; present && bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
 		return fmt.Errorf("invalid planned old activation field")
+	}
+	for _, name := range []string{"edge_config_transition", "edge_config_validation"} {
+		if value, present := fields[name]; present && bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			return fmt.Errorf("invalid %s field", name)
+		}
 	}
 	rank, err := j.effectiveEvidenceRank()
 	if err != nil {
@@ -419,6 +496,7 @@ func requireJournalFields(raw []byte, j UpgradeJournalV1) error {
 		{"migration", rank >= 4},
 		{"candidate_activation_json_sha256", rank >= 5},
 		{"validation", rank >= 5},
+		{"edge_config_validation", rank >= 5 && j.EdgeConfigTransition != nil},
 		{"failure", failureState(j.State)},
 	}
 	for _, check := range checks {

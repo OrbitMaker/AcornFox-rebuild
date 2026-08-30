@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
 usage() {
   cat >&2 <<'USAGE'
 usage: upgrade.sh --root TASK_ROOT --bundle BUNDLE [--url URL] [--offline]
@@ -12,13 +11,56 @@ usage: upgrade.sh --root TASK_ROOT --bundle BUNDLE [--url URL] [--offline]
                   [--confirm-installation-id UPGRADE:ID]
                   [--test-safe-prefix PATH] [--activate] [--dry-run]
 
-The control-plane data backup is made before the release pointer changes.
-If the health command fails, install.sh atomically restores the old pointer.
-System-root PostgreSQL upgrades are fail-closed until temporary-database
-validation and atomic database swapping are implemented.
+Task-root upgrades retain the legacy backup/migration flow. System-root
+upgrades stage the immutable RC1 substrate, provision the fixed upgrade
+control identity, enable the boot-safe target, then delegate only to
+open-card-upgrade.
 USAGE
 }
 die() { echo "open-card upgrade: $*" >&2; exit 1; }
+
+# Resolve a fixed production executable through only root-owned symlinks and
+# root-owned non-group/world-writable parent directories. The final file must
+# be executable, regular, root-owned, and non-group/world-writable.
+verified_production_program() {
+  local candidate=$1 target parent canonical component current owner mode numeric IFS
+  [[ "$candidate" = /* && -n "$candidate" ]] || return 1
+  while [[ -L "$candidate" ]]; do
+    owner=$(/usr/bin/stat -c '%u' -- "$candidate") || return 1
+    [[ "$owner" = 0 ]] || return 1
+    target=$(/usr/bin/readlink -- "$candidate") || return 1
+    [[ -n "$target" ]] || return 1
+    if [[ "$target" = /* ]]; then
+      candidate=$target
+    else
+      parent=$(/usr/bin/dirname -- "$candidate") || return 1
+      candidate="$parent/$target"
+    fi
+  done
+  [[ -f "$candidate" && ! -L "$candidate" && -x "$candidate" ]] || return 1
+  parent=$(/usr/bin/dirname -- "$candidate") || return 1
+  canonical=$(cd -P -- "$parent" && pwd -P) || return 1
+  candidate="$canonical/$(/usr/bin/basename -- "$candidate")"
+  [[ -f "$candidate" && ! -L "$candidate" && -x "$candidate" ]] || return 1
+  owner=$(/usr/bin/stat -c '%u' /) || return 1
+  mode=$(/usr/bin/stat -c '%a' /) || return 1
+  [[ "$owner" = 0 && "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+  numeric=$((8#$mode))
+  (( (numeric & 8#022) == 0 )) || return 1
+  current=/
+  IFS=/ read -r -a parts <<< "${candidate#/}"
+  for component in "${parts[@]}"; do
+    [[ -n "$component" ]] || continue
+    current="${current%/}/$component"
+    [[ ! -L "$current" ]] || return 1
+    owner=$(/usr/bin/stat -c '%u' -- "$current") || return 1
+    mode=$(/usr/bin/stat -c '%a' -- "$current") || return 1
+    [[ "$owner" = 0 && "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    numeric=$((8#$mode))
+    (( (numeric & 8#022) == 0 )) || return 1
+  done
+  printf '%s\n' "$candidate"
+}
 root= bundle= bundle_url= health= database_dump_command= database_restore_command= migration_command= migration_dir= expected_manifest_sha256= safe_prefix= confirmation=
 offline=0 dry_run=0 activate=0 allow_downgrade=0
 while [[ $# -gt 0 ]]; do
@@ -48,15 +90,16 @@ done
 [[ $offline -eq 0 || -z "$bundle_url" ]] || die "--offline refuses online bundle URLs"
 backup_confirmation= restore_confirmation=
 if [[ "$root" = "/" ]]; then
+  # Production never inherits command lookup from its caller. This occurs
+  # before the installation-ID validation invokes stat or cat.
+  PATH=/usr/sbin:/usr/bin:/sbin:/bin
+  export PATH
   [[ "$EUID" -eq 0 ]] || die "--root / requires EUID 0"
   [[ "${OPEN_CARD_ALLOW_SYSTEM_ROOT:-}" = "1" ]] || die "--root / requires OPEN_CARD_ALLOW_SYSTEM_ROOT=1"
   installation_id=/var/lib/open-card/installation-id
   [[ -f "$installation_id" && ! -L "$installation_id" && "$(stat -c '%u:%a' "$installation_id")" = "0:600" ]] || die "--root / requires root-owned installation-id"
   installation_value=$(cat -- "$installation_id")
   [[ "$confirmation" = "UPGRADE:$installation_value" ]] || die "--root / requires --confirm-installation-id UPGRADE:<installation-id>"
-  backup_confirmation="BACKUP:$installation_value"
-  restore_confirmation="RESTORE:$installation_value"
-  die "production upgrade is blocked: temporary PostgreSQL restore validation and atomic database swap are not implemented"
 fi
 if [[ -n "$migration_command" ]]; then
   [[ "$migration_command" = /* && -x "$migration_command" ]] || die "migration command must be an executable absolute path"
@@ -81,6 +124,98 @@ if [[ -n "$expected_manifest_sha256" ]]; then
   expected_manifest_sha256=$(tr '[:upper:]' '[:lower:]' <<< "$expected_manifest_sha256")
 fi
 script_dir=$(cd -- "$(dirname -- "$0")" && pwd -P)
+
+# The production path is intentionally a short delegation boundary. It must
+# never reach the task-root backup/restore/migration state machine below: the
+# Go engine owns the transaction marker, candidate database, pointer swap,
+# rollback and recovery journal.
+if [[ "$root" = "/" ]]; then
+  (( activate )) || die "--root / requires --activate"
+  [[ -n "$expected_manifest_sha256" ]] || die "--root / requires --expected-manifest-sha256"
+  [[ -z "$health" && -z "$database_dump_command" && -z "$database_restore_command" && -z "$migration_command" && -z "$migration_dir" ]] || die "--root / refuses --health-command, --database-dump-command, --database-restore-command, --migration-command, and --migration-dir"
+  (( ! allow_downgrade )) || die "--root / refuses --allow-downgrade"
+
+  stage_args=(--root / --stage-upgrade-substrate --expected-manifest-sha256 "$expected_manifest_sha256")
+  [[ -n "$bundle" ]] && stage_args+=(--bundle "$bundle")
+  [[ -n "$bundle_url" ]] && stage_args+=(--url "$bundle_url")
+  (( offline )) && stage_args+=(--offline)
+  (( dry_run )) && stage_args+=(--dry-run)
+  if ! /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C LC_ALL=C OPEN_CARD_ALLOW_SYSTEM_ROOT=1 OPEN_CARD_INSTALL_CONFIRMATION=OPEN-CARD-INSTALL "$script_dir/install.sh" "${stage_args[@]}"; then
+    die "candidate substrate staging failed"
+  fi
+  if (( dry_run )); then
+    exit 0
+  fi
+
+  production_upgrade=/opt/open-card/upgrade-tools/open-card-upgrade
+  [[ -f "$production_upgrade" && ! -L "$production_upgrade" ]] || die "production upgrade helper is missing"
+  [[ "$(stat -c '%u:%a' "$production_upgrade")" = "0:755" ]] || die "production upgrade helper is not root-owned mode 0755"
+  [[ -f /usr/bin/systemctl && ! -L /usr/bin/systemctl && "$(stat -c '%u:%a' /usr/bin/systemctl)" = "0:755" ]] || die "trusted systemctl is unavailable"
+
+  run_upgrade_helper() {
+    /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C LC_ALL=C "$production_upgrade" "$@"
+  }
+  run_upgrade_helper prepare-control
+
+  /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C LC_ALL=C /usr/bin/systemctl enable --now open-card-upgrade-safe.target
+  /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C LC_ALL=C /usr/bin/systemctl is-enabled --quiet open-card-upgrade-safe.target || die "upgrade-safe target is not enabled"
+  /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C LC_ALL=C /usr/bin/systemctl is-active --quiet open-card-upgrade-safe.target || die "upgrade-safe target is not active"
+  for unit in open-card-buildkit.service open-card-caddy.service open-card-server.service open-card-agent.service open-card-edge.service; do
+    required_link="/etc/systemd/system/$unit.requires/open-card-upgrade-safe.target"
+    [[ -L "$required_link" ]] || die "upgrade-safe target RequiredBy link is missing for $unit"
+    [[ "$(/usr/bin/readlink -- "$required_link")" = "../open-card-upgrade-safe.target" ]] || die "upgrade-safe target RequiredBy link is unsafe for $unit"
+    requirements=$(/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C LC_ALL=C /usr/bin/systemctl show "$unit" --property=Requires --value --no-pager) || die "upgrade-safe dependency is unreadable for $unit"
+    [[ " $requirements " = *" open-card-upgrade-safe.target "* ]] || die "upgrade-safe target is not required by $unit"
+  done
+
+  production_python=$(verified_production_program /usr/bin/python3) || die "trusted production python is unavailable"
+  candidate_release_id=$(/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C LC_ALL=C "$production_python" - /opt/open-card/releases "$expected_manifest_sha256" <<'PY'
+import hashlib, json, os, re, stat, sys
+
+root = sys.argv[1]
+expected = sys.argv[2]
+try:
+    root_stat = os.lstat(root)
+except OSError as exc:
+    raise SystemExit("candidate release root is unavailable") from exc
+if not stat.S_ISDIR(root_stat.st_mode) or stat.S_ISLNK(root_stat.st_mode) or root_stat.st_uid != 0 or root_stat.st_gid != 0 or root_stat.st_mode & 0o022:
+    raise SystemExit("candidate release root is unsafe")
+matches = []
+for entry in os.scandir(root):
+    if not entry.is_dir(follow_symlinks=False) or entry.is_symlink():
+        continue
+    manifest_path = os.path.join(root, entry.name, "manifest.json")
+    try:
+        info = os.lstat(manifest_path)
+    except OSError:
+        continue
+    if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_gid != 0 or stat.S_IMODE(info.st_mode) != 0o644:
+        continue
+    with open(manifest_path, "rb") as stream:
+        raw = stream.read()
+    if hashlib.sha256(raw).hexdigest() != expected:
+        continue
+    try:
+        manifest = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise SystemExit("candidate manifest is invalid") from exc
+    if not isinstance(manifest, dict) or manifest.get("version") != "0.8.0-rc.1" or manifest.get("migration_version") != "0024" or manifest.get("release_id") != entry.name or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", entry.name):
+        raise SystemExit("candidate manifest is not the RC1/0024 release")
+    matches.append(entry.name)
+if len(matches) != 1:
+    raise SystemExit("candidate manifest identity is ambiguous")
+print(matches[0])
+PY
+  ) || die "candidate release identity is unavailable"
+  [[ -r /proc/sys/kernel/random/uuid ]] || die "kernel transaction UUID source is unavailable"
+  IFS= read -r kernel_uuid < /proc/sys/kernel/random/uuid
+  [[ "$kernel_uuid" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || die "kernel transaction UUID is invalid"
+  transaction_id="upgrade-${kernel_uuid//-/}"
+
+  run_upgrade_helper preflight --transaction-id "$transaction_id" --release-id "$candidate_release_id" --manifest-sha256 "$expected_manifest_sha256" --expect-layout rc0-legacy
+  run_upgrade_helper run --transaction-id "$transaction_id" --release-id "$candidate_release_id" --manifest-sha256 "$expected_manifest_sha256" --expect-layout rc0-legacy
+  exit 0
+fi
 
 # First ask the installer to validate/download the candidate without changing
 # the root. This also enforces the root safety boundary.

@@ -1,6 +1,7 @@
 package install
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -54,6 +55,25 @@ type ExistingActivationPreflight struct {
 	DatabaseEnv []byte `json:"-"`
 }
 
+// EdgeConfigTransitionPlan keeps the candidate Edge Caddy configuration in
+// memory while retaining only its non-secret transition evidence on disk.
+// The prepared artifact path is always derived from Evidence.TransactionID.
+type EdgeConfigTransitionPlan struct {
+	Evidence EdgeConfigTransitionV1 `json:"evidence"`
+	Target   []byte                 `json:"-"`
+}
+
+func (p EdgeConfigTransitionPlan) PreparedArtifactPath() string {
+	return edgeConfigPreparedArtifactPath(p.Evidence.TransactionID)
+}
+
+func (p EdgeConfigTransitionPlan) Validate() error {
+	if !p.Evidence.valid() || len(p.Target) == 0 || bytes.Contains(p.Target, []byte("\x00")) || bytesSHA256(p.Target) != p.Evidence.InstalledAfterSHA256 {
+		return fmt.Errorf("invalid edge configuration transition plan")
+	}
+	return nil
+}
+
 func (p ExistingActivationPreflight) Validate() error {
 	if err := p.Activation.Validate(); err != nil || !validSHA(p.JSONSHA256) {
 		return fmt.Errorf("invalid existing activation preflight")
@@ -83,11 +103,12 @@ type LegacyProjectionPlan struct {
 	DatabaseEnv       []byte `json:"-"`
 	DatabaseEnvSHA256 string `json:"database_env_sha256"`
 
-	ServerEnvBeforeSHA256  string `json:"server_env_before_sha256"`
-	ServerEnvAfterSHA256   string `json:"server_env_after_sha256"`
-	ServerUnitBeforeSHA256 string `json:"server_unit_before_sha256"`
-	ServerUnitAfterSHA256  string `json:"server_unit_after_sha256"`
-	ServerUnitReleaseID    string `json:"server_unit_release_id"`
+	ServerEnvBeforeSHA256  string                    `json:"server_env_before_sha256"`
+	ServerEnvAfterSHA256   string                    `json:"server_env_after_sha256"`
+	ServerUnitBeforeSHA256 string                    `json:"server_unit_before_sha256"`
+	ServerUnitAfterSHA256  string                    `json:"server_unit_after_sha256"`
+	ServerUnitReleaseID    string                    `json:"server_unit_release_id"`
+	EdgeConfigTransition   *EdgeConfigTransitionPlan `json:"edge_config_transition,omitempty"`
 
 	Previous ActivationPointerIdentity `json:"previous"`
 }
@@ -100,17 +121,22 @@ func legacyReleaseTarget(release ReleaseV1) string {
 	return filepath.Join("/opt/open-card/releases", release.ID)
 }
 
-func databaseEnvSHA256(raw []byte) string {
+func bytesSHA256(raw []byte) string {
 	digest := sha256.Sum256(raw)
 	return hex.EncodeToString(digest[:])
 }
 
+func databaseEnvSHA256(raw []byte) string { return bytesSHA256(raw) }
+
 func (p LegacyProjectionPlan) Validate() error {
-	if !validID(p.TransactionID) || !validID(p.ActivationID) || !validRC0Release(p.Release) || p.CurrentTarget != legacyReleaseTarget(p.Release) || p.ExpectedMigration != "0023" || !validSHA(p.ExpectedRowsSHA256) || !validSHA(p.DatabaseEnvSHA256) || !validSHA(p.ServerEnvBeforeSHA256) || !validSHA(p.ServerEnvAfterSHA256) || !validSHA(p.ServerUnitBeforeSHA256) || !validSHA(p.ServerUnitAfterSHA256) || !validID(p.ServerUnitReleaseID) || p.Previous.Validate() != nil {
+	if !validID(p.TransactionID) || !validID(p.ActivationID) || !validRC0Release(p.Release) || p.CurrentTarget != legacyReleaseTarget(p.Release) || p.ExpectedMigration != "0023" || !validSHA(p.ExpectedRowsSHA256) || !validSHA(p.DatabaseEnvSHA256) || !validSHA(p.ServerEnvBeforeSHA256) || !validSHA(p.ServerEnvAfterSHA256) || !validSHA(p.ServerUnitBeforeSHA256) || !validSHA(p.ServerUnitAfterSHA256) || !validID(p.ServerUnitReleaseID) || p.Previous.Validate() != nil || p.EdgeConfigTransition == nil {
 		return fmt.Errorf("invalid legacy projection plan")
 	}
 	if _, err := ParseDatabaseEnv(p.DatabaseEnv); err != nil || databaseEnvSHA256(p.DatabaseEnv) != p.DatabaseEnvSHA256 {
 		return fmt.Errorf("invalid legacy projection database environment")
+	}
+	if err := p.EdgeConfigTransition.Validate(); err != nil || p.EdgeConfigTransition.Evidence.TransactionID != p.TransactionID || p.EdgeConfigTransition.Evidence.SourceReleaseID != p.Release.ID || p.EdgeConfigTransition.Evidence.CandidateReleaseID != p.ServerUnitReleaseID {
+		return fmt.Errorf("invalid legacy edge configuration transition")
 	}
 	return nil
 }
@@ -118,7 +144,7 @@ func (p LegacyProjectionPlan) Validate() error {
 // ValidateForCandidate binds the unit replacement evidence to the exact
 // candidate release supplied for this transaction.
 func (p LegacyProjectionPlan) ValidateForCandidate(candidate ReleaseV1) error {
-	if err := p.Validate(); err != nil || !candidate.valid() || p.ServerUnitReleaseID != candidate.ID {
+	if err := p.Validate(); err != nil || !candidate.valid() || p.ServerUnitReleaseID != candidate.ID || p.EdgeConfigTransition.Evidence.CandidateReleaseID != candidate.ID {
 		return fmt.Errorf("legacy projection candidate release mismatch")
 	}
 	return nil
@@ -187,6 +213,22 @@ type LegacyProjectionObservation struct {
 	CurrentTarget        string                    `json:"current_target"`
 	ServerEnvSHA256      string                    `json:"server_env_sha256"`
 	ServerUnitSHA256     string                    `json:"server_unit_sha256"`
+}
+
+// EdgeConfigObservationV1 is the non-secret readback from an Edge
+// configuration prepare/install operation. It intentionally carries digests
+// rather than Caddyfile content or tool output.
+type EdgeConfigObservationV1 struct {
+	PreparedConfigSHA256  string `json:"prepared_config_sha256"`
+	InstalledConfigSHA256 string `json:"installed_config_sha256"`
+	CaddySHA256           string `json:"caddy_sha256"`
+}
+
+func (o EdgeConfigObservationV1) Validate() error {
+	if !validSHA(o.PreparedConfigSHA256) || !validSHA(o.InstalledConfigSHA256) || !validSHA(o.CaddySHA256) {
+		return fmt.Errorf("invalid edge configuration observation")
+	}
+	return nil
 }
 
 func (o LegacyProjectionObservation) Validate() error {

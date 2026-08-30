@@ -54,12 +54,30 @@ class InstallerSecurityContractTests(unittest.TestCase):
         self.assertIn("Edge stays disabled until install-host", text)
         self.assertIn("opencard-edge", text)
 
-    def test_root_upgrade_fails_before_irreversible_database_migration(self) -> None:
+    def test_root_upgrade_delegates_only_after_exact_safety_boundary(self) -> None:
         text = (SCRIPTS / "upgrade.sh").read_text(encoding="utf-8")
         self.assertIn("--confirm-installation-id UPGRADE:ID", text)
-        self.assertIn('backup_confirmation="BACKUP:$installation_value"', text)
-        self.assertIn('restore_confirmation="RESTORE:$installation_value"', text)
-        self.assertIn("production upgrade is blocked", text)
+        self.assertIn("PATH=/usr/sbin:/usr/bin:/sbin:/bin", text)
+        self.assertIn("verified_production_program /usr/bin/python3", text)
+        self.assertIn("--root / requires --activate", text)
+        self.assertIn("--root / requires --expected-manifest-sha256", text)
+        self.assertIn("--root / refuses --health-command, --database-dump-command, --database-restore-command, --migration-command, and --migration-dir", text)
+        self.assertIn("--root / refuses --allow-downgrade", text)
+        self.assertIn("--stage-upgrade-substrate", text)
+        self.assertIn("run_upgrade_helper prepare-control", text)
+        self.assertIn("/usr/bin/systemctl enable --now open-card-upgrade-safe.target", text)
+        self.assertIn("is-enabled --quiet open-card-upgrade-safe.target", text)
+        self.assertIn("is-active --quiet open-card-upgrade-safe.target", text)
+        self.assertIn("upgrade-safe target RequiredBy link is missing", text)
+        self.assertIn("upgrade-safe target RequiredBy link is unsafe", text)
+        self.assertIn("/proc/sys/kernel/random/uuid", text)
+        self.assertIn("--expect-layout rc0-legacy", text)
+        self.assertNotIn("production upgrade is blocked", text)
+        production = text.index('if [[ "$root" = "/" ]]; then\n  (( activate ))')
+        delegated_exit = text.index("  exit 0\nfi\n\n# First ask the installer")
+        legacy_backup = text.index('backup_args=(--root "$root"')
+        self.assertLess(production, delegated_exit)
+        self.assertLess(delegated_exit, legacy_backup)
 
 
 if __name__ == "__main__":

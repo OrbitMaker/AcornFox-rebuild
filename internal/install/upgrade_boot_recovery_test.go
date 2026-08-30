@@ -160,6 +160,8 @@ func TestReconcileBootLegacyProjectionDoesNotCallServices(t *testing.T) {
 	j.OldActivationID, j.OldActivationJSONSHA256, j.PlannedOldActivation = old.ActivationID, digest, &old
 	j.CandidateActivationID, j.CandidateDatabaseName = request.CandidateActivationID, request.CandidateDatabaseName
 	j.PreUpgradePreviousActivationID, j.PreUpgradePreviousActivationJSONSHA256 = preflight.Previous.ID, preflight.Previous.JSONSHA256
+	transition := preflight.Legacy.EdgeConfigTransition.Evidence
+	j.EdgeConfigTransition = &transition
 	store.created = []UpgradeJournalV1{j}
 	store.old, store.oldDigest, store.state.Marker = old, digest, true
 	result, err := e.ReconcilePendingBoot(context.Background(), bootUnitReloaderFake{events: events})
@@ -217,5 +219,24 @@ func TestFinalizeBootNonterminalGuardsAndRetainsMarker(t *testing.T) {
 	var phase UpgradePhaseError
 	if !errors.As(err, &phase) || phase.Phase != JournalRecoveryRequired || !store.state.Marker || eventIndex(*events, "edge:guard") < 0 || eventIndex(*events, "marker:off") >= 0 {
 		t.Fatalf("err=%v state=%+v events=%v", err, store.state, *events)
+	}
+}
+
+func TestFinalizeBootRepeatsCommittedEdgeConfigConvergenceBeforeMarkerRemoval(t *testing.T) {
+	e, store, _, _, events := engineFixture(true)
+	request := engineRequest()
+	request.ExpectedLegacy = true
+	store.fail, store.remaining = "marker:off", 1
+	if err := e.RunNew(context.Background(), request); err == nil || !store.state.Marker || !store.edgeInstalledAfter {
+		t.Fatalf("expected postcommit marker failure with finalized config: err=%v state=%+v", err, store.state)
+	}
+	store.fail, store.remaining = "", 0
+	*events = nil
+	result, err := e.FinalizeBoot(context.Background(), request.TransactionID)
+	if err != nil || result.MarkerRetained || store.state.Marker {
+		t.Fatalf("result=%+v err=%v state=%+v", result, err, store.state)
+	}
+	if eventIndex(*events, "edge:finalize") < 0 || eventIndex(*events, "edge:read") < 0 || eventIndex(*events, "edge:read") > eventIndex(*events, "marker:off") {
+		t.Fatalf("edge config was not reread before marker removal: %v", *events)
 	}
 }

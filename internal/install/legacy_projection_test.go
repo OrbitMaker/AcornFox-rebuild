@@ -37,6 +37,9 @@ func assertJSONKeys(t *testing.T, raw []byte, expected ...string) map[string]jso
 func legacyPlanFixture() LegacyProjectionPlan {
 	env := []byte("OPEN_CARD_DATABASE_URL=postgresql://user:pass@localhost:5432/open_card?sslmode=disable\n")
 	release := rc0ReleaseFixture()
+	target := []byte("console.example.test {\n\trespond \"ok\"\n}\n")
+	edgeEvidence := edgeTransitionFixture("txn-1", release.ID, "release-0.8.0-rc.1")
+	edgeEvidence.InstalledAfterSHA256 = bytesSHA256(target)
 	return LegacyProjectionPlan{
 		TransactionID:          "txn-1",
 		ActivationID:           "activation-old",
@@ -51,6 +54,7 @@ func legacyPlanFixture() LegacyProjectionPlan {
 		ServerUnitBeforeSHA256: sha("d"),
 		ServerUnitAfterSHA256:  sha("e"),
 		ServerUnitReleaseID:    "release-0.8.0-rc.1",
+		EdgeConfigTransition:   &EdgeConfigTransitionPlan{Evidence: edgeEvidence, Target: target},
 		Previous: ActivationPointerIdentity{
 			ID:         "activation-previous",
 			JSONSHA256: sha("f"),
@@ -111,10 +115,14 @@ func TestLegacyProjectionPlanValidationAndSecretBoundary(t *testing.T) {
 	}
 	fields := assertJSONKeys(t, raw,
 		"transaction_id", "activation_id", "release", "current_target", "expected_migration", "expected_rows_sha256",
-		"database_env_sha256", "server_env_before_sha256", "server_env_after_sha256", "server_unit_before_sha256", "server_unit_after_sha256", "server_unit_release_id", "previous",
+		"database_env_sha256", "server_env_before_sha256", "server_env_after_sha256", "server_unit_before_sha256", "server_unit_after_sha256", "server_unit_release_id", "edge_config_transition", "previous",
 	)
-	if _, exists := fields["database_env"]; exists || fields["database_env_sha256"] == nil || fields["previous"] == nil {
+	if _, exists := fields["database_env"]; exists || fields["database_env_sha256"] == nil || fields["previous"] == nil || strings.Contains(string(raw), "console.example.test {") || strings.Contains(string(raw), `respond \\"ok\\"`) {
 		t.Fatal("legacy plan JSON shape is unsafe")
+	}
+	assertJSONKeys(t, fields["edge_config_transition"], "evidence")
+	if strings.Contains(string(fields["edge_config_transition"]), "open-card-edge.Caddyfile") || strings.Contains(string(fields["edge_config_transition"]), "target") {
+		t.Fatal("legacy plan serialized raw edge configuration")
 	}
 
 	for _, edit := range []func(*LegacyProjectionPlan){
@@ -135,12 +143,50 @@ func TestLegacyProjectionPlanValidationAndSecretBoundary(t *testing.T) {
 		func(p *LegacyProjectionPlan) { p.ServerUnitBeforeSHA256 = "bad" },
 		func(p *LegacyProjectionPlan) { p.ServerUnitAfterSHA256 = "bad" },
 		func(p *LegacyProjectionPlan) { p.ServerUnitReleaseID = "" },
+		func(p *LegacyProjectionPlan) { p.EdgeConfigTransition = nil },
+		func(p *LegacyProjectionPlan) { p.EdgeConfigTransition.Target = nil },
+		func(p *LegacyProjectionPlan) { p.EdgeConfigTransition.Evidence.TransactionID = "txn-other" },
+		func(p *LegacyProjectionPlan) { p.EdgeConfigTransition.Evidence.SourceReleaseID = "other-release" },
+		func(p *LegacyProjectionPlan) { p.EdgeConfigTransition.Evidence.CandidateReleaseID = "other-release" },
+		func(p *LegacyProjectionPlan) {
+			p.EdgeConfigTransition.Evidence.ConsoleHostname = "Console.Example.Test"
+		},
+		func(p *LegacyProjectionPlan) { p.EdgeConfigTransition.Evidence.InstalledAfterSHA256 = sha("0") },
 		func(p *LegacyProjectionPlan) { p.Previous.JSONSHA256 = "" },
 	} {
 		broken := legacyPlanFixture()
 		edit(&broken)
 		if err := broken.Validate(); err == nil {
 			t.Fatal("invalid legacy projection plan accepted")
+		}
+	}
+}
+
+func TestEdgeConfigPlanAndObservationContract(t *testing.T) {
+	plan := legacyPlanFixture()
+	edge := plan.EdgeConfigTransition
+	if edge == nil || edge.PreparedArtifactPath() != edgeConfigPreparedArtifactPath(plan.TransactionID) || edge.PreparedArtifactPath() != artifactPath(plan.TransactionID, "open-card-edge.Caddyfile") {
+		t.Fatal("prepared edge artifact path is not transaction-derived")
+	}
+	if err := edge.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if err := plan.ValidateForCandidate(ReleaseV1{ID: "release-0.8.0-rc.1", Version: "0.8.0-rc.1", SourceCommit: strings.Repeat("a", 40), Architecture: "amd64", ManifestSHA256: sha("b")}); err != nil {
+		t.Fatal(err)
+	}
+	observation := EdgeConfigObservationV1{PreparedConfigSHA256: bytesSHA256(edge.Target), InstalledConfigSHA256: edge.Evidence.InstalledAfterSHA256, CaddySHA256: edge.Evidence.CandidateCaddySHA256}
+	if err := observation.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	for _, edit := range []func(*EdgeConfigObservationV1){
+		func(o *EdgeConfigObservationV1) { o.PreparedConfigSHA256 = "bad" },
+		func(o *EdgeConfigObservationV1) { o.InstalledConfigSHA256 = "bad" },
+		func(o *EdgeConfigObservationV1) { o.CaddySHA256 = "bad" },
+	} {
+		broken := observation
+		edit(&broken)
+		if err := broken.Validate(); err == nil {
+			t.Fatal("invalid edge configuration observation accepted")
 		}
 	}
 }
@@ -273,6 +319,8 @@ func TestPlannedOldActivationJournalRoundTripAndStrictJSON(t *testing.T) {
 	journal.OldActivationID = planned.ActivationID
 	journal.OldActivationJSONSHA256 = digest
 	journal.PlannedOldActivation = &planned
+	transition := *legacyPlanFixture().EdgeConfigTransition
+	journal.EdgeConfigTransition = &transition.Evidence
 	if err := journal.Validate(); err != nil {
 		t.Fatal(err)
 	}
@@ -285,7 +333,8 @@ func TestPlannedOldActivationJournalRoundTripAndStrictJSON(t *testing.T) {
 	}
 	fields := assertJSONKeys(t, raw,
 		"schema_version", "transaction_id", "revision", "state", "created_at", "updated_at", "requested_manifest_sha256",
-		"old_activation_id", "old_activation_json_sha256", "planned_old_activation", "candidate_activation_id", "candidate_database_name", "service_snapshot", "history",
+		"upgrade_control_database_env_sha256",
+		"old_activation_id", "old_activation_json_sha256", "planned_old_activation", "candidate_activation_id", "candidate_database_name", "edge_config_transition", "service_snapshot", "history",
 	)
 	assertJSONKeys(t, fields["planned_old_activation"],
 		"schema_version", "activation_id", "origin", "release", "database", "database_env_sha256", "created_at", "created_by_transaction_id", "legacy_projection",

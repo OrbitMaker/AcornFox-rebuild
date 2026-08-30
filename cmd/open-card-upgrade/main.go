@@ -70,6 +70,8 @@ type upgradeRuntime struct {
 type upgradeDependencies struct {
 	euid                      func() int
 	derive                    func(upgradeCommandConfig) (install.UpgradeCLIIdentity, error)
+	verifyExecutable          func() error
+	prepareControl            func(context.Context) (string, error)
 	verifyCandidateExecutable func(string) error
 	newRuntime                func(context.Context) (upgradeRuntime, error)
 	newStatusRuntime          func(context.Context) (upgradeRuntime, error)
@@ -108,6 +110,8 @@ func productionUpgradeDependencies() upgradeDependencies {
 	return upgradeDependencies{
 		euid:                      os.Geteuid,
 		derive:                    deriveProductionIdentity,
+		verifyExecutable:          func() error { return verifyProductionUpgradeExecutable(productionUpgradeExecutable) },
+		prepareControl:            install.PrepareProductionUpgradeControl,
 		verifyCandidateExecutable: verifyProductionUpgradeExecutableDigest,
 		newRuntime:                newProductionRuntime,
 		newStatusRuntime:          newProductionStatusRuntime,
@@ -184,6 +188,19 @@ func runWithDependenciesCore(ctx context.Context, args []string, stdout, stderr 
 	}
 	if deps.euid == nil || deps.euid() != 0 {
 		return writeUpgradeError(stderr, exitPrivilege, "root_required")
+	}
+	// prepare-control deliberately precedes all runtime construction and the
+	// safe-target fence. It provisions only the root-owned control identity;
+	// it must stay usable before any activation slot or systemd barrier exists.
+	if config.command == "prepare-control" {
+		if deps.verifyExecutable == nil || deps.prepareControl == nil || deps.verifyExecutable() != nil {
+			return writeUpgradeError(stderr, exitInternal, "runtime_unavailable")
+		}
+		identity, prepareErr := deps.prepareControl(ctx)
+		if prepareErr != nil || !validCLISHA(identity) {
+			return writeUpgradeError(stderr, exitInternal, "control_prepare_failed")
+		}
+		return writeUpgradeJSON(stdout, exitOK, map[string]any{"ok": true, "command": "prepare-control", "control_identity_sha256": identity})
 	}
 	constructor := deps.newRuntime
 	switch config.command {
@@ -370,6 +387,10 @@ func parseUpgradeArgs(args []string) (upgradeCommandConfig, error) {
 	}
 	config := upgradeCommandConfig{command: args[0]}
 	switch config.command {
+	case "prepare-control":
+		if len(args) != 1 {
+			return upgradeCommandConfig{}, errors.New("prepare-control takes no flags")
+		}
 	case "preflight", "run":
 		for index := 1; index < len(args); index++ {
 			flag := args[index]

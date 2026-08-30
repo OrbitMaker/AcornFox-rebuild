@@ -84,6 +84,9 @@ type UpgradeJournalStore interface {
 	FinalizeLegacyProjection(context.Context, LegacyProjectionPlan, ActivationV1) (LegacyProjectionObservation, error)
 	ReadLegacyProjection(context.Context, LegacyProjectionPlan, ActivationV1) (LegacyProjectionObservation, error)
 	RecoverLegacyPlan(context.Context, ActivationV1, string) (LegacyProjectionPlan, error)
+	PrepareEdgeConfig(context.Context, EdgeConfigTransitionPlan) (EdgeConfigObservationV1, error)
+	FinalizeEdgeConfig(context.Context, EdgeConfigTransitionPlan) (EdgeConfigObservationV1, error)
+	ReadEdgeConfig(context.Context, EdgeConfigTransitionPlan) (EdgeConfigObservationV1, error)
 	ReadActivationState(context.Context) (UpgradeActivationState, error)
 	CreateJournal(context.Context, UpgradeJournalV1) error
 	SaveJournal(context.Context, UpgradeJournalV1) error
@@ -139,6 +142,7 @@ func (r UpgradeDatabaseOpenRequest) Validate() error {
 type UpgradeDatabaseSession interface {
 	UpgradeDatabaseDriver
 	CandidateDatabaseEnv() []byte
+	ControlIdentitySHA256() string
 	Close() error
 }
 
@@ -163,6 +167,7 @@ type UpgradeServiceDriver interface {
 	HealthEdge(context.Context) error
 	GuardEdge(context.Context) error
 	ReloadServerUnit(context.Context, string) error
+	ValidateEdgeConfig(context.Context, EdgeConfigTransitionV1, ArtifactV1) (EdgeConfigValidationV1, error)
 	RestoreSnapshot(context.Context, ServiceSnapshotV1) error
 	HealthRestoredInternal(context.Context) error
 	RestoreEdge(context.Context, ServiceSnapshotV1) error
@@ -199,6 +204,17 @@ func legacyActivation(plan LegacyProjectionPlan, database DatabaseV1, createdAt 
 
 func sameDatabase(left, right DatabaseV1) bool {
 	return left.Name == right.Name && left.Migration == right.Migration && left.SchemaMigrationsSHA256 == right.SchemaMigrationsSHA256
+}
+
+// recoveryControlIdentityMatches accepts an unavailable identity only for
+// inspection-only recovery sessions. Whenever a session exposes the fixed
+// control identity, it must match the durable RunNew binding exactly.
+func recoveryControlIdentityMatches(j UpgradeJournalV1, database UpgradeDatabaseSession) bool {
+	if database == nil {
+		return false
+	}
+	identity := database.ControlIdentitySHA256()
+	return identity == "" || validSHA(identity) && identity == j.UpgradeControlDatabaseEnvSHA256
 }
 
 func inspectionRequestForActivation(databaseEnv []byte, activation ActivationV1) (ActiveDatabaseInspectionRequest, error) {
@@ -378,28 +394,30 @@ func transitionEvidenceSHA256(j UpgradeJournalV1, from, to JournalState) string 
 	// This canonical envelope intentionally contains only durable identifiers and
 	// digests. In particular it never serializes database.env or its decoded DSN.
 	payload := struct {
-		Revision                   int64        `json:"revision"`
-		From                       JournalState `json:"from"`
-		To                         JournalState `json:"to"`
-		RequestedManifestSHA256    string       `json:"requested_manifest_sha256"`
-		OldActivationJSONSHA256    string       `json:"old_activation_json_sha256"`
-		CandidateActivationID      string       `json:"candidate_activation_id"`
-		CandidateActivationJSONSHA string       `json:"candidate_activation_json_sha256,omitempty"`
-		CandidateDatabaseName      string       `json:"candidate_database_name"`
-		SnapshotSHA256             string       `json:"snapshot_sha256,omitempty"`
-		MigrationManifestSHA256    string       `json:"migration_manifest_sha256,omitempty"`
-		ValidationSHA256           string       `json:"validation_sha256,omitempty"`
-		ServiceSnapshotSHA256      string       `json:"service_snapshot_sha256"`
+		Revision                        int64        `json:"revision"`
+		From                            JournalState `json:"from"`
+		To                              JournalState `json:"to"`
+		RequestedManifestSHA256         string       `json:"requested_manifest_sha256"`
+		UpgradeControlDatabaseEnvSHA256 string       `json:"upgrade_control_database_env_sha256"`
+		OldActivationJSONSHA256         string       `json:"old_activation_json_sha256"`
+		CandidateActivationID           string       `json:"candidate_activation_id"`
+		CandidateActivationJSONSHA      string       `json:"candidate_activation_json_sha256,omitempty"`
+		CandidateDatabaseName           string       `json:"candidate_database_name"`
+		SnapshotSHA256                  string       `json:"snapshot_sha256,omitempty"`
+		MigrationManifestSHA256         string       `json:"migration_manifest_sha256,omitempty"`
+		ValidationSHA256                string       `json:"validation_sha256,omitempty"`
+		ServiceSnapshotSHA256           string       `json:"service_snapshot_sha256"`
 	}{
-		Revision:                   j.Revision + 1,
-		From:                       from,
-		To:                         to,
-		RequestedManifestSHA256:    j.RequestedManifestSHA256,
-		OldActivationJSONSHA256:    j.OldActivationJSONSHA256,
-		CandidateActivationID:      j.CandidateActivationID,
-		CandidateActivationJSONSHA: j.CandidateActivationJSONSHA256,
-		CandidateDatabaseName:      j.CandidateDatabaseName,
-		ServiceSnapshotSHA256:      CanonicalServiceSnapshotSHA256(j.ServiceSnapshot),
+		Revision:                        j.Revision + 1,
+		From:                            from,
+		To:                              to,
+		RequestedManifestSHA256:         j.RequestedManifestSHA256,
+		UpgradeControlDatabaseEnvSHA256: j.UpgradeControlDatabaseEnvSHA256,
+		OldActivationJSONSHA256:         j.OldActivationJSONSHA256,
+		CandidateActivationID:           j.CandidateActivationID,
+		CandidateActivationJSONSHA:      j.CandidateActivationJSONSHA256,
+		CandidateDatabaseName:           j.CandidateDatabaseName,
+		ServiceSnapshotSHA256:           CanonicalServiceSnapshotSHA256(j.ServiceSnapshot),
 	}
 	if j.Snapshot != nil {
 		payload.SnapshotSHA256 = j.Snapshot.SHA256
@@ -415,6 +433,50 @@ func transitionEvidenceSHA256(j UpgradeJournalV1, from, to JournalState) string 
 }
 
 func (e *UpgradeEngine) now() time.Time { return e.Now().UTC() }
+
+func sameEdgeConfigObservation(observation EdgeConfigObservationV1, prepared, installed, caddy string) bool {
+	return observation.Validate() == nil && observation.PreparedConfigSHA256 == prepared && observation.InstalledConfigSHA256 == installed && observation.CaddySHA256 == caddy
+}
+
+// prepareAndValidateEdgeConfig is intentionally called only after the native
+// candidate activation has been made durable. Prepare is non-public: it
+// writes a transaction-owned artifact and proves that the installed file is
+// still the journaled before image. The installed file is changed only later,
+// after COMMITTED.
+func (e *UpgradeEngine) prepareAndValidateEdgeConfig(ctx context.Context, j *UpgradeJournalV1, plan EdgeConfigTransitionPlan) error {
+	if j == nil || j.EdgeConfigTransition == nil || plan.Validate() != nil || plan.Evidence != *j.EdgeConfigTransition {
+		return errors.New("invalid edge configuration plan")
+	}
+	prepared, err := e.Store.PrepareEdgeConfig(ctx, plan)
+	if err != nil || !sameEdgeConfigObservation(prepared, plan.Evidence.InstalledAfterSHA256, plan.Evidence.InstalledBeforeSHA256, plan.Evidence.CandidateCaddySHA256) {
+		return errors.New("edge configuration prepare was not provable")
+	}
+	artifact := ArtifactV1{Path: plan.PreparedArtifactPath(), SHA256: plan.Evidence.InstalledAfterSHA256, Size: int64(len(plan.Target))}
+	validation, err := e.Services.ValidateEdgeConfig(ctx, plan.Evidence, artifact)
+	if err != nil || !validation.valid() || validation.ConfigSHA256 != plan.Evidence.InstalledAfterSHA256 || validation.CaddySHA256 != plan.Evidence.CandidateCaddySHA256 {
+		return errors.New("edge configuration validation failed")
+	}
+	j.EdgeConfigValidation = &validation
+	return nil
+}
+
+// edgePlanForJournal reconstructs a journaled legacy Edge transition from the
+// verified immutable release inputs. Configuration bytes are intentionally not
+// journaled; the store's recovery plan is the only source allowed to provide
+// them again.
+func (e *UpgradeEngine) edgePlanForJournal(ctx context.Context, j UpgradeJournalV1) (*EdgeConfigTransitionPlan, error) {
+	if j.EdgeConfigTransition == nil {
+		return nil, nil
+	}
+	if j.PlannedOldActivation == nil || j.PlannedOldActivation.LegacyProjection == nil {
+		return nil, errors.New("edge transition is not reconstructible")
+	}
+	plan, err := e.Store.RecoverLegacyPlan(ctx, *j.PlannedOldActivation, j.RequestedManifestSHA256)
+	if err != nil || plan.Validate() != nil || plan.EdgeConfigTransition == nil || plan.EdgeConfigTransition.Evidence != *j.EdgeConfigTransition {
+		return nil, errors.New("edge transition recovery mismatch")
+	}
+	return plan.EdgeConfigTransition, nil
+}
 
 func (e *UpgradeEngine) advance(ctx context.Context, j *UpgradeJournalV1, to JournalState) error {
 	next := *j
@@ -460,7 +522,7 @@ func failureDigest(err error) string {
 }
 
 var upgradeFailureCodes = map[string]struct{}{
-	"legacy_projection_failed": {}, "marker_create_failed": {}, "service_quiesce_failed": {}, "database_drain_failed": {}, "quiesce_journal_failed": {}, "snapshot_failed": {}, "snapshot_journal_failed": {}, "candidate_database_failed": {}, "candidate_journal_failed": {}, "migration_failed": {}, "migration_journal_failed": {}, "invalid_candidate_activation": {}, "write_candidate_activation_failed": {}, "validation_failed": {}, "validation_journal_failed": {}, "set_previous_failed": {}, "swap_active_failed": {}, "active_journal_failed": {}, "start_internal_failed": {}, "internal_health_failed": {}, "healthy_journal_failed": {}, "edge_journal_failed": {}, "marker_remove_failed": {}, "start_edge_failed": {}, "edge_health_failed": {}, "commit_journal_failed": {},
+	"legacy_projection_failed": {}, "marker_create_failed": {}, "service_quiesce_failed": {}, "database_drain_failed": {}, "quiesce_journal_failed": {}, "snapshot_failed": {}, "snapshot_journal_failed": {}, "candidate_database_failed": {}, "candidate_journal_failed": {}, "migration_failed": {}, "migration_journal_failed": {}, "invalid_candidate_activation": {}, "write_candidate_activation_failed": {}, "edge_config_validation_failed": {}, "validation_failed": {}, "validation_journal_failed": {}, "set_previous_failed": {}, "swap_active_failed": {}, "active_journal_failed": {}, "start_internal_failed": {}, "internal_health_failed": {}, "healthy_journal_failed": {}, "edge_journal_failed": {}, "marker_remove_failed": {}, "start_edge_failed": {}, "edge_health_failed": {}, "commit_journal_failed": {},
 }
 
 func failureFor(phase JournalState, code string, err error) *FailureV1 {
@@ -725,6 +787,10 @@ func (e *UpgradeEngine) RunNew(ctx context.Context, r UpgradeRequest) (result er
 			return upgradeError(JournalPreflighted, "preflight_failed")
 		}
 	}
+	controlIdentity := database.ControlIdentitySHA256()
+	if !validSHA(controlIdentity) {
+		return upgradeError(JournalPreflighted, "control_identity_failed")
+	}
 	serviceSnapshot, err := e.Services.Capture(ctx)
 	if err != nil {
 		return upgradeError(JournalPreflighted, "service_capture_failed")
@@ -737,6 +803,7 @@ func (e *UpgradeEngine) RunNew(ctx context.Context, r UpgradeRequest) (result er
 		CreatedAt:                              now,
 		UpdatedAt:                              now,
 		RequestedManifestSHA256:                r.RequestedManifestSHA256,
+		UpgradeControlDatabaseEnvSHA256:        controlIdentity,
 		OldActivationID:                        old.ActivationID,
 		OldActivationJSONSHA256:                oldJSONSHA256,
 		PreUpgradePreviousActivationID:         baseline.PreviousID,
@@ -749,6 +816,8 @@ func (e *UpgradeEngine) RunNew(ctx context.Context, r UpgradeRequest) (result er
 	if actualLegacy {
 		planned := old
 		j.PlannedOldActivation = &planned
+		transition := preflight.Legacy.EdgeConfigTransition.Evidence
+		j.EdgeConfigTransition = &transition
 	}
 	if err := j.Validate(); err != nil {
 		return upgradeError(JournalPreflighted, "invalid_journal")
@@ -858,6 +927,11 @@ func (e *UpgradeEngine) RunNew(ctx context.Context, r UpgradeRequest) (result er
 	candidateJSONSHA256, err := e.Store.WriteCandidateActivation(ctx, candidate, candidateEnv)
 	if err != nil || !validSHA(candidateJSONSHA256) {
 		return fail(JournalValidated, "write_candidate_activation_failed", err)
+	}
+	if actualLegacy {
+		if err := e.prepareAndValidateEdgeConfig(ctx, &j, *preflight.Legacy.EdgeConfigTransition); err != nil {
+			return fail(JournalValidated, "edge_config_validation_failed", err)
+		}
 	}
 	validation, err := database.Validate(ctx, r.CandidateActivationID)
 	if err != nil {
@@ -973,6 +1047,31 @@ func (e *UpgradeEngine) convergeCommittedPublic(ctx context.Context, j *UpgradeJ
 		_ = e.Services.GuardEdge(ctx)
 		return upgradeError(JournalCommitted, "integrity_failed")
 	}
+	if j.EdgeConfigTransition != nil {
+		if j.EdgeConfigValidation == nil || !j.EdgeConfigValidation.valid() || j.EdgeConfigValidation.ConfigSHA256 != j.EdgeConfigTransition.InstalledAfterSHA256 || j.EdgeConfigValidation.CaddySHA256 != j.EdgeConfigTransition.CandidateCaddySHA256 {
+			return fail(errors.New("edge configuration validation evidence mismatch"))
+		}
+		plan, err := e.edgePlanForJournal(ctx, *j)
+		if err != nil {
+			return fail(err)
+		}
+		// A committed journal may be resumed after a crash before or after the
+		// prepared artifact reached disk. Prepare is idempotent while the
+		// installed config is still the before image; when it is already after,
+		// Finalize below performs the exact prepared/installed reread instead.
+		// Any foreign or unknown result still fails closed through Finalize.
+		if prepared, prepareErr := e.Store.PrepareEdgeConfig(ctx, *plan); prepareErr == nil && !sameEdgeConfigObservation(prepared, plan.Evidence.InstalledAfterSHA256, plan.Evidence.InstalledBeforeSHA256, plan.Evidence.CandidateCaddySHA256) {
+			return fail(errors.New("edge configuration prepare readback was not provable"))
+		}
+		observation, err := e.Store.FinalizeEdgeConfig(ctx, *plan)
+		if err != nil || !sameEdgeConfigObservation(observation, plan.Evidence.InstalledAfterSHA256, plan.Evidence.InstalledAfterSHA256, plan.Evidence.CandidateCaddySHA256) {
+			return fail(errors.New("edge configuration finalize was not provable"))
+		}
+		observation, err = e.Store.ReadEdgeConfig(ctx, *plan)
+		if err != nil || !sameEdgeConfigObservation(observation, plan.Evidence.InstalledAfterSHA256, plan.Evidence.InstalledAfterSHA256, plan.Evidence.CandidateCaddySHA256) {
+			return fail(errors.New("edge configuration readback was not provable"))
+		}
+	}
 	if markerTx == tx {
 		if err := e.Store.Marker(ctx, false); err != nil {
 			return fail(err)
@@ -1023,6 +1122,10 @@ func (e *UpgradeEngine) recoverLegacyPreflight(ctx context.Context, j *UpgradeJo
 	database, err := e.DatabaseFactory.Open(ctx, UpgradeDatabaseOpenRequest{TransactionID: transactionID, CandidateActivationID: j.CandidateActivationID, CandidateDatabaseName: j.CandidateDatabaseName, ActiveDatabaseEnv: plan.DatabaseEnv})
 	if err != nil || database == nil {
 		return e.recoverRecovery(ctx, j, transactionID, j.State, err)
+	}
+	if !recoveryControlIdentityMatches(*j, database) {
+		_ = database.Close()
+		return e.recoverRecovery(ctx, j, transactionID, j.State, errors.New("upgrade control identity mismatch"))
 	}
 	defer func() {
 		// Recovery already has a durable terminal/error outcome.  A close failure

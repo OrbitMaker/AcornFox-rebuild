@@ -88,6 +88,9 @@ func runWithDependencies(
 		return errors.New("ping active administrator database failed")
 	}
 	if config.command == "activation-validate" || config.command == "candidate-validate" {
+		if config.command == "candidate-validate" {
+			return validateCandidateDatabase(ctx, database, resolved.Activation)
+		}
 		return validateActivationDatabase(ctx, database, resolved.Activation)
 	}
 	password, err := readRootOnlyPassword(config.passwordFile)
@@ -296,6 +299,51 @@ func validateActivationDatabase(ctx context.Context, database *sql.DB, activatio
 	defer tx.Rollback()
 	if err := validateSchemaFacts(ctx, tx, activation.Database.Migration, activation.Database.SchemaMigrationsSHA256); err != nil {
 		return err
+	}
+	return nil
+}
+
+// validateCandidateDatabase proves that the candidate connection can perform
+// and roll back an ordinary write before activation. The temporary table is
+// transaction-local, and the deferred rollback is mandatory even if a later
+// schema fact is invalid.
+func validateCandidateDatabase(ctx context.Context, database *sql.DB, activation install.ActivationV1) error {
+	tx, err := database.BeginTx(ctx, nil)
+	if err != nil {
+		return errors.New("begin candidate validation failed")
+	}
+	defer tx.Rollback()
+	if err := validateCandidateRollbackWrite(ctx, tx.ExecContext, func(ctx context.Context, query string, args ...any) candidateValidationRow {
+		return tx.QueryRowContext(ctx, query, args...)
+	}); err != nil {
+		return err
+	}
+	if err := validateSchemaFacts(ctx, tx, activation.Database.Migration, activation.Database.SchemaMigrationsSHA256); err != nil {
+		return err
+	}
+	return nil
+}
+
+type candidateValidationRow interface {
+	Scan(...any) error
+}
+
+type candidateValidationExec func(context.Context, string, ...any) (sql.Result, error)
+type candidateValidationQueryRow func(context.Context, string, ...any) candidateValidationRow
+
+func validateCandidateRollbackWrite(ctx context.Context, exec candidateValidationExec, queryRow candidateValidationQueryRow) error {
+	if exec == nil || queryRow == nil {
+		return errors.New("candidate write validation is unavailable")
+	}
+	if _, err := exec(ctx, `CREATE TEMPORARY TABLE open_card_candidate_validation_probe (value text NOT NULL) ON COMMIT DROP`); err != nil {
+		return errors.New("candidate write validation failed")
+	}
+	if _, err := exec(ctx, `INSERT INTO open_card_candidate_validation_probe(value) VALUES ($1)`, "candidate-validation"); err != nil {
+		return errors.New("candidate write validation failed")
+	}
+	var value string
+	if err := queryRow(ctx, `SELECT value FROM open_card_candidate_validation_probe`).Scan(&value); err != nil || value != "candidate-validation" {
+		return errors.New("candidate write validation failed")
 	}
 	return nil
 }

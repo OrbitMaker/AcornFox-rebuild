@@ -18,10 +18,13 @@ import (
 )
 
 type legacyVerifierFake struct {
-	release ReleaseV1
-	rows    []MigrationRow
-	unit    []byte
-	err     error
+	release           ReleaseV1
+	rows              []MigrationRow
+	unit              []byte
+	sourceTemplate    []byte
+	candidateTemplate []byte
+	caddy             []byte
+	err               error
 }
 
 func prepareTaskLock(t *testing.T, root string) {
@@ -35,6 +38,29 @@ func (v legacyVerifierFake) VerifyRC0(string) (ReleaseV1, []MigrationRow, error)
 	return v.release, v.rows, v.err
 }
 func (v legacyVerifierFake) CandidateServerUnit(ReleaseV1) ([]byte, error) { return v.unit, v.err }
+func (v legacyVerifierFake) RC0EdgeTemplate(ReleaseV1) ([]byte, error) {
+	if len(v.sourceTemplate) == 0 {
+		return edgeSourceTemplateFixture(), v.err
+	}
+	return v.sourceTemplate, v.err
+}
+func (v legacyVerifierFake) CandidateEdgeConfig(ReleaseV1) ([]byte, []byte, error) {
+	template, caddy := v.candidateTemplate, v.caddy
+	if len(template) == 0 {
+		template = edgeCandidateTemplateFixture()
+	}
+	if len(caddy) == 0 {
+		caddy = []byte("caddy\n")
+	}
+	return template, caddy, v.err
+}
+
+func edgeSourceTemplateFixture() []byte {
+	return []byte("console.example.invalid {\n\trespond 200\n}\n")
+}
+func edgeCandidateTemplateFixture() []byte {
+	return []byte("http://127.0.0.1:18482 {\n\t@edge_health path /healthz\n\trespond @edge_health 200\n\trespond 404\n}\n\nconsole.example.invalid {\n\trespond 200\n}\n")
+}
 
 func TestPreflightPlanLegacyWithInjectedVerifierIsPureAndRedacted(t *testing.T) {
 	root := t.TempDir()
@@ -50,6 +76,13 @@ func TestPreflightPlanLegacyWithInjectedVerifierIsPureAndRedacted(t *testing.T) 
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(root, "etc/open-card/server.env"), []byte("# keep\nOPEN_CARD_DATABASE_URL=postgresql://u:p@127.0.0.1:5432/open_card\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	installed, err := renderEdgeConfigTemplate(edgeSourceTemplateFixture(), "console.example.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "etc/open-card/open-card-edge.Caddyfile"), installed, 0640); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(root, "etc/systemd/system/open-card-server.service"), []byte("[Service]\n"), 0644); err != nil {
@@ -1290,6 +1323,13 @@ func legacyStoreForProjectionFixture(t *testing.T, withPrevious bool) (*UpgradeS
 	if err := os.WriteFile(filepath.Join(root, "etc/open-card/server.env"), env, durableFileMode); err != nil {
 		t.Fatal(err)
 	}
+	edgeInstalled, err := renderEdgeConfigTemplate(edgeSourceTemplateFixture(), "console.example.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "etc/open-card/open-card-edge.Caddyfile"), edgeInstalled, 0o640); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(root, "etc/systemd/system/open-card-server.service"), unitBefore, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -1381,6 +1421,113 @@ func TestLegacyPrepareFinalizeEndToEnd(t *testing.T) {
 		if strings.Contains(string(raw), "postgresql://") || strings.Contains(string(raw), "user:pass") {
 			t.Fatal("secret leaked in JSON")
 		}
+	}
+}
+
+func TestEdgeConfigPrepareFinalizeAndRereadAreFixedAndDurable(t *testing.T) {
+	store, root, preflight, _, _, _, cleanup := legacyStoreForProjectionFixture(t, false)
+	defer cleanup()
+	plan := *preflight.Legacy
+	edge := *plan.EdgeConfigTransition
+	installedPath := filepath.Join(root, "etc/open-card", installedEdgeConfigName)
+	before, err := os.ReadFile(installedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := store.PrepareEdgeConfig(context.Background(), edge)
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	if prepared.PreparedConfigSHA256 != edge.Evidence.InstalledAfterSHA256 || prepared.InstalledConfigSHA256 != edge.Evidence.InstalledBeforeSHA256 {
+		t.Fatalf("prepare observation=%+v", prepared)
+	}
+	if after, err := os.ReadFile(installedPath); err != nil || !bytes.Equal(after, before) {
+		t.Fatalf("prepare mutated installed config: %q %v", after, err)
+	}
+	artifact := filepath.Join(root, "var/lib/open-card/upgrade-artifacts", edge.Evidence.TransactionID, edgeConfigArtifactName)
+	info, err := os.Lstat(artifact)
+	if err != nil || info.Mode().Perm() != 0o640 || !info.Mode().IsRegular() {
+		t.Fatalf("prepared artifact=%v mode=%#o", err, info.Mode())
+	}
+	if _, err := store.FinalizeEdgeConfig(context.Background(), edge); err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+	if installed, err := os.ReadFile(installedPath); err != nil || !bytes.Equal(installed, edge.Target) {
+		t.Fatalf("installed=%q err=%v", installed, err)
+	}
+	if observed, err := store.ReadEdgeConfig(context.Background(), edge); err != nil || observed.PreparedConfigSHA256 != edge.Evidence.InstalledAfterSHA256 || observed.InstalledConfigSHA256 != edge.Evidence.InstalledAfterSHA256 {
+		t.Fatalf("read observation=%+v err=%v", observed, err)
+	}
+	// Exact replay is safe; a foreign installed config is not.
+	if _, err := store.FinalizeEdgeConfig(context.Background(), edge); err != nil {
+		t.Fatalf("exact replay: %v", err)
+	}
+	if err := os.WriteFile(installedPath, []byte("foreign\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.FinalizeEdgeConfig(context.Background(), edge); !errors.Is(err, ErrUpgradeJournalConflict) {
+		t.Fatalf("foreign installed config accepted: %v", err)
+	}
+}
+
+func TestEdgeConfigRenderingAndInstalledOwnershipFailClosed(t *testing.T) {
+	source := edgeSourceTemplateFixture()
+	candidate := edgeCandidateTemplateFixture()
+	for _, host := range []string{"Console.example.test", "console.example.invalid", "console.example.test/escape", ""} {
+		if _, err := renderEdgeConfigTemplate(source, host); err == nil {
+			t.Fatalf("unsafe hostname accepted: %q", host)
+		}
+	}
+	if _, err := renderEdgeConfigTemplate([]byte("console.example.invalid console.example.invalid"), "console.example.test"); err == nil {
+		t.Fatal("multiple template placeholders accepted")
+	}
+	installed, err := renderEdgeConfigTemplate(source, "console.example.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := edgeConfigTransitionPlan("txn-1", rc0ReleaseFixture(), ReleaseV1{ID: "release-1", Version: ProductionCandidateVersion, SourceCommit: strings.Repeat("a", 40), Architecture: "amd64", ManifestSHA256: sha("f")}, source, append(installed, 'x'), candidate, []byte("caddy")); err == nil {
+		t.Fatal("non-exact installed rendering accepted")
+	}
+	store, root, preflight, _, _, _, cleanup := legacyStoreForProjectionFixture(t, false)
+	defer cleanup()
+	path := filepath.Join(root, "etc/open-card", installedEdgeConfigName)
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.PrepareEdgeConfig(context.Background(), *preflight.Legacy.EdgeConfigTransition); !errors.Is(err, ErrUpgradeJournalConflict) {
+		t.Fatalf("wrong mode accepted: %v", err)
+	}
+	if err := os.Chmod(path, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("server.env", path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.PrepareEdgeConfig(context.Background(), *preflight.Legacy.EdgeConfigTransition); !errors.Is(err, ErrUpgradeJournalConflict) {
+		t.Fatalf("symlink installed config accepted: %v", err)
+	}
+}
+
+func TestEdgeConfigFinalizeReconcilesPostRenameUnknown(t *testing.T) {
+	store, root, preflight, _, _, _, cleanup := legacyStoreForProjectionFixture(t, false)
+	defer cleanup()
+	edge := *preflight.Legacy.EdgeConfigTransition
+	if _, err := store.PrepareEdgeConfig(context.Background(), edge); err != nil {
+		t.Fatal(err)
+	}
+	writer, fault := renameHookWriter(t, filepath.Join(root, "etc/open-card"))
+	fault.fail = "parent-fsync"
+	old := store.configDurable
+	store.configDurable = writer
+	defer func() {
+		store.configDurable = old
+		_ = writer.Close()
+	}()
+	if _, err := store.FinalizeEdgeConfig(context.Background(), edge); err != nil {
+		t.Fatalf("post-rename unknown did not reconcile: %v", err)
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -20,6 +21,7 @@ import (
 )
 
 var candidateDatabaseName = regexp.MustCompile(`^open_card_act_[a-f0-9]{16}$`)
+var postgresRoleName = regexp.MustCompile(`^[a-z_][a-z0-9_]{0,62}$`)
 var ErrPostgresOutcomeUnknown = errors.New("postgres operation outcome is unknown")
 var ErrSnapshotConflict = errors.New("snapshot artifact already exists with unknown identity")
 var ErrCandidateConflict = errors.New("candidate database conflicts with existing evidence")
@@ -52,10 +54,14 @@ type SessionCounter interface {
 	CountOpenCardSessions(context.Context) (int, error)
 }
 type CandidateControl interface {
-	CandidateEvidence(context.Context, string) (bool, string, error)
+	CandidateEvidence(context.Context, string) (CandidateDatabaseIdentity, error)
 	CreateCandidate(context.Context, string, string) error
 }
-type CreateCandidateRequest struct{ ActivationID, ExpectedExistingName, RecoveryEvidence string }
+type CandidateDatabaseIdentity struct {
+	Exists          bool
+	Evidence, Owner string
+}
+type CreateCandidateRequest struct{ ActivationID, ExpectedExistingName, ExpectedExistingOwner, RecoveryEvidence string }
 type CandidateValidator interface {
 	ValidateCandidate(context.Context, string) error
 }
@@ -80,12 +86,12 @@ func CreateCandidate(ctx context.Context, control CandidateControl, request Crea
 	if err != nil {
 		return "", err
 	}
-	exists, evidence, err := control.CandidateEvidence(ctx, name)
+	identity, err := control.CandidateEvidence(ctx, name)
 	if err != nil {
 		return "", ErrPostgresOutcomeUnknown
 	}
-	if exists {
-		if request.ExpectedExistingName == name && evidence == candidateDatabaseEvidence(request.RecoveryEvidence) {
+	if identity.Exists {
+		if request.ExpectedExistingName == name && request.ExpectedExistingOwner != "" && identity.Owner == request.ExpectedExistingOwner && identity.Evidence == candidateDatabaseEvidence(request.RecoveryEvidence) {
 			return name, nil
 		}
 		return "", ErrCandidateConflict
@@ -103,9 +109,21 @@ func candidateDatabaseEvidence(recoveryEvidence string) string {
 // ProductionPostgresControl keeps decoded DSNs private and exposes only safe
 // fixed/parameterized candidate operations.
 type ProductionPostgresControl struct {
-	admin       postgresDB
-	environment PostgresProcessEnvironment
-	base        *pgx.ConnConfig
+	admin              postgresDB
+	runtimeEnv         PostgresProcessEnvironment
+	runtimeRole        string
+	runtimeBase        *pgx.ConnConfig
+	controlRole        string
+	controlIdentitySHA string
+}
+
+const productionUpgradeDatabaseEnvPath = "/etc/open-card/upgrade-database.env"
+
+// readProductionUpgradeDatabaseEnv is private test indirection only. The
+// exported production constructor always reads the fixed root-owned control
+// identity and never accepts a caller supplied control path or bytes.
+var readProductionUpgradeDatabaseEnv = func() ([]byte, error) {
+	return readRootOnlyDatabaseEnv(productionUpgradeDatabaseEnvPath)
 }
 
 // SelectedPostgresDatabase is a short-lived connection to exactly the
@@ -168,18 +186,48 @@ func (t databaseTx) ExecContext(c context.Context, q string, a ...any) (postgres
 func (t databaseTx) Commit() error   { return t.tx.Commit() }
 func (t databaseTx) Rollback() error { return t.tx.Rollback() }
 
-func NewProductionPostgresControl(databaseEnv []byte) (*ProductionPostgresControl, error) {
-	env, base, err := productionPostgresConfig(databaseEnv)
+func NewProductionPostgresControl(runtimeDatabaseEnv []byte) (*ProductionPostgresControl, error) {
+	controlDatabaseEnv, err := readProductionUpgradeDatabaseEnv()
 	if err != nil {
-		return nil, errors.New("invalid database environment")
+		return nil, errors.New("invalid upgrade control environment")
 	}
-	admin := *base
-	admin.Database = "postgres"
-	db := stdlib.OpenDB(admin)
+	return newPostgresControl(runtimeDatabaseEnv, controlDatabaseEnv)
+}
+
+// TaskPostgresControl is an explicit task-only seam. It permits isolated
+// PostgreSQL acceptance tests to supply a dedicated control role without
+// weakening the fixed production control-env source.
+func TaskPostgresControl(runtimeDatabaseEnv, controlDatabaseEnv []byte) (*ProductionPostgresControl, error) {
+	return newPostgresControl(runtimeDatabaseEnv, controlDatabaseEnv)
+}
+
+func newPostgresControl(runtimeDatabaseEnv, controlDatabaseEnv []byte) (*ProductionPostgresControl, error) {
+	runtimeEnv, runtimeBase, err := productionPostgresConfig(runtimeDatabaseEnv)
+	if err != nil {
+		return nil, errors.New("invalid runtime database environment")
+	}
+	controlEnv, controlBase, err := productionPostgresConfig(controlDatabaseEnv)
+	if err != nil {
+		return nil, errors.New("invalid upgrade control environment")
+	}
+	runtimeRole, err := postgresRole(runtimeDatabaseEnv)
+	if err != nil {
+		return nil, errors.New("invalid runtime database environment")
+	}
+	controlRole, err := postgresRole(controlDatabaseEnv)
+	if err != nil || controlRole == runtimeRole || controlBase.Database != "postgres" || controlEnv.Descriptor.Host != runtimeEnv.Descriptor.Host || controlEnv.Descriptor.Port != runtimeEnv.Descriptor.Port || controlEnv.Descriptor.SSLMode != runtimeEnv.Descriptor.SSLMode {
+		return nil, errors.New("invalid upgrade control environment")
+	}
+	// PostgreSQL forbids CREATE DATABASE inside the extended-protocol implicit
+	// transaction used by database/sql. The fixed cluster-control connection
+	// therefore uses pgx simple protocol only for its vetted statements.
+	controlBase.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+	db := stdlib.OpenDB(*controlBase)
 	if db == nil {
 		return nil, errors.New("open postgres control failed")
 	}
-	return &ProductionPostgresControl{admin: databaseSQL{db}, environment: env, base: base}, nil
+	digest := sha256.Sum256(controlDatabaseEnv)
+	return &ProductionPostgresControl{admin: databaseSQL{db}, runtimeEnv: runtimeEnv, runtimeRole: runtimeRole, runtimeBase: runtimeBase, controlRole: controlRole, controlIdentitySHA: hex.EncodeToString(digest[:])}, nil
 }
 
 func NewSelectedPostgresDatabase(databaseEnv []byte) (*SelectedPostgresDatabase, error) {
@@ -250,26 +298,42 @@ func (p *ProductionPostgresControl) Close() error {
 	p.admin = nil
 	return admin.Close()
 }
-func (p *ProductionPostgresControl) CandidateEvidence(ctx context.Context, name string) (bool, string, error) {
+
+// ControlIdentitySHA256 exposes only the digest of the exact control-env
+// bytes. It is suitable for a journal/audit binding and never exposes the
+// control DSN or password.
+func (p *ProductionPostgresControl) ControlIdentitySHA256() string {
+	if p == nil || !validSHA(p.controlIdentitySHA) {
+		return ""
+	}
+	return p.controlIdentitySHA
+}
+func (p *ProductionPostgresControl) CandidateEvidence(ctx context.Context, name string) (CandidateDatabaseIdentity, error) {
 	if p == nil || !candidateDatabaseName.MatchString(name) {
-		return false, "", ErrPostgresOutcomeUnknown
+		return CandidateDatabaseIdentity{}, ErrPostgresOutcomeUnknown
 	}
-	var exists bool
-	var evidence string
-	err := p.admin.QueryRowContext(ctx, "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1), COALESCE((SELECT obj_description(oid, 'pg_database') FROM pg_database WHERE datname = $1), '')", name).Scan(&exists, &evidence)
+	var identity CandidateDatabaseIdentity
+	err := p.admin.QueryRowContext(ctx, "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1), COALESCE((SELECT shobj_description(oid, 'pg_database') FROM pg_database WHERE datname = $1), ''), COALESCE((SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = $1), '')", name).Scan(&identity.Exists, &identity.Evidence, &identity.Owner)
 	if err != nil {
-		return false, "", ErrPostgresOutcomeUnknown
+		return CandidateDatabaseIdentity{}, ErrPostgresOutcomeUnknown
 	}
-	return exists, evidence, nil
+	return identity, nil
 }
 func (p *ProductionPostgresControl) CreateCandidate(ctx context.Context, name, recoveryEvidence string) error {
-	if p == nil || !candidateDatabaseName.MatchString(name) || !validSHA(recoveryEvidence) {
+	if p == nil || !candidateDatabaseName.MatchString(name) || !validSHA(recoveryEvidence) || !postgresRoleName.MatchString(p.runtimeRole) {
 		return ErrPostgresOutcomeUnknown
 	}
-	if _, err := p.admin.ExecContext(ctx, "CREATE DATABASE "+name); err != nil {
+	if _, err := p.admin.ExecContext(ctx, "CREATE DATABASE "+name+" OWNER "+p.runtimeRole); err != nil {
 		return ErrPostgresOutcomeUnknown
 	}
 	if _, err := p.admin.ExecContext(ctx, "COMMENT ON DATABASE "+name+" IS '"+candidateDatabaseEvidence(recoveryEvidence)+"'"); err != nil {
+		return ErrPostgresOutcomeUnknown
+	}
+	identity, err := p.CandidateEvidence(ctx, name)
+	if err != nil {
+		return ErrPostgresOutcomeUnknown
+	}
+	if !identity.Exists || identity.Owner != p.runtimeRole || identity.Evidence != candidateDatabaseEvidence(recoveryEvidence) {
 		return ErrPostgresOutcomeUnknown
 	}
 	return nil
@@ -283,16 +347,59 @@ func (p *ProductionPostgresControl) CountOpenCardSessions(ctx context.Context) (
 	return count, nil
 }
 func (p *ProductionPostgresControl) ForCandidate(name string) (*SQLMigrationControl, error) {
-	if p == nil || p.base == nil || !candidateDatabaseName.MatchString(name) || hasAmbientPostgresEnvironment() {
+	if p == nil || p.runtimeBase == nil || !candidateDatabaseName.MatchString(name) || hasAmbientPostgresEnvironment() {
 		return nil, ErrPostgresOutcomeUnknown
 	}
-	config := *p.base
+	config := *p.runtimeBase
 	config.Database = name
 	db := stdlib.OpenDB(config)
 	if db == nil {
 		return nil, ErrPostgresOutcomeUnknown
 	}
 	return &SQLMigrationControl{databaseSQL{db}}, nil
+}
+
+func postgresRole(raw []byte) (string, error) {
+	dsn, err := ParseDatabaseEnv(raw)
+	if err != nil {
+		return "", err
+	}
+	u, err := url.Parse(dsn)
+	if err != nil || u.User == nil || !postgresRoleName.MatchString(u.User.Username()) {
+		return "", errors.New("invalid postgres role")
+	}
+	return u.User.Username(), nil
+}
+
+func readRootOnlyDatabaseEnv(path string) ([]byte, error) {
+	if path != productionUpgradeDatabaseEnvPath {
+		return nil, errors.New("invalid upgrade control environment")
+	}
+	parent, err := os.Lstat(filepath.Dir(path))
+	if err != nil || !parent.IsDir() || parent.Mode()&os.ModeSymlink != 0 || parent.Mode().Perm()&0o022 != 0 {
+		return nil, errors.New("invalid upgrade control environment")
+	}
+	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, errors.New("invalid upgrade control environment")
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
+		return nil, errors.New("invalid upgrade control environment")
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat.Uid != 0 || stat.Gid != 0 {
+		return nil, errors.New("invalid upgrade control environment")
+	}
+	raw, err := io.ReadAll(file)
+	if err != nil {
+		return nil, errors.New("invalid upgrade control environment")
+	}
+	if _, err := ParseDatabaseEnv(raw); err != nil {
+		return nil, errors.New("invalid upgrade control environment")
+	}
+	return raw, nil
 }
 
 type SQLMigrationControl struct{ database postgresDB }

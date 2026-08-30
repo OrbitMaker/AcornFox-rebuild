@@ -20,29 +20,30 @@ type engineLock struct {
 func (l engineLock) Release() error { *l.released++; return l.err }
 
 type engineStoreFake struct {
-	events                                         *[]string
-	fail                                           string
-	remaining                                      int
-	unknown                                        bool
-	persistBeforeFailure                           bool
-	legacy                                         bool
-	conflict                                       bool
-	released                                       int
-	releaseErr                                     error
-	created                                        []UpgradeJournalV1
-	saved                                          []UpgradeJournalV1
-	old                                            ActivationV1
-	oldDigest                                      string
-	legacyPlan                                     *LegacyProjectionPlan
-	legacyActivation                               ActivationV1
-	legacyDigest                                   string
-	writtenCandidate                               ActivationV1
-	legacyFinalized                                bool
-	candidateEnv                                   []byte
-	state                                          UpgradeActivationState
-	markerTx                                       string
-	bootPending                                    *PendingTransaction
-	restoreCurrent, restorePrevious, restoreDigest string
+	events                                          *[]string
+	fail                                            string
+	remaining                                       int
+	unknown                                         bool
+	persistBeforeFailure                            bool
+	legacy                                          bool
+	conflict                                        bool
+	released                                        int
+	releaseErr                                      error
+	created                                         []UpgradeJournalV1
+	saved                                           []UpgradeJournalV1
+	old                                             ActivationV1
+	oldDigest                                       string
+	legacyPlan                                      *LegacyProjectionPlan
+	legacyActivation                                ActivationV1
+	legacyDigest                                    string
+	writtenCandidate                                ActivationV1
+	legacyFinalized                                 bool
+	edgePrepared, edgeFinalized, edgeInstalledAfter bool
+	candidateEnv                                    []byte
+	state                                           UpgradeActivationState
+	markerTx                                        string
+	bootPending                                     *PendingTransaction
+	restoreCurrent, restorePrevious, restoreDigest  string
 }
 
 func (s *engineStoreFake) event(name string) error {
@@ -133,8 +134,10 @@ func (s *engineStoreFake) PreflightPlan(_ context.Context, request UpgradePrefli
 	if !s.legacy {
 		return UpgradePreflight{Existing: &ExistingActivationPreflight{Activation: s.old, JSONSHA256: s.oldDigest, DatabaseEnv: engineActiveDatabaseEnv()}, Previous: ActivationPointerIdentity{ID: s.state.PreviousID, JSONSHA256: s.state.PreviousJSONSHA256}}, nil
 	}
+	edgeTarget := []byte("edge candidate configuration\n")
+	edgePlan := &EdgeConfigTransitionPlan{Evidence: EdgeConfigTransitionV1{SchemaVersion: 1, TransactionID: request.TransactionID, SourceReleaseID: "release-rc0", CandidateReleaseID: request.CandidateRelease.ID, ConsoleHostname: "console.example.test", SourceTemplateSHA256: strings.Repeat("5", 64), CandidateTemplateSHA256: strings.Repeat("6", 64), InstalledBeforeSHA256: strings.Repeat("7", 64), InstalledAfterSHA256: sha256Bytes(edgeTarget), CandidateCaddySHA256: strings.Repeat("8", 64)}, Target: edgeTarget}
 	plan := &LegacyProjectionPlan{
-		TransactionID: request.TransactionID, ActivationID: "legacy-0123456789abcdef012345", Release: ReleaseV1{ID: "release-rc0", Version: ProductionNMinusOneVersion, SourceCommit: RC0SourceCommit, Architecture: "amd64", ManifestSHA256: RC0ReleaseManifestSHA256}, CurrentTarget: "/opt/open-card/releases/release-rc0", ExpectedMigration: "0023", ExpectedRowsSHA256: strings.Repeat("c", 64), DatabaseEnv: []byte("OPEN_CARD_DATABASE_URL=postgresql://user:pass@localhost:5432/open_card?sslmode=disable\n"), ServerEnvBeforeSHA256: strings.Repeat("1", 64), ServerEnvAfterSHA256: strings.Repeat("2", 64), ServerUnitBeforeSHA256: strings.Repeat("3", 64), ServerUnitAfterSHA256: strings.Repeat("4", 64), ServerUnitReleaseID: request.CandidateRelease.ID,
+		TransactionID: request.TransactionID, ActivationID: "legacy-0123456789abcdef012345", Release: ReleaseV1{ID: "release-rc0", Version: ProductionNMinusOneVersion, SourceCommit: RC0SourceCommit, Architecture: "amd64", ManifestSHA256: RC0ReleaseManifestSHA256}, CurrentTarget: "/opt/open-card/releases/release-rc0", ExpectedMigration: "0023", ExpectedRowsSHA256: strings.Repeat("c", 64), DatabaseEnv: []byte("OPEN_CARD_DATABASE_URL=postgresql://user:pass@localhost:5432/open_card?sslmode=disable\n"), ServerEnvBeforeSHA256: strings.Repeat("1", 64), ServerEnvAfterSHA256: strings.Repeat("2", 64), ServerUnitBeforeSHA256: strings.Repeat("3", 64), ServerUnitAfterSHA256: strings.Repeat("4", 64), ServerUnitReleaseID: request.CandidateRelease.ID, EdgeConfigTransition: edgePlan,
 	}
 	plan.Previous = ActivationPointerIdentity{ID: s.state.PreviousID, JSONSHA256: s.state.PreviousJSONSHA256}
 	plan.DatabaseEnvSHA256 = sha256Bytes(plan.DatabaseEnv)
@@ -179,6 +182,35 @@ func (s *engineStoreFake) RecoverLegacyPlan(_ context.Context, old ActivationV1,
 	plan := *s.legacyPlan
 	plan.Previous = ActivationPointerIdentity{ID: s.state.PreviousID, JSONSHA256: s.state.PreviousJSONSHA256}
 	return plan, nil
+}
+func (s *engineStoreFake) PrepareEdgeConfig(_ context.Context, plan EdgeConfigTransitionPlan) (EdgeConfigObservationV1, error) {
+	if err := s.event("edge:prepare"); err != nil || plan.Validate() != nil || s.edgeInstalledAfter {
+		if err != nil {
+			return EdgeConfigObservationV1{}, err
+		}
+		return EdgeConfigObservationV1{}, errEngineFake
+	}
+	s.edgePrepared = true
+	return EdgeConfigObservationV1{PreparedConfigSHA256: plan.Evidence.InstalledAfterSHA256, InstalledConfigSHA256: plan.Evidence.InstalledBeforeSHA256, CaddySHA256: plan.Evidence.CandidateCaddySHA256}, nil
+}
+func (s *engineStoreFake) FinalizeEdgeConfig(_ context.Context, plan EdgeConfigTransitionPlan) (EdgeConfigObservationV1, error) {
+	if err := s.event("edge:finalize"); err != nil || plan.Validate() != nil || !s.edgePrepared {
+		if err != nil {
+			return EdgeConfigObservationV1{}, err
+		}
+		return EdgeConfigObservationV1{}, errEngineFake
+	}
+	s.edgeFinalized, s.edgeInstalledAfter = true, true
+	return EdgeConfigObservationV1{PreparedConfigSHA256: plan.Evidence.InstalledAfterSHA256, InstalledConfigSHA256: plan.Evidence.InstalledAfterSHA256, CaddySHA256: plan.Evidence.CandidateCaddySHA256}, nil
+}
+func (s *engineStoreFake) ReadEdgeConfig(_ context.Context, plan EdgeConfigTransitionPlan) (EdgeConfigObservationV1, error) {
+	if err := s.event("edge:read"); err != nil || plan.Validate() != nil || !s.edgePrepared || !s.edgeInstalledAfter {
+		if err != nil {
+			return EdgeConfigObservationV1{}, err
+		}
+		return EdgeConfigObservationV1{}, errEngineFake
+	}
+	return EdgeConfigObservationV1{PreparedConfigSHA256: plan.Evidence.InstalledAfterSHA256, InstalledConfigSHA256: plan.Evidence.InstalledAfterSHA256, CaddySHA256: plan.Evidence.CandidateCaddySHA256}, nil
 }
 func (s *engineStoreFake) ReadActivationState(context.Context) (UpgradeActivationState, error) {
 	if err := s.event("read"); err != nil {
@@ -276,6 +308,7 @@ type engineDBFake struct {
 	snapshotSource  string
 	closed          int
 	closeErr        error
+	controlIdentity string
 }
 
 func (d *engineDBFake) InspectActive(_ context.Context, request ActiveDatabaseInspectionRequest) (DatabaseV1, error) {
@@ -331,7 +364,13 @@ func (d *engineDBFake) Validate(context.Context, string) (ArtifactV1, error) {
 }
 
 func (d *engineDBFake) CandidateDatabaseEnv() []byte { return append([]byte(nil), d.candidateEnv...) }
-func (d *engineDBFake) Close() error                 { d.closed++; return d.closeErr }
+func (d *engineDBFake) ControlIdentitySHA256() string {
+	if d.controlIdentity != "" {
+		return d.controlIdentity
+	}
+	return strings.Repeat("9", 64)
+}
+func (d *engineDBFake) Close() error { d.closed++; return d.closeErr }
 
 type engineServiceFake struct {
 	events     *[]string
@@ -368,6 +407,15 @@ func (s *engineServiceFake) HealthEdge(context.Context) error     { return s.eve
 func (s *engineServiceFake) GuardEdge(context.Context) error      { return s.event("edge:guard") }
 func (s *engineServiceFake) ReloadServerUnit(context.Context, string) error {
 	return s.event("unit:reload")
+}
+func (s *engineServiceFake) ValidateEdgeConfig(_ context.Context, transition EdgeConfigTransitionV1, artifact ArtifactV1) (EdgeConfigValidationV1, error) {
+	if err := s.event("edge:validate"); err != nil || !transition.valid() || artifact.Path != edgeConfigPreparedArtifactPath(transition.TransactionID) || artifact.SHA256 != transition.InstalledAfterSHA256 || artifact.Size < 1 {
+		if err != nil {
+			return EdgeConfigValidationV1{}, err
+		}
+		return EdgeConfigValidationV1{}, errEngineFake
+	}
+	return EdgeConfigValidationV1{ConfigSHA256: transition.InstalledAfterSHA256, CaddySHA256: transition.CandidateCaddySHA256, EvidenceSHA256: strings.Repeat("7", 64)}, nil
 }
 func (s *engineServiceFake) RestoreSnapshot(context.Context, ServiceSnapshotV1) error {
 	return s.event("restore:snapshot")
@@ -740,6 +788,118 @@ func TestUpgradeEngineFactoryFailureCreatesNoJournal(t *testing.T) {
 	}
 	if len(store.created) != 0 {
 		t.Fatalf("journal was created: %#v", store.created)
+	}
+}
+
+func TestRunNewRequiresControlIdentityBeforeInitialJournal(t *testing.T) {
+	e, store, database, _, _ := engineFixture(false)
+	database.controlIdentity = "not-a-sha"
+	if phase := enginePhase(t, e.RunNew(context.Background(), engineRequest())); phase.Phase != JournalPreflighted || phase.Code != "control_identity_failed" {
+		t.Fatalf("phase=%#v", phase)
+	}
+	if len(store.created) != 0 || store.state.Marker {
+		t.Fatalf("journal or marker created without control identity: %#v", store)
+	}
+}
+
+func TestLegacyEdgeConfigPrepareValidateAndPostCommitFinalizeOrdering(t *testing.T) {
+	e, store, _, _, events := engineFixture(true)
+	request := engineRequest()
+	request.ExpectedLegacy = true
+	if err := e.RunNew(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if !store.edgePrepared || !store.edgeFinalized || !store.edgeInstalledAfter {
+		t.Fatalf("edge state=%+v", store)
+	}
+	for _, name := range []string{"edge:prepare", "edge:validate", "edge:finalize", "edge:read"} {
+		if eventIndex(*events, name) < 0 {
+			t.Fatalf("missing %s in %v", name, *events)
+		}
+	}
+	if eventIndex(*events, "write") > eventIndex(*events, "edge:prepare") || eventIndex(*events, "edge:prepare") > eventIndex(*events, "edge:validate") || eventIndex(*events, "edge:validate") > eventIndex(*events, "validate") || eventIndex(*events, "save:COMMITTED") > eventIndex(*events, "edge:finalize") || eventIndex(*events, "edge:read") > eventIndex(*events, "marker:off") {
+		t.Fatalf("edge order=%v", *events)
+	}
+	last := store.saved[len(store.saved)-1]
+	if last.EdgeConfigTransition == nil || last.EdgeConfigValidation == nil || last.UpgradeControlDatabaseEnvSHA256 != strings.Repeat("9", 64) {
+		t.Fatalf("journal edge/control evidence=%+v", last)
+	}
+	if raw, err := MarshalUpgradeJournalV1(last); err != nil || strings.Contains(string(raw), "user:pass") || strings.Contains(string(raw), "postgresql://") {
+		t.Fatalf("journal leaked secret: %q %v", raw, err)
+	}
+}
+
+func TestLegacyEdgeConfigFaultsPreserveBeforeOrCommittedCandidate(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		storeFault bool
+		postCommit bool
+		unknown    bool
+	}{
+		{name: "edge:prepare", storeFault: true},
+		{name: "edge:prepare-unknown", storeFault: true, unknown: true},
+		{name: "edge:validate"},
+		{name: "edge:finalize", storeFault: true, postCommit: true},
+		{name: "edge:finalize-unknown", storeFault: true, postCommit: true, unknown: true},
+		{name: "edge:read", storeFault: true, postCommit: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e, store, _, service, events := engineFixture(true)
+			request := engineRequest()
+			request.ExpectedLegacy = true
+			faultName := strings.TrimSuffix(tc.name, "-unknown")
+			if tc.storeFault {
+				store.fail, store.remaining, store.unknown = faultName, 1, tc.unknown
+			} else {
+				service.fail, service.remaining = faultName, 1
+			}
+			if err := e.RunNew(context.Background(), request); err == nil {
+				t.Fatal("expected edge configuration fault")
+			}
+			if tc.postCommit {
+				if store.state.ActiveID != "activation-new" || !store.state.Marker || eventIndex(*events, "restore-active") >= 0 || eventIndex(*events, "edge:guard") < 0 {
+					t.Fatalf("postcommit fault rolled back or exposed edge: state=%+v events=%v", store.state, *events)
+				}
+			} else if store.edgeInstalledAfter || store.state.ActiveID == "activation-new" {
+				t.Fatalf("precommit edge fault installed/activated candidate: state=%+v events=%v", store.state, *events)
+			}
+		})
+	}
+}
+
+func TestLegacyRecoveryRejectsExposedControlIdentityMismatchAndGuardsEdge(t *testing.T) {
+	e, store, database, _, events := engineFixture(true)
+	request := engineRequest()
+	request.ExpectedLegacy = true
+	store.fail, store.remaining = "legacy:prepare", 1
+	if err := e.RunNew(context.Background(), request); err == nil || len(store.created) != 1 {
+		t.Fatalf("missing recoverable legacy preflight journal: err=%v journals=%v", err, store.created)
+	}
+	database.controlIdentity = strings.Repeat("1", 64)
+	*events = nil
+	if phase := enginePhase(t, e.Recover(context.Background(), request.TransactionID)); phase.Phase != JournalRecoveryRequired || phase.Code != "recovery_required" {
+		t.Fatalf("phase=%#v", phase)
+	}
+	if !store.state.Marker || eventIndex(*events, "edge:guard") < 0 || len(store.saved) == 0 || store.saved[len(store.saved)-1].State != JournalRecoveryRequired {
+		t.Fatalf("mismatch did not fail closed: state=%+v events=%v journals=%v", store.state, *events, store.saved)
+	}
+}
+
+func TestRecoverCommittedReplaysEdgeConfigBeforePublicMarkerRemoval(t *testing.T) {
+	e, store, _, _, events := engineFixture(true)
+	request := engineRequest()
+	request.ExpectedLegacy = true
+	store.fail, store.remaining = "marker:off", 1
+	if err := e.RunNew(context.Background(), request); err == nil || !store.state.Marker || !store.edgeInstalledAfter {
+		t.Fatalf("expected committed marker failure: err=%v state=%+v", err, store.state)
+	}
+	store.fail, store.remaining = "", 0
+	*events = nil
+	if err := e.Recover(context.Background(), request.TransactionID); err != nil {
+		t.Fatal(err)
+	}
+	if store.state.Marker || eventIndex(*events, "edge:finalize") < 0 || eventIndex(*events, "edge:read") < 0 || eventIndex(*events, "edge:read") > eventIndex(*events, "marker:off") {
+		t.Fatalf("recover did not converge edge config before public marker removal: state=%+v events=%v", store.state, *events)
 	}
 }
 
