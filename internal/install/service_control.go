@@ -387,9 +387,15 @@ func (c *ServiceController) state(ctx context.Context, unit ServiceUnit, action 
 		return false, ErrServiceOutcomeUnknown
 	}
 	result := c.runner.Run(ctx, "systemctl", action, "--quiet", serviceName(unit))
-	allowedInactive := action == "is-active" && result.ExitCode == 3
-	allowedDisabled := action == "is-enabled" && result.ExitCode == 1
-	if result.Err != nil || (result.ExitCode != 0 && !allowedInactive && !allowedDisabled) {
+	var exitError *exec.ExitError
+	knownProcessExit := result.Err != nil && errors.As(result.Err, &exitError) && exitError.ExitCode() == result.ExitCode
+	allowedInactive := action == "is-active" && result.ExitCode == 3 && knownProcessExit
+	allowedDisabled := action == "is-enabled" && result.ExitCode == 1 && knownProcessExit
+	// systemctl reports inactive/disabled through documented non-zero exit
+	// statuses, which exec.Command necessarily represents as *exec.ExitError.
+	// Accept the exact state codes while continuing to reject every other
+	// command error or exit status.
+	if (result.ExitCode == 0 && result.Err != nil) || (result.ExitCode != 0 && !allowedInactive && !allowedDisabled) {
 		return false, fmt.Errorf("%w: %s", ErrServiceOutcomeUnknown, action)
 	}
 	return result.ExitCode == 0, nil

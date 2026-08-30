@@ -18,11 +18,17 @@ import (
 )
 
 type fakeServiceRunner struct {
-	active  map[string]bool
-	enabled map[string]bool
-	argv    [][]string
-	fail    map[string]error
+	active      map[string]bool
+	enabled     map[string]bool
+	argv        [][]string
+	fail        map[string]error
+	inactiveErr error
+	disabledErr error
 }
+
+type fixedResultServiceRunner struct{ result CommandResult }
+
+func (r fixedResultServiceRunner) Run(context.Context, ...string) CommandResult { return r.result }
 
 func TestProductionServiceRunnerDoesNotInheritAmbientEnvironment(t *testing.T) {
 	for key, value := range map[string]string{
@@ -425,7 +431,15 @@ type serviceCloseOps struct {
 func (o *serviceCloseOps) Close() error { o.calls++; return o.err }
 
 func newFakeServiceRunner() *fakeServiceRunner {
-	return &fakeServiceRunner{active: map[string]bool{}, enabled: map[string]bool{}, fail: map[string]error{}}
+	return &fakeServiceRunner{active: map[string]bool{}, enabled: map[string]bool{}, fail: map[string]error{}, inactiveErr: testExitError(3), disabledErr: testExitError(1)}
+}
+
+func testExitError(code int) error {
+	err := exec.Command("/bin/sh", "-c", fmt.Sprintf("exit %d", code)).Run()
+	if _, ok := err.(*exec.ExitError); !ok {
+		panic("test command did not return exec.ExitError")
+	}
+	return err
 }
 func (f *fakeServiceRunner) Run(_ context.Context, argv ...string) CommandResult {
 	f.argv = append(f.argv, append([]string(nil), argv...))
@@ -442,12 +456,12 @@ func (f *fakeServiceRunner) Run(_ context.Context, argv ...string) CommandResult
 		if f.active[unit] {
 			return CommandResult{}
 		}
-		return CommandResult{ExitCode: 3}
+		return CommandResult{ExitCode: 3, Err: f.inactiveErr}
 	case "is-enabled":
 		if f.enabled[unit] {
 			return CommandResult{}
 		}
-		return CommandResult{ExitCode: 1}
+		return CommandResult{ExitCode: 1, Err: f.disabledErr}
 	case "start":
 		f.active[unit] = true
 	case "stop":
@@ -508,6 +522,50 @@ func TestServiceControlOrdersQuiesceStartAndSnapshotWithoutRawOutput(t *testing.
 		if !strings.Contains(joined, want) {
 			t.Fatalf("missing fixed command %q", want)
 		}
+	}
+}
+
+func TestServiceControlAcceptsDocumentedInactiveAndDisabledExitErrors(t *testing.T) {
+	runner := newFakeServiceRunner()
+	controller := taskController(t, runner, func() (bool, error) { return false, nil })
+	snapshot, err := controller.CaptureSnapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, unit := range serviceUnits {
+		if snapshot[unit].Active || snapshot[unit].Enabled {
+			t.Fatalf("unexpected active/enabled state for %s: %#v", unit, snapshot[unit])
+		}
+	}
+	if err := controller.Quiesce(context.Background(), true, true); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestServiceControlRejectsUnprovenStatusOutcomes(t *testing.T) {
+	exit3, exit1, exit4 := testExitError(3), testExitError(1), testExitError(4)
+	tests := []struct {
+		name   string
+		action string
+		result CommandResult
+	}{
+		{"inactive nil error", "is-active", CommandResult{ExitCode: 3}},
+		{"disabled nil error", "is-enabled", CommandResult{ExitCode: 1}},
+		{"inactive generic error", "is-active", CommandResult{ExitCode: 3, Err: errors.New("generic")}},
+		{"disabled generic error", "is-enabled", CommandResult{ExitCode: 1, Err: context.Canceled}},
+		{"active zero status generic error", "is-active", CommandResult{Err: errors.New("generic")}},
+		{"enabled zero status generic error", "is-enabled", CommandResult{Err: context.Canceled}},
+		{"swapped active code", "is-active", CommandResult{ExitCode: 1, Err: exit1}},
+		{"swapped enabled code", "is-enabled", CommandResult{ExitCode: 3, Err: exit3}},
+		{"mismatched exit error", "is-active", CommandResult{ExitCode: 3, Err: exit4}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			controller := &ServiceController{runner: fixedResultServiceRunner{result: test.result}}
+			if _, err := controller.state(context.Background(), ServiceEdge, test.action); !errors.Is(err, ErrServiceOutcomeUnknown) {
+				t.Fatalf("state error=%v", err)
+			}
+		})
 	}
 }
 
