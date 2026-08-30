@@ -102,11 +102,17 @@ type productionRuntimeDependencies struct {
 }
 
 var (
-	errBootRuntimeConfiguration  = errors.New("boot runtime configuration unavailable")
-	errBootArtifactsUnavailable  = errors.New("boot artifacts unavailable")
-	errBootExecutableUnavailable = errors.New("boot executable unavailable")
-	errBootStoreUnavailable      = errors.New("boot store unavailable")
-	errBootServiceUnavailable    = errors.New("boot service unavailable")
+	errBootRuntimeConfiguration     = errors.New("boot runtime configuration unavailable")
+	errBootArtifactsUnavailable     = errors.New("boot artifacts unavailable")
+	errBootUnitFilesUnavailable     = errors.New("boot unit files unavailable")
+	errBootSystemctlUnavailable     = errors.New("boot systemctl unavailable")
+	errBootUnitStateUnavailable     = errors.New("boot unit state unavailable")
+	errBootTargetGraphUnavailable   = errors.New("boot target graph unavailable")
+	errBootFenceStateUnavailable    = errors.New("boot fence state unavailable")
+	errBootBusinessGraphUnavailable = errors.New("boot business graph unavailable")
+	errBootExecutableUnavailable    = errors.New("boot executable unavailable")
+	errBootStoreUnavailable         = errors.New("boot store unavailable")
+	errBootServiceUnavailable       = errors.New("boot service unavailable")
 )
 
 func runtimeConstructionErrorCode(err error) string {
@@ -115,6 +121,18 @@ func runtimeConstructionErrorCode(err error) string {
 		return "boot_runtime_configuration_unavailable"
 	case errors.Is(err, errBootArtifactsUnavailable):
 		return "boot_artifacts_unavailable"
+	case errors.Is(err, errBootUnitFilesUnavailable):
+		return "boot_unit_files_unavailable"
+	case errors.Is(err, errBootSystemctlUnavailable):
+		return "boot_systemctl_unavailable"
+	case errors.Is(err, errBootUnitStateUnavailable):
+		return "boot_unit_state_unavailable"
+	case errors.Is(err, errBootTargetGraphUnavailable):
+		return "boot_target_graph_unavailable"
+	case errors.Is(err, errBootFenceStateUnavailable):
+		return "boot_fence_state_unavailable"
+	case errors.Is(err, errBootBusinessGraphUnavailable):
+		return "boot_business_graph_unavailable"
 	case errors.Is(err, errBootExecutableUnavailable):
 		return "boot_executable_unavailable"
 	case errors.Is(err, errBootStoreUnavailable):
@@ -175,7 +193,10 @@ func newProductionBootRuntimeWithDependencies(ctx context.Context, finalize bool
 	if deps.verifyExecutable == nil || deps.verifyBootArtifacts == nil || deps.openStore == nil || deps.openService == nil || deps.databaseFactory == nil || deps.now == nil {
 		return upgradeRuntime{}, errBootRuntimeConfiguration
 	}
-	if deps.verifyBootArtifacts(ctx, finalize) != nil {
+	if err := deps.verifyBootArtifacts(ctx, finalize); err != nil {
+		if runtimeConstructionErrorCode(err) != "runtime_unavailable" {
+			return upgradeRuntime{}, err
+		}
 		return upgradeRuntime{}, errBootArtifactsUnavailable
 	}
 	if deps.verifyExecutable() != nil {
@@ -826,15 +847,15 @@ func verifyProductionBootArtifacts(ctx context.Context, requireActive bool) erro
 	for _, file := range productionBootUnitFiles {
 		root, name := filepath.Dir(file.path), filepath.Base(file.path)
 		if err := verifyRootOwnedDirectoryChain("/etc", "/etc/systemd", "/etc/systemd/system", root); err != nil {
-			return errors.New("invalid boot unit")
+			return errBootUnitFilesUnavailable
 		}
 		raw, err := readRootOwnedNoFollowFile(root, name, 0o644)
 		if err != nil || !bytes.Equal(raw, file.raw()) {
-			return errors.New("invalid boot unit")
+			return errBootUnitFilesUnavailable
 		}
 	}
 	if err := verifyProductionSystemctl(); err != nil {
-		return errors.New("invalid systemctl")
+		return errBootSystemctlUnavailable
 	}
 	for _, check := range []struct {
 		unit, path, state, dropins string
@@ -846,20 +867,20 @@ func verifyProductionBootArtifacts(ctx context.Context, requireActive bool) erro
 	} {
 		values, err := productionSystemctlProperties(ctx, check.unit, "FragmentPath", "DropInPaths", "NeedDaemonReload", "UnitFileState")
 		if err != nil || values["FragmentPath"] != check.path || values["DropInPaths"] != check.dropins || values["NeedDaemonReload"] != "no" || values["UnitFileState"] != check.state {
-			return errors.New("invalid boot unit state")
+			return errBootUnitStateUnavailable
 		}
 	}
 	target, err := productionSystemctlProperties(ctx, "open-card-upgrade-safe.target", "Requires", "Wants", "Before")
 	if err != nil || !containsRequiredBootUnits(target["Requires"], "open-card-upgrade-recover.service") || !containsRequiredBootUnits(target["Wants"], "open-card-upgrade-finalize.service") || !containsRequiredBootUnits(target["Before"], "open-card-buildkit.service", "open-card-caddy.service", "open-card-server.service", "open-card-agent.service", "open-card-edge.service", "open-card-upgrade-finalize.service") {
-		return errors.New("invalid boot target relationships")
+		return errBootTargetGraphUnavailable
 	}
 	if err := verifyProductionSafeBootTargetState(ctx, requireActive); err != nil {
-		return err
+		return errBootFenceStateUnavailable
 	}
 	for _, unit := range []string{"open-card-buildkit.service", "open-card-caddy.service", "open-card-server.service", "open-card-agent.service", "open-card-edge.service"} {
 		values, err := productionSystemctlProperties(ctx, unit, "Requires")
 		if err != nil || !containsRequiredBootUnits(values["Requires"], "open-card-upgrade-safe.target") {
-			return errors.New("invalid boot business relationship")
+			return errBootBusinessGraphUnavailable
 		}
 	}
 	return nil

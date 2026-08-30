@@ -213,6 +213,12 @@ func TestBootRuntimeConstructionErrorsAreStageSpecificAndRedacted(t *testing.T) 
 	}{
 		{errBootRuntimeConfiguration, "boot_runtime_configuration_unavailable"},
 		{errBootArtifactsUnavailable, "boot_artifacts_unavailable"},
+		{errBootUnitFilesUnavailable, "boot_unit_files_unavailable"},
+		{errBootSystemctlUnavailable, "boot_systemctl_unavailable"},
+		{errBootUnitStateUnavailable, "boot_unit_state_unavailable"},
+		{errBootTargetGraphUnavailable, "boot_target_graph_unavailable"},
+		{errBootFenceStateUnavailable, "boot_fence_state_unavailable"},
+		{errBootBusinessGraphUnavailable, "boot_business_graph_unavailable"},
 		{errBootExecutableUnavailable, "boot_executable_unavailable"},
 		{errBootStoreUnavailable, "boot_store_unavailable"},
 		{errBootServiceUnavailable, "boot_service_unavailable"},
