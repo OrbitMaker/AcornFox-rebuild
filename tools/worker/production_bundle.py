@@ -29,6 +29,13 @@ RC0_SOURCE_COMMIT = "35a2b198ac52949af3477475d89d4813b46a9490"
 N_MINUS_ONE_RELEASE_MANIFEST_SHA256 = "3b3953c0a26f8706151583ad6c9cad6b5502da18b28f11ed66ca92fe604aa253"
 N_MINUS_ONE_ARCHIVE_SHA256 = "abc034ed24e8e8dc74b8eabc84dd3071a66f166abe65135502911e9153c0b9fc"
 N_MINUS_ONE_BUNDLE_MANIFEST_SHA256 = "960ab65526b890009e1770ad190a70b1589f825e0f59cf8d757634a0a8848392"
+RC1_SOURCE_COMMIT = "0d5c96bf7b7bd1c641b108cbbd54511d814f2aa0"
+RC1_CERTIFICATION_SHA256 = "22b41c0221f0c159520209dc385557f1918e7205c6b71b2dd1fa9564ac55bc87"
+RC1_RELEASE_INDEX_SHA256 = "784199b3faceb3f757a5b1dbdc1b1ee55a02ab84131a6ea86724a76d965a54a6"
+RC1_LINEAGES = {
+    "amd64": {"version": "0.8.0-rc.1", "migration_version": "0024", "source_commit": RC1_SOURCE_COMMIT, "release_manifest_sha256": "1cf02e4a111e38a4061c692de418b67755a2e55f97a04cbc92cee8cb9f82a7be", "archive_sha256": "9056cb46537537f6cab21482d900160486098d857955d23b0ca8f131a9cc4233", "bundle_manifest_sha256": "d0e8c111dcaa334c89bb815fc2ddc9b122887cddbbf7c59b6eb51436b931706f"},
+    "arm64": {"version": "0.8.0-rc.1", "migration_version": "0024", "source_commit": RC1_SOURCE_COMMIT, "release_manifest_sha256": "6bf1e590c3054d373d9319f03581d7a623ee3093b53ddba7b343cf8af7f85fed", "archive_sha256": "56a697aed3a8f77261cfeb3074a7d7ab0cfb6389ab5d75225ad9931b665bfa86", "bundle_manifest_sha256": "5fda1e9d0f80deadf6b87cb281d80793c9d1e910386624bc5975cdd0464a2650"},
+}
 ARM64_N_MINUS_ONE_RELEASE_MANIFEST_SHA256 = "e4f56105b3d184313d51365c7fff40b9f68111815def83c5e5985bc182177a57"
 ARM64_N_MINUS_ONE_ARCHIVE_SHA256 = "9560df1d4a739c729d857cd93b989b99976da0e86983ffa026d13202339d57b9"
 ARM64_N_MINUS_ONE_BUNDLE_MANIFEST_SHA256 = "fdfd6b6108870118714b70c9007937585fc0429d14fa9d64010a80016edc2a15"
@@ -51,7 +58,7 @@ def release_binaries(version: str) -> tuple[str, ...]:
     """Return the exact executable payload available for one release line."""
     if version == "0.8.0-rc.0":
         return RC0_BINARIES
-    if version == "0.8.0-rc.1":
+    if version in {"0.8.0-rc.1", "0.8.0-rc.2"}:
         return BINARIES
     raise ProductionBundleError("unsupported release version")
 
@@ -115,6 +122,7 @@ RC1_INSTALLER_SCRIPTS = (
     "restore-control-plane.sh",
     "control-plane-migrate.sh",
 )
+RC2_INSTALLER_SCRIPTS = (*RC1_INSTALLER_SCRIPTS, "g6-staging-evidence.sh")
 INSTALLER_SCRIPTS = RC1_INSTALLER_SCRIPTS
 
 
@@ -124,6 +132,8 @@ def installer_scripts(version: str) -> tuple[str, ...]:
         return RC0_INSTALLER_SCRIPTS
     if version == "0.8.0-rc.1":
         return RC1_INSTALLER_SCRIPTS
+    if version == "0.8.0-rc.2":
+        return RC2_INSTALLER_SCRIPTS
     raise ProductionBundleError("unsupported release version")
 
 
@@ -435,6 +445,7 @@ def make_source_manifest(
     source_commit: str,
     tracked: tuple[str, ...],
     installer_payload: tuple[str, ...],
+    version: str,
 ) -> None:
     installers = {f"scripts/mvp/{script}" for script in installer_payload}
 
@@ -452,6 +463,7 @@ def make_source_manifest(
                 "web/.env.example",
             }
             or path in installers
+            or (version == "0.8.0-rc.2" and path in {"tools/evidence/g6_validate.py", "tools/evidence/g6_target_receipt.py"})
             or (path.startswith("web/tsconfig") and path.endswith(".json"))
         ):
             return True
@@ -525,6 +537,8 @@ def release_spec(version: str, migration_version: str) -> dict[str, str | None]:
         return {"expected_n_minus_one_version": None, "expected_n_minus_one_migration": None}
     if (version, migration_version) == ("0.8.0-rc.1", "0024"):
         return {"expected_n_minus_one_version": "0.8.0-rc.0", "expected_n_minus_one_migration": "0023"}
+    if (version, migration_version) == ("0.8.0-rc.2", "0024"):
+        return {"expected_n_minus_one_version": "0.8.0-rc.1", "expected_n_minus_one_migration": "0024"}
     raise ProductionBundleError("unsupported release specification")
 
 
@@ -536,8 +550,9 @@ def verify_n_minus_one(
     arch: str,
     expected_version: str,
     expected_migration: str,
+    lineage: dict[str, str] | None = None,
 ) -> dict[str, object]:
-    lineage = require_frozen_rc0_lineage(arch)
+    lineage = require_frozen_rc0_lineage(arch) if lineage is None else lineage
     directory(release)
     manifest_path = release / "manifest.json"
     regular(manifest_path)
@@ -671,6 +686,10 @@ def assemble(
     live_attestation_sha256: str | None = None,
     n_minus_one_archive_sha256: str | None = None,
     n_minus_one_bundle_manifest_sha256: str | None = None,
+    predecessor_certification: Path | None = None,
+    predecessor_certification_sha256: str | None = None,
+    predecessor_release_index: Path | None = None,
+    predecessor_release_index_sha256: str | None = None,
     structure_only: bool = False,
 ) -> dict[str, object]:
     if not lowercase_hex(source_commit, 40):
@@ -679,7 +698,13 @@ def assemble(
         raise ProductionBundleError(f"unsupported release architecture: {arch}")
     spec = release_spec(version, migration_version)
     needs_n_minus_one = spec["expected_n_minus_one_version"] is not None
-    lineage = require_frozen_rc0_lineage(arch) if needs_n_minus_one else None
+    lineage = (
+        require_frozen_rc0_lineage(arch)
+        if spec["expected_n_minus_one_version"] == "0.8.0-rc.0"
+        else RC1_LINEAGES[arch]
+        if needs_n_minus_one
+        else None
+    )
     directory(stage)
     directory(repo)
     directory(output.parent)
@@ -704,6 +729,16 @@ def assemble(
             or n_minus_one_bundle_manifest_sha256 != lineage["bundle_manifest_sha256"]
         ):
             raise ProductionBundleError("N-1 lineage digests must match the frozen local candidate")
+    if version == "0.8.0-rc.2" and not structure_only:
+        if (
+            predecessor_certification is None
+            or predecessor_release_index is None
+            or predecessor_certification_sha256 != RC1_CERTIFICATION_SHA256
+            or predecessor_release_index_sha256 != RC1_RELEASE_INDEX_SHA256
+            or sha256(predecessor_certification) != predecessor_certification_sha256
+            or sha256(predecessor_release_index) != predecessor_release_index_sha256
+        ):
+            raise ProductionBundleError("RC2 requires exact RC1 certification and release-index evidence")
     if not structure_only and (
         live_attestation is None
         or not lowercase_hex(live_attestation_sha256, 64)
@@ -733,6 +768,7 @@ def assemble(
                 arch,
                 str(spec["expected_n_minus_one_version"]),
                 str(spec["expected_n_minus_one_migration"]),
+                lineage,
             )
 
         stage_snapshot = inputs / "stage"
@@ -833,7 +869,10 @@ def assemble(
                     0o640,
                 )
                 live_attestation_digest = sha256(release / "attestations/live-web.json")
-            make_source_manifest(repo_snapshot, release, source_commit, tracked, installer_payload)
+            if version == "0.8.0-rc.2":
+                for evidence_tool in ("g6_validate.py", "g6_target_receipt.py"):
+                    copy_file(repo_snapshot / "tools/evidence" / evidence_tool, release / "tools/evidence" / evidence_tool, 0o755)
+            make_source_manifest(repo_snapshot, release, source_commit, tracked, installer_payload, version)
             make_sbom(release, version)
 
             candidate_status = (
@@ -893,8 +932,8 @@ def assemble(
                     **(
                         {
                             "n_minus_one": {
-                                "version": "0.8.0-rc.0",
-                                "migration_version": "0023",
+                                "version": spec["expected_n_minus_one_version"],
+                                "migration_version": spec["expected_n_minus_one_migration"],
                                 "source_commit": lineage["source_commit"],
                                 "release_manifest_sha256": lineage["release_manifest_sha256"],
                                 "archive_sha256": lineage["archive_sha256"],
@@ -956,6 +995,11 @@ def assemble(
                         "integration test binaries",
                         "fixture archives",
                     ],
+                    **(
+                        {"predecessor_certification": {"certification_sha256": predecessor_certification_sha256, "release_index_sha256": predecessor_release_index_sha256}}
+                        if version == "0.8.0-rc.2"
+                        else {}
+                    ),
                 }
                 write_json(build_root / "production-bundle.json", metadata)
 
@@ -975,6 +1019,10 @@ def main() -> int:
     parser.add_argument("--n-minus-one-manifest-sha256")
     parser.add_argument("--n-minus-one-archive-sha256")
     parser.add_argument("--n-minus-one-bundle-manifest-sha256")
+    parser.add_argument("--predecessor-certification", type=Path)
+    parser.add_argument("--predecessor-certification-sha256")
+    parser.add_argument("--predecessor-release-index", type=Path)
+    parser.add_argument("--predecessor-release-index-sha256")
     parser.add_argument("--web-dist", required=True, type=Path)
     parser.add_argument("--arch", default="amd64", choices=ARCHES)
     parser.add_argument("--version", required=True)
@@ -1002,6 +1050,10 @@ def main() -> int:
             live_attestation_sha256=args.live_attestation_sha256,
             n_minus_one_archive_sha256=args.n_minus_one_archive_sha256,
             n_minus_one_bundle_manifest_sha256=args.n_minus_one_bundle_manifest_sha256,
+            predecessor_certification=args.predecessor_certification.resolve() if args.predecessor_certification else None,
+            predecessor_certification_sha256=args.predecessor_certification_sha256,
+            predecessor_release_index=args.predecessor_release_index.resolve() if args.predecessor_release_index else None,
+            predecessor_release_index_sha256=args.predecessor_release_index_sha256,
             structure_only=args.structure_only,
         )
     except ProductionBundleError as error:

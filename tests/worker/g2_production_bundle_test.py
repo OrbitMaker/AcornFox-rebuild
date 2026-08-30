@@ -76,6 +76,14 @@ def minimal_repo(
 
 
 class ProductionBundleTests(unittest.TestCase):
+    def test_rc2_selector_adds_only_rc2_g6_payload(self) -> None:
+        tool = load_tool()
+        self.assertEqual(tool.release_spec("0.8.0-rc.2", "0024")["expected_n_minus_one_version"], "0.8.0-rc.1")
+        self.assertIn("g6-staging-evidence.sh", tool.installer_scripts("0.8.0-rc.2"))
+        self.assertNotIn("g6-staging-evidence.sh", tool.installer_scripts("0.8.0-rc.1"))
+        source = TOOL.read_text(encoding="utf-8")
+        self.assertIn('version == "0.8.0-rc.2" and path in {"tools/evidence/g6_validate.py", "tools/evidence/g6_target_receipt.py"}', source)
+
 
     def test_frozen_rc0_lineage_descriptors_are_architecture_complete(self) -> None:
         tool = load_tool()

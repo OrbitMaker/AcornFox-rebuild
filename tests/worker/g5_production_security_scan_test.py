@@ -27,6 +27,18 @@ def load_tool():
 
 
 class ProductionSecurityScanTests(unittest.TestCase):
+    def test_rejects_explicit_version_mismatch_before_publication(self) -> None:
+        tool = load_tool()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source, commit, candidates, certification, govuln, go = self.fixture(root, tool)
+            (certification / "certification.json").write_text('{"schema":"open-card-production-certification.v1","version":"0.8.0-rc.2"}\n', encoding="utf-8")
+            (certification / "release-index.json").write_text('{"schema":"open-card-release-index.v1","version":"0.8.0-rc.2"}\n', encoding="utf-8")
+            output = root / "scan"
+            with self.assertRaises(tool.SecurityScanError):
+                tool.scan(source, commit, candidates, certification, govuln, go, output, "0.8.0-rc.2")
+            self.assertFalse(output.exists())
+
     def test_narrow_secret_policy_allows_templates_and_short_vendor_literals(self) -> None:
         tool = load_tool()
         self.assertFalse(tool.sensitive_filename(PurePosixPath("web/.env.development.example")))
@@ -70,13 +82,16 @@ class ProductionSecurityScanTests(unittest.TestCase):
                 data = payload.read_bytes()
                 info.size = len(data)
                 archive.addfile(info, io.BytesIO(data))
+            (directory / "build-record.json").write_text('{"candidate":{"version":"0.8.0-rc.1"}}\n', encoding="utf-8")
+            (release / "manifest.json").write_text('{"version":"0.8.0-rc.1"}\n', encoding="utf-8")
+            (directory / "production-bundle.json").write_text('{"version":"0.8.0-rc.1"}\n', encoding="utf-8")
         return candidate_set
 
     def certification(self, root: Path) -> Path:
         directory = root / "certification"
         directory.mkdir()
-        (directory / "certification.json").write_text('{"schema":"x"}\n', encoding="utf-8")
-        (directory / "release-index.json").write_text('{"schema":"y"}\n', encoding="utf-8")
+        (directory / "certification.json").write_text('{"schema":"open-card-production-certification.v1"}\n', encoding="utf-8")
+        (directory / "release-index.json").write_text('{"schema":"open-card-release-index.v1","version":"0.8.0-rc.1"}\n', encoding="utf-8")
         return directory
 
     def fake_go(self, root: Path, *, version: str = "go1.25.13", goroot: str = "/fixture/go") -> Path:

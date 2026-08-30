@@ -43,6 +43,10 @@ ARM64_N_MINUS_ONE_RELEASE_MANIFEST_SHA256 = "e4f56105b3d184313d51365c7fff40b9f68
 ARM64_N_MINUS_ONE_ARCHIVE_SHA256 = "9560df1d4a739c729d857cd93b989b99976da0e86983ffa026d13202339d57b9"
 ARM64_N_MINUS_ONE_BUNDLE_MANIFEST_SHA256 = "fdfd6b6108870118714b70c9007937585fc0429d14fa9d64010a80016edc2a15"
 ARM64_N_MINUS_ONE_DECLARED_FILE_COUNT = 62
+RC1_SOURCE_COMMIT = "0d5c96bf7b7bd1c641b108cbbd54511d814f2aa0"
+RC1_CERTIFICATION_SHA256 = "22b41c0221f0c159520209dc385557f1918e7205c6b71b2dd1fa9564ac55bc87"
+RC1_RELEASE_INDEX_SHA256 = "784199b3faceb3f757a5b1dbdc1b1ee55a02ab84131a6ea86724a76d965a54a6"
+RC1_LINEAGES = {"amd64": {"release_manifest_sha256": "1cf02e4a111e38a4061c692de418b67755a2e55f97a04cbc92cee8cb9f82a7be", "archive_sha256": "9056cb46537537f6cab21482d900160486098d857955d23b0ca8f131a9cc4233", "bundle_manifest_sha256": "d0e8c111dcaa334c89bb815fc2ddc9b122887cddbbf7c59b6eb51436b931706f"}, "arm64": {"release_manifest_sha256": "6bf1e590c3054d373d9319f03581d7a623ee3093b53ddba7b343cf8af7f85fed", "archive_sha256": "56a697aed3a8f77261cfeb3074a7d7ab0cfb6389ab5d75225ad9931b665bfa86", "bundle_manifest_sha256": "5fda1e9d0f80deadf6b87cb281d80793c9d1e910386624bc5975cdd0464a2650"}}
 
 
 @dataclass(frozen=True)
@@ -64,9 +68,11 @@ class ReleaseSpec(NamedTuple):
     bootstrap: bool
 RC0_SPEC = ReleaseSpec("0.8.0-rc.0", "0023", True)
 RC1_SPEC = ReleaseSpec("0.8.0-rc.1", "0024", False)
+RC2_SPEC = ReleaseSpec("0.8.0-rc.2", "0024", False)
 def release_spec(version: str) -> ReleaseSpec:
     if version == RC0_SPEC.version: return RC0_SPEC
     if version == RC1_SPEC.version: return RC1_SPEC
+    if version == RC2_SPEC.version: return RC2_SPEC
     raise ProductionBuildError("unsupported release specification")
 GATE3_STATUS = "pass_limited_external_linux_required"
 LIVE_METADATA = {
@@ -205,6 +211,14 @@ def require_frozen_rc0_lineage(arch: str) -> dict[str, object]:
     if lineage is None:
         raise ProductionBuildError("RC1 predecessor lineage is unavailable")
     return lineage
+
+
+def frozen_predecessor_lineage(version: str, arch: str) -> dict[str, object]:
+    if version == RC1_SPEC.version:
+        return require_frozen_rc0_lineage(arch)
+    if version == RC2_SPEC.version:
+        return {"source_commit": RC1_SOURCE_COMMIT, **RC1_LINEAGES[arch]}
+    raise ProductionBuildError("release has no frozen predecessor lineage")
 
 
 class RuntimeInput:
@@ -588,8 +602,31 @@ def load_strict_json(path: Path, label: str) -> dict[str, object]:
 
 
 def verify_n_minus_one_candidate_root(
-    root: Path, *, arch: str = ARCHITECTURE
+    root: Path, *, arch: str = ARCHITECTURE, predecessor_version: str = RC0_SPEC.version
 ) -> NMinusOneEvidence:
+    if predecessor_version == RC1_SPEC.version:
+        lineage = frozen_predecessor_lineage(RC2_SPEC.version, arch)
+        directory(root, "N-1 candidate root")
+        archive_name = f"open-card-{RC1_SPEC.version}-production.tar.gz"
+        if {path.name for path in root.iterdir()} != {"release", "bundle-manifest.sha256", "production-bundle.json", "build-record.json", archive_name}:
+            raise ProductionBuildError("N-1 candidate root does not contain exactly the required evidence")
+        release = root / "release"
+        manifest = release / "manifest.json"
+        for path, label, mode in ((manifest, "N-1 release manifest", 0o644), (root / "bundle-manifest.sha256", "N-1 bundle manifest", 0o640), (root / "build-record.json", "N-1 build record", 0o640), (root / "production-bundle.json", "N-1 bundle metadata", 0o640), (root / archive_name, "N-1 archive", 0o644)):
+            exact_regular(path, label, mode)
+        manifest_digest, archive_digest, bundle_digest = sha256(manifest), sha256(root / archive_name), sha256(root / "bundle-manifest.sha256")
+        if (manifest_digest, archive_digest, bundle_digest) != (lineage["release_manifest_sha256"], lineage["archive_sha256"], lineage["bundle_manifest_sha256"]):
+            raise ProductionBuildError("N-1 RC1 artifact digests are not frozen")
+        document = load_strict_json(manifest, "N-1 release manifest")
+        if (document.get("version"), document.get("migration_version"), document.get("architecture"), document.get("source_commit")) != (RC1_SPEC.version, RC1_SPEC.migration, arch, RC1_SOURCE_COMMIT):
+            raise ProductionBuildError("N-1 RC1 manifest metadata is invalid")
+        if validate_release(release, version=RC1_SPEC.version, migration_version=RC1_SPEC.migration, arch=arch, source_commit=RC1_SOURCE_COMMIT) != manifest_digest:
+            raise ProductionBuildError("N-1 RC1 release validation failed")
+        record, metadata = load_strict_json(root / "build-record.json", "N-1 build record"), load_strict_json(root / "production-bundle.json", "N-1 bundle metadata")
+        candidate = record.get("candidate")
+        if record.get("production_accepted") is not False or not isinstance(candidate, dict) or (candidate.get("version"), candidate.get("migration_version"), candidate.get("architecture"), candidate.get("source_commit")) != (RC1_SPEC.version, RC1_SPEC.migration, arch, RC1_SOURCE_COMMIT) or metadata.get("production_accepted") is not False or metadata.get("candidate_status") != "upgrade_candidate":
+            raise ProductionBuildError("N-1 RC1 candidate metadata is invalid")
+        return NMinusOneEvidence(root.resolve(), release.resolve(), arch, RC1_SPEC.version, RC1_SPEC.migration, RC1_SOURCE_COMMIT, manifest_digest, archive_digest, bundle_digest)
     lineage = require_frozen_rc0_lineage(arch)
     directory(root, "N-1 candidate root")
     archive_name = "open-card-0.8.0-rc.0-production.tar.gz"
@@ -844,11 +881,16 @@ def validate_release(
         or manifest.get("source_commit") != source_commit
     ):
         raise ProductionBuildError("release manifest does not match the candidate contract")
-    if version == RC1_SPEC.version:
-        lineage = require_frozen_rc0_lineage(arch)
+    if version in {RC1_SPEC.version, RC2_SPEC.version}:
+        lineage = require_frozen_rc0_lineage(arch) if version == RC1_SPEC.version else {
+            "source_commit": "0d5c96bf7b7bd1c641b108cbbd54511d814f2aa0",
+            "release_manifest_sha256": {"amd64": "1cf02e4a111e38a4061c692de418b67755a2e55f97a04cbc92cee8cb9f82a7be", "arm64": "6bf1e590c3054d373d9319f03581d7a623ee3093b53ddba7b343cf8af7f85fed"}[arch],
+            "archive_sha256": {"amd64": "9056cb46537537f6cab21482d900160486098d857955d23b0ca8f131a9cc4233", "arm64": "56a697aed3a8f77261cfeb3074a7d7ab0cfb6389ab5d75225ad9931b665bfa86"}[arch],
+            "bundle_manifest_sha256": {"amd64": "d0e8c111dcaa334c89bb815fc2ddc9b122887cddbbf7c59b6eb51436b931706f", "arm64": "5fda1e9d0f80deadf6b87cb281d80793c9d1e910386624bc5975cdd0464a2650"}[arch],
+        }
         expected_lineage = {
-            "version": RC0_SPEC.version,
-            "migration_version": RC0_SPEC.migration,
+            "version": RC0_SPEC.version if version == RC1_SPEC.version else RC1_SPEC.version,
+            "migration_version": RC0_SPEC.migration if version == RC1_SPEC.version else RC1_SPEC.migration,
             "source_commit": lineage["source_commit"],
             "release_manifest_sha256": lineage["release_manifest_sha256"],
             "archive_sha256": lineage["archive_sha256"],
@@ -1062,25 +1104,38 @@ def build_candidate(
     driver_sha256: str,
     version: str = RC0_SPEC.version,
     n_minus_one_candidate_root: Path | None = None,
+    predecessor_certification: Path | None = None,
+    predecessor_certification_sha256: str | None = None,
+    predecessor_release_index: Path | None = None,
+    predecessor_release_index_sha256: str | None = None,
     arch: str = ARCHITECTURE,
 ) -> dict[str, object]:
     spec = release_spec(version)
     if arch not in ARCHES:
         raise ProductionBuildError(f"unsupported release architecture: {arch}")
     if not spec.bootstrap:
-        require_frozen_rc0_lineage(arch)
+        frozen_predecessor_lineage(spec.version, arch)
     if not spec.bootstrap and n_minus_one_candidate_root is None:
         raise ProductionBuildError("RC1 build requires verified local N-1 evidence")
     if spec.bootstrap and n_minus_one_candidate_root is not None:
         raise ProductionBuildError("RC0 bootstrap must not accept N-1 evidence")
     n_minus_one_evidence = (
-        verify_n_minus_one_candidate_root(n_minus_one_candidate_root, arch=arch)
+        verify_n_minus_one_candidate_root(n_minus_one_candidate_root, arch=arch, predecessor_version=RC1_SPEC.version if spec.version == RC2_SPEC.version else RC0_SPEC.version)
         if n_minus_one_candidate_root is not None
         else None
     )
     if output.exists():
         raise ProductionBuildError("refusing to overwrite candidate output")
     directory(output.parent, "candidate output parent")
+    if spec.version == RC2_SPEC.version:
+        if (
+            predecessor_certification is None or predecessor_release_index is None
+            or predecessor_certification_sha256 != RC1_CERTIFICATION_SHA256
+            or predecessor_release_index_sha256 != RC1_RELEASE_INDEX_SHA256
+            or sha256(predecessor_certification) != predecessor_certification_sha256
+            or sha256(predecessor_release_index) != predecessor_release_index_sha256
+        ):
+            raise ProductionBuildError("RC2 build requires exact RC1 certification and release-index evidence")
     verify_clean_detached_worktree(source_worktree, source_commit, spec)
     driver_path = Path(__file__).resolve()
     driver_repo, driver_metadata = verify_clean_tracked_tool(
@@ -1227,6 +1282,11 @@ def build_candidate(
                     if n_minus_one_evidence is not None
                     else []
                 ),
+                *(
+                    ["--predecessor-certification", str(predecessor_certification), "--predecessor-certification-sha256", predecessor_certification_sha256, "--predecessor-release-index", str(predecessor_release_index), "--predecessor-release-index-sha256", predecessor_release_index_sha256]
+                    if spec.version == RC2_SPEC.version
+                    else []
+                ),
                 "--live-attestation",
                 str(attestation_path),
                 "--live-attestation-sha256",
@@ -1311,6 +1371,11 @@ def build_candidate(
                 if n_minus_one_evidence is not None
                 else None
             ),
+            **(
+                {"predecessor_certification": {"certification_sha256": predecessor_certification_sha256, "release_index_sha256": predecessor_release_index_sha256}}
+                if spec.version == RC2_SPEC.version
+                else {}
+            ),
         }
         (candidate / "build-record.json").write_bytes(canonical_json(record))
         (candidate / "build-record.json").chmod(0o640)
@@ -1335,9 +1400,13 @@ def main() -> int:
     parser.add_argument("build", nargs="?")
     parser.add_argument("--source-worktree", required=True, type=Path)
     parser.add_argument("--source-commit", required=True)
-    parser.add_argument("--version", default=RC0_SPEC.version, choices=(RC0_SPEC.version, RC1_SPEC.version))
+    parser.add_argument("--version", default=RC0_SPEC.version, choices=(RC0_SPEC.version, RC1_SPEC.version, RC2_SPEC.version))
     parser.add_argument("--arch", default=ARCHITECTURE, choices=ARCHES)
     parser.add_argument("--n-minus-one-candidate-root", type=Path)
+    parser.add_argument("--predecessor-certification", type=Path)
+    parser.add_argument("--predecessor-certification-sha256")
+    parser.add_argument("--predecessor-release-index", type=Path)
+    parser.add_argument("--predecessor-release-index-sha256")
     parser.add_argument("--runtime-inputs", required=True, type=Path)
     parser.add_argument("--runtime-inputs-sha256", required=True)
     parser.add_argument("--runtime-dir", required=True, type=Path)
@@ -1363,6 +1432,10 @@ def main() -> int:
             driver_sha256=args.driver_sha256,
             version=args.version,
             n_minus_one_candidate_root=args.n_minus_one_candidate_root.resolve() if args.n_minus_one_candidate_root else None,
+            predecessor_certification=args.predecessor_certification.resolve() if args.predecessor_certification else None,
+            predecessor_certification_sha256=args.predecessor_certification_sha256,
+            predecessor_release_index=args.predecessor_release_index.resolve() if args.predecessor_release_index else None,
+            predecessor_release_index_sha256=args.predecessor_release_index_sha256,
             arch=args.arch,
         )
     except ProductionBuildError as error:

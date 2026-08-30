@@ -20,6 +20,7 @@ from pathlib import Path, PurePosixPath
 
 
 ARCHES = ("amd64", "arm64")
+RELEASE_VERSIONS = {"0.8.0-rc.1", "0.8.0-rc.2"}
 GOVULNCHECK_VERSION = "v1.7.0"
 POLICY = {
     "content_patterns": ("pem_private_key", "tencent_akid", "aws_akia", "github_token", "openai_token"),
@@ -331,6 +332,27 @@ def scan_archives(candidate_set: Path) -> tuple[int, int]:
     return blocking, allowed
 
 
+def verify_version_bindings(candidate_set: Path, certification: Path, version: str) -> None:
+    index = strict_json_bytes((certification / "release-index.json").read_bytes(), "release index")
+    certificate = strict_json_bytes((certification / "certification.json").read_bytes(), "certification")
+    if index.get("version") != version or index.get("schema") != "open-card-release-index.v1":
+        raise SecurityScanError("release index version is inconsistent")
+    if version != "0.8.0-rc.1" and certificate.get("version") != version:
+        raise SecurityScanError("certification version is inconsistent")
+    for arch in ARCHES:
+        root = candidate_set / arch
+        for relative, label in (("build-record.json", "build record"), ("release/manifest.json", "release manifest"), ("production-bundle.json", "production bundle")):
+            path = root / relative
+            regular(path, label)
+            value = strict_json_bytes(path.read_bytes(), label)
+            if relative == "build-record.json":
+                version_value = value.get("candidate", {}).get("version") if isinstance(value.get("candidate"), dict) else None
+            else:
+                version_value = value.get("version")
+            if version_value != version:
+                raise SecurityScanError("candidate version is inconsistent")
+
+
 def publish_no_replace(candidate: Path, output: Path) -> None:
     libc = ctypes.CDLL(None, use_errno=True)
     if candidate.parent.resolve() != output.parent.resolve():
@@ -358,9 +380,11 @@ def publish_no_replace(candidate: Path, output: Path) -> None:
     raise SecurityScanError("atomic no-replace security scan publication failed")
 
 
-def scan(source: Path, source_commit: str, candidate_set: Path, certification: Path, govulncheck: Path, go_binary: Path, output: Path) -> dict[str, object]:
+def scan(source: Path, source_commit: str, candidate_set: Path, certification: Path, govulncheck: Path, go_binary: Path, output: Path, version: str = "0.8.0-rc.1") -> dict[str, object]:
     if not HEX_40.fullmatch(source_commit):
         raise SecurityScanError("source commit must be lowercase hexadecimal")
+    if version not in RELEASE_VERSIONS:
+        raise SecurityScanError("release version is unsupported")
     if output.exists():
         raise SecurityScanError("refusing to overwrite security scan output")
     directory(output.parent, "security scan output parent")
@@ -373,6 +397,7 @@ def scan(source: Path, source_commit: str, candidate_set: Path, certification: P
         raise SecurityScanError("certification root does not contain exactly the required evidence")
     for path in certification.iterdir():
         regular(path, "certification evidence")
+    verify_version_bindings(candidate_set, certification, version)
     source_blocking = source_allowed = 0
     for path in source_files:
         found, canary = scan_bytes(path.read_bytes(), PurePosixPath(path.relative_to(source).as_posix()), allow_fixture=True)
@@ -390,6 +415,7 @@ def scan(source: Path, source_commit: str, candidate_set: Path, certification: P
         "schema": "open-card-production-security-scan.v1",
         "scope": "gate5_source_and_artifacts",
         "production_accepted": False,
+        "version": version,
         "source_commit": source_commit,
         "policy_sha256": sha256_bytes(canonical_json(POLICY)),
         "govulncheck": govuln,
@@ -417,10 +443,11 @@ def main() -> int:
     parser.add_argument("--certification-root", required=True, type=Path)
     parser.add_argument("--govulncheck", required=True, type=Path)
     parser.add_argument("--go", required=True, type=Path)
+    parser.add_argument("--version", default="0.8.0-rc.1", choices=sorted(RELEASE_VERSIONS))
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
     try:
-        value = scan(args.source_worktree, args.source_commit, args.candidate_set, args.certification_root, args.govulncheck, args.go, args.output)
+        value = scan(args.source_worktree, args.source_commit, args.candidate_set, args.certification_root, args.govulncheck, args.go, args.output, args.version)
     except SecurityScanError as error:
         print(f"production security scan: {error}")
         return 1

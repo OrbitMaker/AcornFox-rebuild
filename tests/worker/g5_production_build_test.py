@@ -33,6 +33,17 @@ def digest(path: Path) -> str:
 
 
 class ProductionBuildTests(unittest.TestCase):
+    def test_rc2_selector_uses_frozen_rc1_predecessor_and_refuses_missing_evidence(self) -> None:
+        tool = load_tool()
+        self.assertEqual((tool.release_spec("0.8.0-rc.2").migration, tool.release_spec("0.8.0-rc.2").bootstrap), ("0024", False))
+        self.assertEqual(tool.frozen_predecessor_lineage("0.8.0-rc.2", "amd64")["release_manifest_sha256"], "1cf02e4a111e38a4061c692de418b67755a2e55f97a04cbc92cee8cb9f82a7be")
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            output = root / "rc2-output"
+            with self.assertRaisesRegex(tool.ProductionBuildError, "N-1 evidence"):
+                tool.build_candidate(source_worktree=root, source_commit="a" * 40, runtime_inputs=root / "inputs.json", runtime_inputs_sha256="0" * 64, runtime_dir=root, output=output, bundle_tool=root / "bundle.py", bundle_tool_sha256="0" * 64, driver_sha256="0" * 64, version="0.8.0-rc.2", arch="amd64")
+            self.assertFalse(output.exists())
+
     def test_frozen_rc0_lineage_descriptors_are_architecture_complete(self) -> None:
         tool = load_tool()
         expected = {

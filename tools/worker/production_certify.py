@@ -26,6 +26,10 @@ from pathlib import Path, PurePosixPath
 ARCHES = ("amd64", "arm64")
 VERSION = "0.8.0-rc.1"
 MIGRATION = "0024"
+RC2_VERSION = "0.8.0-rc.2"
+RC1_SOURCE_COMMIT = "0d5c96bf7b7bd1c641b108cbbd54511d814f2aa0"
+RC1_CERTIFICATION_SHA256 = "22b41c0221f0c159520209dc385557f1918e7205c6b71b2dd1fa9564ac55bc87"
+RC1_RELEASE_INDEX_SHA256 = "784199b3faceb3f757a5b1dbdc1b1ee55a02ab84131a6ea86724a76d965a54a6"
 RC0_SOURCE_COMMIT = "35a2b198ac52949af3477475d89d4813b46a9490"
 RC0_LINEAGES = {
     "amd64": {
@@ -45,27 +49,36 @@ RC0_LINEAGES = {
         "bundle_manifest_sha256": "fdfd6b6108870118714b70c9007937585fc0429d14fa9d64010a80016edc2a15",
     },
 }
-ARTIFACTS = {
+RC1_LINEAGES = {
+    "amd64": {"version": VERSION, "migration_version": MIGRATION, "source_commit": RC1_SOURCE_COMMIT, "release_manifest_sha256": "1cf02e4a111e38a4061c692de418b67755a2e55f97a04cbc92cee8cb9f82a7be", "archive_sha256": "9056cb46537537f6cab21482d900160486098d857955d23b0ca8f131a9cc4233", "bundle_manifest_sha256": "d0e8c111dcaa334c89bb815fc2ddc9b122887cddbbf7c59b6eb51436b931706f"},
+    "arm64": {"version": VERSION, "migration_version": MIGRATION, "source_commit": RC1_SOURCE_COMMIT, "release_manifest_sha256": "6bf1e590c3054d373d9319f03581d7a623ee3093b53ddba7b343cf8af7f85fed", "archive_sha256": "56a697aed3a8f77261cfeb3074a7d7ab0cfb6389ab5d75225ad9931b665bfa86", "bundle_manifest_sha256": "5fda1e9d0f80deadf6b87cb281d80793c9d1e910386624bc5975cdd0464a2650"},
+}
+def artifacts(version: str) -> dict[str, str]:
+    return {
     "release_manifest": "release/manifest.json",
-    "archive": f"open-card-{VERSION}-production.tar.gz",
+    "archive": f"open-card-{version}-production.tar.gz",
     "bundle_manifest": "bundle-manifest.sha256",
     "source_manifest": "release/source-manifest.sha256",
     "sbom": "release/sbom.spdx.json",
     "live_web_attestation": "release/attestations/live-web.json",
     "production_bundle": "production-bundle.json",
-}
+    }
+
+
+ARTIFACTS = artifacts(VERSION)
+
+
+def contract(version: str) -> tuple[dict[str, dict[str, str]], int, dict[str, str] | None]:
+    if version == VERSION:
+        return RC0_LINEAGES, 68, None
+    if version == RC2_VERSION:
+        return RC1_LINEAGES, 71, {"certification_sha256": RC1_CERTIFICATION_SHA256, "release_index_sha256": RC1_RELEASE_INDEX_SHA256}
+    raise CertificationError("unsupported certification release version")
 RC1_BINARIES = [
     "open-card-server", "open-card-agent", "open-card-static-server",
     "open-card-secretctl", "open-card-security-probe", "open-card-imagegc",
     "open-card-admin", "open-card-upgrade",
 ]
-EXPECTED_ROOT = {
-    "release",
-    "build-record.json",
-    ARTIFACTS["archive"],
-    ARTIFACTS["bundle_manifest"],
-    ARTIFACTS["production_bundle"],
-}
 HEX_40 = re.compile(r"^[a-f0-9]{40}$")
 HEX_64 = re.compile(r"^[a-f0-9]{64}$")
 
@@ -202,7 +215,7 @@ def verify_archive(
                         raise CertificationError("candidate archive member is not bound to release manifest")
     except tarfile.TarError as error:
         raise CertificationError("candidate archive is invalid") from error
-    if len(seen) != 69 or seen != expected:
+    if len(seen) != len(release_entries) + 1 or seen != expected:
         raise CertificationError("candidate archive does not contain the fixed safe member set")
 
 
@@ -301,10 +314,13 @@ def normalized_build_semantics(
 
 
 def verify_candidate(
-    root: Path, arch: str, source_commit: str, source_worktree: Path
+    root: Path, arch: str, source_commit: str, source_worktree: Path, version: str = VERSION
 ) -> dict[str, object]:
+    lineages, expected_count, predecessor_evidence = contract(version)
+    artifact_paths = artifacts(version)
     directory(root, f"{arch} candidate")
-    if {item.name for item in root.iterdir()} != EXPECTED_ROOT:
+    expected_root = {"release", "build-record.json", artifact_paths["archive"], artifact_paths["bundle_manifest"], artifact_paths["production_bundle"]}
+    if {item.name for item in root.iterdir()} != expected_root:
         raise CertificationError(f"{arch} candidate root does not contain exactly the required evidence")
     release = root / "release"
     directory(release, f"{arch} release")
@@ -321,13 +337,13 @@ def verify_candidate(
         manifest.get("migration_version"),
         manifest.get("source_commit"),
         manifest.get("architecture"),
-    ) != (VERSION, MIGRATION, source_commit, arch):
+    ) != (version, MIGRATION, source_commit, arch):
         raise CertificationError(f"{arch} release manifest tuple is invalid")
-    if manifest.get("n_minus_one") != RC0_LINEAGES[arch]:
+    if manifest.get("n_minus_one") != lineages[arch]:
         raise CertificationError(f"{arch} release manifest has invalid frozen N-1 lineage")
     files = manifest.get("files")
-    if not isinstance(files, list) or len(files) != 68:
-        raise CertificationError(f"{arch} release manifest must declare exactly 68 files")
+    if not isinstance(files, list) or len(files) != expected_count:
+        raise CertificationError(f"{arch} release manifest must declare exactly {expected_count} files")
     release_entries: dict[str, tuple[str, int]] = {}
     for entry in files:
         if not isinstance(entry, dict) or set(entry) != {"path", "sha256", "mode"}:
@@ -349,9 +365,9 @@ def verify_candidate(
             actual.add(item.relative_to(release).as_posix())
     if actual != set(release_entries):
         raise CertificationError("release file set does not match manifest")
-    archive = root / ARTIFACTS["archive"]
+    archive = root / artifact_paths["archive"]
     verify_archive(archive, release_entries, release / "manifest.json")
-    bundle_manifest = root / ARTIFACTS["bundle_manifest"]
+    bundle_manifest = root / artifact_paths["bundle_manifest"]
     regular(bundle_manifest, "bundle manifest")
     expected_bundle = (
         f"{sha256(archive)}  {archive.name}\n"
@@ -360,7 +376,7 @@ def verify_candidate(
     if bundle_manifest.read_text(encoding="utf-8") != expected_bundle:
         raise CertificationError("bundle manifest does not match candidate artifacts")
     hashes = {}
-    for name, relative in ARTIFACTS.items():
+    for name, relative in artifact_paths.items():
         path = root / relative
         regular(path, name)
         hashes[name] = sha256(path)
@@ -370,12 +386,14 @@ def verify_candidate(
         "runtime_inputs", "tools", "commands", "stage_files", "live_web", "bundle",
         "n_minus_one",
     }
+    if predecessor_evidence is not None:
+        expected_build_keys.add("predecessor_certification")
     if set(build) != expected_build_keys:
         raise CertificationError(f"{arch} build record schema is invalid")
     candidate = build.get("candidate")
     if not isinstance(candidate, dict) or set(candidate) != {"version", "migration_version", "architecture", "source_commit"} or build.get("production_accepted") is not False or (
         candidate.get("version"), candidate.get("migration_version"), candidate.get("source_commit"), candidate.get("architecture")
-    ) != (VERSION, MIGRATION, source_commit, arch):
+    ) != (version, MIGRATION, source_commit, arch):
         raise CertificationError(f"{arch} build record tuple is invalid")
     bundle_record = build.get("bundle")
     if not isinstance(bundle_record, dict) or bundle_record != {
@@ -393,27 +411,29 @@ def verify_candidate(
     ):
         raise CertificationError(f"{arch} build record is not bound to live web attestation")
     expected_record_lineage = {
-        **RC0_LINEAGES[arch],
+        **lineages[arch],
         "status": "verified_local_candidate",
         "release_embedded": False,
     }
     if build.get("n_minus_one") != expected_record_lineage:
         raise CertificationError(f"{arch} build record lacks RC0 lineage")
-    metadata = strict_json(root / ARTIFACTS["production_bundle"], "production bundle metadata")
+    metadata = strict_json(root / artifact_paths["production_bundle"], "production bundle metadata")
     expected_metadata_keys = {
         "schema_version", "product", "version", "source_commit", "production_accepted",
         "candidate_status", "n_minus_one", "migration_version", "live_web",
         "production_binaries", "excluded",
     }
+    if predecessor_evidence is not None:
+        expected_metadata_keys.add("predecessor_certification")
     expected_metadata_lineage = {
-        "version": "0.8.0-rc.0",
-        "migration_version": "0023",
-        "source_commit": RC0_SOURCE_COMMIT,
+        "version": lineages[arch]["version"],
+        "migration_version": lineages[arch]["migration_version"],
+        "source_commit": lineages[arch]["source_commit"],
         "status": "verified_local_candidate",
         "release_embedded": False,
-        "manifest_sha256": RC0_LINEAGES[arch]["release_manifest_sha256"],
-        "archive_sha256": RC0_LINEAGES[arch]["archive_sha256"],
-        "bundle_manifest_sha256": RC0_LINEAGES[arch]["bundle_manifest_sha256"],
+        "manifest_sha256": lineages[arch]["release_manifest_sha256"],
+        "archive_sha256": lineages[arch]["archive_sha256"],
+        "bundle_manifest_sha256": lineages[arch]["bundle_manifest_sha256"],
     }
     if (
         set(metadata) != expected_metadata_keys
@@ -421,10 +441,15 @@ def verify_candidate(
         or metadata.get("product") != "open-card"
         or metadata.get("production_accepted") is not False
         or metadata.get("candidate_status") != "upgrade_candidate"
-        or (metadata.get("version"), metadata.get("migration_version"), metadata.get("source_commit")) != (VERSION, MIGRATION, source_commit)
+        or (metadata.get("version"), metadata.get("migration_version"), metadata.get("source_commit")) != (version, MIGRATION, source_commit)
         or metadata.get("n_minus_one") != expected_metadata_lineage
     ):
         raise CertificationError(f"{arch} production bundle metadata is invalid")
+    if predecessor_evidence is not None:
+        if build.get("predecessor_certification") != predecessor_evidence or metadata.get("predecessor_certification") != predecessor_evidence:
+            raise CertificationError(f"{arch} RC2 predecessor certification evidence is invalid")
+    elif "predecessor_certification" in build or "predecessor_certification" in metadata:
+        raise CertificationError(f"{arch} RC1 metadata must not carry RC2 predecessor evidence")
     live_web_metadata = metadata.get("live_web")
     if (
         not isinstance(live_web_metadata, dict)
@@ -437,7 +462,7 @@ def verify_candidate(
     return {
         "artifact_hashes": hashes,
         "semantic_digest": hashlib.sha256(canonical_json(normalized_build_semantics(build, arch, source_commit, source_worktree))).hexdigest(),
-        "lineage": RC0_LINEAGES[arch],
+        "lineage": lineages[arch],
     }
 
 
@@ -448,7 +473,9 @@ def certify(
     candidates_b: Path,
     output: Path,
     source_commit: str,
+    version: str = VERSION,
 ) -> dict[str, object]:
+    contract(version)
     if not HEX_40.fullmatch(source_commit):
         raise CertificationError("source commit must be lowercase hexadecimal")
     if source_a.resolve() == source_b.resolve():
@@ -467,8 +494,8 @@ def certify(
             raise CertificationError("candidate set does not contain exactly amd64 and arm64 candidates")
     result: dict[str, object] = {}
     for arch in ARCHES:
-        left = verify_candidate(candidates_a / arch, arch, source_commit, source_a)
-        right = verify_candidate(candidates_b / arch, arch, source_commit, source_b)
+        left = verify_candidate(candidates_a / arch, arch, source_commit, source_a, version)
+        right = verify_candidate(candidates_b / arch, arch, source_commit, source_b, version)
         if left["artifact_hashes"] != right["artifact_hashes"] or left["semantic_digest"] != right["semantic_digest"]:
             raise CertificationError(f"{arch} candidate sets are not byte-equivalent")
         result[arch] = {"equality": True, **left}
@@ -482,6 +509,7 @@ def certify(
         "schema": "open-card-production-certification.v1",
         "scope": "artifact_equality_only",
         "production_accepted": False,
+        **({"version": version} if version != VERSION else {}),
         "source": {"commit": source_commit, "distinct_clean_detached_clones": source_facts},
         "architectures": result,
     }
@@ -491,14 +519,14 @@ def certify(
         "schema": "open-card-release-index.v1",
         "scope": "artifact_equality_only",
         "production_accepted": False,
-        "version": VERSION,
+        "version": version,
         "migration_version": MIGRATION,
         "source_commit": source_commit,
         "certification_sha256": certification_sha256,
         "architectures": {
             arch: {
                 "artifact_triple": dict(zip(("release_manifest", "archive", "bundle_manifest"), triples[arch])),
-                "rc0_lineage": RC0_LINEAGES[arch],
+                **({"rc0_lineage": result[arch]["lineage"]} if version == VERSION else {"predecessor_lineage": result[arch]["lineage"], "predecessor_certification": contract(version)[2]}),
             }
             for arch in ARCHES
         },
@@ -526,9 +554,10 @@ def main() -> int:
     parser.add_argument("--candidates-b", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--source-commit", required=True)
+    parser.add_argument("--version", default=VERSION, choices=(VERSION, RC2_VERSION))
     args = parser.parse_args()
     try:
-        value = certify(args.source_a, args.source_b, args.candidates_a, args.candidates_b, args.output, args.source_commit)
+        value = certify(args.source_a, args.source_b, args.candidates_a, args.candidates_b, args.output, args.source_commit, args.version)
     except CertificationError as error:
         print(f"production certification: {error}")
         return 1
