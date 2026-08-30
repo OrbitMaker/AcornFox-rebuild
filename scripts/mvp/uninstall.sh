@@ -95,6 +95,8 @@ buildkit_config="$root_real/etc/buildkit/buildkitd.toml"
 apparmor_profile="$root_real/etc/apparmor.d/opencard-rootlesskit"
 fstab_path="$root_real/etc/fstab"
 fixture_unit="$systemd_dir/open-card-caddy-fixture.service"
+buildkit_capacity_dir="$systemd_dir/open-card-buildkit.service.d"
+buildkit_capacity_dropin="$buildkit_capacity_dir/20-production-capacity.conf"
 assert_no_symlink_components() {
   local value=$1 current_path=/ component
   IFS=/ read -ra components <<< "${value#/}"
@@ -111,7 +113,7 @@ for path in "$prefix" "$config_dir" "$data_dir" "$systemd_dir"; do
     die "managed path is not a directory: $path"
   fi
 done
-for path in "$agent_state" "$agent_logs" "$caddy_state" "$caddy_logs" "$edge_state" "$edge_logs" "$server_logs" "$buildkit_state" "$buildkit_image" "$buildkit_runtime" "$buildkit_config" "$apparmor_profile" "$fixture_unit"; do
+for path in "$agent_state" "$agent_logs" "$caddy_state" "$caddy_logs" "$edge_state" "$edge_logs" "$server_logs" "$buildkit_state" "$buildkit_image" "$buildkit_runtime" "$buildkit_config" "$apparmor_profile" "$fixture_unit" "$buildkit_capacity_dir" "$buildkit_capacity_dropin"; do
   assert_no_symlink_components "$path"
 done
 if (( dry_run )); then
@@ -140,6 +142,10 @@ if (( system_root )); then
     apparmor_parser -R -- "$apparmor_profile" >/dev/null 2>&1 || true
   fi
 fi
+if (( system_root )); then
+  "$(dirname -- "$0")/buildkit-production-capacity.sh" remove
+fi
+
 rm -rf -- "$prefix" "$config_dir"
 rm -f -- "$systemd_dir/open-card-server.service" "$systemd_dir/open-card-agent.service" "$systemd_dir/open-card-buildkit.service" "$systemd_dir/open-card-caddy.service" "$systemd_dir/open-card-edge.service" "$fixture_unit"
 if (( system_root )) && command -v mountpoint >/dev/null 2>&1 && mountpoint -q "$buildkit_state"; then

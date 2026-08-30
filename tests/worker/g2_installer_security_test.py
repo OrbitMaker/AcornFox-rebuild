@@ -85,6 +85,27 @@ class InstallerSecurityContractTests(unittest.TestCase):
         self.assertLess(production, delegated_exit)
         self.assertLess(delegated_exit, legacy_backup)
 
+    def test_gate6_host_capacity_profile_is_fixed_and_not_an_install_option(self) -> None:
+        host = (SCRIPTS / "install-host.sh").read_text(encoding="utf-8")
+        uninstall = (SCRIPTS / "uninstall.sh").read_text(encoding="utf-8")
+        capacity = (SCRIPTS / "buildkit-production-capacity.sh").read_text(encoding="utf-8")
+        bundle = (ROOT / "tools/worker/production_bundle.py").read_text(encoding="utf-8")
+        self.assertIn("OPEN_CARD_DEDICATED_HOST_CONFIRMATION", host)
+        self.assertIn("OPEN-CARD-DEDICATED-HOST", host)
+        self.assertIn('"$script_dir/host-preflight.sh" --allow-prerequisites-pending', host)
+        self.assertIn('"$script_dir/host-preflight.sh" --post-prerequisites', host)
+        self.assertLess(host.index('"$script_dir/host-preflight.sh" --post-prerequisites'), host.index('"${installer[@]}"'))
+        self.assertIn("buildkit-production-capacity.sh", host)
+        self.assertIn("capacity_rollback", host)
+        self.assertIn("20-production-capacity.conf", capacity)
+        self.assertIn("MemoryMax=2G", capacity)
+        self.assertIn("CPUQuota=200%", capacity)
+        self.assertNotIn("--buildkit-memory", host)
+        self.assertNotIn("--buildkit-cpu", host)
+        self.assertIn('if (( system_root )); then\n  "$(dirname -- "$0")/buildkit-production-capacity.sh" remove', uninstall)
+        self.assertIn('"host-preflight.sh",', bundle)
+        self.assertIn('"buildkit-production-capacity.sh",', bundle)
+
 
 if __name__ == "__main__":
     unittest.main()

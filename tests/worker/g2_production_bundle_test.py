@@ -551,8 +551,10 @@ ConditionPathExists=!/var/lib/open-card/upgrade-in-progress
                 },
             )
             self.assertEqual(metadata["live_web"]["public_domain_verified"], False)
-            for script in tool.INSTALLER_SCRIPTS:
+            for script in tool.installer_scripts("0.8.0-rc.0"):
                 self.assertTrue((output / "release/scripts/mvp" / script).is_file())
+            for script in ("host-preflight.sh", "buildkit-production-capacity.sh"):
+                self.assertFalse((output / "release/scripts/mvp" / script).exists())
             self.assertTrue((output / "release/attestations/live-web.json").is_file())
             self.assertTrue((output / "release/source-commit.txt").is_file())
             names = {item["path"] for item in manifest["files"]}
@@ -627,6 +629,8 @@ ConditionPathExists=!/var/lib/open-card/upgrade-in-progress
                 "systemd/open-card-upgrade-safe.target",
                 "systemd/open-card-upgrade-finalize.service",
                 "systemd/open-card-edge.service.d/10-upgrade-marker.conf",
+                "scripts/mvp/host-preflight.sh",
+                "scripts/mvp/buildkit-production-capacity.sh",
             } <= paths)
             sbom = json.loads((output / "release/sbom.spdx.json").read_text(encoding="utf-8"))
             sbom_names = {package["name"] for package in sbom["packages"]}

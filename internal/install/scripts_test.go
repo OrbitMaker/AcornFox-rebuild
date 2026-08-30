@@ -597,3 +597,47 @@ func TestG7SystemdUnitsKeepPrivilegeAndSocketBoundaries(t *testing.T) {
 		t.Error("Caddy unit must not receive a Docker socket or host bind mount")
 	}
 }
+
+func TestG6HostPreflightAndProductionBuildKitCapacityStayFixed(t *testing.T) {
+	root := scriptRoot(t)
+	preflightRaw, err := os.ReadFile(filepath.Join(root, "scripts", "mvp", "host-preflight.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	capacityRaw, err := os.ReadFile(filepath.Join(root, "scripts", "mvp", "buildkit-production-capacity.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostRaw, err := os.ReadFile(filepath.Join(root, "scripts", "mvp", "install-host.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	uninstallRaw, err := os.ReadFile(filepath.Join(root, "scripts", "mvp", "uninstall.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	preflight, capacity, host, uninstall := string(preflightRaw), string(capacityRaw), string(hostRaw), string(uninstallRaw)
+	for _, required := range []string{"OPEN_CARD_HOST_PREFLIGHT_TEST", "--allow-prerequisites-pending", "MemAvailable", "8388608", "104857600", "73400320", "NTPSynchronized", "DockerRootDir", "listener_conflicts", "existing_services", "schema_version"} {
+		if !strings.Contains(preflight, required) {
+			t.Fatalf("host preflight is missing %q", required)
+		}
+	}
+	for _, required := range []string{"OPEN_CARD_DEDICATED_HOST_CONFIRMATION=OPEN-CARD-DEDICATED-HOST", "host-preflight.sh", "buildkit-production-capacity.sh", "capacity_rollback", "systemctl daemon-reload"} {
+		if !strings.Contains(host, required) {
+			t.Fatalf("host installer is missing %q", required)
+		}
+	}
+	for _, required := range []string{"20-production-capacity.conf", "MemoryMax=2G", "CPUQuota=200%", "O_NOFOLLOW", "os.link", "os.fsync", "OPEN_CARD_BUILDKIT_CAPACITY_TEST"} {
+		if !strings.Contains(capacity, required) {
+			t.Fatalf("BuildKit capacity helper is missing %q", required)
+		}
+	}
+	if strings.Index(host, "host-preflight.sh\"") > strings.Index(host, "\"${installer[@]}\"") {
+		t.Fatal("host capacity preflight runs after installer activation")
+	}
+	for _, required := range []string{"if (( system_root )); then", "buildkit-production-capacity.sh\" remove"} {
+		if !strings.Contains(uninstall, required) {
+			t.Fatalf("uninstall does not safely manage %q", required)
+		}
+	}
+}

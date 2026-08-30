@@ -58,6 +58,7 @@ if [[ -n "$url" && "$url" != https://* ]]; then die "--url must use https://"; f
 if [[ -n "$debs_dir" ]]; then [[ "$debs_dir" = /* && -d "$debs_dir" && ! -L "$debs_dir" ]] || die "--debs-dir must be a real absolute directory"; fi
 if [[ -n "$debs_sha256" ]]; then [[ "$debs_sha256" = /* && -f "$debs_sha256" && ! -L "$debs_sha256" ]] || die "--debs-sha256 must be a real absolute file"; fi
 [[ "${OPEN_CARD_INSTALL_CONFIRMATION:-}" = "OPEN-CARD-INSTALL" ]] || die "production install requires OPEN_CARD_INSTALL_CONFIRMATION=OPEN-CARD-INSTALL"
+[[ "${OPEN_CARD_DEDICATED_HOST_CONFIRMATION:-}" = "OPEN-CARD-DEDICATED-HOST" ]] || die "production install requires OPEN_CARD_DEDICATED_HOST_CONFIRMATION=OPEN-CARD-DEDICATED-HOST"
 [[ "${OPEN_CARD_M6_ENABLED:-false}" != "true" && "${OPEN_CARD_AI_ENABLED:-false}" != "true" ]] || die "production installer refuses AI-enabled environment"
 [[ "$EUID" -eq 0 ]] || die "production installation requires root"
 [[ -n "$migration_command" && -n "$migration_dir" ]] || die "production install requires --migration-command and --migration-dir"
@@ -92,6 +93,11 @@ export OPEN_CARD_INSTALL_CONFIRMATION=OPEN-CARD-INSTALL
 export OPEN_CARD_M6_ENABLED=false
 export OPEN_CARD_AI_ENABLED=false
 expected=$(tr '[:upper:]' '[:lower:]' <<< "$expected")
+
+# Before packages are present the receipt may report only docker prerequisite
+# pending. Capacity, host identity, listeners and colocated services must
+# already pass; a strict second receipt is required before activation.
+"$script_dir/host-preflight.sh" --allow-prerequisites-pending
 
 if [[ -L /opt/open-card/current ]] && (( ! dry_run )); then
   die "existing production installation requires upgrade.sh; root upgrades remain fail-closed pending atomic PostgreSQL restore support"
@@ -158,6 +164,7 @@ PY
     fi
   fi
   for command_name in docker psql runuser newuidmap newgidmap; do require_command "$command_name"; done
+  "$script_dir/host-preflight.sh" --post-prerequisites
 
   for account in opencard opencard-agent opencard-buildkit opencard-caddy opencard-edge; do
     if ! getent passwd "$account" >/dev/null; then
@@ -367,12 +374,30 @@ SQL
   export OPEN_CARD_DATABASE_URL="$database_url"
   export DATABASE_URL="$database_url"
 fi
+if (( skip_prerequisites )); then "$script_dir/host-preflight.sh" --post-prerequisites; fi
 for command_name in docker psql runuser newuidmap newgidmap; do require_command "$command_name"; done
 for command_path in /usr/lib/postgresql/16/bin/psql /usr/lib/postgresql/16/bin/pg_dump /usr/lib/postgresql/16/bin/pg_restore; do
   [[ -x "$command_path" && ! -L "$command_path" ]] || die "required PostgreSQL 16 tool is missing or unsafe: $command_path"
 done
 
+# Gate 6 capacity profile is an exact replay-only helper contract.
+capacity_receipt=$("$script_dir/buildkit-production-capacity.sh" install)
+capacity_created=0
+[[ "$capacity_receipt" = '{"status":"created"}' ]] && capacity_created=1
+[[ "$capacity_receipt" = '{"status":"created"}' || "$capacity_receipt" = '{"status":"existing"}' ]] || die "BuildKit production capacity helper failed"
+capacity_rollback() {
+  local status=$?
+  if (( status != 0 && capacity_created == 1 )); then
+    "$script_dir/buildkit-production-capacity.sh" remove >/dev/null 2>&1 || true
+    /usr/bin/systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+  return "$status"
+}
+trap capacity_rollback EXIT
+/usr/bin/systemctl daemon-reload || die "BuildKit capacity daemon-reload failed"
+
 "${installer[@]}"
+trap - EXIT
 installation_id=/var/lib/open-card/installation-id
 if [[ ! -e "$installation_id" ]]; then openssl rand -hex 24 >"$installation_id"; fi
 [[ -f "$installation_id" && ! -L "$installation_id" ]] || die "installation id is unsafe"

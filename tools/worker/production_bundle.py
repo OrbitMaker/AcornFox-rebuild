@@ -95,7 +95,7 @@ def systemd_files(version: str) -> tuple[str, ...]:
     if version == "0.8.0-rc.1":
         return (*UNITS, *UNIT_DROP_INS)
     raise ProductionBundleError("unsupported release version")
-INSTALLER_SCRIPTS = (
+RC0_INSTALLER_SCRIPTS = (
     "install.sh",
     "install-host.sh",
     "upgrade.sh",
@@ -104,6 +104,27 @@ INSTALLER_SCRIPTS = (
     "restore-control-plane.sh",
     "control-plane-migrate.sh",
 )
+RC1_INSTALLER_SCRIPTS = (
+    "install.sh",
+    "install-host.sh",
+    "host-preflight.sh",
+    "buildkit-production-capacity.sh",
+    "upgrade.sh",
+    "uninstall.sh",
+    "backup-control-plane.sh",
+    "restore-control-plane.sh",
+    "control-plane-migrate.sh",
+)
+INSTALLER_SCRIPTS = RC1_INSTALLER_SCRIPTS
+
+
+def installer_scripts(version: str) -> tuple[str, ...]:
+    """Keep the frozen RC0 source/payload independent from later host gates."""
+    if version == "0.8.0-rc.0":
+        return RC0_INSTALLER_SCRIPTS
+    if version == "0.8.0-rc.1":
+        return RC1_INSTALLER_SCRIPTS
+    raise ProductionBundleError("unsupported release version")
 
 
 class ProductionBundleError(RuntimeError):
@@ -413,8 +434,9 @@ def make_source_manifest(
     release: Path,
     source_commit: str,
     tracked: tuple[str, ...],
+    installer_payload: tuple[str, ...],
 ) -> None:
-    installers = {f"scripts/mvp/{script}" for script in INSTALLER_SCRIPTS}
+    installers = {f"scripts/mvp/{script}" for script in installer_payload}
 
     def allowed(path: str) -> bool:
         if (
@@ -666,6 +688,7 @@ def assemble(
 
     systemd_payload = systemd_files(version)
     binaries = release_binaries(version)
+    installer_payload = installer_scripts(version)
     tracked = verify_repo(repo, source_commit, migration_version)
     if not needs_n_minus_one and (
         n_minus_one_release is not None or n_minus_one_manifest_sha256 is not None or n_minus_one_archive_sha256 is not None or n_minus_one_bundle_manifest_sha256 is not None
@@ -733,7 +756,7 @@ def assemble(
 
         for systemd_file in systemd_payload:
             regular(repo_snapshot / "deploy/systemd" / systemd_file)
-        for script in INSTALLER_SCRIPTS:
+        for script in installer_payload:
             regular(repo_snapshot / "scripts/mvp" / script)
         regular(repo_snapshot / "deploy/caddy/open-card-edge.Caddyfile.example")
         regular(repo_snapshot / "deploy/caddy/open-card-edge.env.example")
@@ -795,7 +818,7 @@ def assemble(
             ):
                 raise ProductionBundleError("production release is missing the declared migration")
             copy_tree(repo_snapshot / "docs/licenses", release / "docs/licenses")
-            for script in INSTALLER_SCRIPTS:
+            for script in installer_payload:
                 copy_file(
                     repo_snapshot / "scripts/mvp" / script,
                     release / "scripts/mvp" / script,
@@ -810,7 +833,7 @@ def assemble(
                     0o640,
                 )
                 live_attestation_digest = sha256(release / "attestations/live-web.json")
-            make_source_manifest(repo_snapshot, release, source_commit, tracked)
+            make_source_manifest(repo_snapshot, release, source_commit, tracked, installer_payload)
             make_sbom(release, version)
 
             candidate_status = (
