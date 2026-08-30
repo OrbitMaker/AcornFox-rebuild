@@ -254,4 +254,8 @@ remote_cleanup >"$local_evidence/cleanup.txt"
 for token in DOMAIN_ABSENT NET_ABSENT POOL_ABSENT ROOT_ABSENT BRIDGE_ABSENT CLAIM_ABSENT; do grep -Fxq "$token" "$local_evidence/cleanup.txt"; done
 ssh -o BatchMode=yes -o ConnectTimeout=15 "$remote" "printf '[domains]\\n'; sudo -n virsh list --all --name | LC_ALL=C sort; printf '[networks]\\n'; sudo -n virsh net-list --all --name | LC_ALL=C sort; printf '[pools]\\n'; sudo -n virsh pool-list --all --name | LC_ALL=C sort; printf '[bridge]\\n'; sudo -n ip link show dev '$bridge' 2>/dev/null || printf 'ABSENT\\n'" >"$local_evidence/host-after.txt"
 cmp "$local_evidence/host-before.txt" "$local_evidence/host-after.txt"
-echo "G5B_PRODUCT_${scenario^^}=PASS evidence=$local_evidence"
+case "$scenario" in
+  success) scenario_label=SUCCESS ;;
+  active-switch-crash) scenario_label=ACTIVE_SWITCH_CRASH ;;
+esac
+echo "G5B_PRODUCT_${scenario_label}=PASS evidence=$local_evidence"
