@@ -819,22 +819,7 @@ func inspectSelectedActiveDatabase(ctx context.Context, request ActiveDatabaseIn
 }
 
 func (a *UpgradeDatabaseAdapter) Snapshot(ctx context.Context) (SnapshotEvidence, string, error) {
-	if a == nil || a.plan.ArtifactWriter == nil {
-		return SnapshotEvidence{}, "", ErrPostgresOutcomeUnknown
-	}
-	if _, err := a.plan.ArtifactWriter.CreateChildDirectory(a.plan.TransactionID, activationSlotDirMode); err != nil {
-		if !errors.Is(err, ErrDurableCommitUnknown) {
-			return SnapshotEvidence{}, "", ErrPostgresOutcomeUnknown
-		}
-		if _, retryErr := a.plan.ArtifactWriter.CreateChildDirectory(a.plan.TransactionID, activationSlotDirMode); retryErr != nil {
-			return SnapshotEvidence{}, "", ErrPostgresOutcomeUnknown
-		}
-	}
-	child, err := a.plan.ArtifactWriter.OpenChildWriter(a.plan.TransactionID, activationSlotDirMode)
-	if err != nil {
-		return SnapshotEvidence{}, "", ErrPostgresOutcomeUnknown
-	}
-	if closeErr := child.Close(); closeErr != nil || !secureArtifactDirectory(a.plan.ArtifactDir) {
+	if a == nil || a.ensureArtifactDirectory() != nil {
 		return SnapshotEvidence{}, "", ErrPostgresOutcomeUnknown
 	}
 	evidence, err := a.snapshotter.Snapshot(ctx, a.plan.TransactionID, a.plan.ArtifactDir, a.activeEnv, a.snapshot)
@@ -843,6 +828,28 @@ func (a *UpgradeDatabaseAdapter) Snapshot(ctx context.Context) (SnapshotEvidence
 	}
 	a.snapshot = &evidence
 	return evidence, a.activeEnv.Descriptor.Database, nil
+}
+
+func (a *UpgradeDatabaseAdapter) ensureArtifactDirectory() error {
+	if a == nil || a.plan.ArtifactWriter == nil {
+		return ErrPostgresOutcomeUnknown
+	}
+	if _, err := a.plan.ArtifactWriter.CreateChildDirectory(a.plan.TransactionID, activationSlotDirMode); err != nil {
+		if !errors.Is(err, ErrDurableCommitUnknown) {
+			return ErrPostgresOutcomeUnknown
+		}
+		if _, retryErr := a.plan.ArtifactWriter.CreateChildDirectory(a.plan.TransactionID, activationSlotDirMode); retryErr != nil {
+			return ErrPostgresOutcomeUnknown
+		}
+	}
+	child, err := a.plan.ArtifactWriter.OpenChildWriter(a.plan.TransactionID, activationSlotDirMode)
+	if err != nil {
+		return ErrPostgresOutcomeUnknown
+	}
+	if closeErr := child.Close(); closeErr != nil || !secureArtifactDirectory(a.plan.ArtifactDir) {
+		return ErrPostgresOutcomeUnknown
+	}
+	return nil
 }
 
 func (a *UpgradeDatabaseAdapter) CreateRestore(ctx context.Context, candidate string) error {
@@ -878,6 +885,9 @@ func (a *UpgradeDatabaseAdapter) candidateRole() string {
 func (a *UpgradeDatabaseAdapter) PrepareBackupSnapshot(ctx context.Context, expected ActiveDatabaseBackupV2) (SnapshotEvidence, error) {
 	if a == nil || a.plan.BackupWriter == nil || a.plan.BackupRoot == "" || expected.Validate() != nil || ctx.Err() != nil {
 		return SnapshotEvidence{}, ErrPostgresOutcomeUnknown
+	}
+	if err := a.ensureArtifactDirectory(); err != nil {
+		return SnapshotEvidence{}, err
 	}
 	backup, dump, err := a.readVerifiedBackup(expected)
 	if err != nil {

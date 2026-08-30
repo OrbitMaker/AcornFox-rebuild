@@ -363,6 +363,33 @@ func TestUpgradeDatabaseAdapterSnapshotCreatesTransactionArtifactDirectory(t *te
 	}
 }
 
+func TestUpgradeDatabaseAdapterRestoreSnapshotCreatesTransactionArtifactDirectory(t *testing.T) {
+	plan, _, pg := adapterPlan(t)
+	backup := adapterBackup(t, plan, "custom-backup")
+	if err := os.Remove(plan.ArtifactDir); err != nil {
+		t.Fatal(err)
+	}
+	active, err := PostgresEnvironment(plan.ActiveDatabaseEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter, err := TaskUpgradeDatabaseAdapter(plan, adapterControl(active), adapterSnapshotter(t, pg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer adapter.Close()
+	if _, err := adapter.PrepareBackupSnapshot(context.Background(), backup); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(plan.ArtifactDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.IsDir() || info.Mode().Perm() != activationSlotDirMode {
+		t.Fatalf("artifact directory mode=%v", info.Mode())
+	}
+}
+
 func adapterBackup(t *testing.T, plan UpgradeDatabasePlan, payload string) ActiveDatabaseBackupV2 {
 	t.Helper()
 	if plan.BackupWriter == nil {
