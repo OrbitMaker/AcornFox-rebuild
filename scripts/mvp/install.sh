@@ -298,11 +298,18 @@ install_stable_file() {
   durable_sync_file_and_parent "$destination" || die "$label durability outcome is unknown"
 }
 prepare_upgrade_lock() {
-  local expected_owner=$1 temporary run_dir
+  local expected_owner=$1 temporary run_dir actual_owner actual_mode
   assert_no_symlink_components "$upgrade_lock_dir"
   run_dir=$(dirname -- "$upgrade_lock_dir")
   require_stable_directory "$run_dir" "$expected_owner" 755
-  require_stable_directory "$upgrade_lock_dir" "$expected_owner" 755
+  if (( system_root )); then
+    [[ -d "$upgrade_lock_dir" && ! -L "$upgrade_lock_dir" ]] || die "system lock path is not a real directory"
+    actual_owner=$(file_owner "$upgrade_lock_dir")
+    actual_mode=$(file_mode "$upgrade_lock_dir")
+    [[ "$actual_owner" = "$expected_owner" && "$actual_mode" = "1777" ]] || die "system lock path must be root-owned mode 1777"
+  else
+    require_stable_directory "$upgrade_lock_dir" "$expected_owner" 755
+  fi
   if [[ -e "$upgrade_lock" || -L "$upgrade_lock" ]]; then
     require_stable_file "$upgrade_lock" "$expected_owner" 600
     durable_sync_file_and_parent "$upgrade_lock" || die "upgrade lock durability outcome is unknown"

@@ -425,6 +425,7 @@ func TestG5BRecoverySubstrateStaysStageOnlyAndBootDisabled(t *testing.T) {
 		"durable_sync_file_and_parent",
 		"durable_sync_directory_and_parent",
 		"prepare_upgrade_data_root",
+		"system lock path must be root-owned mode 1777",
 		"install -d -m 0711 -o root -g root /var/lib/open-card",
 		"chmod 0755 \"$prefix\" \"$releases\"",
 		"chmod 0755 \"$stage_dir\"",
