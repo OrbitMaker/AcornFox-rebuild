@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # Disposable Ubuntu guest only: real RC0 -> RC1 Gate5B production-wrapper
-# success, V2 backup/restore, and an actual normal reboot.  Public DNS/ACME,
-# crash/failure matrix, and customer acceptance stay outside.
+# success, V2 backup/restore, normal reboot, and ACTIVE_SWITCHED crash recovery.
+# Public DNS/ACME and customer acceptance stay outside.
 set -Eeuo pipefail
 umask 077
 
 mode=${1:-initial}
 [[ "$mode" == initial || "$mode" == post-reboot ]]
+scenario=${OPEN_CARD_G5B_PRODUCT_SCENARIO:-success}
+[[ "$scenario" == success || "$scenario" == active-switch-crash ]]
 prefix=${OPEN_CARD_G5B_PRODUCT_PREFIX:-opencard-g5b-20260830-a02}
 [[ "$prefix" =~ ^opencard-g5b-[0-9]{8}-a[0-9]{2}$ ]]
 source_root=${OPEN_CARD_G5B_PRODUCT_SOURCE_ROOT:-/home/ubuntu/g5b-product-source}
@@ -129,7 +131,117 @@ assert_runtime_services() {
   assert_edge_active
   [[ ! -e "$marker" && ! -L "$marker" ]]
 }
+run_active_switch_crash() {
+  local wrapper_pid helper_pid watcher_pid tx candidate_id journal status journal_state i
+  local -a helper_pids=()
+  set +e
+  env OPEN_CARD_ALLOW_SYSTEM_ROOT=1 bash "$rc1/release/scripts/mvp/upgrade.sh" --root / --offline --activate --expected-manifest-sha256 "$rc1_manifest_sha" --bundle "$rc1/release" --confirm-installation-id "UPGRADE:$(cat /var/lib/open-card/installation-id)" >"$evidence/production-upgrade.jsonl" 2>"$evidence/production-upgrade.stderr" &
+  wrapper_pid=$!
+  set -e
+  for _ in $(seq 1 12000); do
+    if grep -q '"command":"preflight"' "$evidence/production-upgrade.jsonl" 2>/dev/null; then
+      read -r tx candidate_id < <(python3 - "$evidence/production-upgrade.jsonl" <<'PY'
+import json,sys
+values=[]
+for line in open(sys.argv[1], encoding="utf-8"):
+    try: values.append(json.loads(line))
+    except ValueError: pass
+values=[v for v in values if v.get("command") == "preflight" and v.get("ok") is True]
+assert len(values) == 1
+value=values[0]["eligibility"]
+print(value["transaction_id"], value["candidate_activation_id"])
+PY
+)
+      break
+    fi
+    kill -0 "$wrapper_pid" 2>/dev/null || break
+    sleep 0.005
+  done
+  [[ "${tx:-}" =~ ^upgrade-[0-9a-f]{32}$ && "${candidate_id:-}" =~ ^act-[0-9a-f]{24}$ ]]
+  journal="/var/lib/open-card/upgrade-transactions/$tx.json"
+  for _ in $(seq 1 12000); do
+    if grep -q '"state":"MIGRATED"' "$journal" 2>/dev/null; then
+      mapfile -t helper_pids < <(pgrep -f "^/opt/open-card/upgrade-tools/open-card-upgrade run --transaction-id $tx ")
+      [[ ${#helper_pids[@]} -eq 1 ]]
+      helper_pid=${helper_pids[0]}
+      kill -STOP "$helper_pid"
+      break
+    fi
+    kill -0 "$wrapper_pid" 2>/dev/null || break
+    sleep 0.005
+  done
+  [[ "${helper_pid:-}" =~ ^[0-9]+$ ]]
+  (
+    for ((i=0; i<200000; i++)); do
+      if [[ "$(readlink /opt/open-card/active 2>/dev/null || true)" = "activations/$candidate_id" ]]; then
+        kill -KILL "$helper_pid"
+        exit 0
+      fi
+    done
+    exit 1
+  ) &
+  watcher_pid=$!
+  kill -CONT "$helper_pid"
+  wait "$watcher_pid"
+  set +e
+  wait "$wrapper_pid"
+  status=$?
+  set -e
+  [[ $status -ne 0 ]]
+  journal_state=$(python3 - "$journal" <<'PY'
+import json,sys
+print(json.load(open(sys.argv[1], encoding="utf-8"))["state"])
+PY
+)
+  [[ "$journal_state" == VALIDATED || "$journal_state" == ACTIVE_SWITCHED ]]
+  [[ "$(cat "$marker")" = "$tx" ]]
+  printf '%s\n' "$tx" >"$state/crash-transaction-id"
+  printf 'scenario=active-switch-crash\ntransaction_id=%s\njournal_state_before_reboot=%s\nmarker=retained\n' "$tx" "$journal_state" >"$evidence/crash-armed-summary.txt"
+  printf 'G5B_PRODUCT_CRASH_ARMED=PASS\n'
+}
+post_reboot_crash() {
+  local tx journal active previous old_activation candidate_activation old_database candidate_database db_password old_url
+  phase=post_reboot_crash
+  assert_runtime_services
+  tx=$(cat "$state/crash-transaction-id")
+  journal="/var/lib/open-card/upgrade-transactions/$tx.json"
+  python3 - "$journal" <<'PY' >"$evidence/crash-recovery-journal.txt"
+import json,sys
+value=json.load(open(sys.argv[1], encoding="utf-8"))
+assert value["request_kind"] == "upgrade" and value["state"] == "ROLLED_BACK"
+assert value["failure"]["code"] == "boot_recovered"
+print("request_kind=upgrade")
+print("state=ROLLED_BACK")
+print("failure_code=boot_recovered")
+PY
+  active=$(readlink /opt/open-card/active)
+  previous=$(readlink /opt/open-card/previous-active)
+  [[ "$active" =~ ^activations/legacy-[0-9a-f]{24}$ && "$previous" =~ ^activations/act-[0-9a-f]{24}$ ]]
+  old_activation=${active#activations/}
+  candidate_activation=${previous#activations/}
+  read -r old_database candidate_database < <(python3 - "/opt/open-card/activations/$old_activation/activation.json" "/opt/open-card/activations/$candidate_activation/activation.json" <<'PY'
+import json,sys
+old,candidate=[json.load(open(path, encoding="utf-8")) for path in sys.argv[1:]]
+assert old["release"]["version"] == "0.8.0-rc.0" and old["database"]["migration"] == "0023"
+assert candidate["release"]["version"] == "0.8.0-rc.1" and candidate["database"]["migration"] == "0024"
+print(old["database"]["name"], candidate["database"]["name"])
+PY
+)
+  db_password=$(cat /etc/open-card/postgres-password)
+  old_url="postgresql://opencard:${db_password}@127.0.0.1:5432/${old_database}?sslmode=disable"
+  [[ "$(psql "$old_url" -X -Aqt -c 'SELECT value FROM gate5b_success_sentinel WHERE id=1')" = rc0-before-upgrade ]]
+  [[ "$(runuser -u postgres -- psql -d "$candidate_database" -X -Aqt -c 'SELECT count(*) FROM schema_migrations')" = 24 ]]
+  [[ ! -e "$marker" && ! -L "$marker" ]]
+  printf 'crash_recovery=PASS\njournal_state=ROLLED_BACK\nmarker=absent\nedge=active\ncandidate_retained=PASS\npublic_dns_acme_customer_acceptance=PENDING\n' >"$evidence/crash-recovery-summary.txt"
+  ! grep -R -a -E 'postgres(ql)?://|OPEN_CARD_DATABASE_URL=|BEGIN [A-Z ]*PRIVATE KEY|password=' "$evidence"
+  (cd "$evidence" && find . -type f ! -name manifest.sha256 -print0 | LC_ALL=C sort -z | xargs -0 sha256sum >manifest.sha256)
+  printf 'G5B_PRODUCT_CRASH_POST_REBOOT=PASS\n'
+}
 post_reboot() {
+  if [[ "$scenario" == active-switch-crash ]]; then
+    post_reboot_crash
+    return
+  fi
   local active restored_database db_password restored_url
   phase=post_reboot
   assert_runtime_services
@@ -184,10 +296,12 @@ fi
 phase=source_binding
 test -f "$source_root/source-commit.txt" && ! test -L "$source_root/source-commit.txt"
 test -f "$source_root/source-manifest.sha256" && ! test -L "$source_root/source-manifest.sha256"
+test -f "$source_root/harness-commit.txt" && ! test -L "$source_root/harness-commit.txt"
 (cd "$source_root" && sha256sum -c source-manifest.sha256) >"$evidence/source-manifest-check.txt" 2>&1
 [[ "$(tr -d '\n' <"$source_root/source-commit.txt")" = "$rc1_source" ]]
-cp "$source_root/source-commit.txt" "$source_root/source-manifest.sha256" "$evidence/"
-chmod 0600 "$evidence/source-commit.txt" "$evidence/source-manifest.sha256"
+[[ "$(tr -d '\n' <"$source_root/harness-commit.txt")" =~ ^[0-9a-f]{40}$ ]]
+cp "$source_root/source-commit.txt" "$source_root/source-manifest.sha256" "$source_root/harness-commit.txt" "$evidence/"
+chmod 0600 "$evidence/source-commit.txt" "$evidence/source-manifest.sha256" "$evidence/harness-commit.txt"
 
 phase=candidate_verify
 verify_candidate "$rc0" 0.8.0-rc.0 0023 35a2b198ac52949af3477475d89d4813b46a9490 "$rc0_manifest_sha" "$rc0_archive_sha" "$rc0_bundle_sha"
@@ -393,6 +507,10 @@ rm -f -- "$admin_password"
 assert_edge_running
 
 phase=production_upgrade_wrapper
+if [[ "$scenario" == active-switch-crash ]]; then
+  run_active_switch_crash
+  exit 0
+fi
 env OPEN_CARD_ALLOW_SYSTEM_ROOT=1 bash "$rc1/release/scripts/mvp/upgrade.sh" --root / --offline --activate --expected-manifest-sha256 "$rc1_manifest_sha" --bundle "$rc1/release" --confirm-installation-id "UPGRADE:$(cat /var/lib/open-card/installation-id)" >"$evidence/production-upgrade.jsonl" 2>"$evidence/production-upgrade.stderr"
 tx=$(python3 - "$evidence/production-upgrade.jsonl" <<'PY'
 import json, sys

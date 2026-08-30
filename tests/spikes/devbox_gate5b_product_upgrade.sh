@@ -9,6 +9,8 @@ umask 077
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 prefix=${OPEN_CARD_G5B_PRODUCT_PREFIX:-opencard-g5b-20260830-a02}
 [[ "$prefix" =~ ^opencard-g5b-[0-9]{8}-a[0-9]{2}$ ]]
+scenario=${OPEN_CARD_G5B_PRODUCT_SCENARIO:-success}
+[[ "$scenario" == success || "$scenario" == active-switch-crash ]]
 [[ -z "${OPEN_CARD_DEVBOX_HOST+x}" ]] || { echo "OPEN_CARD_DEVBOX_HOST override is forbidden" >&2; exit 2; }
 remote=yanyan-devbox-via-idc
 domain=$prefix
@@ -21,6 +23,7 @@ base=/var/lib/libvirt/images/sealos-cluster/ubuntu-24.04-server-cloudimg-amd64.i
 base_sha=0533b0655c32e68b31d792ecd6ccfca95abdbc536c4446874fe0513bd4140ffe
 rc0_rel=output/production/0.8.0-rc.0/amd64
 rc1_rel=output/production/0.8.0-rc.1/amd64
+rc1_source=cba392e00b64116b0ad87881a74e8f2e4d697e8c
 local_tmp=$(mktemp -d "${TMPDIR:-/tmp}/${prefix}.XXXXXX")
 local_evidence=${OPEN_CARD_G5B_PRODUCT_EVIDENCE_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/${prefix}.evidence.XXXXXX")}
 mkdir -p "$local_evidence"
@@ -107,11 +110,21 @@ on_exit() {
   exit "$verify"
 }
 for path in tests/spikes/clean_worker_gate5b_product_guest.sh "$rc0_rel/release/manifest.json" "$rc1_rel/release/manifest.json"; do test -f "$repo_root/$path"; done
-test "$(git -C "$repo_root" rev-parse HEAD)" = cba392e00b64116b0ad87881a74e8f2e4d697e8c
+test "$(git -C "$repo_root" rev-parse "$rc1_source^{commit}")" = "$rc1_source"
+git -C "$repo_root" merge-base --is-ancestor "$rc1_source" HEAD
+test -z "$(git -C "$repo_root" status --short)"
 test "$(sha256sum "$repo_root/$rc1_rel/release/manifest.json" | awk '{print $1}')" = fe0f3017eb4faa5ba329bc8f1fb1cb810eb334ab8cdc1fff5075d9069f93aaf1
 test "$(sha256sum "$repo_root/$rc1_rel/open-card-0.8.0-rc.1-production.tar.gz" | awk '{print $1}')" = 9dfbed75ac4d5ec765f6518876b42abe0b80d6aa66d7fe5fb2b6900695473cc3
 test "$(sha256sum "$repo_root/$rc1_rel/bundle-manifest.sha256" | awk '{print $1}')" = cdc3c7f01d75371d9a186f810ca600f78ca190046a7c77956837f17cdd276936
-! rg -n '/opt/open-card/upgrade-tools/open-card-upgrade|stage-upgrade-substrate' "$repo_root/tests/spikes/clean_worker_gate5b_product_guest.sh"
+python3 - "$repo_root/tests/spikes/clean_worker_gate5b_product_guest.sh" <<'PY'
+import pathlib, sys
+source=pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+helper="/opt/open-card/upgrade-tools/open-card-upgrade"
+references=[line.strip() for line in source.splitlines() if helper in line]
+want='mapfile -t helper_pids < <(pgrep -f "^/opt/open-card/upgrade-tools/open-card-upgrade run --transaction-id $tx ")'
+assert references == [want], references
+assert "stage-upgrade-substrate" not in source
+PY
 verify_remote_identity
 trap on_exit EXIT
 mkdir -p "$local_tmp/candidates"
@@ -120,10 +133,11 @@ cp "$repo_root/tests/spikes/devbox_gate5b_product_upgrade.sh" "$local_tmp/"
 cp -a "$repo_root/$rc0_rel" "$local_tmp/candidates/rc0"
 cp -a "$repo_root/$rc1_rel" "$local_tmp/candidates/rc1"
 if command -v xattr >/dev/null 2>&1; then xattr -cr "$local_tmp"; fi
-git -C "$repo_root" rev-parse HEAD >"$local_tmp/source-commit.txt"
+printf '%s\n' "$rc1_source" >"$local_tmp/source-commit.txt"
+git -C "$repo_root" rev-parse HEAD >"$local_tmp/harness-commit.txt"
 (cd "$local_tmp" && find clean_worker_gate5b_product_guest.sh devbox_gate5b_product_upgrade.sh candidates -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum) >"$local_tmp/source-manifest.sha256"
-printf 'harness_worktree=exact-head\n' >"$local_tmp/harness-binding.txt"
-cat "$local_tmp/source-commit.txt" "$local_tmp/source-manifest.sha256" "$local_tmp/harness-binding.txt" >"$local_evidence/source-binding.txt"
+printf 'candidate_source_is_ancestor_of_harness_commit=yes\nharness_worktree=clean\n' >"$local_tmp/harness-binding.txt"
+cat "$local_tmp/source-commit.txt" "$local_tmp/harness-commit.txt" "$local_tmp/source-manifest.sha256" "$local_tmp/harness-binding.txt" >"$local_evidence/source-binding.txt"
 
 verify_remote_identity
 ssh -o BatchMode=yes -o ConnectTimeout=15 "$remote" "bash -s -- '$prefix' '$domain' '$network' '$pool' '$task' '$claim' '$bridge' '$base' '$base_sha'" <<'REMOTE_CREATE'
@@ -180,7 +194,7 @@ sudo -n virt-install --name "$domain" --memory 8192 --vcpus 4 --cpu host-model -
 sudo -n virsh autostart "$domain" --disable >/dev/null
 REMOTE_CREATE
 
-COPYFILE_DISABLE=1 tar -C "$local_tmp" -cf - clean_worker_gate5b_product_guest.sh devbox_gate5b_product_upgrade.sh candidates source-commit.txt source-manifest.sha256 harness-binding.txt | ssh -o BatchMode=yes -o ConnectTimeout=15 "$remote" "sudo -n tar -C '$task/source' -xf -"
+COPYFILE_DISABLE=1 tar -C "$local_tmp" -cf - clean_worker_gate5b_product_guest.sh devbox_gate5b_product_upgrade.sh candidates source-commit.txt source-manifest.sha256 harness-binding.txt harness-commit.txt | ssh -o BatchMode=yes -o ConnectTimeout=15 "$remote" "sudo -n tar -C '$task/source' -xf -"
 ssh -o BatchMode=yes -o ConnectTimeout=15 "$remote" "bash -s -- '$network' '$task' '$prefix'" <<'REMOTE_GUEST'
 set -Eeuo pipefail
 network=$1 task=$2 prefix=$3
@@ -194,7 +208,7 @@ test -n "${ip:-}" && test -s "$task/known_hosts"
 sudo -n scp -i "$task/id_ed25519" -o BatchMode=yes -o UserKnownHostsFile="$task/known_hosts" -o StrictHostKeyChecking=yes -r "$task/source" ubuntu@"$ip":/home/ubuntu/g5b-product-source
 run_guest() {
   sudo -n ssh -n -i "$task/id_ed25519" -o BatchMode=yes -o UserKnownHostsFile="$task/known_hosts" -o StrictHostKeyChecking=yes ubuntu@"$ip" \
-    "sudo OPEN_CARD_G5B_PRODUCT_PREFIX='$prefix' bash /home/ubuntu/g5b-product-source/clean_worker_gate5b_product_guest.sh $1"
+    "sudo OPEN_CARD_G5B_PRODUCT_PREFIX='$prefix' OPEN_CARD_G5B_PRODUCT_SCENARIO='$scenario' bash /home/ubuntu/g5b-product-source/clean_worker_gate5b_product_guest.sh $1"
 }
 set +e
 run_guest initial 2>&1 | sudo -n tee "$task/evidence/guest-initial.txt"
@@ -223,14 +237,20 @@ printf 'boot_before=%s\nboot_after=%s\n' "$boot_before" "$boot_after" | sudo -n 
 REMOTE_GUEST
 
 fetch_remote
-grep -Fxq 'marker=absent' "$local_evidence/guest/summary.txt"
-grep -Fxq 'edge=active' "$local_evidence/guest/summary.txt"
-grep -Fxq 'backup_restore=PASS' "$local_evidence/guest/summary.txt"
-grep -Fxq 'post_reboot=PASS' "$local_evidence/guest/post-reboot-summary.txt"
-grep -Fxq 'crash_failure_matrix=PENDING' "$local_evidence/guest/summary.txt"
-grep -Fxq 'public_dns_acme_customer_acceptance=PENDING' "$local_evidence/guest/summary.txt"
+if [[ "$scenario" == success ]]; then
+  grep -Fxq 'marker=absent' "$local_evidence/guest/summary.txt"
+  grep -Fxq 'edge=active' "$local_evidence/guest/summary.txt"
+  grep -Fxq 'backup_restore=PASS' "$local_evidence/guest/summary.txt"
+  grep -Fxq 'post_reboot=PASS' "$local_evidence/guest/post-reboot-summary.txt"
+  grep -Fxq 'crash_failure_matrix=PENDING' "$local_evidence/guest/summary.txt"
+  grep -Fxq 'public_dns_acme_customer_acceptance=PENDING' "$local_evidence/guest/summary.txt"
+else
+  grep -Fxq 'crash_recovery=PASS' "$local_evidence/guest/crash-recovery-summary.txt"
+  grep -Fxq 'journal_state=ROLLED_BACK' "$local_evidence/guest/crash-recovery-summary.txt"
+  grep -Fxq 'candidate_retained=PASS' "$local_evidence/guest/crash-recovery-summary.txt"
+fi
 remote_cleanup >"$local_evidence/cleanup.txt"
 for token in DOMAIN_ABSENT NET_ABSENT POOL_ABSENT ROOT_ABSENT BRIDGE_ABSENT CLAIM_ABSENT; do grep -Fxq "$token" "$local_evidence/cleanup.txt"; done
 ssh -o BatchMode=yes -o ConnectTimeout=15 "$remote" "printf '[domains]\\n'; sudo -n virsh list --all --name | LC_ALL=C sort; printf '[networks]\\n'; sudo -n virsh net-list --all --name | LC_ALL=C sort; printf '[pools]\\n'; sudo -n virsh pool-list --all --name | LC_ALL=C sort; printf '[bridge]\\n'; sudo -n ip link show dev '$bridge' 2>/dev/null || printf 'ABSENT\\n'" >"$local_evidence/host-after.txt"
 cmp "$local_evidence/host-before.txt" "$local_evidence/host-after.txt"
-echo "G5B_PRODUCT_UPGRADE=PASS evidence=$local_evidence"
+echo "G5B_PRODUCT_${scenario^^}=PASS evidence=$local_evidence"
