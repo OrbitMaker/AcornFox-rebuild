@@ -177,8 +177,13 @@ func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
 	if s.tlsAllow != nil && s.tlsAllow.Handle(writer, request) {
 		return
 	}
-	if request.URL.Path == "/healthz" {
-		s.handleHealth(writer, request, false)
+	if request.URL.Path == "/healthz" || request.URL.Path == "/readyz" {
+		if request.Method != http.MethodGet {
+			writer.Header().Set("Allow", http.MethodGet)
+			writer.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		s.handleHealth(writer, request, request.URL.Path == "/readyz")
 		return
 	}
 	if isAuthRoute(request.URL.Path) && strings.HasPrefix(request.URL.Path, apiPrefix) {
@@ -223,9 +228,6 @@ func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 	switch request.URL.Path {
-	case "/readyz":
-		s.handleHealth(writer, request, true)
-		return
 	case "/api/v1/settings/system-status":
 		s.handleSystemStatus(writer, request)
 		return

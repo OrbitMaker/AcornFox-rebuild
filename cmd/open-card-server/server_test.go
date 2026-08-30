@@ -158,7 +158,7 @@ func TestServerReadinessFailsWhenPersistentRepositoryIsUnavailable(t *testing.T)
 	repository := unhealthyRepository{MemoryRepository: application.NewMemoryRepository()}
 	serverState := NewServerWithRepository(repository)
 	now := time.Unix(1_700_000_000, 0).UTC()
-	_, session := attachTestAdministrator(t, serverState, &now)
+	attachTestAdministrator(t, serverState, &now)
 	server := httptest.NewServer(serverState.Handler())
 	defer server.Close()
 	for _, test := range []struct {
@@ -168,9 +168,6 @@ func TestServerReadinessFailsWhenPersistentRepositoryIsUnavailable(t *testing.T)
 		request, err := http.NewRequest(http.MethodGet, server.URL+test.path, nil)
 		if err != nil {
 			t.Fatal(err)
-		}
-		if test.path == "/readyz" {
-			request.AddCookie(session)
 		}
 		response, err := http.DefaultClient.Do(request)
 		if err != nil {
@@ -210,7 +207,7 @@ func TestAPI_SECURITY_001_ServerRejectsUnknownJSONFields(t *testing.T) {
 func TestServerReadinessIsDistinctFromLiveness(t *testing.T) {
 	serverState := NewServer()
 	now := time.Unix(1_700_000_000, 0).UTC()
-	_, session := attachTestAdministrator(t, serverState, &now)
+	attachTestAdministrator(t, serverState, &now)
 	serverState.SetReady(false)
 	server := httptest.NewServer(serverState.Handler())
 	defer server.Close()
@@ -218,9 +215,6 @@ func TestServerReadinessIsDistinctFromLiveness(t *testing.T) {
 		request, err := http.NewRequest(http.MethodGet, server.URL+path, nil)
 		if err != nil {
 			t.Fatal(err)
-		}
-		if path == "/readyz" {
-			request.AddCookie(session)
 		}
 		response, err := http.DefaultClient.Do(request)
 		if err != nil {

@@ -76,6 +76,20 @@ func TestControlPlaneAuthRejectsAnonymousAndForgedIdentityHeaders(t *testing.T) 
 	if health.Code != http.StatusOK {
 		t.Fatalf("health must remain public: %d %s", health.Code, health.Body.String())
 	}
+	readiness := httptest.NewRecorder()
+	server.Handler().ServeHTTP(readiness, controlPlaneRequest(http.MethodGet, "/readyz", nil, nil))
+	if readiness.Code != http.StatusOK {
+		t.Fatalf("readiness must remain public: %d %s", readiness.Code, readiness.Body.String())
+	}
+	for _, path := range []string{"/healthz", "/readyz"} {
+		for _, method := range []string{http.MethodPost, http.MethodOptions, http.MethodDelete} {
+			denied := httptest.NewRecorder()
+			server.Handler().ServeHTTP(denied, controlPlaneRequest(method, path, nil, nil))
+			if denied.Code != http.StatusMethodNotAllowed || denied.Header().Get("Allow") != http.MethodGet {
+				t.Fatalf("anonymous health path %s method %s status=%d allow=%q", path, method, denied.Code, denied.Header().Get("Allow"))
+			}
+		}
+	}
 
 	allowed := httptest.NewRecorder()
 	server.Handler().ServeHTTP(allowed, controlPlaneRequest(http.MethodGet, "/api/v1/applications", nil, session))
@@ -90,7 +104,6 @@ func TestControlPlaneAuthProtectsReadinessWritesAndSSE(t *testing.T) {
 	_, session, csrf := attachTestAdministratorTokens(t, server, &now)
 
 	protected := []string{
-		"/readyz",
 		"/api/v1/applications",
 		"/api/v1/events",
 		"/api/v1/access/platform-domains",
