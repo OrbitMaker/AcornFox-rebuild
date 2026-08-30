@@ -1120,7 +1120,10 @@ func migrationInput(releaseRoot string, manifest Manifest) ([]MigrationRow, stri
 				match, matches = file, matches+1
 			}
 		}
-		if matches != 1 || match.Mode != 0o644 {
+		// Production bundles intentionally stage migrations as root-readable
+		// 0640 payloads.  The manifest mode is part of the verified release
+		// identity and must match that packaged contract exactly.
+		if matches != 1 || match.Mode != 0o640 {
 			return nil, "", ErrPostgresOutcomeUnknown
 		}
 		// control-plane-migrate.sh records the canonical filename stem (for

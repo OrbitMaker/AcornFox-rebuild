@@ -1499,7 +1499,10 @@ func legacyMigrationRows(manifest Manifest) ([]MigrationRow, error) {
 				found, n = f, n+1
 			}
 		}
-		if n != 1 || found.Mode != 0o644 {
+		// The frozen RC0 production bundle declares migration payloads as
+		// root-readable 0640 files.  Requiring the source-tree 0644 mode here
+		// makes the verified N-1 artifact impossible to project.
+		if n != 1 || found.Mode != 0o640 {
 			return nil, ErrUpgradeJournalConflict
 		}
 		rows = append(rows, MigrationRow{Version: formatMigrationVersion(i), Checksum: found.SHA256})

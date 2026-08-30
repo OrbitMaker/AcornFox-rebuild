@@ -851,7 +851,7 @@ func (f *gate5BFixture) release(badMigration bool) (install.ReleaseV1, string) {
 		if badMigration && version == 24 {
 			raw = []byte("THIS IS NOT VALID SQL;\n")
 		}
-		write("migrations/control-plane/"+filepath.Base(matches[0]), raw, 0o644)
+		write("migrations/control-plane/"+filepath.Base(matches[0]), raw, 0o640)
 	}
 	for path, raw := range map[string][]byte{
 		"bin/open-card-admin":                                     []byte("#!/bin/sh\nexit 0\n"),

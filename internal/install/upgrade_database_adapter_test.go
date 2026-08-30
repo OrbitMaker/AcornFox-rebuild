@@ -199,10 +199,10 @@ func adapterRelease(t *testing.T) (ReleaseV1, string) {
 		}
 		path := filepath.Join(root, "migrations/control-plane", name)
 		raw := []byte("-- migration " + formatMigrationVersion(version) + "\nSELECT " + formatMigrationVersion(version) + ";\n")
-		if err := os.WriteFile(path, raw, 0o644); err != nil {
+		if err := os.WriteFile(path, raw, 0o640); err != nil {
 			t.Fatal(err)
 		}
-		files = append(files, FileDigest{Path: "migrations/control-plane/" + name, SHA256: adapterDigest(raw), Mode: 0o644})
+		files = append(files, FileDigest{Path: "migrations/control-plane/" + name, SHA256: adapterDigest(raw), Mode: 0o640})
 	}
 	for path, raw := range map[string][]byte{
 		"bin/open-card-admin":                                     []byte("admin\n"),
@@ -255,6 +255,32 @@ func adapterRelease(t *testing.T) (ReleaseV1, string) {
 		t.Fatal(err)
 	}
 	return ReleaseV1{ID: manifest.ReleaseID, Version: manifest.Version, SourceCommit: manifest.SourceCommit, Architecture: manifest.Architecture, ManifestSHA256: digest}, root
+}
+
+func TestMigrationInputRejectsSourceTreeModeForFrozenBundle(t *testing.T) {
+	_, root := adapterRelease(t)
+	manifest, err := LoadManifest(filepath.Join(root, "manifest.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := "migrations/control-plane/0001_upgrade.sql"
+	if err := os.Chmod(filepath.Join(root, filepath.FromSlash(path)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for index := range manifest.Files {
+		if manifest.Files[index].Path == path {
+			manifest.Files[index].Mode = 0o644
+			found = true
+			break
+		}
+	}
+	if !found || VerifyRelease(root, manifest) != nil {
+		t.Fatal("self-consistent source-tree migration fixture is invalid")
+	}
+	if _, _, err := migrationInput(root, manifest); !errors.Is(err, ErrPostgresOutcomeUnknown) {
+		t.Fatalf("migration input error=%v", err)
+	}
 }
 
 func adapterPlan(t *testing.T) (UpgradeDatabasePlan, *adapterValidationFake, *fakePG) {

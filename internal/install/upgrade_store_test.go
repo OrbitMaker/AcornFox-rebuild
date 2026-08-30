@@ -62,6 +62,25 @@ func edgeCandidateTemplateFixture() []byte {
 	return []byte("http://127.0.0.1:18482 {\n\t@edge_health path /healthz\n\trespond @edge_health 200\n\trespond 404\n}\n\nconsole.example.invalid {\n\trespond 200\n}\n")
 }
 
+func TestLegacyMigrationRowsRequireFrozenRC0BundleMode(t *testing.T) {
+	manifest := Manifest{}
+	for version := 1; version <= 23; version++ {
+		manifest.Files = append(manifest.Files, FileDigest{
+			Path:   "migrations/control-plane/" + formatMigrationVersion(version) + "_migration.sql",
+			SHA256: strings.Repeat("a", 64),
+			Mode:   0o640,
+		})
+	}
+	rows, err := legacyMigrationRows(manifest)
+	if err != nil || len(rows) != 23 || rows[22].Version != "0023" {
+		t.Fatalf("rows=%#v err=%v", rows, err)
+	}
+	manifest.Files[0].Mode = 0o644
+	if _, err := legacyMigrationRows(manifest); err == nil {
+		t.Fatal("source-tree migration mode accepted as frozen RC0 bundle evidence")
+	}
+}
+
 func TestPreflightPlanLegacyWithInjectedVerifierIsPureAndRedacted(t *testing.T) {
 	root := t.TempDir()
 	for _, p := range []string{"var/lib/open-card/upgrade-transactions", "run/lock", "etc/open-card", "etc/systemd/system", "opt/open-card/releases/rc0"} {
