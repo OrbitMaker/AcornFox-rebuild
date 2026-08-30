@@ -123,12 +123,14 @@ func bootstrapRC2Store(t *testing.T) (*BootstrapStore, BootstrapJournalV1, Activ
 		upgradeCleanup()
 		t.Fatal(err)
 	}
-	lineage, err := RC1LineageForArchitecture("amd64")
+	architecture := RuntimeArchitecture()
+	lineage, err := RC1LineageForArchitecture(architecture)
 	if err != nil {
 		upgradeCleanup()
 		t.Fatal(err)
 	}
 	manifest.Version = Gate6CandidateVersion
+	manifest.Architecture = architecture
 	manifest.NMinusOne = &NMinusOne{Version: Gate6NMinusOneVersion, MigrationVersion: CurrentMigrationVersion, SourceCommit: lineage.SourceCommit, ReleaseManifestSHA256: lineage.ReleaseManifestSHA256, ArchiveSHA256: lineage.ArchiveSHA256, BundleManifestSHA256: lineage.BundleManifestSHA256}
 	releaseDirectory := filepath.Dir(manifestPath)
 	for path, mode := range map[string]os.FileMode{
@@ -164,12 +166,17 @@ func bootstrapRC2Store(t *testing.T) (*BootstrapStore, BootstrapJournalV1, Activ
 		t.Fatal(err)
 	}
 	release := ReleaseV1{ID: manifest.ReleaseID, Version: manifest.Version, SourceCommit: manifest.SourceCommit, Architecture: manifest.Architecture, ManifestSHA256: manifestDigest}
-	databaseName := "open_card_act_0123456789abcdef"
+	activationID := "bootstrap-activation-1"
+	databaseName, err := CandidateDatabaseName(activationID)
+	if err != nil {
+		upgradeCleanup()
+		t.Fatal(err)
+	}
 	databaseEnv := []byte("OPEN_CARD_DATABASE_URL=postgresql://user:secret@127.0.0.1:5432/" + databaseName + "?sslmode=disable\n")
 	envSum := sha256.Sum256(databaseEnv)
 	journal := bootstrapJournalAt(t, BootstrapActivationWritten)
 	journal.Release = release
-	journal.CandidateActivationID = "bootstrap-activation-1"
+	journal.CandidateActivationID = activationID
 	journal.CandidateDatabaseName = databaseName
 	activation := ActivationV1{
 		SchemaVersion: ActivationSchemaVersion, ActivationID: journal.CandidateActivationID, Origin: "native", Release: release,

@@ -209,16 +209,31 @@ func TestBootstrapEngineRunsCanonicalSequenceAndCommittedReplay(t *testing.T) {
 	if store.journal == nil || store.journal.State != BootstrapCommitted || store.marker || store.activeID != request.CandidateActivationID || !store.current || store.previous || db.creates < 2 || db.migrates < 2 {
 		t.Fatalf("state=%#v db=%#v", store, db)
 	}
-	want := []string{"guard", "enable-internal", "start-internal", "health-internal", "capture", "enable-internal", "start-internal", "health-internal", "capture", "enable-edge", "start-edge", "health-edge", "capture", "health-internal", "health-edge", "capture", "health-internal", "health-edge", "capture"}
+	want := []string{"guard", "enable-internal", "start-internal", "health-internal", "capture", "enable-internal", "start-internal", "health-internal", "capture", "enable-edge", "start-edge", "health-edge", "capture", "health-internal", "health-edge", "capture", "enable-internal", "start-internal", "health-internal", "enable-edge", "start-edge", "health-edge", "capture"}
 	if strings.Join(services.events, ",") != strings.Join(want, ",") {
 		t.Fatalf("events=%v", services.events)
 	}
-	beforeEnable := strings.Count(strings.Join(services.events, ","), "enable-internal")
+	beforeCreates, beforeMigrates := db.creates, db.migrates
+	beforeJournal, _ := MarshalBootstrapJournalV1(*store.journal)
 	if err := engine.Run(context.Background(), request); err != nil {
 		t.Fatalf("committed replay failed: %v", err)
 	}
-	if strings.Count(strings.Join(services.events, ","), "enable-internal") != beforeEnable {
-		t.Fatal("committed replay mutated services")
+	afterJournal, _ := MarshalBootstrapJournalV1(*store.journal)
+	if db.creates != beforeCreates || db.migrates != beforeMigrates || string(beforeJournal) != string(afterJournal) {
+		t.Fatal("committed replay mutated database or journal")
+	}
+}
+
+func TestBootstrapEngineCommittedReplayConvergesSameMarkerAndStoppedEdge(t *testing.T) {
+	engine, store, _, services, request := bootstrapEngineFixture(t)
+	if err := engine.Run(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	store.marker = true
+	services.state.Edge.Active = false
+	services.events = nil
+	if err := engine.Run(context.Background(), request); err != nil || store.marker || !services.state.Edge.Active || !containsEvent(services.events, "guard") || !containsEvent(services.events, "start-edge") {
+		t.Fatalf("err=%v marker=%v state=%+v events=%v", err, store.marker, services.state, services.events)
 	}
 }
 

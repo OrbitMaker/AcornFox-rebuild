@@ -279,17 +279,7 @@ func (e *BootstrapEngine) resume(ctx context.Context, request BootstrapRequest, 
 				return e.recovery(ctx, j, "commit_journal_failed")
 			}
 		case BootstrapCommitted:
-			if err := e.verifyPointers(ctx, *j, false); err != nil {
-				return e.committedFailure(ctx, j.TransactionID)
-			}
-			if err := e.Services.HealthInternal(ctx); err != nil {
-				return e.committedFailure(ctx, j.TransactionID)
-			}
-			if err := e.Services.HealthEdge(ctx); err != nil {
-				return e.committedFailure(ctx, j.TransactionID)
-			}
-			snapshot, err := e.Services.Capture(ctx)
-			if err != nil || !bootstrapFinalSnapshot(snapshot) || j.EdgeHealthSHA256 != bootstrapServiceEvidence(snapshot, "edge") {
+			if err := e.convergeCommitted(ctx, *j); err != nil {
 				return e.committedFailure(ctx, j.TransactionID)
 			}
 			return nil
@@ -327,6 +317,45 @@ func (e *BootstrapEngine) committedFailure(ctx context.Context, tx string) error
 	_ = e.Store.EnsureMarker(ctx, tx)
 	_ = e.Services.GuardEdge(ctx)
 	return ErrBootstrapRecoveryRequired
+}
+
+func (e *BootstrapEngine) convergeCommitted(ctx context.Context, j BootstrapJournalV1) error {
+	state, err := e.Store.ReadInitialPointerState(ctx, j.CandidateActivationID)
+	if err != nil || !state.ActivationExists || state.ActivationJSONSHA256 != j.ActivationJSONSHA256 || state.ActiveID != j.CandidateActivationID || !state.CurrentPresent || state.PreviousPresent || state.PointerStateSHA256 != j.PointerStateSHA256 {
+		return ErrBootstrapConflict
+	}
+	switch state.MarkerTransactionID {
+	case "":
+	case j.TransactionID:
+		if err := e.Services.GuardEdge(ctx); err != nil || e.Store.Marker(ctx, false) != nil {
+			return ErrBootstrapRecoveryRequired
+		}
+	default:
+		return ErrBootstrapConflict
+	}
+	if err := e.Services.EnableInternal(ctx); err != nil {
+		return err
+	}
+	if err := e.Services.StartInternal(ctx); err != nil {
+		return err
+	}
+	if err := e.Services.HealthInternal(ctx); err != nil {
+		return err
+	}
+	if err := e.Services.EnableEdge(ctx); err != nil {
+		return err
+	}
+	if err := e.Services.StartEdge(ctx); err != nil {
+		return err
+	}
+	if err := e.Services.HealthEdge(ctx); err != nil {
+		return err
+	}
+	snapshot, err := e.Services.Capture(ctx)
+	if err != nil || !bootstrapFinalSnapshot(snapshot) || j.InternalHealthSHA256 != bootstrapServiceEvidence(snapshot, "internal") || j.EdgeHealthSHA256 != bootstrapServiceEvidence(snapshot, "edge") {
+		return ErrBootstrapRecoveryRequired
+	}
+	return nil
 }
 
 func (e *BootstrapEngine) verifySlot(ctx context.Context, j BootstrapJournalV1) error {

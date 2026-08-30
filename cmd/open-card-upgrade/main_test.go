@@ -3,6 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
@@ -76,6 +79,14 @@ func TestParseUpgradeArgsIsExactAndForbidsDangerousInputs(t *testing.T) {
 	bootstrapConfig, err := parseUpgradeArgs(bootstrapCLIArgs())
 	if err != nil || bootstrapConfig.command != "bootstrap-native" || bootstrapConfig.manifestSHA256 != testManifest || bootstrapConfig.confirmation != testBootstrapConfirmation {
 		t.Fatalf("bootstrap parse=%+v err=%v", bootstrapConfig, err)
+	}
+	for _, command := range []string{"bootstrap-verify", "bootstrap-finalize"} {
+		args := bootstrapCLIArgs()
+		args[0] = command
+		config, err := parseUpgradeArgs(args)
+		if err != nil || config.command != command || config.manifestSHA256 != testManifest || config.confirmation != testBootstrapConfirmation {
+			t.Fatalf("%s parse=%+v err=%v", command, config, err)
+		}
 	}
 	for _, args := range [][]string{
 		{"bootstrap-native"},
@@ -200,6 +211,47 @@ func TestBootstrapNativeErrorMappingIsStableAndSecretFree(t *testing.T) {
 	}
 }
 
+func TestBootstrapVerifyAndFinalizeAreRootOnlyRuntimeFreeAndRedacted(t *testing.T) {
+	for _, command := range []string{"bootstrap-verify", "bootstrap-finalize"} {
+		t.Run(command, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			constructed, called := false, false
+			request := testBootstrapRequest()
+			deps := upgradeDependencies{
+				euid:            func() int { return 0 },
+				deriveBootstrap: func(upgradeCommandConfig) (install.BootstrapRequest, error) { return request, nil },
+				newRuntime: func(context.Context) (upgradeRuntime, error) {
+					constructed = true
+					return upgradeRuntime{}, nil
+				},
+				verifyCommittedBootstrap: func(_ context.Context, got install.BootstrapRequest) error {
+					called = true
+					if got != request {
+						t.Fatalf("request=%+v", got)
+					}
+					return nil
+				},
+				finalizeBootstrap: func(_ context.Context, got install.BootstrapRequest) (install.BootstrapFinalizationReceipt, error) {
+					called = true
+					return install.BootstrapFinalizationReceipt{TransactionID: got.TransactionID, ActivationID: got.CandidateActivationID, ActivationJSONSHA256: testManifest}, nil
+				},
+			}
+			args := bootstrapCLIArgs()
+			args[0] = command
+			if code := runWithDependencies(context.Background(), args, &stdout, &stderr, deps); code != exitOK || !called || constructed || stderr.Len() != 0 || strings.Contains(stdout.String(), "postgresql://") || !strings.Contains(stdout.String(), command) {
+				t.Fatalf("code=%d called=%v constructed=%v out=%q err=%q", code, called, constructed, stdout.String(), stderr.String())
+			}
+			stdout.Reset()
+			stderr.Reset()
+			called = false
+			deps.euid = func() int { return 99 }
+			if code := runWithDependencies(context.Background(), args, &stdout, &stderr, deps); code != exitPrivilege || called || !strings.Contains(stderr.String(), "root_required") {
+				t.Fatalf("non-root code=%d called=%v out=%q err=%q", code, called, stdout.String(), stderr.String())
+			}
+		})
+	}
+}
+
 type cliBootstrapStoreFake struct{}
 
 func (*cliBootstrapStoreFake) Acquire(context.Context, string) (install.UpgradeLock, error) {
@@ -252,6 +304,105 @@ func (*cliBootstrapDatabaseFake) Migrate(context.Context, install.BootstrapCandi
 	return install.BootstrapDatabaseResult{}, install.ErrPostgresOutcomeUnknown
 }
 
+type cliCommittedBootstrapLock struct{}
+
+func (cliCommittedBootstrapLock) Release() error { return nil }
+
+type cliCommittedBootstrapStore struct {
+	journal install.BootstrapJournalV1
+	pointer install.BootstrapInitialPointerState
+	marker  bool
+}
+
+func (s *cliCommittedBootstrapStore) Acquire(context.Context, string) (install.UpgradeLock, error) {
+	return cliCommittedBootstrapLock{}, nil
+}
+func (s *cliCommittedBootstrapStore) EnsureMarker(context.Context, string) error {
+	s.marker = true
+	return nil
+}
+func (s *cliCommittedBootstrapStore) Marker(_ context.Context, set bool) error {
+	s.marker = set
+	return nil
+}
+func (s *cliCommittedBootstrapStore) Load(context.Context, string) (install.BootstrapJournalV1, error) {
+	return s.journal, nil
+}
+func (*cliCommittedBootstrapStore) Create(context.Context, install.BootstrapJournalV1) error {
+	return errors.New("not used")
+}
+func (s *cliCommittedBootstrapStore) Save(_ context.Context, journal install.BootstrapJournalV1) error {
+	s.journal = journal
+	return nil
+}
+func (*cliCommittedBootstrapStore) WriteInitialActivation(context.Context, install.BootstrapJournalV1, install.ActivationV1, []byte) (string, error) {
+	return "", errors.New("not used")
+}
+func (*cliCommittedBootstrapStore) PublishInitialPointers(context.Context, install.BootstrapJournalV1, install.ActivationV1) (string, error) {
+	return "", errors.New("not used")
+}
+func (s *cliCommittedBootstrapStore) ReadInitialPointerState(context.Context, string) (install.BootstrapInitialPointerState, error) {
+	pointer := s.pointer
+	if s.marker {
+		pointer.MarkerTransactionID = s.journal.TransactionID
+	}
+	return pointer, nil
+}
+
+type cliCommittedBootstrapService struct{ guarded bool }
+
+func (s *cliCommittedBootstrapService) GuardEdge(context.Context) error    { s.guarded = true; return nil }
+func (*cliCommittedBootstrapService) EnableInternal(context.Context) error { return nil }
+func (*cliCommittedBootstrapService) StartInternal(context.Context) error  { return nil }
+func (*cliCommittedBootstrapService) HealthInternal(context.Context) error { return nil }
+func (*cliCommittedBootstrapService) EnableEdge(context.Context) error     { return nil }
+func (*cliCommittedBootstrapService) StartEdge(context.Context) error      { return nil }
+func (*cliCommittedBootstrapService) HealthEdge(context.Context) error     { return nil }
+func (*cliCommittedBootstrapService) Capture(context.Context) (install.ServiceSnapshotV1, error) {
+	active := install.UnitSnapshotV1{Active: true, Enabled: true}
+	return install.ServiceSnapshotV1{Edge: active, Agent: active, Server: active, Caddy: active, BuildKit: active}, nil
+}
+
+func committedCLIJournal(t *testing.T, request install.BootstrapRequest) (install.BootstrapJournalV1, install.BootstrapInitialPointerState) {
+	t.Helper()
+	states := []install.BootstrapState{install.BootstrapPrepared, install.BootstrapCandidateDBCreated, install.BootstrapMigrated0024, install.BootstrapActivationWritten, install.BootstrapPointersPublished, install.BootstrapInternalHealthy, install.BootstrapEdgeHealthy, install.BootstrapCommitted}
+	created := time.Unix(1, 0).UTC()
+	history := make([]install.BootstrapHistoryV1, 0, len(states))
+	for index, state := range states {
+		from := install.BootstrapState("")
+		if index > 0 {
+			from = states[index-1]
+		}
+		history = append(history, install.BootstrapHistoryV1{Revision: int64(index + 1), From: from, To: state, At: created.Add(time.Duration(index) * time.Second), EvidenceSHA256: strings.Repeat("e", 64)})
+	}
+	name, err := install.CandidateDatabaseName(request.CandidateActivationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	active := install.UnitSnapshotV1{Active: true, Enabled: true}
+	internalSnapshot := install.ServiceSnapshotV1{Agent: active, Server: active, Caddy: active, BuildKit: active}
+	finalSnapshot := internalSnapshot
+	finalSnapshot.Edge = active
+	journal := install.BootstrapJournalV1{SchemaVersion: 1, TransactionID: request.TransactionID, Revision: 8, State: install.BootstrapCommitted, CreatedAt: created, UpdatedAt: created.Add(7 * time.Second), InstallationIDSHA256: request.InstallationIDSHA256, Release: request.Release, CandidateActivationID: request.CandidateActivationID, CandidateDatabaseName: name, CandidateDatabaseSchemaSHA256: strings.Repeat("a", 64), ActivationJSONSHA256: strings.Repeat("b", 64), PointerStateSHA256: strings.Repeat("c", 64), InternalHealthSHA256: cliBootstrapServiceEvidence(internalSnapshot, "internal"), EdgeHealthSHA256: cliBootstrapServiceEvidence(finalSnapshot, "edge"), MarkerTransactionID: request.TransactionID, ServiceSnapshot: &internalSnapshot, History: history}
+	if err := journal.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	pointer := install.BootstrapInitialPointerState{ActivationExists: true, ActivationJSONSHA256: journal.ActivationJSONSHA256, PointerStateSHA256: journal.PointerStateSHA256, ActiveID: request.CandidateActivationID, CurrentPresent: true}
+	return journal, pointer
+}
+
+func cliBootstrapServiceEvidence(snapshot install.ServiceSnapshotV1, phase string) string {
+	if phase == "internal" {
+		snapshot.Edge = install.UnitSnapshotV1{}
+	}
+	raw, _ := json.Marshal(struct {
+		Phase string                    `json:"phase"`
+		Units install.ServiceSnapshotV1 `json:"units"`
+	}{phase, snapshot})
+	digest := sha256.Sum256(raw)
+	return hex.EncodeToString(digest[:])
+}
+
 func TestProductionBootstrapRuntimeUsesFixedConstructionAndCloseOrder(t *testing.T) {
 	events := []string{}
 	request := testBootstrapRequest()
@@ -290,6 +441,70 @@ func TestProductionBootstrapRuntimeUsesFixedConstructionAndCloseOrder(t *testing
 	}
 	if err := runtime.close(); err != nil || strings.Join(events, ",") != "executable,boot,store,service,database,database-close,service-close,store-close" {
 		t.Fatalf("close events=%v err=%v", events, err)
+	}
+}
+
+func TestProductionBootstrapRuntimeCommittedReplayNeedsNoBootstrapDatabaseEnv(t *testing.T) {
+	request := testBootstrapRequest()
+	journal, pointer := committedCLIJournal(t, request)
+	store := &cliCommittedBootstrapStore{journal: journal, pointer: pointer}
+	deps := productionBootstrapRuntimeDependencies{
+		verifyExecutable:    func() error { return nil },
+		verifyBootArtifacts: func(context.Context, bool) error { return nil },
+		openStore: func() (install.BootstrapEngineStore, func() error, error) {
+			return store, func() error { return nil }, nil
+		},
+		openService: func() (install.BootstrapServiceDriver, func() error, error) {
+			return &cliCommittedBootstrapService{}, func() error { return nil }, nil
+		},
+		openDatabase: func(install.BootstrapDatabaseInput) (install.BootstrapDatabaseDriver, func() error, error) {
+			return nil, nil, errors.New("bootstrap environment is already absent")
+		},
+		now: func() time.Time { return time.Unix(20, 0).UTC() },
+	}
+	runtime, err := newProductionBootstrapRuntimeWithDependencies(context.Background(), deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.close()
+	if err := runtime.bootstrap(context.Background(), request); err != nil {
+		t.Fatalf("committed replay required deleted bootstrap env: %v", err)
+	}
+}
+
+func TestProductionBootstrapRuntimeMissingEnvFailsClosedForNonterminalJournal(t *testing.T) {
+	request := testBootstrapRequest()
+	journal, _ := committedCLIJournal(t, request)
+	journal.Revision, journal.State, journal.UpdatedAt = 1, install.BootstrapPrepared, journal.CreatedAt
+	journal.History = append([]install.BootstrapHistoryV1(nil), journal.History[:1]...)
+	journal.CandidateDatabaseSchemaSHA256, journal.ActivationJSONSHA256, journal.PointerStateSHA256 = "", "", ""
+	journal.InternalHealthSHA256, journal.EdgeHealthSHA256, journal.ServiceSnapshot = "", "", nil
+	if err := journal.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	store := &cliCommittedBootstrapStore{journal: journal}
+	service := &cliCommittedBootstrapService{}
+	deps := productionBootstrapRuntimeDependencies{
+		verifyExecutable:    func() error { return nil },
+		verifyBootArtifacts: func(context.Context, bool) error { return nil },
+		openStore: func() (install.BootstrapEngineStore, func() error, error) {
+			return store, func() error { return nil }, nil
+		},
+		openService: func() (install.BootstrapServiceDriver, func() error, error) {
+			return service, func() error { return nil }, nil
+		},
+		openDatabase: func(install.BootstrapDatabaseInput) (install.BootstrapDatabaseDriver, func() error, error) {
+			return nil, nil, errors.New("bootstrap environment is absent")
+		},
+		now: func() time.Time { return time.Unix(20, 0).UTC() },
+	}
+	runtime, err := newProductionBootstrapRuntimeWithDependencies(context.Background(), deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.close()
+	if err := runtime.bootstrap(context.Background(), request); !errors.Is(err, install.ErrBootstrapRecoveryRequired) || store.journal.State != install.BootstrapRecoveryRequired || !store.marker || !service.guarded {
+		t.Fatalf("err=%v state=%s marker=%v guarded=%v", err, store.journal.State, store.marker, service.guarded)
 	}
 }
 

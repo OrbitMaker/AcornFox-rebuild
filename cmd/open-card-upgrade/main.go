@@ -89,6 +89,8 @@ type upgradeDependencies struct {
 	newBackupRuntime          func(context.Context) (upgradeRuntime, error)
 	deriveBootstrap           func(upgradeCommandConfig) (install.BootstrapRequest, error)
 	newBootstrapRuntime       func(context.Context) (upgradeRuntime, error)
+	verifyCommittedBootstrap  func(context.Context, install.BootstrapRequest) error
+	finalizeBootstrap         func(context.Context, install.BootstrapRequest) (install.BootstrapFinalizationReceipt, error)
 }
 
 type productionBootstrapRuntimeDependencies struct {
@@ -98,6 +100,15 @@ type productionBootstrapRuntimeDependencies struct {
 	openService         func() (install.BootstrapServiceDriver, func() error, error)
 	openDatabase        func(install.BootstrapDatabaseInput) (install.BootstrapDatabaseDriver, func() error, error)
 	now                 func() time.Time
+}
+
+type unavailableBootstrapDatabase struct{}
+
+func (unavailableBootstrapDatabase) Create(context.Context) (install.BootstrapCandidateDatabase, error) {
+	return install.BootstrapCandidateDatabase{}, install.ErrPostgresOutcomeUnknown
+}
+func (unavailableBootstrapDatabase) Migrate(context.Context, install.BootstrapCandidateDatabase) (install.BootstrapDatabaseResult, error) {
+	return install.BootstrapDatabaseResult{}, install.ErrPostgresOutcomeUnknown
 }
 
 // productionRuntimeDependencies is a private construction seam. It proves the
@@ -188,7 +199,9 @@ func productionUpgradeDependencies() upgradeDependencies {
 		deriveBootstrap: func(config upgradeCommandConfig) (install.BootstrapRequest, error) {
 			return install.DeriveProductionBootstrapRequest(config.manifestSHA256, config.confirmation)
 		},
-		newBootstrapRuntime: newProductionBootstrapRuntime,
+		newBootstrapRuntime:      newProductionBootstrapRuntime,
+		verifyCommittedBootstrap: install.VerifyProductionCommittedBootstrap,
+		finalizeBootstrap:        install.FinalizeProductionBootstrapEnvironment,
 	}
 }
 
@@ -296,9 +309,32 @@ func runWithDependenciesCore(ctx context.Context, args []string, stdout, stderr 
 		}
 		return writeUpgradeJSON(stdout, exitOK, map[string]any{"ok": true, "command": config.command, "receipt": receipt})
 	}
+	if config.command == "bootstrap-verify" || config.command == "bootstrap-finalize" {
+		if deps.deriveBootstrap == nil {
+			return writeUpgradeError(stderr, exitInternal, "internal_error")
+		}
+		request, deriveErr := deps.deriveBootstrap(config)
+		if deriveErr != nil {
+			return writeUpgradeError(stderr, exitIneligible, "bootstrap_identity_ineligible")
+		}
+		if config.command == "bootstrap-verify" {
+			if deps.verifyCommittedBootstrap == nil || deps.verifyCommittedBootstrap(ctx, request) != nil {
+				return writeUpgradeError(stderr, exitConflict, "bootstrap_not_committed")
+			}
+			return writeUpgradeJSON(stdout, exitOK, map[string]any{"ok": true, "command": config.command, "state": install.BootstrapCommitted})
+		}
+		if deps.finalizeBootstrap == nil {
+			return writeUpgradeError(stderr, exitInternal, "internal_error")
+		}
+		receipt, finalizeErr := deps.finalizeBootstrap(ctx, request)
+		if finalizeErr != nil || receipt.Validate() != nil {
+			return writeUpgradeError(stderr, exitConflict, "bootstrap_finalize_failed")
+		}
+		return writeUpgradeJSON(stdout, exitOK, map[string]any{"ok": true, "command": config.command, "receipt": receipt})
+	}
 	constructor := deps.newRuntime
 	switch config.command {
-	case "bootstrap-native":
+	case "bootstrap-native", "bootstrap-verify", "bootstrap-finalize":
 		constructor = deps.newBootstrapRuntime
 	case "status":
 		constructor = deps.newStatusRuntime
@@ -328,7 +364,7 @@ func runWithDependenciesCore(ctx context.Context, args []string, stdout, stderr 
 		return runUpgradeStatus(ctx, stdout, stderr, runtime, config)
 	}
 	switch config.command {
-	case "bootstrap-native":
+	case "bootstrap-native", "bootstrap-verify", "bootstrap-finalize":
 		request, err := deps.deriveBootstrap(config)
 		if err != nil {
 			return writeUpgradeError(stderr, exitIneligible, "bootstrap_identity_ineligible")
@@ -561,7 +597,7 @@ func parseUpgradeArgs(args []string) (upgradeCommandConfig, error) {
 			return upgradeCommandConfig{}, errors.New("invalid prepare-bootstrap command")
 		}
 		config.manifestSHA256 = args[2]
-	case "bootstrap-native":
+	case "bootstrap-native", "bootstrap-verify", "bootstrap-finalize":
 		for index := 1; index < len(args); index++ {
 			if index+1 >= len(args) {
 				return upgradeCommandConfig{}, errors.New("flag value required")
@@ -822,7 +858,10 @@ func newProductionBootstrapRuntimeWithDependencies(ctx context.Context, deps pro
 	runtime.bootstrap = func(callCtx context.Context, request install.BootstrapRequest) error {
 		database, closeDatabase, err := deps.openDatabase(install.BootstrapDatabaseInput{TransactionID: request.TransactionID, InstallationIDSHA256: request.InstallationIDSHA256, CandidateActivationID: request.CandidateActivationID, Release: request.Release})
 		if err != nil || database == nil || closeDatabase == nil {
-			return install.ErrBootstrapConflict
+			// COMMITTED replay needs no database credential and must remain
+			// possible after the fixed bootstrap environment is finalized. Any
+			// nonterminal journal reaches Create/Migrate and fails closed.
+			database, closeDatabase = unavailableBootstrapDatabase{}, func() error { return nil }
 		}
 		engine := &install.BootstrapEngine{Store: store, Database: database, Services: services, Now: deps.now}
 		runErr := engine.Run(callCtx, request)
