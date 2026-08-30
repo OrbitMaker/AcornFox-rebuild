@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import tarfile
 import unittest
@@ -17,12 +18,8 @@ EXPECTED_VERSIONS = {
     "buildx": "0.36.1",
     "caddy": "2.11.4",
 }
-EVIDENCE_NAMES = {
-    "buildkit": "buildkit.tar.gz",
-    "rootlesskit": "rootlesskit.tar.gz",
-    "buildx": "docker-buildx",
-    "caddy": "caddy.tar.gz",
-}
+EVIDENCE = ROOT / "release/runtime-inputs-evidence.json"
+EVIDENCE_FIELDS = {"tool", "architecture", "version", "url", "filename", "sha256", "sha256_source"}
 OFFICIAL_HOSTS = {
     "buildkit": "github.com",
     "rootlesskit": "github.com",
@@ -61,6 +58,10 @@ def load_inputs() -> dict:
     return json.loads(INPUTS.read_text(encoding="utf-8"))
 
 
+def load_evidence() -> dict:
+    return json.loads(EVIDENCE.read_text(encoding="utf-8"))
+
+
 def walk_field_names(value: object):
     if isinstance(value, dict):
         for key, child in value.items():
@@ -79,6 +80,35 @@ class G5RuntimeInputsTests(unittest.TestCase):
         self.assertEqual(set(document["runtime_inputs"]), set(EXPECTED_VERSIONS))
         fields = {field.lower() for field in walk_field_names(document)}
         self.assertTrue(fields.isdisjoint(FORBIDDEN_FIELD_NAMES))
+
+    def test_tracked_evidence_has_exact_schema_and_eight_records(self) -> None:
+        document = load_evidence()
+        self.assertEqual(set(document), {"schema_version", "source_evidence", "runtime_inputs_sha256", "records"})
+        self.assertEqual(document["schema_version"], 1)
+        self.assertEqual(set(document["source_evidence"]), {"tar_sha256", "member"})
+        self.assertEqual(document["source_evidence"]["member"], "supply-chain.json")
+        self.assertRegex(document["source_evidence"]["tar_sha256"], r"^[0-9a-f]{64}$")
+        self.assertRegex(document["runtime_inputs_sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(len(document["records"]), 8)
+        self.assertEqual({record["tool"] for record in document["records"]}, set(EXPECTED_VERSIONS))
+        self.assertEqual(
+            {(record["tool"], record["architecture"]) for record in document["records"]},
+            {(tool, architecture) for tool in EXPECTED_VERSIONS for architecture in ("amd64", "arm64")},
+        )
+        fields = {field.lower() for field in walk_field_names(document)}
+        self.assertTrue(fields.isdisjoint(FORBIDDEN_FIELD_NAMES))
+        for record in document["records"]:
+            self.assertEqual(set(record), EVIDENCE_FIELDS)
+            self.assertRegex(record["sha256"], r"^[0-9a-f]{64}$")
+            self.assertEqual(record["sha256_source"], "assets.sha256")
+            parsed = urlparse(record["url"])
+            self.assertEqual(parsed.scheme, "https")
+            self.assertEqual(parsed.netloc, "github.com")
+
+    def test_tracked_evidence_binds_the_runtime_inputs_manifest_digest(self) -> None:
+        expected = load_evidence()["runtime_inputs_sha256"]
+        actual = hashlib.sha256(INPUTS.read_bytes()).hexdigest()
+        self.assertEqual(actual, expected)
 
     def test_every_asset_is_official_https_with_exact_filename_and_sha256(self) -> None:
         document = load_inputs()["runtime_inputs"]
@@ -106,23 +136,30 @@ class G5RuntimeInputsTests(unittest.TestCase):
             self.assertNotEqual(amd64["url"], arm64["url"])
 
     def test_each_record_matches_the_m7_supply_evidence(self) -> None:
-        if not SUPPLY_EVIDENCE.is_file():
-            self.fail(f"required M7 supply evidence is missing: {SUPPLY_EVIDENCE}")
-        with tarfile.open(SUPPLY_EVIDENCE, "r:gz") as archive:
-            supply = json.loads(archive.extractfile("supply-chain.json").read())
-        evidence = {
-            (entry["architecture"], entry["name"]): entry
-            for entry in supply["fixed_assets"]
-            if entry["name"] in EVIDENCE_NAMES.values()
-        }
-        document = load_inputs()["runtime_inputs"]
-        for tool, evidence_name in EVIDENCE_NAMES.items():
-            for architecture, asset in document[tool]["architectures"].items():
-                source = evidence[(architecture, evidence_name)]
-                self.assertEqual(asset["url"], source["url"])
-                self.assertEqual(asset["filename"], LOCAL_FILENAMES[tool])
-                self.assertEqual(asset["sha256"], source["sha256"])
-                self.assertEqual(source["version"], EXPECTED_VERSIONS[tool])
+        tracked = load_evidence()
+        runtime = load_inputs()["runtime_inputs"]
+        tracked_records = {(record["tool"], record["architecture"]): record for record in tracked["records"]}
+        for tool, record in runtime.items():
+            for architecture, asset in record["architectures"].items():
+                source = tracked_records[(tool, architecture)]
+                self.assertEqual(
+                    {"tool": tool, "architecture": architecture, "version": record["version"],
+                     "url": asset["url"], "filename": asset["filename"], "sha256": asset["sha256"],
+                     "sha256_source": source["sha256_source"]},
+                    source,
+                )
+
+        if SUPPLY_EVIDENCE.is_file():
+            self.assertEqual(hashlib.sha256(SUPPLY_EVIDENCE.read_bytes()).hexdigest(), tracked["source_evidence"]["tar_sha256"])
+            with tarfile.open(SUPPLY_EVIDENCE, "r:gz") as archive:
+                supply = json.loads(archive.extractfile(tracked["source_evidence"]["member"]).read())
+            raw_records = {(entry["architecture"], entry["name"]): entry for entry in supply["fixed_assets"]}
+            for source in tracked["records"]:
+                raw = raw_records[(source["architecture"], source["filename"])]
+                self.assertEqual(source["version"], raw["version"])
+                self.assertEqual(source["url"], raw["url"])
+                self.assertEqual(source["sha256"], raw["sha256"])
+                self.assertEqual(source["sha256_source"], raw["sha256_source"])
 
 
 if __name__ == "__main__":
