@@ -183,10 +183,11 @@ PY
   watcher_pid=$!
   kill -CONT "$helper_pid"
   wait "$watcher_pid"
-  set +e
-  wait "$wrapper_pid"
-  status=$?
-  set -e
+  if wait "$wrapper_pid"; then
+    status=0
+  else
+    status=$?
+  fi
   [[ $status -ne 0 ]]
   journal_state=$(python3 - "$journal" <<'PY'
 import json,sys
