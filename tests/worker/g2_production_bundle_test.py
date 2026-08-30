@@ -93,10 +93,10 @@ class ProductionBundleTests(unittest.TestCase):
     def attestation_digest(self, attestation: Path) -> str:
         return hashlib.sha256(attestation.read_bytes()).hexdigest()
 
-    def stage(self, root: Path) -> Path:
+    def stage(self, root: Path, arch: str = "amd64") -> Path:
         stage = root / "stage"
         for name in (*load_tool().BINARIES, *load_tool().RUNTIME):
-            path = stage / "binaries/amd64" / name if name in load_tool().BINARIES else stage / "runtime/amd64" / name
+            path = stage / "binaries" / arch / name if name in load_tool().BINARIES else stage / "runtime" / arch / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(name.encode())
             path.chmod(0o755)
@@ -158,6 +158,97 @@ class ProductionBundleTests(unittest.TestCase):
             tool.assemble(self.stage(root), repo, output, "amd64", None, None, dist, version="0.8.0-rc.1", migration_version="0024", source_commit=commit, structure_only=True)
             self.assertFalse((output / "release/manifest.json").exists())
             self.assertFalse(list(output.glob("*.tar.gz")))
+
+    def test_arm64_rc0_structure_path_and_rc1_lineage_refusal(self) -> None:
+        tool = load_tool()
+        help_result = subprocess.run(
+            [sys.executable, str(TOOL), "--help"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(help_result.returncode, 0)
+        self.assertIn("--arch {amd64,arm64}", help_result.stdout)
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            repo, commit = minimal_repo(root, "0023")
+            dist = root / "dist"
+            dist.mkdir()
+            (dist / "index.html").write_text("x", encoding="utf-8")
+            output = root / "arm64-rc0"
+            metadata = tool.assemble(
+                self.stage(root, "arm64"),
+                repo,
+                output,
+                "arm64",
+                None,
+                None,
+                dist,
+                version="0.8.0-rc.0",
+                migration_version="0023",
+                source_commit=commit,
+                structure_only=True,
+            )
+            self.assertEqual(metadata["candidate_status"], "bootstrap_baseline")
+            self.assertTrue((output / "STRUCTURE-ONLY-NOT-INSTALLABLE").is_file())
+            blocked = root / "arm64-rc1"
+            with self.assertRaisesRegex(
+                tool.ProductionBundleError,
+                "same-architecture RC0 lineage is frozen",
+            ):
+                tool.assemble(
+                    root / "missing-stage",
+                    root / "missing-repo",
+                    blocked,
+                    "arm64",
+                    None,
+                    None,
+                    root / "missing-dist",
+                    version="0.8.0-rc.1",
+                    migration_version="0024",
+                    source_commit="a" * 40,
+                    structure_only=True,
+                )
+            self.assertFalse(blocked.exists())
+
+    def test_mixed_arch_n_minus_one_release_is_rejected(self) -> None:
+        tool = load_tool()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            release = root / "release"
+            release.mkdir()
+            manifest = release / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "version": "0.8.0-rc.0",
+                        "migration_version": "0023",
+                        "architecture": "arm64",
+                        "source_commit": tool.RC0_SOURCE_COMMIT,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            manifest_digest = hashlib.sha256(manifest.read_bytes()).hexdigest()
+            with mock.patch.multiple(
+                tool,
+                N_MINUS_ONE_RELEASE_MANIFEST_SHA256=manifest_digest,
+                N_MINUS_ONE_ARCHIVE_SHA256="a" * 64,
+                N_MINUS_ONE_BUNDLE_MANIFEST_SHA256="b" * 64,
+            ):
+                with self.assertRaisesRegex(
+                    tool.ProductionBundleError,
+                    "version/migration/architecture",
+                ):
+                    tool.verify_n_minus_one(
+                        release,
+                        manifest_digest,
+                        "a" * 64,
+                        "b" * 64,
+                        "amd64",
+                        "0.8.0-rc.0",
+                        "0023",
+                    )
 
     def test_boot_safe_units_are_canonical_and_included_in_release_contract(self) -> None:
         tool = load_tool()
@@ -287,6 +378,17 @@ ConditionPathExists=!/var/lib/open-card/upgrade-in-progress
             metadata = tool.assemble(self.stage(root / "rc1"), rc1_repo, output, "amd64", rc0_output / "release", checksum, rc1_dist, version="0.8.0-rc.1", migration_version="0024", source_commit=rc1_commit, live_attestation=rc1_attestation, live_attestation_sha256=self.attestation_digest(rc1_attestation), n_minus_one_archive_sha256=archive_digest, n_minus_one_bundle_manifest_sha256=bundle_digest)
             self.assertEqual(metadata["n_minus_one"]["status"], "verified_local_candidate")
             manifest = json.loads((output / "release/manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(
+                manifest["n_minus_one"],
+                {
+                    "version": "0.8.0-rc.0",
+                    "migration_version": "0023",
+                    "source_commit": rc0_commit,
+                    "release_manifest_sha256": checksum,
+                    "archive_sha256": archive_digest,
+                    "bundle_manifest_sha256": bundle_digest,
+                },
+            )
             paths = {item["path"] for item in manifest["files"]}
             self.assertTrue({
                 "bin/open-card-upgrade",

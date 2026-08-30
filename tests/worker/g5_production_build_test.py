@@ -37,6 +37,41 @@ class ProductionBuildTests(unittest.TestCase):
         tool = load_tool()
         self.assertEqual(tool.GO_TARGETS["open-card-upgrade"], "./cmd/open-card-upgrade")
 
+    def test_arch_cli_dataflow_and_rc1_arm64_fail_closed_before_output(self) -> None:
+        tool = load_tool()
+        help_result = subprocess.run(
+            [sys.executable, str(TOOL), "--help"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(help_result.returncode, 0)
+        self.assertIn("--arch {amd64,arm64}", help_result.stdout)
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            _, go_env, _ = tool.isolated_build_environments(root, "arm64")
+            self.assertEqual(go_env["GOARCH"], "arm64")
+            output = root / "arm64-rc1"
+            with self.assertRaisesRegex(
+                tool.ProductionBuildError,
+                "same-architecture RC0 lineage is frozen",
+            ):
+                tool.build_candidate(
+                    source_worktree=root,
+                    source_commit="a" * 40,
+                    runtime_inputs=root / "inputs.json",
+                    runtime_inputs_sha256="0" * 64,
+                    runtime_dir=root,
+                    output=output,
+                    bundle_tool=root / "bundle.py",
+                    bundle_tool_sha256="0" * 64,
+                    driver_sha256="0" * 64,
+                    version=tool.RC1_SPEC.version,
+                    n_minus_one_candidate_root=root / "missing-n-minus-one",
+                    arch="arm64",
+                )
+            self.assertFalse(output.exists())
+
     def n_minus_one_candidate(self, tool, root: Path) -> tuple[Path, dict[str, object]]:
         candidate = root / "n-minus-one"
         release = candidate / "release"
@@ -126,6 +161,7 @@ class ProductionBuildTests(unittest.TestCase):
             self.assertEqual(evidence.candidate_root, candidate.resolve())
             self.assertEqual(evidence.release_path, (candidate / "release").resolve())
             self.assertEqual((evidence.version, evidence.migration, evidence.source_commit), ("0.8.0-rc.0", "0023", tool.RC0_SOURCE_COMMIT))
+            self.assertEqual(evidence.architecture, "amd64")
             self.assertEqual(evidence.archive_sha256, pins["N_MINUS_ONE_ARCHIVE_SHA256"])
 
     def test_n_minus_one_candidate_rejects_every_frozen_boundary(self) -> None:

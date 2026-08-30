@@ -93,6 +93,29 @@ class ProductionBundleError(RuntimeError):
     pass
 
 
+def frozen_rc0_lineage(arch: str) -> dict[str, str] | None:
+    """Return the frozen RC0 predecessor lineage for a release architecture."""
+    if arch == "amd64":
+        return {
+            "source_commit": RC0_SOURCE_COMMIT,
+            "release_manifest_sha256": N_MINUS_ONE_RELEASE_MANIFEST_SHA256,
+            "archive_sha256": N_MINUS_ONE_ARCHIVE_SHA256,
+            "bundle_manifest_sha256": N_MINUS_ONE_BUNDLE_MANIFEST_SHA256,
+        }
+    if arch == "arm64":
+        return None
+    raise ProductionBundleError(f"unsupported release architecture: {arch}")
+
+
+def require_frozen_rc0_lineage(arch: str) -> dict[str, str]:
+    lineage = frozen_rc0_lineage(arch)
+    if lineage is None:
+        raise ProductionBundleError(
+            "RC1 arm64 is unavailable until same-architecture RC0 lineage is frozen"
+        )
+    return lineage
+
+
 @contextmanager
 def private_temporary_directory(*, prefix: str, directory: Path):
     path = Path(tempfile.mkdtemp(prefix=prefix, dir=directory))
@@ -470,14 +493,15 @@ def verify_n_minus_one(
     expected_version: str,
     expected_migration: str,
 ) -> dict[str, object]:
+    lineage = require_frozen_rc0_lineage(arch)
     directory(release)
     manifest_path = release / "manifest.json"
     regular(manifest_path)
     manifest_bytes = manifest_path.read_bytes()
     if (
-        expected_manifest_sha256 != N_MINUS_ONE_RELEASE_MANIFEST_SHA256
-        or expected_archive_sha256 != N_MINUS_ONE_ARCHIVE_SHA256
-        or expected_bundle_manifest_sha256 != N_MINUS_ONE_BUNDLE_MANIFEST_SHA256
+        expected_manifest_sha256 != lineage["release_manifest_sha256"]
+        or expected_archive_sha256 != lineage["archive_sha256"]
+        or expected_bundle_manifest_sha256 != lineage["bundle_manifest_sha256"]
         or expected_manifest_sha256 != hashlib.sha256(manifest_bytes).hexdigest()
     ):
         raise ProductionBundleError("N-1 manifest checksum does not match the supplied expectation")
@@ -493,7 +517,7 @@ def verify_n_minus_one(
     ):
         raise ProductionBundleError("N-1 release manifest does not match the expected version/migration/architecture")
     source_commit = manifest.get("source_commit")
-    if source_commit != RC0_SOURCE_COMMIT:
+    if source_commit != lineage["source_commit"]:
         raise ProductionBundleError("N-1 release manifest has an invalid source commit")
     files = manifest.get("files")
     if not isinstance(files, list) or not files:
@@ -609,16 +633,17 @@ def assemble(
         raise ProductionBundleError("version, migration version, or source commit is invalid")
     if arch not in ARCHES:
         raise ProductionBundleError(f"unsupported release architecture: {arch}")
+    spec = release_spec(version, migration_version)
+    needs_n_minus_one = spec["expected_n_minus_one_version"] is not None
+    lineage = require_frozen_rc0_lineage(arch) if needs_n_minus_one else None
     directory(stage)
     directory(repo)
     directory(output.parent)
     if output.exists():
         raise ProductionBundleError("refusing to overwrite production bundle output")
 
-    spec = release_spec(version, migration_version)
     systemd_payload = systemd_files(version)
     tracked = verify_repo(repo, source_commit, migration_version)
-    needs_n_minus_one = spec["expected_n_minus_one_version"] is not None
     if not needs_n_minus_one and (
         n_minus_one_release is not None or n_minus_one_manifest_sha256 is not None or n_minus_one_archive_sha256 is not None or n_minus_one_bundle_manifest_sha256 is not None
     ):
@@ -628,9 +653,9 @@ def assemble(
     if not structure_only and needs_n_minus_one:
         if (
             n_minus_one_release is None
-            or n_minus_one_manifest_sha256 != N_MINUS_ONE_RELEASE_MANIFEST_SHA256
-            or n_minus_one_archive_sha256 != N_MINUS_ONE_ARCHIVE_SHA256
-            or n_minus_one_bundle_manifest_sha256 != N_MINUS_ONE_BUNDLE_MANIFEST_SHA256
+            or n_minus_one_manifest_sha256 != lineage["release_manifest_sha256"]
+            or n_minus_one_archive_sha256 != lineage["archive_sha256"]
+            or n_minus_one_bundle_manifest_sha256 != lineage["bundle_manifest_sha256"]
         ):
             raise ProductionBundleError("N-1 lineage digests must match the frozen local candidate")
     if not structure_only and (
@@ -824,10 +849,10 @@ def assemble(
                             "n_minus_one": {
                                 "version": "0.8.0-rc.0",
                                 "migration_version": "0023",
-                                "source_commit": RC0_SOURCE_COMMIT,
-                                "release_manifest_sha256": N_MINUS_ONE_RELEASE_MANIFEST_SHA256,
-                                "archive_sha256": N_MINUS_ONE_ARCHIVE_SHA256,
-                                "bundle_manifest_sha256": N_MINUS_ONE_BUNDLE_MANIFEST_SHA256,
+                                "source_commit": lineage["source_commit"],
+                                "release_manifest_sha256": lineage["release_manifest_sha256"],
+                                "archive_sha256": lineage["archive_sha256"],
+                                "bundle_manifest_sha256": lineage["bundle_manifest_sha256"],
                             }
                         }
                         if needs_n_minus_one
@@ -854,7 +879,7 @@ def assemble(
                     "n_minus_one": {
                         "version": spec["expected_n_minus_one_version"],
                         "migration_version": spec["expected_n_minus_one_migration"],
-                        "source_commit": RC0_SOURCE_COMMIT if needs_n_minus_one else None,
+                        "source_commit": lineage["source_commit"] if lineage else None,
                         "status": (
                             "not_required_bootstrap"
                             if not needs_n_minus_one
@@ -901,7 +926,7 @@ def main() -> int:
     parser.add_argument("--n-minus-one-archive-sha256")
     parser.add_argument("--n-minus-one-bundle-manifest-sha256")
     parser.add_argument("--web-dist", required=True, type=Path)
-    parser.add_argument("--arch", default="amd64")
+    parser.add_argument("--arch", default="amd64", choices=ARCHES)
     parser.add_argument("--version", required=True)
     parser.add_argument("--migration-version", required=True)
     parser.add_argument("--source-commit", required=True)

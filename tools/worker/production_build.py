@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the locally verified 0.8.0-rc.0 amd64 candidate from fixed inputs.
+"""Build the locally verified 0.8.0-rc.0 candidate from fixed inputs.
 
 This driver deliberately has no download path. A caller supplies a clean,
 detached source worktree and a local runtime-input directory; every runtime
@@ -33,6 +33,7 @@ from typing import NamedTuple
 VERSION = "0.8.0-rc.0"
 MIGRATION_VERSION = "0023"
 ARCHITECTURE = "amd64"
+ARCHES = ("amd64", "arm64")
 RC0_SOURCE_COMMIT = "35a2b198ac52949af3477475d89d4813b46a9490"
 N_MINUS_ONE_RELEASE_MANIFEST_SHA256 = "3b3953c0a26f8706151583ad6c9cad6b5502da18b28f11ed66ca92fe604aa253"
 N_MINUS_ONE_ARCHIVE_SHA256 = "abc034ed24e8e8dc74b8eabc84dd3071a66f166abe65135502911e9153c0b9fc"
@@ -44,6 +45,7 @@ N_MINUS_ONE_DECLARED_FILE_COUNT = 62
 class NMinusOneEvidence:
     candidate_root: Path
     release_path: Path
+    architecture: str
     version: str
     migration: str
     source_commit: str
@@ -153,6 +155,35 @@ TEST_PATH_PARTS = frozenset({"test", "tests", "testdata", "fixtures", "__tests__
 
 class ProductionBuildError(RuntimeError):
     pass
+
+
+def frozen_rc0_lineage(arch: str) -> dict[str, object] | None:
+    """Return the immutable RC0 predecessor contract for one architecture.
+
+    Keep the amd64 values as compatibility constants because the frozen
+    candidate tests deliberately replace them with synthetic pins.  Phase A
+    has no arm64 RC0 candidate to pin, so RC1 must remain fail-closed there.
+    """
+    if arch == "amd64":
+        return {
+            "source_commit": RC0_SOURCE_COMMIT,
+            "release_manifest_sha256": N_MINUS_ONE_RELEASE_MANIFEST_SHA256,
+            "archive_sha256": N_MINUS_ONE_ARCHIVE_SHA256,
+            "bundle_manifest_sha256": N_MINUS_ONE_BUNDLE_MANIFEST_SHA256,
+            "declared_file_count": N_MINUS_ONE_DECLARED_FILE_COUNT,
+        }
+    if arch == "arm64":
+        return None
+    raise ProductionBuildError(f"unsupported release architecture: {arch}")
+
+
+def require_frozen_rc0_lineage(arch: str) -> dict[str, object]:
+    lineage = frozen_rc0_lineage(arch)
+    if lineage is None:
+        raise ProductionBuildError(
+            "RC1 arm64 is unavailable until same-architecture RC0 lineage is frozen"
+        )
+    return lineage
 
 
 class RuntimeInput:
@@ -401,8 +432,10 @@ def snapshot_runtime_inputs(
     return snapshots
 
 
-def stage_runtime_inputs(selected: dict[str, RuntimeInput], stage: Path) -> None:
-    runtime = stage / "runtime" / ARCHITECTURE
+def stage_runtime_inputs(
+    selected: dict[str, RuntimeInput], stage: Path, arch: str
+) -> None:
+    runtime = stage / "runtime" / arch
     for tool, layout in RUNTIME_LAYOUT.items():
         if layout["archive"]:
             extract_runtime_archive(selected[tool].path, runtime, layout["members"])
@@ -428,7 +461,9 @@ def run_command(
     return result.stdout
 
 
-def isolated_build_environments(root: Path) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
+def isolated_build_environments(
+    root: Path, arch: str
+) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
     home = root / "home"
     go_cache = root / "go-cache"
     go_mod_cache = root / "go-mod-cache"
@@ -450,7 +485,7 @@ def isolated_build_environments(root: Path) -> tuple[dict[str, str], dict[str, s
     go_env = {
         **base,
         "CGO_ENABLED": "0",
-        "GOARCH": ARCHITECTURE,
+        "GOARCH": arch,
         "GOCACHE": str(go_cache),
         "GOENV": "off",
         "GOFLAGS": "",
@@ -531,7 +566,10 @@ def load_strict_json(path: Path, label: str) -> dict[str, object]:
     return value
 
 
-def verify_n_minus_one_candidate_root(root: Path) -> NMinusOneEvidence:
+def verify_n_minus_one_candidate_root(
+    root: Path, *, arch: str = ARCHITECTURE
+) -> NMinusOneEvidence:
+    lineage = require_frozen_rc0_lineage(arch)
     directory(root, "N-1 candidate root")
     archive_name = "open-card-0.8.0-rc.0-production.tar.gz"
     expected_root = {"release", "bundle-manifest.sha256", "production-bundle.json", "build-record.json", archive_name}
@@ -551,29 +589,40 @@ def verify_n_minus_one_candidate_root(root: Path) -> NMinusOneEvidence:
     manifest = root / "release" / "manifest.json"
     exact_regular(manifest, "N-1 release manifest", 0o644)
     manifest_digest = sha256(manifest)
-    if manifest_digest != N_MINUS_ONE_RELEASE_MANIFEST_SHA256:
+    if manifest_digest != lineage["release_manifest_sha256"]:
         raise ProductionBuildError("N-1 release manifest digest is not pinned")
     archive_digest = sha256(archive)
-    if archive_digest != N_MINUS_ONE_ARCHIVE_SHA256:
+    if archive_digest != lineage["archive_sha256"]:
         raise ProductionBuildError("N-1 archive digest is not pinned")
     bundle_digest = sha256(bundle_manifest)
-    if bundle_digest != N_MINUS_ONE_BUNDLE_MANIFEST_SHA256:
+    if bundle_digest != lineage["bundle_manifest_sha256"]:
         raise ProductionBuildError("N-1 bundle manifest digest is not pinned")
     expected_lines = (
-        f"{N_MINUS_ONE_ARCHIVE_SHA256}  {archive_name}",
-        f"{N_MINUS_ONE_RELEASE_MANIFEST_SHA256}  release/manifest.json",
+        f"{lineage['archive_sha256']}  {archive_name}",
+        f"{lineage['release_manifest_sha256']}  release/manifest.json",
     )
     if bundle_manifest.read_text(encoding="utf-8") != "\n".join(expected_lines) + "\n":
         raise ProductionBuildError("N-1 bundle manifest must contain exactly the pinned archive and release manifest")
     release_document = load_strict_json(manifest, "N-1 release manifest")
     build_record = load_strict_json(build_record_path, "N-1 build record")
     metadata = load_strict_json(production_bundle, "N-1 bundle metadata")
-    if (release_document.get("version"), release_document.get("migration_version"), release_document.get("architecture"), release_document.get("source_commit")) != (RC0_SPEC.version, RC0_SPEC.migration, ARCHITECTURE, RC0_SOURCE_COMMIT):
+    if (
+        release_document.get("version"),
+        release_document.get("migration_version"),
+        release_document.get("architecture"),
+        release_document.get("source_commit"),
+    ) != (RC0_SPEC.version, RC0_SPEC.migration, arch, lineage["source_commit"]):
         raise ProductionBuildError("N-1 release manifest metadata is invalid")
     files = release_document.get("files")
-    if not isinstance(files, list) or len(files) != N_MINUS_ONE_DECLARED_FILE_COUNT:
+    if not isinstance(files, list) or len(files) != lineage["declared_file_count"]:
         raise ProductionBuildError("N-1 release manifest must declare exactly the frozen file set")
-    if validate_release(release, version=RC0_SPEC.version, migration_version=RC0_SPEC.migration, arch=ARCHITECTURE, source_commit=RC0_SOURCE_COMMIT) != manifest_digest:
+    if validate_release(
+        release,
+        version=RC0_SPEC.version,
+        migration_version=RC0_SPEC.migration,
+        arch=arch,
+        source_commit=str(lineage["source_commit"]),
+    ) != manifest_digest:
         raise ProductionBuildError("N-1 release validation did not preserve its pinned manifest")
     bundle = build_record.get("bundle")
     candidate = build_record.get("candidate")
@@ -581,7 +630,12 @@ def verify_n_minus_one_candidate_root(root: Path) -> NMinusOneEvidence:
         build_record.get("production_accepted") is not False
         or not isinstance(candidate, dict)
         or not isinstance(bundle, dict)
-        or (candidate.get("version"), candidate.get("migration_version"), candidate.get("architecture"), candidate.get("source_commit")) != (RC0_SPEC.version, RC0_SPEC.migration, ARCHITECTURE, RC0_SOURCE_COMMIT)
+        or (
+            candidate.get("version"),
+            candidate.get("migration_version"),
+            candidate.get("architecture"),
+            candidate.get("source_commit"),
+        ) != (RC0_SPEC.version, RC0_SPEC.migration, arch, lineage["source_commit"])
         or (bundle.get("archive"), bundle.get("archive_sha256"), bundle.get("manifest_sha256"), bundle.get("bundle_manifest_sha256")) != (archive_name, archive_digest, manifest_digest, bundle_digest)
     ):
         raise ProductionBuildError("N-1 build record is not bootstrap-only")
@@ -589,7 +643,11 @@ def verify_n_minus_one_candidate_root(root: Path) -> NMinusOneEvidence:
     if (
         metadata.get("candidate_status") != "bootstrap_baseline"
         or metadata.get("production_accepted") is not False
-        or (metadata.get("source_commit"), metadata.get("version"), metadata.get("migration_version")) != (RC0_SOURCE_COMMIT, RC0_SPEC.version, RC0_SPEC.migration)
+        or (
+            metadata.get("source_commit"),
+            metadata.get("version"),
+            metadata.get("migration_version"),
+        ) != (lineage["source_commit"], RC0_SPEC.version, RC0_SPEC.migration)
         or not isinstance(n_minus_one, dict)
         or n_minus_one != {"manifest_sha256": None, "release_embedded": False, "release_id": None, "status": "not_required_bootstrap", "version": None}
     ):
@@ -597,9 +655,10 @@ def verify_n_minus_one_candidate_root(root: Path) -> NMinusOneEvidence:
     return NMinusOneEvidence(
         candidate_root=root.resolve(),
         release_path=release.resolve(),
+        architecture=arch,
         version=RC0_SPEC.version,
         migration=RC0_SPEC.migration,
-        source_commit=RC0_SOURCE_COMMIT,
+        source_commit=str(lineage["source_commit"]),
         release_manifest_sha256=manifest_digest,
         archive_sha256=archive_digest,
         bundle_manifest_sha256=bundle_digest,
@@ -764,15 +823,16 @@ def validate_release(
         or manifest.get("source_commit") != source_commit
     ):
         raise ProductionBuildError("release manifest does not match the candidate contract")
-    expected_lineage = {
-        "version": RC0_SPEC.version,
-        "migration_version": RC0_SPEC.migration,
-        "source_commit": RC0_SOURCE_COMMIT,
-        "release_manifest_sha256": N_MINUS_ONE_RELEASE_MANIFEST_SHA256,
-        "archive_sha256": N_MINUS_ONE_ARCHIVE_SHA256,
-        "bundle_manifest_sha256": N_MINUS_ONE_BUNDLE_MANIFEST_SHA256,
-    }
     if version == RC1_SPEC.version:
+        lineage = require_frozen_rc0_lineage(arch)
+        expected_lineage = {
+            "version": RC0_SPEC.version,
+            "migration_version": RC0_SPEC.migration,
+            "source_commit": lineage["source_commit"],
+            "release_manifest_sha256": lineage["release_manifest_sha256"],
+            "archive_sha256": lineage["archive_sha256"],
+            "bundle_manifest_sha256": lineage["bundle_manifest_sha256"],
+        }
         if manifest.get("n_minus_one") != expected_lineage:
             raise ProductionBuildError("RC1 release manifest has invalid frozen N-1 lineage")
     elif "n_minus_one" in manifest:
@@ -981,14 +1041,19 @@ def build_candidate(
     driver_sha256: str,
     version: str = RC0_SPEC.version,
     n_minus_one_candidate_root: Path | None = None,
+    arch: str = ARCHITECTURE,
 ) -> dict[str, object]:
     spec = release_spec(version)
+    if arch not in ARCHES:
+        raise ProductionBuildError(f"unsupported release architecture: {arch}")
+    if not spec.bootstrap:
+        require_frozen_rc0_lineage(arch)
     if not spec.bootstrap and n_minus_one_candidate_root is None:
         raise ProductionBuildError("RC1 build requires verified local N-1 evidence")
     if spec.bootstrap and n_minus_one_candidate_root is not None:
         raise ProductionBuildError("RC0 bootstrap must not accept N-1 evidence")
     n_minus_one_evidence = (
-        verify_n_minus_one_candidate_root(n_minus_one_candidate_root)
+        verify_n_minus_one_candidate_root(n_minus_one_candidate_root, arch=arch)
         if n_minus_one_candidate_root is not None
         else None
     )
@@ -1024,7 +1089,7 @@ def build_candidate(
     commands: list[list[str]] = []
     with tempfile.TemporaryDirectory(prefix=f".{output.name}.build-", dir=output.parent) as raw:
         build_root = Path(raw)
-        base_env, go_env, npm_env = isolated_build_environments(build_root)
+        base_env, go_env, npm_env = isolated_build_environments(build_root, arch)
         runtime_manifest_snapshot = build_root / "runtime-inputs.json"
         runtime_manifest_digest = snapshot_pinned_file(
             runtime_inputs,
@@ -1052,7 +1117,7 @@ def build_candidate(
         selected_inputs = load_runtime_inputs(
             runtime_manifest_snapshot,
             runtime_dir,
-            ARCHITECTURE,
+            arch,
         )
         source_snapshot = build_root / "source"
         source_snapshot.mkdir(mode=0o700)
@@ -1062,15 +1127,15 @@ def build_candidate(
             build_root / "runtime-inputs",
         )
         stage = build_root / "stage"
-        (stage / "binaries" / ARCHITECTURE).mkdir(parents=True)
+        (stage / "binaries" / arch).mkdir(parents=True)
         for binary, package in GO_TARGETS.items():
             run_command(
-                ["go", "build", "-trimpath", "-buildvcs=false", "-ldflags=-buildid=", "-o", str(stage / "binaries" / ARCHITECTURE / binary), package],
+                ["go", "build", "-trimpath", "-buildvcs=false", "-ldflags=-buildid=", "-o", str(stage / "binaries" / arch / binary), package],
                 cwd=source_snapshot,
                 env=go_env,
                 records=commands,
             )
-        stage_runtime_inputs(runtime_snapshot, stage)
+        stage_runtime_inputs(runtime_snapshot, stage, arch)
         go_environment = json.loads(
             run_command(
                 ["go", "env", "-json", "GOVERSION", "GOOS", "GOARCH", "CGO_ENABLED", "GOWORK"],
@@ -1120,7 +1185,7 @@ def build_candidate(
                 "--web-dist",
                 str(web_dist),
                 "--arch",
-                ARCHITECTURE,
+                arch,
                 "--version",
                 spec.version,
                 "--migration-version",
@@ -1154,7 +1219,7 @@ def build_candidate(
             candidate / "release",
             version=spec.version,
             migration_version=spec.migration,
-            arch=ARCHITECTURE,
+            arch=arch,
             source_commit=source_commit,
         )
         archive = candidate / f"open-card-{spec.version}-production.tar.gz"
@@ -1175,7 +1240,7 @@ def build_candidate(
             "candidate": {
                 "version": spec.version,
                 "migration_version": spec.migration,
-                "architecture": ARCHITECTURE,
+                "architecture": arch,
                 "source_commit": source_commit,
             },
             "build_tool": {
@@ -1234,7 +1299,7 @@ def build_candidate(
             output,
             version=spec.version,
             migration_version=spec.migration,
-            arch=ARCHITECTURE,
+            arch=arch,
             source_commit=source_commit,
             manifest_digest=manifest_digest,
             archive_name=archive.name,
@@ -1250,6 +1315,7 @@ def main() -> int:
     parser.add_argument("--source-worktree", required=True, type=Path)
     parser.add_argument("--source-commit", required=True)
     parser.add_argument("--version", default=RC0_SPEC.version, choices=(RC0_SPEC.version, RC1_SPEC.version))
+    parser.add_argument("--arch", default=ARCHITECTURE, choices=ARCHES)
     parser.add_argument("--n-minus-one-candidate-root", type=Path)
     parser.add_argument("--runtime-inputs", required=True, type=Path)
     parser.add_argument("--runtime-inputs-sha256", required=True)
@@ -1276,6 +1342,7 @@ def main() -> int:
             driver_sha256=args.driver_sha256,
             version=args.version,
             n_minus_one_candidate_root=args.n_minus_one_candidate_root.resolve() if args.n_minus_one_candidate_root else None,
+            arch=args.arch,
         )
     except ProductionBuildError as error:
         print(f"production build: {error}", file=sys.stderr)
