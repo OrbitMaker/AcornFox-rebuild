@@ -589,7 +589,7 @@ func TestServiceControlUnknownRollbackAndMarkerAreFailClosed(t *testing.T) {
 func TestHealthProbeOnlyUsesLoopbackApprovedEndpoints(t *testing.T) {
 	runner := newFakeServiceRunner()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/healthz" {
+		if r.URL.Path == "/healthz" || r.URL.Path == "/config/" {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
@@ -598,6 +598,9 @@ func TestHealthProbeOnlyUsesLoopbackApprovedEndpoints(t *testing.T) {
 	defer server.Close()
 	controller := taskController(t, runner, func() (bool, error) { return false, nil })
 	if _, err := controller.ProbeHealth(context.Background(), server.URL+"/healthz"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.ProbeHealth(context.Background(), server.URL+"/config/"); err != nil {
 		t.Fatal(err)
 	}
 	for _, raw := range []string{"http://example.com:8080/healthz", "http://127.0.0.1:8080/nope", "http://127.0.0.1:8080/healthz?secret=value"} {

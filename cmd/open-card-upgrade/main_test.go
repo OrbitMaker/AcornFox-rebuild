@@ -881,3 +881,4 @@ func (*cliServiceFake) HealthRestoredInternal(context.Context) error { return er
 func (*cliServiceFake) RestoreEdge(context.Context, install.ServiceSnapshotV1) error {
 	return errors.New("not used")
 }
+func (*cliServiceFake) HealthRestoredEdge(context.Context) error { return errors.New("not used") }

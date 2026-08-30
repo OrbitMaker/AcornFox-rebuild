@@ -197,6 +197,7 @@ type UpgradeServiceDriver interface {
 	RestoreSnapshot(context.Context, ServiceSnapshotV1) error
 	HealthRestoredInternal(context.Context) error
 	RestoreEdge(context.Context, ServiceSnapshotV1) error
+	HealthRestoredEdge(context.Context) error
 }
 
 func legacyActivation(plan LegacyProjectionPlan, database DatabaseV1, createdAt time.Time) (ActivationV1, string, error) {
@@ -654,6 +655,7 @@ func failureDigest(err error) string {
 var upgradeFailureCodes = map[string]struct{}{
 	"legacy_projection_failed": {}, "marker_create_failed": {}, "service_quiesce_failed": {}, "database_drain_failed": {}, "quiesce_journal_failed": {}, "snapshot_failed": {}, "snapshot_journal_failed": {}, "candidate_database_failed": {}, "candidate_journal_failed": {}, "migration_failed": {}, "migration_journal_failed": {}, "invalid_candidate_activation": {}, "write_candidate_activation_failed": {}, "edge_config_validation_failed": {}, "validation_failed": {}, "validation_journal_failed": {}, "set_previous_failed": {}, "swap_active_failed": {}, "active_journal_failed": {}, "start_internal_failed": {}, "internal_health_failed": {}, "healthy_journal_failed": {}, "edge_journal_failed": {}, "marker_remove_failed": {}, "start_edge_failed": {}, "edge_health_failed": {}, "commit_journal_failed": {},
 	"restore_backup_inspect_failed": {}, "restore_source_mismatch": {}, "restore_active_read_failed": {}, "restore_active_inspect_failed": {}, "restore_snapshot_failed": {}, "restore_schema_failed": {},
+	"boot_recovered": {},
 }
 
 func failureFor(phase JournalState, code string, err error) *FailureV1 {
@@ -766,7 +768,7 @@ func (e *UpgradeEngine) abortPreSwitch(ctx context.Context, j *UpgradeJournalV1,
 		if err := e.Services.RestoreEdge(ctx, j.ServiceSnapshot); err != nil {
 			return e.recoveryRequired(ctx, j, phase, code, err)
 		}
-		if err := e.Services.HealthEdge(ctx); err != nil {
+		if err := e.healthRestoredEdge(ctx, j); err != nil {
 			return e.recoveryRequired(ctx, j, phase, code, err)
 		}
 	}
@@ -812,7 +814,7 @@ func (e *UpgradeEngine) rollback(ctx context.Context, j *UpgradeJournalV1, old A
 		if err := e.Services.RestoreEdge(ctx, j.ServiceSnapshot); err != nil {
 			return e.recoveryRequired(ctx, j, phase, code, err)
 		}
-		if err := e.Services.HealthEdge(ctx); err != nil {
+		if err := e.healthRestoredEdge(ctx, j); err != nil {
 			return e.recoveryRequired(ctx, j, phase, code, err)
 		}
 	}
@@ -1359,6 +1361,13 @@ func (e *UpgradeEngine) restoreOldServices(ctx context.Context, j *UpgradeJourna
 	}
 	if err := e.Services.RestoreEdge(ctx, j.ServiceSnapshot); err != nil {
 		return err
+	}
+	return e.healthRestoredEdge(ctx, j)
+}
+
+func (e *UpgradeEngine) healthRestoredEdge(ctx context.Context, j *UpgradeJournalV1) error {
+	if j != nil && j.PlannedOldActivation != nil && j.PlannedOldActivation.LegacyProjection != nil {
+		return e.Services.HealthRestoredEdge(ctx)
 	}
 	return e.Services.HealthEdge(ctx)
 }

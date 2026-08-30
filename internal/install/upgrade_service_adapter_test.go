@@ -22,9 +22,10 @@ func adapterForTest(t *testing.T, runner *fakeServiceRunner, marker func() (bool
 
 func adapterProbeConfig(serverURL string) UpgradeServiceProbeConfig {
 	return UpgradeServiceProbeConfig{
-		ServerHealth: serverURL + "/healthz",
-		ServerReady:  serverURL + "/readyz",
-		EdgeHealth:   serverURL + "/healthz",
+		ServerHealth:      serverURL + "/healthz",
+		ServerReady:       serverURL + "/readyz",
+		EdgeHealth:        serverURL + "/healthz",
+		RestoredEdgeReady: serverURL + "/config/",
 	}
 }
 
@@ -96,7 +97,7 @@ func TestUpgradeServiceAdapterHealthTargetsAndSafeFailures(t *testing.T) {
 	edgePaths := []string{}
 	edge := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		edgePaths = append(edgePaths, r.URL.Path)
-		if r.URL.Path == "/healthz" {
+		if r.URL.Path == "/healthz" || r.URL.Path == "/config/" {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
@@ -106,6 +107,7 @@ func TestUpgradeServiceAdapterHealthTargetsAndSafeFailures(t *testing.T) {
 	runner := newFakeServiceRunner()
 	probes := adapterProbeConfig(server.URL)
 	probes.EdgeHealth = edge.URL + "/healthz"
+	probes.RestoredEdgeReady = edge.URL + "/config/"
 	adapter := adapterForTest(t, runner, func() (bool, error) { return false, nil }, probes)
 	if err := adapter.HealthInternal(context.Background()); err != nil {
 		t.Fatal(err)
@@ -113,14 +115,20 @@ func TestUpgradeServiceAdapterHealthTargetsAndSafeFailures(t *testing.T) {
 	if err := adapter.HealthEdge(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	if err := adapter.HealthRestoredEdge(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	if want := []string{"/healthz", "/readyz"}; !reflect.DeepEqual(serverPaths, want) {
 		t.Fatalf("server health targets = %v, want %v", serverPaths, want)
 	}
-	if want := []string{"/healthz"}; !reflect.DeepEqual(edgePaths, want) {
+	if want := []string{"/healthz", "/config/"}; !reflect.DeepEqual(edgePaths, want) {
 		t.Fatalf("edge health targets = %v, want %v", edgePaths, want)
 	}
 	if productionEdgeHealthURL != "http://127.0.0.1:18482/healthz" || strings.Contains(productionEdgeHealthURL, ":443") {
 		t.Fatalf("production edge health target = %q", productionEdgeHealthURL)
+	}
+	if productionRestoredEdgeReadyURL != "http://127.0.0.1:2020/config/" {
+		t.Fatalf("production restored edge readiness target = %q", productionRestoredEdgeReadyURL)
 	}
 
 	unsafe, err := TaskUpgradeServiceAdapter(taskController(t, runner, func() (bool, error) { return false, nil }), UpgradeServiceProbeConfig{ServerHealth: "http://127.0.0.1:8080/healthz?secret=raw-url", ServerReady: server.URL + "/readyz"})

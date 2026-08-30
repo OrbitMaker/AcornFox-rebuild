@@ -6,11 +6,12 @@ import (
 )
 
 const (
-	productionServerHealthURL = "http://127.0.0.1:8080/healthz"
-	productionServerReadyURL  = "http://127.0.0.1:8080/readyz"
-	productionEdgeHealthURL   = "http://127.0.0.1:18482/healthz"
-	productionHealthTimeout   = 30 * time.Second
-	productionHealthInterval  = 250 * time.Millisecond
+	productionServerHealthURL      = "http://127.0.0.1:8080/healthz"
+	productionServerReadyURL       = "http://127.0.0.1:8080/readyz"
+	productionEdgeHealthURL        = "http://127.0.0.1:18482/healthz"
+	productionRestoredEdgeReadyURL = "http://127.0.0.1:2020/config/"
+	productionHealthTimeout        = 30 * time.Second
+	productionHealthInterval       = 250 * time.Millisecond
 )
 
 var restoreInternalStartOrder = []ServiceUnit{ServiceBuildKit, ServiceCaddy, ServiceServer, ServiceAgent}
@@ -18,9 +19,10 @@ var restoreInternalStartOrder = []ServiceUnit{ServiceBuildKit, ServiceCaddy, Ser
 // UpgradeServiceProbeConfig contains the only health targets an upgrade
 // adapter may use. ServiceController enforces their loopback endpoint policy.
 type UpgradeServiceProbeConfig struct {
-	ServerHealth string
-	ServerReady  string
-	EdgeHealth   string
+	ServerHealth      string
+	ServerReady       string
+	EdgeHealth        string
+	RestoredEdgeReady string
 }
 
 // UpgradeServiceAdapter maps the fixed service-controller boundary into the
@@ -45,9 +47,10 @@ func ProductionUpgradeServiceAdapter() (*UpgradeServiceAdapter, error) {
 		return nil, err
 	}
 	adapter, err := TaskUpgradeServiceAdapterWithEdgeConfigValidator(controller, UpgradeServiceProbeConfig{
-		ServerHealth: productionServerHealthURL,
-		ServerReady:  productionServerReadyURL,
-		EdgeHealth:   productionEdgeHealthURL,
+		ServerHealth:      productionServerHealthURL,
+		ServerReady:       productionServerReadyURL,
+		EdgeHealth:        productionEdgeHealthURL,
+		RestoredEdgeReady: productionRestoredEdgeReadyURL,
 	}, validator)
 	if err != nil {
 		_ = controller.Close()
@@ -145,6 +148,19 @@ func (a *UpgradeServiceAdapter) HealthEdge(ctx context.Context) error {
 	retryCtx, cancel := a.healthRetryContext(ctx)
 	defer cancel()
 	return a.probeHealth(retryCtx, a.probes.EdgeHealth)
+}
+
+// HealthRestoredEdge checks the Caddy admin readiness endpoint that exists in
+// the pinned RC0 baseline as well as current releases. Rollback must not probe
+// the candidate-only 18482 listener while the old Edge configuration is
+// authoritative again.
+func (a *UpgradeServiceAdapter) HealthRestoredEdge(ctx context.Context) error {
+	if a == nil || a.controller == nil {
+		return ErrServiceOutcomeUnknown
+	}
+	retryCtx, cancel := a.healthRetryContext(ctx)
+	defer cancel()
+	return a.probeHealth(retryCtx, a.probes.RestoredEdgeReady)
 }
 
 func (a *UpgradeServiceAdapter) healthRetryContext(ctx context.Context) (context.Context, context.CancelFunc) {

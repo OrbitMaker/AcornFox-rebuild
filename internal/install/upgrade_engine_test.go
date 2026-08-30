@@ -459,6 +459,9 @@ func (s *engineServiceFake) HealthRestoredInternal(context.Context) error {
 func (s *engineServiceFake) RestoreEdge(context.Context, ServiceSnapshotV1) error {
 	return s.event("restore:edge")
 }
+func (s *engineServiceFake) HealthRestoredEdge(context.Context) error {
+	return s.event("restore:edge-health")
+}
 
 func engineActiveDatabaseEnv() []byte {
 	return []byte("OPEN_CARD_DATABASE_URL=postgresql://user:pass@localhost:5432/open_card?sslmode=disable\n")

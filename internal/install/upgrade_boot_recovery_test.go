@@ -206,10 +206,41 @@ func TestFinalizeBootTerminalPoliciesAndPublicOrdering(t *testing.T) {
 				if eventIndex(*events, "internal:start") < 0 || eventIndex(*events, "internal:health") < 0 || eventIndex(*events, "marker:off") > eventIndex(*events, "edge:start") {
 					t.Fatalf("committed finalization order=%v", *events)
 				}
-			} else if eventIndex(*events, "restore:snapshot") < 0 || eventIndex(*events, "restore:internal-health") < 0 || eventIndex(*events, "marker:off") < 0 {
-				t.Fatalf("old finalization missing restore=%v", *events)
+			} else if eventIndex(*events, "restore:snapshot") < 0 || eventIndex(*events, "restore:internal-health") < 0 || eventIndex(*events, "marker:off") < 0 || eventIndex(*events, "edge:health") < 0 || eventIndex(*events, "restore:edge-health") >= 0 {
+				t.Fatalf("native old finalization missing current Edge health=%v", *events)
 			}
 		})
+	}
+}
+
+func TestFinalizeBootLegacyRollbackUsesRC0CompatibleEdgeReadiness(t *testing.T) {
+	e, store, _, services, events := engineFixture(true)
+	services.fail, services.remaining = "internal:start", 1
+	request := engineRequest()
+	request.ExpectedLegacy = true
+	if got := enginePhase(t, e.RunNew(context.Background(), request)); got.Phase != JournalRolledBack {
+		t.Fatalf("run phase=%#v", got)
+	}
+	store.state.Marker, store.markerTx = true, request.TransactionID
+	*events = nil
+	result, err := e.FinalizeBoot(context.Background(), request.TransactionID)
+	if err != nil || result.State != JournalRolledBack || result.MarkerRetained || store.state.Marker {
+		t.Fatalf("result=%+v err=%v state=%+v events=%v", result, err, store.state, *events)
+	}
+	if eventIndex(*events, "restore:edge-health") < 0 || eventIndex(*events, "edge:health") >= 0 {
+		t.Fatalf("legacy rollback used candidate Edge health contract: %v", *events)
+	}
+}
+
+func TestReconcileBootPersistsTypedBootRecoveredFailure(t *testing.T) {
+	e, store, _, _ := bootFixture(t, JournalValidated, true)
+	result, err := e.ReconcilePendingBoot(context.Background(), nil)
+	if err != nil || result.State != JournalRolledBack {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	journal := store.saved[len(store.saved)-1]
+	if journal.Failure == nil || journal.Failure.Code != "boot_recovered" || journal.Failure.Phase != JournalActiveSwitched {
+		t.Fatalf("failure=%+v", journal.Failure)
 	}
 }
 

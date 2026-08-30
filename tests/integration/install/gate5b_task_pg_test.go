@@ -919,6 +919,7 @@ func (s *gate5BServices) RestoreEdge(context.Context, install.ServiceSnapshotV1)
 	s.restored = true
 	return nil
 }
+func (*gate5BServices) HealthRestoredEdge(context.Context) error { return nil }
 
 func assertNoGate5BSecretLeak(t *testing.T, outcome error, store *gate5BStore, session *gate5BSession) {
 	t.Helper()

@@ -704,7 +704,7 @@ type HealthResult struct{ Code string }
 
 func (c *ServiceController) ProbeHealth(ctx context.Context, rawURL string) (HealthResult, error) {
 	parsed, err := url.Parse(rawURL)
-	if err != nil || parsed.Scheme != "http" || parsed.User != nil || parsed.RawQuery != "" || (parsed.Path != "/healthz" && parsed.Path != "/readyz") {
+	if err != nil || parsed.Scheme != "http" || parsed.User != nil || parsed.RawQuery != "" || (parsed.Path != "/healthz" && parsed.Path != "/readyz" && parsed.Path != "/config/") {
 		return HealthResult{Code: "invalid_target"}, errors.New("health target is not approved")
 	}
 	host := parsed.Hostname()
