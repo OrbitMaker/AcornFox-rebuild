@@ -502,6 +502,7 @@ func TestG5BSystemRootUpgradeUsesOnlyVerifiedEngineDelegation(t *testing.T) {
 		"is-enabled --quiet open-card-upgrade-safe.target",
 		"is-active --quiet open-card-upgrade-safe.target",
 		"upgrade-safe target RequiredBy link is missing",
+		"upgrade-safe target RequiredBy link owner is unsafe",
 		"upgrade-safe target RequiredBy link is unsafe",
 		"verified_production_program /usr/bin/python3",
 		"/proc/sys/kernel/random/uuid",

@@ -163,7 +163,9 @@ if [[ "$root" = "/" ]]; then
   for unit in open-card-buildkit.service open-card-caddy.service open-card-server.service open-card-agent.service open-card-edge.service; do
     required_link="/etc/systemd/system/$unit.requires/open-card-upgrade-safe.target"
     [[ -L "$required_link" ]] || die "upgrade-safe target RequiredBy link is missing for $unit"
-    [[ "$(/usr/bin/readlink -- "$required_link")" = "../open-card-upgrade-safe.target" ]] || die "upgrade-safe target RequiredBy link is unsafe for $unit"
+    [[ "$(/usr/bin/stat -c '%u' -- "$required_link")" = 0 ]] || die "upgrade-safe target RequiredBy link owner is unsafe for $unit"
+    required_target=$(/usr/bin/readlink -- "$required_link") || die "upgrade-safe target RequiredBy link is unreadable for $unit"
+    [[ "$required_target" = "../open-card-upgrade-safe.target" || "$required_target" = "/etc/systemd/system/open-card-upgrade-safe.target" ]] || die "upgrade-safe target RequiredBy link is unsafe for $unit"
     requirements=$(/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C LC_ALL=C /usr/bin/systemctl show "$unit" --property=Requires --value --no-pager) || die "upgrade-safe dependency is unreadable for $unit"
     [[ " $requirements " = *" open-card-upgrade-safe.target "* ]] || die "upgrade-safe target is not required by $unit"
   done
