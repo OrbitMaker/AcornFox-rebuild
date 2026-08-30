@@ -17,7 +17,7 @@ func TestProductionUpgradeRecoveryUnitsAreExactAndDigested(t *testing.T) {
 		dig  func() string
 		want string
 	}{
-		{"recover", []byte(productionUpgradeRecoveryUnitText), ProductionUpgradeRecoveryUnitBytes, ProductionUpgradeRecoveryUnitSHA256, "42d4c3c68ac471f82d3935afb8b7043f29e005d2e8642dcbc5fdfe56fa4df806"},
+		{"recover", []byte(productionUpgradeRecoveryUnitText), ProductionUpgradeRecoveryUnitBytes, ProductionUpgradeRecoveryUnitSHA256, "086ab7b25d6f779bb4df2dd0d6f5e0b4376fd157b6ccc35fcff6eeead775bb5c"},
 		{"safe", []byte(productionUpgradeSafeBootTargetText), ProductionUpgradeSafeBootTargetBytes, ProductionUpgradeSafeBootTargetSHA256, "0de4a37d59566971cf11606f9e584ca2d9325bf6d8ca217325d382f796960cfd"},
 		{"finalizer", []byte(productionUpgradeFinalizeUnitText), ProductionUpgradeFinalizeUnitBytes, ProductionUpgradeFinalizeUnitSHA256, "0fbbda51c9c1b1c2c2600ee09b0cf4e05e99db26e500a6e2c6fe34ec31c5aa63"},
 		{"edge-dropin", []byte(productionUpgradeEdgeMarkerDropInText), ProductionUpgradeEdgeMarkerDropInBytes, ProductionUpgradeEdgeMarkerDropInSHA256, "af0cf74314389ca5c9c2a3ca541679f65670ea95eebb12a0ce75eba71a72fbd8"},

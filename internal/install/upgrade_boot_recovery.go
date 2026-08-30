@@ -22,6 +22,7 @@ type BootRecoveryResultV1 struct {
 	State            JournalState `json:"state"`
 	MarkerRetained   bool         `json:"marker_retained"`
 	FinalizeRequired bool         `json:"finalize_required"`
+	Skipped          bool         `json:"skipped,omitempty"`
 }
 
 func bootResult(j UpgradeJournalV1) BootRecoveryResultV1 {
@@ -30,6 +31,10 @@ func bootResult(j UpgradeJournalV1) BootRecoveryResultV1 {
 
 func finalizedBootResult(j UpgradeJournalV1) BootRecoveryResultV1 {
 	return BootRecoveryResultV1{SchemaVersion: ActivationSchemaVersion, TransactionID: j.TransactionID, State: j.State, MarkerRetained: false, FinalizeRequired: false}
+}
+
+func skippedBootResult() BootRecoveryResultV1 {
+	return BootRecoveryResultV1{SchemaVersion: ActivationSchemaVersion, Skipped: true}
 }
 
 func bootMarkerSame(actual UpgradeActualState, tx string) bool {
@@ -169,13 +174,18 @@ func (e *UpgradeEngine) bootReconcileLegacy(ctx context.Context, j *UpgradeJourn
 	return e.bootAbortOld(ctx, j, actual)
 }
 
-// ReconcileBoot repairs only durable activation/journal state while the boot
-// marker remains in place. It intentionally has no ServiceDriver calls.
-func (e *UpgradeEngine) ReconcileBoot(ctx context.Context, transactionID string, reloader UpgradeBootUnitReloader) (result BootRecoveryResultV1, returnErr error) {
-	if e == nil || e.Store == nil || e.Now == nil || !validID(transactionID) {
+// ReconcilePendingBoot acquires the global flock before reading the marker.
+// An absent marker is a typed no-op while the lock is held; a present marker
+// binds the lock to that exact transaction before journal reconciliation.
+func (e *UpgradeEngine) ReconcilePendingBoot(ctx context.Context, reloader UpgradeBootUnitReloader) (result BootRecoveryResultV1, returnErr error) {
+	if e == nil || e.Store == nil || e.Now == nil {
 		return BootRecoveryResultV1{}, upgradeError(JournalRecoveryRequired, "invalid_request")
 	}
-	lock, err := acquireUpgradeLock(ctx, e.Store, transactionID, JournalRecoveryRequired)
+	pendingStore, ok := e.Store.(UpgradePendingBootStore)
+	if !ok {
+		return BootRecoveryResultV1{}, upgradeError(JournalRecoveryRequired, "integrity_failed")
+	}
+	lock, pending, err := pendingStore.AcquirePendingBoot(ctx)
 	if err != nil {
 		return BootRecoveryResultV1{}, err
 	}
@@ -185,6 +195,19 @@ func (e *UpgradeEngine) ReconcileBoot(ctx context.Context, transactionID string,
 			returnErr = upgradeError(JournalRecoveryRequired, "lock_release_failed")
 		}
 	}()
+	if pending.Marker == UpgradeMarkerAbsent {
+		return skippedBootResult(), nil
+	}
+	if pending.Marker != UpgradeMarkerSame || !validID(pending.TransactionID) {
+		return BootRecoveryResultV1{}, upgradeError(JournalRecoveryRequired, "integrity_failed")
+	}
+	return e.reconcileBootLocked(ctx, pending.TransactionID, reloader)
+}
+
+// reconcileBootLocked repairs only durable activation/journal state while
+// AcquirePendingBoot holds the flock bound to transactionID. It intentionally
+// has no ServiceDriver calls.
+func (e *UpgradeEngine) reconcileBootLocked(ctx context.Context, transactionID string, reloader UpgradeBootUnitReloader) (BootRecoveryResultV1, error) {
 	j, err := e.Store.LoadJournal(ctx, transactionID)
 	if err != nil || j.TransactionID != transactionID || j.Validate() != nil {
 		return BootRecoveryResultV1{}, upgradeError(JournalRecoveryRequired, "integrity_failed")

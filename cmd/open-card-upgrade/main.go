@@ -60,7 +60,7 @@ type upgradeRuntime struct {
 	preflight func(context.Context, install.UpgradeRequest) (install.UpgradeEligibilityV1, error)
 	run       func(context.Context, install.UpgradeRequest) error
 	recover   func(context.Context, string) error
-	prepare   func(context.Context, string) (install.BootRecoveryResultV1, error)
+	prepare   func(context.Context) (install.BootRecoveryResultV1, error)
 	finalize  func(context.Context, string) (install.BootRecoveryResultV1, error)
 	status    func(context.Context, string) (install.UpgradeStatusV1, error)
 	pending   func(context.Context) (install.PendingTransaction, error)
@@ -130,7 +130,7 @@ func newProductionFinalizeRuntime(ctx context.Context) (upgradeRuntime, error) {
 
 func newProductionBootRuntime(ctx context.Context, finalize bool) (upgradeRuntime, error) {
 	deps := productionRuntimeDeps()
-	if deps.verifyExecutable == nil || deps.openStore == nil || deps.openService == nil || deps.databaseFactory == nil || deps.now == nil || verifyProductionBootArtifacts(ctx) != nil || deps.verifyExecutable() != nil {
+	if deps.verifyExecutable == nil || deps.openStore == nil || deps.openService == nil || deps.databaseFactory == nil || deps.now == nil || verifyProductionBootArtifacts(ctx, finalize) != nil || deps.verifyExecutable() != nil {
 		return upgradeRuntime{}, errors.New("invalid production boot runtime")
 	}
 	store, err := deps.openStore()
@@ -154,8 +154,8 @@ func newProductionBootRuntime(ctx context.Context, finalize bool) (upgradeRuntim
 		engine.Services = services
 		runtime.finalize = engine.FinalizeBoot
 	} else {
-		runtime.prepare = func(callCtx context.Context, tx string) (install.BootRecoveryResultV1, error) {
-			return engine.ReconcileBoot(callCtx, tx, services)
+		runtime.prepare = func(callCtx context.Context) (install.BootRecoveryResultV1, error) {
+			return engine.ReconcilePendingBoot(callCtx, services)
 		}
 	}
 	return runtime, nil
@@ -275,7 +275,16 @@ func runWithDependenciesCore(ctx context.Context, args []string, stdout, stderr 
 			return writeUpgradeError(stderr, exitRecovery, "recovery_required")
 		}
 		return writeUpgradeJSON(stdout, exitOK, map[string]any{"ok": true, "command": "recover", "status": status})
-	case "recover-prepare", "recover-finalize":
+	case "recover-prepare":
+		if runtime.prepare == nil {
+			return writeUpgradeError(stderr, exitInternal, "runtime_unavailable")
+		}
+		result, err := runtime.prepare(ctx)
+		if err != nil {
+			return writeUpgradeEngineError(stderr, err)
+		}
+		return writeUpgradeJSON(stdout, exitOK, map[string]any{"ok": true, "command": config.command, "recovery": result})
+	case "recover-finalize":
 		if runtime.pending == nil {
 			return writeUpgradeError(stderr, exitInternal, "runtime_unavailable")
 		}
@@ -283,18 +292,10 @@ func runWithDependenciesCore(ctx context.Context, args []string, stdout, stderr 
 		if pendingErr != nil || pending.Marker != install.UpgradeMarkerSame || pending.TransactionID == "" {
 			return writeUpgradeError(stderr, exitConflict, "status_unreadable")
 		}
-		var result install.BootRecoveryResultV1
-		if config.command == "recover-prepare" {
-			if runtime.prepare == nil {
-				return writeUpgradeError(stderr, exitInternal, "runtime_unavailable")
-			}
-			result, err = runtime.prepare(ctx, pending.TransactionID)
-		} else {
-			if runtime.finalize == nil {
-				return writeUpgradeError(stderr, exitInternal, "runtime_unavailable")
-			}
-			result, err = runtime.finalize(ctx, pending.TransactionID)
+		if runtime.finalize == nil {
+			return writeUpgradeError(stderr, exitInternal, "runtime_unavailable")
 		}
+		result, err := runtime.finalize(ctx, pending.TransactionID)
 		if err != nil {
 			return writeUpgradeEngineError(stderr, err)
 		}
@@ -629,7 +630,11 @@ func verifyProductionRecoveryUnit(path string) error {
 // verifyProductionBootArtifacts binds the privileged boot commands to all
 // four exact fragments. It checks files before querying systemd so an unsafe
 // fragment or drop-in can never influence an argv passed to systemctl.
-func verifyProductionBootArtifacts(ctx context.Context) error {
+// verifyProductionBootArtifacts validates the exact installed graph and its
+// safe-target runtime state. Normal mutable commands and boot finalization
+// require an active barrier; boot prepare may run while systemd is still
+// activating the target, but it still requires the target to be enabled.
+func verifyProductionBootArtifacts(ctx context.Context, requireActive bool) error {
 	for _, file := range productionBootUnitFiles {
 		root, name := filepath.Dir(file.path), filepath.Base(file.path)
 		if err := verifyRootOwnedDirectoryChain("/etc", "/etc/systemd", "/etc/systemd/system", root); err != nil {
@@ -660,11 +665,32 @@ func verifyProductionBootArtifacts(ctx context.Context) error {
 	if err != nil || !containsRequiredBootUnits(target["Requires"], "open-card-upgrade-recover.service") || !containsRequiredBootUnits(target["Wants"], "open-card-upgrade-finalize.service") || !containsRequiredBootUnits(target["Before"], "open-card-buildkit.service", "open-card-caddy.service", "open-card-server.service", "open-card-agent.service", "open-card-edge.service", "open-card-upgrade-finalize.service") {
 		return errors.New("invalid boot target relationships")
 	}
+	if err := verifyProductionSafeBootTargetState(ctx, requireActive); err != nil {
+		return err
+	}
 	for _, unit := range []string{"open-card-buildkit.service", "open-card-caddy.service", "open-card-server.service", "open-card-agent.service", "open-card-edge.service"} {
 		values, err := productionSystemctlProperties(ctx, unit, "Requires")
 		if err != nil || !containsRequiredBootUnits(values["Requires"], "open-card-upgrade-safe.target") {
 			return errors.New("invalid boot business relationship")
 		}
+	}
+	return nil
+}
+
+func validSafeBootTargetState(unitFileState, activeState string, requireActive bool) bool {
+	if unitFileState != "enabled" {
+		return false
+	}
+	if requireActive {
+		return activeState == "active"
+	}
+	return activeState == "active" || activeState == "activating" || activeState == "inactive"
+}
+
+func verifyProductionSafeBootTargetState(ctx context.Context, requireActive bool) error {
+	values, err := productionSystemctlProperties(ctx, "open-card-upgrade-safe.target", "UnitFileState", "ActiveState")
+	if err != nil || !validSafeBootTargetState(values["UnitFileState"], values["ActiveState"], requireActive) {
+		return errors.New("invalid safe boot target state")
 	}
 	return nil
 }
@@ -755,7 +781,7 @@ func containsRequiredBootUnits(value string, expected ...string) bool {
 }
 
 func verifyProductionRecoveryServiceState(ctx context.Context) error {
-	return verifyProductionBootArtifacts(ctx)
+	return verifyProductionBootArtifacts(ctx, true)
 }
 
 type systemctlCommandFactory func(context.Context, string, ...string) *exec.Cmd
@@ -774,6 +800,30 @@ func verifyRecoveryServiceStateWithDependencies(ctx context.Context, verifySyste
 		return errors.New("invalid recovery unit state")
 	}
 	return parseRecoveryServiceState(raw)
+}
+
+// verifySafeBootTargetStateWithDependencies is the narrow injected seam for
+// the mutable-runtime fence. Its caller has already pinned /usr/bin/systemctl
+// and the canonical unit fragments; this helper proves that ordinary mutable
+// commands cannot run in the gap before the safe target becomes active.
+func verifySafeBootTargetStateWithDependencies(ctx context.Context, commandFactory systemctlCommandFactory, requireActive bool) error {
+	if commandFactory == nil {
+		return errors.New("invalid safe boot target state")
+	}
+	command := commandFactory(ctx, "/usr/bin/systemctl", "show", "open-card-upgrade-safe.target", "--property=UnitFileState", "--property=ActiveState", "--no-pager")
+	if command == nil {
+		return errors.New("invalid safe boot target state")
+	}
+	command.Env = []string{"PATH=/usr/sbin:/usr/bin:/sbin:/bin", "LANG=C", "LC_ALL=C"}
+	raw, err := command.Output()
+	if err != nil {
+		return errors.New("invalid safe boot target state")
+	}
+	values, err := parseSystemctlProperties(raw, []string{"UnitFileState", "ActiveState"})
+	if err != nil || !validSafeBootTargetState(values["UnitFileState"], values["ActiveState"], requireActive) {
+		return errors.New("invalid safe boot target state")
+	}
+	return nil
 }
 
 func verifyProductionSystemctl() error {

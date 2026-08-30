@@ -74,7 +74,7 @@ class BootUnitGraphTests(unittest.TestCase):
 
         self.assertIn(f"Before={SAFE_TARGET}\n", recovery)
         self.assertIn(f"After={SAFE_TARGET}\n", finalizer)
-        self.assertIn(f"ConditionPathExists={MARKER}\n", recovery)
+        self.assertNotIn("ConditionPathExists=", recovery)
         self.assertIn(f"ConditionPathExists={MARKER}\n", finalizer)
         self.assertIn(
             "ExecStart=/opt/open-card/upgrade-tools/open-card-upgrade recover-prepare --pending\n",

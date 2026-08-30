@@ -41,6 +41,7 @@ type engineStoreFake struct {
 	candidateEnv                                   []byte
 	state                                          UpgradeActivationState
 	markerTx                                       string
+	bootPending                                    *PendingTransaction
 	restoreCurrent, restorePrevious, restoreDigest string
 }
 
@@ -62,6 +63,23 @@ func (s *engineStoreFake) Acquire(context.Context, string) (UpgradeLock, error) 
 		return nil, err
 	}
 	return engineLock{released: &s.released, err: s.releaseErr}, nil
+}
+func (s *engineStoreFake) AcquirePendingBoot(ctx context.Context) (UpgradeLock, PendingTransaction, error) {
+	lock, err := s.Acquire(ctx, "txn-1")
+	if err != nil {
+		return nil, PendingTransaction{}, err
+	}
+	if s.bootPending != nil {
+		return lock, *s.bootPending, nil
+	}
+	if !s.state.Marker {
+		return lock, PendingTransaction{Marker: UpgradeMarkerAbsent}, nil
+	}
+	tx := s.markerTx
+	if tx == "" {
+		tx = "txn-1"
+	}
+	return lock, PendingTransaction{TransactionID: tx, Marker: UpgradeMarkerSame}, nil
 }
 func (s *engineStoreFake) LoadJournal(context.Context, string) (UpgradeJournalV1, error) {
 	if err := s.event("load"); err != nil {

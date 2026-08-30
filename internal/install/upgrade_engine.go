@@ -66,6 +66,14 @@ type UpgradeEligibilityV1 struct {
 
 type UpgradeLock interface{ Release() error }
 
+// UpgradePendingBootStore is deliberately narrower than UpgradeJournalStore.
+// Only the boot prepare engine needs the atomic marker-plus-lock acquisition;
+// ordinary status callers remain read-only and ordinary upgrade callers keep
+// their transaction-scoped Acquire boundary.
+type UpgradePendingBootStore interface {
+	AcquirePendingBoot(context.Context) (UpgradeLock, PendingTransaction, error)
+}
+
 type UpgradeJournalStore interface {
 	Acquire(context.Context, string) (UpgradeLock, error)
 	LoadJournal(context.Context, string) (UpgradeJournalV1, error)

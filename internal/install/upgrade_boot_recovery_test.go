@@ -77,7 +77,7 @@ func TestReconcileBootStateMatrixNeverCallsServices(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			e, store, _, events := bootFixture(t, tc.state, tc.candidate)
-			result, err := e.ReconcileBoot(context.Background(), "txn-1", nil)
+			result, err := e.ReconcilePendingBoot(context.Background(), nil)
 			if err != nil || result.State != tc.want || !result.MarkerRetained || !store.state.Marker {
 				t.Fatalf("result=%+v err=%v state=%+v events=%v", result, err, store.state, *events)
 			}
@@ -87,6 +87,30 @@ func TestReconcileBootStateMatrixNeverCallsServices(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestReconcilePendingBootNoMarkerIsTypedNoOp(t *testing.T) {
+	e, store, _, events := bootFixture(t, JournalSnapshotCreated, false)
+	store.state.Marker = false
+	result, err := e.ReconcilePendingBoot(context.Background(), nil)
+	if err != nil || !result.Skipped || result.MarkerRetained || result.FinalizeRequired || result.TransactionID != "" {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	for _, forbidden := range []string{"load", "actual", "ensure-marker", "save:", "marker:"} {
+		if eventIndex(*events, forbidden) >= 0 {
+			t.Fatalf("absent marker mutated or read durable recovery state: %v", *events)
+		}
+	}
+}
+
+func TestReconcilePendingBootRejectsUnknownMarkerBeforeJournal(t *testing.T) {
+	e, store, _, events := bootFixture(t, JournalSnapshotCreated, false)
+	store.bootPending = &PendingTransaction{Marker: UpgradeMarkerUnknown}
+	_, err := e.ReconcilePendingBoot(context.Background(), nil)
+	var phase UpgradePhaseError
+	if !errors.As(err, &phase) || phase.Phase != JournalRecoveryRequired || eventIndex(*events, "load") >= 0 {
+		t.Fatalf("err=%v events=%v", err, *events)
 	}
 }
 
@@ -101,7 +125,7 @@ func TestReconcileBootRejectsForeignAndUnprovableState(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			e, store, _, events := bootFixture(t, JournalValidated, false)
 			tc.mutate(store)
-			_, err := e.ReconcileBoot(context.Background(), "txn-1", nil)
+			_, err := e.ReconcilePendingBoot(context.Background(), nil)
 			if err == nil || strings.Contains(err.Error(), "postgres") || eventIndex(*events, "edge:guard") >= 0 {
 				t.Fatalf("err=%v events=%v", err, *events)
 			}
@@ -112,7 +136,7 @@ func TestReconcileBootRejectsForeignAndUnprovableState(t *testing.T) {
 func TestReconcileBootRetriesUnknownJournalSaveByReread(t *testing.T) {
 	e, store, _, _ := bootFixture(t, JournalSnapshotCreated, false)
 	store.fail, store.remaining, store.unknown, store.persistBeforeFailure = "save:"+string(JournalAbortedPreSwitch), 1, true, true
-	result, err := e.ReconcileBoot(context.Background(), "txn-1", nil)
+	result, err := e.ReconcilePendingBoot(context.Background(), nil)
 	if err != nil || result.State != JournalAbortedPreSwitch || len(store.saved) == 0 || store.saved[len(store.saved)-1].State != JournalAbortedPreSwitch {
 		t.Fatalf("result=%+v err=%v journals=%+v", result, err, store.saved)
 	}
@@ -138,7 +162,7 @@ func TestReconcileBootLegacyProjectionDoesNotCallServices(t *testing.T) {
 	j.PreUpgradePreviousActivationID, j.PreUpgradePreviousActivationJSONSHA256 = preflight.Previous.ID, preflight.Previous.JSONSHA256
 	store.created = []UpgradeJournalV1{j}
 	store.old, store.oldDigest, store.state.Marker = old, digest, true
-	result, err := e.ReconcileBoot(context.Background(), "txn-1", bootUnitReloaderFake{events: events})
+	result, err := e.ReconcilePendingBoot(context.Background(), bootUnitReloaderFake{events: events})
 	unitReloaded := false
 	for _, event := range *events {
 		unitReloaded = unitReloaded || strings.HasPrefix(event, "boot:unit:")

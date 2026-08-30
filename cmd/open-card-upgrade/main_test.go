@@ -80,58 +80,75 @@ func TestParseUpgradeArgsIsExactAndForbidsDangerousInputs(t *testing.T) {
 	}
 }
 
-func TestBootCommandsUseOnlyPendingTransactionAndRedactErrors(t *testing.T) {
-	for _, tc := range []struct {
-		command string
-		field   string
-	}{
-		{"recover-prepare", "prepare"},
-		{"recover-finalize", "finalize"},
-	} {
+func TestBootCommandsUseOnlyAtomicPendingPrepareAndRedactErrors(t *testing.T) {
+	for _, tc := range []struct{ command string }{{"recover-prepare"}, {"recover-finalize"}} {
 		t.Run(tc.command, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
-			called := ""
-			runtime := upgradeRuntime{
-				pending: func(context.Context) (install.PendingTransaction, error) {
-					return install.PendingTransaction{TransactionID: testTransaction, Marker: install.UpgradeMarkerSame}, nil
-				},
-				close: func() error { return nil },
-			}
+			prepareCalled, finalizeCalled := false, ""
+			runtime := upgradeRuntime{pending: func(context.Context) (install.PendingTransaction, error) {
+				return install.PendingTransaction{TransactionID: testTransaction, Marker: install.UpgradeMarkerSame}, nil
+			}, close: func() error { return nil }}
 			result := install.BootRecoveryResultV1{SchemaVersion: 1, TransactionID: testTransaction, State: install.JournalCommitted, MarkerRetained: true, FinalizeRequired: true}
-			if tc.field == "prepare" {
-				runtime.prepare = func(_ context.Context, tx string) (install.BootRecoveryResultV1, error) {
-					called = tx
-					return result, nil
-				}
-			} else {
-				runtime.finalize = func(_ context.Context, tx string) (install.BootRecoveryResultV1, error) {
-					called = tx
-					return result, nil
-				}
+			runtime.prepare = func(context.Context) (install.BootRecoveryResultV1, error) { prepareCalled = true; return result, nil }
+			runtime.finalize = func(_ context.Context, tx string) (install.BootRecoveryResultV1, error) {
+				finalizeCalled = tx
+				return result, nil
 			}
 			deps := testDependencies(upgradeRuntime{})
 			deps.newPrepareRuntime = func(context.Context) (upgradeRuntime, error) { return runtime, nil }
 			deps.newFinalizeRuntime = func(context.Context) (upgradeRuntime, error) { return runtime, nil }
-			if code := runWithDependencies(context.Background(), []string{tc.command, "--pending"}, &stdout, &stderr, deps); code != exitOK || called != testTransaction || stderr.Len() != 0 || !strings.Contains(stdout.String(), "COMMITTED") {
-				t.Fatalf("boot command failed: code=%d called=%q out=%q err=%q", code, called, stdout.String(), stderr.String())
+			if code := runWithDependencies(context.Background(), []string{tc.command, "--pending"}, &stdout, &stderr, deps); code != exitOK || stderr.Len() != 0 || !strings.Contains(stdout.String(), "COMMITTED") {
+				t.Fatalf("boot command failed: code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+			}
+			if tc.command == "recover-prepare" && (!prepareCalled || finalizeCalled != "") {
+				t.Fatalf("prepare was not atomic-only: prepare=%v finalize=%q", prepareCalled, finalizeCalled)
+			}
+			if tc.command == "recover-finalize" && (prepareCalled || finalizeCalled != testTransaction) {
+				t.Fatalf("finalize did not use pending marker: prepare=%v finalize=%q", prepareCalled, finalizeCalled)
 			}
 		})
 	}
 }
 
-func TestBootCommandsRejectMissingOrForeignPendingMarker(t *testing.T) {
-	for _, pending := range []install.PendingTransaction{{Marker: install.UpgradeMarkerAbsent}, {Marker: install.UpgradeMarkerForeign}, {Marker: install.UpgradeMarkerUnknown}} {
-		var stdout, stderr bytes.Buffer
-		called := false
-		runtime := upgradeRuntime{pending: func(context.Context) (install.PendingTransaction, error) { return pending, nil }, prepare: func(context.Context, string) (install.BootRecoveryResultV1, error) {
-			called = true
-			return install.BootRecoveryResultV1{}, nil
-		}, close: func() error { return nil }}
-		deps := testDependencies(upgradeRuntime{})
-		deps.newPrepareRuntime = func(context.Context) (upgradeRuntime, error) { return runtime, nil }
-		if code := runWithDependencies(context.Background(), []string{"recover-prepare", "--pending"}, &stdout, &stderr, deps); code != exitConflict || called || strings.Contains(stderr.String(), "foreign") {
-			t.Fatalf("pending=%+v code=%d called=%v out=%q err=%q", pending, code, called, stdout.String(), stderr.String())
-		}
+func TestRecoverPrepareWithoutMarkerIsReadOnlyNoOp(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	prepareConstructor := false
+	prepareCalls := false
+	deps := testDependencies(upgradeRuntime{})
+	deps.newPrepareRuntime = func(context.Context) (upgradeRuntime, error) {
+		prepareConstructor = true
+		return upgradeRuntime{prepare: func(context.Context) (install.BootRecoveryResultV1, error) {
+			prepareCalls = true
+			return install.BootRecoveryResultV1{SchemaVersion: 1, Skipped: true}, nil
+		}, close: func() error { return nil }}, nil
+	}
+	if code := runWithDependencies(context.Background(), []string{"recover-prepare", "--pending"}, &stdout, &stderr, deps); code != exitOK || !prepareConstructor || !prepareCalls || stderr.Len() != 0 || !strings.Contains(stdout.String(), "\"skipped\":true") || !strings.Contains(stdout.String(), "\"marker_retained\":false") {
+		t.Fatalf("no-marker prepare was not typed atomic no-op: code=%d constructed=%v called=%v out=%q err=%q", code, prepareConstructor, prepareCalls, stdout.String(), stderr.String())
+	}
+}
+
+func TestBootCommandsRejectForeignOrUnknownPendingMarkerAndFinalizeAbsent(t *testing.T) {
+	for _, tc := range []struct {
+		command string
+		pending install.PendingTransaction
+	}{
+		{"recover-finalize", install.PendingTransaction{Marker: install.UpgradeMarkerAbsent}},
+		{"recover-finalize", install.PendingTransaction{Marker: install.UpgradeMarkerForeign}},
+		{"recover-finalize", install.PendingTransaction{Marker: install.UpgradeMarkerUnknown}},
+	} {
+		t.Run(tc.command+"-"+string(tc.pending.Marker), func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			called := false
+			runtime := upgradeRuntime{pending: func(context.Context) (install.PendingTransaction, error) { return tc.pending, nil }, finalize: func(context.Context, string) (install.BootRecoveryResultV1, error) {
+				called = true
+				return install.BootRecoveryResultV1{}, nil
+			}, close: func() error { return nil }}
+			deps := testDependencies(upgradeRuntime{})
+			deps.newFinalizeRuntime = func(context.Context) (upgradeRuntime, error) { return runtime, nil }
+			if code := runWithDependencies(context.Background(), []string{tc.command, "--pending"}, &stdout, &stderr, deps); code != exitConflict || called || strings.Contains(stderr.String(), "foreign") {
+				t.Fatalf("pending=%+v code=%d called=%v out=%q err=%q", tc.pending, code, called, stdout.String(), stderr.String())
+			}
+		})
 	}
 }
 
@@ -232,6 +249,35 @@ func TestRecoveryServiceStateParserIsClosed(t *testing.T) {
 		if err := parseRecoveryServiceState(raw); err == nil {
 			t.Fatalf("accepted unsafe unit state %q", raw)
 		}
+	}
+}
+
+func TestSafeBootTargetActiveFence(t *testing.T) {
+	commandFor := func(raw string) systemctlCommandFactory {
+		return func(context.Context, string, ...string) *exec.Cmd {
+			return exec.Command("/bin/sh", "-c", "printf '%b' \"$1\"", "sh", raw)
+		}
+	}
+	for _, tc := range []struct {
+		name          string
+		raw           string
+		requireActive bool
+		want          bool
+	}{
+		{"normal-active", "UnitFileState=enabled\\nActiveState=active\\n", true, true},
+		{"normal-inactive", "UnitFileState=enabled\\nActiveState=inactive\\n", true, false},
+		{"normal-activating", "UnitFileState=enabled\\nActiveState=activating\\n", true, false},
+		{"prepare-inactive", "UnitFileState=enabled\\nActiveState=inactive\\n", false, true},
+		{"prepare-activating", "UnitFileState=enabled\\nActiveState=activating\\n", false, true},
+		{"disabled", "UnitFileState=disabled\\nActiveState=active\\n", false, false},
+		{"failed", "UnitFileState=enabled\\nActiveState=failed\\n", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := verifySafeBootTargetStateWithDependencies(context.Background(), commandFor(tc.raw), tc.requireActive)
+			if (err == nil) != tc.want {
+				t.Fatalf("raw=%q requireActive=%v err=%v", tc.raw, tc.requireActive, err)
+			}
+		})
 	}
 }
 
@@ -465,6 +511,44 @@ func TestProductionRuntimeRejectsRecoveryUnitServiceStateBeforeStore(t *testing.
 	}
 	if _, err := newProductionRuntimeWithDependencies(context.Background(), deps); err == nil || calledStore {
 		t.Fatalf("unsafe recovery unit state reached store: err=%v called=%v", err, calledStore)
+	}
+}
+
+func TestMutableRuntimeRequiresActiveSafeTargetBeforeOpeningStore(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		fenceError error
+		wantStore  bool
+	}{
+		{"inactive-target", errors.New("safe target inactive"), false},
+		{"active-target", nil, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			openedStore := false
+			deps := productionRuntimeDependencies{
+				verifyExecutable:   func() error { return nil },
+				verifyRecoveryUnit: func() error { return nil },
+				verifyRecoveryServiceState: func(context.Context) error {
+					return tc.fenceError
+				},
+				openStore: func() (upgradeRuntimeStore, error) {
+					openedStore = true
+					return upgradeRuntimeStore{store: &cliStoreFake{}, status: func(context.Context, string) (install.UpgradeStatusV1, error) { return install.UpgradeStatusV1{}, nil }, pending: func(context.Context) (install.PendingTransaction, error) { return install.PendingTransaction{}, nil }, close: func() error { return nil }}, nil
+				},
+				openService: func() (install.UpgradeServiceDriver, func() error, error) {
+					return &cliServiceFake{}, func() error { return nil }, nil
+				},
+				databaseFactory: install.NewProductionUpgradeDatabaseFactory(),
+				now:             func() time.Time { return time.Unix(1, 0).UTC() },
+			}
+			runtime, err := newProductionRuntimeWithDependencies(context.Background(), deps)
+			if (err == nil) != tc.wantStore || openedStore != tc.wantStore {
+				t.Fatalf("err=%v openedStore=%v", err, openedStore)
+			}
+			if runtime.close != nil {
+				_ = runtime.close()
+			}
+		})
 	}
 }
 

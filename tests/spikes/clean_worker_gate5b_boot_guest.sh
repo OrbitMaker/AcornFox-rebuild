@@ -86,7 +86,12 @@ state=/var/lib/opencard-g5b-20260830-a01
 marker=/var/lib/open-card/upgrade-in-progress
 case "${1:-}" in
   recover-prepare)
-    [[ "${2:-}" == --pending && -f "$marker" ]] || exit 64
+    [[ "${2:-}" == --pending ]] || exit 64
+    # The safe target always invokes prepare.  A missing marker is the
+    # deliberately successful atomic no-op branch, not a skipped unit.
+    if [[ ! -f "$marker" ]]; then
+      exit 0
+    fi
     case "$(cat "$state/prepare-mode")" in
       success) touch "$state/prepare-ok" ;;
       fail) echo prepare_failed >&2; exit 71 ;;
@@ -155,15 +160,15 @@ initial() {
   install_fixture
   verify_graph
 
-  # No marker: the condition-gated helpers are skipped and the safe target
-  # permits every benign business unit to start.
+  # No marker: the required prepare unit runs its explicit no-op path, so the
+  # safe target permits every benign business unit to start.
   stop_business
   rm -f "$marker" "$state/prepare-ok" "$state/finalize-ok"
   printf 'success\n' >"$state/prepare-mode"
   printf 'success\n' >"$state/finalize-mode"
   systemctl start "$safe" "${units[@]}"
   for unit in "${units[@]}"; do systemctl is-active --quiet "$unit"; done
-  [[ ! -e "$marker" ]]
+  [[ ! -e "$marker" && ! -e "$state/prepare-ok" ]]
   record_unit_states marker_absent
 
   # Prepare failure is a required dependency failure; no business unit may

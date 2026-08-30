@@ -326,6 +326,52 @@ func TestUpgradeStoreMarkerRequiresOwnedLock(t *testing.T) {
 	_ = lock.Release()
 }
 
+func TestAcquirePendingBootAtomicallyBindsMarkerAndFlock(t *testing.T) {
+	store, root, _, _, cleanup := candidateStore(t)
+	defer cleanup()
+	other, err := TaskUpgradeStore(root, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+
+	lock, pending, err := store.AcquirePendingBoot(context.Background())
+	if err != nil || pending.Marker != UpgradeMarkerAbsent || store.lock == nil || store.lock.tx != pendingBootLockIdentity {
+		t.Fatalf("absent boot acquire pending=%+v lock=%#v err=%v", pending, store.lock, err)
+	}
+	// This is the marker-absent TOCTOU proof: an ordinary upgrade cannot acquire
+	// the global lock before the boot barrier releases its no-op decision.
+	if _, err := other.Acquire(context.Background(), "txn-race"); !errors.Is(err, ErrUpgradeLocked) {
+		t.Fatalf("ordinary upgrade acquired during boot decision: %v", err)
+	}
+	if err := lock.Release(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.dataWriter.CreateMetadata(storeUpgradeInProgressPath, []byte("txn-marker\n")); err != nil {
+		t.Fatal(err)
+	}
+	lock, pending, err = store.AcquirePendingBoot(context.Background())
+	if err != nil || pending.Marker != UpgradeMarkerSame || pending.TransactionID != "txn-marker" || store.lock == nil || store.lock.tx != "txn-marker" {
+		t.Fatalf("same-marker boot acquire pending=%+v lock=%#v err=%v", pending, store.lock, err)
+	}
+	if err := lock.Release(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.dataWriter.WriteMetadata(storeUpgradeInProgressPath, []byte("bad\nmarker\n")); err != nil {
+		t.Fatal(err)
+	}
+	if lock, pending, err := store.AcquirePendingBoot(context.Background()); err == nil || lock != nil || pending.Marker != "" {
+		t.Fatalf("malformed marker accepted: lock=%v pending=%+v err=%v", lock, pending, err)
+	}
+	if lock, err := other.Acquire(context.Background(), "txn-after-malformed"); err != nil {
+		t.Fatalf("malformed marker leaked flock: %v", err)
+	} else if err := lock.Release(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestStoreReturnsUnknownWhenMarkerOrPointerPublishesIntoReplacedRoot(t *testing.T) {
 	t.Run("marker", func(t *testing.T) {
 		store, root, _, _, cleanup := candidateStore(t)

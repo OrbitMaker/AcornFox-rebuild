@@ -141,7 +141,6 @@ Description=Prepare interrupted Open Card upgrade recovery
 Wants=network-online.target
 After=local-fs.target network-online.target
 Before=open-card-upgrade-safe.target
-ConditionPathExists=/var/lib/open-card/upgrade-in-progress
 
 [Service]
 Type=oneshot

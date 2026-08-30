@@ -19,6 +19,11 @@ var ErrUpgradeJournalConflict = errors.New("upgrade journal conflict")
 
 const storeUpgradeInProgressPath = "upgrade-in-progress"
 
+// pendingBootLockIdentity reserves the global upgrade flock while the boot
+// barrier decides whether a marker exists. It is never persisted and is
+// replaced with the marker transaction before any journal operation.
+const pendingBootLockIdentity = "boot-pending-barrier"
+
 type UpgradeStore struct {
 	root             string
 	lockPath         string
@@ -484,6 +489,36 @@ func (s *UpgradeStore) Acquire(_ context.Context, tx string) (UpgradeLock, error
 	lock := &upgradeStoreLock{file: f, tx: tx, owner: s}
 	s.lock = lock
 	return lock, nil
+}
+
+// AcquirePendingBoot makes the marker decision while owning the global
+// upgrade flock.  In particular, callers must not call PendingTransaction
+// and then acquire a transaction lock: an upgrade could publish its marker in
+// that interval and escape the boot barrier.
+func (s *UpgradeStore) AcquirePendingBoot(ctx context.Context) (UpgradeLock, PendingTransaction, error) {
+	lock, err := s.Acquire(ctx, pendingBootLockIdentity)
+	if err != nil {
+		return nil, PendingTransaction{}, err
+	}
+	pending, pendingErr := s.PendingTransaction(ctx)
+	if pendingErr != nil || pending.Marker != UpgradeMarkerAbsent && pending.Marker != UpgradeMarkerSame {
+		if releaseErr := lock.Release(); releaseErr != nil {
+			return nil, PendingTransaction{}, ErrUpgradeJournalConflict
+		}
+		return nil, PendingTransaction{}, ErrUpgradeJournalConflict
+	}
+	if pending.Marker == UpgradeMarkerSame {
+		if pending.TransactionID == "" || s.lock == nil {
+			if releaseErr := lock.Release(); releaseErr != nil {
+				return nil, PendingTransaction{}, ErrUpgradeJournalConflict
+			}
+			return nil, PendingTransaction{}, ErrUpgradeJournalConflict
+		}
+		// Bind all following journal writes to the only transaction whose marker
+		// was observed while this flock was held.
+		s.lock.tx = pending.TransactionID
+	}
+	return lock, pending, nil
 }
 func (s *UpgradeStore) LoadJournal(_ context.Context, tx string) (UpgradeJournalV1, error) {
 	if s == nil || !validID(tx) {
