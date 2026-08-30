@@ -65,6 +65,13 @@ def minimal_repo(root: Path, migration_version: str) -> tuple[Path, str]:
 
 
 class ProductionBundleTests(unittest.TestCase):
+
+    def test_private_workspaces_stay_below_the_build_stage(self) -> None:
+        source = TOOL.read_text(encoding="utf-8")
+        self.assertNotIn("dir=output.parent", source)
+        self.assertIn('prefix=f".{output.name}.inputs-", dir=stage.parent', source)
+        self.assertIn('prefix=f".{output.name}.build-", dir=inputs', source)
+
     def attestation_digest(self, attestation: Path) -> str:
         return hashlib.sha256(attestation.read_bytes()).hexdigest()
 

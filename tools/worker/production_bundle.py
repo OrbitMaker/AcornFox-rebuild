@@ -618,7 +618,7 @@ def assemble(
         raise ProductionBundleError("Live attestation and its pinned SHA-256 are required")
 
     with tempfile.TemporaryDirectory(
-        prefix=f".{output.name}.inputs-", dir=output.parent
+        prefix=f".{output.name}.inputs-", dir=stage.parent
     ) as raw_inputs:
         inputs = Path(raw_inputs)
         repo_snapshot = inputs / "repository"
@@ -685,7 +685,7 @@ def assemble(
             )
 
         with tempfile.TemporaryDirectory(
-            prefix=f".{output.name}.build-", dir=output.parent
+            prefix=f".{output.name}.build-", dir=inputs
         ) as raw_build:
             build_root = Path(raw_build)
             release = build_root / "release"
