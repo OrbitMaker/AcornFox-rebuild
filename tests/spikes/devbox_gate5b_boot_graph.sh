@@ -9,51 +9,117 @@ prefix=${OPEN_CARD_G5B_BOOT_PREFIX:-opencard-g5b-20260830-a01}
 [[ "$prefix" =~ ^opencard-g5b-[0-9]{8}-a[0-9]{2}$ ]]
 remote=${OPEN_CARD_DEVBOX_HOST:-yanyan-devbox-via-idc}
 task=/var/lib/libvirt/images/$prefix
+claim=/var/lib/libvirt/images/.${prefix}.claim
 domain=$prefix
 network=${prefix}-net
 pool=${prefix}-pool
 bridge=virbr-g5ba01
 base=/var/lib/libvirt/images/sealos-cluster/ubuntu-24.04-server-cloudimg-amd64.img
 local_tmp=$(mktemp -d "${TMPDIR:-/tmp}/$prefix.XXXXXX")
-local_evidence=${OPEN_CARD_G5B_BOOT_EVIDENCE_DIR:-$local_tmp/evidence}
+if [[ -n "${OPEN_CARD_G5B_BOOT_EVIDENCE_DIR:-}" ]]; then
+  local_evidence=$OPEN_CARD_G5B_BOOT_EVIDENCE_DIR
+else
+  local_evidence=$(mktemp -d "${TMPDIR:-/tmp}/${prefix}.evidence.XXXXXX")
+fi
 mkdir -p "$local_evidence"
 
 cleanup_local() { rm -rf "$local_tmp"; }
 cleanup_remote() {
-  ssh -o BatchMode=yes -o ConnectTimeout=15 "$remote" "bash -s -- '$prefix' '$domain' '$network' '$pool' '$task'" <<'REMOTE_CLEANUP' || true
+  ssh -o BatchMode=yes -o ConnectTimeout=15 "$remote" "bash -s -- '$prefix' '$domain' '$network' '$pool' '$task' '$claim' '$bridge'" <<'REMOTE_CLEANUP'
 set -Eeuo pipefail
-prefix=$1 domain=$2 network=$3 pool=$4 task=$5
+prefix=$1 domain=$2 network=$3 pool=$4 task=$5 claim=$6 bridge=$7
 [[ "$prefix" =~ ^opencard-g5b-[0-9]{8}-a[0-9]{2}$ ]]
 [[ "$domain" == "$prefix" && "$network" == "$prefix-net" && "$pool" == "$prefix-pool" && "$task" == "/var/lib/libvirt/images/$prefix" ]]
-if sudo -n test -f "$task/.open-card-task-marker"; then
+[[ "$claim" == "/var/lib/libvirt/images/.${prefix}.claim" && "$bridge" == virbr-g5ba01 ]]
+claim_text=$(printf 'open-card-g5b-boot-claim-v1\nprefix=%s\ndomain=%s\nnetwork=%s\npool=%s\ntask=%s\nbridge=%s\n' \
+  "$prefix" "$domain" "$network" "$pool" "$task" "$bridge")
+
+# A missing claim proves this task created nothing.  A present claim must bind
+# every mutable resource exactly; the task marker is deliberately irrelevant.
+if ! sudo -n test -e "$claim" && ! sudo -n test -L "$claim"; then
+  ! sudo -n virsh dominfo "$domain" >/dev/null 2>&1
+  ! sudo -n virsh net-info "$network" >/dev/null 2>&1
+  ! sudo -n virsh pool-info "$pool" >/dev/null 2>&1
+    ! sudo -n test -e "$task" && ! sudo -n test -L "$task"
+  ! sudo -n ip link show dev "$bridge" >/dev/null 2>&1
+else
+  [[ "$(sudo -n cat "$claim")" == "${claim_text%$'\n'}" ]]
   if sudo -n virsh dominfo "$domain" >/dev/null 2>&1; then
-    state=$(sudo -n virsh domstate "$domain" || true)
-    [[ "$state" == 'running' || "$state" == 'paused' ]] && sudo -n virsh destroy "$domain" >/dev/null || true
-    sudo -n virsh undefine "$domain" --managed-save >/dev/null 2>&1 || sudo -n virsh undefine "$domain" >/dev/null 2>&1 || true
+    state=$(sudo -n virsh domstate "$domain")
+    if [[ "$state" == running || "$state" == paused ]]; then
+      sudo -n virsh destroy "$domain" >/dev/null
+    fi
+    if ! sudo -n virsh undefine "$domain" --managed-save >/dev/null 2>&1; then
+      sudo -n virsh undefine "$domain" >/dev/null
+    fi
   fi
   if sudo -n virsh net-info "$network" >/dev/null 2>&1; then
-    sudo -n virsh net-destroy "$network" >/dev/null 2>&1 || true
-    sudo -n virsh net-undefine "$network" >/dev/null 2>&1 || true
+    active=$(sudo -n virsh net-info "$network" | awk -F': *' '/^Active:/{print $2}')
+    [[ "$active" != yes ]] || sudo -n virsh net-destroy "$network" >/dev/null
+    sudo -n virsh net-undefine "$network" >/dev/null
   fi
   if sudo -n virsh pool-info "$pool" >/dev/null 2>&1; then
-    sudo -n virsh pool-destroy "$pool" >/dev/null 2>&1 || true
-    sudo -n virsh pool-undefine "$pool" >/dev/null 2>&1 || true
+    active=$(sudo -n virsh pool-info "$pool" | awk -F': *' '/^State:/{print $2}')
+    [[ "$active" != running ]] || sudo -n virsh pool-destroy "$pool" >/dev/null
+    sudo -n virsh pool-undefine "$pool" >/dev/null
   fi
   sudo -n rm -rf -- "$task"
+  sudo -n rm -f -- "$claim"
 fi
+! sudo -n virsh dominfo "$domain" >/dev/null 2>&1
+! sudo -n virsh net-info "$network" >/dev/null 2>&1
+! sudo -n virsh pool-info "$pool" >/dev/null 2>&1
+! sudo -n test -e "$task" && ! sudo -n test -L "$task"
+! sudo -n test -e "$claim" && ! sudo -n test -L "$claim"
+! sudo -n ip link show dev "$bridge" >/dev/null 2>&1
+printf 'DOMAIN_ABSENT\nNET_ABSENT\nPOOL_ABSENT\nROOT_ABSENT\nBRIDGE_ABSENT\nCLAIM_ABSENT\n'
 REMOTE_CLEANUP
+}
+verify_remote_absence() {
+  ssh -o BatchMode=yes -o ConnectTimeout=15 "$remote" "bash -s -- '$domain' '$network' '$pool' '$task' '$claim' '$bridge'" <<'REMOTE_VERIFY'
+set -Eeuo pipefail
+domain=$1 network=$2 pool=$3 task=$4 claim=$5 bridge=$6
+! sudo -n virsh dominfo "$domain" >/dev/null 2>&1
+! sudo -n virsh net-info "$network" >/dev/null 2>&1
+! sudo -n virsh pool-info "$pool" >/dev/null 2>&1
+! sudo -n test -e "$task" && ! sudo -n test -L "$task"
+! sudo -n test -e "$claim" && ! sudo -n test -L "$claim"
+! sudo -n ip link show dev "$bridge" >/dev/null 2>&1
+printf 'DOMAIN_ABSENT\nNET_ABSENT\nPOOL_ABSENT\nROOT_ABSENT\nBRIDGE_ABSENT\nCLAIM_ABSENT\n'
+REMOTE_VERIFY
 }
 on_exit() {
   local status=$?
-  cleanup_remote
-  cleanup_local
+  local cleanup_status=0
+  local verify_status=0
+  set +e
+  if (( status != 0 )); then
+    mkdir -p "$local_evidence"
+    ssh -o BatchMode=yes -o ConnectTimeout=15 "$remote" \
+      "sudo -n test -f '$claim' && sudo -n test -d '$task/evidence' && sudo -n tar -C '$task/evidence' -cf - ." \
+      2>/dev/null | tar -C "$local_evidence" -xf - 2>/dev/null
+    fetch_status=${PIPESTATUS[1]}
+    (( fetch_status == 0 )) || printf 'failure_evidence_fetch_status=%s\n' "$fetch_status" >&2
+  fi
+  cleanup_remote >"$local_evidence/cleanup.txt" || cleanup_status=$?
+  if (( cleanup_status != 0 )); then
+    printf 'remote_cleanup_failed_status=%s\n' "$cleanup_status" >&2
+  fi
+  verify_remote_absence >"$local_evidence/cleanup-verify.txt" || verify_status=$?
+  if (( verify_status != 0 )); then
+    printf 'remote_cleanup_absence_verify_failed_status=%s\n' "$verify_status" >&2
+    (( cleanup_status == 0 )) && cleanup_status=$verify_status
+  fi
+  cleanup_local || cleanup_status=$?
   trap - EXIT
-  exit "$status"
+  (( status != 0 )) && exit "$status"
+  exit "$cleanup_status"
 }
 trap on_exit EXIT
 
 for path in \
   tests/spikes/clean_worker_gate5b_boot_guest.sh \
+  tests/spikes/devbox_gate5b_boot_graph.sh \
   deploy/systemd/open-card-upgrade-recover.service \
   deploy/systemd/open-card-upgrade-safe.target \
   deploy/systemd/open-card-upgrade-finalize.service \
@@ -61,31 +127,66 @@ for path in \
   test -f "$repo_root/$path"
 done
 cp "$repo_root/tests/spikes/clean_worker_gate5b_boot_guest.sh" "$local_tmp/"
+cp "$repo_root/tests/spikes/devbox_gate5b_boot_graph.sh" "$local_tmp/"
 mkdir -p "$local_tmp/systemd/open-card-edge.service.d"
 cp "$repo_root/deploy/systemd/open-card-upgrade-recover.service" \
   "$repo_root/deploy/systemd/open-card-upgrade-safe.target" \
   "$repo_root/deploy/systemd/open-card-upgrade-finalize.service" "$local_tmp/systemd/"
 cp "$repo_root/deploy/systemd/open-card-edge.service.d/10-upgrade-marker.conf" \
   "$local_tmp/systemd/open-card-edge.service.d/"
+git -C "$repo_root" rev-parse HEAD >"$local_tmp/source-commit.txt"
+(
+  cd "$local_tmp"
+  sha256sum \
+    clean_worker_gate5b_boot_guest.sh \
+    devbox_gate5b_boot_graph.sh \
+    systemd/open-card-upgrade-recover.service \
+    systemd/open-card-upgrade-safe.target \
+    systemd/open-card-upgrade-finalize.service \
+    systemd/open-card-edge.service.d/10-upgrade-marker.conf
+) >"$local_tmp/source-manifest.sha256"
+if git -C "$repo_root" diff --quiet -- \
+  tests/spikes/clean_worker_gate5b_boot_guest.sh \
+  tests/spikes/devbox_gate5b_boot_graph.sh; then
+  printf 'harness_worktree=clean\n' >"$local_tmp/harness-binding.txt"
+else
+  printf 'harness_worktree=dirty\n' >"$local_tmp/harness-binding.txt"
+fi
+cat "$local_tmp/source-commit.txt" "$local_tmp/source-manifest.sha256" \
+  "$local_tmp/harness-binding.txt" >"$local_evidence/source-binding.txt"
 
 # Preflight is read-only.  It records the exact domain/network/pool inventory
 # before this task creates anything and rejects a pre-existing prefix.
-ssh -o BatchMode=yes -o ConnectTimeout=15 "$remote" "bash -s -- '$prefix' '$domain' '$network' '$pool' '$task' '$base'" <<'REMOTE_CREATE'
+ssh -o BatchMode=yes -o ConnectTimeout=15 "$remote" "bash -s -- '$prefix' '$domain' '$network' '$pool' '$task' '$claim' '$bridge' '$base'" <<'REMOTE_CREATE'
 set -Eeuo pipefail
-prefix=$1 domain=$2 network=$3 pool=$4 task=$5 base=$6
-bridge=virbr-g5ba01
+prefix=$1 domain=$2 network=$3 pool=$4 task=$5 claim=$6 bridge=$7 base=$8
 snapshot() {
   printf '[domains]\n'; sudo -n virsh list --all --name | LC_ALL=C sort
   printf '[networks]\n'; sudo -n virsh net-list --all --name | LC_ALL=C sort
   printf '[pools]\n'; sudo -n virsh pool-list --all --name | LC_ALL=C sort
+  printf '[bridge]\n'
+  if sudo -n ip link show dev "$bridge" >/dev/null 2>&1; then
+    sudo -n ip -d link show dev "$bridge"
+  else
+    printf 'ABSENT\n'
+  fi
 }
 [[ "$prefix" =~ ^opencard-g5b-[0-9]{8}-a[0-9]{2}$ ]]
 [[ "$domain" == "$prefix" && "$network" == "$prefix-net" && "$pool" == "$prefix-pool" && "$task" == "/var/lib/libvirt/images/$prefix" ]]
+[[ "$claim" == "/var/lib/libvirt/images/.${prefix}.claim" && "$bridge" == virbr-g5ba01 ]]
 ! sudo -n virsh dominfo "$domain" >/dev/null 2>&1
 ! sudo -n virsh net-info "$network" >/dev/null 2>&1
 ! sudo -n virsh pool-info "$pool" >/dev/null 2>&1
-! sudo -n test -e "$task"
+! sudo -n test -e "$task" && ! sudo -n test -L "$task"
+! sudo -n test -e "$claim" && ! sudo -n test -L "$claim"
+! sudo -n ip link show dev "$bridge" >/dev/null 2>&1
 sudo -n test -f "$base" && ! sudo -n test -L "$base"
+claim_text=$(printf 'open-card-g5b-boot-claim-v1\nprefix=%s\ndomain=%s\nnetwork=%s\npool=%s\ntask=%s\nbridge=%s\n' \
+  "$prefix" "$domain" "$network" "$pool" "$task" "$bridge")
+printf '%s' "$claim_text" | sudo -n tee "$claim" >/dev/null
+sudo -n chown root:root "$claim"
+sudo -n chmod 0600 "$claim"
+[[ "$(sudo -n cat "$claim")" == "${claim_text%$'\n'}" ]]
 sudo -n install -d -o root -g root -m 0711 "$task" "$task/volumes"
 sudo -n install -d -o root -g root -m 0700 "$task/source" "$task/evidence"
 printf '%s\n' "$prefix" | sudo -n tee "$task/.open-card-task-marker" >/dev/null
@@ -144,7 +245,13 @@ sudo -n virt-install --name "$domain" --memory 8192 --vcpus 4 --cpu host-model \
 sudo -n virsh autostart "$domain" --disable >/dev/null
 REMOTE_CREATE
 
-tar -C "$local_tmp" -cf - clean_worker_gate5b_boot_guest.sh systemd | \
+tar -C "$local_tmp" -cf - \
+  clean_worker_gate5b_boot_guest.sh \
+  devbox_gate5b_boot_graph.sh \
+  source-commit.txt \
+  source-manifest.sha256 \
+  harness-binding.txt \
+  systemd | \
   ssh -o BatchMode=yes -o ConnectTimeout=15 "$remote" "sudo -n tar -C '$task/source' -xf -"
 
 # Wait for the no-forward isolated network lease, then use only the task key
@@ -154,7 +261,14 @@ set -Eeuo pipefail
 domain=$1 network=$2 task=$3 prefix=$4
 for _ in $(seq 1 180); do
   ip=$(sudo -n virsh net-dhcp-leases "$network" 2>/dev/null | awk '/ipv4/ {sub(/\/.*/,"",$5); print $5; exit}')
-  if [[ -n "${ip:-}" ]] && sudo -n ssh -n -i "$task/id_ed25519" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=3 ubuntu@"$ip" true 2>/dev/null; then
+  if [[ -n "${ip:-}" && ! -s "$task/known_hosts" ]]; then
+    key=$(sudo -n ssh-keyscan -T 3 -t ed25519 "$ip" 2>/dev/null || true)
+    if [[ -n "$key" ]]; then
+      printf '%s\n' "$key" | sudo -n tee "$task/known_hosts" >/dev/null
+      sudo -n chmod 0600 "$task/known_hosts"
+    fi
+  fi
+  if [[ -n "${ip:-}" && -s "$task/known_hosts" ]] && sudo -n ssh -n -i "$task/id_ed25519" -o BatchMode=yes -o UserKnownHostsFile="$task/known_hosts" -o StrictHostKeyChecking=yes -o ConnectTimeout=3 ubuntu@"$ip" true 2>/dev/null; then
     printf '%s\n' "$ip" | sudo -n tee "$task/guest-ip" >/dev/null
     break
   fi
@@ -163,28 +277,37 @@ done
 test -s "$task/guest-ip"
 ip=$(sudo -n cat "$task/guest-ip")
 printf 'guest_ip=%s\n' "$ip" | sudo -n tee "$task/evidence/guest-trace.txt" >/dev/null
-sudo -n scp -i "$task/id_ed25519" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -r "$task/source" ubuntu@"$ip":/home/ubuntu/g5b-source
-sudo -n ssh -n -i "$task/id_ed25519" -o BatchMode=yes -o StrictHostKeyChecking=accept-new ubuntu@"$ip" \
+sudo -n scp -i "$task/id_ed25519" -o BatchMode=yes -o UserKnownHostsFile="$task/known_hosts" -o StrictHostKeyChecking=yes -r "$task/source" ubuntu@"$ip":/home/ubuntu/g5b-source
+set +e
+sudo -n ssh -n -i "$task/id_ed25519" -o BatchMode=yes -o UserKnownHostsFile="$task/known_hosts" -o StrictHostKeyChecking=yes ubuntu@"$ip" \
   "sudo OPEN_CARD_G5B_BOOT_PREFIX='$prefix' bash /home/ubuntu/g5b-source/clean_worker_gate5b_boot_guest.sh initial" 2>&1 | \
   sudo -n tee "$task/evidence/guest-initial.txt"
+guest_status=${PIPESTATUS[0]}
+set -e
+if (( guest_status != 0 )); then
+  sudo -n install -d -o root -g root -m 0700 "$task/evidence/guest"
+  sudo -n ssh -n -i "$task/id_ed25519" -o BatchMode=yes -o UserKnownHostsFile="$task/known_hosts" -o StrictHostKeyChecking=yes ubuntu@"$ip" \
+    "sudo tar -C /var/lib/open-card/$prefix/evidence -cf - ." | sudo -n tar -C "$task/evidence/guest" -xf - || true
+  exit "$guest_status"
+fi
 printf 'initial_complete\n' | sudo -n tee -a "$task/evidence/guest-trace.txt" >/dev/null
-boot_before=$(sudo -n ssh -n -i "$task/id_ed25519" -o BatchMode=yes -o StrictHostKeyChecking=accept-new ubuntu@"$ip" cat /proc/sys/kernel/random/boot_id)
+boot_before=$(sudo -n ssh -n -i "$task/id_ed25519" -o BatchMode=yes -o UserKnownHostsFile="$task/known_hosts" -o StrictHostKeyChecking=yes ubuntu@"$ip" cat /proc/sys/kernel/random/boot_id)
 sudo -n virsh reboot "$domain" --mode acpi >/dev/null
 for _ in $(seq 1 180); do
-  if sudo -n ssh -n -i "$task/id_ed25519" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=3 ubuntu@"$ip" true 2>/dev/null; then
-    boot_after=$(sudo -n ssh -n -i "$task/id_ed25519" -o BatchMode=yes -o StrictHostKeyChecking=accept-new ubuntu@"$ip" cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)
+  if sudo -n ssh -n -i "$task/id_ed25519" -o BatchMode=yes -o UserKnownHostsFile="$task/known_hosts" -o StrictHostKeyChecking=yes -o ConnectTimeout=3 ubuntu@"$ip" true 2>/dev/null; then
+    boot_after=$(sudo -n ssh -n -i "$task/id_ed25519" -o BatchMode=yes -o UserKnownHostsFile="$task/known_hosts" -o StrictHostKeyChecking=yes ubuntu@"$ip" cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)
     [[ -n "$boot_after" && "$boot_after" != "$boot_before" ]] && break
   fi
   sleep 2
 done
 test -n "${boot_after:-}" && test "$boot_after" != "$boot_before"
-sudo -n ssh -n -i "$task/id_ed25519" -o BatchMode=yes -o StrictHostKeyChecking=accept-new ubuntu@"$ip" \
+sudo -n ssh -n -i "$task/id_ed25519" -o BatchMode=yes -o UserKnownHostsFile="$task/known_hosts" -o StrictHostKeyChecking=yes ubuntu@"$ip" \
   "sudo OPEN_CARD_G5B_BOOT_PREFIX='$prefix' bash /home/ubuntu/g5b-source/clean_worker_gate5b_boot_guest.sh post-reboot" 2>&1 | \
   sudo -n tee "$task/evidence/guest-post-reboot.txt" >/dev/null
 printf 'post_reboot_complete\n' | sudo -n tee -a "$task/evidence/guest-trace.txt" >/dev/null
 sudo -n install -d -o root -g root -m 0700 "$task/evidence/guest"
-sudo -n ssh -n -i "$task/id_ed25519" -o BatchMode=yes -o StrictHostKeyChecking=accept-new ubuntu@"$ip" \
-  "sudo tar -C /var/lib/$prefix/evidence -cf - ." | sudo -n tar -C "$task/evidence/guest" -xf -
+sudo -n ssh -n -i "$task/id_ed25519" -o BatchMode=yes -o UserKnownHostsFile="$task/known_hosts" -o StrictHostKeyChecking=yes ubuntu@"$ip" \
+  "sudo tar -C /var/lib/open-card/$prefix/evidence -cf - ." | sudo -n tar -C "$task/evidence/guest" -xf -
 printf 'guest_ip=%s\nboot_before=%s\nboot_after=%s\n' "$ip" "$boot_before" "$boot_after" | sudo -n tee "$task/evidence/guest-boot.txt" >/dev/null
 REMOTE_GUEST
 
@@ -194,34 +317,19 @@ ssh -o BatchMode=yes -o ConnectTimeout=15 "$remote" "sudo -n tar -C '$task/evide
 ssh -o BatchMode=yes -o ConnectTimeout=15 "$remote" "sudo -n cat '$task/host-before.txt'" >"$local_evidence/host-before.txt"
 cat "$local_evidence/guest/summary.txt"
 
-# Reclaim exactly the named task resources, then compare the remaining libvirt
-# inventory byte-for-byte with the pre-create snapshot.
-ssh -o BatchMode=yes -o ConnectTimeout=15 "$remote" "bash -s -- '$prefix' '$domain' '$network' '$pool' '$task'" <<'REMOTE_FINISH'
-set -Eeuo pipefail
-prefix=$1 domain=$2 network=$3 pool=$4 task=$5
-snapshot() {
-  printf '[domains]\n'; sudo -n virsh list --all --name | LC_ALL=C sort
-  printf '[networks]\n'; sudo -n virsh net-list --all --name | LC_ALL=C sort
-  printf '[pools]\n'; sudo -n virsh pool-list --all --name | LC_ALL=C sort
-}
-sudo -n test -f "$task/.open-card-task-marker"
-state=$(sudo -n virsh domstate "$domain" || true)
-[[ "$state" == 'running' || "$state" == 'paused' ]] && sudo -n virsh shutdown "$domain" >/dev/null || true
-for _ in $(seq 1 90); do [[ "$(sudo -n virsh domstate "$domain" || true)" == 'shut off' ]] && break; sleep 1; done
-sudo -n virsh undefine "$domain" --managed-save >/dev/null 2>&1 || sudo -n virsh undefine "$domain"
-sudo -n virsh net-destroy "$network" >/dev/null 2>&1 || true
-sudo -n virsh net-undefine "$network"
-sudo -n virsh pool-destroy "$pool" >/dev/null 2>&1 || true
-sudo -n virsh pool-undefine "$pool"
-sudo -n rm -rf -- "$task"
-! sudo -n virsh dominfo "$domain" >/dev/null 2>&1
-! sudo -n virsh net-info "$network" >/dev/null 2>&1
-! sudo -n virsh pool-info "$pool" >/dev/null 2>&1
-! sudo -n test -e "$task"
-REMOTE_FINISH
+# Reclaim only resources whose exact claim still binds this task.  The
+# cleanup routine verifies the final absence itself and writes its tokens into
+# retained local evidence even when the guest marker is absent.
+cleanup_remote >"$local_evidence/cleanup.txt"
+grep -Fxq DOMAIN_ABSENT "$local_evidence/cleanup.txt"
+grep -Fxq NET_ABSENT "$local_evidence/cleanup.txt"
+grep -Fxq POOL_ABSENT "$local_evidence/cleanup.txt"
+grep -Fxq ROOT_ABSENT "$local_evidence/cleanup.txt"
+grep -Fxq BRIDGE_ABSENT "$local_evidence/cleanup.txt"
+grep -Fxq CLAIM_ABSENT "$local_evidence/cleanup.txt"
 
 # The final comparison is intentionally a separate read-only SSH call: task
 # root is gone, while its baseline was fetched into the local evidence folder.
-ssh -o BatchMode=yes -o ConnectTimeout=15 "$remote" "printf '[domains]\\n'; sudo -n virsh list --all --name | LC_ALL=C sort; printf '[networks]\\n'; sudo -n virsh net-list --all --name | LC_ALL=C sort; printf '[pools]\\n'; sudo -n virsh pool-list --all --name | LC_ALL=C sort" >"$local_evidence/host-after.txt"
+ssh -o BatchMode=yes -o ConnectTimeout=15 "$remote" "printf '[domains]\\n'; sudo -n virsh list --all --name | LC_ALL=C sort; printf '[networks]\\n'; sudo -n virsh net-list --all --name | LC_ALL=C sort; printf '[pools]\\n'; sudo -n virsh pool-list --all --name | LC_ALL=C sort; printf '[bridge]\\n'; if sudo -n ip link show dev '$bridge' >/dev/null 2>&1; then sudo -n ip -d link show dev '$bridge'; else printf 'ABSENT\\n'; fi" >"$local_evidence/host-after.txt"
 cmp "$local_evidence/host-before.txt" "$local_evidence/host-after.txt"
 echo "G5B_BOOT_GRAPH=PASS evidence=$local_evidence"

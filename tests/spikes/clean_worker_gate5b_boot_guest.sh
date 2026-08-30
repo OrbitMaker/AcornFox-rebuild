@@ -11,7 +11,7 @@ phase=${1:?phase is required: initial|post-reboot}
 prefix=${OPEN_CARD_G5B_BOOT_PREFIX:-opencard-g5b-20260830-a01}
 [[ "$prefix" =~ ^opencard-g5b-[0-9]{8}-a[0-9]{2}$ ]]
 source_root=${OPEN_CARD_G5B_BOOT_SOURCE_ROOT:-/home/ubuntu/g5b-source}
-state=/var/lib/$prefix
+state=/var/lib/open-card/$prefix
 evidence=$state/evidence
 marker=/var/lib/open-card/upgrade-in-progress
 safe=open-card-upgrade-safe.target
@@ -21,17 +21,50 @@ units=(open-card-buildkit.service open-card-caddy.service open-card-server.servi
 
 [[ "$(id -u)" -eq 0 ]]
 [[ -d "$source_root/systemd" && ! -L "$source_root/systemd" ]]
-install -d -o root -g root -m 0700 "$state" "$evidence" /opt/open-card/upgrade-tools /var/lib/open-card
+install -d -o root -g root -m 0700 \
+  "$state" "$evidence" \
+  /etc/open-card \
+  /opt/open-card/upgrade-tools \
+  /var/lib/open-card/upgrade-transactions \
+  /var/lib/open-card/upgrade-artifacts
+install -d -o root -g root -m 0711 /opt/open-card /opt/open-card/activations /var/lib/open-card
+install -d -o root -g root -m 0755 /run/lock
+install -o root -g root -m 0600 /dev/null /run/lock/open-card-upgrade.lock
 printf '%s\n' "$prefix" >"$state/.open-card-task-marker"
 chmod 0600 "$state/.open-card-task-marker"
+
+verify_source_binding() {
+  local expected_commit actual_commit
+  test -f "$source_root/source-commit.txt" && ! test -L "$source_root/source-commit.txt"
+  test -f "$source_root/source-manifest.sha256" && ! test -L "$source_root/source-manifest.sha256"
+  test -f "$source_root/harness-binding.txt" && ! test -L "$source_root/harness-binding.txt"
+  expected_commit=$(tr -d '\n' <"$source_root/source-commit.txt")
+  [[ "$expected_commit" =~ ^[0-9a-f]{40}$ ]]
+  actual_commit=$expected_commit
+  (
+    cd "$source_root"
+    sha256sum -c source-manifest.sha256
+  ) >"$evidence/source-manifest-check.txt" 2>&1
+  printf 'source_commit=%s\n' "$actual_commit" >"$evidence/source-commit.txt"
+  cp "$source_root/source-manifest.sha256" "$evidence/source-manifest.sha256"
+  cp "$source_root/harness-binding.txt" "$evidence/harness-binding.txt"
+  chmod 0600 "$evidence/source-commit.txt" "$evidence/source-manifest.sha256" "$evidence/harness-binding.txt"
+}
 
 diagnose_failure() {
   local status=$?
   trap - ERR
-  printf 'guest_phase=%s failed_status=%s\n' "$phase" "$status" >&2
+  printf 'guest_phase=%s failed_status=%s failed_line=%s command=%q\n' \
+    "$phase" "$status" "${BASH_LINENO[0]:-unknown}" "${BASH_COMMAND:-unknown}" >&2
   for file in "$evidence"/systemd-analyze-verify.txt "$evidence"/prepare-failure-start.txt; do
     [[ -f "$file" ]] && tail -80 "$file" >&2 || true
   done
+  systemctl status --no-pager "$recover" "$safe" "$finalize" "${units[@]}" \
+    >"$evidence/failure-systemctl-status.txt" 2>&1 || true
+  journalctl -b --no-pager -u "$recover" -u "$safe" -u "$finalize" \
+    >"$evidence/failure-journal.txt" 2>&1 || true
+  tail -120 "$evidence/failure-systemctl-status.txt" >&2 || true
+  tail -120 "$evidence/failure-journal.txt" >&2 || true
   exit "$status"
 }
 trap diagnose_failure ERR
@@ -82,7 +115,7 @@ install_fixture() {
   cat >/opt/open-card/upgrade-tools/open-card-upgrade <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
-state=/var/lib/opencard-g5b-20260830-a01
+state=/var/lib/open-card/opencard-g5b-20260830-a01
 marker=/var/lib/open-card/upgrade-in-progress
 case "${1:-}" in
   recover-prepare)
@@ -157,6 +190,7 @@ verify_graph() {
 }
 
 initial() {
+  verify_source_binding
   install_fixture
   verify_graph
 
@@ -177,10 +211,11 @@ initial() {
   printf 'txn-prepare-fail\n' >"$marker"
   printf 'fail\n' >"$state/prepare-mode"
   printf 'success\n' >"$state/finalize-mode"
-  set +e
-  systemctl start "$safe" >"$evidence/prepare-failure-start.txt" 2>&1
-  prepare_status=$?
-  set -e
+  if systemctl start "$safe" >"$evidence/prepare-failure-start.txt" 2>&1; then
+    prepare_status=0
+  else
+    prepare_status=$?
+  fi
   [[ $prepare_status -ne 0 ]]
   [[ -f "$marker" ]]
   assert_inactive_business
@@ -193,13 +228,38 @@ initial() {
   printf 'txn-finalize-fail\n' >"$marker"
   printf 'success\n' >"$state/prepare-mode"
   printf 'fail\n' >"$state/finalize-mode"
-  systemctl start "$safe"
+  # A failed Wants= finalizer may make the synchronous systemctl transaction
+  # return non-zero even though prepare released the safe target.  The safety
+  # invariant is the retained marker and inactive Edge, not this client exit.
+  if systemctl start "$safe" >"$evidence/finalizer-failure-start.txt" 2>&1; then
+    finalizer_start_status=0
+  else
+    finalizer_start_status=$?
+  fi
+  printf 'systemctl_start_status=%s\n' "$finalizer_start_status" \
+    >>"$evidence/finalizer-failure-start.txt"
   for _ in $(seq 1 100); do
     [[ "$(systemctl show --value -p ActiveState "$finalize")" != activating ]] && break
     sleep 0.1
   done
   [[ -f "$marker" ]]
   [[ "$(systemctl show --value -p ActiveState open-card-edge.service)" != active ]]
+  if systemctl start open-card-edge.service >"$evidence/finalizer-failure-edge-direct-start.txt" 2>&1; then
+    edge_direct_status=0
+  else
+    edge_direct_status=$?
+  fi
+  {
+    printf 'systemctl_start_status=%s\n' "$edge_direct_status"
+    systemctl show -p ActiveState -p SubState -p Result -p ConditionResult open-card-edge.service
+  } >>"$evidence/finalizer-failure-edge-direct-start.txt"
+  # systemctl reports a condition-skipped start as a successful transaction on
+  # Ubuntu systemd.  The authoritative boundary is the inactive/skipped unit
+  # plus retained marker, while the client status remains captured above.
+  [[ -f "$marker" ]]
+  [[ "$(systemctl show --value -p ActiveState open-card-edge.service)" == inactive ]]
+  ss -lntup >"$evidence/finalizer-failure-listeners.txt"
+  ! grep -Eq ':(80|443)[[:space:]]' "$evidence/finalizer-failure-listeners.txt"
   record_unit_states finalizer_failure
 
   # A successful terminal fixture removes the marker.  Starting the Edge only
