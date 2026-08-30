@@ -126,10 +126,11 @@ HOST_INVENTORY_MATCH
 No existing VM, storage pool, network, bridge, cloud resource, DNS record,
 firewall rule, or public endpoint was changed.
 
-## Remaining Gate5B boundary
+## Subsequent Gate5B closure
 
 This proof validates the real systemd graph, marker gating, failure propagation,
-and reboot behavior with safe dummy services. Gate5B still requires the clean
-Ubuntu RC0-to-RC1 product upgrade, real service health, kill/reboot points, and
-public Edge checks before production enablement or removal of the
-`upgrade.sh` hard refusal.
+and reboot behavior with safe dummy services. The later
+`docs/evidence/gate5b-rc1-upgrade-proof.md` closes the remaining **internal**
+product boundary with a clean Ubuntu RC0-to-RC1 success run and a real
+active-switch kill/reboot rollback. Public DNS, public ACME, external browser
+and customer deployment evidence remain pending and are not inferred here.
