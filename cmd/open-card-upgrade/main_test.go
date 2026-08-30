@@ -17,6 +17,7 @@ import (
 const testTransaction = "upgrade-cli-test"
 const testRelease = "release-cli-test"
 const testManifest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+const testBootstrapConfirmation = "BOOTSTRAP:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 func cliIdentity(t *testing.T) install.UpgradeCLIIdentity {
 	t.Helper()
@@ -33,6 +34,14 @@ func testIdentity() (install.UpgradeCLIIdentity, error) {
 
 func cliArgs(command string) []string {
 	return []string{command, "--transaction-id", testTransaction, "--release-id", testRelease, "--manifest-sha256", testManifest, "--expect-layout", "native"}
+}
+
+func bootstrapCLIArgs() []string {
+	return []string{"bootstrap-native", "--expected-manifest-sha256", testManifest, "--confirm-installation-id", testBootstrapConfirmation}
+}
+
+func testBootstrapRequest() install.BootstrapRequest {
+	return install.BootstrapRequest{TransactionID: "bootstrap-cli-test", InstallationIDSHA256: testManifest, CandidateActivationID: "activation-cli-test", Release: install.ReleaseV1{ID: "release-rc2-cli", Version: install.Gate6CandidateVersion, SourceCommit: "0123456789abcdef0123456789abcdef01234567", Architecture: install.RuntimeArchitecture(), ManifestSHA256: testManifest}}
 }
 
 func testDependencies(runtime upgradeRuntime) upgradeDependencies {
@@ -62,6 +71,21 @@ func TestParseUpgradeArgsIsExactAndForbidsDangerousInputs(t *testing.T) {
 	} {
 		if _, err := parseUpgradeArgs(args); err == nil {
 			t.Fatalf("accepted forbidden args %#v", args)
+		}
+	}
+	bootstrapConfig, err := parseUpgradeArgs(bootstrapCLIArgs())
+	if err != nil || bootstrapConfig.command != "bootstrap-native" || bootstrapConfig.manifestSHA256 != testManifest || bootstrapConfig.confirmation != testBootstrapConfirmation {
+		t.Fatalf("bootstrap parse=%+v err=%v", bootstrapConfig, err)
+	}
+	for _, args := range [][]string{
+		{"bootstrap-native"},
+		{"bootstrap-native", "--expected-manifest-sha256", testManifest, "--confirm-installation-id", "BOOTSTRAP:../secret"},
+		append(append([]string{}, bootstrapCLIArgs()...), "--transaction-id", testTransaction),
+		append(append([]string{}, bootstrapCLIArgs()...), "--database-url", "postgresql://secret@db/x"),
+		append(append([]string{}, bootstrapCLIArgs()...), "--confirm-installation-id", testBootstrapConfirmation),
+	} {
+		if _, err := parseUpgradeArgs(args); err == nil {
+			t.Fatalf("accepted unsafe bootstrap args %#v", args)
 		}
 	}
 	if config, err := parseUpgradeArgs([]string{"recover", "--pending"}); err != nil || !config.pending {
@@ -110,6 +134,176 @@ func TestParseUpgradeArgsIsExactAndForbidsDangerousInputs(t *testing.T) {
 		if _, err := parseUpgradeArgs(args); err == nil {
 			t.Fatalf("accepted unsafe backup/restore args %#v", args)
 		}
+	}
+}
+
+func TestBootstrapNativeCommandIsRootOnlyTypedAndRedacted(t *testing.T) {
+	request := testBootstrapRequest()
+	var stdout, stderr bytes.Buffer
+	called := false
+	runtime := upgradeRuntime{bootstrap: func(_ context.Context, got install.BootstrapRequest) error {
+		called = true
+		if got != request {
+			t.Fatalf("request=%+v", got)
+		}
+		return nil
+	}, close: func() error { return nil }}
+	deps := upgradeDependencies{
+		euid: func() int { return 0 },
+		deriveBootstrap: func(config upgradeCommandConfig) (install.BootstrapRequest, error) {
+			if config.confirmation != testBootstrapConfirmation || config.manifestSHA256 != testManifest {
+				t.Fatalf("config=%+v", config)
+			}
+			return request, nil
+		},
+		newBootstrapRuntime: func(context.Context) (upgradeRuntime, error) { return runtime, nil },
+	}
+	if code := runWithDependencies(context.Background(), bootstrapCLIArgs(), &stdout, &stderr, deps); code != exitOK || !called || stderr.Len() != 0 || !strings.Contains(stdout.String(), "COMMITTED") || strings.Contains(stdout.String(), strings.TrimPrefix(testBootstrapConfirmation, "BOOTSTRAP:")) {
+		t.Fatalf("code=%d called=%v out=%q err=%q", code, called, stdout.String(), stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	called = false
+	deps.euid = func() int { return 99 }
+	if code := runWithDependencies(context.Background(), bootstrapCLIArgs(), &stdout, &stderr, deps); code != exitPrivilege || called || !strings.Contains(stderr.String(), "root_required") {
+		t.Fatalf("non-root code=%d called=%v out=%q err=%q", code, called, stdout.String(), stderr.String())
+	}
+}
+
+func TestBootstrapNativeErrorMappingIsStableAndSecretFree(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		code int
+		text string
+	}{
+		{install.ErrUpgradeLocked, exitLocked, "bootstrap_locked"},
+		{install.ErrBootstrapConflict, exitConflict, "bootstrap_conflict"},
+		{install.ErrBootstrapRecoveryRequired, exitRecovery, "bootstrap_recovery_required"},
+		{errors.New("postgresql://user:secret@db/x"), exitInternal, "bootstrap_unavailable"},
+	} {
+		t.Run(tc.text, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			runtime := upgradeRuntime{bootstrap: func(context.Context, install.BootstrapRequest) error { return tc.err }, close: func() error { return nil }}
+			deps := upgradeDependencies{euid: func() int { return 0 }, deriveBootstrap: func(upgradeCommandConfig) (install.BootstrapRequest, error) { return testBootstrapRequest(), nil }, newBootstrapRuntime: func(context.Context) (upgradeRuntime, error) { return runtime, nil }}
+			if code := runWithDependencies(context.Background(), bootstrapCLIArgs(), &stdout, &stderr, deps); code != tc.code || !strings.Contains(stderr.String(), tc.text) || strings.Contains(stderr.String(), "secret") || stdout.Len() != 0 {
+				t.Fatalf("code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+			}
+		})
+	}
+}
+
+type cliBootstrapStoreFake struct{}
+
+func (*cliBootstrapStoreFake) Acquire(context.Context, string) (install.UpgradeLock, error) {
+	return nil, install.ErrUpgradeJournalConflict
+}
+func (*cliBootstrapStoreFake) EnsureMarker(context.Context, string) error {
+	return install.ErrUpgradeJournalConflict
+}
+func (*cliBootstrapStoreFake) Marker(context.Context, bool) error {
+	return install.ErrUpgradeJournalConflict
+}
+func (*cliBootstrapStoreFake) Load(context.Context, string) (install.BootstrapJournalV1, error) {
+	return install.BootstrapJournalV1{}, install.ErrUpgradeJournalConflict
+}
+func (*cliBootstrapStoreFake) Create(context.Context, install.BootstrapJournalV1) error {
+	return install.ErrUpgradeJournalConflict
+}
+func (*cliBootstrapStoreFake) Save(context.Context, install.BootstrapJournalV1) error {
+	return install.ErrUpgradeJournalConflict
+}
+func (*cliBootstrapStoreFake) WriteInitialActivation(context.Context, install.BootstrapJournalV1, install.ActivationV1, []byte) (string, error) {
+	return "", install.ErrUpgradeJournalConflict
+}
+func (*cliBootstrapStoreFake) PublishInitialPointers(context.Context, install.BootstrapJournalV1, install.ActivationV1) (string, error) {
+	return "", install.ErrUpgradeJournalConflict
+}
+func (*cliBootstrapStoreFake) ReadInitialPointerState(context.Context, string) (install.BootstrapInitialPointerState, error) {
+	return install.BootstrapInitialPointerState{}, install.ErrUpgradeJournalConflict
+}
+
+type cliBootstrapServiceFake struct{}
+
+func (*cliBootstrapServiceFake) GuardEdge(context.Context) error      { return nil }
+func (*cliBootstrapServiceFake) EnableInternal(context.Context) error { return nil }
+func (*cliBootstrapServiceFake) StartInternal(context.Context) error  { return nil }
+func (*cliBootstrapServiceFake) HealthInternal(context.Context) error { return nil }
+func (*cliBootstrapServiceFake) EnableEdge(context.Context) error     { return nil }
+func (*cliBootstrapServiceFake) StartEdge(context.Context) error      { return nil }
+func (*cliBootstrapServiceFake) HealthEdge(context.Context) error     { return nil }
+func (*cliBootstrapServiceFake) Capture(context.Context) (install.ServiceSnapshotV1, error) {
+	return install.ServiceSnapshotV1{}, nil
+}
+
+type cliBootstrapDatabaseFake struct{}
+
+func (*cliBootstrapDatabaseFake) Create(context.Context) (install.BootstrapCandidateDatabase, error) {
+	return install.BootstrapCandidateDatabase{}, install.ErrPostgresOutcomeUnknown
+}
+func (*cliBootstrapDatabaseFake) Migrate(context.Context, install.BootstrapCandidateDatabase) (install.BootstrapDatabaseResult, error) {
+	return install.BootstrapDatabaseResult{}, install.ErrPostgresOutcomeUnknown
+}
+
+func TestProductionBootstrapRuntimeUsesFixedConstructionAndCloseOrder(t *testing.T) {
+	events := []string{}
+	request := testBootstrapRequest()
+	deps := productionBootstrapRuntimeDependencies{
+		verifyExecutable: func() error { events = append(events, "executable"); return nil },
+		verifyBootArtifacts: func(_ context.Context, active bool) error {
+			events = append(events, "boot")
+			if active {
+				t.Fatal("fresh bootstrap required active safe target")
+			}
+			return nil
+		},
+		openStore: func() (install.BootstrapEngineStore, func() error, error) {
+			events = append(events, "store")
+			return &cliBootstrapStoreFake{}, func() error { events = append(events, "store-close"); return nil }, nil
+		},
+		openService: func() (install.BootstrapServiceDriver, func() error, error) {
+			events = append(events, "service")
+			return &cliBootstrapServiceFake{}, func() error { events = append(events, "service-close"); return nil }, nil
+		},
+		openDatabase: func(input install.BootstrapDatabaseInput) (install.BootstrapDatabaseDriver, func() error, error) {
+			events = append(events, "database")
+			if input.TransactionID != request.TransactionID || input.Release != request.Release {
+				t.Fatalf("input=%+v", input)
+			}
+			return &cliBootstrapDatabaseFake{}, func() error { events = append(events, "database-close"); return nil }, nil
+		},
+		now: func() time.Time { return time.Unix(1, 0).UTC() },
+	}
+	runtime, err := newProductionBootstrapRuntimeWithDependencies(context.Background(), deps)
+	if err != nil || strings.Join(events, ",") != "executable,boot,store,service" {
+		t.Fatalf("construct events=%v err=%v", events, err)
+	}
+	if err := runtime.bootstrap(context.Background(), request); !errors.Is(err, install.ErrBootstrapConflict) || strings.Join(events, ",") != "executable,boot,store,service,database,database-close" {
+		t.Fatalf("run events=%v err=%v", events, err)
+	}
+	if err := runtime.close(); err != nil || strings.Join(events, ",") != "executable,boot,store,service,database,database-close,service-close,store-close" {
+		t.Fatalf("close events=%v err=%v", events, err)
+	}
+}
+
+func TestProductionBootstrapRuntimeStopsBeforeStoreOnBootArtifactFailure(t *testing.T) {
+	opened := false
+	deps := productionBootstrapRuntimeDependencies{
+		verifyExecutable:    func() error { return nil },
+		verifyBootArtifacts: func(context.Context, bool) error { return errBootUnitFilesUnavailable },
+		openStore: func() (install.BootstrapEngineStore, func() error, error) {
+			opened = true
+			return nil, nil, errors.New("must not open")
+		},
+		openService: func() (install.BootstrapServiceDriver, func() error, error) {
+			return nil, nil, errors.New("must not open")
+		},
+		openDatabase: func(install.BootstrapDatabaseInput) (install.BootstrapDatabaseDriver, func() error, error) {
+			return nil, nil, errors.New("must not open")
+		},
+		now: time.Now,
+	}
+	if _, err := newProductionBootstrapRuntimeWithDependencies(context.Background(), deps); !errors.Is(err, errBootUnitFilesUnavailable) || opened {
+		t.Fatalf("err=%v opened=%v", err, opened)
 	}
 }
 

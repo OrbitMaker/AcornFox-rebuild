@@ -82,6 +82,9 @@ func (e *BootstrapEngine) Run(ctx context.Context, request BootstrapRequest) (re
 	}
 	lock, err := e.Store.Acquire(ctx, request.TransactionID)
 	if err != nil {
+		if errors.Is(err, ErrUpgradeLocked) {
+			return ErrUpgradeLocked
+		}
 		return ErrBootstrapConflict
 	}
 	defer func() {

@@ -56,9 +56,11 @@ type upgradeCommandConfig struct {
 	reason         string
 	expectLegacy   bool
 	pending        bool
+	confirmation   string
 }
 
 type upgradeRuntime struct {
+	bootstrap        func(context.Context, install.BootstrapRequest) error
 	preflight        func(context.Context, install.UpgradeRequest) (install.UpgradeEligibilityV1, error)
 	run              func(context.Context, install.UpgradeRequest) error
 	recover          func(context.Context, string) error
@@ -84,6 +86,17 @@ type upgradeDependencies struct {
 	newPrepareRuntime         func(context.Context) (upgradeRuntime, error)
 	newFinalizeRuntime        func(context.Context) (upgradeRuntime, error)
 	newBackupRuntime          func(context.Context) (upgradeRuntime, error)
+	deriveBootstrap           func(upgradeCommandConfig) (install.BootstrapRequest, error)
+	newBootstrapRuntime       func(context.Context) (upgradeRuntime, error)
+}
+
+type productionBootstrapRuntimeDependencies struct {
+	verifyExecutable    func() error
+	verifyBootArtifacts func(context.Context, bool) error
+	openStore           func() (install.BootstrapEngineStore, func() error, error)
+	openService         func() (install.BootstrapServiceDriver, func() error, error)
+	openDatabase        func(install.BootstrapDatabaseInput) (install.BootstrapDatabaseDriver, func() error, error)
+	now                 func() time.Time
 }
 
 // productionRuntimeDependencies is a private construction seam. It proves the
@@ -170,6 +183,10 @@ func productionUpgradeDependencies() upgradeDependencies {
 		newPrepareRuntime:         newProductionPrepareRuntime,
 		newFinalizeRuntime:        newProductionFinalizeRuntime,
 		newBackupRuntime:          newProductionBackupRuntime,
+		deriveBootstrap: func(config upgradeCommandConfig) (install.BootstrapRequest, error) {
+			return install.DeriveProductionBootstrapRequest(config.manifestSHA256, config.confirmation)
+		},
+		newBootstrapRuntime: newProductionBootstrapRuntime,
 	}
 }
 
@@ -269,6 +286,8 @@ func runWithDependenciesCore(ctx context.Context, args []string, stdout, stderr 
 	}
 	constructor := deps.newRuntime
 	switch config.command {
+	case "bootstrap-native":
+		constructor = deps.newBootstrapRuntime
 	case "status":
 		constructor = deps.newStatusRuntime
 	case "backup-create", "backup-status":
@@ -278,7 +297,7 @@ func runWithDependenciesCore(ctx context.Context, args []string, stdout, stderr 
 	case "recover-finalize":
 		constructor = deps.newFinalizeRuntime
 	}
-	if constructor == nil || ((config.command == "preflight" || config.command == "run") && deps.derive == nil) {
+	if constructor == nil || ((config.command == "preflight" || config.command == "run") && deps.derive == nil) || (config.command == "bootstrap-native" && deps.deriveBootstrap == nil) {
 		return writeUpgradeError(stderr, exitInternal, "internal_error")
 	}
 	runtime, err := constructor(ctx)
@@ -297,6 +316,18 @@ func runWithDependenciesCore(ctx context.Context, args []string, stdout, stderr 
 		return runUpgradeStatus(ctx, stdout, stderr, runtime, config)
 	}
 	switch config.command {
+	case "bootstrap-native":
+		request, err := deps.deriveBootstrap(config)
+		if err != nil {
+			return writeUpgradeError(stderr, exitIneligible, "bootstrap_identity_ineligible")
+		}
+		if runtime.bootstrap == nil {
+			return writeUpgradeError(stderr, exitInternal, "runtime_unavailable")
+		}
+		if err := runtime.bootstrap(ctx, request); err != nil {
+			return writeBootstrapError(stderr, err)
+		}
+		return writeUpgradeJSON(stdout, exitOK, map[string]any{"ok": true, "command": config.command, "state": install.BootstrapCommitted})
 	case "backup-create":
 		if runtime.backupCreate == nil {
 			return writeUpgradeError(stderr, exitInternal, "runtime_unavailable")
@@ -431,6 +462,19 @@ func writeBackupError(stdout io.Writer, err error) int {
 	return writeUpgradeError(stdout, exitInternal, "backup_unavailable")
 }
 
+func writeBootstrapError(stdout io.Writer, err error) int {
+	if errors.Is(err, install.ErrUpgradeLocked) {
+		return writeUpgradeError(stdout, exitLocked, "bootstrap_locked")
+	}
+	if errors.Is(err, install.ErrBootstrapConflict) || errors.Is(err, install.ErrUpgradeJournalConflict) || errors.Is(err, install.ErrCandidateConflict) {
+		return writeUpgradeError(stdout, exitConflict, "bootstrap_conflict")
+	}
+	if errors.Is(err, install.ErrBootstrapRecoveryRequired) {
+		return writeUpgradeError(stdout, exitRecovery, "bootstrap_recovery_required")
+	}
+	return writeUpgradeError(stdout, exitInternal, "bootstrap_unavailable")
+}
+
 func runUpgradeStatus(ctx context.Context, stdout, stderr io.Writer, runtime upgradeRuntime, config upgradeCommandConfig) int {
 	if runtime.status == nil || runtime.pending == nil {
 		return writeUpgradeError(stderr, exitInternal, "runtime_unavailable")
@@ -499,6 +543,25 @@ func parseUpgradeArgs(args []string) (upgradeCommandConfig, error) {
 	case "prepare-control":
 		if len(args) != 1 {
 			return upgradeCommandConfig{}, errors.New("prepare-control takes no flags")
+		}
+	case "bootstrap-native":
+		for index := 1; index < len(args); index++ {
+			if index+1 >= len(args) {
+				return upgradeCommandConfig{}, errors.New("flag value required")
+			}
+			flag, value := args[index], args[index+1]
+			index++
+			switch flag {
+			case "--expected-manifest-sha256":
+				config.manifestSHA256 = value
+			case "--confirm-installation-id":
+				config.confirmation = value
+			default:
+				return upgradeCommandConfig{}, errors.New("unsupported flag")
+			}
+		}
+		if !validCLISHA(config.manifestSHA256) || !validBootstrapConfirmation(config.confirmation) || !containsExactly(args[1:], "--expected-manifest-sha256", "--confirm-installation-id") {
+			return upgradeCommandConfig{}, errors.New("invalid bootstrap command")
 		}
 	case "preflight", "run":
 		for index := 1; index < len(args); index++ {
@@ -644,6 +707,19 @@ func validCLIBackupID(value string) bool {
 	return strings.HasPrefix(value, "backup-") && validCLIIdentifier(value)
 }
 
+func validBootstrapConfirmation(value string) bool {
+	const prefix = "BOOTSTRAP:"
+	if !strings.HasPrefix(value, prefix) || len(value) != len(prefix)+48 {
+		return false
+	}
+	for _, character := range value[len(prefix):] {
+		if !(character >= '0' && character <= '9' || character >= 'a' && character <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 func validCLISHA(value string) bool {
 	if len(value) != 64 {
 		return false
@@ -662,6 +738,87 @@ func deriveProductionIdentity(config upgradeCommandConfig) (install.UpgradeCLIId
 		return install.UpgradeCLIIdentity{}, err
 	}
 	return install.DeriveUpgradeCLIIdentity(config.transactionID, release)
+}
+
+func newProductionBootstrapRuntime(ctx context.Context) (upgradeRuntime, error) {
+	return newProductionBootstrapRuntimeWithDependencies(ctx, productionBootstrapRuntimeDeps())
+}
+
+func productionBootstrapRuntimeDeps() productionBootstrapRuntimeDependencies {
+	return productionBootstrapRuntimeDependencies{
+		verifyExecutable:    func() error { return verifyProductionUpgradeExecutable(productionUpgradeExecutable) },
+		verifyBootArtifacts: verifyProductionBootArtifacts,
+		openStore: func() (install.BootstrapEngineStore, func() error, error) {
+			store, err := install.ProductionBootstrapStore()
+			if err != nil {
+				return nil, nil, err
+			}
+			return store, store.Close, nil
+		},
+		openService: func() (install.BootstrapServiceDriver, func() error, error) {
+			service, err := install.ProductionBootstrapServiceAdapter()
+			if err != nil {
+				return nil, nil, err
+			}
+			return service, service.Close, nil
+		},
+		openDatabase: func(input install.BootstrapDatabaseInput) (install.BootstrapDatabaseDriver, func() error, error) {
+			database, err := install.ProductionBootstrapDatabase(input)
+			if err != nil {
+				return nil, nil, err
+			}
+			return database, database.Close, nil
+		},
+		now: func() time.Time { return time.Now().UTC() },
+	}
+}
+
+func newProductionBootstrapRuntimeWithDependencies(ctx context.Context, deps productionBootstrapRuntimeDependencies) (upgradeRuntime, error) {
+	if deps.verifyExecutable == nil || deps.verifyBootArtifacts == nil || deps.openStore == nil || deps.openService == nil || deps.openDatabase == nil || deps.now == nil {
+		return upgradeRuntime{}, errors.New("invalid bootstrap runtime dependencies")
+	}
+	if deps.verifyExecutable() != nil {
+		return upgradeRuntime{}, errBootExecutableUnavailable
+	}
+	if err := deps.verifyBootArtifacts(ctx, false); err != nil {
+		if runtimeConstructionErrorCode(err) != "runtime_unavailable" {
+			return upgradeRuntime{}, err
+		}
+		return upgradeRuntime{}, errBootArtifactsUnavailable
+	}
+	store, closeStore, err := deps.openStore()
+	if err != nil || store == nil || closeStore == nil {
+		return upgradeRuntime{}, errBootStoreUnavailable
+	}
+	services, closeServices, err := deps.openService()
+	if err != nil || services == nil || closeServices == nil {
+		_ = closeStore()
+		return upgradeRuntime{}, errBootServiceUnavailable
+	}
+	runtime := upgradeRuntime{close: func() error {
+		first := closeServices()
+		if closeErr := closeStore(); first == nil {
+			first = closeErr
+		}
+		return first
+	}}
+	runtime.bootstrap = func(callCtx context.Context, request install.BootstrapRequest) error {
+		database, closeDatabase, err := deps.openDatabase(install.BootstrapDatabaseInput{TransactionID: request.TransactionID, InstallationIDSHA256: request.InstallationIDSHA256, CandidateActivationID: request.CandidateActivationID, Release: request.Release})
+		if err != nil || database == nil || closeDatabase == nil {
+			return install.ErrBootstrapConflict
+		}
+		engine := &install.BootstrapEngine{Store: store, Database: database, Services: services, Now: deps.now}
+		runErr := engine.Run(callCtx, request)
+		closeErr := closeDatabase()
+		if runErr != nil {
+			return runErr
+		}
+		if closeErr != nil {
+			return install.ErrBootstrapRecoveryRequired
+		}
+		return nil
+	}
+	return runtime, nil
 }
 
 func newProductionRuntime(ctx context.Context) (upgradeRuntime, error) {
