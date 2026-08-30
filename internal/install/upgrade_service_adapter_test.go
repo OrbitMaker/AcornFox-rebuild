@@ -118,7 +118,11 @@ func TestUpgradeServiceAdapterHealthTargetsAndSafeFailures(t *testing.T) {
 	if err := adapter.HealthRestoredEdge(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if want := []string{"/healthz", "/readyz"}; !reflect.DeepEqual(serverPaths, want) {
+	adapter.restoredInternal.Server.Active = true
+	if err := adapter.HealthLegacyRestoredInternal(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"/healthz", "/readyz", "/healthz"}; !reflect.DeepEqual(serverPaths, want) {
 		t.Fatalf("server health targets = %v, want %v", serverPaths, want)
 	}
 	if want := []string{"/healthz", "/config/"}; !reflect.DeepEqual(edgePaths, want) {
@@ -354,6 +358,9 @@ func TestUpgradeServiceAdapterRestoreInternalPolicyOrderAndHealth(t *testing.T) 
 		t.Fatal(err)
 	}
 	if err := adapter.HealthRestoredInternal(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := adapter.HealthLegacyRestoredInternal(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if len(paths) != 0 {

@@ -287,6 +287,23 @@ func (a *UpgradeServiceAdapter) HealthRestoredInternal(ctx context.Context) erro
 	return a.HealthInternal(ctx)
 }
 
+// HealthLegacyRestoredInternal uses only the unauthenticated liveness route
+// exposed by the pinned RC0 server. Its /readyz route is behind the legacy
+// authentication middleware, so probing it without credentials would reject
+// a healthy rollback forever. Native activations continue to require both
+// health and readiness through HealthRestoredInternal.
+func (a *UpgradeServiceAdapter) HealthLegacyRestoredInternal(ctx context.Context) error {
+	if a == nil || a.controller == nil {
+		return ErrServiceOutcomeUnknown
+	}
+	if !a.restoredInternal.Server.Active {
+		return nil
+	}
+	retryCtx, cancel := a.healthRetryContext(ctx)
+	defer cancel()
+	return a.probeHealth(retryCtx, a.probes.ServerHealth)
+}
+
 // RestoreEdge applies enablement before the final active/inactive action.
 // It never probes health: UpgradeEngine owns the one post-restore edge probe.
 func (a *UpgradeServiceAdapter) RestoreEdge(ctx context.Context, snapshot ServiceSnapshotV1) error {

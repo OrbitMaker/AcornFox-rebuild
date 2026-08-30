@@ -206,7 +206,7 @@ func TestFinalizeBootTerminalPoliciesAndPublicOrdering(t *testing.T) {
 				if eventIndex(*events, "internal:start") < 0 || eventIndex(*events, "internal:health") < 0 || eventIndex(*events, "marker:off") > eventIndex(*events, "edge:start") {
 					t.Fatalf("committed finalization order=%v", *events)
 				}
-			} else if eventIndex(*events, "restore:snapshot") < 0 || eventIndex(*events, "restore:internal-health") < 0 || eventIndex(*events, "marker:off") < 0 || eventIndex(*events, "edge:health") < 0 || eventIndex(*events, "restore:edge-health") >= 0 {
+			} else if eventIndex(*events, "restore:snapshot") < 0 || eventIndex(*events, "restore:internal-health") < 0 || eventIndex(*events, "restore:legacy-internal-health") >= 0 || eventIndex(*events, "marker:off") < 0 || eventIndex(*events, "edge:health") < 0 || eventIndex(*events, "restore:edge-health") >= 0 {
 				t.Fatalf("native old finalization missing current Edge health=%v", *events)
 			}
 		})
@@ -227,8 +227,8 @@ func TestFinalizeBootLegacyRollbackUsesRC0CompatibleEdgeReadiness(t *testing.T) 
 	if err != nil || result.State != JournalRolledBack || result.MarkerRetained || store.state.Marker {
 		t.Fatalf("result=%+v err=%v state=%+v events=%v", result, err, store.state, *events)
 	}
-	if eventIndex(*events, "restore:edge-health") < 0 || eventIndex(*events, "edge:health") >= 0 {
-		t.Fatalf("legacy rollback used candidate Edge health contract: %v", *events)
+	if eventIndex(*events, "restore:legacy-internal-health") < 0 || eventIndex(*events, "restore:internal-health") >= 0 || eventIndex(*events, "restore:edge-health") < 0 || eventIndex(*events, "edge:health") >= 0 {
+		t.Fatalf("legacy rollback used a native health contract: %v", *events)
 	}
 }
 

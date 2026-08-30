@@ -914,7 +914,8 @@ func (s *gate5BServices) RestoreSnapshot(context.Context, install.ServiceSnapsho
 	s.restored = true
 	return nil
 }
-func (*gate5BServices) HealthRestoredInternal(context.Context) error { return nil }
+func (*gate5BServices) HealthRestoredInternal(context.Context) error       { return nil }
+func (*gate5BServices) HealthLegacyRestoredInternal(context.Context) error { return nil }
 func (s *gate5BServices) RestoreEdge(context.Context, install.ServiceSnapshotV1) error {
 	s.restored = true
 	return nil

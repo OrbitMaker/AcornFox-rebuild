@@ -878,6 +878,9 @@ func (*cliServiceFake) RestoreSnapshot(context.Context, install.ServiceSnapshotV
 	return errors.New("not used")
 }
 func (*cliServiceFake) HealthRestoredInternal(context.Context) error { return errors.New("not used") }
+func (*cliServiceFake) HealthLegacyRestoredInternal(context.Context) error {
+	return errors.New("not used")
+}
 func (*cliServiceFake) RestoreEdge(context.Context, install.ServiceSnapshotV1) error {
 	return errors.New("not used")
 }

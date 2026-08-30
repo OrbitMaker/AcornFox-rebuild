@@ -196,6 +196,7 @@ type UpgradeServiceDriver interface {
 	ValidateEdgeConfig(context.Context, EdgeConfigTransitionV1, ArtifactV1) (EdgeConfigValidationV1, error)
 	RestoreSnapshot(context.Context, ServiceSnapshotV1) error
 	HealthRestoredInternal(context.Context) error
+	HealthLegacyRestoredInternal(context.Context) error
 	RestoreEdge(context.Context, ServiceSnapshotV1) error
 	HealthRestoredEdge(context.Context) error
 }
@@ -754,7 +755,7 @@ func (e *UpgradeEngine) abortPreSwitch(ctx context.Context, j *UpgradeJournalV1,
 	if err := e.Services.RestoreSnapshot(ctx, j.ServiceSnapshot); err != nil {
 		return e.recoveryRequired(ctx, j, phase, code, err)
 	}
-	if err := e.Services.HealthRestoredInternal(ctx); err != nil {
+	if err := e.healthRestoredInternal(ctx, j); err != nil {
 		return e.recoveryRequired(ctx, j, phase, code, err)
 	}
 	if err := e.Store.Marker(ctx, false); err != nil {
@@ -800,7 +801,7 @@ func (e *UpgradeEngine) rollback(ctx context.Context, j *UpgradeJournalV1, old A
 	if err := e.Services.RestoreSnapshot(ctx, j.ServiceSnapshot); err != nil {
 		return e.recoveryRequired(ctx, j, phase, code, err)
 	}
-	if err := e.Services.HealthRestoredInternal(ctx); err != nil {
+	if err := e.healthRestoredInternal(ctx, j); err != nil {
 		return e.recoveryRequired(ctx, j, phase, code, err)
 	}
 	if err := e.Store.Marker(ctx, false); err != nil {
@@ -1350,7 +1351,7 @@ func (e *UpgradeEngine) restoreOldServices(ctx context.Context, j *UpgradeJourna
 	if err := e.Services.RestoreSnapshot(ctx, j.ServiceSnapshot); err != nil {
 		return err
 	}
-	if err := e.Services.HealthRestoredInternal(ctx); err != nil {
+	if err := e.healthRestoredInternal(ctx, j); err != nil {
 		return err
 	}
 	if err := e.Store.Marker(ctx, false); err != nil {
@@ -1370,6 +1371,13 @@ func (e *UpgradeEngine) healthRestoredEdge(ctx context.Context, j *UpgradeJourna
 		return e.Services.HealthRestoredEdge(ctx)
 	}
 	return e.Services.HealthEdge(ctx)
+}
+
+func (e *UpgradeEngine) healthRestoredInternal(ctx context.Context, j *UpgradeJournalV1) error {
+	if j != nil && j.PlannedOldActivation != nil && j.PlannedOldActivation.LegacyProjection != nil {
+		return e.Services.HealthLegacyRestoredInternal(ctx)
+	}
+	return e.Services.HealthRestoredInternal(ctx)
 }
 
 func (e *UpgradeEngine) convergeCommittedPublic(ctx context.Context, j *UpgradeJournalV1, tx, markerTx string) error {

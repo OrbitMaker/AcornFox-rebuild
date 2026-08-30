@@ -456,6 +456,9 @@ func (s *engineServiceFake) RestoreSnapshot(context.Context, ServiceSnapshotV1) 
 func (s *engineServiceFake) HealthRestoredInternal(context.Context) error {
 	return s.event("restore:internal-health")
 }
+func (s *engineServiceFake) HealthLegacyRestoredInternal(context.Context) error {
+	return s.event("restore:legacy-internal-health")
+}
 func (s *engineServiceFake) RestoreEdge(context.Context, ServiceSnapshotV1) error {
 	return s.event("restore:edge")
 }
