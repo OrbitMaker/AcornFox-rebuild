@@ -1177,6 +1177,30 @@ func (s *UpgradeStore) validateActivationLayout() error {
 	return nil
 }
 
+// ensureActivationLayout creates the activation collection at the first
+// journaled projection boundary.  A valid RC0 split layout has no collection
+// yet, while native installs and recovery retries may already have the exact
+// root-owned 0711 directory.
+func (s *UpgradeStore) ensureActivationLayout() error {
+	if err := s.validateActivationRoot(); err != nil {
+		return err
+	}
+	_, err := s.activationWriter.CreateChildDirectory("activations", activationSlotDirMode)
+	if err != nil {
+		if !errors.Is(err, ErrDurableCommitUnknown) || s.validateActivationLayout() != nil {
+			return err
+		}
+		// Visibility proves only that mkdir reached the live namespace; it
+		// does not prove the parent directory entry survived the failed fsync.
+		// Retry that durability boundary before native, restore, or legacy
+		// publication can journal the collection as established.
+		if syncErr := s.activationWriter.SyncRoot(); syncErr != nil {
+			return fmt.Errorf("%w: activation collection fsync retry: %v", ErrDurableCommitUnknown, syncErr)
+		}
+	}
+	return s.validateActivationLayout()
+}
+
 func (s *UpgradeStore) validateActivationDirectory(path string) error {
 	if s == nil || s.activationWriter == nil || cleanRelative(path) != nil {
 		return ErrUpgradeJournalConflict
@@ -1220,7 +1244,7 @@ func (s *UpgradeStore) createActivationDirectory(id string) (bool, error) {
 	if !validID(id) {
 		return false, ErrUpgradeJournalConflict
 	}
-	if err := s.validateActivationLayout(); err != nil {
+	if err := s.ensureActivationLayout(); err != nil {
 		return false, err
 	}
 	collection, err := s.activationWriter.OpenChildWriter("activations", activationSlotDirMode)

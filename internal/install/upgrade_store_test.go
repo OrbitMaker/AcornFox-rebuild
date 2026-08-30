@@ -27,6 +27,10 @@ type legacyVerifierFake struct {
 	err               error
 }
 
+type alwaysSyncFaultOps struct{ durableOps }
+
+func (o *alwaysSyncFaultOps) Sync(*os.File) error { return errors.New("injected sync failure") }
+
 func prepareTaskLock(t *testing.T, root string) {
 	t.Helper()
 	if err := PrepareTaskUpgradeLock(root, os.Getuid(), os.Getgid()); err != nil {
@@ -1454,6 +1458,125 @@ func TestLegacyPrepareFinalizeEndToEnd(t *testing.T) {
 		if strings.Contains(string(raw), "postgresql://") || strings.Contains(string(raw), "user:pass") {
 			t.Fatal("secret leaked in JSON")
 		}
+	}
+}
+
+func TestPrepareLegacyProjectionCreatesMissingActivationCollection(t *testing.T) {
+	store, root, preflight, activation, _, _, cleanup := legacyStoreForProjectionFixture(t, false)
+	defer cleanup()
+	collection := filepath.Join(root, "opt/open-card/activations")
+	if err := os.Remove(collection); err != nil {
+		t.Fatal(err)
+	}
+	observation, err := store.PrepareLegacyProjection(context.Background(), *preflight.Legacy, activation)
+	if err != nil || observation.ActivationID != activation.ActivationID {
+		t.Fatalf("observation=%#v err=%v", observation, err)
+	}
+	info, err := os.Lstat(collection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.IsDir() || info.Mode().Perm() != activationSlotDirMode {
+		t.Fatalf("collection mode=%v", info.Mode())
+	}
+	if target, err := os.Readlink(filepath.Join(root, "opt/open-card/active")); err != nil || target != "activations/"+activation.ActivationID {
+		t.Fatalf("active target=%q err=%v", target, err)
+	}
+}
+
+func TestPrepareLegacyProjectionReconcilesCollectionSyncUnknown(t *testing.T) {
+	store, root, preflight, activation, _, _, cleanup := legacyStoreForProjectionFixture(t, false)
+	defer cleanup()
+	collection := filepath.Join(root, "opt/open-card/activations")
+	if err := os.Remove(collection); err != nil {
+		t.Fatal(err)
+	}
+	writer, fault := renameHookWriter(t, filepath.Join(root, "opt/open-card"))
+	fault.fail = "link-parent-fsync"
+	old := store.activationWriter
+	store.activationWriter = writer
+	defer func() {
+		store.activationWriter = old
+		_ = writer.Close()
+	}()
+	observation, err := store.PrepareLegacyProjection(context.Background(), *preflight.Legacy, activation)
+	if err != nil || observation.ActivationID != activation.ActivationID || fault.syncCalls < 1 {
+		t.Fatalf("observation=%#v sync_calls=%d err=%v", observation, fault.syncCalls, err)
+	}
+	if target, err := os.Readlink(filepath.Join(root, "opt/open-card/active")); err != nil || target != "activations/"+activation.ActivationID {
+		t.Fatalf("active target=%q err=%v", target, err)
+	}
+}
+
+func TestWriteCandidateActivationDurablyReconcilesMissingCollection(t *testing.T) {
+	store, root, activation, env, cleanup := candidateStore(t)
+	defer cleanup()
+	if err := os.Remove(filepath.Join(root, "opt/open-card/activations")); err != nil {
+		t.Fatal(err)
+	}
+	writer, fault := renameHookWriter(t, filepath.Join(root, "opt/open-card"))
+	fault.fail = "link-parent-fsync"
+	old := store.activationWriter
+	store.activationWriter = writer
+	defer func() {
+		store.activationWriter = old
+		_ = writer.Close()
+	}()
+	lock := acquireCandidate(t, store)
+	defer lock.Release()
+	digest, err := store.WriteCandidateActivation(context.Background(), activation, env)
+	if err != nil || !validSHA(digest) || fault.syncCalls < 2 {
+		t.Fatalf("digest=%q sync_calls=%d err=%v", digest, fault.syncCalls, err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "opt/open-card/activations", activation.ActivationID, "activation.json")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWriteCandidateActivationPropagatesCollectionSyncRetryFailure(t *testing.T) {
+	store, root, activation, env, cleanup := candidateStore(t)
+	defer cleanup()
+	collection := filepath.Join(root, "opt/open-card/activations")
+	if err := os.Remove(collection); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := os.OpenRoot(filepath.Join(root, "opt/open-card"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := realDurableOps{durableRoot: osDurableRoot{root: opened}}
+	writer, err := newDurableWriter(filepath.Join(root, "opt/open-card"), os.Getuid(), os.Getgid(), &alwaysSyncFaultOps{durableOps: base})
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := store.activationWriter
+	store.activationWriter = writer
+	defer func() {
+		store.activationWriter = old
+		_ = writer.Close()
+	}()
+	lock := acquireCandidate(t, store)
+	defer lock.Release()
+	if _, err := store.WriteCandidateActivation(context.Background(), activation, env); !errors.Is(err, ErrDurableCommitUnknown) {
+		t.Fatalf("sync retry failure=%v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(collection, activation.ActivationID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("activation slot published after failed collection durability: %v", err)
+	}
+}
+
+func TestPrepareLegacyProjectionRejectsWrongActivationCollectionMode(t *testing.T) {
+	store, root, preflight, activation, _, _, cleanup := legacyStoreForProjectionFixture(t, false)
+	defer cleanup()
+	collection := filepath.Join(root, "opt/open-card/activations")
+	if err := os.Remove(collection); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(collection, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.PrepareLegacyProjection(context.Background(), *preflight.Legacy, activation); !errors.Is(err, ErrUpgradeJournalConflict) {
+		t.Fatalf("wrong activation collection mode accepted: %v", err)
 	}
 }
 
