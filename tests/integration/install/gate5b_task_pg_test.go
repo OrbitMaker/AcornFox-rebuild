@@ -461,11 +461,11 @@ func (f *gate5BFixture) databaseSession(tx, activationID, candidate string, rele
 	f.t.Helper()
 	artifactRoot := filepath.Join(f.root, "artifacts")
 	artifactDir := filepath.Join(artifactRoot, tx)
-	if err := os.MkdirAll(artifactDir, 0o700); err != nil {
+	if err := os.MkdirAll(artifactDir, 0o711); err != nil {
 		f.t.Fatal(err)
 	}
-	for _, path := range []string{artifactRoot, artifactDir} {
-		if err := os.Chmod(path, 0o700); err != nil {
+	for path, mode := range map[string]os.FileMode{artifactRoot: 0o700, artifactDir: 0o711} {
+		if err := os.Chmod(path, mode); err != nil {
 			f.t.Fatal(err)
 		}
 		if err := os.Chown(path, os.Getuid(), os.Getgid()); err != nil {

@@ -819,7 +819,22 @@ func inspectSelectedActiveDatabase(ctx context.Context, request ActiveDatabaseIn
 }
 
 func (a *UpgradeDatabaseAdapter) Snapshot(ctx context.Context) (SnapshotEvidence, string, error) {
-	if a == nil || !secureArtifactDirectory(a.plan.ArtifactDir) {
+	if a == nil || a.plan.ArtifactWriter == nil {
+		return SnapshotEvidence{}, "", ErrPostgresOutcomeUnknown
+	}
+	if _, err := a.plan.ArtifactWriter.CreateChildDirectory(a.plan.TransactionID, activationSlotDirMode); err != nil {
+		if !errors.Is(err, ErrDurableCommitUnknown) {
+			return SnapshotEvidence{}, "", ErrPostgresOutcomeUnknown
+		}
+		if _, retryErr := a.plan.ArtifactWriter.CreateChildDirectory(a.plan.TransactionID, activationSlotDirMode); retryErr != nil {
+			return SnapshotEvidence{}, "", ErrPostgresOutcomeUnknown
+		}
+	}
+	child, err := a.plan.ArtifactWriter.OpenChildWriter(a.plan.TransactionID, activationSlotDirMode)
+	if err != nil {
+		return SnapshotEvidence{}, "", ErrPostgresOutcomeUnknown
+	}
+	if closeErr := child.Close(); closeErr != nil || !secureArtifactDirectory(a.plan.ArtifactDir) {
 		return SnapshotEvidence{}, "", ErrPostgresOutcomeUnknown
 	}
 	evidence, err := a.snapshotter.Snapshot(ctx, a.plan.TransactionID, a.plan.ArtifactDir, a.activeEnv, a.snapshot)
@@ -938,7 +953,7 @@ func (a *UpgradeDatabaseAdapter) publishRestoreDump(dump []byte, expected Snapsh
 	if a == nil || a.plan.ArtifactWriter == nil || expected.SHA256 == "" || expected.Size < 1 || int64(len(dump)) != expected.Size || sha256Bytes(dump) != expected.SHA256 {
 		return ErrPostgresOutcomeUnknown
 	}
-	child, err := a.plan.ArtifactWriter.OpenChildWriter(a.plan.TransactionID, durableDirMode)
+	child, err := a.plan.ArtifactWriter.OpenChildWriter(a.plan.TransactionID, activationSlotDirMode)
 	if err != nil {
 		return ErrPostgresOutcomeUnknown
 	}
@@ -1021,8 +1036,12 @@ func (a *UpgradeDatabaseAdapter) Validate(ctx context.Context, activationID stri
 	if err != nil {
 		return ArtifactV1{}, ErrPostgresOutcomeUnknown
 	}
-	name := filepath.ToSlash(filepath.Join(a.plan.TransactionID, "validation.json"))
-	if err := createExactValidation(a.plan.ArtifactWriter, name, raw); err != nil {
+	child, err := a.plan.ArtifactWriter.OpenChildWriter(a.plan.TransactionID, activationSlotDirMode)
+	if err != nil {
+		return ArtifactV1{}, ErrPostgresOutcomeUnknown
+	}
+	defer child.Close()
+	if err := createExactValidation(child, "validation.json", raw); err != nil {
 		return ArtifactV1{}, upgradeDatabaseError(err)
 	}
 	digest := sha256.Sum256(raw)

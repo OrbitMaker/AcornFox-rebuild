@@ -177,8 +177,25 @@ func (w *DurableWriter) CreateChildDirectory(name string, mode os.FileMode) (boo
 		if statErr != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm() != mode || verifyOwner(info, w.uid, w.gid) != nil {
 			return false, fmt.Errorf("durable child directory is unsafe")
 		}
+		directory, openErr := w.ops.OpenFile(name, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+		if openErr != nil {
+			return false, fmt.Errorf("%w: %v", ErrDurableCommitUnknown, openErr)
+		}
+		directoryInfo, statErr := w.ops.Stat(directory)
+		if statErr != nil || directoryInfo.Mode()&os.ModeSymlink != 0 || !directoryInfo.IsDir() || directoryInfo.Mode().Perm() != mode || verifyOwner(directoryInfo, w.uid, w.gid) != nil {
+			_ = w.ops.CloseFile(directory)
+			return false, fmt.Errorf("%w: durable child directory is unsafe", ErrDurableCommitUnknown)
+		}
+		if syncErr := w.ops.Sync(directory); syncErr != nil {
+			_ = w.ops.CloseFile(directory)
+			return false, fmt.Errorf("%w: %v", ErrDurableCommitUnknown, syncErr)
+		}
+		if closeErr := w.ops.CloseFile(directory); closeErr != nil {
+			return false, fmt.Errorf("%w: %v", ErrDurableCommitUnknown, closeErr)
+		}
 		// A previous call may have published the entry but lost the outcome of
-		// its parent fsync. Re-sync even for an exact existing directory.
+		// its directory or parent fsync. Re-sync both boundaries for an exact
+		// existing directory before reporting convergence.
 		if syncErr := w.SyncRoot(); syncErr != nil {
 			return false, fmt.Errorf("%w: %v", ErrDurableCommitUnknown, syncErr)
 		}

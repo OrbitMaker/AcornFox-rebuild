@@ -289,7 +289,7 @@ func adapterPlan(t *testing.T) (UpgradeDatabasePlan, *adapterValidationFake, *fa
 	artifactRoot := filepath.Join(t.TempDir(), "artifacts")
 	tx := "transaction-1"
 	artifactDir := filepath.Join(artifactRoot, tx)
-	if err := os.MkdirAll(artifactDir, 0o700); err != nil {
+	if err := os.MkdirAll(artifactDir, activationSlotDirMode); err != nil {
 		t.Fatal(err)
 	}
 	writer, err := TaskDurableWriter(artifactRoot, os.Getuid(), os.Getgid())
@@ -335,6 +335,32 @@ func adapterPlan(t *testing.T) (UpgradeDatabasePlan, *adapterValidationFake, *fa
 		Validator:                 validator,
 		ArtifactWriter:            writer,
 	}, validator, pg
+}
+
+func TestUpgradeDatabaseAdapterSnapshotCreatesTransactionArtifactDirectory(t *testing.T) {
+	plan, _, pg := adapterPlan(t)
+	if err := os.Remove(plan.ArtifactDir); err != nil {
+		t.Fatal(err)
+	}
+	active, err := PostgresEnvironment(plan.ActiveDatabaseEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter, err := TaskUpgradeDatabaseAdapter(plan, adapterControl(active), adapterSnapshotter(t, pg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer adapter.Close()
+	if _, _, err := adapter.Snapshot(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(plan.ArtifactDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.IsDir() || info.Mode().Perm() != activationSlotDirMode {
+		t.Fatalf("artifact directory mode=%v", info.Mode())
+	}
 }
 
 func adapterBackup(t *testing.T, plan UpgradeDatabasePlan, payload string) ActiveDatabaseBackupV2 {

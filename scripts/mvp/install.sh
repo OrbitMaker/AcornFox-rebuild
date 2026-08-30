@@ -389,7 +389,7 @@ prepare_upgrade_substrate() {
   prepare_upgrade_layout_directory "$prefix/activations" "$expected_owner" 711
   prepare_upgrade_layout_directory "$data_dir/backups" "$expected_owner" 700
   prepare_upgrade_layout_directory "$data_dir/upgrade-transactions" "$expected_owner" 700
-  prepare_upgrade_layout_directory "$data_dir/upgrade-artifacts" "$expected_owner" 700
+  prepare_upgrade_layout_directory "$data_dir/upgrade-artifacts" "$expected_owner" 711
   install_stable_file "$release_dir/bin/open-card-upgrade" "$upgrade_tools/open-card-upgrade" "$expected_owner" 755 "upgrade recovery binary"
   require_stable_directory "$systemd_dir" "$expected_owner" 755
   install_stable_file "$release_dir/systemd/open-card-upgrade-recover.service" "$systemd_dir/open-card-upgrade-recover.service" "$expected_owner" 644 "upgrade recovery unit"

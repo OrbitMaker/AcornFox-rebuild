@@ -211,7 +211,7 @@ func TestUpgradeStoreAcceptsInstallerRecoverySubstrateModes(t *testing.T) {
 		mode os.FileMode
 	}{
 		{"var", 0o711}, {"var/lib", 0o711}, {"var/lib/open-card", 0o711},
-		{"var/lib/open-card/upgrade-transactions", 0o700}, {"var/lib/open-card/upgrade-artifacts", 0o700},
+		{"var/lib/open-card/upgrade-transactions", 0o700}, {"var/lib/open-card/upgrade-artifacts", 0o711},
 		{"opt", 0o711}, {"opt/open-card", 0o711}, {"opt/open-card/activations", 0o711},
 		{"etc", 0o711}, {"etc/open-card", 0o700}, {"etc/systemd", 0o711}, {"etc/systemd/system", 0o755},
 	} {
@@ -1525,7 +1525,7 @@ func TestWriteCandidateActivationDurablyReconcilesMissingCollection(t *testing.T
 	lock := acquireCandidate(t, store)
 	defer lock.Release()
 	digest, err := store.WriteCandidateActivation(context.Background(), activation, env)
-	if err != nil || !validSHA(digest) || fault.syncCalls < 2 {
+	if err != nil || !validSHA(digest) || fault.syncCalls < 4 {
 		t.Fatalf("digest=%q sync_calls=%d err=%v", digest, fault.syncCalls, err)
 	}
 	if _, err := os.Lstat(filepath.Join(root, "opt/open-card/activations", activation.ActivationID, "activation.json")); err != nil {
@@ -1579,7 +1579,7 @@ func TestWriteCandidateActivationReconcilesExistingCollectionSyncUnknown(t *test
 	lock := acquireCandidate(t, store)
 	defer lock.Release()
 	digest, err := store.WriteCandidateActivation(context.Background(), activation, env)
-	if err != nil || !validSHA(digest) || fault.syncCalls < 2 {
+	if err != nil || !validSHA(digest) || fault.syncCalls < 3 {
 		t.Fatalf("digest=%q sync_calls=%d err=%v", digest, fault.syncCalls, err)
 	}
 }

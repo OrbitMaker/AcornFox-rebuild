@@ -309,7 +309,7 @@ func TestG2StageUpgradeSubstrateLeavesLegacyRuntimeUntouched(t *testing.T) {
 		"opt/open-card/activations":                                          0o711,
 		"var/lib/open-card":                                                  0o711,
 		"var/lib/open-card/upgrade-transactions":                             0o700,
-		"var/lib/open-card/upgrade-artifacts":                                0o700,
+		"var/lib/open-card/upgrade-artifacts":                                0o711,
 		"opt/open-card/upgrade-tools/open-card-upgrade":                      0o755,
 		"etc/systemd/system/open-card-upgrade-recover.service":               0o644,
 		"etc/systemd/system/open-card-upgrade-safe.target":                   0o644,

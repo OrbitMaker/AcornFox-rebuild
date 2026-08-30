@@ -1200,8 +1200,8 @@ func (s *UpgradeStore) ensureActivationLayout() error {
 		// does not prove the parent directory entry survived the failed fsync.
 		// Retry that durability boundary before native, restore, or legacy
 		// publication can journal the collection as established.
-		if syncErr := s.activationWriter.SyncRoot(); syncErr != nil {
-			return fmt.Errorf("%w: activation collection fsync retry: %v", ErrDurableCommitUnknown, syncErr)
+		if _, retryErr := s.activationWriter.CreateChildDirectory("activations", activationSlotDirMode); retryErr != nil {
+			return fmt.Errorf("%w: activation collection fsync retry: %v", ErrDurableCommitUnknown, retryErr)
 		}
 	}
 	return s.validateActivationLayout()

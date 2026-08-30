@@ -270,10 +270,10 @@ func TestCreateChildDirectoryResyncsExactExistingDirectory(t *testing.T) {
 			writer, fault := renameHookWriter(t, root)
 			defer writer.Close()
 			if failure {
-				fault.fail = "link-parent-fsync"
+				fault.fail = "directory-parent-fsync"
 			}
 			created, err := writer.CreateChildDirectory("activation", activationSlotDirMode)
-			if created || fault.syncCalls != 1 {
+			if created || fault.syncCalls != 2 {
 				t.Fatalf("created=%t sync_calls=%d err=%v", created, fault.syncCalls, err)
 			}
 			if failure && !errors.Is(err, ErrDurableCommitUnknown) {
