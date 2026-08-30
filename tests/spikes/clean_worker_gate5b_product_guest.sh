@@ -145,7 +145,7 @@ assert_no_public_acme() {
   ! journalctl --no-pager -u open-card-edge.service | grep -E 'acme-v02\.api\.letsencrypt\.org|acme\.zerossl\.com'
 }
 run_active_switch_crash() {
-  local wrapper_pid helper_pid watcher_pid tx candidate_id journal status journal_state i
+  local wrapper_pid helper_pid watcher_pid tx candidate_id journal status journal_state active_before_reboot previous_before_reboot i
   local -a helper_pids=()
   set +e
   env OPEN_CARD_ALLOW_SYSTEM_ROOT=1 bash "$rc1/release/scripts/mvp/upgrade.sh" --root / --offline --activate --expected-manifest-sha256 "$rc1_manifest_sha" --bundle "$rc1/release" --confirm-installation-id "UPGRADE:$(cat /var/lib/open-card/installation-id)" >"$evidence/production-upgrade.jsonl" 2>"$evidence/production-upgrade.stderr" &
@@ -209,12 +209,15 @@ PY
 )
   [[ "$journal_state" == VALIDATED || "$journal_state" == ACTIVE_SWITCHED ]]
   [[ "$(cat "$marker")" = "$tx" ]]
+  active_before_reboot=$(readlink /opt/open-card/active)
+  previous_before_reboot=$(readlink /opt/open-card/previous-active)
+  [[ "$active_before_reboot" = "activations/$candidate_id" && "$previous_before_reboot" =~ ^activations/legacy-[0-9a-f]{24}$ ]]
   printf '%s\n' "$tx" >"$state/crash-transaction-id"
-  printf 'scenario=active-switch-crash\ntransaction_id=%s\njournal_state_before_reboot=%s\nmarker=retained\n' "$tx" "$journal_state" >"$evidence/crash-armed-summary.txt"
+  printf 'scenario=active-switch-crash\ntransaction_id=%s\njournal_state_before_reboot=%s\nactive_before_reboot=%s\nprevious_before_reboot=%s\nmarker=retained\n' "$tx" "$journal_state" "$active_before_reboot" "$previous_before_reboot" >"$evidence/crash-armed-summary.txt"
   printf 'G5B_PRODUCT_CRASH_ARMED=PASS\n'
 }
 post_reboot_crash() {
-  local tx journal active previous old_activation candidate_activation old_database candidate_database db_password old_url
+  local tx journal active previous old_activation candidate_activation old_database candidate_database db_password old_url old_sentinel candidate_rows
   phase=post_reboot_crash
   assert_legacy_runtime_services
   tx=$(cat "$state/crash-transaction-id")
@@ -243,10 +246,12 @@ PY
 )
   db_password=$(cat /etc/open-card/postgres-password)
   old_url="postgresql://opencard:${db_password}@127.0.0.1:5432/${old_database}?sslmode=disable"
-  [[ "$(psql "$old_url" -X -Aqt -c 'SELECT value FROM gate5b_success_sentinel WHERE id=1')" = rc0-before-upgrade ]]
-  [[ "$(runuser -u postgres -- psql -d "$candidate_database" -X -Aqt -c 'SELECT count(*) FROM schema_migrations')" = 24 ]]
+  old_sentinel=$(psql "$old_url" -X -Aqt -c 'SELECT value FROM gate5b_success_sentinel WHERE id=1')
+  candidate_rows=$(runuser -u postgres -- psql -d "$candidate_database" -X -Aqt -c 'SELECT count(*) FROM schema_migrations')
+  [[ "$old_sentinel" = rc0-before-upgrade && "$candidate_rows" = 24 ]]
   [[ ! -e "$marker" && ! -L "$marker" ]]
   assert_no_public_acme
+  printf 'active=%s\nprevious_active=%s\nold_database=%s\ncandidate_database=%s\nold_sentinel=%s\ncandidate_schema_rows=%s\nmarker=absent\nedge=active\npublic_ca_requests=absent\n' "$active" "$previous" "$old_database" "$candidate_database" "$old_sentinel" "$candidate_rows" >"$evidence/crash-recovery-facts.txt"
   printf 'crash_recovery=PASS\njournal_state=ROLLED_BACK\nmarker=absent\nedge=active\ncandidate_retained=PASS\npublic_dns_acme_customer_acceptance=PENDING\n' >"$evidence/crash-recovery-summary.txt"
   ! grep -R -a -E 'postgres(ql)?://|OPEN_CARD_DATABASE_URL=|BEGIN [A-Z ]*PRIVATE KEY|password=' "$evidence"
   (cd "$evidence" && find . -type f ! -name manifest.sha256 -print0 | LC_ALL=C sort -z | xargs -0 sha256sum >manifest.sha256)
