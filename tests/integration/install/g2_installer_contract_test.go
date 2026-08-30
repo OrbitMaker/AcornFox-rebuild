@@ -128,9 +128,32 @@ func TestG2CandidateStagesEdgeAndRequires0024WithoutActivation(t *testing.T) {
 			t.Fatalf("stable %s mode=%v err=%v", relative, info.Mode(), err)
 		}
 	}
+	for _, relative := range []string{"opt/open-card", "opt/open-card/releases", "opt/open-card/releases/release-0.8.0-rc.1"} {
+		path := filepath.Join(root, filepath.FromSlash(relative))
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("runtime directory %s: %v", relative, err)
+		}
+		if !info.IsDir() || info.Mode().Perm() != 0o755 {
+			t.Fatalf("runtime directory %s mode=%v", relative, info.Mode())
+		}
+		if err := os.Chmod(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
 	replay := exec.Command("bash", filepath.Join(repo, "scripts", "mvp", "install.sh"), "--root", root, "--bundle", bundle, "--migration-command", migrate, "--migration-dir", migrations, "--test-safe-prefix", directory)
 	if output, err := replay.CombinedOutput(); err != nil || !strings.Contains(string(output), "idempotent") {
 		t.Fatalf("candidate replay: %v\n%s", err, output)
+	}
+	for _, relative := range []string{"opt/open-card", "opt/open-card/releases", "opt/open-card/releases/release-0.8.0-rc.1"} {
+		path := filepath.Join(root, filepath.FromSlash(relative))
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("reconciled runtime directory %s: %v", relative, err)
+		}
+		if !info.IsDir() || info.Mode().Perm() != 0o755 {
+			t.Fatalf("reconciled runtime directory %s mode=%v", relative, info.Mode())
+		}
 	}
 	if value, err := os.ReadFile(filepath.Join(root, "var/lib/open-card/migration.version")); err != nil || string(value) != "0024\n" {
 		t.Fatalf("migration state=%q err=%v", value, err)

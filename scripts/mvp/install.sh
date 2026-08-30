@@ -647,11 +647,18 @@ else
     fi
     assert_no_symlink_components "$releases"
     stage_dir=$(mktemp -d "$releases/.staging-$release_name.XXXXXX")
+    chmod 0755 "$stage_dir"
     cp -a -- "$bundle_dir"/. "$stage_dir"/
     [[ -z "$(find "$stage_dir" -type l -print -quit)" ]] || die "bundle contains symlinks"
     verify_release "$stage_dir"
     mv -- "$stage_dir" "$release_dir"
   fi
+fi
+if (( ! dry_run )); then
+  if (( system_root )); then
+    chown root:root "$prefix" "$releases" "$release_dir"
+  fi
+  chmod 0755 "$prefix" "$releases" "$release_dir"
 fi
 
 if (( stage_upgrade_substrate )); then
@@ -673,7 +680,15 @@ fi
 
 if (( ! dry_run )); then
   mkdir -p -- "$config_dir" "$backups" "$evidence"
-  chmod 0750 "$config_dir" "$backups" "$evidence"
+  if (( system_root )); then
+    chown root:root "$backups" "$evidence"
+    chmod 0700 "$backups" "$evidence"
+    chown root:root "$config_dir"
+    chmod 0711 "$config_dir"
+  else
+    chmod 0750 "$backups" "$evidence"
+    chmod 0750 "$config_dir"
+  fi
   if [[ "$version" = "0.8.0-rc.1" ]]; then
     expected_owner=$(id -u)
     prepare_upgrade_substrate "$expected_owner"

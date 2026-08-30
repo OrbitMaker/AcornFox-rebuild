@@ -426,6 +426,10 @@ func TestG5BRecoverySubstrateStaysStageOnlyAndBootDisabled(t *testing.T) {
 		"durable_sync_directory_and_parent",
 		"prepare_upgrade_data_root",
 		"install -d -m 0711 -o root -g root /var/lib/open-card",
+		"chmod 0755 \"$prefix\" \"$releases\"",
+		"chmod 0755 \"$stage_dir\"",
+		"chmod 0711 \"$config_dir\"",
+		"chmod 0700 \"$backups\" \"$evidence\"",
 		"open-card-upgrade-safe.target",
 		"open-card-upgrade-finalize.service",
 		"open-card-edge.service.d/10-upgrade-marker.conf",
@@ -442,11 +446,19 @@ func TestG5BRecoverySubstrateStaysStageOnlyAndBootDisabled(t *testing.T) {
 	stage := strings.Index(install, "if (( stage_upgrade_substrate )); then\n  if (( dry_run ))")
 	units := strings.Index(install, "units=(open-card-server.service")
 	stageExit := strings.Index(install, "say \"staged verified upgrade recovery substrate for $release_name\"\n  exit 0")
+	releaseBranch := strings.Index(install, "if [[ -d \"$release_dir\" ]]")
+	runtimeModes := strings.Index(install, "chmod 0755 \"$prefix\" \"$releases\" \"$release_dir\"")
 	if stage < 0 || units < 0 || stageExit < stage || stageExit > units {
 		t.Fatal("stage-only substrate path does not return before ordinary unit staging")
 	}
+	if releaseBranch < 0 || runtimeModes < releaseBranch || runtimeModes > stage {
+		t.Fatal("runtime traversal modes are not reconciled after existing and new release branches")
+	}
 	if !strings.Contains(host, "install -d -m 0711 -o root -g root /var/lib/open-card") || strings.Index(host, "\"${installer[@]}\"") > strings.Index(host, "installation_id=/var/lib/open-card/installation-id") {
 		t.Fatal("host installer does not establish a root-owned data parent before creating an installation id")
+	}
+	if !strings.Contains(host, "install -d -m 0711 -o root -g root /etc/open-card") || !strings.Contains(host, "install -d -m 0700 -o root -g root /var/lib/open-card/evidence") {
+		t.Fatal("host installer does not separate runtime traversal from root-only evidence")
 	}
 	if preflight := strings.Index(host, "--validate-activation-intent"); preflight < 0 || preflight > strings.Index(host, "require_command()") {
 		t.Fatal("host activation-intent preflight does not precede mutable prerequisites")

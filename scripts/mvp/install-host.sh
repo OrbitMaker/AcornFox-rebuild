@@ -197,7 +197,8 @@ EOF
   fi
   if command -v apparmor_parser >/dev/null 2>&1; then apparmor_parser -r /etc/apparmor.d/opencard-rootlesskit || die "failed to load Open Card AppArmor profile"; fi
 
-  install -d -m 0750 /etc/open-card /var/lib/open-card/evidence
+  install -d -m 0711 -o root -g root /etc/open-card
+  install -d -m 0700 -o root -g root /var/lib/open-card/evidence
   if [[ ! -f /etc/open-card/agent-ca.crt ]]; then
     openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 365 -subj "/CN=Open Card CA" -keyout /etc/open-card/agent-ca.key -out /etc/open-card/agent-ca.crt >/dev/null 2>&1
     cat >/etc/open-card/agent-cert.ext <<'EOF'
