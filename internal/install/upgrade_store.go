@@ -339,6 +339,9 @@ func (l *upgradeStoreLock) Release() error {
 }
 
 func ProductionUpgradeStore() (*UpgradeStore, error) {
+	if err := prepareProductionUpgradeLock(); err != nil {
+		return nil, ErrUpgradeJournalConflict
+	}
 	edge, err := user.LookupGroup(productionCaddyUser)
 	if err != nil {
 		return nil, ErrUpgradeJournalConflict
@@ -370,6 +373,93 @@ func ProductionUpgradeStore() (*UpgradeStore, error) {
 		return nil, e
 	}
 	return &UpgradeStore{root: "/", lockPath: "/run/lock/open-card-upgrade.lock", production: true, dataWriter: d, activationWriter: a, configDurable: c, unitDurable: u, edgeGID: edgeGID, legacyVerifier: fixedLegacyReleaseVerifier{writer: a}}, nil
+}
+
+func prepareProductionUpgradeLock() error {
+	for _, parent := range []string{"/run", "/run/lock"} {
+		if err := verifyProductionLockDirectory(parent); err != nil {
+			return err
+		}
+	}
+	return prepareUpgradeLockFile("/run/lock/open-card-upgrade.lock", 0, 0, verifyProductionLockDirectory)
+}
+
+func prepareUpgradeLockFile(path string, uid, gid int, verifyDirectory func(string) error) error {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path || uid < 0 || gid < 0 || verifyDirectory == nil {
+		return ErrUpgradeJournalConflict
+	}
+	parent := filepath.Dir(path)
+	if err := verifyDirectory(parent); err != nil {
+		return ErrUpgradeJournalConflict
+	}
+	fd, err := syscall.Open(path, syscall.O_RDWR|syscall.O_CREAT|syscall.O_EXCL|syscall.O_NOFOLLOW, durableFileMode)
+	if err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return syncPreparedUpgradeLock(path, uid, gid, verifyDirectory)
+		}
+		return ErrUpgradeJournalConflict
+	}
+	created := os.NewFile(uintptr(fd), path)
+	if created == nil {
+		_ = syscall.Close(fd)
+		return ErrUpgradeJournalConflict
+	}
+	metadataErr := created.Chmod(durableFileMode)
+	if metadataErr == nil {
+		metadataErr = created.Chown(uid, gid)
+	}
+	if metadataErr == nil {
+		metadataErr = created.Sync()
+	}
+	closeErr := created.Close()
+	if metadataErr != nil || closeErr != nil {
+		return ErrUpgradeJournalConflict
+	}
+	return syncPreparedUpgradeLock(path, uid, gid, verifyDirectory)
+}
+
+func syncPreparedUpgradeLock(path string, uid, gid int, verifyDirectory func(string) error) error {
+	parent := filepath.Dir(path)
+	if err := verifyDirectory(parent); err != nil {
+		return ErrUpgradeJournalConflict
+	}
+	fd, err := syscall.Open(path, syscall.O_RDWR|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return ErrUpgradeJournalConflict
+	}
+	file := os.NewFile(uintptr(fd), path)
+	if file == nil {
+		_ = syscall.Close(fd)
+		return ErrUpgradeJournalConflict
+	}
+	info, statErr := file.Stat()
+	if statErr != nil || !info.Mode().IsRegular() || info.Mode().Perm() != durableFileMode || verifyOwner(info, uid, gid) != nil {
+		_ = file.Close()
+		return ErrUpgradeJournalConflict
+	}
+	fileSyncErr := file.Sync()
+	fileCloseErr := file.Close()
+	if fileSyncErr != nil || fileCloseErr != nil {
+		return ErrUpgradeJournalConflict
+	}
+	parentFD, err := syscall.Open(parent, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return ErrUpgradeJournalConflict
+	}
+	parentFile := os.NewFile(uintptr(parentFD), parent)
+	if parentFile == nil {
+		_ = syscall.Close(parentFD)
+		return ErrUpgradeJournalConflict
+	}
+	syncErr := parentFile.Sync()
+	parentCloseErr := parentFile.Close()
+	if syncErr != nil || parentCloseErr != nil {
+		return ErrUpgradeJournalConflict
+	}
+	if err := verifyDirectory(parent); err != nil || verifyLockFile(path, uid, gid) != nil {
+		return ErrUpgradeJournalConflict
+	}
+	return nil
 }
 func TaskUpgradeStore(root string, uid, gid int) (*UpgradeStore, error) {
 	return TaskUpgradeStoreWithEdgeOwner(root, uid, gid, gid)

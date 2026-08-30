@@ -442,6 +442,74 @@ func TestAcquirePendingBootAtomicallyBindsMarkerAndFlock(t *testing.T) {
 	}
 }
 
+func TestPrepareUpgradeLockFileCreatesReplaysAndRejectsUnsafeLeaf(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, durableDirMode); err != nil {
+		t.Fatal(err)
+	}
+	verifyDirectory := func(path string) error {
+		info, err := os.Lstat(path)
+		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o022 != 0 || verifyOwner(info, os.Getuid(), os.Getgid()) != nil {
+			return ErrUpgradeJournalConflict
+		}
+		return nil
+	}
+	path := filepath.Join(root, "open-card-upgrade.lock")
+	if err := prepareUpgradeLockFile(path, os.Getuid(), os.Getgid(), verifyDirectory); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepareUpgradeLockFile(path, os.Getuid(), os.Getgid(), verifyDirectory); err != nil {
+		t.Fatalf("exact replay=%v", err)
+	}
+	if err := os.Chmod(path, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepareUpgradeLockFile(path, os.Getuid(), os.Getgid(), verifyDirectory); !errors.Is(err, ErrUpgradeJournalConflict) {
+		t.Fatalf("unsafe mode accepted: %v", err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(root, "foreign"), path); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepareUpgradeLockFile(path, os.Getuid(), os.Getgid(), verifyDirectory); !errors.Is(err, ErrUpgradeJournalConflict) {
+		t.Fatalf("symlink lock accepted: %v", err)
+	}
+}
+
+func TestPrepareUpgradeLockFileConvergesConcurrentCreators(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, durableDirMode); err != nil {
+		t.Fatal(err)
+	}
+	verifyDirectory := func(path string) error {
+		info, err := os.Lstat(path)
+		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o022 != 0 || verifyOwner(info, os.Getuid(), os.Getgid()) != nil {
+			return ErrUpgradeJournalConflict
+		}
+		return nil
+	}
+	path := filepath.Join(root, "open-card-upgrade.lock")
+	start := make(chan struct{})
+	errorsFound := make(chan error, 8)
+	for range 8 {
+		go func() {
+			<-start
+			errorsFound <- prepareUpgradeLockFile(path, os.Getuid(), os.Getgid(), verifyDirectory)
+		}()
+	}
+	close(start)
+	for range 8 {
+		if err := <-errorsFound; err != nil {
+			t.Fatalf("concurrent prepare=%v", err)
+		}
+	}
+	if err := verifyLockFile(path, os.Getuid(), os.Getgid()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestStoreReturnsUnknownWhenMarkerOrPointerPublishesIntoReplacedRoot(t *testing.T) {
 	t.Run("marker", func(t *testing.T) {
 		store, root, _, _, cleanup := candidateStore(t)
