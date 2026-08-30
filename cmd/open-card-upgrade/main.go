@@ -877,9 +877,18 @@ func verifyProductionBootArtifacts(ctx context.Context, requireActive bool) erro
 	if err := verifyProductionSafeBootTargetState(ctx, requireActive); err != nil {
 		return errBootFenceStateUnavailable
 	}
-	for _, unit := range []string{"open-card-buildkit.service", "open-card-caddy.service", "open-card-server.service", "open-card-agent.service", "open-card-edge.service"} {
-		values, err := productionSystemctlProperties(ctx, unit, "Requires")
-		if err != nil || !containsRequiredBootUnits(values["Requires"], "open-card-upgrade-safe.target") {
+	for _, check := range []struct {
+		unit     string
+		requires []string
+	}{
+		{"open-card-buildkit.service", []string{"open-card-upgrade-safe.target"}},
+		{"open-card-caddy.service", []string{"open-card-upgrade-safe.target"}},
+		{"open-card-server.service", []string{"open-card-buildkit.service", "open-card-upgrade-safe.target"}},
+		{"open-card-agent.service", []string{"open-card-upgrade-safe.target"}},
+		{"open-card-edge.service", []string{"open-card-upgrade-safe.target"}},
+	} {
+		values, err := productionSystemctlProperties(ctx, check.unit, "Requires")
+		if err != nil || !containsRequiredBootUnits(values["Requires"], check.requires...) {
 			return errBootBusinessGraphUnavailable
 		}
 	}

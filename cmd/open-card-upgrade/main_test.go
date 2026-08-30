@@ -486,6 +486,12 @@ func TestBootGraphAcceptsSystemdDerivedDependenciesButRejectsOpenCardDrift(t *te
 	if !containsRequiredBootUnits("sysinit.target open-card-upgrade-safe.target shutdown.target", "open-card-upgrade-safe.target") {
 		t.Fatal("derived business requirement was rejected")
 	}
+	if !containsRequiredBootUnits("-.mount open-card-buildkit.service sysinit.target system.slice open-card-upgrade-safe.target", "open-card-buildkit.service", "open-card-upgrade-safe.target") {
+		t.Fatal("server's fixed BuildKit and safe-target requirements were rejected")
+	}
+	if containsRequiredBootUnits("open-card-buildkit.service open-card-upgrade-safe.target open-card-foreign.service", "open-card-buildkit.service", "open-card-upgrade-safe.target") {
+		t.Fatal("foreign server requirement was accepted")
+	}
 	for _, value := range []string{
 		"sysinit.target open-card-edge.service",                               // missing required members
 		"open-card-upgrade-recover.service open-card-foreign.service",         // foreign Open Card edge
