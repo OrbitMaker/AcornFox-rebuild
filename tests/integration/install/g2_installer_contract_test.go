@@ -12,6 +12,10 @@ import (
 )
 
 func writeG2CandidateBundle(t *testing.T, directory string, includeEdge bool) string {
+	return writeG2CandidateBundleVersion(t, directory, includeEdge, install.ProductionCandidateVersion)
+}
+
+func writeG2CandidateBundleVersion(t *testing.T, directory string, includeEdge bool, version string) string {
 	t.Helper()
 	bundle := filepath.Join(directory, "candidate")
 	files := []struct {
@@ -20,6 +24,30 @@ func writeG2CandidateBundle(t *testing.T, directory string, includeEdge bool) st
 	}{
 		{"bin/open-card-server", 0o755}, {"bin/open-card-agent", 0o755}, {"bin/open-card-buildkit", 0o755}, {"bin/open-card-caddy", 0o755}, {"bin/open-card-admin", 0o755}, {"bin/open-card-upgrade", 0o755},
 		{"caddy/open-card-edge.Caddyfile.example", 0o644}, {"caddy/open-card-edge.env.example", 0o640}, {"migrations/control-plane/0024_dns_change_ledger.sql", 0o644}, {"web/dist/index.html", 0o644}, {"docs/licenses/licenses-manifest.json", 0o644}, {"sbom.spdx.json", 0o644}, {"source-manifest.sha256", 0o640},
+	}
+	if version == install.Gate6CandidateVersion {
+		files = append(files,
+			struct {
+				path string
+				mode os.FileMode
+			}{"scripts/mvp/host-preflight.sh", 0o755},
+			struct {
+				path string
+				mode os.FileMode
+			}{"scripts/mvp/buildkit-production-capacity.sh", 0o755},
+			struct {
+				path string
+				mode os.FileMode
+			}{"scripts/mvp/g6-staging-evidence.sh", 0o755},
+			struct {
+				path string
+				mode os.FileMode
+			}{"tools/evidence/g6_validate.py", 0o755},
+			struct {
+				path string
+				mode os.FileMode
+			}{"tools/evidence/g6_target_receipt.py", 0o755},
+		)
 	}
 	for _, item := range files {
 		path := filepath.Join(bundle, filepath.FromSlash(item.path))
@@ -77,11 +105,55 @@ func writeG2CandidateBundle(t *testing.T, directory string, includeEdge bool) st
 	if err != nil {
 		t.Fatal(err)
 	}
-	manifest := install.Manifest{SchemaVersion: install.ManifestSchemaVersion, Product: install.ManifestProduct, Version: install.ProductionCandidateVersion, ReleaseID: "release-0.8.0-rc.1", Architecture: architecture, MigrationVersion: install.CurrentMigrationVersion, SourceCommit: strings.Repeat("a", 40), NMinusOne: &install.NMinusOne{Version: install.ProductionNMinusOneVersion, MigrationVersion: "0023", SourceCommit: lineage.SourceCommit, ReleaseManifestSHA256: lineage.ReleaseManifestSHA256, ArchiveSHA256: lineage.ArchiveSHA256, BundleManifestSHA256: lineage.BundleManifestSHA256}, Protocol: install.AgentProtocolVersion, ConfigDir: install.DefaultConfigDir, DataDir: install.DefaultDataDir, Compatibility: install.Compatibility{MinDataVersion: 1, MaxDataVersion: 24, MinAgentProtocol: install.PreviousAgentProtocol, MaxAgentProtocol: install.AgentProtocolVersion}, Files: entries}
+	predecessorVersion, predecessorMigration := install.ProductionNMinusOneVersion, "0023"
+	if version == install.Gate6CandidateVersion {
+		lineage, err = install.RC1LineageForArchitecture(architecture)
+		if err != nil {
+			t.Fatal(err)
+		}
+		predecessorVersion, predecessorMigration = install.Gate6NMinusOneVersion, "0024"
+	}
+	manifest := install.Manifest{SchemaVersion: install.ManifestSchemaVersion, Product: install.ManifestProduct, Version: version, ReleaseID: "release-" + version, Architecture: architecture, MigrationVersion: install.CurrentMigrationVersion, SourceCommit: strings.Repeat("a", 40), NMinusOne: &install.NMinusOne{Version: predecessorVersion, MigrationVersion: predecessorMigration, SourceCommit: lineage.SourceCommit, ReleaseManifestSHA256: lineage.ReleaseManifestSHA256, ArchiveSHA256: lineage.ArchiveSHA256, BundleManifestSHA256: lineage.BundleManifestSHA256}, Protocol: install.AgentProtocolVersion, ConfigDir: install.DefaultConfigDir, DataDir: install.DefaultDataDir, Compatibility: install.Compatibility{MinDataVersion: 1, MaxDataVersion: 24, MinAgentProtocol: install.PreviousAgentProtocol, MaxAgentProtocol: install.AgentProtocolVersion}, Files: entries}
 	if err := install.SaveManifest(filepath.Join(bundle, "manifest.json"), manifest); err != nil {
 		t.Fatal(err)
 	}
 	return bundle
+}
+
+func TestG2RC2CandidateRequiresGate6Payload(t *testing.T) {
+	directory := t.TempDir()
+	bundle := writeG2CandidateBundleVersion(t, directory, true, install.Gate6CandidateVersion)
+	_, sourceFile, _, _ := runtime.Caller(0)
+	repo := filepath.Clean(filepath.Join(filepath.Dir(sourceFile), "..", "..", ".."))
+	run := func() ([]byte, error) {
+		root := filepath.Join(directory, "root")
+		return exec.Command("bash", filepath.Join(repo, "scripts/mvp/install.sh"), "--root", root, "--bundle", bundle, "--dry-run", "--test-safe-prefix", directory).CombinedOutput()
+	}
+	if output, err := run(); err != nil {
+		t.Fatalf("RC2 structural preflight: %v\n%s", err, output)
+	}
+	manifestPath := filepath.Join(bundle, "manifest.json")
+	manifest, err := install.LoadManifest(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	missing := "scripts/mvp/g6-staging-evidence.sh"
+	filtered := manifest.Files[:0]
+	for _, file := range manifest.Files {
+		if file.Path != missing {
+			filtered = append(filtered, file)
+		}
+	}
+	manifest.Files = filtered
+	if err := os.Remove(filepath.Join(bundle, filepath.FromSlash(missing))); err != nil {
+		t.Fatal(err)
+	}
+	if err := install.SaveManifest(manifestPath, manifest); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := run(); err == nil || !strings.Contains(string(output), missing) {
+		t.Fatalf("RC2 without Gate6 collector was accepted: %v\n%s", err, output)
+	}
 }
 
 func TestG2CandidateStagesEdgeAndRequires0024WithoutActivation(t *testing.T) {
@@ -409,7 +481,7 @@ func TestG2StageUpgradeSubstrateDataRootFaultsFailClosed(t *testing.T) {
 	}
 }
 
-func TestG2StageUpgradeSubstrateRequiresRC1Candidate(t *testing.T) {
+func TestG2StageUpgradeSubstrateRequiresRC1OrRC2Candidate(t *testing.T) {
 	directory := t.TempDir()
 	bundle := writeG2CandidateBundle(t, directory, true)
 	manifestPath := filepath.Join(bundle, "manifest.json")
@@ -427,7 +499,7 @@ func TestG2StageUpgradeSubstrateRequiresRC1Candidate(t *testing.T) {
 	_, sourceFile, _, _ := runtime.Caller(0)
 	repo := filepath.Clean(filepath.Join(filepath.Dir(sourceFile), "..", "..", ".."))
 	command := exec.Command("bash", filepath.Join(repo, "scripts", "mvp", "install.sh"), "--root", filepath.Join(directory, "root"), "--bundle", bundle, "--stage-upgrade-substrate", "--test-safe-prefix", directory)
-	if output, err := command.CombinedOutput(); err == nil || !strings.Contains(string(output), "requires the 0.8.0-rc.1 production candidate") {
+	if output, err := command.CombinedOutput(); err == nil || !strings.Contains(string(output), "requires an RC1 or RC2 production candidate") {
 		t.Fatalf("RC0 substrate stage was accepted: %v\n%s", err, output)
 	}
 }

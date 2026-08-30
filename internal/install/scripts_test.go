@@ -421,7 +421,7 @@ func TestG5BRecoverySubstrateStaysStageOnlyAndBootDisabled(t *testing.T) {
 		"--validate-activation-intent",
 		"prepare_upgrade_substrate",
 		"existing production installation requires upgrade.sh or --stage-upgrade-substrate",
-		"0.8.0-rc.1 system-root activation requires native bootstrap activation support",
+		"$version system-root activation requires native bootstrap activation support",
 		"durable_sync_file_and_parent",
 		"durable_sync_directory_and_parent",
 		"prepare_upgrade_data_root",
@@ -506,7 +506,11 @@ func TestG5BSystemRootUpgradeUsesOnlyVerifiedEngineDelegation(t *testing.T) {
 		"upgrade-safe target RequiredBy link is unsafe",
 		"verified_production_program /usr/bin/python3",
 		"/proc/sys/kernel/random/uuid",
-		"--expect-layout rc0-legacy",
+		"(\"0.8.0-rc.0\", \"0.8.0-rc.1\"): \"rc0-legacy\"",
+		"(\"0.8.0-rc.1\", \"0.8.0-rc.2\"): \"native\"",
+		"--expect-layout \"$expected_layout\"",
+		"os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)",
+		"os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)",
 		"candidate manifest identity is ambiguous",
 	} {
 		if !strings.Contains(upgrade, required) {

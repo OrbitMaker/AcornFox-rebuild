@@ -162,6 +162,12 @@ func ValidateProductionCandidate(manifest Manifest) error {
 	return nil
 }
 
+// IsProductionCandidateVersion recognizes the immutable historical RC1 and
+// the Gate 6 RC2 line without changing legacy RC0 identity constants.
+func IsProductionCandidateVersion(version string) bool {
+	return version == ProductionCandidateVersion || version == Gate6CandidateVersion
+}
+
 // Compatibility describes the oldest and newest data/protocol contracts that
 // a release can read. A range is inclusive. SchemaVersion is the manifest
 // format, while data versions are controlled by the control-plane migrations.

@@ -19,7 +19,7 @@ USAGE
 die() { echo "open-card install: $*" >&2; exit 1; }
 say() { echo "open-card install: $*"; }
 
-root= bundle= bundle_url= health_command= migration_command= migration_dir= expected_manifest_sha256= safe_prefix=
+root= bundle= bundle_url= health_command= migration_command= migration_dir= expected_manifest_sha256= safe_prefix= required_version=
 offline=0 dry_run=0 activate=0 stage_upgrade_substrate=0 validate_activation_intent=0 allow_downgrade=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -31,6 +31,7 @@ while [[ $# -gt 0 ]]; do
     --migration-dir) [[ $# -gt 1 ]] || die "--migration-dir requires a value"; migration_dir=$2; shift 2 ;;
     --allow-downgrade) allow_downgrade=1; shift ;;
     --expected-manifest-sha256) [[ $# -gt 1 ]] || die "--expected-manifest-sha256 requires a value"; expected_manifest_sha256=$2; shift 2 ;;
+    --require-version) [[ $# -gt 1 ]] || die "--require-version requires a value"; required_version=$2; shift 2 ;;
     --test-safe-prefix) [[ $# -gt 1 ]] || die "--test-safe-prefix requires a value"; safe_prefix=$2; shift 2 ;;
     --activate) activate=1; shift ;;
     --stage-upgrade-substrate) stage_upgrade_substrate=1; shift ;;
@@ -53,6 +54,7 @@ if [[ -n "$expected_manifest_sha256" ]]; then
   [[ "$expected_manifest_sha256" =~ ^[0-9a-fA-F]{64}$ ]] || die "expected manifest sha256 must be 64 hexadecimal characters"
   expected_manifest_sha256=$(tr '[:upper:]' '[:lower:]' <<< "$expected_manifest_sha256")
 fi
+if [[ -n "$required_version" && "$required_version" != "0.8.0-rc.2" ]]; then die "--require-version only accepts the current production candidate"; fi
 system_root=0
 if [[ "$root" = "/" ]]; then
   system_root=1
@@ -445,7 +447,7 @@ case "$host_arch" in
   aarch64|arm64) host_arch=arm64 ;;
   *) die "unsupported runtime architecture: ${host_arch:-unknown}" ;;
 esac
-manifest_info=$(python3 - "$manifest" "$bundle_dir" "$host_arch" <<'PY'
+manifest_info=$(python3 - "$manifest" "$bundle_dir" "$host_arch" "$required_version" <<'PY'
 import json, os, re, sys
 with open(sys.argv[1], encoding="utf-8") as stream:
     value = json.load(stream)
@@ -457,6 +459,8 @@ if value["schema_version"] != 1 or value["product"] != "open-card":
     raise SystemExit("unsupported manifest schema or product")
 if not isinstance(value["version"], str) or not re.fullmatch(r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?", value["version"]):
     raise SystemExit("manifest version is invalid")
+if sys.argv[4] and value["version"] != sys.argv[4]:
+    raise SystemExit("manifest version is not the required production candidate")
 def normalize_protocol(raw):
     raw = raw.strip().lower()
     if raw == "v1":
@@ -493,19 +497,28 @@ if tuple(map(int, minimum_protocol.split("."))) > tuple(map(int, maximum_protoco
 files = value["files"]
 if not isinstance(files, list) or not files:
     raise SystemExit("manifest files are empty")
-if value["version"] == "0.8.0-rc.1":
+if value["version"] in {"0.8.0-rc.1", "0.8.0-rc.2"}:
+    candidate_version = value["version"]
     if migration_version != "0024" or not isinstance(value.get("source_commit"), str) or not re.fullmatch(r"[a-f0-9]{40}", value["source_commit"]):
-        raise SystemExit("0.8.0-rc.1 production candidate must declare source and migration 0024")
-    lineage_by_architecture = {
-        "amd64": ("3b3953c0a26f8706151583ad6c9cad6b5502da18b28f11ed66ca92fe604aa253", "abc034ed24e8e8dc74b8eabc84dd3071a66f166abe65135502911e9153c0b9fc", "960ab65526b890009e1770ad190a70b1589f825e0f59cf8d757634a0a8848392"),
-        "arm64": ("e4f56105b3d184313d51365c7fff40b9f68111815def83c5e5985bc182177a57", "9560df1d4a739c729d857cd93b989b99976da0e86983ffa026d13202339d57b9", "fdfd6b6108870118714b70c9007937585fc0429d14fa9d64010a80016edc2a15"),
-    }
+        raise SystemExit(candidate_version + " production candidate must declare source and migration 0024")
+    if candidate_version == "0.8.0-rc.1":
+        lineage_by_architecture = {
+            "amd64": ("3b3953c0a26f8706151583ad6c9cad6b5502da18b28f11ed66ca92fe604aa253", "abc034ed24e8e8dc74b8eabc84dd3071a66f166abe65135502911e9153c0b9fc", "960ab65526b890009e1770ad190a70b1589f825e0f59cf8d757634a0a8848392"),
+            "arm64": ("e4f56105b3d184313d51365c7fff40b9f68111815def83c5e5985bc182177a57", "9560df1d4a739c729d857cd93b989b99976da0e86983ffa026d13202339d57b9", "fdfd6b6108870118714b70c9007937585fc0429d14fa9d64010a80016edc2a15"),
+        }
+        predecessor = ("0.8.0-rc.0", "0023", "35a2b198ac52949af3477475d89d4813b46a9490")
+    else:
+        lineage_by_architecture = {
+            "amd64": ("1cf02e4a111e38a4061c692de418b67755a2e55f97a04cbc92cee8cb9f82a7be", "9056cb46537537f6cab21482d900160486098d857955d23b0ca8f131a9cc4233", "d0e8c111dcaa334c89bb815fc2ddc9b122887cddbbf7c59b6eb51436b931706f"),
+            "arm64": ("6bf1e590c3054d373d9319f03581d7a623ee3093b53ddba7b343cf8af7f85fed", "56a697aed3a8f77261cfeb3074a7d7ab0cfb6389ab5d75225ad9931b665bfa86", "5fda1e9d0f80deadf6b87cb281d80793c9d1e910386624bc5975cdd0464a2650"),
+        }
+        predecessor = ("0.8.0-rc.1", "0024", "0d5c96bf7b7bd1c641b108cbbd54511d814f2aa0")
     if architecture not in lineage_by_architecture:
-        raise SystemExit("0.8.0-rc.1 production candidate requires a supported architecture")
+        raise SystemExit(candidate_version + " production candidate requires a supported architecture")
     manifest_sha256, archive_sha256, bundle_manifest_sha256 = lineage_by_architecture[architecture]
-    expected_n_minus_one = {"version":"0.8.0-rc.0","migration_version":"0023","source_commit":"35a2b198ac52949af3477475d89d4813b46a9490","release_manifest_sha256":manifest_sha256,"archive_sha256":archive_sha256,"bundle_manifest_sha256":bundle_manifest_sha256}
+    expected_n_minus_one = {"version":predecessor[0],"migration_version":predecessor[1],"source_commit":predecessor[2],"release_manifest_sha256":manifest_sha256,"archive_sha256":archive_sha256,"bundle_manifest_sha256":bundle_manifest_sha256}
     if value.get("n_minus_one") != expected_n_minus_one:
-        raise SystemExit("0.8.0-rc.1 production candidate has invalid N-1 lineage")
+        raise SystemExit(candidate_version + " production candidate has invalid N-1 lineage")
     production_required = {
         "bin/open-card-admin", "bin/open-card-upgrade",
         "systemd/open-card-edge.service", "systemd/open-card-upgrade-recover.service",
@@ -515,13 +528,15 @@ if value["version"] == "0.8.0-rc.1":
         "migrations/control-plane/0024_dns_change_ledger.sql", "web/dist/index.html",
         "docs/licenses/licenses-manifest.json", "sbom.spdx.json", "source-manifest.sha256",
     }
+    if candidate_version == "0.8.0-rc.2":
+        production_required |= {"scripts/mvp/g6-staging-evidence.sh", "scripts/mvp/host-preflight.sh", "scripts/mvp/buildkit-production-capacity.sh", "tools/evidence/g6_validate.py", "tools/evidence/g6_target_receipt.py"}
     candidate_paths = {item.get("path") for item in files if isinstance(item, dict)}
     missing = sorted(production_required - candidate_paths)
     if missing:
-        raise SystemExit("0.8.0-rc.1 production manifest is missing " + ", ".join(missing))
+        raise SystemExit(candidate_version + " production manifest is missing " + ", ".join(missing))
     forbidden = sorted(path for path in candidate_paths if isinstance(path, str) and ("fixture" in path.lower() or "/tests/" in "/" + path or path.endswith(".test") or "open-card-caddy-fixture" in path))
     if forbidden:
-        raise SystemExit("0.8.0-rc.1 production manifest contains test-only payload")
+        raise SystemExit(candidate_version + " production manifest contains test-only payload")
 elif value["version"] == "0.8.0-rc.0":
     if migration_version != "0023" or value.get("source_commit") != "35a2b198ac52949af3477475d89d4813b46a9490" or "n_minus_one" in value:
         raise SystemExit("0.8.0-rc.0 bootstrap lineage is invalid")
@@ -562,18 +577,18 @@ release_id=$(sed -n '2p' <<< "$manifest_info")
 release_name="$release_id"
 release_dir="$releases/$release_name"
 installation_id="$data_dir/installation-id"
-if (( stage_upgrade_substrate )) && [[ "$version" != "0.8.0-rc.1" ]]; then
-  die "--stage-upgrade-substrate requires the 0.8.0-rc.1 production candidate"
+if (( stage_upgrade_substrate )) && [[ "$version" != "0.8.0-rc.1" && "$version" != "0.8.0-rc.2" ]]; then
+  die "--stage-upgrade-substrate requires an RC1 or RC2 production candidate"
 fi
-if (( validate_activation_intent )) && [[ "$version" = "0.8.0-rc.1" ]]; then
-  die "0.8.0-rc.1 system-root activation requires native bootstrap activation support"
+if (( validate_activation_intent )) && [[ "$version" = "0.8.0-rc.1" || "$version" = "0.8.0-rc.2" ]]; then
+  die "$version system-root activation requires native bootstrap activation support"
 fi
 if (( system_root && ! stage_upgrade_substrate )); then
   if [[ -e "$current" || -L "$current" || -e "$installation_id" || -L "$installation_id" ]]; then
     die "existing production installation requires upgrade.sh or --stage-upgrade-substrate"
   fi
-  if [[ "$version" = "0.8.0-rc.1" && $activate -eq 1 ]]; then
-    die "0.8.0-rc.1 system-root activation requires native bootstrap activation support"
+  if [[ ( "$version" = "0.8.0-rc.1" || "$version" = "0.8.0-rc.2" ) && $activate -eq 1 ]]; then
+    die "$version system-root activation requires native bootstrap activation support"
   fi
 fi
 manifest_migration_version=$(python3 - "$manifest" <<'PY'
@@ -703,7 +718,7 @@ if (( ! dry_run )); then
     chmod 0750 "$backups" "$evidence"
     chmod 0750 "$config_dir"
   fi
-  if [[ "$version" = "0.8.0-rc.1" ]]; then
+  if [[ "$version" = "0.8.0-rc.1" || "$version" = "0.8.0-rc.2" ]]; then
     expected_owner=$(id -u)
     prepare_upgrade_substrate "$expected_owner"
   else
@@ -714,8 +729,8 @@ if (( ! dry_run )); then
   units=(open-card-server.service open-card-agent.service open-card-buildkit.service open-card-caddy.service)
   if [[ -f "$bundle_dir/systemd/open-card-edge.service" && ! -L "$bundle_dir/systemd/open-card-edge.service" ]]; then
     units+=(open-card-edge.service)
-  elif [[ "$version" = "0.8.0-rc.1" ]]; then
-    die "0.8.0-rc.1 production candidate is missing open-card-edge.service"
+  elif [[ "$version" = "0.8.0-rc.1" || "$version" = "0.8.0-rc.2" ]]; then
+    die "$version production candidate is missing open-card-edge.service"
   fi
   for unit in "${units[@]}"; do
     [[ -f "$bundle_dir/systemd/$unit" && ! -L "$bundle_dir/systemd/$unit" ]] || die "bundle is missing $unit"

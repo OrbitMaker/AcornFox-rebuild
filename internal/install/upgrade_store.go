@@ -1374,7 +1374,7 @@ func (s *UpgradeStore) verifyCandidateRelease(activation ActivationV1) error {
 	// The activation store remains reusable for historical/fixture releases,
 	// while every real RC1 publication is pinned to the production candidate
 	// payload contract before slot creation.
-	if (release.Version == ProductionCandidateVersion && ValidateProductionCandidate(manifest) != nil) || manifest.ReleaseID != release.ID || manifest.Version != release.Version || manifest.SourceCommit != release.SourceCommit || manifest.Architecture != release.Architecture || manifest.MigrationVersion != activation.Database.Migration {
+	if (IsProductionCandidateVersion(release.Version) && ValidateProductionCandidate(manifest) != nil) || manifest.ReleaseID != release.ID || manifest.Version != release.Version || manifest.SourceCommit != release.SourceCommit || manifest.Architecture != release.Architecture || manifest.MigrationVersion != activation.Database.Migration {
 		return ErrUpgradeJournalConflict
 	}
 	return verifySecureRelease(s.activationWriter, release.ID, manifest)

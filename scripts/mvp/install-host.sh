@@ -105,9 +105,9 @@ if [[ -L /opt/open-card/current ]] && (( ! dry_run )); then
   die "existing production installation requires upgrade.sh; root upgrades remain fail-closed pending atomic PostgreSQL restore support"
 fi
 
-installer=("$script_dir/install.sh" --root / --activate --expected-manifest-sha256 "$expected")
+installer=("$script_dir/install.sh" --root / --activate --require-version 0.8.0-rc.2 --expected-manifest-sha256 "$expected")
 installer+=("${forward[@]}")
-preflight=("$script_dir/install.sh" --root / --dry-run --validate-activation-intent --expected-manifest-sha256 "$expected")
+preflight=("$script_dir/install.sh" --root / --dry-run --validate-activation-intent --require-version 0.8.0-rc.2 --expected-manifest-sha256 "$expected")
 preflight+=("${forward[@]}")
 "${preflight[@]}" >/tmp/open-card-install-host-preflight-$$.log 2>&1 || {
   status=$?

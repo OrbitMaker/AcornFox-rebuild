@@ -155,6 +155,86 @@ if [[ "$root" = "/" ]]; then
   run_upgrade_helper() {
     /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C LC_ALL=C "$production_upgrade" "$@"
   }
+  production_python=$(verified_production_program /usr/bin/python3) || die "trusted production python is unavailable"
+  candidate_identity=$(/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C LC_ALL=C "$production_python" - /opt/open-card/releases "$expected_manifest_sha256" /opt/open-card/current/manifest.json <<'PY'
+import hashlib, json, os, re, stat, sys
+
+root = sys.argv[1]
+expected = sys.argv[2]
+current_release_path = os.path.realpath(os.path.dirname(sys.argv[3]))
+try:
+    root_stat = os.lstat(root)
+except OSError as exc:
+    raise SystemExit("candidate release root is unavailable") from exc
+if not stat.S_ISDIR(root_stat.st_mode) or stat.S_ISLNK(root_stat.st_mode) or root_stat.st_uid != 0 or root_stat.st_gid != 0 or root_stat.st_mode & 0o022:
+    raise SystemExit("candidate release root is unsafe")
+root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+
+def read_release(name):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", name):
+        raise SystemExit("release identity is unsafe")
+    directory_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
+    try:
+        directory_info = os.fstat(directory_fd)
+        if not stat.S_ISDIR(directory_info.st_mode) or directory_info.st_uid != 0 or directory_info.st_gid != 0 or stat.S_IMODE(directory_info.st_mode) & 0o022:
+            raise SystemExit("release directory is unsafe")
+        manifest_fd = os.open("manifest.json", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+        try:
+            before = os.fstat(manifest_fd)
+            if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_uid != 0 or before.st_gid != 0 or stat.S_IMODE(before.st_mode) != 0o644:
+                raise SystemExit("release manifest is unsafe")
+            chunks = []
+            while True:
+                chunk = os.read(manifest_fd, 65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            raw = b"".join(chunks)
+            after = os.fstat(manifest_fd)
+            if (after.st_dev, after.st_ino, after.st_nlink) != (before.st_dev, before.st_ino, before.st_nlink):
+                raise SystemExit("release manifest changed during read")
+        finally:
+            os.close(manifest_fd)
+    finally:
+        os.close(directory_fd)
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise SystemExit("release manifest is invalid") from exc
+    return raw, value
+
+matches = []
+for entry in os.scandir(root_fd):
+    try:
+        info = entry.stat(follow_symlinks=False)
+    except OSError:
+        continue
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_gid != 0 or stat.S_IMODE(info.st_mode) & 0o022:
+        continue
+    raw, manifest = read_release(entry.name)
+    if hashlib.sha256(raw).hexdigest() != expected:
+        continue
+    if not isinstance(manifest, dict) or manifest.get("version") not in {"0.8.0-rc.1", "0.8.0-rc.2"} or manifest.get("migration_version") != "0024" or manifest.get("release_id") != entry.name or manifest.get("architecture") not in {"amd64", "arm64"} or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", entry.name):
+        raise SystemExit("candidate manifest is not a supported RC/0024 release")
+    matches.append((entry.name, manifest["version"], manifest["architecture"]))
+if len(matches) != 1:
+    raise SystemExit("candidate manifest identity is ambiguous")
+if os.path.dirname(current_release_path) != root:
+    raise SystemExit("current release manifest escapes the release root")
+_, current = read_release(os.path.basename(current_release_path))
+candidate_id, candidate_version, candidate_arch = matches[0]
+current_version, current_arch = current.get("version"), current.get("architecture")
+matrix = {("0.8.0-rc.0", "0.8.0-rc.1"): "rc0-legacy", ("0.8.0-rc.1", "0.8.0-rc.2"): "native"}
+layout = matrix.get((current_version, candidate_version))
+if layout is None or current_arch != candidate_arch:
+    raise SystemExit("unsupported production upgrade matrix")
+print(candidate_id + "\t" + candidate_version + "\t" + layout)
+os.close(root_fd)
+PY
+  ) || die "candidate release identity is unavailable"
+  IFS=$'\t' read -r candidate_release_id candidate_release_version expected_layout <<<"$candidate_identity"
+  [[ -n "$candidate_release_id" && "$candidate_release_version" =~ ^0\.8\.0-rc\.[12]$ && ( "$expected_layout" = rc0-legacy || "$expected_layout" = native ) ]] || die "candidate release matrix is invalid"
+
   run_upgrade_helper prepare-control
 
   /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C LC_ALL=C /usr/bin/systemctl enable --now open-card-upgrade-safe.target
@@ -169,53 +249,13 @@ if [[ "$root" = "/" ]]; then
     requirements=$(/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C LC_ALL=C /usr/bin/systemctl show "$unit" --property=Requires --value --no-pager) || die "upgrade-safe dependency is unreadable for $unit"
     [[ " $requirements " = *" open-card-upgrade-safe.target "* ]] || die "upgrade-safe target is not required by $unit"
   done
-
-  production_python=$(verified_production_program /usr/bin/python3) || die "trusted production python is unavailable"
-  candidate_release_id=$(/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C LC_ALL=C "$production_python" - /opt/open-card/releases "$expected_manifest_sha256" <<'PY'
-import hashlib, json, os, re, stat, sys
-
-root = sys.argv[1]
-expected = sys.argv[2]
-try:
-    root_stat = os.lstat(root)
-except OSError as exc:
-    raise SystemExit("candidate release root is unavailable") from exc
-if not stat.S_ISDIR(root_stat.st_mode) or stat.S_ISLNK(root_stat.st_mode) or root_stat.st_uid != 0 or root_stat.st_gid != 0 or root_stat.st_mode & 0o022:
-    raise SystemExit("candidate release root is unsafe")
-matches = []
-for entry in os.scandir(root):
-    if not entry.is_dir(follow_symlinks=False) or entry.is_symlink():
-        continue
-    manifest_path = os.path.join(root, entry.name, "manifest.json")
-    try:
-        info = os.lstat(manifest_path)
-    except OSError:
-        continue
-    if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_gid != 0 or stat.S_IMODE(info.st_mode) != 0o644:
-        continue
-    with open(manifest_path, "rb") as stream:
-        raw = stream.read()
-    if hashlib.sha256(raw).hexdigest() != expected:
-        continue
-    try:
-        manifest = json.loads(raw)
-    except (TypeError, ValueError) as exc:
-        raise SystemExit("candidate manifest is invalid") from exc
-    if not isinstance(manifest, dict) or manifest.get("version") != "0.8.0-rc.1" or manifest.get("migration_version") != "0024" or manifest.get("release_id") != entry.name or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", entry.name):
-        raise SystemExit("candidate manifest is not the RC1/0024 release")
-    matches.append(entry.name)
-if len(matches) != 1:
-    raise SystemExit("candidate manifest identity is ambiguous")
-print(matches[0])
-PY
-  ) || die "candidate release identity is unavailable"
   [[ -r /proc/sys/kernel/random/uuid ]] || die "kernel transaction UUID source is unavailable"
   IFS= read -r kernel_uuid < /proc/sys/kernel/random/uuid
   [[ "$kernel_uuid" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || die "kernel transaction UUID is invalid"
   transaction_id="upgrade-${kernel_uuid//-/}"
 
-  run_upgrade_helper preflight --transaction-id "$transaction_id" --release-id "$candidate_release_id" --manifest-sha256 "$expected_manifest_sha256" --expect-layout rc0-legacy
-  run_upgrade_helper run --transaction-id "$transaction_id" --release-id "$candidate_release_id" --manifest-sha256 "$expected_manifest_sha256" --expect-layout rc0-legacy
+  run_upgrade_helper preflight --transaction-id "$transaction_id" --release-id "$candidate_release_id" --manifest-sha256 "$expected_manifest_sha256" --expect-layout "$expected_layout"
+  run_upgrade_helper run --transaction-id "$transaction_id" --release-id "$candidate_release_id" --manifest-sha256 "$expected_manifest_sha256" --expect-layout "$expected_layout"
   exit 0
 fi
 

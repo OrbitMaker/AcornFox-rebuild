@@ -370,7 +370,8 @@ func TestSystemRootUpgradeUsesStagedRC1DelegationInsteadOfLegacyMutation(t *test
 		"verified_production_program /usr/bin/python3",
 		"open-card-buildkit.service open-card-caddy.service open-card-server.service open-card-agent.service open-card-edge.service",
 		"candidate manifest identity is ambiguous",
-		"--expect-layout rc0-legacy",
+		"(\"0.8.0-rc.0\", \"0.8.0-rc.1\"): \"rc0-legacy\"",
+		"(\"0.8.0-rc.1\", \"0.8.0-rc.2\"): \"native\"",
 	} {
 		if !strings.Contains(upgrade, required) {
 			t.Fatalf("missing system-root upgrade delegation %q", required)
