@@ -335,11 +335,11 @@ func runWithDependenciesCore(ctx context.Context, args []string, stdout, stderr 
 	case "preflight":
 		identity, err := deps.derive(config)
 		if err != nil {
-			return writeUpgradeError(stderr, exitIneligible, "release_ineligible")
+			return writeUpgradeError(stderr, exitIneligible, "release_identity_ineligible")
 		}
 		identity.Request.ExpectedLegacy = config.expectLegacy
 		if deps.verifyCandidateExecutable != nil && deps.verifyCandidateExecutable(identity.UpgradeExecutableSHA256) != nil {
-			return writeUpgradeError(stderr, exitIneligible, "release_ineligible")
+			return writeUpgradeError(stderr, exitIneligible, "upgrade_executable_ineligible")
 		}
 		if runtime.preflight == nil {
 			return writeUpgradeError(stderr, exitInternal, "runtime_unavailable")
@@ -352,11 +352,11 @@ func runWithDependenciesCore(ctx context.Context, args []string, stdout, stderr 
 	case "run":
 		identity, err := deps.derive(config)
 		if err != nil {
-			return writeUpgradeError(stderr, exitIneligible, "release_ineligible")
+			return writeUpgradeError(stderr, exitIneligible, "release_identity_ineligible")
 		}
 		identity.Request.ExpectedLegacy = config.expectLegacy
 		if deps.verifyCandidateExecutable != nil && deps.verifyCandidateExecutable(identity.UpgradeExecutableSHA256) != nil {
-			return writeUpgradeError(stderr, exitIneligible, "release_ineligible")
+			return writeUpgradeError(stderr, exitIneligible, "upgrade_executable_ineligible")
 		}
 		if runtime.run == nil {
 			return writeUpgradeError(stderr, exitInternal, "runtime_unavailable")

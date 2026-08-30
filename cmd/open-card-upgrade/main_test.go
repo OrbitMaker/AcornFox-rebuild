@@ -396,22 +396,48 @@ func TestRunPreflightAndRunUseDerivedIdentity(t *testing.T) {
 
 func TestPreflightRejectsCandidateBinaryDigestBeforeEngine(t *testing.T) {
 	identity := cliIdentity(t)
-	called := false
-	var stdout, stderr bytes.Buffer
-	runtime := upgradeRuntime{preflight: func(context.Context, install.UpgradeRequest) (install.UpgradeEligibilityV1, error) {
-		called = true
-		return install.UpgradeEligibilityV1{}, nil
-	}, close: func() error { return nil }}
-	deps := testDependencies(runtime)
-	deps.derive = func(upgradeCommandConfig) (install.UpgradeCLIIdentity, error) { return identity, nil }
-	deps.verifyCandidateExecutable = func(digest string) error {
-		if digest != identity.UpgradeExecutableSHA256 {
-			t.Fatalf("unexpected binary digest %q", digest)
+	for _, command := range []string{"preflight", "run"} {
+		called := false
+		var stdout, stderr bytes.Buffer
+		runtime := upgradeRuntime{preflight: func(context.Context, install.UpgradeRequest) (install.UpgradeEligibilityV1, error) {
+			called = true
+			return install.UpgradeEligibilityV1{}, nil
+		}, run: func(context.Context, install.UpgradeRequest) error {
+			called = true
+			return nil
+		}, close: func() error { return nil }}
+		deps := testDependencies(runtime)
+		deps.derive = func(upgradeCommandConfig) (install.UpgradeCLIIdentity, error) { return identity, nil }
+		deps.verifyCandidateExecutable = func(digest string) error {
+			if digest != identity.UpgradeExecutableSHA256 {
+				t.Fatalf("unexpected binary digest %q", digest)
+			}
+			return errors.New("digest mismatch")
 		}
-		return errors.New("digest mismatch")
+		if code := runWithDependencies(context.Background(), cliArgs(command), &stdout, &stderr, deps); code != exitIneligible || called || !strings.Contains(stderr.String(), "upgrade_executable_ineligible") || strings.Contains(stderr.String(), "digest mismatch") {
+			t.Fatalf("%s candidate binary mismatch reached engine/leaked: code=%d called=%v out=%q err=%q", command, code, called, stdout.String(), stderr.String())
+		}
 	}
-	if code := runWithDependencies(context.Background(), cliArgs("preflight"), &stdout, &stderr, deps); code != exitIneligible || called || strings.Contains(stderr.String(), "digest mismatch") {
-		t.Fatalf("candidate binary mismatch reached engine/leaked: code=%d called=%v out=%q err=%q", code, called, stdout.String(), stderr.String())
+}
+
+func TestPreflightRejectsReleaseIdentityBeforeEngine(t *testing.T) {
+	for _, command := range []string{"preflight", "run"} {
+		called := false
+		var stdout, stderr bytes.Buffer
+		runtime := upgradeRuntime{preflight: func(context.Context, install.UpgradeRequest) (install.UpgradeEligibilityV1, error) {
+			called = true
+			return install.UpgradeEligibilityV1{}, nil
+		}, run: func(context.Context, install.UpgradeRequest) error {
+			called = true
+			return nil
+		}, close: func() error { return nil }}
+		deps := testDependencies(runtime)
+		deps.derive = func(upgradeCommandConfig) (install.UpgradeCLIIdentity, error) {
+			return install.UpgradeCLIIdentity{}, errors.New("postgresql://secret@invalid")
+		}
+		if code := runWithDependencies(context.Background(), cliArgs(command), &stdout, &stderr, deps); code != exitIneligible || called || !strings.Contains(stderr.String(), "release_identity_ineligible") || strings.Contains(stderr.String(), "secret") {
+			t.Fatalf("%s release identity failure reached engine/leaked: code=%d called=%v out=%q err=%q", command, code, called, stdout.String(), stderr.String())
+		}
 	}
 }
 
