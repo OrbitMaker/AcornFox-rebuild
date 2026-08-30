@@ -25,7 +25,7 @@ rc1_manifest_sha=57271339953ece13c64ea80b6db5cc045005c104f942ca9e95f9e705dd3cf7f
 rc1_archive_sha=7eb268c1becfc7a61564a87b6a6132c988a567f7be5d1d66ec31427a45f7a46a
 rc1_bundle_sha=15f667fca1ba4240fc5fa87ab42fd5c16c42e76e431058d88b6c76a2f4df5214
 rc1_source=a23ec9024a176cb0d00784a64aaf10a97fc4d1c4
-edge_domain=console.g5b.invalid
+edge_domain=console.localhost
 
 [[ "$(id -u)" -eq 0 ]]
 [[ -d "$source_root" && ! -L "$source_root" ]]
@@ -131,6 +131,19 @@ assert_runtime_services() {
   assert_edge_active
   [[ ! -e "$marker" && ! -L "$marker" ]]
 }
+assert_legacy_runtime_services() {
+  local unit
+  for unit in open-card-upgrade-safe.target open-card-server.service open-card-agent.service open-card-buildkit.service open-card-caddy.service; do wait_active "$unit"; done
+  test -S /run/open-card-buildkit/buildkitd.sock
+  wait_http http://127.0.0.1:8080/healthz
+  wait_http http://127.0.0.1:18481/healthz
+  assert_edge_running
+  wait_http http://127.0.0.1:2020/config/
+  [[ ! -e "$marker" && ! -L "$marker" ]]
+}
+assert_no_public_acme() {
+  ! journalctl --no-pager -u open-card-edge.service | grep -E 'acme-v02\.api\.letsencrypt\.org|acme\.zerossl\.com'
+}
 run_active_switch_crash() {
   local wrapper_pid helper_pid watcher_pid tx candidate_id journal status journal_state i
   local -a helper_pids=()
@@ -203,7 +216,7 @@ PY
 post_reboot_crash() {
   local tx journal active previous old_activation candidate_activation old_database candidate_database db_password old_url
   phase=post_reboot_crash
-  assert_runtime_services
+  assert_legacy_runtime_services
   tx=$(cat "$state/crash-transaction-id")
   journal="/var/lib/open-card/upgrade-transactions/$tx.json"
   python3 - "$journal" <<'PY' >"$evidence/crash-recovery-journal.txt"
@@ -233,6 +246,7 @@ PY
   [[ "$(psql "$old_url" -X -Aqt -c 'SELECT value FROM gate5b_success_sentinel WHERE id=1')" = rc0-before-upgrade ]]
   [[ "$(runuser -u postgres -- psql -d "$candidate_database" -X -Aqt -c 'SELECT count(*) FROM schema_migrations')" = 24 ]]
   [[ ! -e "$marker" && ! -L "$marker" ]]
+  assert_no_public_acme
   printf 'crash_recovery=PASS\njournal_state=ROLLED_BACK\nmarker=absent\nedge=active\ncandidate_retained=PASS\npublic_dns_acme_customer_acceptance=PENDING\n' >"$evidence/crash-recovery-summary.txt"
   ! grep -R -a -E 'postgres(ql)?://|OPEN_CARD_DATABASE_URL=|BEGIN [A-Z ]*PRIVATE KEY|password=' "$evidence"
   (cd "$evidence" && find . -type f ! -name manifest.sha256 -print0 | LC_ALL=C sort -z | xargs -0 sha256sum >manifest.sha256)
@@ -246,6 +260,7 @@ post_reboot() {
   local active restored_database db_password restored_url
   phase=post_reboot
   assert_runtime_services
+  assert_no_public_acme
   [[ "$(readlink /opt/open-card/current)" = active/release ]]
   active=$(readlink /opt/open-card/active)
   [[ "$active" =~ ^activations/(act|restore)-[0-9a-f]{24}$ ]]
