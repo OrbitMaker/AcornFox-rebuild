@@ -29,6 +29,15 @@ const (
 	CurrentMigrationVersion       = "0024"
 	ProductionCandidateVersion    = "0.8.0-rc.1"
 	ProductionNMinusOneVersion    = "0.8.0-rc.0"
+	Gate6CandidateVersion         = "0.8.0-rc.2"
+	Gate6NMinusOneVersion         = "0.8.0-rc.1"
+	RC1SourceCommit               = "0d5c96bf7b7bd1c641b108cbbd54511d814f2aa0"
+	RC1ReleaseManifestSHA256      = "1cf02e4a111e38a4061c692de418b67755a2e55f97a04cbc92cee8cb9f82a7be"
+	RC1ArchiveSHA256              = "9056cb46537537f6cab21482d900160486098d857955d23b0ca8f131a9cc4233"
+	RC1BundleManifestSHA256       = "d0e8c111dcaa334c89bb815fc2ddc9b122887cddbbf7c59b6eb51436b931706f"
+	ARM64RC1ReleaseManifestSHA256 = "6bf1e590c3054d373d9319f03581d7a623ee3093b53ddba7b343cf8af7f85fed"
+	ARM64RC1ArchiveSHA256         = "56a697aed3a8f77261cfeb3074a7d7ab0cfb6389ab5d75225ad9931b665bfa86"
+	ARM64RC1BundleManifestSHA256  = "5fda1e9d0f80deadf6b87cb281d80793c9d1e910386624bc5975cdd0464a2650"
 	RC0SourceCommit               = "35a2b198ac52949af3477475d89d4813b46a9490"
 	RC0ReleaseManifestSHA256      = "3b3953c0a26f8706151583ad6c9cad6b5502da18b28f11ed66ca92fe604aa253"
 	RC0ArchiveSHA256              = "abc034ed24e8e8dc74b8eabc84dd3071a66f166abe65135502911e9153c0b9fc"
@@ -52,6 +61,21 @@ type RC0Lineage struct {
 	ReleaseManifestSHA256 string
 	ArchiveSHA256         string
 	BundleManifestSHA256  string
+}
+
+// RC1LineageForArchitecture is the immutable predecessor tuple for RC2.
+func RC1LineageForArchitecture(architecture string) (RC0Lineage, error) {
+	normalized, err := NormalizeArchitecture(architecture)
+	if err != nil {
+		return RC0Lineage{}, fmt.Errorf("unsupported RC1 lineage architecture %q", architecture)
+	}
+	if normalized == "amd64" {
+		return RC0Lineage{Architecture: normalized, SourceCommit: RC1SourceCommit, ReleaseManifestSHA256: RC1ReleaseManifestSHA256, ArchiveSHA256: RC1ArchiveSHA256, BundleManifestSHA256: RC1BundleManifestSHA256}, nil
+	}
+	if normalized == "arm64" {
+		return RC0Lineage{Architecture: normalized, SourceCommit: RC1SourceCommit, ReleaseManifestSHA256: ARM64RC1ReleaseManifestSHA256, ArchiveSHA256: ARM64RC1ArchiveSHA256, BundleManifestSHA256: ARM64RC1BundleManifestSHA256}, nil
+	}
+	return RC0Lineage{}, fmt.Errorf("unsupported RC1 lineage architecture %q", architecture)
 }
 
 // RC0LineageForArchitecture returns the independently frozen RC0 evidence
@@ -93,8 +117,8 @@ func ValidateProductionCandidate(manifest Manifest) error {
 	if err := manifest.Validate(); err != nil {
 		return err
 	}
-	if manifest.Version != ProductionCandidateVersion || manifest.MigrationVersion != CurrentMigrationVersion {
-		return errors.New("manifest is not the 0.8.0-rc.1 production candidate")
+	if (manifest.Version != ProductionCandidateVersion && manifest.Version != Gate6CandidateVersion) || manifest.MigrationVersion != CurrentMigrationVersion {
+		return errors.New("manifest is not a supported 0.8.0 production candidate")
 	}
 	required := map[string]bool{
 		"bin/open-card-admin":                                     false,
@@ -110,6 +134,17 @@ func ValidateProductionCandidate(manifest Manifest) error {
 		"docs/licenses/licenses-manifest.json":                    false,
 		"sbom.spdx.json":                                          false,
 		"source-manifest.sha256":                                  false,
+	}
+	if manifest.Version == Gate6CandidateVersion {
+		for _, path := range []string{
+			"scripts/mvp/host-preflight.sh",
+			"scripts/mvp/buildkit-production-capacity.sh",
+			"scripts/mvp/g6-staging-evidence.sh",
+			"tools/evidence/g6_validate.py",
+			"tools/evidence/g6_target_receipt.py",
+		} {
+			required[path] = false
+		}
 	}
 	for _, file := range manifest.Files {
 		if strings.Contains(file.Path, "fixture") || strings.Contains(file.Path, "/tests/") || strings.HasSuffix(file.Path, ".test") || strings.Contains(file.Path, "open-card-caddy-fixture") {
@@ -453,10 +488,22 @@ func (m Manifest) Validate() error {
 		if n.Version != ProductionNMinusOneVersion || n.MigrationVersion != "0023" || n.SourceCommit != lineage.SourceCommit || n.ReleaseManifestSHA256 != lineage.ReleaseManifestSHA256 || n.ArchiveSHA256 != lineage.ArchiveSHA256 || n.BundleManifestSHA256 != lineage.BundleManifestSHA256 {
 			return errors.New("rc1 n_minus_one lineage is invalid")
 		}
+	} else if m.Version == Gate6CandidateVersion && m.MigrationVersion == "0024" {
+		if m.SourceCommit == "" || m.NMinusOne == nil {
+			return errors.New("rc2 manifest lineage is required")
+		}
+		lineage, err := RC1LineageForArchitecture(m.Architecture)
+		if err != nil {
+			return errors.New("rc2 manifest architecture lineage is invalid")
+		}
+		n := m.NMinusOne
+		if n.Version != Gate6NMinusOneVersion || n.MigrationVersion != "0024" || n.SourceCommit != lineage.SourceCommit || n.ReleaseManifestSHA256 != lineage.ReleaseManifestSHA256 || n.ArchiveSHA256 != lineage.ArchiveSHA256 || n.BundleManifestSHA256 != lineage.BundleManifestSHA256 {
+			return errors.New("rc2 n_minus_one lineage is invalid")
+		}
 	} else if m.NMinusOne != nil {
-		return errors.New("only rc1/0024 manifests may carry n_minus_one lineage")
+		return errors.New("only rc1/0024 and rc2/0024 manifests may carry n_minus_one lineage")
 	} else if m.SourceCommit != "" {
-		return errors.New("only rc0/0023 and rc1/0024 manifests may carry source_commit")
+		return errors.New("only rc0/0023, rc1/0024 and rc2/0024 manifests may carry source_commit")
 	}
 	if _, err := NormalizeProtocolVersion(m.Protocol); err != nil {
 		return errors.New("manifest protocol is invalid")

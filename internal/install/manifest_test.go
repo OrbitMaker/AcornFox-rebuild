@@ -81,7 +81,7 @@ func TestRCManifestLineageUsesOnlyFrozenTuplesAndDigests(t *testing.T) {
 	}
 	arm64 := rc1
 	arm64.Architecture = "arm64"
-	arm64.NMinusOne = &NMinusOne{Version: ProductionNMinusOneVersion, MigrationVersion: "0023", SourceCommit: RC0SourceCommit, ReleaseManifestSHA256: ARM64RC0ReleaseManifestSHA256, ArchiveSHA256: ARM64RC0ArchiveSHA256, BundleManifestSHA256: ARM64RC0BundleManifestSHA256}
+	arm64.NMinusOne = &NMinusOne{Version: "0.8.0-rc.0", MigrationVersion: "0023", SourceCommit: RC0SourceCommit, ReleaseManifestSHA256: ARM64RC0ReleaseManifestSHA256, ArchiveSHA256: ARM64RC0ArchiveSHA256, BundleManifestSHA256: ARM64RC0BundleManifestSHA256}
 	if err := arm64.Validate(); err != nil {
 		t.Fatalf("arm64 rc1 lineage rejected: %v", err)
 	}
@@ -110,6 +110,44 @@ func TestRCManifestLineageUsesOnlyFrozenTuplesAndDigests(t *testing.T) {
 	if err := rc1.Validate(); err == nil {
 		t.Fatal("rc1 accepted missing N-1 lineage")
 	}
+	rc2, _ := testManifest(t, Gate6CandidateVersion, "bin/open-card-server", []byte("server"))
+	rc2.Architecture, rc2.MigrationVersion, rc2.SourceCommit = "amd64", "0024", strings.Repeat("b", 40)
+	rc2.NMinusOne = &NMinusOne{Version: Gate6NMinusOneVersion, MigrationVersion: "0024", SourceCommit: RC1SourceCommit, ReleaseManifestSHA256: RC1ReleaseManifestSHA256, ArchiveSHA256: RC1ArchiveSHA256, BundleManifestSHA256: RC1BundleManifestSHA256}
+	if err := rc2.Validate(); err != nil {
+		t.Fatalf("rc2 lineage rejected: %v", err)
+	}
+	rc2ARM := rc2
+	rc2ARM.Architecture = "arm64"
+	rc2ARM.NMinusOne = &NMinusOne{Version: Gate6NMinusOneVersion, MigrationVersion: "0024", SourceCommit: RC1SourceCommit, ReleaseManifestSHA256: ARM64RC1ReleaseManifestSHA256, ArchiveSHA256: ARM64RC1ArchiveSHA256, BundleManifestSHA256: ARM64RC1BundleManifestSHA256}
+	if err := rc2ARM.Validate(); err != nil {
+		t.Fatalf("arm64 rc2 lineage rejected: %v", err)
+	}
+	rc2ARM.NMinusOne.ReleaseManifestSHA256 = RC1ReleaseManifestSHA256
+	if err := rc2ARM.Validate(); err == nil {
+		t.Fatal("arm64 rc2 accepted amd64 predecessor")
+	}
+	rc2.NMinusOne.SourceCommit = RC0SourceCommit
+	if err := rc2.Validate(); err == nil {
+		t.Fatal("rc2 accepted RC0 predecessor")
+	}
+	rc2.NMinusOne.SourceCommit = RC1SourceCommit
+	for name, mutate := range map[string]func(*NMinusOne){
+		"version":   func(n *NMinusOne) { n.Version = ProductionNMinusOneVersion },
+		"migration": func(n *NMinusOne) { n.MigrationVersion = "0023" },
+		"manifest":  func(n *NMinusOne) { n.ReleaseManifestSHA256 = strings.Repeat("0", 64) },
+		"archive":   func(n *NMinusOne) { n.ArchiveSHA256 = strings.Repeat("0", 64) },
+		"bundle":    func(n *NMinusOne) { n.BundleManifestSHA256 = strings.Repeat("0", 64) },
+	} {
+		t.Run("rc2-"+name, func(t *testing.T) {
+			candidate := rc2
+			lineage := *candidate.NMinusOne
+			candidate.NMinusOne = &lineage
+			mutate(candidate.NMinusOne)
+			if err := candidate.Validate(); err == nil {
+				t.Fatal("rc2 accepted invalid predecessor field")
+			}
+		})
+	}
 
 	other, _ := testManifest(t, "1.2.3", "bin/open-card-server", []byte("server"))
 	other.SourceCommit = strings.Repeat("a", 40)
@@ -119,11 +157,11 @@ func TestRCManifestLineageUsesOnlyFrozenTuplesAndDigests(t *testing.T) {
 }
 
 func TestProductionCandidateRequires0024PayloadAndRejectsFixtures(t *testing.T) {
-	manifest, _ := testManifest(t, ProductionCandidateVersion, "bin/open-card-admin", []byte("admin"))
+	manifest, _ := testManifest(t, Gate6CandidateVersion, "bin/open-card-admin", []byte("admin"))
 	manifest.Architecture = "amd64"
 	manifest.MigrationVersion = CurrentMigrationVersion
 	manifest.SourceCommit = strings.Repeat("a", 40)
-	manifest.NMinusOne = &NMinusOne{Version: "0.8.0-rc.0", MigrationVersion: "0023", SourceCommit: RC0SourceCommit, ReleaseManifestSHA256: RC0ReleaseManifestSHA256, ArchiveSHA256: RC0ArchiveSHA256, BundleManifestSHA256: RC0BundleManifestSHA256}
+	manifest.NMinusOne = &NMinusOne{Version: Gate6NMinusOneVersion, MigrationVersion: "0024", SourceCommit: RC1SourceCommit, ReleaseManifestSHA256: RC1ReleaseManifestSHA256, ArchiveSHA256: RC1ArchiveSHA256, BundleManifestSHA256: RC1BundleManifestSHA256}
 	manifest.Files = append(manifest.Files,
 		FileDigest{Path: "bin/open-card-upgrade", SHA256: strings.Repeat("9", 64), Mode: 0o755},
 		FileDigest{Path: "systemd/open-card-edge.service", SHA256: strings.Repeat("a", 64), Mode: 0o644},
@@ -137,6 +175,11 @@ func TestProductionCandidateRequires0024PayloadAndRejectsFixtures(t *testing.T) 
 		FileDigest{Path: "docs/licenses/licenses-manifest.json", SHA256: strings.Repeat("e", 64), Mode: 0o644},
 		FileDigest{Path: "sbom.spdx.json", SHA256: strings.Repeat("f", 64), Mode: 0o644},
 		FileDigest{Path: "source-manifest.sha256", SHA256: strings.Repeat("1", 64), Mode: 0o644},
+		FileDigest{Path: "scripts/mvp/host-preflight.sh", SHA256: strings.Repeat("2", 64), Mode: 0o755},
+		FileDigest{Path: "scripts/mvp/buildkit-production-capacity.sh", SHA256: strings.Repeat("3", 64), Mode: 0o755},
+		FileDigest{Path: "scripts/mvp/g6-staging-evidence.sh", SHA256: strings.Repeat("4", 64), Mode: 0o755},
+		FileDigest{Path: "tools/evidence/g6_validate.py", SHA256: strings.Repeat("5", 64), Mode: 0o755},
+		FileDigest{Path: "tools/evidence/g6_target_receipt.py", SHA256: strings.Repeat("6", 64), Mode: 0o755},
 	)
 	if err := ValidateProductionCandidate(manifest); err != nil {
 		t.Fatalf("production candidate rejected: %v", err)
