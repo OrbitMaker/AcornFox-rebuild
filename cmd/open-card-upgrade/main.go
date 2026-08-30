@@ -80,6 +80,7 @@ type upgradeDependencies struct {
 	derive                    func(upgradeCommandConfig) (install.UpgradeCLIIdentity, error)
 	verifyExecutable          func() error
 	prepareControl            func(context.Context) (string, error)
+	prepareBootstrap          func(context.Context, string) (install.BootstrapRuntimeReceipt, error)
 	verifyCandidateExecutable func(string) error
 	newRuntime                func(context.Context) (upgradeRuntime, error)
 	newStatusRuntime          func(context.Context) (upgradeRuntime, error)
@@ -177,6 +178,7 @@ func productionUpgradeDependencies() upgradeDependencies {
 		derive:                    deriveProductionIdentity,
 		verifyExecutable:          func() error { return verifyProductionUpgradeExecutable(productionUpgradeExecutable) },
 		prepareControl:            install.PrepareProductionUpgradeControl,
+		prepareBootstrap:          install.PrepareProductionBootstrapRuntime,
 		verifyCandidateExecutable: verifyProductionUpgradeExecutableDigest,
 		newRuntime:                newProductionRuntime,
 		newStatusRuntime:          newProductionStatusRuntime,
@@ -283,6 +285,16 @@ func runWithDependenciesCore(ctx context.Context, args []string, stdout, stderr 
 			return writeUpgradeError(stderr, exitInternal, "control_prepare_failed")
 		}
 		return writeUpgradeJSON(stdout, exitOK, map[string]any{"ok": true, "command": "prepare-control", "control_identity_sha256": identity})
+	}
+	if config.command == "prepare-bootstrap" {
+		if deps.verifyExecutable == nil || deps.prepareBootstrap == nil || deps.verifyExecutable() != nil {
+			return writeUpgradeError(stderr, exitInternal, "runtime_unavailable")
+		}
+		receipt, prepareErr := deps.prepareBootstrap(ctx, config.manifestSHA256)
+		if prepareErr != nil || receipt.Validate() != nil || receipt.ManifestSHA256 != config.manifestSHA256 {
+			return writeUpgradeError(stderr, exitInternal, "bootstrap_prepare_failed")
+		}
+		return writeUpgradeJSON(stdout, exitOK, map[string]any{"ok": true, "command": config.command, "receipt": receipt})
 	}
 	constructor := deps.newRuntime
 	switch config.command {
@@ -544,6 +556,11 @@ func parseUpgradeArgs(args []string) (upgradeCommandConfig, error) {
 		if len(args) != 1 {
 			return upgradeCommandConfig{}, errors.New("prepare-control takes no flags")
 		}
+	case "prepare-bootstrap":
+		if len(args) != 3 || args[1] != "--expected-manifest-sha256" || !validCLISHA(args[2]) {
+			return upgradeCommandConfig{}, errors.New("invalid prepare-bootstrap command")
+		}
+		config.manifestSHA256 = args[2]
 	case "bootstrap-native":
 		for index := 1; index < len(args); index++ {
 			if index+1 >= len(args) {

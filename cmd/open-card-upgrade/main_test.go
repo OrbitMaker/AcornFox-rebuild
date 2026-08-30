@@ -94,6 +94,14 @@ func TestParseUpgradeArgsIsExactAndForbidsDangerousInputs(t *testing.T) {
 	if config, err := parseUpgradeArgs([]string{"prepare-control"}); err != nil || config.command != "prepare-control" {
 		t.Fatalf("prepare-control parse failed: %#v %v", config, err)
 	}
+	if config, err := parseUpgradeArgs([]string{"prepare-bootstrap", "--expected-manifest-sha256", testManifest}); err != nil || config.command != "prepare-bootstrap" || config.manifestSHA256 != testManifest {
+		t.Fatalf("prepare-bootstrap parse failed: %+v %v", config, err)
+	}
+	for _, args := range [][]string{{"prepare-bootstrap"}, {"prepare-bootstrap", "--manifest-sha256", testManifest}, {"prepare-bootstrap", "--expected-manifest-sha256", testManifest, "--task-root", "/tmp/x"}} {
+		if _, err := parseUpgradeArgs(args); err == nil {
+			t.Fatalf("prepare-bootstrap accepted flags %#v", args)
+		}
+	}
 	for _, args := range [][]string{{"prepare-control", "--task-root", "/tmp/x"}, {"prepare-control", "--transaction-id", testTransaction}} {
 		if _, err := parseUpgradeArgs(args); err == nil {
 			t.Fatalf("prepare-control accepted flags %#v", args)
@@ -397,6 +405,47 @@ func TestPrepareControlIsRootOnlyAndDoesNotConstructRuntime(t *testing.T) {
 	deps.euid = func() int { return 99 }
 	if code := runWithDependencies(context.Background(), []string{"prepare-control"}, &stdout, &stderr, deps); code != exitPrivilege || prepared || strings.Contains(stderr.String(), "postgres") {
 		t.Fatalf("non-root prepare-control was accepted/leaked: code=%d prepared=%v out=%q err=%q", code, prepared, stdout.String(), stderr.String())
+	}
+}
+
+func TestPrepareBootstrapIsRootOnlyAndDoesNotConstructRuntime(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	constructed, prepared := false, false
+	receipt := install.BootstrapRuntimeReceipt{ReleaseID: "release-rc2", ManifestSHA256: testManifest, BootstrapDatabaseEnvSHA256: strings.Repeat("b", 64), SafeEdgeConfigSHA256: strings.Repeat("c", 64), SafeEdgeEnvSHA256: strings.Repeat("d", 64)}
+	deps := upgradeDependencies{
+		euid:             func() int { return 0 },
+		verifyExecutable: func() error { return nil },
+		prepareBootstrap: func(_ context.Context, digest string) (install.BootstrapRuntimeReceipt, error) {
+			prepared = true
+			if digest != testManifest {
+				t.Fatalf("digest=%s", digest)
+			}
+			return receipt, nil
+		},
+		newRuntime: func(context.Context) (upgradeRuntime, error) {
+			constructed = true
+			return upgradeRuntime{}, nil
+		},
+	}
+	args := []string{"prepare-bootstrap", "--expected-manifest-sha256", testManifest}
+	if code := runWithDependencies(context.Background(), args, &stdout, &stderr, deps); code != exitOK || !prepared || constructed || stderr.Len() != 0 || !strings.Contains(stdout.String(), "safe_edge_config_sha256") || strings.Contains(stdout.String(), "postgresql://") {
+		t.Fatalf("code=%d prepared=%v constructed=%v out=%q err=%q", code, prepared, constructed, stdout.String(), stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	prepared = false
+	deps.euid = func() int { return 99 }
+	if code := runWithDependencies(context.Background(), args, &stdout, &stderr, deps); code != exitPrivilege || prepared || !strings.Contains(stderr.String(), "root_required") {
+		t.Fatalf("non-root code=%d prepared=%v out=%q err=%q", code, prepared, stdout.String(), stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	deps.euid = func() int { return 0 }
+	deps.prepareBootstrap = func(context.Context, string) (install.BootstrapRuntimeReceipt, error) {
+		return install.BootstrapRuntimeReceipt{}, errors.New("postgresql://secret@db/x")
+	}
+	if code := runWithDependencies(context.Background(), args, &stdout, &stderr, deps); code != exitInternal || !strings.Contains(stderr.String(), "bootstrap_prepare_failed") || strings.Contains(stderr.String(), "secret") {
+		t.Fatalf("failure code=%d out=%q err=%q", code, stdout.String(), stderr.String())
 	}
 }
 
