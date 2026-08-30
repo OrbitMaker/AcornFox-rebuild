@@ -97,7 +97,9 @@ expected=$(tr '[:upper:]' '[:lower:]' <<< "$expected")
 # Before packages are present the receipt may report only docker prerequisite
 # pending. Capacity, host identity, listeners and colocated services must
 # already pass; a strict second receipt is required before activation.
-"$script_dir/host-preflight.sh" --allow-prerequisites-pending
+early_preflight_receipt=$("$script_dir/host-preflight.sh" --allow-prerequisites-pending)
+printf '%s\n' "$early_preflight_receipt"
+post_preflight_receipt=
 
 if [[ -L /opt/open-card/current ]] && (( ! dry_run )); then
   die "existing production installation requires upgrade.sh; root upgrades remain fail-closed pending atomic PostgreSQL restore support"
@@ -164,7 +166,8 @@ PY
     fi
   fi
   for command_name in docker psql runuser newuidmap newgidmap; do require_command "$command_name"; done
-  "$script_dir/host-preflight.sh" --post-prerequisites
+  post_preflight_receipt=$("$script_dir/host-preflight.sh" --post-prerequisites)
+  printf '%s\n' "$post_preflight_receipt"
 
   for account in opencard opencard-agent opencard-buildkit opencard-caddy opencard-edge; do
     if ! getent passwd "$account" >/dev/null; then
@@ -374,7 +377,10 @@ SQL
   export OPEN_CARD_DATABASE_URL="$database_url"
   export DATABASE_URL="$database_url"
 fi
-if (( skip_prerequisites )); then "$script_dir/host-preflight.sh" --post-prerequisites; fi
+if (( skip_prerequisites )); then
+  post_preflight_receipt=$("$script_dir/host-preflight.sh" --post-prerequisites)
+  printf '%s\n' "$post_preflight_receipt"
+fi
 for command_name in docker psql runuser newuidmap newgidmap; do require_command "$command_name"; done
 for command_path in /usr/lib/postgresql/16/bin/psql /usr/lib/postgresql/16/bin/pg_dump /usr/lib/postgresql/16/bin/pg_restore; do
   [[ -x "$command_path" && ! -L "$command_path" ]] || die "required PostgreSQL 16 tool is missing or unsafe: $command_path"
@@ -398,6 +404,44 @@ trap capacity_rollback EXIT
 
 "${installer[@]}"
 trap - EXIT
+[[ -n "$post_preflight_receipt" ]] || die "post-prerequisite host preflight receipt is missing"
+python3 - /var/lib/open-card/evidence/host-preflight.json "$post_preflight_receipt" <<'PY'
+import json, os, stat, sys, tempfile
+target, raw = sys.argv[1], (sys.argv[2] + "\n").encode()
+try:
+    value = json.loads(raw)
+except json.JSONDecodeError:
+    raise SystemExit("host preflight receipt is invalid")
+if value.get("schema_version") != 1 or value.get("status") != "pass" or value.get("mode") != "post":
+    raise SystemExit("host preflight receipt is not the accepted post-prerequisite state")
+parent = os.path.dirname(target)
+parent_stat = os.lstat(parent)
+if not stat.S_ISDIR(parent_stat.st_mode) or stat.S_ISLNK(parent_stat.st_mode) or parent_stat.st_uid != 0 or parent_stat.st_gid != 0 or stat.S_IMODE(parent_stat.st_mode) != 0o700:
+    raise SystemExit("host preflight evidence directory is unsafe")
+if os.path.lexists(target):
+    target_stat = os.lstat(target)
+    if not stat.S_ISREG(target_stat.st_mode) or stat.S_ISLNK(target_stat.st_mode) or target_stat.st_nlink != 1 or target_stat.st_uid != 0 or target_stat.st_gid != 0 or stat.S_IMODE(target_stat.st_mode) != 0o600:
+        raise SystemExit("existing host preflight receipt is unsafe")
+    with open(target, "rb", opener=lambda path, flags: os.open(path, flags | os.O_NOFOLLOW)) as stream:
+        if stream.read() != raw:
+            raise SystemExit("existing host preflight receipt conflicts")
+    raise SystemExit(0)
+fd, temporary = tempfile.mkstemp(prefix=".host-preflight.", dir=parent)
+try:
+    with os.fdopen(fd, "wb") as stream:
+        stream.write(raw); stream.flush(); os.fsync(stream.fileno()); os.fchmod(stream.fileno(), 0o600); os.fchown(stream.fileno(), 0, 0); os.fsync(stream.fileno())
+    os.link(temporary, target, follow_symlinks=False)
+    os.unlink(temporary)
+    directory = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try: os.fsync(directory)
+    finally: os.close(directory)
+    final = os.lstat(target)
+    if not stat.S_ISREG(final.st_mode) or final.st_nlink != 1 or final.st_uid != 0 or final.st_gid != 0 or stat.S_IMODE(final.st_mode) != 0o600:
+        raise SystemExit("published host preflight receipt is unsafe")
+finally:
+    try: os.unlink(temporary)
+    except FileNotFoundError: pass
+PY
 installation_id=/var/lib/open-card/installation-id
 if [[ ! -e "$installation_id" ]]; then openssl rand -hex 24 >"$installation_id"; fi
 [[ -f "$installation_id" && ! -L "$installation_id" ]] || die "installation id is unsafe"
