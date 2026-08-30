@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -279,6 +280,23 @@ func TestBootstrapInitialActivationPublishesExactPointersAndReplays(t *testing.T
 	}
 	if first == journal.ActivationJSONSHA256 || strings.Contains(first, activation.ActivationID) {
 		t.Fatal("pointer evidence is not an independent digest")
+	}
+}
+
+func TestBootstrapStoreReadInitialPointerStateIsSecretFreeAndExact(t *testing.T) {
+	store, journal, activation, databaseEnv, _, cleanup := bootstrapRC2Store(t)
+	defer cleanup()
+	persistBootstrapActivationWritten(t, store, journal, activation, databaseEnv)
+	state, err := store.ReadInitialPointerState(context.Background(), activation.ActivationID)
+	if err != nil || !state.ActivationExists || state.ActivationJSONSHA256 != journal.ActivationJSONSHA256 || state.ActiveID != "" || state.CurrentPresent || state.PreviousPresent || state.MarkerTransactionID != journal.TransactionID {
+		t.Fatalf("slot-only state=%+v err=%v", state, err)
+	}
+	if _, err := store.PublishInitialPointers(context.Background(), journal, activation); err != nil {
+		t.Fatal(err)
+	}
+	state, err = store.ReadInitialPointerState(context.Background(), activation.ActivationID)
+	if err != nil || state.ActiveID != activation.ActivationID || !state.CurrentPresent || state.PreviousPresent || !validSHA(state.PointerStateSHA256) || strings.Contains(fmt.Sprintf("%+v", state), "secret") {
+		t.Fatalf("published state=%+v err=%v", state, err)
 	}
 }
 

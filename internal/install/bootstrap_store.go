@@ -14,6 +14,19 @@ import (
 
 type BootstrapStore struct{ upgrade *UpgradeStore }
 
+// BootstrapInitialPointerState is the secret-free observation used by the
+// initial-install engine. It describes only the activation slot and initial
+// active/current/previous links; no path or database environment escapes.
+type BootstrapInitialPointerState struct {
+	ActivationExists     bool
+	ActivationJSONSHA256 string
+	PointerStateSHA256   string
+	ActiveID             string
+	CurrentPresent       bool
+	PreviousPresent      bool
+	MarkerTransactionID  string
+}
+
 type bootstrapPointerStateV1 struct {
 	ActiveActivationID         string `json:"active_activation_id"`
 	ActiveActivationJSONSHA256 string `json:"active_activation_json_sha256"`
@@ -52,6 +65,60 @@ func (s *BootstrapStore) Marker(ctx context.Context, set bool) error {
 		return ErrUpgradeJournalConflict
 	}
 	return s.upgrade.Marker(ctx, set)
+}
+
+// ReadInitialPointerState verifies the empty-or-exact bootstrap pointer
+// surface while the matching global lock is held. It deliberately rejects
+// malformed/foreign links rather than normalizing them.
+func (s *BootstrapStore) ReadInitialPointerState(_ context.Context, activationID string) (BootstrapInitialPointerState, error) {
+	if s == nil || s.upgrade == nil || !s.upgrade.ownsLock() || !validID(activationID) {
+		return BootstrapInitialPointerState{}, ErrUpgradeJournalConflict
+	}
+	digest, exists, err := s.upgrade.activationDigestIfPresent(activationID)
+	if err != nil {
+		return BootstrapInitialPointerState{}, ErrUpgradeJournalConflict
+	}
+	state := BootstrapInitialPointerState{ActivationExists: exists, ActivationJSONSHA256: digest}
+	active, err := s.upgrade.activationWriter.ReadActivationLink(ActivationLinkActive)
+	if err == nil {
+		id, ok := activationIDFromTarget(active)
+		if !ok {
+			return BootstrapInitialPointerState{}, ErrUpgradeJournalConflict
+		}
+		state.ActiveID = id
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return BootstrapInitialPointerState{}, ErrUpgradeJournalConflict
+	}
+	current, err := s.upgrade.activationWriter.ReadActivationLink(ActivationLinkCurrent)
+	if err == nil {
+		if current != "active/release" {
+			return BootstrapInitialPointerState{}, ErrUpgradeJournalConflict
+		}
+		state.CurrentPresent = true
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return BootstrapInitialPointerState{}, ErrUpgradeJournalConflict
+	}
+	if previous, err := s.upgrade.activationWriter.ReadActivationLink(ActivationLinkPreviousActive); err == nil {
+		if _, ok := activationIDFromTarget(previous); !ok {
+			return BootstrapInitialPointerState{}, ErrUpgradeJournalConflict
+		}
+		state.PreviousPresent = true
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return BootstrapInitialPointerState{}, ErrUpgradeJournalConflict
+	}
+	marker, err := s.upgrade.markerTransaction()
+	if err != nil {
+		return BootstrapInitialPointerState{}, ErrUpgradeJournalConflict
+	}
+	state.MarkerTransactionID = marker
+	if state.ActivationExists && state.ActiveID == activationID && state.CurrentPresent && !state.PreviousPresent {
+		pointerDigest, err := s.pointerState(activationID, state.ActivationJSONSHA256)
+		if err != nil {
+			return BootstrapInitialPointerState{}, ErrUpgradeJournalConflict
+		}
+		state.PointerStateSHA256 = pointerDigest
+	}
+	return state, nil
 }
 func (s *BootstrapStore) path(tx string) string {
 	return filepath.ToSlash(filepath.Join("bootstrap-transactions", tx+".json"))
