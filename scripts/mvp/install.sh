@@ -380,6 +380,7 @@ prepare_upgrade_substrate() {
   local expected_owner=$1
   prepare_upgrade_data_root "$expected_owner"
   prepare_upgrade_layout_directory "$prefix/activations" "$expected_owner" 711
+  prepare_upgrade_layout_directory "$data_dir/backups" "$expected_owner" 700
   prepare_upgrade_layout_directory "$data_dir/upgrade-transactions" "$expected_owner" 700
   prepare_upgrade_layout_directory "$data_dir/upgrade-artifacts" "$expected_owner" 700
   install_stable_file "$release_dir/bin/open-card-upgrade" "$upgrade_tools/open-card-upgrade" "$expected_owner" 755 "upgrade recovery binary"

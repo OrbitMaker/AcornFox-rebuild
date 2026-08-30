@@ -26,9 +26,14 @@ import (
 // an upgrade is allowed to use. In particular, it keeps the physical task
 // artifact directory separate from the journal's fixed artifact path.
 type UpgradeDatabasePlan struct {
-	TransactionID             string
-	ArtifactRoot              string
-	ArtifactDir               string
+	TransactionID string
+	ArtifactRoot  string
+	ArtifactDir   string
+	// BackupRoot and BackupWriter are used only by the explicit restore-from-
+	// backup path. Production pins them to productionBackupRoot; task callers
+	// must provide an already-opened task writer rather than a dump pathname.
+	BackupRoot                string
+	BackupWriter              *DurableWriter
 	ActiveDatabaseEnv         []byte
 	CandidateDatabaseName     string
 	CandidateActivationID     string
@@ -195,10 +200,17 @@ func ProductionUpgradeDatabaseAdapter(input ProductionUpgradeDatabaseInput) (*Up
 	if err != nil {
 		return nil, ErrPostgresOutcomeUnknown
 	}
+	backupWriter, err := ProductionDurableWriter(productionBackupRoot)
+	if err != nil {
+		_ = writer.Close()
+		return nil, ErrPostgresOutcomeUnknown
+	}
 	plan := UpgradeDatabasePlan{
 		TransactionID:             input.TransactionID,
 		ArtifactRoot:              upgradeArtifactsRoot,
 		ArtifactDir:               filepath.Join(upgradeArtifactsRoot, input.TransactionID),
+		BackupRoot:                productionBackupRoot,
+		BackupWriter:              backupWriter,
 		ActiveDatabaseEnv:         input.ActiveDatabaseEnv,
 		CandidateDatabaseName:     input.CandidateDatabaseName,
 		CandidateActivationID:     input.CandidateActivationID,
@@ -216,12 +228,14 @@ func ProductionUpgradeDatabaseAdapter(input ProductionUpgradeDatabaseInput) (*Up
 	}
 	control, err := NewProductionPostgresControl(plan.ActiveDatabaseEnv)
 	if err != nil {
+		_ = plan.BackupWriter.Close()
 		_ = plan.ArtifactWriter.Close()
 		return nil, ErrPostgresOutcomeUnknown
 	}
 	snapshotter, err := ProductionPostgresSnapshotter()
 	if err != nil {
 		_ = control.Close()
+		_ = plan.BackupWriter.Close()
 		_ = plan.ArtifactWriter.Close()
 		return nil, ErrPostgresOutcomeUnknown
 	}
@@ -232,6 +246,7 @@ func ProductionUpgradeDatabaseAdapter(input ProductionUpgradeDatabaseInput) (*Up
 	adapter, err := newUpgradeDatabaseAdapter(plan, control, snapshotter)
 	if err != nil {
 		_ = control.Close()
+		_ = plan.BackupWriter.Close()
 		_ = plan.ArtifactWriter.Close()
 		return nil, err
 	}
@@ -737,6 +752,11 @@ func validUpgradeDatabasePlan(plan UpgradeDatabasePlan) bool {
 	if plan.CandidateRecoveryEvidence != "" && !validSHA(plan.CandidateRecoveryEvidence) {
 		return false
 	}
+	if plan.BackupWriter != nil || plan.BackupRoot != "" {
+		if plan.BackupWriter == nil || !safeAbsPath(plan.BackupRoot) || plan.BackupWriter.rootPath != plan.BackupRoot || plan.BackupWriter.VerifyLiveRoot() != nil {
+			return false
+		}
+	}
 	return true
 }
 
@@ -817,7 +837,7 @@ func (a *UpgradeDatabaseAdapter) CreateRestore(ctx context.Context, candidate st
 	if _, err := CreateCandidate(ctx, a.control, CreateCandidateRequest{
 		ActivationID:          a.plan.CandidateActivationID,
 		ExpectedExistingName:  a.plan.CandidateDatabaseName,
-		ExpectedExistingOwner: a.activeRole(),
+		ExpectedExistingOwner: a.candidateRole(),
 		RecoveryEvidence:      a.recoveryEvidence(),
 	}); err != nil {
 		return upgradeDatabaseError(err)
@@ -828,12 +848,120 @@ func (a *UpgradeDatabaseAdapter) CreateRestore(ctx context.Context, candidate st
 	return nil
 }
 
-func (a *UpgradeDatabaseAdapter) activeRole() string {
-	role, err := postgresRole(a.plan.ActiveDatabaseEnv)
-	if err != nil {
+func (a *UpgradeDatabaseAdapter) candidateRole() string {
+	if a == nil || a.control == nil || !postgresRoleName.MatchString(a.control.runtimeRole) {
 		return ""
 	}
-	return role
+	return a.control.runtimeRole
+}
+
+// PrepareBackupSnapshot verifies a complete, root-owned backup receipt and
+// copies its exact custom dump into this transaction's fixed artifact
+// directory. It deliberately performs no candidate create or pg_restore: the
+// engine journals SNAPSHOT_CREATED after this call, then separately calls
+// CreateRestore before it journals CANDIDATE_DB_READY.
+func (a *UpgradeDatabaseAdapter) PrepareBackupSnapshot(ctx context.Context, expected ActiveDatabaseBackupV2) (SnapshotEvidence, error) {
+	if a == nil || a.plan.BackupWriter == nil || a.plan.BackupRoot == "" || expected.Validate() != nil || ctx.Err() != nil {
+		return SnapshotEvidence{}, ErrPostgresOutcomeUnknown
+	}
+	backup, dump, err := a.readVerifiedBackup(expected)
+	if err != nil {
+		return SnapshotEvidence{}, err
+	}
+	evidence := SnapshotEvidence{SHA256: backup.DumpSHA256, Size: backup.DumpSize}
+	if err := a.publishRestoreDump(dump, evidence); err != nil {
+		return SnapshotEvidence{}, err
+	}
+	a.snapshot = &evidence
+	return evidence, nil
+}
+
+// InspectBackupRestoredCandidate proves that the restored candidate contains
+// exactly the source schema rows. It intentionally executes no migration SQL:
+// a backup restore is schema-preserving, and any drift is a conflict.
+func (a *UpgradeDatabaseAdapter) InspectBackupRestoredCandidate(ctx context.Context, backup ActiveDatabaseBackupV2) (result UpgradeMigrationEvidence, returnErr error) {
+	if a == nil || backup.Validate() != nil {
+		return UpgradeMigrationEvidence{}, ErrPostgresOutcomeUnknown
+	}
+	open := a.candidateOpen
+	if open == nil {
+		open = a.control.ForCandidate
+	}
+	control, err := open(a.plan.CandidateDatabaseName)
+	if err != nil || control == nil {
+		return UpgradeMigrationEvidence{}, ErrPostgresOutcomeUnknown
+	}
+	defer func() {
+		if closeErr := control.Close(); closeErr != nil && returnErr == nil {
+			result, returnErr = UpgradeMigrationEvidence{}, ErrPostgresOutcomeUnknown
+		}
+	}()
+	rows, err := control.MigrationRows(ctx)
+	if err != nil || !validBackupMigrationRows(rows, backup.SourceDatabase.Migration) {
+		return UpgradeMigrationEvidence{}, ErrCandidateConflict
+	}
+	evidence, err := migrationEvidence(rows)
+	if err != nil || evidence.RowsSHA256 != backup.SourceDatabase.SchemaMigrationsSHA256 {
+		return UpgradeMigrationEvidence{}, ErrCandidateConflict
+	}
+	return UpgradeMigrationEvidence{From: backup.SourceDatabase.Migration, To: backup.SourceDatabase.Migration, RowsSHA256: evidence.RowsSHA256, ReleaseManifestSHA256: a.plan.CandidateRelease.ManifestSHA256}, nil
+}
+
+func (a *UpgradeDatabaseAdapter) readVerifiedBackup(expected ActiveDatabaseBackupV2) (ActiveDatabaseBackupV2, []byte, error) {
+	if a.plan.BackupWriter.VerifyLiveRoot() != nil {
+		return ActiveDatabaseBackupV2{}, nil, ErrPostgresOutcomeUnknown
+	}
+	child, err := a.plan.BackupWriter.OpenChildWriter(expected.BackupID, durableDirMode)
+	if err != nil {
+		return ActiveDatabaseBackupV2{}, nil, ErrPostgresOutcomeUnknown
+	}
+	defer child.Close()
+	raw, err := child.ReadMetadata(activeDatabaseBackupMetadataName)
+	if err != nil {
+		return ActiveDatabaseBackupV2{}, nil, ErrPostgresOutcomeUnknown
+	}
+	backup, err := ParseActiveDatabaseBackupV2(raw)
+	if err != nil || backup != expected {
+		return ActiveDatabaseBackupV2{}, nil, ErrCandidateConflict
+	}
+	dump, err := child.ReadMetadata(ActiveDatabaseBackupDumpFile)
+	if err != nil {
+		return ActiveDatabaseBackupV2{}, nil, ErrPostgresOutcomeUnknown
+	}
+	if int64(len(dump)) != backup.DumpSize || sha256Bytes(dump) != backup.DumpSHA256 {
+		return ActiveDatabaseBackupV2{}, nil, ErrCandidateConflict
+	}
+	return backup, dump, nil
+}
+
+func (a *UpgradeDatabaseAdapter) publishRestoreDump(dump []byte, expected SnapshotEvidence) error {
+	if a == nil || a.plan.ArtifactWriter == nil || expected.SHA256 == "" || expected.Size < 1 || int64(len(dump)) != expected.Size || sha256Bytes(dump) != expected.SHA256 {
+		return ErrPostgresOutcomeUnknown
+	}
+	child, err := a.plan.ArtifactWriter.OpenChildWriter(a.plan.TransactionID, durableDirMode)
+	if err != nil {
+		return ErrPostgresOutcomeUnknown
+	}
+	defer child.Close()
+	if err := child.CreateMetadata(ActiveDatabaseBackupDumpFile, dump); err != nil {
+		existing, readErr := child.ReadMetadata(ActiveDatabaseBackupDumpFile)
+		if readErr != nil || int64(len(existing)) != expected.Size || sha256Bytes(existing) != expected.SHA256 {
+			return upgradeDatabaseError(err)
+		}
+	}
+	published, err := child.ReadMetadata(ActiveDatabaseBackupDumpFile)
+	if err != nil || int64(len(published)) != expected.Size || sha256Bytes(published) != expected.SHA256 {
+		return ErrPostgresOutcomeUnknown
+	}
+	return nil
+}
+
+func validBackupMigrationRows(rows []MigrationRow, migration string) bool {
+	if len(migration) != 4 || strings.Trim(migration, "0123456789") != "" {
+		return false
+	}
+	count, err := strconv.Atoi(migration)
+	return err == nil && count > 0 && validMigrationRows(rows, count)
 }
 
 func (a *UpgradeDatabaseAdapter) recoveryEvidence() string {
@@ -905,9 +1033,10 @@ func (a *UpgradeDatabaseAdapter) Close() error {
 	if a == nil {
 		return nil
 	}
-	control, writer := a.control, a.plan.ArtifactWriter
+	control, writer, backupWriter := a.control, a.plan.ArtifactWriter, a.plan.BackupWriter
 	a.control = nil
 	a.plan.ArtifactWriter = nil
+	a.plan.BackupWriter = nil
 	var first error
 	if control != nil {
 		if err := control.Close(); err != nil {
@@ -916,6 +1045,11 @@ func (a *UpgradeDatabaseAdapter) Close() error {
 	}
 	if writer != nil {
 		if err := writer.Close(); err != nil && first == nil {
+			first = ErrPostgresOutcomeUnknown
+		}
+	}
+	if backupWriter != nil && backupWriter != writer {
+		if err := backupWriter.Close(); err != nil && first == nil {
 			first = ErrPostgresOutcomeUnknown
 		}
 	}

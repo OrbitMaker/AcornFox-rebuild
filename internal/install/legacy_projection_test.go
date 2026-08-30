@@ -332,7 +332,7 @@ func TestPlannedOldActivationJournalRoundTripAndStrictJSON(t *testing.T) {
 		t.Fatal("journal serialized database secret")
 	}
 	fields := assertJSONKeys(t, raw,
-		"schema_version", "transaction_id", "revision", "state", "created_at", "updated_at", "requested_manifest_sha256",
+		"schema_version", "transaction_id", "request_kind", "revision", "state", "created_at", "updated_at", "requested_manifest_sha256",
 		"upgrade_control_database_env_sha256",
 		"old_activation_id", "old_activation_json_sha256", "planned_old_activation", "candidate_activation_id", "candidate_database_name", "edge_config_transition", "service_snapshot", "history",
 	)

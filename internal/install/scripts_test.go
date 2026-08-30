@@ -352,6 +352,58 @@ func TestG7ScriptsAreBashSyntaxValid(t *testing.T) {
 	}
 }
 
+func TestG5BProductionBackupRestoreDelegateOnlyToFixedV2Helper(t *testing.T) {
+	root := scriptRoot(t)
+	backupRaw, err := os.ReadFile(filepath.Join(root, "scripts", "mvp", "backup-control-plane.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	restoreRaw, err := os.ReadFile(filepath.Join(root, "scripts", "mvp", "restore-control-plane.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	backup, restore := string(backupRaw), string(restoreRaw)
+	for name, text := range map[string]string{"backup": backup, "restore": restore} {
+		for _, required := range []string{
+			"PATH=/usr/sbin:/usr/bin:/sbin:/bin",
+			"/opt/open-card/upgrade-tools/open-card-upgrade",
+			"--confirm-installation-id",
+			"unset OPEN_CARD_DATABASE_URL DATABASE_URL",
+		} {
+			if !strings.Contains(text, required) {
+				t.Fatalf("%s production boundary is missing %q", name, required)
+			}
+		}
+	}
+	backupProduction := strings.Index(backup, "# Production backups are V2 database receipts")
+	legacyDatabase := strings.Index(backup, "database_url=${OPEN_CARD_DATABASE_URL")
+	if !strings.Contains(backup, "exec /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C LC_ALL=C \"$helper\" backup-create --backup-id \"$backup_id\" --reason \"$reason\"") || backupProduction < 0 || legacyDatabase < backupProduction || strings.Index(backup, "tar -czf") < legacyDatabase {
+		t.Fatal("production backup can reach ambient database or archive path")
+	}
+	for _, forbidden := range []string{"--database-dump-command", "release, migration, and database dump overrides"} {
+		if !strings.Contains(backup, forbidden) {
+			t.Fatalf("production backup does not reject %q", forbidden)
+		}
+	}
+	restoreProduction := strings.Index(restore, "# System-root restore is intentionally a journaled V2 database operation")
+	legacyArchive := strings.Index(restore, "if [[ \"$backup\" = *.json ]]")
+	if !strings.Contains(restore, "restore-preflight --transaction-id \"$transaction_id\" --backup-id \"$backup_id\"") || !strings.Contains(restore, "exec /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C LC_ALL=C \"$helper\" restore-run --transaction-id \"$transaction_id\" --backup-id \"$backup_id\"") || restoreProduction < 0 || legacyArchive < restoreProduction || strings.Index(restore, "rm -rf --") < legacyArchive || strings.Index(restore, "mv -- \"$data_dir\"") < legacyArchive {
+		t.Fatal("production restore can reach legacy archive mutation path")
+	}
+	for _, forbidden := range []string{"--database-restore-command", "--root / requires a V2 backup id or exact backup.json path"} {
+		if !strings.Contains(restore, forbidden) {
+			t.Fatalf("production restore does not reject %q", forbidden)
+		}
+	}
+	installRaw, err := os.ReadFile(filepath.Join(root, "scripts", "mvp", "install.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(installRaw), "prepare_upgrade_layout_directory \"$data_dir/backups\" \"$expected_owner\" 700") {
+		t.Fatal("upgrade substrate does not provision the fixed V2 backup root")
+	}
+}
+
 func TestG5BRecoverySubstrateStaysStageOnlyAndBootDisabled(t *testing.T) {
 	root := scriptRoot(t)
 	installBytes, err := os.ReadFile(filepath.Join(root, "scripts", "mvp", "install.sh"))

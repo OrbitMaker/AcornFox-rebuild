@@ -86,6 +86,97 @@ func TestParseUpgradeArgsIsExactAndForbidsDangerousInputs(t *testing.T) {
 			}
 		}
 	}
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"backup-create", "--backup-id", "backup-cli-1", "--reason", "manual"}, "backup-create"},
+		{[]string{"backup-status", "--backup-id", "backup-cli-1"}, "backup-status"},
+		{[]string{"restore-preflight", "--transaction-id", "restore-cli-1", "--backup-id", "backup-cli-1"}, "restore-preflight"},
+		{[]string{"restore-run", "--transaction-id", "restore-cli-1", "--backup-id", "backup-cli-1"}, "restore-run"},
+	} {
+		config, err := parseUpgradeArgs(tc.args)
+		if err != nil || config.command != tc.want || config.backupID != "backup-cli-1" {
+			t.Fatalf("backup/restore parse failed: args=%#v config=%#v err=%v", tc.args, config, err)
+		}
+	}
+	for _, args := range [][]string{
+		{"backup-create", "--backup-id", "backup-cli-1", "--reason", "manual", "--path", "/tmp/x"},
+		{"backup-create", "--backup-id", "not-a-backup", "--reason", "manual"},
+		{"backup-status", "--backup-id", "../backup"},
+		{"restore-preflight", "--transaction-id", "restore-cli-1", "--backup-id", "backup-cli-1", "--database-url", "postgres://secret@db/x"},
+		{"restore-run", "--transaction-id", "restore-cli-1", "--backup-id", "backup-cli-1", "--backup-id", "backup-cli-1"},
+	} {
+		if _, err := parseUpgradeArgs(args); err == nil {
+			t.Fatalf("accepted unsafe backup/restore args %#v", args)
+		}
+	}
+}
+
+func TestBackupAndRestoreCommandsStayTypedAndRedacted(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	var backupRequest install.BackupCreateRequest
+	var restoreRequest install.RestoreRequest
+	runtime := upgradeRuntime{
+		backupCreate: func(_ context.Context, request install.BackupCreateRequest) (install.ActiveDatabaseBackupV2, error) {
+			backupRequest = request
+			return install.ActiveDatabaseBackupV2{BackupID: request.BackupID}, nil
+		},
+		backupStatus: func(_ context.Context, backupID string) (install.ActiveDatabaseBackupV2, error) {
+			return install.ActiveDatabaseBackupV2{BackupID: backupID}, nil
+		},
+		restorePreflight: func(_ context.Context, request install.RestoreRequest) (install.RestoreEligibilityV1, error) {
+			restoreRequest = request
+			return install.RestoreEligibilityV1{SchemaVersion: 1, TransactionID: request.TransactionID, BackupID: request.BackupID}, nil
+		},
+		restoreRun: func(_ context.Context, request install.RestoreRequest) error { restoreRequest = request; return nil },
+		close:      func() error { return nil },
+	}
+	deps := testDependencies(runtime)
+	deps.newBackupRuntime = func(context.Context) (upgradeRuntime, error) { return runtime, nil }
+	for _, tc := range []struct{ args []string }{
+		{[]string{"backup-create", "--backup-id", "backup-cli-1", "--reason", "manual"}},
+		{[]string{"backup-status", "--backup-id", "backup-cli-1"}},
+		{[]string{"restore-preflight", "--transaction-id", "restore-cli-1", "--backup-id", "backup-cli-1"}},
+		{[]string{"restore-run", "--transaction-id", "restore-cli-1", "--backup-id", "backup-cli-1"}},
+	} {
+		stdout.Reset()
+		stderr.Reset()
+		if code := runWithDependencies(context.Background(), tc.args, &stdout, &stderr, deps); code != exitOK || stderr.Len() != 0 || strings.Contains(stdout.String(), "postgres") {
+			t.Fatalf("command failed: args=%#v code=%d out=%q err=%q", tc.args, code, stdout.String(), stderr.String())
+		}
+		if tc.args[0] == "restore-run" && (!strings.Contains(stdout.String(), "\"request_kind\":\"restore\"") || !strings.Contains(stdout.String(), "COMMITTED")) {
+			t.Fatalf("restore run did not expose typed journal result: %q", stdout.String())
+		}
+	}
+	if backupRequest.BackupID != "backup-cli-1" || backupRequest.Reason != "manual" || restoreRequest.TransactionID != "restore-cli-1" || restoreRequest.BackupID != "backup-cli-1" {
+		t.Fatalf("typed requests were not preserved: backup=%+v restore=%+v", backupRequest, restoreRequest)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	runtime.backupCreate = func(context.Context, install.BackupCreateRequest) (install.ActiveDatabaseBackupV2, error) {
+		return install.ActiveDatabaseBackupV2{}, errors.New("postgres://secret@db/x")
+	}
+	deps.newBackupRuntime = func(context.Context) (upgradeRuntime, error) { return runtime, nil }
+	if code := runWithDependencies(context.Background(), []string{"backup-create", "--backup-id", "backup-cli-1", "--reason", "manual"}, &stdout, &stderr, deps); code != exitInternal || strings.Contains(stdout.String()+stderr.String(), "secret") || !strings.Contains(stderr.String(), "backup_unavailable") {
+		t.Fatalf("backup error leaked or had wrong code: code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestBackupRestoreCommandsRequireRootBeforeRuntimeConstruction(t *testing.T) {
+	for _, args := range [][]string{
+		{"backup-create", "--backup-id", "backup-cli-1", "--reason", "manual"},
+		{"backup-status", "--backup-id", "backup-cli-1"},
+		{"restore-preflight", "--transaction-id", "restore-cli-1", "--backup-id", "backup-cli-1"},
+		{"restore-run", "--transaction-id", "restore-cli-1", "--backup-id", "backup-cli-1"},
+	} {
+		var stdout, stderr bytes.Buffer
+		called := false
+		deps := upgradeDependencies{euid: func() int { return 99 }, newRuntime: func(context.Context) (upgradeRuntime, error) { called = true; return upgradeRuntime{}, nil }, newBackupRuntime: func(context.Context) (upgradeRuntime, error) { called = true; return upgradeRuntime{}, nil }}
+		if code := runWithDependencies(context.Background(), args, &stdout, &stderr, deps); code != exitPrivilege || called || !strings.Contains(stderr.String(), "root_required") {
+			t.Fatalf("command escaped root gate: args=%#v code=%d called=%v out=%q err=%q", args, code, called, stdout.String(), stderr.String())
+		}
+	}
 }
 
 func TestPrepareControlIsRootOnlyAndDoesNotConstructRuntime(t *testing.T) {
@@ -515,6 +606,10 @@ func TestProductionRuntimeConstructsAndClosesInFixedOrder(t *testing.T) {
 			events = append(events, "service")
 			return &cliServiceFake{}, func() error { events = append(events, "service-close"); return errors.New("service close") }, nil
 		},
+		openBackupInspector: func() (install.UpgradeBackupInspector, func() error, error) {
+			events = append(events, "backup")
+			return cliBackupInspectorFake{}, func() error { events = append(events, "backup-close"); return nil }, nil
+		},
 		databaseFactory: install.UpgradeDatabaseOpenFunc(func(context.Context, install.UpgradeDatabaseOpenRequest) (install.UpgradeDatabaseSession, error) {
 			return nil, errors.New("not used")
 		}),
@@ -522,10 +617,10 @@ func TestProductionRuntimeConstructsAndClosesInFixedOrder(t *testing.T) {
 	}
 	deps.verifyRecoveryServiceState = func(context.Context) error { events = append(events, "unit-state"); return nil }
 	runtime, err := newProductionRuntimeWithDependencies(context.Background(), deps)
-	if err != nil || strings.Join(events, ",") != "executable,unit,unit-state,store,service" {
+	if err != nil || strings.Join(events, ",") != "executable,unit,unit-state,store,service,backup" {
 		t.Fatalf("constructor order failed: %v %v", events, err)
 	}
-	if err := runtime.close(); err == nil || strings.Join(events, ",") != "executable,unit,unit-state,store,service,service-close,store-close" {
+	if err := runtime.close(); err == nil || strings.Join(events, ",") != "executable,unit,unit-state,store,service,backup,backup-close,service-close,store-close" {
 		t.Fatalf("close order/precedence failed: %v %v", events, err)
 	}
 }
@@ -573,6 +668,9 @@ func TestMutableRuntimeRequiresActiveSafeTargetBeforeOpeningStore(t *testing.T) 
 				openService: func() (install.UpgradeServiceDriver, func() error, error) {
 					return &cliServiceFake{}, func() error { return nil }, nil
 				},
+				openBackupInspector: func() (install.UpgradeBackupInspector, func() error, error) {
+					return cliBackupInspectorFake{}, func() error { return nil }, nil
+				},
 				databaseFactory: install.NewProductionUpgradeDatabaseFactory(),
 				now:             func() time.Time { return time.Unix(1, 0).UTC() },
 			}
@@ -588,6 +686,12 @@ func TestMutableRuntimeRequiresActiveSafeTargetBeforeOpeningStore(t *testing.T) 
 }
 
 type cliStoreFake struct{}
+
+type cliBackupInspectorFake struct{}
+
+func (cliBackupInspectorFake) Inspect(context.Context, string) (install.ActiveDatabaseBackupV2, error) {
+	return install.ActiveDatabaseBackupV2{}, errors.New("not used")
+}
 
 func (*cliStoreFake) Acquire(context.Context, string) (install.UpgradeLock, error) {
 	return nil, errors.New("not used")
@@ -626,6 +730,9 @@ func (*cliStoreFake) ReadEdgeConfig(context.Context, install.EdgeConfigTransitio
 func (*cliStoreFake) ReadActivationState(context.Context) (install.UpgradeActivationState, error) {
 	return install.UpgradeActivationState{}, errors.New("not used")
 }
+func (*cliStoreFake) ReadActiveForRestore(context.Context) (install.ExistingActivationPreflight, error) {
+	return install.ExistingActivationPreflight{}, errors.New("not used")
+}
 func (*cliStoreFake) CreateJournal(context.Context, install.UpgradeJournalV1) error {
 	return errors.New("not used")
 }
@@ -634,6 +741,9 @@ func (*cliStoreFake) SaveJournal(context.Context, install.UpgradeJournalV1) erro
 }
 func (*cliStoreFake) Marker(context.Context, bool) error { return errors.New("not used") }
 func (*cliStoreFake) WriteCandidateActivation(context.Context, install.ActivationV1, []byte) (string, error) {
+	return "", errors.New("not used")
+}
+func (*cliStoreFake) WriteRestoreActivation(context.Context, install.ActivationV1, []byte) (string, error) {
 	return "", errors.New("not used")
 }
 func (*cliStoreFake) SetPrevious(context.Context, string) error { return errors.New("not used") }

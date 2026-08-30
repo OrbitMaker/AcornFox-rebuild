@@ -61,6 +61,26 @@ fi
 if [[ -n "$migration_version" ]]; then
   [[ "$migration_version" =~ ^[0-9]{4}$ ]] || die "migration version is invalid"
 fi
+
+# Production backups are V2 database receipts owned by the fixed Go helper.
+# Keep this branch before every legacy filesystem/archive or ambient-DSN path.
+if (( system_root )); then
+  [[ -z "$release_version" && -z "$migration_version" && -z "$database_dump_command" ]] || die "--root / refuses release, migration, and database dump overrides"
+  PATH=/usr/sbin:/usr/bin:/sbin:/bin
+  export PATH
+  helper=/opt/open-card/upgrade-tools/open-card-upgrade
+  [[ -f "$helper" && ! -L "$helper" && -x "$helper" && "$(stat -c '%u:%a' "$helper")" = "0:755" ]] || die "--root / requires verified open-card-upgrade helper"
+  backup_id="backup-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  [[ "$backup_id" =~ ^backup-[A-Za-z0-9._-]+$ ]] || die "could not generate safe backup id"
+  # The helper resolves the active activation database itself. Do not let a
+  # caller's process environment select a second database identity.
+  unset OPEN_CARD_DATABASE_URL DATABASE_URL
+  if (( dry_run )); then
+    echo "open-card backup: dry-run only; would create V2 backup receipt $backup_id (reason=$reason)"
+    exit 0
+  fi
+  exec /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C LC_ALL=C "$helper" backup-create --backup-id "$backup_id" --reason "$reason"
+fi
 database_url=${OPEN_CARD_DATABASE_URL:-${DATABASE_URL:-}}
 if [[ -n "$database_dump_command" ]]; then
   [[ "$database_dump_command" = /* && -x "$database_dump_command" ]] || die "database dump command must be an executable absolute path"

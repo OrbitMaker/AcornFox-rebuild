@@ -75,6 +75,37 @@ if (( ! system_root )) && [[ -e "$root" || -L "$root" ]]; then
   [[ "$root_real" = "$root" || ( "$root_real" = /private/* && "/${root_real#/private/}" = "$root" ) ]] || die "root resolves through an unexpected symlink"
 fi
 
+# System-root restore is intentionally a journaled V2 database operation.
+# Keep it separate from the task-root archive fixture compatibility path below:
+# no archive extraction, active data/config rename, or injected tool executes.
+if (( system_root )); then
+  [[ -z "$database_restore_command" ]] || die "--root / refuses --database-restore-command"
+  PATH=/usr/sbin:/usr/bin:/sbin:/bin
+  export PATH
+  helper=/opt/open-card/upgrade-tools/open-card-upgrade
+  [[ -f "$helper" && ! -L "$helper" && -x "$helper" && "$(stat -c '%u:%a' "$helper")" = "0:755" ]] || die "--root / requires verified open-card-upgrade helper"
+  backup_root=/var/lib/open-card/backups
+  if [[ "$backup" =~ ^backup-[A-Za-z0-9._-]+$ ]]; then
+    backup_id=$backup
+  else
+    [[ "$backup" = "$backup_root/"*/backup.json ]] || die "--root / requires a V2 backup id or exact backup.json path"
+    backup_id=${backup#"$backup_root/"}
+    backup_id=${backup_id%/backup.json}
+    [[ "$backup" = "$backup_root/$backup_id/backup.json" && "$backup_id" =~ ^backup-[A-Za-z0-9._-]+$ ]] || die "--root / backup path is not exact"
+  fi
+  transaction_id="restore-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  [[ "$transaction_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "could not generate safe restore transaction id"
+  # The helper only accepts the immutable V2 backup ID and derives active DB
+  # identity below its own lock. Ambient environment cannot redirect restore.
+  unset OPEN_CARD_DATABASE_URL DATABASE_URL
+  if (( dry_run )); then
+    /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C LC_ALL=C "$helper" restore-preflight --transaction-id "$transaction_id" --backup-id "$backup_id"
+    exit $?
+  fi
+  /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C LC_ALL=C "$helper" restore-preflight --transaction-id "$transaction_id" --backup-id "$backup_id"
+  exec /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C LC_ALL=C "$helper" restore-run --transaction-id "$transaction_id" --backup-id "$backup_id"
+fi
+
 if [[ "$backup" = *.json ]]; then
   metadata="$backup"
 else

@@ -22,7 +22,15 @@ var sha256Text = regexp.MustCompile(`^[a-f0-9]{64}$`)
 
 type JournalState string
 
+// RequestKind distinguishes ordinary release upgrades from database restores.
+// It is persisted explicitly so a restore cannot be interpreted as a normal
+// 0023 -> 0024 migration during recovery.
+type RequestKind string
+
 const (
+	RequestKindUpgrade RequestKind = "upgrade"
+	RequestKindRestore RequestKind = "restore"
+
 	JournalPreflighted      JournalState = "PREFLIGHTED"
 	JournalLegacyProjected  JournalState = "LEGACY_PROJECTED"
 	JournalQuiesced         JournalState = "QUIESCED"
@@ -61,15 +69,16 @@ type LegacyProjectionV1 struct {
 	ServerUnitReleaseID    string `json:"server_unit_release_id"`
 }
 type ActivationV1 struct {
-	SchemaVersion          int                 `json:"schema_version"`
-	ActivationID           string              `json:"activation_id"`
-	Origin                 string              `json:"origin"`
-	Release                ReleaseV1           `json:"release"`
-	Database               DatabaseV1          `json:"database"`
-	DatabaseEnvSHA256      string              `json:"database_env_sha256"`
-	CreatedAt              time.Time           `json:"created_at"`
-	CreatedByTransactionID string              `json:"created_by_transaction_id"`
-	LegacyProjection       *LegacyProjectionV1 `json:"legacy_projection,omitempty"`
+	SchemaVersion          int                        `json:"schema_version"`
+	ActivationID           string                     `json:"activation_id"`
+	Origin                 string                     `json:"origin"`
+	Release                ReleaseV1                  `json:"release"`
+	Database               DatabaseV1                 `json:"database"`
+	DatabaseEnvSHA256      string                     `json:"database_env_sha256"`
+	CreatedAt              time.Time                  `json:"created_at"`
+	CreatedByTransactionID string                     `json:"created_by_transaction_id"`
+	LegacyProjection       *LegacyProjectionV1        `json:"legacy_projection,omitempty"`
+	RestoreSource          *ActivationRestoreSourceV1 `json:"restore_source,omitempty"`
 }
 type ArtifactV1 struct {
 	Path           string `json:"path"`
@@ -132,6 +141,7 @@ type EdgeConfigValidationV1 struct {
 type UpgradeJournalV1 struct {
 	SchemaVersion           int          `json:"schema_version"`
 	TransactionID           string       `json:"transaction_id"`
+	RequestKind             RequestKind  `json:"request_kind"`
 	Revision                int64        `json:"revision"`
 	State                   JournalState `json:"state"`
 	CreatedAt               time.Time    `json:"created_at"`
@@ -141,6 +151,7 @@ type UpgradeJournalV1 struct {
 	// the separately-authenticated control database environment without ever
 	// serializing its bytes or DSN.
 	UpgradeControlDatabaseEnvSHA256        string                  `json:"upgrade_control_database_env_sha256"`
+	RestoreSource                          *RestoreSourceV1        `json:"restore_source,omitempty"`
 	OldActivationID                        string                  `json:"old_activation_id"`
 	OldActivationJSONSHA256                string                  `json:"old_activation_json_sha256"`
 	PreUpgradePreviousActivationID         string                  `json:"pre_upgrade_previous_activation_id,omitempty"`
@@ -169,8 +180,11 @@ func CanonicalServiceSnapshotSHA256(snapshot ServiceSnapshotV1) string {
 	return hex.EncodeToString(digest[:])
 }
 
-func validID(v string) bool            { return installID.MatchString(v) }
-func validSHA(v string) bool           { return sha256Text.MatchString(v) }
+func validID(v string) bool  { return installID.MatchString(v) }
+func validSHA(v string) bool { return sha256Text.MatchString(v) }
+func validRequestKind(v RequestKind) bool {
+	return v == RequestKindUpgrade || v == RequestKindRestore
+}
 func artifactPath(tx, n string) string { return filepath.Join(upgradeArtifactsRoot, tx, n) }
 func edgeConfigPreparedArtifactPath(tx string) string {
 	return artifactPath(tx, "open-card-edge.Caddyfile")
@@ -259,6 +273,23 @@ func validValidation(tx string, a *ArtifactV1) bool {
 	return a != nil && a.Path == artifactPath(tx, "validation.json") && !strings.Contains(a.Path, "\x00") && validSHA(a.SHA256) && a.Size > 0 && a.SourceDatabase == ""
 }
 
+func validJournalMigration(kind RequestKind, migration *MigrationV1) bool {
+	if migration == nil || !validSHA(migration.ManifestSHA256) {
+		return false
+	}
+	switch kind {
+	case RequestKindUpgrade:
+		return migration.From == "0023" && migration.To == CurrentMigrationVersion
+	case RequestKindRestore:
+		// A restore uses the verified current schema rather than applying an
+		// upgrade step. Keeping both values explicit prevents an incomplete
+		// restore from being treated as a successful version transition.
+		return migration.From == CurrentMigrationVersion && migration.To == CurrentMigrationVersion
+	default:
+		return false
+	}
+}
+
 func (j UpgradeJournalV1) effectiveEvidenceRank() (int, error) {
 	if j.State == JournalAbortedPreSwitch || j.State == JournalRecoveryRequired {
 		if len(j.History) == 0 {
@@ -278,6 +309,12 @@ func (j UpgradeJournalV1) effectiveEvidenceRank() (int, error) {
 func (a ActivationV1) Validate() error {
 	if a.SchemaVersion != 1 || !validID(a.ActivationID) || !a.Release.valid() || !a.Database.valid() || !validSHA(a.DatabaseEnvSHA256) || a.CreatedAt.IsZero() || !validID(a.CreatedByTransactionID) {
 		return fmt.Errorf("invalid activation v1")
+	}
+	if a.RestoreSource != nil {
+		if a.Origin != "restore" || a.LegacyProjection != nil || a.RestoreSource.Validate() != nil {
+			return fmt.Errorf("invalid restore activation")
+		}
+		return nil
 	}
 	if a.LegacyProjection == nil {
 		if a.Origin != "native" {
@@ -302,8 +339,15 @@ func CanonicalActivationJSONSHA256(a ActivationV1) (string, error) {
 	return hex.EncodeToString(digest[:]), nil
 }
 func (j UpgradeJournalV1) Validate() error {
-	if j.SchemaVersion != 1 || !validID(j.TransactionID) || j.History == nil || j.Revision != int64(len(j.History)+1) || !stateOK(j.State) || j.CreatedAt.IsZero() || j.UpdatedAt.Before(j.CreatedAt) || !validSHA(j.RequestedManifestSHA256) || !validSHA(j.UpgradeControlDatabaseEnvSHA256) || !validID(j.OldActivationID) || !validSHA(j.OldActivationJSONSHA256) || !validID(j.CandidateActivationID) || !candidateDatabaseName.MatchString(j.CandidateDatabaseName) {
+	if j.SchemaVersion != 1 || !validID(j.TransactionID) || !validRequestKind(j.RequestKind) || j.History == nil || j.Revision != int64(len(j.History)+1) || !stateOK(j.State) || j.CreatedAt.IsZero() || j.UpdatedAt.Before(j.CreatedAt) || !validSHA(j.RequestedManifestSHA256) || !validSHA(j.UpgradeControlDatabaseEnvSHA256) || !validID(j.OldActivationID) || !validSHA(j.OldActivationJSONSHA256) || !validID(j.CandidateActivationID) || !candidateDatabaseName.MatchString(j.CandidateDatabaseName) {
 		return fmt.Errorf("invalid upgrade journal v1")
+	}
+	if j.RequestKind == RequestKindRestore {
+		if j.RestoreSource == nil || j.RestoreSource.Validate() != nil || j.PlannedOldActivation != nil {
+			return fmt.Errorf("invalid restore journal source")
+		}
+	} else if j.RestoreSource != nil {
+		return fmt.Errorf("unexpected upgrade restore source")
 	}
 	if (j.PreUpgradePreviousActivationID == "") != (j.PreUpgradePreviousActivationJSONSHA256 == "") || j.PreUpgradePreviousActivationID != "" && (!validID(j.PreUpgradePreviousActivationID) || !validSHA(j.PreUpgradePreviousActivationJSONSHA256)) {
 		return fmt.Errorf("invalid pre-upgrade previous activation")
@@ -327,6 +371,16 @@ func (j UpgradeJournalV1) Validate() error {
 		}
 	} else if j.PlannedOldActivation != nil {
 		return fmt.Errorf("missing legacy edge configuration transition")
+	}
+	if j.RequestKind == RequestKindRestore {
+		if j.State == JournalLegacyProjected {
+			return fmt.Errorf("restore journal cannot project legacy activation")
+		}
+		for _, h := range j.History {
+			if h.From == JournalLegacyProjected || h.To == JournalLegacyProjected {
+				return fmt.Errorf("restore journal cannot project legacy activation")
+			}
+		}
 	}
 	if len(j.History) == 0 {
 		if j.Revision != 1 || j.State != JournalPreflighted || !j.UpdatedAt.Equal(j.CreatedAt) {
@@ -355,7 +409,7 @@ func (j UpgradeJournalV1) Validate() error {
 	if rank < 2 && j.Snapshot != nil {
 		return fmt.Errorf("early snapshot")
 	}
-	if rank >= 4 && (j.CandidateDatabase == nil || !j.CandidateDatabase.valid() || j.CandidateDatabase.Name != j.CandidateDatabaseName || j.CandidateDatabase.Migration != "0024" || j.Migration == nil || j.Migration.From != "0023" || j.Migration.To != "0024" || !validSHA(j.Migration.ManifestSHA256)) {
+	if rank >= 4 && (j.CandidateDatabase == nil || !j.CandidateDatabase.valid() || j.CandidateDatabase.Name != j.CandidateDatabaseName || j.CandidateDatabase.Migration != CurrentMigrationVersion || !validJournalMigration(j.RequestKind, j.Migration)) {
 		return fmt.Errorf("invalid progressive candidate")
 	}
 	if rank < 4 && (j.CandidateDatabase != nil || j.Migration != nil) {
@@ -468,7 +522,7 @@ func requireJournalFields(raw []byte, j UpgradeJournalV1) error {
 	if err := json.Unmarshal(raw, &fields); err != nil {
 		return err
 	}
-	required := []string{"schema_version", "transaction_id", "revision", "state", "created_at", "updated_at", "requested_manifest_sha256", "upgrade_control_database_env_sha256", "old_activation_id", "old_activation_json_sha256", "candidate_activation_id", "candidate_database_name", "service_snapshot", "history"}
+	required := []string{"schema_version", "transaction_id", "request_kind", "revision", "state", "created_at", "updated_at", "requested_manifest_sha256", "upgrade_control_database_env_sha256", "old_activation_id", "old_activation_json_sha256", "candidate_activation_id", "candidate_database_name", "service_snapshot", "history"}
 	for _, name := range required {
 		value, ok := fields[name]
 		if !ok || bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
@@ -477,6 +531,16 @@ func requireJournalFields(raw []byte, j UpgradeJournalV1) error {
 	}
 	if value, present := fields["planned_old_activation"]; present && bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
 		return fmt.Errorf("invalid planned old activation field")
+	}
+	if value, present := fields["restore_source"]; present && bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+		return fmt.Errorf("invalid restore source field")
+	}
+	if j.RequestKind == RequestKindRestore {
+		if value, present := fields["restore_source"]; !present || bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			return fmt.Errorf("missing restore source field")
+		}
+	} else if _, present := fields["restore_source"]; present {
+		return fmt.Errorf("unexpected upgrade restore source field")
 	}
 	for _, name := range []string{"edge_config_transition", "edge_config_validation"} {
 		if value, present := fields[name]; present && bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
@@ -510,12 +574,33 @@ func requireJournalFields(raw []byte, j UpgradeJournalV1) error {
 	}
 	return nil
 }
+
+func requireActivationFields(raw []byte, a ActivationV1) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return err
+	}
+	if value, present := fields["restore_source"]; present && bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+		return fmt.Errorf("invalid activation restore source field")
+	}
+	if a.Origin == "restore" {
+		if value, present := fields["restore_source"]; !present || bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			return fmt.Errorf("missing activation restore source field")
+		}
+	} else if _, present := fields["restore_source"]; present {
+		return fmt.Errorf("unexpected activation restore source field")
+	}
+	return nil
+}
 func ParseActivationV1(raw []byte) (ActivationV1, error) {
 	var a ActivationV1
 	if e := decodeStrict(raw, &a); e != nil {
 		return a, e
 	}
-	return a, a.Validate()
+	if e := a.Validate(); e != nil {
+		return a, e
+	}
+	return a, requireActivationFields(raw, a)
 }
 func ParseUpgradeJournalV1(raw []byte) (UpgradeJournalV1, error) {
 	var j UpgradeJournalV1

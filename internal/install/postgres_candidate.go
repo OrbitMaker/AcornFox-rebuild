@@ -700,3 +700,37 @@ func snapshotEvidence(p string) (SnapshotEvidence, error) {
 	d := sha256.Sum256(b)
 	return SnapshotEvidence{hex.EncodeToString(d[:]), i.Size()}, nil
 }
+
+// syncSnapshotEvidence verifies and fsyncs an already-created custom-format
+// dump.  Callers that publish a dump with their own directory transaction use
+// this after pg_dump exits and before the final rename.  It deliberately does
+// not accept a directory or build an output pathname.
+func syncSnapshotEvidence(path string) (SnapshotEvidence, error) {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path || strings.Contains(path, "\x00") {
+		return SnapshotEvidence{}, errors.New("snapshot unsafe")
+	}
+	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return SnapshotEvidence{}, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != durableFileMode || info.Size() < 1 {
+		return SnapshotEvidence{}, errors.New("snapshot unsafe")
+	}
+	if err := file.Sync(); err != nil {
+		return SnapshotEvidence{}, err
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return SnapshotEvidence{}, err
+	}
+	content, err := io.ReadAll(file)
+	if err != nil {
+		return SnapshotEvidence{}, err
+	}
+	if int64(len(content)) != info.Size() {
+		return SnapshotEvidence{}, errors.New("snapshot unsafe")
+	}
+	digest := sha256.Sum256(content)
+	return SnapshotEvidence{SHA256: hex.EncodeToString(digest[:]), Size: info.Size()}, nil
+}

@@ -677,6 +677,12 @@ func (s *gate5BStore) ReadEdgeConfig(context.Context, install.EdgeConfigTransiti
 func (s *gate5BStore) ReadActivationState(context.Context) (install.UpgradeActivationState, error) {
 	return install.UpgradeActivationState{ActiveID: s.activeID, PreviousID: s.previousID, ActiveActivationJSONSHA256: s.activeDigest, PreviousJSONSHA256: s.previousDigest, Marker: s.marker}, nil
 }
+func (s *gate5BStore) ReadActiveForRestore(context.Context) (install.ExistingActivationPreflight, error) {
+	if s.marker || s.activeID != s.old.ActivationID || s.activeDigest != s.oldDigest {
+		return install.ExistingActivationPreflight{}, errors.New("active restore identity is unavailable")
+	}
+	return install.ExistingActivationPreflight{Activation: s.old, JSONSHA256: s.oldDigest, DatabaseEnv: append([]byte(nil), s.fixture.activeEnv...)}, nil
+}
 func (s *gate5BStore) CreateJournal(_ context.Context, j install.UpgradeJournalV1) error {
 	s.journal = j
 	return nil
@@ -693,6 +699,12 @@ func (s *gate5BStore) WriteCandidateActivation(_ context.Context, a install.Acti
 	}
 	s.candidate, s.candidateDigest, s.candidateEnv = a, digest, append([]byte(nil), env...)
 	return digest, nil
+}
+func (s *gate5BStore) WriteRestoreActivation(ctx context.Context, a install.ActivationV1, env []byte) (string, error) {
+	if a.Origin != "restore" || a.RestoreSource == nil {
+		return "", errors.New("invalid restore activation")
+	}
+	return s.WriteCandidateActivation(ctx, a, env)
 }
 func (s *gate5BStore) SetPrevious(_ context.Context, id string) error {
 	s.previousID, s.previousDigest = id, s.oldDigest

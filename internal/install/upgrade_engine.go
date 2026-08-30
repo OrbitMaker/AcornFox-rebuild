@@ -48,6 +48,22 @@ type UpgradeRequest struct {
 	ExpectedLegacy          bool
 }
 
+// RestoreRequest intentionally identifies only the durable backup receipt. All
+// activation, database, tool, and environment identities are derived below the
+// lock from that receipt and the current activation; callers never supply a
+// path, release, database name, or DSN.
+type RestoreRequest struct {
+	TransactionID string
+	BackupID      string
+}
+
+// UpgradeBackupInspector is the narrow BR3 boundary for an immutable V2
+// backup receipt. Implementations must verify the receipt and dump together;
+// the engine never reads a backup path itself.
+type UpgradeBackupInspector interface {
+	Inspect(context.Context, string) (ActiveDatabaseBackupV2, error)
+}
+
 // UpgradeEligibilityV1 is the secret-free result of a locked, read-only
 // preflight. It proves only the immutable identities needed to decide whether
 // a later upgrade run may be attempted; it never publishes an activation,
@@ -88,10 +104,12 @@ type UpgradeJournalStore interface {
 	FinalizeEdgeConfig(context.Context, EdgeConfigTransitionPlan) (EdgeConfigObservationV1, error)
 	ReadEdgeConfig(context.Context, EdgeConfigTransitionPlan) (EdgeConfigObservationV1, error)
 	ReadActivationState(context.Context) (UpgradeActivationState, error)
+	ReadActiveForRestore(context.Context) (ExistingActivationPreflight, error)
 	CreateJournal(context.Context, UpgradeJournalV1) error
 	SaveJournal(context.Context, UpgradeJournalV1) error
 	Marker(context.Context, bool) error
 	WriteCandidateActivation(context.Context, ActivationV1, []byte) (string, error)
+	WriteRestoreActivation(context.Context, ActivationV1, []byte) (string, error)
 	SetPrevious(context.Context, string) error
 	RestorePrevious(context.Context, string, string, string) error
 	SwapActive(context.Context, string) error
@@ -105,6 +123,14 @@ type UpgradeDatabaseDriver interface {
 	CreateRestore(context.Context, string) error
 	Migrate(context.Context) (UpgradeMigrationEvidence, error)
 	Validate(context.Context, string) (ArtifactV1, error)
+}
+
+// UpgradeBackupRestoreDriver is deliberately separate from the general
+// migration interface: restore consumes the copied transaction artifact and
+// proves an exact schema restore without executing migration SQL.
+type UpgradeBackupRestoreDriver interface {
+	PrepareBackupSnapshot(context.Context, ActiveDatabaseBackupV2) (SnapshotEvidence, error)
+	InspectBackupRestoredCandidate(context.Context, ActiveDatabaseBackupV2) (UpgradeMigrationEvidence, error)
 }
 
 // UpgradeDatabaseOpenRequest is the complete non-secret identity a locked
@@ -255,6 +281,7 @@ type UpgradeEngine struct {
 	Store           UpgradeJournalStore
 	DatabaseFactory UpgradeDatabaseFactory
 	Services        UpgradeServiceDriver
+	BackupInspector UpgradeBackupInspector
 	Now             func() time.Time
 }
 
@@ -390,6 +417,109 @@ func validUpgradeRequest(r UpgradeRequest) bool {
 	return true
 }
 
+// RestoreEligibilityV1 is deliberately secret-free and path-free. It is the
+// read-only result of binding a verified backup receipt to the active runtime
+// identity before any journal or marker exists.
+type RestoreEligibilityV1 struct {
+	SchemaVersion           int    `json:"schema_version"`
+	TransactionID           string `json:"transaction_id"`
+	BackupID                string `json:"backup_id"`
+	BackupMetadataSHA256    string `json:"backup_metadata_sha256"`
+	OldActivationID         string `json:"old_activation_id"`
+	OldActivationJSONSHA256 string `json:"old_activation_json_sha256"`
+	CandidateActivationID   string `json:"candidate_activation_id"`
+	CandidateDatabaseName   string `json:"candidate_database_name"`
+	RequestedManifestSHA256 string `json:"requested_manifest_sha256"`
+	RecoveryEvidenceSHA256  string `json:"recovery_evidence_sha256"`
+}
+
+func validRestoreRequest(r RestoreRequest) bool {
+	return validID(r.TransactionID) && validBackupID(r.BackupID)
+}
+
+func canonicalBackupMetadataSHA256(backup ActiveDatabaseBackupV2) (string, error) {
+	raw, err := MarshalActiveDatabaseBackupV2(backup)
+	if err != nil {
+		return "", err
+	}
+	return sha256Bytes(raw), nil
+}
+
+func restoreDerivedIdentity(transactionID string, backup ActiveDatabaseBackupV2, metadataSHA256 string) (activationID, databaseName, recoverySHA256 string, err error) {
+	if !validID(transactionID) || backup.Validate() != nil || !validSHA(metadataSHA256) {
+		return "", "", "", errors.New("invalid restore identity input")
+	}
+	idDigest := sha256Bytes([]byte("open-card-restore-activation-v1\n" + transactionID + "\n" + metadataSHA256))
+	activationID = "restore-" + idDigest[:24]
+	if !validID(activationID) {
+		return "", "", "", errors.New("invalid restore activation id")
+	}
+	databaseName, err = CandidateDatabaseName(activationID)
+	if err != nil {
+		return "", "", "", err
+	}
+	recoverySHA256 = sha256Bytes([]byte("open-card-restore-recovery-v1\n" + transactionID + "\n" + metadataSHA256 + "\n" + backup.DumpSHA256 + "\n" + backup.SourceActivationJSONSHA256))
+	return activationID, databaseName, recoverySHA256, nil
+}
+
+func restoreSourceMatchesActive(backup ActiveDatabaseBackupV2, active ActivationV1) bool {
+	// A backup may originate from a different activation/database instance, but
+	// cannot cross an immutable release or schema boundary into the active
+	// runtime. Its dump rows are proved separately after pg_restore.
+	return backup.Validate() == nil && active.Validate() == nil && backup.SourceRelease == active.Release && backup.SourceDatabase.Migration == active.Database.Migration && backup.SourceDatabase.SchemaMigrationsSHA256 == active.Database.SchemaMigrationsSHA256 && active.Database.Migration == CurrentMigrationVersion
+}
+
+func (e *UpgradeEngine) inspectRestorePreflight(ctx context.Context, r RestoreRequest) (ActiveDatabaseBackupV2, ExistingActivationPreflight, RestoreEligibilityV1, error) {
+	if e == nil || e.Store == nil || e.BackupInspector == nil || !validRestoreRequest(r) {
+		return ActiveDatabaseBackupV2{}, ExistingActivationPreflight{}, RestoreEligibilityV1{}, upgradeError(JournalPreflighted, "invalid_request")
+	}
+	backup, err := e.BackupInspector.Inspect(ctx, r.BackupID)
+	if err != nil || backup.Validate() != nil {
+		return ActiveDatabaseBackupV2{}, ExistingActivationPreflight{}, RestoreEligibilityV1{}, upgradeError(JournalPreflighted, "restore_backup_inspect_failed")
+	}
+	active, err := e.Store.ReadActiveForRestore(ctx)
+	if err != nil || active.Activation.Validate() != nil || !validSHA(active.JSONSHA256) || len(active.DatabaseEnv) == 0 {
+		return ActiveDatabaseBackupV2{}, ExistingActivationPreflight{}, RestoreEligibilityV1{}, upgradeError(JournalPreflighted, "restore_active_read_failed")
+	}
+	if !restoreSourceMatchesActive(backup, active.Activation) {
+		return ActiveDatabaseBackupV2{}, ExistingActivationPreflight{}, RestoreEligibilityV1{}, upgradeError(JournalPreflighted, "restore_source_mismatch")
+	}
+	metadataSHA256, err := canonicalBackupMetadataSHA256(backup)
+	if err != nil {
+		return ActiveDatabaseBackupV2{}, ExistingActivationPreflight{}, RestoreEligibilityV1{}, upgradeError(JournalPreflighted, "restore_backup_inspect_failed")
+	}
+	activationID, candidateDatabase, recoverySHA256, err := restoreDerivedIdentity(r.TransactionID, backup, metadataSHA256)
+	if err != nil {
+		return ActiveDatabaseBackupV2{}, ExistingActivationPreflight{}, RestoreEligibilityV1{}, upgradeError(JournalPreflighted, "invalid_request")
+	}
+	return backup, active, RestoreEligibilityV1{
+		SchemaVersion: ActivationSchemaVersion, TransactionID: r.TransactionID, BackupID: r.BackupID, BackupMetadataSHA256: metadataSHA256,
+		OldActivationID: active.Activation.ActivationID, OldActivationJSONSHA256: active.JSONSHA256,
+		CandidateActivationID: activationID, CandidateDatabaseName: candidateDatabase,
+		RequestedManifestSHA256: active.Activation.Release.ManifestSHA256, RecoveryEvidenceSHA256: recoverySHA256,
+	}, nil
+}
+
+// PreflightRestore reads only strict V2 receipt and active-slot facts. It has
+// no database, journal, marker, service, artifact, or pointer side effects.
+func (e *UpgradeEngine) PreflightRestore(ctx context.Context, r RestoreRequest) (result RestoreEligibilityV1, returnErr error) {
+	if e == nil || e.Store == nil || e.BackupInspector == nil || e.Now == nil || !validRestoreRequest(r) {
+		return RestoreEligibilityV1{}, upgradeError(JournalPreflighted, "invalid_request")
+	}
+	lock, err := acquireUpgradeLock(ctx, e.Store, r.TransactionID, JournalPreflighted)
+	if err != nil {
+		return RestoreEligibilityV1{}, err
+	}
+	defer func() {
+		if closeErr := lock.Release(); closeErr != nil && returnErr == nil {
+			result = RestoreEligibilityV1{}
+			returnErr = upgradeError(JournalPreflighted, "preflight_lock_release_failed")
+		}
+	}()
+	_, _, eligibility, err := e.inspectRestorePreflight(ctx, r)
+	return eligibility, err
+}
+
 func transitionEvidenceSHA256(j UpgradeJournalV1, from, to JournalState) string {
 	// This canonical envelope intentionally contains only durable identifiers and
 	// digests. In particular it never serializes database.env or its decoded DSN.
@@ -523,6 +653,7 @@ func failureDigest(err error) string {
 
 var upgradeFailureCodes = map[string]struct{}{
 	"legacy_projection_failed": {}, "marker_create_failed": {}, "service_quiesce_failed": {}, "database_drain_failed": {}, "quiesce_journal_failed": {}, "snapshot_failed": {}, "snapshot_journal_failed": {}, "candidate_database_failed": {}, "candidate_journal_failed": {}, "migration_failed": {}, "migration_journal_failed": {}, "invalid_candidate_activation": {}, "write_candidate_activation_failed": {}, "edge_config_validation_failed": {}, "validation_failed": {}, "validation_journal_failed": {}, "set_previous_failed": {}, "swap_active_failed": {}, "active_journal_failed": {}, "start_internal_failed": {}, "internal_health_failed": {}, "healthy_journal_failed": {}, "edge_journal_failed": {}, "marker_remove_failed": {}, "start_edge_failed": {}, "edge_health_failed": {}, "commit_journal_failed": {},
+	"restore_backup_inspect_failed": {}, "restore_source_mismatch": {}, "restore_active_read_failed": {}, "restore_active_inspect_failed": {}, "restore_snapshot_failed": {}, "restore_schema_failed": {},
 }
 
 func failureFor(phase JournalState, code string, err error) *FailureV1 {
@@ -798,6 +929,7 @@ func (e *UpgradeEngine) RunNew(ctx context.Context, r UpgradeRequest) (result er
 	j := UpgradeJournalV1{
 		SchemaVersion:                          ActivationSchemaVersion,
 		TransactionID:                          r.TransactionID,
+		RequestKind:                            RequestKindUpgrade,
 		Revision:                               1,
 		State:                                  JournalPreflighted,
 		CreatedAt:                              now,
@@ -972,6 +1104,200 @@ func (e *UpgradeEngine) RunNew(ctx context.Context, r UpgradeRequest) (result er
 	}
 	actualPointers, err = e.Store.ReadActivationState(ctx)
 	if err != nil || actualPointers.ActiveID != r.CandidateActivationID || actualPointers.ActiveActivationJSONSHA256 != candidateJSONSHA256 || actualPointers.PreviousID != old.ActivationID || actualPointers.PreviousJSONSHA256 != oldJSONSHA256 {
+		return e.recoveryRequired(ctx, &j, JournalCommitted, "commit_journal_failed", err)
+	}
+	if err := e.advance(ctx, &j, JournalCommitted); err != nil {
+		return e.recoveryRequired(ctx, &j, JournalCommitted, "commit_journal_failed", err)
+	}
+	return e.convergeCommittedPublic(ctx, &j, r.TransactionID, r.TransactionID)
+}
+
+// RunRestore restores a strict V2 backup into a fresh candidate database and
+// publishes it through the ordinary journal/pointer/service state machine.
+// It intentionally performs no direct backup-path access and no migration
+// SQL: the transaction artifact is copied and verified by the database
+// adapter, then the restored schema rows must match the backup receipt.
+func (e *UpgradeEngine) RunRestore(ctx context.Context, r RestoreRequest) (result error) {
+	if e == nil || e.Store == nil || e.DatabaseFactory == nil || e.Services == nil || e.BackupInspector == nil || e.Now == nil || !validRestoreRequest(r) {
+		return upgradeError(JournalPreflighted, "invalid_request")
+	}
+	lock, err := acquireUpgradeLock(ctx, e.Store, r.TransactionID, JournalPreflighted)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := lock.Release(); closeErr != nil && result == nil {
+			result = upgradeError(JournalCommitted, "lock_release_failed")
+		}
+	}()
+
+	backup, source, eligibility, err := e.inspectRestorePreflight(ctx, r)
+	if err != nil {
+		return err
+	}
+	old, oldDigest, activeEnv := source.Activation, source.JSONSHA256, append([]byte(nil), source.DatabaseEnv...)
+	database, err := e.DatabaseFactory.Open(ctx, UpgradeDatabaseOpenRequest{
+		TransactionID: r.TransactionID, CandidateRelease: old.Release, CandidateActivationID: eligibility.CandidateActivationID,
+		CandidateDatabaseName: eligibility.CandidateDatabaseName, RecoveryEvidenceSHA256: eligibility.RecoveryEvidenceSHA256, ActiveDatabaseEnv: activeEnv,
+	})
+	if err != nil || database == nil {
+		return upgradeError(JournalPreflighted, "database_open_failed")
+	}
+	defer func() {
+		if closeErr := database.Close(); closeErr != nil && result == nil {
+			result = upgradeError(JournalCommitted, "database_close_failed")
+		}
+	}()
+	controlIdentity := database.ControlIdentitySHA256()
+	if !validSHA(controlIdentity) {
+		return upgradeError(JournalPreflighted, "control_identity_failed")
+	}
+	inspectRequest, err := inspectionRequestForActivation(activeEnv, old)
+	if err != nil {
+		return upgradeError(JournalPreflighted, "restore_active_inspect_failed")
+	}
+	inspected, err := database.InspectActive(ctx, inspectRequest)
+	if err != nil || !sameDatabase(inspected, old.Database) {
+		return upgradeError(JournalPreflighted, "restore_active_inspect_failed")
+	}
+	baseline, err := e.Store.ReadActivationState(ctx)
+	if err != nil || baseline.Marker || !sameOldState(baseline, baseline, old, oldDigest) {
+		return upgradeError(JournalPreflighted, "restore_active_read_failed")
+	}
+	serviceSnapshot, err := e.Services.Capture(ctx)
+	if err != nil {
+		return upgradeError(JournalPreflighted, "service_capture_failed")
+	}
+	restoreSource := &RestoreSourceV1{BackupID: backup.BackupID, BackupMetadataSHA256: eligibility.BackupMetadataSHA256, DumpSHA256: backup.DumpSHA256, SourceActivationID: backup.SourceActivationID, SourceActivationJSONSHA256: backup.SourceActivationJSONSHA256}
+	j := UpgradeJournalV1{
+		SchemaVersion: ActivationSchemaVersion, TransactionID: r.TransactionID, RequestKind: RequestKindRestore, Revision: 1, State: JournalPreflighted,
+		CreatedAt: e.now(), UpdatedAt: e.now(), RequestedManifestSHA256: old.Release.ManifestSHA256, UpgradeControlDatabaseEnvSHA256: controlIdentity,
+		RestoreSource: restoreSource, OldActivationID: old.ActivationID, OldActivationJSONSHA256: oldDigest,
+		PreUpgradePreviousActivationID: baseline.PreviousID, PreUpgradePreviousActivationJSONSHA256: baseline.PreviousJSONSHA256,
+		CandidateActivationID: eligibility.CandidateActivationID, CandidateDatabaseName: eligibility.CandidateDatabaseName, ServiceSnapshot: serviceSnapshot, History: []JournalTransitionV1{},
+	}
+	// Use one captured time for the initial journal. Journal validation requires
+	// created_at == updated_at before the first durable transition.
+	j.UpdatedAt = j.CreatedAt
+	if err := j.Validate(); err != nil {
+		return upgradeError(JournalPreflighted, "invalid_journal")
+	}
+	if err := e.Store.CreateJournal(ctx, j); err != nil {
+		if errors.Is(err, ErrUpgradeConflict) {
+			return ErrUpgradeConflict
+		}
+		if outcomeUnknown(err) {
+			loaded, loadErr := e.Store.LoadJournal(ctx, r.TransactionID)
+			expectedRaw, expectedErr := MarshalUpgradeJournalV1(j)
+			actualRaw, actualErr := MarshalUpgradeJournalV1(loaded)
+			if loadErr != nil || expectedErr != nil || actualErr != nil || !bytes.Equal(expectedRaw, actualRaw) {
+				return upgradeErrorWith(JournalPreflighted, "create_journal_unknown", err)
+			}
+		} else {
+			return upgradeError(JournalPreflighted, "create_journal_failed")
+		}
+	}
+	fail := func(phase JournalState, code string, cause error) error {
+		return e.handleFailure(ctx, &j, old, baseline, phase, code, cause)
+	}
+	if err := e.Store.Marker(ctx, true); err != nil {
+		return fail(j.State, "marker_create_failed", err)
+	}
+	if err := e.Services.Quiesce(ctx); err != nil {
+		return fail(JournalQuiesced, "service_quiesce_failed", err)
+	}
+	if err := database.Drain(ctx); err != nil {
+		return fail(JournalQuiesced, "database_drain_failed", err)
+	}
+	inspected, err = database.InspectActive(ctx, inspectRequest)
+	if err != nil || !sameDatabase(inspected, old.Database) {
+		return e.recoveryRequired(ctx, &j, JournalQuiesced, "restore_active_inspect_failed", err)
+	}
+	if err := e.advance(ctx, &j, JournalQuiesced); err != nil {
+		return fail(JournalQuiesced, "quiesce_journal_failed", err)
+	}
+	restoreDriver, ok := database.(UpgradeBackupRestoreDriver)
+	if !ok {
+		return fail(JournalSnapshotCreated, "restore_snapshot_failed", errors.New("backup restore driver unavailable"))
+	}
+	evidence, err := restoreDriver.PrepareBackupSnapshot(ctx, backup)
+	if err != nil || !validSHA(evidence.SHA256) || evidence.Size <= 0 {
+		return fail(JournalSnapshotCreated, "restore_snapshot_failed", err)
+	}
+	j.Snapshot = &ArtifactV1{Path: artifactPath(j.TransactionID, "control-plane.dump"), SHA256: evidence.SHA256, Size: evidence.Size, SourceDatabase: backup.SourceDatabase.Name}
+	if err := e.advance(ctx, &j, JournalSnapshotCreated); err != nil {
+		return fail(JournalSnapshotCreated, "snapshot_journal_failed", err)
+	}
+	if err := database.CreateRestore(ctx, eligibility.CandidateDatabaseName); err != nil {
+		return fail(JournalCandidateDBReady, "candidate_database_failed", err)
+	}
+	if err := e.advance(ctx, &j, JournalCandidateDBReady); err != nil {
+		return fail(JournalCandidateDBReady, "candidate_journal_failed", err)
+	}
+	migration, err := restoreDriver.InspectBackupRestoredCandidate(ctx, backup)
+	if err != nil || migration.From != old.Database.Migration || migration.To != old.Database.Migration || migration.To != CurrentMigrationVersion || migration.RowsSHA256 != backup.SourceDatabase.SchemaMigrationsSHA256 || migration.ReleaseManifestSHA256 != old.Release.ManifestSHA256 {
+		return fail(JournalMigrated, "restore_schema_failed", err)
+	}
+	j.CandidateDatabase = &DatabaseV1{Name: eligibility.CandidateDatabaseName, Migration: migration.To, SchemaMigrationsSHA256: migration.RowsSHA256}
+	j.Migration = &MigrationV1{From: migration.From, To: migration.To, ManifestSHA256: migration.ReleaseManifestSHA256}
+	if err := e.advance(ctx, &j, JournalMigrated); err != nil {
+		return fail(JournalMigrated, "migration_journal_failed", err)
+	}
+	candidateEnv := database.CandidateDatabaseEnv()
+	candidateEnvironment, candidateEnvErr := PostgresEnvironment(candidateEnv)
+	if candidateEnvErr != nil || candidateEnvironment.Descriptor.Database != eligibility.CandidateDatabaseName {
+		return fail(JournalValidated, "invalid_candidate_database_env", candidateEnvErr)
+	}
+	candidate := ActivationV1{SchemaVersion: ActivationSchemaVersion, ActivationID: eligibility.CandidateActivationID, Origin: "restore", Release: old.Release, Database: *j.CandidateDatabase, DatabaseEnvSHA256: sha256Bytes(candidateEnv), CreatedAt: e.now(), CreatedByTransactionID: r.TransactionID, RestoreSource: &ActivationRestoreSourceV1{BackupID: backup.BackupID, BackupMetadataSHA256: eligibility.BackupMetadataSHA256}}
+	if err := candidate.Validate(); err != nil {
+		return fail(JournalValidated, "invalid_candidate_activation", err)
+	}
+	candidateDigest, err := e.Store.WriteRestoreActivation(ctx, candidate, candidateEnv)
+	if err != nil || !validSHA(candidateDigest) {
+		return fail(JournalValidated, "write_candidate_activation_failed", err)
+	}
+	validation, err := database.Validate(ctx, eligibility.CandidateActivationID)
+	if err != nil {
+		return fail(JournalValidated, "validation_failed", err)
+	}
+	j.CandidateActivationJSONSHA256, j.Validation = candidateDigest, &validation
+	if err := e.advance(ctx, &j, JournalValidated); err != nil {
+		return fail(JournalValidated, "validation_journal_failed", err)
+	}
+	if err := e.Store.SetPrevious(ctx, old.ActivationID); err != nil {
+		return fail(JournalActiveSwitched, "set_previous_failed", err)
+	}
+	pointers, err := e.Store.ReadActivationState(ctx)
+	if err != nil || pointers.PreviousID != old.ActivationID || pointers.PreviousJSONSHA256 != oldDigest {
+		return e.recoveryRequired(ctx, &j, JournalActiveSwitched, "set_previous_failed", err)
+	}
+	if err := e.Store.SwapActive(ctx, eligibility.CandidateActivationID); err != nil {
+		return fail(JournalActiveSwitched, "swap_active_failed", err)
+	}
+	pointers, err = e.Store.ReadActivationState(ctx)
+	if err != nil || pointers.ActiveID != eligibility.CandidateActivationID || pointers.ActiveActivationJSONSHA256 != candidateDigest || pointers.PreviousID != old.ActivationID || pointers.PreviousJSONSHA256 != oldDigest {
+		return e.recoveryRequired(ctx, &j, JournalActiveSwitched, "swap_active_failed", err)
+	}
+	if err := e.advance(ctx, &j, JournalActiveSwitched); err != nil {
+		return fail(JournalActiveSwitched, "active_journal_failed", err)
+	}
+	if err := e.Services.StartInternal(ctx); err != nil {
+		return fail(JournalHealthy, "start_internal_failed", err)
+	}
+	if err := e.Services.HealthInternal(ctx); err != nil {
+		return fail(JournalHealthy, "internal_health_failed", err)
+	}
+	if err := e.advance(ctx, &j, JournalHealthy); err != nil {
+		return fail(JournalHealthy, "healthy_journal_failed", err)
+	}
+	// EDGE_ARMED is the shared irreversible public-boundary transition. A
+	// restore has no Edge config transition, but still reaches this durable
+	// state before COMMITTED and public convergence.
+	if err := e.advance(ctx, &j, JournalEdgeArmed); err != nil {
+		return fail(JournalEdgeArmed, "edge_journal_failed", err)
+	}
+	pointers, err = e.Store.ReadActivationState(ctx)
+	if err != nil || pointers.ActiveID != eligibility.CandidateActivationID || pointers.ActiveActivationJSONSHA256 != candidateDigest || pointers.PreviousID != old.ActivationID || pointers.PreviousJSONSHA256 != oldDigest {
 		return e.recoveryRequired(ctx, &j, JournalCommitted, "commit_journal_failed", err)
 	}
 	if err := e.advance(ctx, &j, JournalCommitted); err != nil {

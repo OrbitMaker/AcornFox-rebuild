@@ -270,6 +270,14 @@ func adapterPlan(t *testing.T) (UpgradeDatabasePlan, *adapterValidationFake, *fa
 	if err != nil {
 		t.Fatal(err)
 	}
+	backupRoot := filepath.Join(t.TempDir(), "backups")
+	if err := os.MkdirAll(backupRoot, durableDirMode); err != nil {
+		t.Fatal(err)
+	}
+	backupWriter, err := TaskDurableWriter(backupRoot, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
 	activationID := "activation-new"
 	candidate, err := CandidateDatabaseName(activationID)
 	if err != nil {
@@ -288,6 +296,8 @@ func adapterPlan(t *testing.T) (UpgradeDatabasePlan, *adapterValidationFake, *fa
 		TransactionID:             tx,
 		ArtifactRoot:              artifactRoot,
 		ArtifactDir:               artifactDir,
+		BackupRoot:                backupRoot,
+		BackupWriter:              backupWriter,
 		ActiveDatabaseEnv:         []byte("OPEN_CARD_DATABASE_URL=postgresql://user:password@127.0.0.1:5432/open_card?sslmode=require\n"),
 		CandidateDatabaseName:     candidate,
 		CandidateActivationID:     activationID,
@@ -299,6 +309,61 @@ func adapterPlan(t *testing.T) (UpgradeDatabasePlan, *adapterValidationFake, *fa
 		Validator:                 validator,
 		ArtifactWriter:            writer,
 	}, validator, pg
+}
+
+func adapterBackup(t *testing.T, plan UpgradeDatabasePlan, payload string) ActiveDatabaseBackupV2 {
+	t.Helper()
+	if plan.BackupWriter == nil {
+		t.Fatal("missing task backup writer")
+	}
+	backupID := "backup-restore-1"
+	created, err := plan.BackupWriter.CreateChildDirectory(backupID, durableDirMode)
+	if err != nil || !created {
+		t.Fatalf("create backup directory created=%v err=%v", created, err)
+	}
+	child, err := plan.BackupWriter.OpenChildWriter(backupID, durableDirMode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer child.Close()
+	if err := child.CreateMetadata(ActiveDatabaseBackupDumpFile, []byte(payload)); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := verifiedUpgradeRelease(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, _, err := migrationInput(plan.CandidateReleaseRoot, manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence, err := migrationEvidence(rows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata := ActiveDatabaseBackupV2{
+		SchemaVersion:              ActiveDatabaseBackupSchemaVersion,
+		BackupID:                   backupID,
+		CreatedAt:                  time.Unix(1, 0).UTC(),
+		Reason:                     "manual",
+		SourceActivationID:         "activation-source",
+		SourceActivationJSONSHA256: strings.Repeat("c", 64),
+		SourceRelease:              plan.CandidateRelease,
+		SourceDatabase:             DatabaseV1{Name: "open_card_source", Migration: "0024", SchemaMigrationsSHA256: evidence.RowsSHA256},
+		DatabaseEnvSHA256:          strings.Repeat("d", 64),
+		DumpFile:                   ActiveDatabaseBackupDumpFile,
+		DumpSHA256:                 sha256Bytes([]byte(payload)),
+		DumpSize:                   int64(len(payload)),
+		DumpFormat:                 ActiveDatabaseBackupDumpFormat,
+	}
+	raw, err := MarshalActiveDatabaseBackupV2(metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := child.CreateMetadata(activeDatabaseBackupMetadataName, raw); err != nil {
+		t.Fatal(err)
+	}
+	return metadata
 }
 
 func adapterSnapshotter(t *testing.T, pg *fakePG) *PostgresSnapshotter {
@@ -463,6 +528,241 @@ func TestUpgradeDatabaseAdapterRestoresKnownExistingCandidateAndRejectsReleaseSy
 	if source, err := os.ReadFile("upgrade_database_adapter.go"); err == nil && strings.Contains(strings.ToLower(string(source)), "drop database") {
 		t.Fatal("adapter must not add a candidate-drop path")
 	}
+}
+
+func TestUpgradeDatabaseAdapterRestoresVerifiedBackupIntoCandidateArtifact(t *testing.T) {
+	plan, _, pg := adapterPlan(t)
+	backup := adapterBackup(t, plan, "custom-backup")
+	sourceDump, err := ActiveDatabaseBackupDumpPath(plan.BackupRoot, backup.BackupID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The source can change after the no-follow read/copy. pg_restore must use
+	// the transaction artifact, not re-open the backup path.
+	pg.write = func(argv []string) {
+		if strings.HasSuffix(argv[0], "pg_restore") {
+			if err := os.WriteFile(sourceDump, []byte("mutated-after-copy"), durableFileMode); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	active, err := PostgresEnvironment(plan.ActiveDatabaseEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter, err := TaskUpgradeDatabaseAdapter(plan, adapterControl(active), adapterSnapshotter(t, pg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer adapter.Close()
+	snapshot, err := adapter.PrepareBackupSnapshot(context.Background(), backup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot != (SnapshotEvidence{SHA256: backup.DumpSHA256, Size: backup.DumpSize}) || len(pg.argv) != 0 {
+		t.Fatalf("snapshot=%+v candidate argv=%q", snapshot, pg.argv)
+	}
+	if err := adapter.CreateRestore(context.Background(), plan.CandidateDatabaseName); err != nil {
+		t.Fatal(err)
+	}
+	artifactPath := filepath.Join(plan.ArtifactDir, ActiveDatabaseBackupDumpFile)
+	artifact, err := os.ReadFile(artifactPath)
+	if err != nil || string(artifact) != "custom-backup" {
+		t.Fatalf("artifact=%q err=%v", artifact, err)
+	}
+	info, err := os.Lstat(artifactPath)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != durableFileMode {
+		t.Fatalf("artifact mode=%v err=%v", info.Mode(), err)
+	}
+	if strings.Contains(strings.Join(pg.argv, "\n"), "password") || strings.Contains(strings.Join(pg.argv, "\n"), "open_card\n") || !strings.Contains(strings.Join(pg.argv, "\n"), "--dbname\n"+plan.CandidateDatabaseName) {
+		t.Fatalf("unsafe restore argv=%q", pg.argv)
+	}
+	if strings.Contains(strings.Join(pg.env, "\n"), "OPEN_CARD_DATABASE_URL") || strings.Contains(strings.Join(pg.env, "\n"), "PGDATABASE=open_card\n") {
+		t.Fatalf("unsafe restore env=%q", pg.env)
+	}
+	rowsManifest, _, err := migrationInput(plan.CandidateReleaseRoot, mustVerifiedUpgradeRelease(t, plan))
+	if err != nil {
+		t.Fatal(err)
+	}
+	inspectDB := &adapterDB{rows: inspectionRows(rowsManifest)}
+	adapter.candidateOpen = func(name string) (*SQLMigrationControl, error) {
+		if name != plan.CandidateDatabaseName {
+			t.Fatalf("candidate=%q", name)
+		}
+		return &SQLMigrationControl{database: inspectDB}, nil
+	}
+	evidence, err := adapter.InspectBackupRestoredCandidate(context.Background(), backup)
+	if err != nil || evidence.From != "0024" || evidence.To != "0024" || evidence.RowsSHA256 != backup.SourceDatabase.SchemaMigrationsSHA256 || evidence.ReleaseManifestSHA256 != plan.CandidateRelease.ManifestSHA256 || inspectDB.exec != "" {
+		t.Fatalf("evidence=%+v exec=%q err=%v", evidence, inspectDB.exec, err)
+	}
+}
+
+func TestUpgradeDatabaseAdapterBackupRestoreReplayAndRejectsBackupIdentityDrift(t *testing.T) {
+	t.Run("exact-replay", func(t *testing.T) {
+		plan, _, pg := adapterPlan(t)
+		backup := adapterBackup(t, plan, "custom-backup")
+		active, err := PostgresEnvironment(plan.ActiveDatabaseEnv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		adapter, err := TaskUpgradeDatabaseAdapter(plan, adapterControl(active), adapterSnapshotter(t, pg))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer adapter.Close()
+		first, err := adapter.PrepareBackupSnapshot(context.Background(), backup)
+		if err != nil {
+			t.Fatal(err)
+		}
+		second, err := adapter.PrepareBackupSnapshot(context.Background(), backup)
+		if err != nil || second != first {
+			t.Fatalf("second=%+v first=%+v err=%v", second, first, err)
+		}
+	})
+	for name, mutate := range map[string]func(*ActiveDatabaseBackupV2){
+		"release":     func(b *ActiveDatabaseBackupV2) { b.SourceRelease.SourceCommit = strings.Repeat("f", 40) },
+		"database":    func(b *ActiveDatabaseBackupV2) { b.SourceDatabase.Name = "open_card_other" },
+		"dump-digest": func(b *ActiveDatabaseBackupV2) { b.DumpSHA256 = strings.Repeat("e", 64) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			plan, _, pg := adapterPlan(t)
+			backup := adapterBackup(t, plan, "custom-backup")
+			mutate(&backup)
+			active, err := PostgresEnvironment(plan.ActiveDatabaseEnv)
+			if err != nil {
+				t.Fatal(err)
+			}
+			adapter, err := TaskUpgradeDatabaseAdapter(plan, adapterControl(active), adapterSnapshotter(t, pg))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer adapter.Close()
+			if _, err := adapter.PrepareBackupSnapshot(context.Background(), backup); !errors.Is(err, ErrCandidateConflict) {
+				t.Fatalf("restore error=%v", err)
+			}
+			if len(pg.argv) != 0 {
+				t.Fatalf("restore tool ran for mismatched backup identity: %v", pg.argv)
+			}
+		})
+	}
+	t.Run("dump-mutated", func(t *testing.T) {
+		plan, _, pg := adapterPlan(t)
+		backup := adapterBackup(t, plan, "custom-backup")
+		dump, err := ActiveDatabaseBackupDumpPath(plan.BackupRoot, backup.BackupID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(dump, []byte("tampered"), durableFileMode); err != nil {
+			t.Fatal(err)
+		}
+		active, err := PostgresEnvironment(plan.ActiveDatabaseEnv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		adapter, err := TaskUpgradeDatabaseAdapter(plan, adapterControl(active), adapterSnapshotter(t, pg))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer adapter.Close()
+		if _, err := adapter.PrepareBackupSnapshot(context.Background(), backup); !errors.Is(err, ErrCandidateConflict) {
+			t.Fatalf("restore error=%v", err)
+		}
+	})
+	for name, corrupt := range map[string]func(t *testing.T, dump string){
+		"mode": func(t *testing.T, dump string) {
+			if err := os.Chmod(dump, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"symlink": func(t *testing.T, dump string) {
+			if err := os.Remove(dump); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink("elsewhere", dump); err != nil {
+				t.Fatal(err)
+			}
+		},
+	} {
+		t.Run("unsafe-"+name, func(t *testing.T) {
+			plan, _, pg := adapterPlan(t)
+			backup := adapterBackup(t, plan, "custom-backup")
+			dump, err := ActiveDatabaseBackupDumpPath(plan.BackupRoot, backup.BackupID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			corrupt(t, dump)
+			active, err := PostgresEnvironment(plan.ActiveDatabaseEnv)
+			if err != nil {
+				t.Fatal(err)
+			}
+			adapter, err := TaskUpgradeDatabaseAdapter(plan, adapterControl(active), adapterSnapshotter(t, pg))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer adapter.Close()
+			if _, err := adapter.PrepareBackupSnapshot(context.Background(), backup); !errors.Is(err, ErrPostgresOutcomeUnknown) {
+				t.Fatalf("restore error=%v", err)
+			}
+			if len(pg.argv) != 0 {
+				t.Fatalf("restore tool ran for unsafe dump: %v", pg.argv)
+			}
+		})
+	}
+}
+
+func TestUpgradeDatabaseAdapterBackupRestoreFailsClosed(t *testing.T) {
+	t.Run("restore-unknown", func(t *testing.T) {
+		plan, _, pg := adapterPlan(t)
+		backup := adapterBackup(t, plan, "custom-backup")
+		pg.result = PostgresRunResult{ExitCode: 1, Err: errors.New("restore failed: password=never-log")}
+		active, err := PostgresEnvironment(plan.ActiveDatabaseEnv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		adapter, err := TaskUpgradeDatabaseAdapter(plan, adapterControl(active), adapterSnapshotter(t, pg))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer adapter.Close()
+		if _, err = adapter.PrepareBackupSnapshot(context.Background(), backup); err != nil {
+			t.Fatalf("prepare error=%v", err)
+		}
+		err = adapter.CreateRestore(context.Background(), plan.CandidateDatabaseName)
+		if !errors.Is(err, ErrPostgresOutcomeUnknown) || strings.Contains(err.Error(), "password") {
+			t.Fatalf("restore error=%v", err)
+		}
+		if _, err := os.Stat(filepath.Join(plan.ArtifactDir, ActiveDatabaseBackupDumpFile)); err != nil {
+			t.Fatalf("copied artifact missing after restore uncertainty: %v", err)
+		}
+	})
+	t.Run("schema-drift", func(t *testing.T) {
+		plan, _, pg := adapterPlan(t)
+		backup := adapterBackup(t, plan, "custom-backup")
+		active, err := PostgresEnvironment(plan.ActiveDatabaseEnv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		adapter, err := TaskUpgradeDatabaseAdapter(plan, adapterControl(active), adapterSnapshotter(t, pg))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer adapter.Close()
+		adapter.candidateOpen = func(string) (*SQLMigrationControl, error) {
+			return &SQLMigrationControl{database: &adapterDB{rows: inspectionRows(migrationRows(23))}}, nil
+		}
+		if _, err := adapter.InspectBackupRestoredCandidate(context.Background(), backup); !errors.Is(err, ErrCandidateConflict) {
+			t.Fatalf("schema drift error=%v", err)
+		}
+	})
+}
+
+func mustVerifiedUpgradeRelease(t *testing.T, plan UpgradeDatabasePlan) Manifest {
+	t.Helper()
+	manifest, err := verifiedUpgradeRelease(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return manifest
 }
 
 type candidateProcessFake struct {

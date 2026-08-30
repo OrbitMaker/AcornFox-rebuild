@@ -52,19 +52,25 @@ type upgradeCommandConfig struct {
 	transactionID  string
 	releaseID      string
 	manifestSHA256 string
+	backupID       string
+	reason         string
 	expectLegacy   bool
 	pending        bool
 }
 
 type upgradeRuntime struct {
-	preflight func(context.Context, install.UpgradeRequest) (install.UpgradeEligibilityV1, error)
-	run       func(context.Context, install.UpgradeRequest) error
-	recover   func(context.Context, string) error
-	prepare   func(context.Context) (install.BootRecoveryResultV1, error)
-	finalize  func(context.Context, string) (install.BootRecoveryResultV1, error)
-	status    func(context.Context, string) (install.UpgradeStatusV1, error)
-	pending   func(context.Context) (install.PendingTransaction, error)
-	close     func() error
+	preflight        func(context.Context, install.UpgradeRequest) (install.UpgradeEligibilityV1, error)
+	run              func(context.Context, install.UpgradeRequest) error
+	recover          func(context.Context, string) error
+	prepare          func(context.Context) (install.BootRecoveryResultV1, error)
+	finalize         func(context.Context, string) (install.BootRecoveryResultV1, error)
+	status           func(context.Context, string) (install.UpgradeStatusV1, error)
+	backupCreate     func(context.Context, install.BackupCreateRequest) (install.ActiveDatabaseBackupV2, error)
+	backupStatus     func(context.Context, string) (install.ActiveDatabaseBackupV2, error)
+	restorePreflight func(context.Context, install.RestoreRequest) (install.RestoreEligibilityV1, error)
+	restoreRun       func(context.Context, install.RestoreRequest) error
+	pending          func(context.Context) (install.PendingTransaction, error)
+	close            func() error
 }
 
 type upgradeDependencies struct {
@@ -77,6 +83,7 @@ type upgradeDependencies struct {
 	newStatusRuntime          func(context.Context) (upgradeRuntime, error)
 	newPrepareRuntime         func(context.Context) (upgradeRuntime, error)
 	newFinalizeRuntime        func(context.Context) (upgradeRuntime, error)
+	newBackupRuntime          func(context.Context) (upgradeRuntime, error)
 }
 
 // productionRuntimeDependencies is a private construction seam. It proves the
@@ -88,6 +95,7 @@ type productionRuntimeDependencies struct {
 	verifyRecoveryServiceState func(context.Context) error
 	openStore                  func() (upgradeRuntimeStore, error)
 	openService                func() (install.UpgradeServiceDriver, func() error, error)
+	openBackupInspector        func() (install.UpgradeBackupInspector, func() error, error)
 	databaseFactory            install.UpgradeDatabaseFactory
 	now                        func() time.Time
 }
@@ -117,6 +125,7 @@ func productionUpgradeDependencies() upgradeDependencies {
 		newStatusRuntime:          newProductionStatusRuntime,
 		newPrepareRuntime:         newProductionPrepareRuntime,
 		newFinalizeRuntime:        newProductionFinalizeRuntime,
+		newBackupRuntime:          newProductionBackupRuntime,
 	}
 }
 
@@ -206,6 +215,8 @@ func runWithDependenciesCore(ctx context.Context, args []string, stdout, stderr 
 	switch config.command {
 	case "status":
 		constructor = deps.newStatusRuntime
+	case "backup-create", "backup-status":
+		constructor = deps.newBackupRuntime
 	case "recover-prepare":
 		constructor = deps.newPrepareRuntime
 	case "recover-finalize":
@@ -230,6 +241,41 @@ func runWithDependenciesCore(ctx context.Context, args []string, stdout, stderr 
 		return runUpgradeStatus(ctx, stdout, stderr, runtime, config)
 	}
 	switch config.command {
+	case "backup-create":
+		if runtime.backupCreate == nil {
+			return writeUpgradeError(stderr, exitInternal, "runtime_unavailable")
+		}
+		backup, err := runtime.backupCreate(ctx, install.BackupCreateRequest{BackupID: config.backupID, Reason: config.reason})
+		if err != nil {
+			return writeBackupError(stderr, err)
+		}
+		return writeUpgradeJSON(stdout, exitOK, map[string]any{"ok": true, "command": config.command, "backup": backup})
+	case "backup-status":
+		if runtime.backupStatus == nil {
+			return writeUpgradeError(stderr, exitInternal, "runtime_unavailable")
+		}
+		backup, err := runtime.backupStatus(ctx, config.backupID)
+		if err != nil {
+			return writeBackupError(stderr, err)
+		}
+		return writeUpgradeJSON(stdout, exitOK, map[string]any{"ok": true, "command": config.command, "backup": backup})
+	case "restore-preflight":
+		if runtime.restorePreflight == nil {
+			return writeUpgradeError(stderr, exitInternal, "runtime_unavailable")
+		}
+		eligibility, err := runtime.restorePreflight(ctx, install.RestoreRequest{TransactionID: config.transactionID, BackupID: config.backupID})
+		if err != nil {
+			return writeUpgradeEngineError(stderr, err)
+		}
+		return writeUpgradeJSON(stdout, exitOK, map[string]any{"ok": true, "command": config.command, "eligibility": eligibility})
+	case "restore-run":
+		if runtime.restoreRun == nil {
+			return writeUpgradeError(stderr, exitInternal, "runtime_unavailable")
+		}
+		if err := runtime.restoreRun(ctx, install.RestoreRequest{TransactionID: config.transactionID, BackupID: config.backupID}); err != nil {
+			return writeUpgradeEngineError(stderr, err)
+		}
+		return writeUpgradeJSON(stdout, exitOK, map[string]any{"ok": true, "command": config.command, "transaction_id": config.transactionID, "request_kind": install.RequestKindRestore, "state": install.JournalCommitted})
 	case "preflight":
 		identity, err := deps.derive(config)
 		if err != nil {
@@ -320,6 +366,13 @@ func runWithDependenciesCore(ctx context.Context, args []string, stdout, stderr 
 	default:
 		return writeUpgradeError(stderr, exitArgs, "invalid_arguments")
 	}
+}
+
+func writeBackupError(stdout io.Writer, err error) int {
+	if errors.Is(err, install.ErrBackupConflict) {
+		return writeUpgradeError(stdout, exitConflict, "backup_conflict")
+	}
+	return writeUpgradeError(stdout, exitInternal, "backup_unavailable")
 }
 
 func runUpgradeStatus(ctx context.Context, stdout, stderr io.Writer, runtime upgradeRuntime, config upgradeCommandConfig) int {
@@ -420,6 +473,49 @@ func parseUpgradeArgs(args []string) (upgradeCommandConfig, error) {
 		if !validCLIIdentifier(config.transactionID) || !validCLIIdentifier(config.releaseID) || !validCLISHA(config.manifestSHA256) || !containsExactly(args[1:], "--transaction-id", "--release-id", "--manifest-sha256", "--expect-layout") {
 			return upgradeCommandConfig{}, errors.New("invalid command")
 		}
+	case "restore-preflight", "restore-run":
+		for index := 1; index < len(args); index++ {
+			flag := args[index]
+			if index+1 >= len(args) {
+				return upgradeCommandConfig{}, errors.New("flag value required")
+			}
+			index++
+			switch flag {
+			case "--transaction-id":
+				config.transactionID = args[index]
+			case "--backup-id":
+				config.backupID = args[index]
+			default:
+				return upgradeCommandConfig{}, errors.New("unsupported flag")
+			}
+		}
+		if !validCLIIdentifier(config.transactionID) || !validCLIBackupID(config.backupID) || !containsExactly(args[1:], "--transaction-id", "--backup-id") {
+			return upgradeCommandConfig{}, errors.New("invalid restore command")
+		}
+	case "backup-create":
+		for index := 1; index < len(args); index++ {
+			flag := args[index]
+			if index+1 >= len(args) {
+				return upgradeCommandConfig{}, errors.New("flag value required")
+			}
+			index++
+			switch flag {
+			case "--backup-id":
+				config.backupID = args[index]
+			case "--reason":
+				config.reason = args[index]
+			default:
+				return upgradeCommandConfig{}, errors.New("unsupported flag")
+			}
+		}
+		if !validCLIBackupID(config.backupID) || !validCLIIdentifier(config.reason) || !containsExactly(args[1:], "--backup-id", "--reason") {
+			return upgradeCommandConfig{}, errors.New("invalid backup create command")
+		}
+	case "backup-status":
+		if len(args) != 3 || args[1] != "--backup-id" || !validCLIBackupID(args[2]) {
+			return upgradeCommandConfig{}, errors.New("invalid backup status command")
+		}
+		config.backupID = args[2]
 	case "recover", "status":
 		for index := 1; index < len(args); index++ {
 			switch args[index] {
@@ -488,6 +584,10 @@ func validCLIIdentifier(value string) bool {
 	return true
 }
 
+func validCLIBackupID(value string) bool {
+	return strings.HasPrefix(value, "backup-") && validCLIIdentifier(value)
+}
+
 func validCLISHA(value string) bool {
 	if len(value) != 64 {
 		return false
@@ -531,13 +631,20 @@ func productionRuntimeDeps() productionRuntimeDependencies {
 			}
 			return service, service.Close, nil
 		},
+		openBackupInspector: func() (install.UpgradeBackupInspector, func() error, error) {
+			manager, err := install.ProductionBackupManager()
+			if err != nil {
+				return nil, nil, err
+			}
+			return manager, manager.Close, nil
+		},
 		databaseFactory: install.NewProductionUpgradeDatabaseFactory(),
 		now:             func() time.Time { return time.Now().UTC() },
 	}
 }
 
 func newProductionRuntimeWithDependencies(ctx context.Context, deps productionRuntimeDependencies) (upgradeRuntime, error) {
-	if deps.verifyExecutable == nil || deps.verifyRecoveryUnit == nil || deps.verifyRecoveryServiceState == nil || deps.openStore == nil || deps.openService == nil || deps.databaseFactory == nil || deps.now == nil {
+	if deps.verifyExecutable == nil || deps.verifyRecoveryUnit == nil || deps.verifyRecoveryServiceState == nil || deps.openStore == nil || deps.openService == nil || deps.openBackupInspector == nil || deps.databaseFactory == nil || deps.now == nil {
 		return upgradeRuntime{}, errors.New("invalid production runtime dependencies")
 	}
 	if err := deps.verifyExecutable(); err != nil {
@@ -558,21 +665,45 @@ func newProductionRuntimeWithDependencies(ctx context.Context, deps productionRu
 		_ = store.close()
 		return upgradeRuntime{}, errors.New("open upgrade service failed")
 	}
-	engine := &install.UpgradeEngine{Store: store.store, DatabaseFactory: deps.databaseFactory, Services: service, Now: deps.now}
+	backupInspector, closeBackups, err := deps.openBackupInspector()
+	if err != nil || backupInspector == nil || closeBackups == nil {
+		_ = closeService()
+		_ = store.close()
+		return upgradeRuntime{}, errors.New("open backup manager failed")
+	}
+	engine := &install.UpgradeEngine{Store: store.store, DatabaseFactory: deps.databaseFactory, Services: service, BackupInspector: backupInspector, Now: deps.now}
 	return upgradeRuntime{
-		preflight: engine.Preflight,
-		run:       engine.RunNew,
-		recover:   engine.Recover,
-		status:    store.status,
-		pending:   store.pending,
+		preflight:        engine.Preflight,
+		run:              engine.RunNew,
+		recover:          engine.Recover,
+		status:           store.status,
+		pending:          store.pending,
+		restorePreflight: engine.PreflightRestore,
+		restoreRun:       engine.RunRestore,
 		close: func() error {
-			first := closeService()
+			first := closeBackups()
+			if err := closeService(); first == nil {
+				first = err
+			}
 			if err := store.close(); first == nil {
 				first = err
 			}
 			return first
 		},
 	}, nil
+}
+
+// newProductionBackupRuntime owns only the V2 backup receipt boundary. It
+// neither opens a release, database migration adapter, nor a service driver.
+func newProductionBackupRuntime(_ context.Context) (upgradeRuntime, error) {
+	if verifyProductionUpgradeExecutable(productionUpgradeExecutable) != nil {
+		return upgradeRuntime{}, errors.New("invalid production backup runtime")
+	}
+	backups, err := install.ProductionBackupManager()
+	if err != nil {
+		return upgradeRuntime{}, errors.New("open backup manager failed")
+	}
+	return upgradeRuntime{backupCreate: backups.Create, backupStatus: backups.Inspect, close: backups.Close}, nil
 }
 
 // newProductionStatusRuntime deliberately opens only the durable store. A

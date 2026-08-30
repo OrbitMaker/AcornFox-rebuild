@@ -118,7 +118,8 @@ func (s *engineStoreFake) ReadActualState(_ context.Context, oldID, candidateID 
 	if s.state.PreviousID == s.old.ActivationID && previousDigest == strings.Repeat("a", 64) {
 		previousDigest = oldDigest
 	}
-	return UpgradeActualState{ActiveID: s.state.ActiveID, PreviousID: s.state.PreviousID, MarkerTransactionID: markerTx, OldActivationJSONSHA256: oldDigest, CandidateActivationJSONSHA256: strings.Repeat("b", 64), PreviousActivationJSONSHA256: previousDigest, OldActivationExists: oldID == s.old.ActivationID || oldID == s.legacyActivation.ActivationID, CandidateActivationExists: candidateID == "activation-new"}, nil
+	candidateExists := candidateID == "activation-new" || candidateID == s.writtenCandidate.ActivationID
+	return UpgradeActualState{ActiveID: s.state.ActiveID, PreviousID: s.state.PreviousID, MarkerTransactionID: markerTx, OldActivationJSONSHA256: oldDigest, CandidateActivationJSONSHA256: strings.Repeat("b", 64), PreviousActivationJSONSHA256: previousDigest, OldActivationExists: oldID == s.old.ActivationID || oldID == s.legacyActivation.ActivationID, CandidateActivationExists: candidateExists}, nil
 }
 func (s *engineStoreFake) EnsureMarker(_ context.Context, tx string) error {
 	if err := s.event("ensure-marker"); err != nil {
@@ -218,6 +219,15 @@ func (s *engineStoreFake) ReadActivationState(context.Context) (UpgradeActivatio
 	}
 	return s.state, nil
 }
+func (s *engineStoreFake) ReadActiveForRestore(context.Context) (ExistingActivationPreflight, error) {
+	if err := s.event("restore:read-active"); err != nil {
+		return ExistingActivationPreflight{}, err
+	}
+	if s.legacy || s.state.Marker || s.state.ActiveID != s.old.ActivationID {
+		return ExistingActivationPreflight{}, errEngineFake
+	}
+	return ExistingActivationPreflight{Activation: s.old, JSONSHA256: s.oldDigest, DatabaseEnv: engineActiveDatabaseEnv()}, nil
+}
 func (s *engineStoreFake) CreateJournal(_ context.Context, j UpgradeJournalV1) error {
 	if err := s.event("create"); err != nil {
 		return err
@@ -257,6 +267,12 @@ func (s *engineStoreFake) WriteCandidateActivation(_ context.Context, candidate 
 		return "", err
 	}
 	return strings.Repeat("b", 64), nil
+}
+func (s *engineStoreFake) WriteRestoreActivation(ctx context.Context, candidate ActivationV1, env []byte) (string, error) {
+	if candidate.Origin != "restore" || candidate.RestoreSource == nil {
+		return "", errEngineFake
+	}
+	return s.WriteCandidateActivation(ctx, candidate, env)
 }
 func (s *engineStoreFake) SetPrevious(_ context.Context, id string) error {
 	if err := s.event("previous"); err != nil {
@@ -309,6 +325,7 @@ type engineDBFake struct {
 	closed          int
 	closeErr        error
 	controlIdentity string
+	validationTX    string
 }
 
 func (d *engineDBFake) InspectActive(_ context.Context, request ActiveDatabaseInspectionRequest) (DatabaseV1, error) {
@@ -356,11 +373,27 @@ func (d *engineDBFake) Migrate(context.Context) (UpgradeMigrationEvidence, error
 	}
 	return UpgradeMigrationEvidence{From: "0023", To: "0024", RowsSHA256: strings.Repeat("d", 64), ReleaseManifestSHA256: strings.Repeat("f", 64)}, nil
 }
+func (d *engineDBFake) PrepareBackupSnapshot(_ context.Context, backup ActiveDatabaseBackupV2) (SnapshotEvidence, error) {
+	if err := d.event("restore:snapshot"); err != nil {
+		return SnapshotEvidence{}, err
+	}
+	return SnapshotEvidence{SHA256: backup.DumpSHA256, Size: backup.DumpSize}, nil
+}
+func (d *engineDBFake) InspectBackupRestoredCandidate(_ context.Context, backup ActiveDatabaseBackupV2) (UpgradeMigrationEvidence, error) {
+	if err := d.event("restore:schema"); err != nil {
+		return UpgradeMigrationEvidence{}, err
+	}
+	return UpgradeMigrationEvidence{From: backup.SourceDatabase.Migration, To: backup.SourceDatabase.Migration, RowsSHA256: backup.SourceDatabase.SchemaMigrationsSHA256, ReleaseManifestSHA256: backup.SourceRelease.ManifestSHA256}, nil
+}
 func (d *engineDBFake) Validate(context.Context, string) (ArtifactV1, error) {
 	if err := d.event("validate"); err != nil {
 		return ArtifactV1{}, err
 	}
-	return ArtifactV1{Path: artifactPath("txn-1", "validation.json"), SHA256: strings.Repeat("e", 64), Size: 9}, nil
+	tx := d.validationTX
+	if tx == "" {
+		tx = "txn-1"
+	}
+	return ArtifactV1{Path: artifactPath(tx, "validation.json"), SHA256: strings.Repeat("e", 64), Size: 9}, nil
 }
 
 func (d *engineDBFake) CandidateDatabaseEnv() []byte { return append([]byte(nil), d.candidateEnv...) }
@@ -441,6 +474,67 @@ func engineRequest() UpgradeRequest {
 	}
 	return UpgradeRequest{TransactionID: "txn-1", CandidateRelease: ReleaseV1{ID: "release-new", Version: "0.8.0-rc.1", SourceCommit: strings.Repeat("e", 40), Architecture: "amd64", ManifestSHA256: strings.Repeat("f", 64)}, CandidateActivationID: "activation-new", CandidateDatabaseName: name, RecoveryEvidenceSHA256: strings.Repeat("d", 64), RequestedManifestSHA256: strings.Repeat("f", 64)}
 }
+
+type engineBackupInspectorFake struct {
+	backup ActiveDatabaseBackupV2
+	events *[]string
+	fail   error
+}
+
+func (b *engineBackupInspectorFake) Inspect(_ context.Context, backupID string) (ActiveDatabaseBackupV2, error) {
+	*b.events = append(*b.events, "restore:inspect-backup")
+	if b.fail != nil || backupID != b.backup.BackupID {
+		return ActiveDatabaseBackupV2{}, errEngineFake
+	}
+	return b.backup, nil
+}
+
+func engineRestoreActivation() ActivationV1 {
+	return ActivationV1{SchemaVersion: 1, ActivationID: "activation-current", Origin: "native", Release: ReleaseV1{ID: "release-current", Version: ProductionCandidateVersion, SourceCommit: strings.Repeat("e", 40), Architecture: "amd64", ManifestSHA256: strings.Repeat("f", 64)}, Database: DatabaseV1{Name: "open_card", Migration: CurrentMigrationVersion, SchemaMigrationsSHA256: strings.Repeat("c", 64)}, DatabaseEnvSHA256: sha256Bytes(engineActiveDatabaseEnv()), CreatedAt: time.Unix(1, 0).UTC(), CreatedByTransactionID: "old-txn"}
+}
+
+func engineRestoreBackup(active ActivationV1) ActiveDatabaseBackupV2 {
+	return ActiveDatabaseBackupV2{SchemaVersion: ActiveDatabaseBackupSchemaVersion, BackupID: "backup-restore-1", CreatedAt: time.Unix(1, 0).UTC(), Reason: "manual", SourceActivationID: "activation-source", SourceActivationJSONSHA256: strings.Repeat("a", 64), SourceRelease: active.Release, SourceDatabase: DatabaseV1{Name: "source_card", Migration: active.Database.Migration, SchemaMigrationsSHA256: active.Database.SchemaMigrationsSHA256}, DatabaseEnvSHA256: strings.Repeat("b", 64), DumpFile: ActiveDatabaseBackupDumpFile, DumpSHA256: strings.Repeat("d", 64), DumpSize: 17, DumpFormat: ActiveDatabaseBackupDumpFormat}
+}
+
+func engineRestoreFixture() (*UpgradeEngine, *engineStoreFake, *engineDBFake, *engineServiceFake, *engineBackupInspectorFake, *[]string, RestoreRequest) {
+	e, store, database, services, events := engineFixture(false)
+	active := engineRestoreActivation()
+	digest, err := CanonicalActivationJSONSHA256(active)
+	if err != nil {
+		panic(err)
+	}
+	store.old, store.oldDigest = active, digest
+	store.state = UpgradeActivationState{ActiveID: active.ActivationID, ActiveActivationJSONSHA256: digest}
+	backup := engineRestoreBackup(active)
+	request := RestoreRequest{TransactionID: "txn-restore-1", BackupID: backup.BackupID}
+	_, candidateDB, _, err := restoreDerivedIdentity(request.TransactionID, backup, mustBackupMetadataSHA(backup))
+	if err != nil {
+		panic(err)
+	}
+	database.candidateEnv, err = CandidateDatabaseEnv(engineActiveDatabaseEnv(), candidateDB)
+	if err != nil {
+		panic(err)
+	}
+	database.validationTX = request.TransactionID
+	e.DatabaseFactory = UpgradeDatabaseOpenFunc(func(_ context.Context, open UpgradeDatabaseOpenRequest) (UpgradeDatabaseSession, error) {
+		if open.Validate() != nil || open.CandidateRelease != active.Release || open.CandidateDatabaseName != candidateDB {
+			return nil, errEngineFake
+		}
+		return database, nil
+	})
+	inspector := &engineBackupInspectorFake{backup: backup, events: events}
+	e.BackupInspector = inspector
+	return e, store, database, services, inspector, events, request
+}
+
+func mustBackupMetadataSHA(backup ActiveDatabaseBackupV2) string {
+	value, err := canonicalBackupMetadataSHA256(backup)
+	if err != nil {
+		panic(err)
+	}
+	return value
+}
 func engineFixture(legacy bool) (*UpgradeEngine, *engineStoreFake, *engineDBFake, *engineServiceFake, *[]string) {
 	events := []string{}
 	old := engineOldActivation()
@@ -510,6 +604,170 @@ func TestUpgradeEnginePreflightIsLockedReadOnlyAndRedacted(t *testing.T) {
 				t.Fatalf("eligibility leaked a DSN: %q", raw)
 			}
 		})
+	}
+}
+
+func TestUpgradeEngineRestorePreflightIsLockedReadOnlyAndSecretFree(t *testing.T) {
+	e, store, database, _, _, events, request := engineRestoreFixture()
+	eligibility, err := e.PreflightRestore(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if eligibility.BackupID != request.BackupID || eligibility.OldActivationID != store.old.ActivationID || !validSHA(eligibility.BackupMetadataSHA256) || !validID(eligibility.CandidateActivationID) || !candidateDatabaseName.MatchString(eligibility.CandidateDatabaseName) || !validSHA(eligibility.RecoveryEvidenceSHA256) {
+		t.Fatalf("eligibility=%+v", eligibility)
+	}
+	if len(store.created) != 0 || len(store.saved) != 0 || store.state.Marker || database.closed != 0 || eventIndex(*events, "restore:inspect-backup") < 0 || eventIndex(*events, "restore:read-active") < 0 {
+		t.Fatalf("preflight mutated=%+v events=%v", store, *events)
+	}
+	raw, err := json.Marshal(eligibility)
+	if err != nil || strings.Contains(string(raw), "postgres") || strings.Contains(string(raw), "pass") {
+		t.Fatalf("eligibility leaked secret: %q", raw)
+	}
+}
+
+func TestUpgradeEngineRestoreRejectsCrossReleaseMigrationAndSchemaBeforeJournal(t *testing.T) {
+	for _, mutate := range []func(*ActiveDatabaseBackupV2){
+		func(b *ActiveDatabaseBackupV2) { b.SourceRelease.ManifestSHA256 = strings.Repeat("1", 64) },
+		func(b *ActiveDatabaseBackupV2) { b.SourceDatabase.Migration = "0023" },
+		func(b *ActiveDatabaseBackupV2) { b.SourceDatabase.SchemaMigrationsSHA256 = strings.Repeat("1", 64) },
+	} {
+		e, store, database, _, inspector, events, request := engineRestoreFixture()
+		mutate(&inspector.backup)
+		if got := enginePhase(t, mustRestorePreflightError(t, e, request)); got.Phase != JournalPreflighted || got.Code != "restore_source_mismatch" {
+			t.Fatalf("preflight phase=%#v", got)
+		}
+		if len(store.created) != 0 || len(store.saved) != 0 || store.state.Marker || database.closed != 0 || eventIndex(*events, "inspect-active") >= 0 || eventIndex(*events, "capture") >= 0 {
+			t.Fatalf("preflight mutated state: events=%v store=%+v", *events, store)
+		}
+		if got := enginePhase(t, e.RunRestore(context.Background(), request)); got.Phase != JournalPreflighted || got.Code != "restore_source_mismatch" {
+			t.Fatalf("phase=%#v", got)
+		}
+		if len(store.created) != 0 || len(store.saved) != 0 || store.state.Marker || database.closed != 0 || eventIndex(*events, "inspect-active") >= 0 || eventIndex(*events, "capture") >= 0 {
+			t.Fatalf("journal/marker before mismatch rejection: %+v", store)
+		}
+	}
+}
+
+func mustRestorePreflightError(t *testing.T, e *UpgradeEngine, request RestoreRequest) error {
+	t.Helper()
+	_, err := e.PreflightRestore(context.Background(), request)
+	if err == nil {
+		t.Fatal("restore preflight unexpectedly succeeded")
+	}
+	return err
+}
+
+func TestUpgradeEngineRestoreHappyPathSharesJournalAndPublicBoundary(t *testing.T) {
+	e, store, database, _, _, events, request := engineRestoreFixture()
+	if err := e.RunRestore(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.created) != 1 || store.created[0].RequestKind != RequestKindRestore || store.created[0].RestoreSource == nil || store.created[0].EdgeConfigTransition != nil {
+		t.Fatalf("initial journal=%+v", store.created)
+	}
+	last := store.saved[len(store.saved)-1]
+	if last.State != JournalCommitted || last.RequestKind != RequestKindRestore || last.RestoreSource == nil || last.CandidateDatabase == nil || last.Migration == nil || last.Migration.From != CurrentMigrationVersion || last.Migration.To != CurrentMigrationVersion || last.CandidateDatabase.SchemaMigrationsSHA256 != store.old.Database.SchemaMigrationsSHA256 {
+		t.Fatalf("last journal=%+v", last)
+	}
+	if store.writtenCandidate.Origin != "restore" || store.writtenCandidate.RestoreSource == nil || store.writtenCandidate.Release != store.old.Release || store.writtenCandidate.Database.Name != last.CandidateDatabaseName {
+		t.Fatalf("restore activation=%+v", store.writtenCandidate)
+	}
+	if store.state.ActiveID != last.CandidateActivationID || store.state.Marker || database.closed != 1 {
+		t.Fatalf("state=%+v closes=%d", store.state, database.closed)
+	}
+	for _, name := range []string{"restore:inspect-backup", "restore:read-active", "inspect-active", "capture", "marker:on", "quiesce", "drain", "restore:snapshot", "candidate", "restore:schema", "write", "validate", "previous", "swap", "internal:start", "internal:health", "save:COMMITTED", "marker:off", "edge:start", "edge:health"} {
+		if eventIndex(*events, name) < 0 {
+			t.Fatalf("missing %s: %v", name, *events)
+		}
+	}
+	if eventIndex(*events, "restore:snapshot") > eventIndex(*events, "candidate") || eventIndex(*events, "candidate") > eventIndex(*events, "restore:schema") || eventIndex(*events, "restore:schema") > eventIndex(*events, "write") || eventIndex(*events, "save:COMMITTED") > eventIndex(*events, "marker:off") {
+		t.Fatalf("bad restore ordering: %v", *events)
+	}
+	raw, err := MarshalUpgradeJournalV1(last)
+	if err != nil || strings.Contains(string(raw), "postgres") || strings.Contains(string(raw), "user:pass") || strings.Contains(string(raw), "must-not-be-used") {
+		t.Fatalf("journal leaked secret: %q", raw)
+	}
+}
+
+func TestUpgradeEngineRestoreFaultsRetainOldOrRollbackCandidate(t *testing.T) {
+	for _, phase := range []string{"restore:inspect-backup", "restore:read-active", "inspect-active", "capture", "marker:on", "quiesce", "drain", "restore:snapshot", "candidate", "restore:schema", "write", "validate", "previous", "swap", "internal:start", "internal:health"} {
+		t.Run(phase, func(t *testing.T) {
+			e, store, database, service, inspector, events, request := engineRestoreFixture()
+			switch phase {
+			case "restore:inspect-backup":
+				inspector.fail = errEngineFake
+			case "restore:read-active", "marker:on", "previous", "swap", "write":
+				store.fail, store.remaining = phase, 1
+			case "capture", "quiesce", "internal:start", "internal:health":
+				service.fail, service.remaining = phase, 1
+			default:
+				database.fail, database.remaining = phase, 1
+			}
+			if err := e.RunRestore(context.Background(), request); err == nil {
+				t.Fatal("expected restore failure")
+			}
+			if eventIndex(*events, "restore-active") >= 0 && store.state.ActiveID != store.old.ActivationID {
+				t.Fatalf("rollback did not restore old: events=%v state=%+v", *events, store.state)
+			}
+			if strings.Contains(strings.Join(*events, "\n"), "postgres") {
+				t.Fatalf("secret in events=%v", *events)
+			}
+		})
+	}
+}
+
+func TestUpgradeEngineRestoreRecoverPreservesCommittedAndRollsBackPostSwitch(t *testing.T) {
+	e, store, _, service, _, _, request := engineRestoreFixture()
+	service.fail, service.remaining = "internal:start", 1
+	if err := e.RunRestore(context.Background(), request); err == nil {
+		t.Fatal("expected post-switch failure")
+	}
+	if store.state.ActiveID != store.old.ActivationID {
+		t.Fatalf("post switch did not roll back: %+v", store.state)
+	}
+	if err := e.Recover(context.Background(), request.TransactionID); err != nil {
+		phase := enginePhase(t, err)
+		if phase.Phase != JournalRolledBack {
+			t.Fatalf("recover=%#v", phase)
+		}
+	}
+
+	e, store, _, service, _, _, request = engineRestoreFixture()
+	service.fail, service.remaining = "edge:start", 1
+	if err := e.RunRestore(context.Background(), request); err == nil {
+		t.Fatal("expected public failure")
+	}
+	if store.state.ActiveID != store.writtenCandidate.ActivationID || !store.state.Marker {
+		t.Fatalf("committed restore rolled back: %+v", store.state)
+	}
+}
+
+func TestUpgradeEngineRestoreRecoveryUsesJournalNotBackupSource(t *testing.T) {
+	e, store, _, _, inspector, events, request := engineRestoreFixture()
+	if err := e.RunRestore(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	var activeSwitched UpgradeJournalV1
+	for _, journal := range store.saved {
+		if journal.State == JournalActiveSwitched {
+			activeSwitched = journal
+			break
+		}
+	}
+	if activeSwitched.State != JournalActiveSwitched {
+		t.Fatalf("missing active switched journal: %+v", store.saved)
+	}
+	store.saved = []UpgradeJournalV1{activeSwitched}
+	store.state.Marker, store.markerTx = true, request.TransactionID
+	// A crash recovery must decide solely from the durable journal/pointers and
+	// copied transaction artifact; it does not re-inspect the original backup.
+	*events = nil
+	inspector.fail = errors.New("original backup must not be read in recovery")
+	if err := e.Recover(context.Background(), request.TransactionID); err == nil {
+		t.Fatal("expected recovered rollback result")
+	}
+	if eventIndex(*events, "restore:inspect-backup") >= 0 || store.state.ActiveID != store.old.ActivationID {
+		t.Fatalf("recovery touched source backup or failed rollback: events=%v state=%+v", *events, store.state)
 	}
 }
 

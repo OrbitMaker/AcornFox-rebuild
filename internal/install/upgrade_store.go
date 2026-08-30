@@ -782,6 +782,37 @@ func (s *UpgradeStore) ReadActivationState(context.Context) (UpgradeActivationSt
 	return state, nil
 }
 
+// ReadActiveForRestore is the restore-only active slot reader. It permits no
+// legacy current/server.env fallback: a restore must begin from a fully
+// projected, strict activation slot whose opaque database.env is authenticated
+// against activation metadata.
+func (s *UpgradeStore) ReadActiveForRestore(ctx context.Context) (ExistingActivationPreflight, error) {
+	if s == nil || !s.ownsLock() {
+		return ExistingActivationPreflight{}, ErrUpgradeJournalConflict
+	}
+	state, err := s.ReadActivationState(ctx)
+	if err != nil || state.Marker || !validID(state.ActiveID) || !validSHA(state.ActiveActivationJSONSHA256) {
+		return ExistingActivationPreflight{}, ErrUpgradeJournalConflict
+	}
+	activation, digest, err := s.readActivation(state.ActiveID)
+	if err != nil || digest != state.ActiveActivationJSONSHA256 || activation.LegacyProjection != nil {
+		return ExistingActivationPreflight{}, ErrUpgradeJournalConflict
+	}
+	slot, err := s.activationSlotWriter(state.ActiveID)
+	if err != nil {
+		return ExistingActivationPreflight{}, ErrUpgradeJournalConflict
+	}
+	defer slot.Close()
+	env, err := slot.ReadMetadata("database.env")
+	if err != nil || sha256Bytes(env) != activation.DatabaseEnvSHA256 {
+		return ExistingActivationPreflight{}, ErrUpgradeJournalConflict
+	}
+	if _, err := ParseDatabaseEnv(env); err != nil {
+		return ExistingActivationPreflight{}, ErrUpgradeJournalConflict
+	}
+	return ExistingActivationPreflight{Activation: activation, JSONSHA256: digest, DatabaseEnv: append([]byte(nil), env...)}, nil
+}
+
 func (s *UpgradeStore) ownsLock() bool {
 	return s != nil && s.activationWriter != nil && s.dataWriter != nil && s.lock != nil && s.lock.owner == s && s.lock.file != nil && s.lock.tx != "" && s.verifyLiveRoots() == nil
 }
@@ -907,6 +938,16 @@ func (s *UpgradeStore) legacyCurrentPresent() bool {
 // is accepted only when every persisted object is byte-for-byte equivalent.
 func (s *UpgradeStore) WriteCandidateActivation(ctx context.Context, activation ActivationV1, databaseEnv []byte) (string, error) {
 	if activation.Origin != "native" {
+		return "", ErrUpgradeJournalConflict
+	}
+	return s.writeActivation(ctx, activation, databaseEnv, false)
+}
+
+// WriteRestoreActivation is the sole publication path for a restore origin.
+// It shares append-only, root-contained activation publication with upgrades
+// while refusing native or compatibility projection metadata.
+func (s *UpgradeStore) WriteRestoreActivation(ctx context.Context, activation ActivationV1, databaseEnv []byte) (string, error) {
+	if activation.Origin != "restore" || activation.RestoreSource == nil {
 		return "", ErrUpgradeJournalConflict
 	}
 	return s.writeActivation(ctx, activation, databaseEnv, false)

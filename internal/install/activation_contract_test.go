@@ -15,7 +15,27 @@ func activationFixture() ActivationV1 {
 
 func journalFixture() UpgradeJournalV1 {
 	now := time.Unix(1, 0).UTC()
-	return UpgradeJournalV1{SchemaVersion: 1, TransactionID: "txn-1", Revision: 1, State: JournalPreflighted, CreatedAt: now, UpdatedAt: now, RequestedManifestSHA256: sha("e"), UpgradeControlDatabaseEnvSHA256: sha("9"), OldActivationID: "activation-old", OldActivationJSONSHA256: sha("f"), CandidateActivationID: "activation-1", CandidateDatabaseName: "open_card_act_0123456789abcdef", ServiceSnapshot: ServiceSnapshotV1{Edge: UnitSnapshotV1{Active: true, Enabled: true}, Agent: UnitSnapshotV1{Active: true}, Server: UnitSnapshotV1{Enabled: true}, Caddy: UnitSnapshotV1{Active: true, Enabled: true}}, History: []JournalTransitionV1{}}
+	return UpgradeJournalV1{SchemaVersion: 1, TransactionID: "txn-1", RequestKind: RequestKindUpgrade, Revision: 1, State: JournalPreflighted, CreatedAt: now, UpdatedAt: now, RequestedManifestSHA256: sha("e"), UpgradeControlDatabaseEnvSHA256: sha("9"), OldActivationID: "activation-old", OldActivationJSONSHA256: sha("f"), CandidateActivationID: "activation-1", CandidateDatabaseName: "open_card_act_0123456789abcdef", ServiceSnapshot: ServiceSnapshotV1{Edge: UnitSnapshotV1{Active: true, Enabled: true}, Agent: UnitSnapshotV1{Active: true}, Server: UnitSnapshotV1{Enabled: true}, Caddy: UnitSnapshotV1{Active: true, Enabled: true}}, History: []JournalTransitionV1{}}
+}
+
+func restoreSourceFixture() RestoreSourceV1 {
+	return RestoreSourceV1{
+		BackupID:                   "backup-20260830-a1",
+		BackupMetadataSHA256:       sha("1"),
+		DumpSHA256:                 sha("2"),
+		SourceActivationID:         "activation-source",
+		SourceActivationJSONSHA256: sha("3"),
+	}
+}
+
+func restoreActivationFixture() ActivationV1 {
+	a := activationFixture()
+	a.Origin = "restore"
+	a.RestoreSource = &ActivationRestoreSourceV1{
+		BackupID:             "backup-20260830-a1",
+		BackupMetadataSHA256: sha("1"),
+	}
+	return a
 }
 
 func edgeTransitionFixture(transactionID, sourceReleaseID, candidateReleaseID string) EdgeConfigTransitionV1 {
@@ -49,7 +69,11 @@ func addEvidence(j *UpgradeJournalV1) {
 	}
 	if rank >= 4 {
 		j.CandidateDatabase = &DatabaseV1{Name: j.CandidateDatabaseName, Migration: "0024", SchemaMigrationsSHA256: sha("c")}
-		j.Migration = &MigrationV1{From: "0023", To: "0024", ManifestSHA256: sha("d")}
+		from := "0023"
+		if j.RequestKind == RequestKindRestore {
+			from = CurrentMigrationVersion
+		}
+		j.Migration = &MigrationV1{From: from, To: CurrentMigrationVersion, ManifestSHA256: sha("d")}
 	}
 	if rank >= 5 {
 		j.CandidateActivationJSONSHA256 = sha("e")
@@ -61,6 +85,24 @@ func addEvidence(j *UpgradeJournalV1) {
 	if failureState(j.State) {
 		j.Failure = &FailureV1{Code: "upgrade_failed", Phase: j.History[len(j.History)-1].From, MessageDigest: sha("a")}
 	}
+}
+
+func restoreJournalAt(state JournalState) UpgradeJournalV1 {
+	j := journalFixture()
+	j.RequestKind = RequestKindRestore
+	source := restoreSourceFixture()
+	j.RestoreSource = &source
+	if state == JournalPreflighted {
+		return j
+	}
+	for _, next := range []JournalState{JournalQuiesced, JournalSnapshotCreated, JournalCandidateDBReady, JournalMigrated, JournalValidated, JournalActiveSwitched, JournalHealthy, JournalEdgeArmed, JournalCommitted} {
+		appendTransition(&j, next)
+		if next == state {
+			addEvidence(&j)
+			return j
+		}
+	}
+	panic("unsupported restore journal state")
 }
 
 func journalAt(state JournalState, legacy bool) UpgradeJournalV1 {
@@ -256,6 +298,9 @@ func TestEdgeConfigJournalContractsAreStrictAndProgressive(t *testing.T) {
 	if err := json.Unmarshal(raw, &fields); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := ParseUpgradeJournalV1(append(raw, []byte(" trailing")...)); err == nil {
+		t.Fatal("trailing restore journal JSON accepted")
+	}
 	for _, edit := range []func(map[string]json.RawMessage){
 		func(v map[string]json.RawMessage) { v["edge_config_transition"] = json.RawMessage("null") },
 		func(v map[string]json.RawMessage) { v["edge_config_validation"] = json.RawMessage("null") },
@@ -325,6 +370,155 @@ func TestUpgradeJournalPreviousBaselineAbsentAndPresentRoundTrip(t *testing.T) {
 		if err != nil || (got.PreUpgradePreviousActivationID != j.PreUpgradePreviousActivationID) || (got.PreUpgradePreviousActivationJSONSHA256 != j.PreUpgradePreviousActivationJSONSHA256) {
 			t.Fatalf("previous=%v got=%+v err=%v", previous, got, err)
 		}
+	}
+}
+
+func TestRestoreJournalWireContractAndCurrentSchemaEvidence(t *testing.T) {
+	for _, state := range []JournalState{JournalPreflighted, JournalSnapshotCreated, JournalMigrated, JournalValidated, JournalCommitted} {
+		journal := restoreJournalAt(state)
+		if err := journal.Validate(); err != nil {
+			t.Fatalf("state=%s: %v", state, err)
+		}
+		raw, err := MarshalUpgradeJournalV1(journal)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(raw), `"request_kind":"restore"`) || !strings.Contains(string(raw), `"restore_source"`) || strings.Contains(string(raw), "postgres") || strings.Contains(string(raw), "OPEN_CARD_DATABASE_URL=") {
+			t.Fatalf("restore journal wire is not secret-free and explicit: %s", raw)
+		}
+		got, err := ParseUpgradeJournalV1(raw)
+		if err != nil || got.RequestKind != RequestKindRestore || got.RestoreSource == nil || *got.RestoreSource != *journal.RestoreSource {
+			t.Fatalf("state=%s restore round-trip got=%#v err=%v", state, got, err)
+		}
+		if state == JournalMigrated && (got.Migration.From != CurrentMigrationVersion || got.Migration.To != CurrentMigrationVersion) {
+			t.Fatalf("restore migration=%#v", got.Migration)
+		}
+	}
+
+	for _, tc := range []struct {
+		name string
+		edit func(*UpgradeJournalV1)
+	}{
+		{"missing source", func(j *UpgradeJournalV1) { j.RestoreSource = nil }},
+		{"invalid source", func(j *UpgradeJournalV1) { j.RestoreSource.DumpSHA256 = "bad" }},
+		{"legacy projection", func(j *UpgradeJournalV1) {
+			planned := legacyActivationFixture()
+			j.PlannedOldActivation = &planned
+		}},
+		{"legacy state", func(j *UpgradeJournalV1) { appendTransition(j, JournalLegacyProjected) }},
+		{"upgrade migration semantics", func(j *UpgradeJournalV1) { j.Migration.From = "0023" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			j := restoreJournalAt(JournalMigrated)
+			tc.edit(&j)
+			if err := j.Validate(); err == nil {
+				t.Fatal("invalid restore journal accepted")
+			}
+		})
+	}
+
+	upgrade := journalFixture()
+	source := restoreSourceFixture()
+	upgrade.RestoreSource = &source
+	if err := upgrade.Validate(); err == nil {
+		t.Fatal("upgrade journal accepted restore source")
+	}
+	upgrade.RestoreSource = nil
+	upgrade.RequestKind = ""
+	if err := upgrade.Validate(); err == nil {
+		t.Fatal("journal accepted implicit request kind")
+	}
+}
+
+func TestRestoreJournalStrictJSONAndActivationOrigins(t *testing.T) {
+	journal := restoreJournalAt(JournalMigrated)
+	raw, err := MarshalUpgradeJournalV1(journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatal(err)
+	}
+	for _, edit := range []func(map[string]json.RawMessage){
+		func(v map[string]json.RawMessage) { v["restore_source"] = json.RawMessage("null") },
+		func(v map[string]json.RawMessage) { delete(v, "restore_source") },
+		func(v map[string]json.RawMessage) {
+			v["restore_source"] = json.RawMessage(`{"backup_id":"backup-20260830-a1","backup_id":"backup-20260830-a1"}`)
+		},
+		func(v map[string]json.RawMessage) {
+			v["restore_source"] = json.RawMessage(`{"backup_id":"backup-20260830-a1","unknown":true}`)
+		},
+		func(v map[string]json.RawMessage) { v["request_kind"] = json.RawMessage(`"unknown"`) },
+	} {
+		broken := make(map[string]json.RawMessage, len(fields))
+		for k, v := range fields {
+			broken[k] = v
+		}
+		edit(broken)
+		bad, err := json.Marshal(broken)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ParseUpgradeJournalV1(bad); err == nil {
+			t.Fatal("unsafe restore journal JSON accepted")
+		}
+	}
+
+	restore := restoreActivationFixture()
+	activationRaw, err := MarshalActivationV1(restore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(activationRaw), `"origin":"restore"`) || !strings.Contains(string(activationRaw), `"restore_source"`) {
+		t.Fatalf("restore activation did not persist source: %s", activationRaw)
+	}
+	if _, err := ParseActivationV1(activationRaw); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ParseActivationV1(append(activationRaw, []byte(" trailing")...)); err == nil {
+		t.Fatal("trailing restore activation JSON accepted")
+	}
+	firstDigest, err := CanonicalActivationJSONSHA256(restore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changedSource := *restore.RestoreSource
+	changedSource.BackupMetadataSHA256 = sha("2")
+	changed := restore
+	changed.RestoreSource = &changedSource
+	secondDigest, err := CanonicalActivationJSONSHA256(changed)
+	if err != nil || firstDigest == secondDigest {
+		t.Fatalf("restore source did not bind activation digest: %q %q %v", firstDigest, secondDigest, err)
+	}
+	for _, edit := range []func(*ActivationV1){
+		func(a *ActivationV1) { a.Origin = "native" },
+		func(a *ActivationV1) { a.RestoreSource = nil },
+		func(a *ActivationV1) { a.LegacyProjection = &LegacyProjectionV1{} },
+		func(a *ActivationV1) { a.RestoreSource.BackupMetadataSHA256 = "bad" },
+	} {
+		broken := restore
+		source := *restore.RestoreSource
+		broken.RestoreSource = &source
+		edit(&broken)
+		if err := broken.Validate(); err == nil {
+			t.Fatal("invalid restore activation accepted")
+		}
+	}
+	native := activationFixture()
+	native.RestoreSource = restore.RestoreSource
+	if err := native.Validate(); err == nil {
+		t.Fatal("native activation accepted restore source")
+	}
+
+	var activationFields map[string]json.RawMessage
+	if err := json.Unmarshal(activationRaw, &activationFields); err != nil {
+		t.Fatal(err)
+	}
+	activationFields["restore_source"] = json.RawMessage("null")
+	nullSource, _ := json.Marshal(activationFields)
+	if _, err := ParseActivationV1(nullSource); err == nil {
+		t.Fatal("explicit-null activation restore source accepted")
 	}
 }
 

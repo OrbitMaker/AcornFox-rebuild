@@ -38,6 +38,7 @@ type PendingTransaction struct {
 type UpgradeStatusV1 struct {
 	SchemaVersion int                         `json:"schema_version"`
 	TransactionID string                      `json:"transaction_id"`
+	RequestKind   RequestKind                 `json:"request_kind"`
 	State         JournalState                `json:"state"`
 	Revision      int64                       `json:"revision"`
 	UpdatedAt     string                      `json:"updated_at"`
@@ -138,6 +139,7 @@ func (s *UpgradeStore) readUpgradeStatusSample(ctx context.Context, transactionI
 		status: UpgradeStatusV1{
 			SchemaVersion: ActivationSchemaVersion,
 			TransactionID: transactionID,
+			RequestKind:   journal.RequestKind,
 			State:         journal.State,
 			Revision:      journal.Revision,
 			UpdatedAt:     journal.UpdatedAt.UTC().Format("2006-01-02T15:04:05Z"),
