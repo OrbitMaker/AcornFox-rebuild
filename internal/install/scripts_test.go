@@ -460,6 +460,17 @@ func TestG5BRecoverySubstrateStaysStageOnlyAndBootDisabled(t *testing.T) {
 	if !strings.Contains(host, "install -d -m 0711 -o root -g root /etc/open-card") || !strings.Contains(host, "install -d -m 0700 -o root -g root /var/lib/open-card/evidence") {
 		t.Fatal("host installer does not separate runtime traversal from root-only evidence")
 	}
+	for _, required := range []string{"newuidmap newgidmap", "util-linux uidmap apparmor", "require_command \"$command_name\""} {
+		if !strings.Contains(host, required) {
+			t.Fatalf("host installer does not enforce rootless uidmap prerequisite %q", required)
+		}
+	}
+	skipBranch := strings.Index(host, "if (( ! skip_prerequisites )); then")
+	runtimeVerification := strings.LastIndex(host, "for command_name in docker psql runuser newuidmap newgidmap")
+	installerCall := strings.Index(host, "\"$"+"{installer[@]}\"")
+	if skipBranch < 0 || runtimeVerification < skipBranch || installerCall < runtimeVerification {
+		t.Fatal("skip-prerequisites can bypass required runtime command verification")
+	}
 	if preflight := strings.Index(host, "--validate-activation-intent"); preflight < 0 || preflight > strings.Index(host, "require_command()") {
 		t.Fatal("host activation-intent preflight does not precede mutable prerequisites")
 	}

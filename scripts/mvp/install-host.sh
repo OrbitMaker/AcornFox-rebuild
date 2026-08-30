@@ -113,11 +113,11 @@ if (( dry_run )); then
 fi
 
 require_command() { command -v "$1" >/dev/null 2>&1 || die "required command is missing: $1"; }
+required_commands=(install useradd getent openssl systemctl)
+for command_name in "${required_commands[@]}"; do require_command "$command_name"; done
 if (( ! skip_prerequisites )); then
-  required_commands=(install useradd getent openssl systemctl)
-  for command_name in "${required_commands[@]}"; do require_command "$command_name"; done
   missing_packages=()
-  for command_name in docker psql runuser; do command -v "$command_name" >/dev/null 2>&1 || missing_packages+=("$command_name"); done
+  for command_name in docker psql runuser newuidmap newgidmap; do command -v "$command_name" >/dev/null 2>&1 || missing_packages+=("$command_name"); done
   if (( ${#missing_packages[@]} > 0 )); then
     if (( offline )); then
       [[ -n "$debs_dir" && -n "$debs_sha256" ]] || die "offline prerequisite installation requires --debs-dir and --debs-sha256"
@@ -154,9 +154,10 @@ PY
       require_command apt-get
       export DEBIAN_FRONTEND=noninteractive
       apt-get update
-      apt-get install -y ca-certificates curl docker.io postgresql postgresql-client util-linux apparmor apparmor-utils
+      apt-get install -y ca-certificates curl docker.io postgresql postgresql-client util-linux uidmap apparmor apparmor-utils
     fi
   fi
+  for command_name in docker psql runuser newuidmap newgidmap; do require_command "$command_name"; done
 
   for account in opencard opencard-agent opencard-buildkit opencard-caddy opencard-edge; do
     if ! getent passwd "$account" >/dev/null; then
@@ -366,6 +367,7 @@ SQL
   export OPEN_CARD_DATABASE_URL="$database_url"
   export DATABASE_URL="$database_url"
 fi
+for command_name in docker psql runuser newuidmap newgidmap; do require_command "$command_name"; done
 
 "${installer[@]}"
 installation_id=/var/lib/open-card/installation-id
