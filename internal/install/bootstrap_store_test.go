@@ -248,20 +248,28 @@ func persistBootstrapJournal(t *testing.T, store *BootstrapStore, journal Bootst
 	}
 }
 
-func persistBootstrapActivationWritten(t *testing.T, store *BootstrapStore, journal BootstrapJournalV1) {
+func persistBootstrapActivationWritten(t *testing.T, store *BootstrapStore, journal BootstrapJournalV1, activation ActivationV1, databaseEnv []byte) {
 	t.Helper()
-	persistBootstrapJournal(t, store, journal, true)
+	migrated := bootstrapJournalRevision(t, journal, 3)
+	persistBootstrapJournal(t, store, migrated, true)
+	digest, err := store.WriteInitialActivation(context.Background(), migrated, activation, databaseEnv)
+	if err != nil || digest != journal.ActivationJSONSHA256 {
+		t.Fatalf("write activation digest=%q err=%v", digest, err)
+	}
+	if err := store.Save(context.Background(), journal); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestBootstrapInitialActivationPublishesExactPointersAndReplays(t *testing.T) {
 	store, journal, activation, databaseEnv, _, cleanup := bootstrapRC2Store(t)
 	defer cleanup()
-	persistBootstrapActivationWritten(t, store, journal)
-	first, err := store.PublishInitialActivation(context.Background(), journal, activation, databaseEnv)
+	persistBootstrapActivationWritten(t, store, journal, activation, databaseEnv)
+	first, err := store.PublishInitialPointers(context.Background(), journal, activation)
 	if err != nil || !validSHA(first) {
 		t.Fatalf("publish digest=%q err=%v", first, err)
 	}
-	second, err := store.PublishInitialActivation(context.Background(), journal, activation, databaseEnv)
+	second, err := store.PublishInitialPointers(context.Background(), journal, activation)
 	if err != nil || second != first {
 		t.Fatalf("replay digest=%q want=%q err=%v", second, first, err)
 	}
@@ -277,15 +285,11 @@ func TestBootstrapInitialActivationPublishesExactPointersAndReplays(t *testing.T
 func TestBootstrapInitialActivationConvergesExactActiveOnlyCrash(t *testing.T) {
 	store, journal, activation, databaseEnv, _, cleanup := bootstrapRC2Store(t)
 	defer cleanup()
-	persistBootstrapActivationWritten(t, store, journal)
-	digest, err := store.upgrade.WriteCandidateActivation(context.Background(), activation, databaseEnv)
-	if err != nil || digest != journal.ActivationJSONSHA256 {
-		t.Fatal(err)
-	}
+	persistBootstrapActivationWritten(t, store, journal, activation, databaseEnv)
 	if err := store.upgrade.activationWriter.SwapActivationLink(ActivationLinkActive, activation.ActivationID, ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.PublishInitialActivation(context.Background(), journal, activation, databaseEnv); err != nil {
+	if _, err := store.PublishInitialPointers(context.Background(), journal, activation); err != nil {
 		t.Fatal(err)
 	}
 	if !store.exactCurrent() {
@@ -298,12 +302,6 @@ func TestBootstrapInitialActivationRejectsForeignAndUnsafePointerStates(t *testi
 		"foreign-active": func(t *testing.T, store *BootstrapStore, _ ActivationV1, _ string) {
 			t.Helper()
 			if err := store.upgrade.activationWriter.SwapActivationLink(ActivationLinkActive, "foreign", ""); err != nil {
-				t.Fatal(err)
-			}
-		},
-		"candidate-active-missing-slot": func(t *testing.T, store *BootstrapStore, activation ActivationV1, _ string) {
-			t.Helper()
-			if err := store.upgrade.activationWriter.SwapActivationLink(ActivationLinkActive, activation.ActivationID, ""); err != nil {
 				t.Fatal(err)
 			}
 		},
@@ -329,12 +327,25 @@ func TestBootstrapInitialActivationRejectsForeignAndUnsafePointerStates(t *testi
 		t.Run(name, func(t *testing.T) {
 			store, journal, activation, databaseEnv, root, cleanup := bootstrapRC2Store(t)
 			defer cleanup()
-			persistBootstrapActivationWritten(t, store, journal)
+			persistBootstrapActivationWritten(t, store, journal, activation, databaseEnv)
 			arrange(t, store, activation, root)
-			if _, err := store.PublishInitialActivation(context.Background(), journal, activation, databaseEnv); !errors.Is(err, ErrUpgradeJournalConflict) {
+			if _, err := store.PublishInitialPointers(context.Background(), journal, activation); !errors.Is(err, ErrUpgradeJournalConflict) {
 				t.Fatalf("unsafe pointer state err=%v", err)
 			}
 		})
+	}
+}
+
+func TestBootstrapWriteInitialActivationRequiresPointerAbsence(t *testing.T) {
+	store, journal, activation, databaseEnv, _, cleanup := bootstrapRC2Store(t)
+	defer cleanup()
+	migrated := bootstrapJournalRevision(t, journal, 3)
+	persistBootstrapJournal(t, store, migrated, true)
+	if err := store.upgrade.activationWriter.SwapActivationLink(ActivationLinkActive, activation.ActivationID, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.WriteInitialActivation(context.Background(), migrated, activation, databaseEnv); !errors.Is(err, ErrUpgradeJournalConflict) {
+		t.Fatalf("preexisting pointer accepted before activation write: %v", err)
 	}
 }
 
@@ -352,9 +363,20 @@ func TestBootstrapInitialActivationRequiresDurableBoundJournalAndMarker(t *testi
 		t.Run(name, func(t *testing.T) {
 			store, journal, activation, databaseEnv, _, cleanup := bootstrapRC2Store(t)
 			defer cleanup()
-			persistBootstrapJournal(t, store, journal, tc.keepMarker)
+			if tc.keepMarker {
+				persistBootstrapActivationWritten(t, store, journal, activation, databaseEnv)
+			} else {
+				migrated := bootstrapJournalRevision(t, journal, 3)
+				persistBootstrapJournal(t, store, migrated, false)
+				if _, err := store.upgrade.WriteCandidateActivation(context.Background(), activation, databaseEnv); err != nil {
+					t.Fatal(err)
+				}
+				if err := store.Save(context.Background(), journal); err != nil {
+					t.Fatal(err)
+				}
+			}
 			tc.mutate(&journal, &activation)
-			if _, err := store.PublishInitialActivation(context.Background(), journal, activation, databaseEnv); !errors.Is(err, ErrUpgradeJournalConflict) {
+			if _, err := store.PublishInitialPointers(context.Background(), journal, activation); !errors.Is(err, ErrUpgradeJournalConflict) {
 				t.Fatalf("unbound request err=%v", err)
 			}
 		})
@@ -364,13 +386,10 @@ func TestBootstrapInitialActivationRequiresDurableBoundJournalAndMarker(t *testi
 func TestBootstrapInitialActivationReconcilesPostRenameUnknown(t *testing.T) {
 	store, journal, activation, databaseEnv, _, cleanup := bootstrapRC2Store(t)
 	defer cleanup()
-	persistBootstrapActivationWritten(t, store, journal)
-	if _, err := store.upgrade.WriteCandidateActivation(context.Background(), activation, databaseEnv); err != nil {
-		t.Fatal(err)
-	}
+	persistBootstrapActivationWritten(t, store, journal, activation, databaseEnv)
 	original := store.upgrade.activationWriter.ops
 	store.upgrade.activationWriter.ops = &bootstrapNthSyncFaultOps{durableOps: original, failAt: 3}
-	digest, err := store.PublishInitialActivation(context.Background(), journal, activation, databaseEnv)
+	digest, err := store.PublishInitialPointers(context.Background(), journal, activation)
 	if err != nil || !validSHA(digest) {
 		t.Fatalf("post-rename reconciliation digest=%q err=%v", digest, err)
 	}

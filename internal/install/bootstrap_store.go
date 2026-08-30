@@ -131,17 +131,60 @@ func preservesBootstrapEvidence(old, next BootstrapJournalV1) bool {
 	return true
 }
 
-func (s *BootstrapStore) PublishInitialActivation(ctx context.Context, j BootstrapJournalV1, a ActivationV1, env []byte) (string, error) {
-	if s == nil || s.upgrade == nil || !s.upgrade.ownsLock() || s.upgrade.lock.tx != j.TransactionID || j.Validate() != nil || j.State != BootstrapActivationWritten || a.Origin != "native" || a.CreatedByTransactionID != j.TransactionID || a.ActivationID != j.CandidateActivationID || a.Release != j.Release || a.Database.Name != j.CandidateDatabaseName || a.Database.Migration != CurrentMigrationVersion || a.Database.SchemaMigrationsSHA256 != j.CandidateDatabaseSchemaSHA256 || a.LegacyProjection != nil || a.RestoreSource != nil {
+func validBootstrapActivationBinding(j BootstrapJournalV1, a ActivationV1) bool {
+	return a.Origin == "native" && a.CreatedByTransactionID == j.TransactionID && a.ActivationID == j.CandidateActivationID && a.Release == j.Release && a.Database.Name == j.CandidateDatabaseName && a.Database.Migration == CurrentMigrationVersion && a.Database.SchemaMigrationsSHA256 == j.CandidateDatabaseSchemaSHA256 && a.LegacyProjection == nil && a.RestoreSource == nil
+}
+
+func (s *BootstrapStore) exactDurableBootstrapJournal(ctx context.Context, j BootstrapJournalV1) bool {
+	if s == nil || s.upgrade == nil || !s.upgrade.ownsLock() || s.upgrade.lock.tx != j.TransactionID || j.Validate() != nil {
+		return false
+	}
+	persisted, err := s.Load(ctx, j.TransactionID)
+	return err == nil && sameBootstrapJournal(persisted, j)
+}
+
+// WriteInitialActivation publishes only the immutable native activation slot.
+// It is the postcondition used to advance MIGRATED to ACTIVATION_WRITTEN;
+// active/current/previous must remain absent throughout this operation.
+func (s *BootstrapStore) WriteInitialActivation(ctx context.Context, j BootstrapJournalV1, a ActivationV1, env []byte) (string, error) {
+	if j.State != BootstrapMigrated0024 || !validBootstrapActivationBinding(j, a) || !s.exactDurableBootstrapJournal(ctx, j) {
 		return "", ErrUpgradeJournalConflict
 	}
 	raw, e := MarshalActivationV1(a)
 	sum := sha256.Sum256(raw)
-	if e != nil || hex.EncodeToString(sum[:]) != j.ActivationJSONSHA256 {
+	if e != nil {
 		return "", ErrUpgradeJournalConflict
 	}
-	persisted, e := s.Load(ctx, j.TransactionID)
-	if e != nil || !sameBootstrapJournal(persisted, j) {
+	digest := hex.EncodeToString(sum[:])
+	marker, e := s.upgrade.markerTransaction()
+	if e != nil || marker != j.TransactionID {
+		return "", ErrUpgradeJournalConflict
+	}
+	activeID, currentPresent, e := s.bootstrapPointers()
+	if e != nil || activeID != "" || currentPresent {
+		return "", ErrUpgradeJournalConflict
+	}
+	written, e := s.upgrade.WriteCandidateActivation(ctx, a, env)
+	if e != nil || written != digest || !s.exactActivationSlot(a.ActivationID, digest) {
+		return "", ErrUpgradeJournalConflict
+	}
+	activeID, currentPresent, e = s.bootstrapPointers()
+	if e != nil || activeID != "" || currentPresent {
+		return "", ErrUpgradeJournalConflict
+	}
+	return digest, nil
+}
+
+// PublishInitialPointers consumes an already-durable ACTIVATION_WRITTEN
+// journal and publishes only active/current. It accepts an exact active-only
+// crash prefix, rejects every foreign partial state, and never creates a slot.
+func (s *BootstrapStore) PublishInitialPointers(ctx context.Context, j BootstrapJournalV1, a ActivationV1) (string, error) {
+	if j.State != BootstrapActivationWritten || !validBootstrapActivationBinding(j, a) || !s.exactDurableBootstrapJournal(ctx, j) {
+		return "", ErrUpgradeJournalConflict
+	}
+	raw, e := MarshalActivationV1(a)
+	sum := sha256.Sum256(raw)
+	if e != nil || hex.EncodeToString(sum[:]) != j.ActivationJSONSHA256 || !s.exactActivationSlot(a.ActivationID, j.ActivationJSONSHA256) {
 		return "", ErrUpgradeJournalConflict
 	}
 	marker, e := s.upgrade.markerTransaction()
@@ -158,12 +201,8 @@ func (s *BootstrapStore) PublishInitialActivation(ctx context.Context, j Bootstr
 	if activeID != "" && !s.exactActive(a.ActivationID, j.ActivationJSONSHA256) {
 		return "", ErrUpgradeJournalConflict
 	}
-	digest, e := s.upgrade.WriteCandidateActivation(ctx, a, env)
-	if e != nil || digest != j.ActivationJSONSHA256 {
-		return "", ErrUpgradeJournalConflict
-	}
 	if activeID == "" {
-		if e = s.upgrade.activationWriter.SwapActivationLink(ActivationLinkActive, a.ActivationID, ""); e != nil && !s.exactActive(a.ActivationID, digest) {
+		if e = s.upgrade.activationWriter.SwapActivationLink(ActivationLinkActive, a.ActivationID, ""); e != nil && !s.exactActive(a.ActivationID, j.ActivationJSONSHA256) {
 			return "", e
 		}
 	}
@@ -174,7 +213,12 @@ func (s *BootstrapStore) PublishInitialActivation(ctx context.Context, j Bootstr
 	} else if !s.exactCurrent() {
 		return "", ErrUpgradeJournalConflict
 	}
-	return s.pointerState(a.ActivationID, digest)
+	return s.pointerState(a.ActivationID, j.ActivationJSONSHA256)
+}
+
+func (s *BootstrapStore) exactActivationSlot(id, digest string) bool {
+	_, got, e := s.upgrade.readActivation(id)
+	return e == nil && got == digest
 }
 
 func sameBootstrapJournal(left, right BootstrapJournalV1) bool {
@@ -183,8 +227,7 @@ func sameBootstrapJournal(left, right BootstrapJournalV1) bool {
 	return lerr == nil && rerr == nil && bytes.Equal(l, r)
 }
 func (s *BootstrapStore) exactActive(id, digest string) bool {
-	_, got, e := s.upgrade.readActivation(id)
-	if e != nil || got != digest {
+	if !s.exactActivationSlot(id, digest) {
 		return false
 	}
 	target, e := s.upgrade.activationWriter.ReadActivationLink(ActivationLinkActive)
