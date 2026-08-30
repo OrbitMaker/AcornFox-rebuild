@@ -23,7 +23,7 @@ base=/var/lib/libvirt/images/sealos-cluster/ubuntu-24.04-server-cloudimg-amd64.i
 base_sha=0533b0655c32e68b31d792ecd6ccfca95abdbc536c4446874fe0513bd4140ffe
 rc0_rel=output/production/0.8.0-rc.0/amd64
 rc1_rel=output/production/0.8.0-rc.1/amd64
-rc1_source=21d28c918b02f97b5fb91d2f686d4f195f578e15
+rc1_source=a23ec9024a176cb0d00784a64aaf10a97fc4d1c4
 local_tmp=$(mktemp -d "${TMPDIR:-/tmp}/${prefix}.XXXXXX")
 local_evidence=${OPEN_CARD_G5B_PRODUCT_EVIDENCE_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/${prefix}.evidence.XXXXXX")}
 mkdir -p "$local_evidence"
@@ -113,9 +113,9 @@ for path in tests/spikes/clean_worker_gate5b_product_guest.sh "$rc0_rel/release/
 test "$(git -C "$repo_root" rev-parse "$rc1_source^{commit}")" = "$rc1_source"
 git -C "$repo_root" merge-base --is-ancestor "$rc1_source" HEAD
 test -z "$(git -C "$repo_root" status --short)"
-test "$(sha256sum "$repo_root/$rc1_rel/release/manifest.json" | awk '{print $1}')" = 182c4421ae6fea0706e3bc456afd3b330136186353083d50d4a9107cf9f3f770
-test "$(sha256sum "$repo_root/$rc1_rel/open-card-0.8.0-rc.1-production.tar.gz" | awk '{print $1}')" = 93d69e64e6bb6bef4b9648cb2f183a320230204f001c87dd447cd4ca70c1b25d
-test "$(sha256sum "$repo_root/$rc1_rel/bundle-manifest.sha256" | awk '{print $1}')" = 28815c1e96816f0ae358dafbd5df8b56f746d48ff4b160bb6953dcded8cd6523
+test "$(sha256sum "$repo_root/$rc1_rel/release/manifest.json" | awk '{print $1}')" = 57271339953ece13c64ea80b6db5cc045005c104f942ca9e95f9e705dd3cf7fa
+test "$(sha256sum "$repo_root/$rc1_rel/open-card-0.8.0-rc.1-production.tar.gz" | awk '{print $1}')" = 7eb268c1becfc7a61564a87b6a6132c988a567f7be5d1d66ec31427a45f7a46a
+test "$(sha256sum "$repo_root/$rc1_rel/bundle-manifest.sha256" | awk '{print $1}')" = 15f667fca1ba4240fc5fa87ab42fd5c16c42e76e431058d88b6c76a2f4df5214
 python3 - "$repo_root/tests/spikes/clean_worker_gate5b_product_guest.sh" <<'PY'
 import pathlib, sys
 source=pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
