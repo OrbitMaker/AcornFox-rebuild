@@ -63,17 +63,31 @@ func edgeCandidateTemplateFixture() []byte {
 }
 
 func TestLegacyMigrationRowsRequireFrozenRC0BundleMode(t *testing.T) {
+	names := []string{
+		"0001_foundation", "0002_invariants", "0003_audit_chain_serialization",
+		"0004_repository_runtime", "0005_observability", "0006_controller_worker",
+		"0007_compatibility_contract", "0008_m1_delivery", "0009_m1_runtime_observation",
+		"0010_m1_publish_idempotency", "0011_m1_source_reupload", "0012_m2_service_groups",
+		"0013_m3_access_routes", "0014_m4_operations_notifications", "0015_m4_rollout_coordinator",
+		"0016_m4_staged_route_sets", "0017_m4_independent_runtime_facts", "0018_m4_atomic_rollout_plan",
+		"0019_m4_durable_candidate_cleanup", "0020_m5_usage", "0021_m6_controlled_ai",
+		"0022_admin_auth", "0023_source_uploads",
+	}
 	manifest := Manifest{}
-	for version := 1; version <= 23; version++ {
+	for _, name := range names {
 		manifest.Files = append(manifest.Files, FileDigest{
-			Path:   "migrations/control-plane/" + formatMigrationVersion(version) + "_migration.sql",
+			Path:   "migrations/control-plane/" + name + ".sql",
 			SHA256: strings.Repeat("a", 64),
 			Mode:   0o640,
 		})
 	}
 	rows, err := legacyMigrationRows(manifest)
-	if err != nil || len(rows) != 23 || rows[22].Version != "0023" {
+	if err != nil || len(rows) != len(names) || rows[0].Version != names[0] || rows[22].Version != names[22] {
 		t.Fatalf("rows=%#v err=%v", rows, err)
+	}
+	evidence, err := migrationEvidence(rows)
+	if err != nil || evidence.RowsSHA256 != "94861d794456e6be9672ea26f3ec4ef503ddd6fea48c3487c278552b2c9d0b05" {
+		t.Fatalf("evidence=%#v err=%v", evidence, err)
 	}
 	manifest.Files[0].Mode = 0o644
 	if _, err := legacyMigrationRows(manifest); err == nil {

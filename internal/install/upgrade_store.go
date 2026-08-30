@@ -1505,7 +1505,10 @@ func legacyMigrationRows(manifest Manifest) ([]MigrationRow, error) {
 		if n != 1 || found.Mode != 0o640 {
 			return nil, ErrUpgradeJournalConflict
 		}
-		rows = append(rows, MigrationRow{Version: formatMigrationVersion(i), Checksum: found.SHA256})
+		// control-plane-migrate.sh persists the canonical filename stem, not
+		// only the numeric prefix.  Legacy inspection must hash the same rows
+		// or an intact RC0 database can never match its release manifest.
+		rows = append(rows, MigrationRow{Version: strings.TrimSuffix(filepath.Base(found.Path), ".sql"), Checksum: found.SHA256})
 	}
 	if !validMigrationRows(rows, 23) {
 		return nil, ErrUpgradeJournalConflict
