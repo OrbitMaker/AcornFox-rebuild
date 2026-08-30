@@ -1,11 +1,16 @@
 package install
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 const (
 	productionServerHealthURL = "http://127.0.0.1:8080/healthz"
 	productionServerReadyURL  = "http://127.0.0.1:8080/readyz"
 	productionEdgeHealthURL   = "http://127.0.0.1:18482/healthz"
+	productionHealthTimeout   = 30 * time.Second
+	productionHealthInterval  = 250 * time.Millisecond
 )
 
 var restoreInternalStartOrder = []ServiceUnit{ServiceBuildKit, ServiceCaddy, ServiceServer, ServiceAgent}
@@ -25,6 +30,8 @@ type UpgradeServiceAdapter struct {
 	probes           UpgradeServiceProbeConfig
 	restoredInternal ServiceSnapshotV1
 	edgeValidator    *EdgeConfigValidator
+	healthTimeout    time.Duration
+	healthInterval   time.Duration
 }
 
 func ProductionUpgradeServiceAdapter() (*UpgradeServiceAdapter, error) {
@@ -46,6 +53,8 @@ func ProductionUpgradeServiceAdapter() (*UpgradeServiceAdapter, error) {
 		_ = controller.Close()
 		return nil, err
 	}
+	adapter.healthTimeout = productionHealthTimeout
+	adapter.healthInterval = productionHealthInterval
 	return adapter, nil
 }
 
@@ -114,11 +123,12 @@ func (a *UpgradeServiceAdapter) HealthInternal(ctx context.Context) error {
 	if a == nil || a.controller == nil {
 		return ErrServiceOutcomeUnknown
 	}
-	if _, err := a.controller.ProbeHealth(ctx, a.probes.ServerHealth); err != nil {
+	retryCtx, cancel := a.healthRetryContext(ctx)
+	defer cancel()
+	if err := a.probeHealth(retryCtx, a.probes.ServerHealth); err != nil {
 		return err
 	}
-	_, err := a.controller.ProbeHealth(ctx, a.probes.ServerReady)
-	return err
+	return a.probeHealth(retryCtx, a.probes.ServerReady)
 }
 
 func (a *UpgradeServiceAdapter) StartEdge(ctx context.Context) error {
@@ -132,8 +142,43 @@ func (a *UpgradeServiceAdapter) HealthEdge(ctx context.Context) error {
 	if a == nil || a.controller == nil {
 		return ErrServiceOutcomeUnknown
 	}
-	_, err := a.controller.ProbeHealth(ctx, a.probes.EdgeHealth)
-	return err
+	retryCtx, cancel := a.healthRetryContext(ctx)
+	defer cancel()
+	return a.probeHealth(retryCtx, a.probes.EdgeHealth)
+}
+
+func (a *UpgradeServiceAdapter) healthRetryContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if a == nil || a.healthTimeout <= 0 || a.healthInterval <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, a.healthTimeout)
+}
+
+func (a *UpgradeServiceAdapter) probeHealth(ctx context.Context, target string) error {
+	if a == nil || a.controller == nil {
+		return ErrServiceOutcomeUnknown
+	}
+	if a.healthTimeout <= 0 || a.healthInterval <= 0 {
+		_, err := a.controller.ProbeHealth(ctx, target)
+		return err
+	}
+	for {
+		if _, err := a.controller.ProbeHealth(ctx, target); err == nil {
+			return nil
+		}
+		timer := time.NewTimer(a.healthInterval)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return ErrServiceOutcomeUnknown
+		case <-timer.C:
+		}
+	}
 }
 
 func (a *UpgradeServiceAdapter) GuardEdge(ctx context.Context) error {

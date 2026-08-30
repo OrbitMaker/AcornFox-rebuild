@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func adapterForTest(t *testing.T, runner *fakeServiceRunner, marker func() (bool, error), probes UpgradeServiceProbeConfig) *UpgradeServiceAdapter {
@@ -151,6 +152,65 @@ func TestUpgradeServiceAdapterHealthTargetsAndSafeFailures(t *testing.T) {
 	_, err = adapter.Capture(context.Background())
 	if !errors.Is(err, ErrServiceOutcomeUnknown) || strings.Contains(err.Error(), "sensitive") {
 		t.Fatalf("capture error = %v", err)
+	}
+}
+
+func TestUpgradeServiceAdapterRetriesStartupHealthWithinBoundedBudget(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.URL.Path == "/healthz" && requests < 3 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	runner := newFakeServiceRunner()
+	adapter := adapterForTest(t, runner, func() (bool, error) { return false, nil }, UpgradeServiceProbeConfig{ServerHealth: server.URL + "/healthz", ServerReady: server.URL + "/readyz"})
+	adapter.healthTimeout = 250 * time.Millisecond
+	adapter.healthInterval = time.Millisecond
+	if err := adapter.HealthInternal(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if requests < 4 {
+		t.Fatalf("health requests=%d", requests)
+	}
+}
+
+func TestUpgradeServiceAdapterSharesOneInternalHealthBudget(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			time.Sleep(60 * time.Millisecond)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	adapter := adapterForTest(t, newFakeServiceRunner(), func() (bool, error) { return false, nil }, UpgradeServiceProbeConfig{ServerHealth: server.URL + "/healthz", ServerReady: server.URL + "/readyz"})
+	adapter.healthTimeout = 90 * time.Millisecond
+	adapter.healthInterval = time.Millisecond
+	started := time.Now()
+	err := adapter.HealthInternal(context.Background())
+	if elapsed := time.Since(started); !errors.Is(err, ErrServiceOutcomeUnknown) || elapsed > 140*time.Millisecond {
+		t.Fatalf("elapsed=%s err=%v", elapsed, err)
+	}
+}
+
+func TestUpgradeServiceAdapterHealthRetryHonorsCallerCancellation(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	adapter := adapterForTest(t, newFakeServiceRunner(), func() (bool, error) { return false, nil }, UpgradeServiceProbeConfig{ServerHealth: server.URL + "/healthz", ServerReady: server.URL + "/readyz"})
+	adapter.healthTimeout = time.Second
+	adapter.healthInterval = time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := adapter.HealthInternal(ctx)
+	if !errors.Is(err, ErrServiceOutcomeUnknown) || strings.Contains(err.Error(), server.URL) {
+		t.Fatalf("cancelled health error=%v", err)
 	}
 }
 
