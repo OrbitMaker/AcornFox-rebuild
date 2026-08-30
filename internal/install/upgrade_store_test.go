@@ -1492,7 +1492,7 @@ func TestPrepareLegacyProjectionReconcilesCollectionSyncUnknown(t *testing.T) {
 		t.Fatal(err)
 	}
 	writer, fault := renameHookWriter(t, filepath.Join(root, "opt/open-card"))
-	fault.fail = "link-parent-fsync"
+	fault.fail = "directory-parent-fsync"
 	old := store.activationWriter
 	store.activationWriter = writer
 	defer func() {
@@ -1515,7 +1515,7 @@ func TestWriteCandidateActivationDurablyReconcilesMissingCollection(t *testing.T
 		t.Fatal(err)
 	}
 	writer, fault := renameHookWriter(t, filepath.Join(root, "opt/open-card"))
-	fault.fail = "link-parent-fsync"
+	fault.fail = "directory-parent-fsync"
 	old := store.activationWriter
 	store.activationWriter = writer
 	defer func() {
@@ -1562,6 +1562,53 @@ func TestWriteCandidateActivationPropagatesCollectionSyncRetryFailure(t *testing
 	}
 	if _, err := os.Lstat(filepath.Join(collection, activation.ActivationID)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("activation slot published after failed collection durability: %v", err)
+	}
+}
+
+func TestWriteCandidateActivationReconcilesExistingCollectionSyncUnknown(t *testing.T) {
+	store, root, activation, env, cleanup := candidateStore(t)
+	defer cleanup()
+	writer, fault := renameHookWriter(t, filepath.Join(root, "opt/open-card"))
+	fault.fail = "link-parent-fsync"
+	old := store.activationWriter
+	store.activationWriter = writer
+	defer func() {
+		store.activationWriter = old
+		_ = writer.Close()
+	}()
+	lock := acquireCandidate(t, store)
+	defer lock.Release()
+	digest, err := store.WriteCandidateActivation(context.Background(), activation, env)
+	if err != nil || !validSHA(digest) || fault.syncCalls < 2 {
+		t.Fatalf("digest=%q sync_calls=%d err=%v", digest, fault.syncCalls, err)
+	}
+}
+
+func TestWriteCandidateActivationRejectsExistingCollectionSyncRetryFailure(t *testing.T) {
+	store, root, activation, env, cleanup := candidateStore(t)
+	defer cleanup()
+	opened, err := os.OpenRoot(filepath.Join(root, "opt/open-card"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := realDurableOps{durableRoot: osDurableRoot{root: opened}}
+	writer, err := newDurableWriter(filepath.Join(root, "opt/open-card"), os.Getuid(), os.Getgid(), &alwaysSyncFaultOps{durableOps: base})
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := store.activationWriter
+	store.activationWriter = writer
+	defer func() {
+		store.activationWriter = old
+		_ = writer.Close()
+	}()
+	lock := acquireCandidate(t, store)
+	defer lock.Release()
+	if _, err := store.WriteCandidateActivation(context.Background(), activation, env); !errors.Is(err, ErrDurableCommitUnknown) {
+		t.Fatalf("sync retry failure=%v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "opt/open-card/activations", activation.ActivationID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("activation slot published after failed existing-collection durability: %v", err)
 	}
 }
 

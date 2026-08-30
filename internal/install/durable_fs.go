@@ -170,15 +170,52 @@ func (w *DurableWriter) CreateChildDirectory(name string, mode os.FileMode) (boo
 		return false, fmt.Errorf("durable child path is unsafe")
 	}
 	if err := w.ops.Mkdir(name, mode); err != nil {
-		if errors.Is(err, os.ErrExist) {
-			return false, nil
+		if !errors.Is(err, os.ErrExist) {
+			return false, err
 		}
-		return false, err
+		info, statErr := w.ops.Lstat(name)
+		if statErr != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm() != mode || verifyOwner(info, w.uid, w.gid) != nil {
+			return false, fmt.Errorf("durable child directory is unsafe")
+		}
+		// A previous call may have published the entry but lost the outcome of
+		// its parent fsync. Re-sync even for an exact existing directory.
+		if syncErr := w.SyncRoot(); syncErr != nil {
+			return false, fmt.Errorf("%w: %v", ErrDurableCommitUnknown, syncErr)
+		}
+		return false, nil
 	}
-	info, err := w.ops.Lstat(name)
+	unknown := func(err error) (bool, error) {
+		return false, fmt.Errorf("%w: %v", ErrDurableCommitUnknown, err)
+	}
+	directory, err := w.ops.OpenFile(name, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return unknown(err)
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			_ = w.ops.CloseFile(directory)
+		}
+	}()
+	// Mkdir is subject to the process umask. Apply and verify the exact
+	// deployment mode and owner through the no-follow directory descriptor.
+	if err := w.ops.Chmod(directory, mode); err != nil {
+		return unknown(err)
+	}
+	if err := w.ops.Chown(directory, w.uid, w.gid); err != nil {
+		return unknown(err)
+	}
+	info, err := w.ops.Stat(directory)
 	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm() != mode || verifyOwner(info, w.uid, w.gid) != nil {
-		return false, fmt.Errorf("durable child directory is unsafe")
+		return unknown(fmt.Errorf("durable child directory is unsafe"))
 	}
+	if err := w.ops.Sync(directory); err != nil {
+		return unknown(err)
+	}
+	if err := w.ops.CloseFile(directory); err != nil {
+		return unknown(err)
+	}
+	closed = true
 	if err := w.SyncRoot(); err != nil {
 		return false, fmt.Errorf("%w: %v", ErrDurableCommitUnknown, err)
 	}

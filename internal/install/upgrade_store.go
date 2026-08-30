@@ -1187,7 +1187,13 @@ func (s *UpgradeStore) ensureActivationLayout() error {
 	}
 	_, err := s.activationWriter.CreateChildDirectory("activations", activationSlotDirMode)
 	if err != nil {
-		if !errors.Is(err, ErrDurableCommitUnknown) || s.validateActivationLayout() != nil {
+		if !errors.Is(err, ErrDurableCommitUnknown) {
+			if s.validateActivationLayout() != nil {
+				return ErrUpgradeJournalConflict
+			}
+			return err
+		}
+		if s.validateActivationLayout() != nil {
 			return err
 		}
 		// Visibility proves only that mkdir reached the live namespace; it

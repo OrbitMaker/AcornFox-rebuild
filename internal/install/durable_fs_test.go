@@ -220,6 +220,72 @@ type phaseFaultOps struct {
 	afterRename func() error
 }
 
+type restrictiveMkdirOps struct{ durableOps }
+
+func (o *restrictiveMkdirOps) Mkdir(name string, _ os.FileMode) error {
+	return o.durableOps.Mkdir(name, 0o700)
+}
+
+func TestCreateChildDirectoryOverridesRestrictiveUmaskMode(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, durableDirMode); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := os.OpenRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := realDurableOps{durableRoot: osDurableRoot{root: opened}}
+	writer, err := newDurableWriter(root, os.Getuid(), os.Getgid(), &restrictiveMkdirOps{durableOps: base})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	if created, err := writer.CreateChildDirectory("activation", activationSlotDirMode); err != nil || !created {
+		t.Fatalf("created=%t err=%v", created, err)
+	}
+	info, err := os.Lstat(filepath.Join(root, "activation"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != activationSlotDirMode {
+		t.Fatalf("mode=%v", info.Mode())
+	}
+}
+
+func TestCreateChildDirectoryResyncsExactExistingDirectory(t *testing.T) {
+	for _, failure := range []bool{false, true} {
+		name := "success"
+		if failure {
+			name = "parent-sync-failure"
+		}
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			if err := os.Chmod(root, durableDirMode); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(filepath.Join(root, "activation"), activationSlotDirMode); err != nil {
+				t.Fatal(err)
+			}
+			writer, fault := renameHookWriter(t, root)
+			defer writer.Close()
+			if failure {
+				fault.fail = "link-parent-fsync"
+			}
+			created, err := writer.CreateChildDirectory("activation", activationSlotDirMode)
+			if created || fault.syncCalls != 1 {
+				t.Fatalf("created=%t sync_calls=%d err=%v", created, fault.syncCalls, err)
+			}
+			if failure && !errors.Is(err, ErrDurableCommitUnknown) {
+				t.Fatalf("parent sync failure=%v", err)
+			}
+			if !failure && err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestDurableWriterCloseDetachesRootAfterFirstAttempt(t *testing.T) {
 	root := t.TempDir()
 	if err := os.Chmod(root, durableDirMode); err != nil {
@@ -289,6 +355,7 @@ func (f *phaseFaultOps) Sync(file *os.File) error {
 	if (f.fail == "fsync1" && f.syncCalls == 1) ||
 		(f.fail == "fsync2" && f.syncCalls == 2) ||
 		(f.fail == "parent-fsync" && f.syncCalls == 3) ||
+		(f.fail == "directory-parent-fsync" && f.syncCalls == 2) ||
 		(f.fail == "link-parent-fsync" && f.syncCalls == 1) {
 		return errors.New("injected fsync failure")
 	}
