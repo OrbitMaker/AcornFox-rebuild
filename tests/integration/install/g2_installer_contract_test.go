@@ -371,7 +371,7 @@ func TestG2StageUpgradeSubstrateLeavesLegacyRuntimeUntouched(t *testing.T) {
 	if current, err := os.Readlink(filepath.Join(root, "opt/open-card/current")); err != nil || current != "releases/release-0.8.0-rc.0" {
 		t.Fatalf("stage changed current pointer=%q err=%v", current, err)
 	}
-	for _, relative := range []string{"opt/open-card/active", "opt/open-card/previous", "etc/systemd/system/open-card-agent.service", "etc/systemd/system/open-card-edge.service"} {
+	for _, relative := range []string{"opt/open-card/active", "opt/open-card/previous", "var/lib/open-card/bootstrap-transactions", "etc/systemd/system/open-card-agent.service", "etc/systemd/system/open-card-edge.service"} {
 		if _, err := os.Lstat(filepath.Join(root, filepath.FromSlash(relative))); !os.IsNotExist(err) {
 			t.Fatalf("stage unexpectedly created or changed %s: %v", relative, err)
 		}
@@ -402,6 +402,55 @@ func TestG2StageUpgradeSubstrateLeavesLegacyRuntimeUntouched(t *testing.T) {
 	replay := exec.Command("bash", installScript, "--root", root, "--bundle", bundle, "--stage-upgrade-substrate", "--test-safe-prefix", directory)
 	if output, err := replay.CombinedOutput(); err != nil || !strings.Contains(string(output), "staged verified upgrade recovery substrate") {
 		t.Fatalf("stage replay: %v\n%s", err, output)
+	}
+}
+
+func TestG2StageNativeBootstrapPublishesNoPointersOrRuntimeState(t *testing.T) {
+	directory := t.TempDir()
+	bundle := writeG2CandidateBundleVersion(t, directory, true, install.Gate6CandidateVersion)
+	_, sourceFile, _, _ := runtime.Caller(0)
+	repo := filepath.Clean(filepath.Join(filepath.Dir(sourceFile), "..", "..", ".."))
+	installScript := filepath.Join(repo, "scripts", "mvp", "install.sh")
+	root := filepath.Join(directory, "root")
+	command := exec.Command("bash", installScript, "--root", root, "--bundle", bundle, "--stage-native-bootstrap", "--test-safe-prefix", directory)
+	output, err := command.CombinedOutput()
+	if err != nil || !strings.Contains(string(output), "staged verified native bootstrap substrate") {
+		t.Fatalf("stage native bootstrap: %v\n%s", err, output)
+	}
+	for _, relative := range []string{"opt/open-card/active", "opt/open-card/current", "opt/open-card/previous", "opt/open-card/previous-active", "var/lib/open-card/migration.version", "var/lib/open-card/schema.version"} {
+		if _, err := os.Lstat(filepath.Join(root, filepath.FromSlash(relative))); !os.IsNotExist(err) {
+			t.Fatalf("native staging published runtime state %s: %v", relative, err)
+		}
+	}
+	for relative, mode := range map[string]os.FileMode{
+		"opt/open-card/releases/release-0.8.0-rc.2":                          0o755,
+		"opt/open-card/activations":                                          0o711,
+		"var/lib/open-card/bootstrap-transactions":                           0o700,
+		"var/lib/open-card/upgrade-transactions":                             0o700,
+		"opt/open-card/upgrade-tools/open-card-upgrade":                      0o755,
+		"etc/systemd/system/open-card-server.service":                        0o644,
+		"etc/systemd/system/open-card-agent.service":                         0o644,
+		"etc/systemd/system/open-card-buildkit.service":                      0o644,
+		"etc/systemd/system/open-card-caddy.service":                         0o644,
+		"etc/systemd/system/open-card-edge.service":                          0o644,
+		"etc/systemd/system/open-card-upgrade-safe.target":                   0o644,
+		"etc/systemd/system/open-card-edge.service.d/10-upgrade-marker.conf": 0o644,
+	} {
+		info, err := os.Lstat(filepath.Join(root, filepath.FromSlash(relative)))
+		if err != nil || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != mode {
+			t.Fatalf("native stage %s mode=%v err=%v", relative, info.Mode(), err)
+		}
+	}
+	replay := exec.Command("bash", installScript, "--root", root, "--bundle", bundle, "--stage-native-bootstrap", "--test-safe-prefix", directory)
+	if replayOutput, err := replay.CombinedOutput(); err != nil || !strings.Contains(string(replayOutput), "staged verified native bootstrap substrate") {
+		t.Fatalf("native staging replay: %v\n%s", err, replayOutput)
+	}
+	if err := os.Symlink("activations/foreign", filepath.Join(root, "opt/open-card/active")); err != nil {
+		t.Fatal(err)
+	}
+	foreign := exec.Command("bash", installScript, "--root", root, "--bundle", bundle, "--stage-native-bootstrap", "--test-safe-prefix", directory)
+	if foreignOutput, err := foreign.CombinedOutput(); err == nil || !strings.Contains(string(foreignOutput), "existing production activation requires upgrade.sh") {
+		t.Fatalf("native staging accepted foreign activation: %v\n%s", err, foreignOutput)
 	}
 }
 
@@ -511,8 +560,23 @@ func TestG2ActivationIntentValidationRejectsFreshRC1WithoutMutation(t *testing.T
 	repo := filepath.Clean(filepath.Join(filepath.Dir(sourceFile), "..", "..", ".."))
 	root := filepath.Join(directory, "root")
 	command := exec.Command("bash", filepath.Join(repo, "scripts", "mvp", "install.sh"), "--root", root, "--bundle", bundle, "--dry-run", "--validate-activation-intent", "--test-safe-prefix", directory)
-	if output, err := command.CombinedOutput(); err == nil || !strings.Contains(string(output), "requires native bootstrap activation support") {
+	if output, err := command.CombinedOutput(); err == nil || !strings.Contains(string(output), "not the native bootstrap candidate") {
 		t.Fatalf("fresh RC1 activation intent was accepted: %v\n%s", err, output)
+	}
+	if _, err := os.Lstat(root); !os.IsNotExist(err) {
+		t.Fatalf("activation intent validation created task root: %v", err)
+	}
+}
+
+func TestG2ActivationIntentValidationAcceptsFreshRC2WithoutMutation(t *testing.T) {
+	directory := t.TempDir()
+	bundle := writeG2CandidateBundleVersion(t, directory, true, install.Gate6CandidateVersion)
+	_, sourceFile, _, _ := runtime.Caller(0)
+	repo := filepath.Clean(filepath.Join(filepath.Dir(sourceFile), "..", "..", ".."))
+	root := filepath.Join(directory, "root")
+	command := exec.Command("bash", filepath.Join(repo, "scripts", "mvp", "install.sh"), "--root", root, "--bundle", bundle, "--dry-run", "--validate-activation-intent", "--test-safe-prefix", directory)
+	if output, err := command.CombinedOutput(); err != nil || !strings.Contains(string(output), "would stage verified native bootstrap release") {
+		t.Fatalf("fresh RC2 activation intent: %v\n%s", err, output)
 	}
 	if _, err := os.Lstat(root); !os.IsNotExist(err) {
 		t.Fatalf("activation intent validation created task root: %v", err)

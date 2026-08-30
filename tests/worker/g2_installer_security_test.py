@@ -48,12 +48,16 @@ class InstallerSecurityContractTests(unittest.TestCase):
         self.assertIn("systemd/open-card-upgrade-finalize.service", text)
         self.assertIn("systemd/open-card-edge.service.d/10-upgrade-marker.conf", text)
         self.assertIn("--stage-upgrade-substrate", text)
+        self.assertIn("--stage-native-bootstrap", text)
         self.assertIn("prepare_upgrade_substrate", text)
-        for unit in ("open-card-upgrade-recover.service", "open-card-upgrade-safe.target", "open-card-upgrade-finalize.service"):
+        for unit in ("open-card-upgrade-recover.service", "open-card-upgrade-finalize.service"):
             self.assertNotIn(f"enable {unit}", text)
             self.assertNotIn(f"start {unit}", text)
         self.assertIn("existing production installation requires upgrade.sh or --stage-upgrade-substrate", text)
-        self.assertIn("$version system-root activation requires native bootstrap activation support", text)
+        self.assertIn("$version system-root activation is not supported by native bootstrap", text)
+        self.assertIn("$version system-root activation requires --stage-native-bootstrap and bootstrap-native", text)
+        self.assertIn('prepare_upgrade_layout_directory "$data_dir/bootstrap-transactions" "$expected_owner" 700', text)
+        self.assertIn("systemctl enable open-card-upgrade-safe.target open-card-server.service open-card-agent.service open-card-buildkit.service open-card-caddy.service open-card-edge.service", text)
         self.assertIn("durability outcome is unknown", text)
         self.assertIn("E/F boot-safe activation gate", text)
         self.assertIn('candidate_version + " production candidate must declare source and migration 0024"', text)

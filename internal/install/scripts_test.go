@@ -418,10 +418,13 @@ func TestG5BRecoverySubstrateStaysStageOnlyAndBootDisabled(t *testing.T) {
 	host := string(hostBytes)
 	for _, required := range []string{
 		"--stage-upgrade-substrate",
+		"--stage-native-bootstrap",
 		"--validate-activation-intent",
 		"prepare_upgrade_substrate",
 		"existing production installation requires upgrade.sh or --stage-upgrade-substrate",
-		"$version system-root activation requires native bootstrap activation support",
+		"$version system-root activation is not supported by native bootstrap",
+		"prepare_upgrade_layout_directory \"$data_dir/bootstrap-transactions\" \"$expected_owner\" 700",
+		"systemctl enable open-card-upgrade-safe.target open-card-server.service open-card-agent.service open-card-buildkit.service open-card-caddy.service open-card-edge.service",
 		"durable_sync_file_and_parent",
 		"durable_sync_directory_and_parent",
 		"prepare_upgrade_data_root",
@@ -439,14 +442,14 @@ func TestG5BRecoverySubstrateStaysStageOnlyAndBootDisabled(t *testing.T) {
 			t.Fatalf("install substrate contract is missing %q", required)
 		}
 	}
-	for _, unit := range []string{"open-card-upgrade-recover.service", "open-card-upgrade-safe.target", "open-card-upgrade-finalize.service"} {
+	for _, unit := range []string{"open-card-upgrade-recover.service", "open-card-upgrade-finalize.service"} {
 		if strings.Contains(install, "enable "+unit) || strings.Contains(install, "start "+unit) {
 			t.Fatalf("installer enables or starts %s before the boot-safe gate", unit)
 		}
 	}
-	stage := strings.Index(install, "if (( stage_upgrade_substrate )); then\n  if (( dry_run ))")
+	stage := strings.Index(install, "if (( stage_upgrade_substrate || stage_native_bootstrap )); then\n  if (( dry_run ))")
 	units := strings.Index(install, "units=(open-card-server.service")
-	stageExit := strings.Index(install, "say \"staged verified upgrade recovery substrate for $release_name\"\n  exit 0")
+	stageExit := strings.Index(install, "say \"staged verified upgrade recovery substrate for $release_name\"\n    exit 0")
 	releaseBranch := strings.Index(install, "if [[ -d \"$release_dir\" ]]")
 	runtimeModes := strings.Index(install, "chmod 0755 \"$prefix\" \"$releases\" \"$release_dir\"")
 	if stage < 0 || units < 0 || stageExit < stage || stageExit > units {

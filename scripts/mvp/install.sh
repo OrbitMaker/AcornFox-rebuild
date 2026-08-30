@@ -8,6 +8,7 @@ usage: install.sh --root TASK_ROOT --bundle BUNDLE [--url URL] [--offline]
                   [--migration-dir DIRECTORY] [--allow-downgrade]
                   [--expected-manifest-sha256 HEX]
                   [--test-safe-prefix PATH] [--activate] [--stage-upgrade-substrate]
+                  [--stage-native-bootstrap]
                   [--validate-activation-intent] [--dry-run]
 
 `--root /` requires root plus either the legacy clean-worker gate or
@@ -20,7 +21,7 @@ die() { echo "open-card install: $*" >&2; exit 1; }
 say() { echo "open-card install: $*"; }
 
 root= bundle= bundle_url= health_command= migration_command= migration_dir= expected_manifest_sha256= safe_prefix= required_version=
-offline=0 dry_run=0 activate=0 stage_upgrade_substrate=0 validate_activation_intent=0 allow_downgrade=0
+offline=0 dry_run=0 activate=0 stage_upgrade_substrate=0 stage_native_bootstrap=0 validate_activation_intent=0 allow_downgrade=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --root) [[ $# -gt 1 ]] || die "--root requires a value"; root=$2; shift 2 ;;
@@ -35,6 +36,7 @@ while [[ $# -gt 0 ]]; do
     --test-safe-prefix) [[ $# -gt 1 ]] || die "--test-safe-prefix requires a value"; safe_prefix=$2; shift 2 ;;
     --activate) activate=1; shift ;;
     --stage-upgrade-substrate) stage_upgrade_substrate=1; shift ;;
+    --stage-native-bootstrap) stage_native_bootstrap=1; shift ;;
     --validate-activation-intent) validate_activation_intent=1; shift ;;
     --offline) offline=1; shift ;;
     --dry-run) dry_run=1; shift ;;
@@ -70,7 +72,7 @@ if [[ "$root" = "/" ]]; then
   else
     die "--root / requires clean-worker authorization or OPEN_CARD_INSTALL_CONFIRMATION=OPEN-CARD-INSTALL"
   fi
-  if (( production_root && ! activate && ! dry_run && ! stage_upgrade_substrate )); then
+  if (( production_root && ! activate && ! dry_run && ! stage_upgrade_substrate && ! stage_native_bootstrap )); then
     die "production system-root install requires --activate"
   fi
   if (( production_root )) && [[ "${OPEN_CARD_M6_ENABLED:-false}" = "true" || "${OPEN_CARD_AI_ENABLED:-false}" = "true" ]]; then
@@ -84,14 +86,15 @@ else
   [[ "$root" != "$HOME" && "$root" != "$HOME"/* ]] || die "refusing HOME or a path below HOME"
   (( ! activate )) || die "--activate requires --root / and clean-worker authorization"
 fi
-if (( stage_upgrade_substrate )); then
-  (( ! activate )) || die "--stage-upgrade-substrate cannot be combined with --activate"
-  [[ -z "$health_command" && -z "$migration_command" && -z "$migration_dir" ]] || die "--stage-upgrade-substrate refuses health and migration commands"
-  (( ! allow_downgrade )) || die "--stage-upgrade-substrate refuses --allow-downgrade"
+if (( stage_upgrade_substrate || stage_native_bootstrap )); then
+  (( ! activate )) || die "staging mode cannot be combined with --activate"
+  [[ -z "$health_command" && -z "$migration_command" && -z "$migration_dir" ]] || die "staging mode refuses health and migration commands"
+  (( ! allow_downgrade )) || die "staging mode refuses --allow-downgrade"
+  (( !(stage_upgrade_substrate && stage_native_bootstrap) )) || die "choose one staging mode"
 fi
 if (( validate_activation_intent )); then
   (( dry_run )) || die "--validate-activation-intent requires --dry-run"
-  (( ! stage_upgrade_substrate && ! activate )) || die "--validate-activation-intent is a preflight-only flag"
+  (( ! stage_upgrade_substrate && ! stage_native_bootstrap && ! activate )) || die "--validate-activation-intent is a preflight-only flag"
 fi
 if [[ -n "$safe_prefix" ]]; then
   [[ "$safe_prefix" = /* && "$safe_prefix" != "/" ]] || die "--test-safe-prefix must be absolute and non-root"
@@ -580,16 +583,23 @@ installation_id="$data_dir/installation-id"
 if (( stage_upgrade_substrate )) && [[ "$version" != "0.8.0-rc.1" && "$version" != "0.8.0-rc.2" ]]; then
   die "--stage-upgrade-substrate requires an RC1 or RC2 production candidate"
 fi
-if (( validate_activation_intent )) && [[ "$version" = "0.8.0-rc.1" || "$version" = "0.8.0-rc.2" ]]; then
-  die "$version system-root activation requires native bootstrap activation support"
+if (( stage_native_bootstrap )) && [[ "$version" != "0.8.0-rc.2" ]]; then
+  die "--stage-native-bootstrap requires the RC2 production candidate"
 fi
-if (( system_root && ! stage_upgrade_substrate )); then
+if (( validate_activation_intent )) && [[ "$version" != "0.8.0-rc.2" ]]; then
+  die "$version system-root activation is not the native bootstrap candidate"
+fi
+if (( system_root && ! stage_upgrade_substrate && ! stage_native_bootstrap )); then
   if [[ -e "$current" || -L "$current" || -e "$installation_id" || -L "$installation_id" ]]; then
     die "existing production installation requires upgrade.sh or --stage-upgrade-substrate"
   fi
-  if [[ ( "$version" = "0.8.0-rc.1" || "$version" = "0.8.0-rc.2" ) && $activate -eq 1 ]]; then
-    die "$version system-root activation requires native bootstrap activation support"
-  fi
+  if [[ "$version" = "0.8.0-rc.1" && $activate -eq 1 ]]; then die "$version system-root activation is not supported by native bootstrap"; fi
+  if [[ "$version" = "0.8.0-rc.2" && $activate -eq 1 ]]; then die "$version system-root activation requires --stage-native-bootstrap and bootstrap-native"; fi
+fi
+if (( stage_native_bootstrap )); then
+  for native_existing in "$prefix/active" "$prefix/current" "$prefix/previous" "$prefix/previous-active"; do
+    [[ ! -e "$native_existing" && ! -L "$native_existing" ]] || die "existing production activation requires upgrade.sh"
+  done
 fi
 manifest_migration_version=$(python3 - "$manifest" <<'PY'
 import json, sys
@@ -669,7 +679,7 @@ else
     verify_release "$bundle_dir"
     say "would create release $release_name"
   else
-    if (( stage_upgrade_substrate )); then
+    if (( stage_upgrade_substrate || stage_native_bootstrap )); then
       mkdir -p -- "$releases" "$data_dir"
     else
       mkdir -p -- "$releases" "$config_dir" "$data_dir" "$backups" "$evidence"
@@ -690,21 +700,27 @@ if (( ! dry_run )); then
   chmod 0755 "$prefix" "$releases" "$release_dir"
 fi
 
-if (( stage_upgrade_substrate )); then
+if (( stage_upgrade_substrate || stage_native_bootstrap )); then
   if (( dry_run )); then
-    say "would stage verified upgrade recovery substrate for $release_name"
+    if (( stage_native_bootstrap )); then say "would stage verified native bootstrap substrate for $release_name without starting services"
+    else say "would stage verified upgrade recovery substrate for $release_name"; fi
     exit 0
   fi
   expected_owner=$(id -u)
   prepare_upgrade_substrate "$expected_owner"
+  if (( stage_native_bootstrap )); then
+    prepare_upgrade_layout_directory "$data_dir/bootstrap-transactions" "$expected_owner" 700
+  fi
   if (( system_root )); then
     command -v systemctl >/dev/null 2>&1 || die "systemctl is required for system-root upgrade substrate staging"
     systemctl daemon-reload
   fi
-  # The recovery unit stays disabled until the E/F boot-safe activation gate
-  # owns CLI enablement and crash/reboot evidence. Staging must not start it.
-  say "staged verified upgrade recovery substrate for $release_name"
-  exit 0
+  if (( stage_upgrade_substrate )); then
+    # The recovery unit stays disabled until the E/F boot-safe activation gate
+    # owns CLI enablement and crash/reboot evidence. Staging must not start it.
+    say "staged verified upgrade recovery substrate for $release_name"
+    exit 0
+  fi
 fi
 
 if (( ! dry_run )); then
@@ -734,9 +750,28 @@ if (( ! dry_run )); then
   fi
   for unit in "${units[@]}"; do
     [[ -f "$bundle_dir/systemd/$unit" && ! -L "$bundle_dir/systemd/$unit" ]] || die "bundle is missing $unit"
-    cp -f -- "$bundle_dir/systemd/$unit" "$systemd_dir/$unit"
-    chmod 0644 "$systemd_dir/$unit"
+    if (( stage_native_bootstrap )); then
+      install_stable_file "$release_dir/systemd/$unit" "$systemd_dir/$unit" "$(id -u)" 644 "native bootstrap $unit"
+    else
+      cp -f -- "$bundle_dir/systemd/$unit" "$systemd_dir/$unit"
+      chmod 0644 "$systemd_dir/$unit"
+    fi
   done
+fi
+
+if (( validate_activation_intent )); then
+  say "would stage verified native bootstrap release $release_name without publishing current or starting services"
+  exit 0
+fi
+
+if (( stage_native_bootstrap )); then
+  if (( system_root )); then
+    command -v systemctl >/dev/null 2>&1 || die "systemctl is required for native bootstrap staging"
+    systemctl daemon-reload
+    systemctl enable open-card-upgrade-safe.target open-card-server.service open-card-agent.service open-card-buildkit.service open-card-caddy.service open-card-edge.service
+  fi
+  say "staged verified native bootstrap substrate for $release_name"
+  exit 0
 fi
 
 old_release=
