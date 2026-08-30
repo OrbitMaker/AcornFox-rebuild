@@ -28,6 +28,12 @@ var ErrCandidateConflict = errors.New("candidate database conflicts with existin
 
 const WaitForNoOpenCardSessionsSQL = `SELECT count(*) FROM pg_stat_activity WHERE datname LIKE 'open_card%' AND pid <> pg_backend_pid() AND application_name <> 'open-card-admin'`
 
+const (
+	productionPostgresPSQLTool    = "/usr/lib/postgresql/16/bin/psql"
+	productionPostgresDumpTool    = "/usr/lib/postgresql/16/bin/pg_dump"
+	productionPostgresRestoreTool = "/usr/lib/postgresql/16/bin/pg_restore"
+)
+
 type PostgresDescriptor struct{ Host, Port, Database, SSLMode string }
 type PostgresProcessEnvironment struct {
 	ChildEnv   []string
@@ -624,7 +630,7 @@ func WaitForNoOpenCardSessions(ctx context.Context, c SessionCounter, interval t
 	}
 }
 func ProductionPostgresSnapshotter() (*PostgresSnapshotter, error) {
-	return newSnapshotter("/usr/bin/pg_dump", "/usr/bin/pg_restore", nil, true)
+	return newSnapshotter(productionPostgresDumpTool, productionPostgresRestoreTool, nil, true)
 }
 func TaskPostgresSnapshotter(tool string, r PostgresRunner) (*PostgresSnapshotter, error) {
 	return newSnapshotter(tool, "", r, false)
@@ -633,26 +639,26 @@ func TaskPostgresSnapshotterWithRestore(dumpTool, restoreTool string, r Postgres
 	return newSnapshotter(dumpTool, restoreTool, r, false)
 }
 func newSnapshotter(tool, restoreTool string, r PostgresRunner, prod bool) (*PostgresSnapshotter, error) {
-	i, e := os.Lstat(tool)
+	var i os.FileInfo
+	var e error
+	if prod {
+		i, e = safeProductionExecutable(tool)
+	} else {
+		i, e = os.Lstat(tool)
+	}
 	if e != nil || !i.Mode().IsRegular() || i.Mode()&os.ModeSymlink != 0 || i.Mode().Perm()&0o022 != 0 {
 		return nil, errors.New("pg_dump tool is unsafe")
 	}
-	if prod {
-		st, ok := i.Sys().(*syscall.Stat_t)
-		if !ok || st.Uid != 0 {
-			return nil, errors.New("pg_dump tool is unsafe")
-		}
-	}
 	if restoreTool != "" {
-		ri, re := os.Lstat(restoreTool)
+		var ri os.FileInfo
+		var re error
+		if prod {
+			ri, re = safeProductionExecutable(restoreTool)
+		} else {
+			ri, re = os.Lstat(restoreTool)
+		}
 		if re != nil || !ri.Mode().IsRegular() || ri.Mode()&os.ModeSymlink != 0 || ri.Mode().Perm()&0o022 != 0 {
 			return nil, errors.New("pg_restore tool is unsafe")
-		}
-		if prod {
-			st, ok := ri.Sys().(*syscall.Stat_t)
-			if !ok || st.Uid != 0 {
-				return nil, errors.New("pg_restore tool is unsafe")
-			}
 		}
 	}
 	if !prod && r == nil {

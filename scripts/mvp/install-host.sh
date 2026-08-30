@@ -368,6 +368,9 @@ SQL
   export DATABASE_URL="$database_url"
 fi
 for command_name in docker psql runuser newuidmap newgidmap; do require_command "$command_name"; done
+for command_path in /usr/lib/postgresql/16/bin/psql /usr/lib/postgresql/16/bin/pg_dump /usr/lib/postgresql/16/bin/pg_restore; do
+  [[ -x "$command_path" && ! -L "$command_path" ]] || die "required PostgreSQL 16 tool is missing or unsafe: $command_path"
+done
 
 "${installer[@]}"
 installation_id=/var/lib/open-card/installation-id

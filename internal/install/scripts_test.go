@@ -466,6 +466,11 @@ func TestG5BRecoverySubstrateStaysStageOnlyAndBootDisabled(t *testing.T) {
 			t.Fatalf("host installer does not enforce rootless uidmap prerequisite %q", required)
 		}
 	}
+	for _, required := range []string{"/usr/lib/postgresql/16/bin/psql", "/usr/lib/postgresql/16/bin/pg_dump", "/usr/lib/postgresql/16/bin/pg_restore"} {
+		if !strings.Contains(host, required) {
+			t.Fatalf("host installer does not pin PostgreSQL 16 tool %q", required)
+		}
+	}
 	skipBranch := strings.Index(host, "if (( ! skip_prerequisites )); then")
 	runtimeVerification := strings.LastIndex(host, "for command_name in docker psql runuser newuidmap newgidmap")
 	installerCall := strings.Index(host, "\"$"+"{installer[@]}\"")

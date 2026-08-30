@@ -10,7 +10,6 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 )
 
@@ -19,7 +18,7 @@ const (
 	upgradeControlRuntimeRole     = "opencard"
 	upgradeControlRole            = "open_card_upgrade_control"
 	upgradeControlRunuser         = "/usr/sbin/runuser"
-	upgradeControlPSQL            = "/usr/bin/psql"
+	upgradeControlPSQL            = productionPostgresPSQLTool
 )
 
 // ErrUpgradeControlProvisioning is deliberately generic.  Provisioning must
@@ -265,11 +264,7 @@ func verifyUpgradeControlSecureDirectory(path string) error {
 }
 
 func verifyUpgradeControlTool(path string) error {
-	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
-		return ErrUpgradeControlProvisioning
-	}
-	info, err := os.Lstat(path)
-	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm()&0o022 != 0 || verifyOwner(info, 0, 0) != nil {
+	if _, err := safeProductionExecutable(path); err != nil {
 		return ErrUpgradeControlProvisioning
 	}
 	return nil

@@ -103,6 +103,14 @@ func TestUpgradeControlProvisionCreatesFileBeforeFixedRoleSQLAndReplays(t *testi
 	}
 }
 
+func TestProductionPostgresToolsUseUbuntuVersionedRegularPaths(t *testing.T) {
+	if upgradeControlPSQL != "/usr/lib/postgresql/16/bin/psql" ||
+		productionPostgresDumpTool != "/usr/lib/postgresql/16/bin/pg_dump" ||
+		productionPostgresRestoreTool != "/usr/lib/postgresql/16/bin/pg_restore" {
+		t.Fatal("production PostgreSQL tools are not pinned to Ubuntu 24.04 regular binaries")
+	}
+}
+
 func TestUpgradeControlConcurrentFirstProvisionUsesOneDurableWinner(t *testing.T) {
 	root := t.TempDir()
 	if err := os.Chmod(root, durableDirMode); err != nil {
