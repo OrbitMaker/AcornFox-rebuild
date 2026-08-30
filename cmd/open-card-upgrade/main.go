@@ -91,6 +91,7 @@ type upgradeDependencies struct {
 // alternate production path in the shipped parser.
 type productionRuntimeDependencies struct {
 	verifyExecutable           func() error
+	verifyBootArtifacts        func(context.Context, bool) error
 	verifyRecoveryUnit         func() error
 	verifyRecoveryServiceState func(context.Context) error
 	openStore                  func() (upgradeRuntimeStore, error)
@@ -98,6 +99,31 @@ type productionRuntimeDependencies struct {
 	openBackupInspector        func() (install.UpgradeBackupInspector, func() error, error)
 	databaseFactory            install.UpgradeDatabaseFactory
 	now                        func() time.Time
+}
+
+var (
+	errBootRuntimeConfiguration  = errors.New("boot runtime configuration unavailable")
+	errBootArtifactsUnavailable  = errors.New("boot artifacts unavailable")
+	errBootExecutableUnavailable = errors.New("boot executable unavailable")
+	errBootStoreUnavailable      = errors.New("boot store unavailable")
+	errBootServiceUnavailable    = errors.New("boot service unavailable")
+)
+
+func runtimeConstructionErrorCode(err error) string {
+	switch {
+	case errors.Is(err, errBootRuntimeConfiguration):
+		return "boot_runtime_configuration_unavailable"
+	case errors.Is(err, errBootArtifactsUnavailable):
+		return "boot_artifacts_unavailable"
+	case errors.Is(err, errBootExecutableUnavailable):
+		return "boot_executable_unavailable"
+	case errors.Is(err, errBootStoreUnavailable):
+		return "boot_store_unavailable"
+	case errors.Is(err, errBootServiceUnavailable):
+		return "boot_service_unavailable"
+	default:
+		return "runtime_unavailable"
+	}
 }
 
 type upgradeRuntimeStore struct {
@@ -142,18 +168,27 @@ func newProductionFinalizeRuntime(ctx context.Context) (upgradeRuntime, error) {
 }
 
 func newProductionBootRuntime(ctx context.Context, finalize bool) (upgradeRuntime, error) {
-	deps := productionRuntimeDeps()
-	if deps.verifyExecutable == nil || deps.openStore == nil || deps.openService == nil || deps.databaseFactory == nil || deps.now == nil || verifyProductionBootArtifacts(ctx, finalize) != nil || deps.verifyExecutable() != nil {
-		return upgradeRuntime{}, errors.New("invalid production boot runtime")
+	return newProductionBootRuntimeWithDependencies(ctx, finalize, productionRuntimeDeps())
+}
+
+func newProductionBootRuntimeWithDependencies(ctx context.Context, finalize bool, deps productionRuntimeDependencies) (upgradeRuntime, error) {
+	if deps.verifyExecutable == nil || deps.verifyBootArtifacts == nil || deps.openStore == nil || deps.openService == nil || deps.databaseFactory == nil || deps.now == nil {
+		return upgradeRuntime{}, errBootRuntimeConfiguration
+	}
+	if deps.verifyBootArtifacts(ctx, finalize) != nil {
+		return upgradeRuntime{}, errBootArtifactsUnavailable
+	}
+	if deps.verifyExecutable() != nil {
+		return upgradeRuntime{}, errBootExecutableUnavailable
 	}
 	store, err := deps.openStore()
 	if err != nil || store.store == nil || store.close == nil || store.pending == nil {
-		return upgradeRuntime{}, errors.New("open upgrade store failed")
+		return upgradeRuntime{}, errBootStoreUnavailable
 	}
 	services, closeServices, err := deps.openService()
 	if err != nil || services == nil || closeServices == nil {
 		_ = store.close()
-		return upgradeRuntime{}, errors.New("open upgrade service failed")
+		return upgradeRuntime{}, errBootServiceUnavailable
 	}
 	engine := &install.UpgradeEngine{Store: store.store, DatabaseFactory: deps.databaseFactory, Now: deps.now}
 	runtime := upgradeRuntime{pending: store.pending, close: func() error {
@@ -227,7 +262,7 @@ func runWithDependenciesCore(ctx context.Context, args []string, stdout, stderr 
 	}
 	runtime, err := constructor(ctx)
 	if err != nil {
-		return writeUpgradeError(stderr, exitInternal, "runtime_unavailable")
+		return writeUpgradeError(stderr, exitInternal, runtimeConstructionErrorCode(err))
 	}
 	if runtime.close != nil {
 		defer func() {
@@ -615,6 +650,7 @@ func newProductionRuntime(ctx context.Context) (upgradeRuntime, error) {
 func productionRuntimeDeps() productionRuntimeDependencies {
 	return productionRuntimeDependencies{
 		verifyExecutable:           func() error { return verifyProductionUpgradeExecutable(productionUpgradeExecutable) },
+		verifyBootArtifacts:        verifyProductionBootArtifacts,
 		verifyRecoveryUnit:         func() error { return verifyProductionRecoveryUnit(productionUpgradeRecoveryUnit) },
 		verifyRecoveryServiceState: verifyProductionRecoveryServiceState,
 		openStore: func() (upgradeRuntimeStore, error) {

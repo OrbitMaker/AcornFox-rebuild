@@ -206,6 +206,72 @@ func TestPrepareControlIsRootOnlyAndDoesNotConstructRuntime(t *testing.T) {
 	}
 }
 
+func TestBootRuntimeConstructionErrorsAreStageSpecificAndRedacted(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		code string
+	}{
+		{errBootRuntimeConfiguration, "boot_runtime_configuration_unavailable"},
+		{errBootArtifactsUnavailable, "boot_artifacts_unavailable"},
+		{errBootExecutableUnavailable, "boot_executable_unavailable"},
+		{errBootStoreUnavailable, "boot_store_unavailable"},
+		{errBootServiceUnavailable, "boot_service_unavailable"},
+	} {
+		var stdout, stderr bytes.Buffer
+		deps := testDependencies(upgradeRuntime{})
+		deps.newPrepareRuntime = func(context.Context) (upgradeRuntime, error) {
+			return upgradeRuntime{}, errors.Join(tc.err, errors.New("postgresql://secret@invalid"))
+		}
+		if got := runWithDependencies(context.Background(), []string{"recover-prepare", "--pending"}, &stdout, &stderr, deps); got != exitInternal || !strings.Contains(stderr.String(), tc.code) || strings.Contains(stderr.String(), "secret") || stdout.Len() != 0 {
+			t.Fatalf("err=%v exit=%d out=%q stderr=%q", tc.err, got, stdout.String(), stderr.String())
+		}
+	}
+}
+
+func TestProductionBootRuntimeClassifiesConstructorStage(t *testing.T) {
+	valid := func() productionRuntimeDependencies {
+		return productionRuntimeDependencies{
+			verifyExecutable:    func() error { return nil },
+			verifyBootArtifacts: func(context.Context, bool) error { return nil },
+			openStore: func() (upgradeRuntimeStore, error) {
+				return upgradeRuntimeStore{store: &cliStoreFake{}, pending: func(context.Context) (install.PendingTransaction, error) { return install.PendingTransaction{}, nil }, close: func() error { return nil }}, nil
+			},
+			openService: func() (install.UpgradeServiceDriver, func() error, error) {
+				return &cliServiceFake{}, func() error { return nil }, nil
+			},
+			databaseFactory: install.NewProductionUpgradeDatabaseFactory(),
+			now:             func() time.Time { return time.Unix(1, 0).UTC() },
+		}
+	}
+	for _, tc := range []struct {
+		name   string
+		mutate func(*productionRuntimeDependencies)
+		want   error
+	}{
+		{"configuration", func(deps *productionRuntimeDependencies) { deps.verifyBootArtifacts = nil }, errBootRuntimeConfiguration},
+		{"artifacts", func(deps *productionRuntimeDependencies) {
+			deps.verifyBootArtifacts = func(context.Context, bool) error { return errors.New("unsafe") }
+		}, errBootArtifactsUnavailable},
+		{"executable", func(deps *productionRuntimeDependencies) {
+			deps.verifyExecutable = func() error { return errors.New("unsafe") }
+		}, errBootExecutableUnavailable},
+		{"store", func(deps *productionRuntimeDependencies) {
+			deps.openStore = func() (upgradeRuntimeStore, error) { return upgradeRuntimeStore{}, errors.New("unavailable") }
+		}, errBootStoreUnavailable},
+		{"service", func(deps *productionRuntimeDependencies) {
+			deps.openService = func() (install.UpgradeServiceDriver, func() error, error) { return nil, nil, errors.New("unavailable") }
+		}, errBootServiceUnavailable},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			deps := valid()
+			tc.mutate(&deps)
+			if _, err := newProductionBootRuntimeWithDependencies(context.Background(), false, deps); !errors.Is(err, tc.want) {
+				t.Fatalf("error=%v want=%v", err, tc.want)
+			}
+		})
+	}
+}
+
 func TestBootCommandsUseOnlyAtomicPendingPrepareAndRedactErrors(t *testing.T) {
 	for _, tc := range []struct{ command string }{{"recover-prepare"}, {"recover-finalize"}} {
 		t.Run(tc.command, func(t *testing.T) {
