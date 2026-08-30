@@ -41,6 +41,18 @@ BINARIES = (
     "open-card-admin",
     "open-card-upgrade",
 )
+RC0_BINARIES = tuple(binary for binary in BINARIES if binary != "open-card-upgrade")
+
+
+def release_binaries(version: str) -> tuple[str, ...]:
+    """Return the exact executable payload available for one release line."""
+    if version == "0.8.0-rc.0":
+        return RC0_BINARIES
+    if version == "0.8.0-rc.1":
+        return BINARIES
+    raise ProductionBundleError("unsupported release version")
+
+
 RUNTIME = (
     "buildkitd",
     "buildctl",
@@ -55,12 +67,14 @@ RC0_UNITS = (
     "open-card-buildkit.service",
     "open-card-caddy.service",
     "open-card-edge.service",
-    "open-card-upgrade-recover.service",
 )
-UNITS = (*RC0_UNITS,
+RC1_UNITS = (
+    *RC0_UNITS,
+    "open-card-upgrade-recover.service",
     "open-card-upgrade-safe.target",
     "open-card-upgrade-finalize.service",
 )
+UNITS = RC1_UNITS
 UNIT_DROP_INS = (
     "open-card-edge.service.d/10-upgrade-marker.conf",
 )
@@ -643,6 +657,7 @@ def assemble(
         raise ProductionBundleError("refusing to overwrite production bundle output")
 
     systemd_payload = systemd_files(version)
+    binaries = release_binaries(version)
     tracked = verify_repo(repo, source_commit, migration_version)
     if not needs_n_minus_one and (
         n_minus_one_release is not None or n_minus_one_manifest_sha256 is not None or n_minus_one_archive_sha256 is not None or n_minus_one_bundle_manifest_sha256 is not None
@@ -690,7 +705,7 @@ def assemble(
             )
 
         stage_snapshot = inputs / "stage"
-        for binary in BINARIES:
+        for binary in binaries:
             copy_file(
                 stage / "binaries" / arch / binary,
                 stage_snapshot / "binaries" / arch / binary,
@@ -735,7 +750,7 @@ def assemble(
         ) as build_root:
             release = build_root / "release"
             release.mkdir(mode=0o755)
-            for binary in BINARIES:
+            for binary in binaries:
                 copy_file(
                     stage_snapshot / "binaries" / arch / binary,
                     release / "bin" / binary,
@@ -900,7 +915,7 @@ def assemble(
                         "public_domain_verified": False,
                         "attestation_sha256": live_attestation_digest,
                     },
-                    "production_binaries": list(BINARIES),
+                    "production_binaries": list(binaries),
                     "excluded": [
                         "open-card-caddy-fixture",
                         "integration test binaries",

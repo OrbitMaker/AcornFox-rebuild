@@ -24,9 +24,11 @@ def load_tool():
     return module
 
 
-def minimal_repo(root: Path, migration_version: str) -> tuple[Path, str]:
+def minimal_repo(
+    root: Path, migration_version: str, *, include_rc1_units: bool = True
+) -> tuple[Path, str]:
     repo = root / "repo"
-    for path, content in {
+    files = {
         "go.mod": "module example.test/open-card\ngo 1.25\n",
         "go.sum": "",
         "api/openapi/openapi.yaml": "openapi: 3.0.3\ninfo: {title: x, version: x}\npaths: {}\n",
@@ -45,7 +47,16 @@ def minimal_repo(root: Path, migration_version: str) -> tuple[Path, str]:
         "deploy/caddy/open-card-edge.env.example": "# env\n",
         "docs/licenses/licenses-manifest.json": "{}\n",
         "web/dist/index.html": "<!doctype html>\n",
-    }.items():
+    }
+    if not include_rc1_units:
+        for path in (
+            "deploy/systemd/open-card-upgrade-recover.service",
+            "deploy/systemd/open-card-upgrade-safe.target",
+            "deploy/systemd/open-card-upgrade-finalize.service",
+            "deploy/systemd/open-card-edge.service.d/10-upgrade-marker.conf",
+        ):
+            del files[path]
+    for path, content in files.items():
         target = repo / path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
@@ -93,10 +104,17 @@ class ProductionBundleTests(unittest.TestCase):
     def attestation_digest(self, attestation: Path) -> str:
         return hashlib.sha256(attestation.read_bytes()).hexdigest()
 
-    def stage(self, root: Path, arch: str = "amd64") -> Path:
+    def stage(
+        self,
+        root: Path,
+        arch: str = "amd64",
+        binaries: tuple[str, ...] | None = None,
+    ) -> Path:
         stage = root / "stage"
-        for name in (*load_tool().BINARIES, *load_tool().RUNTIME):
-            path = stage / "binaries" / arch / name if name in load_tool().BINARIES else stage / "runtime" / arch / name
+        tool = load_tool()
+        selected_binaries = tool.BINARIES if binaries is None else binaries
+        for name in (*selected_binaries, *tool.RUNTIME):
+            path = stage / "binaries" / arch / name if name in selected_binaries else stage / "runtime" / arch / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(name.encode())
             path.chmod(0o755)
@@ -171,13 +189,13 @@ class ProductionBundleTests(unittest.TestCase):
         self.assertIn("--arch {amd64,arm64}", help_result.stdout)
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
-            repo, commit = minimal_repo(root, "0023")
+            repo, commit = minimal_repo(root, "0023", include_rc1_units=False)
             dist = root / "dist"
             dist.mkdir()
             (dist / "index.html").write_text("x", encoding="utf-8")
             output = root / "arm64-rc0"
             metadata = tool.assemble(
-                self.stage(root, "arm64"),
+                self.stage(root, "arm64", tool.release_binaries("0.8.0-rc.0")),
                 repo,
                 output,
                 "arm64",
@@ -190,6 +208,10 @@ class ProductionBundleTests(unittest.TestCase):
                 structure_only=True,
             )
             self.assertEqual(metadata["candidate_status"], "bootstrap_baseline")
+            self.assertFalse((output / "release/bin/open-card-upgrade").exists())
+            self.assertFalse(
+                (output / "release/systemd/open-card-upgrade-recover.service").exists()
+            )
             self.assertTrue((output / "STRUCTURE-ONLY-NOT-INSTALLABLE").is_file())
             blocked = root / "arm64-rc1"
             with self.assertRaisesRegex(
@@ -210,6 +232,68 @@ class ProductionBundleTests(unittest.TestCase):
                     structure_only=True,
                 )
             self.assertFalse(blocked.exists())
+
+    def test_release_binary_sets_preserve_rc0_and_require_rc1_upgrade(self) -> None:
+        tool = load_tool()
+        self.assertEqual(
+            tool.release_binaries("0.8.0-rc.0"),
+            (
+                "open-card-server",
+                "open-card-agent",
+                "open-card-static-server",
+                "open-card-secretctl",
+                "open-card-security-probe",
+                "open-card-imagegc",
+                "open-card-admin",
+            ),
+        )
+        self.assertEqual(tool.release_binaries("0.8.0-rc.1"), tool.BINARIES)
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            repo, commit = minimal_repo(root, "0024")
+            dist = root / "dist"
+            dist.mkdir()
+            (dist / "index.html").write_text("x", encoding="utf-8")
+            output = root / "rc1-without-upgrade"
+            with self.assertRaisesRegex(tool.ProductionBundleError, "open-card-upgrade"):
+                tool.assemble(
+                    self.stage(root, binaries=tool.RC0_BINARIES),
+                    repo,
+                    output,
+                    "amd64",
+                    None,
+                    None,
+                    dist,
+                    version="0.8.0-rc.1",
+                    migration_version="0024",
+                    source_commit=commit,
+                    structure_only=True,
+                )
+            self.assertFalse(output.exists())
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            repo, commit = minimal_repo(root, "0024", include_rc1_units=False)
+            dist = root / "dist"
+            dist.mkdir()
+            (dist / "index.html").write_text("x", encoding="utf-8")
+            output = root / "rc1-without-recovery-unit"
+            with self.assertRaisesRegex(
+                tool.ProductionBundleError, "open-card-upgrade-recover.service"
+            ):
+                tool.assemble(
+                    self.stage(root),
+                    repo,
+                    output,
+                    "amd64",
+                    None,
+                    None,
+                    dist,
+                    version="0.8.0-rc.1",
+                    migration_version="0024",
+                    source_commit=commit,
+                    structure_only=True,
+                )
+            self.assertFalse(output.exists())
 
     def test_mixed_arch_n_minus_one_release_is_rejected(self) -> None:
         tool = load_tool()
@@ -307,6 +391,16 @@ ConditionPathExists=!/var/lib/open-card/upgrade-in-progress
             self.assertEqual((ROOT / "deploy/systemd" / path).read_text(encoding="utf-8"), contents)
         self.assertEqual(set(tool.systemd_files("0.8.0-rc.0")), set(tool.RC0_UNITS))
         self.assertEqual(
+            tool.RC0_UNITS,
+            (
+                "open-card-server.service",
+                "open-card-agent.service",
+                "open-card-buildkit.service",
+                "open-card-caddy.service",
+                "open-card-edge.service",
+            ),
+        )
+        self.assertEqual(
             set(tool.systemd_files("0.8.0-rc.1")),
             set(tool.UNITS) | set(tool.UNIT_DROP_INS),
         )
@@ -314,8 +408,15 @@ ConditionPathExists=!/var/lib/open-card/upgrade-in-progress
         self.assertNotIn("Before=open-card-edge.service", finalizer)
         self.assertIn("RequiredBy=open-card-buildkit.service open-card-caddy.service open-card-server.service open-card-agent.service open-card-edge.service", safe_target)
         self.assertIn("open-card-upgrade", tool.BINARIES)
-        self.assertIn("open-card-upgrade-recover.service", tool.RC0_UNITS)
-        self.assertTrue({"open-card-upgrade-safe.target", "open-card-upgrade-finalize.service"} <= set(tool.UNITS))
+        self.assertNotIn("open-card-upgrade-recover.service", tool.RC0_UNITS)
+        self.assertTrue(
+            {
+                "open-card-upgrade-recover.service",
+                "open-card-upgrade-safe.target",
+                "open-card-upgrade-finalize.service",
+            }
+            <= set(tool.UNITS)
+        )
         self.assertIn("open-card-edge.service.d/10-upgrade-marker.conf", tool.UNIT_DROP_INS)
 
     def test_rc0_bootstrap_build_contains_provenance_and_installers(self) -> None:

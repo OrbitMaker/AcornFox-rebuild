@@ -33,9 +33,26 @@ def digest(path: Path) -> str:
 
 
 class ProductionBuildTests(unittest.TestCase):
-    def test_recovery_binary_is_a_fixed_go_build_target(self) -> None:
+    def test_release_specs_select_exact_go_build_targets(self) -> None:
         tool = load_tool()
         self.assertEqual(tool.GO_TARGETS["open-card-upgrade"], "./cmd/open-card-upgrade")
+        self.assertEqual(
+            tuple(tool.go_targets(tool.RC0_SPEC)),
+            (
+                "open-card-server",
+                "open-card-agent",
+                "open-card-static-server",
+                "open-card-secretctl",
+                "open-card-security-probe",
+                "open-card-imagegc",
+                "open-card-admin",
+            ),
+        )
+        self.assertEqual(tuple(tool.go_targets(tool.RC1_SPEC)), tuple(tool.GO_TARGETS))
+        self.assertIn(
+            "for binary, package in go_targets(spec).items():",
+            TOOL.read_text(encoding="utf-8"),
+        )
 
     def test_arch_cli_dataflow_and_rc1_arm64_fail_closed_before_output(self) -> None:
         tool = load_tool()

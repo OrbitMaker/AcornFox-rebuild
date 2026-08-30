@@ -80,6 +80,18 @@ GO_TARGETS = {
     "open-card-admin": "./cmd/open-card-admin",
     "open-card-upgrade": "./cmd/open-card-upgrade",
 }
+RC0_GO_TARGETS = {
+    binary: package
+    for binary, package in GO_TARGETS.items()
+    if binary != "open-card-upgrade"
+}
+
+
+def go_targets(spec: ReleaseSpec) -> dict[str, str]:
+    """Return the exact Go binary set available in one release source tree."""
+    return RC0_GO_TARGETS if spec.bootstrap else GO_TARGETS
+
+
 RUNTIME_LAYOUT = {
     "buildkit": {
         "archive": True,
@@ -1128,7 +1140,7 @@ def build_candidate(
         )
         stage = build_root / "stage"
         (stage / "binaries" / arch).mkdir(parents=True)
-        for binary, package in GO_TARGETS.items():
+        for binary, package in go_targets(spec).items():
             run_command(
                 ["go", "build", "-trimpath", "-buildvcs=false", "-ldflags=-buildid=", "-o", str(stage / "binaries" / arch / binary), package],
                 cwd=source_snapshot,
