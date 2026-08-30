@@ -68,9 +68,27 @@ class ProductionBundleTests(unittest.TestCase):
 
     def test_private_workspaces_stay_below_the_build_stage(self) -> None:
         source = TOOL.read_text(encoding="utf-8")
-        self.assertNotIn("dir=output.parent", source)
-        self.assertIn('prefix=f".{output.name}.inputs-", dir=stage.parent', source)
-        self.assertIn('prefix=f".{output.name}.build-", dir=inputs', source)
+        self.assertNotIn("directory=output.parent", source)
+        self.assertIn('prefix=f".{output.name}.inputs-", directory=stage.parent', source)
+        self.assertIn('prefix=f".{output.name}.build-", directory=inputs', source)
+
+    def test_private_workspace_cleanup_retries_directory_not_empty(self) -> None:
+        tool = load_tool()
+        with tempfile.TemporaryDirectory() as raw:
+            real_rmtree = tool.shutil.rmtree
+            attempts = []
+
+            def directory_not_empty_once(path):
+                attempts.append(Path(path))
+                if len(attempts) == 1:
+                    raise OSError(tool.errno.ENOTEMPTY, "directory not empty")
+                return real_rmtree(path)
+
+            with mock.patch.object(tool.shutil, "rmtree", side_effect=directory_not_empty_once):
+                with tool.private_temporary_directory(prefix="retry-", directory=Path(raw)) as workspace:
+                    (workspace / "payload").write_text("verified\n", encoding="utf-8")
+                self.assertFalse(workspace.exists())
+            self.assertEqual(len(attempts), 2)
 
     def attestation_digest(self, attestation: Path) -> str:
         return hashlib.sha256(attestation.read_bytes()).hexdigest()

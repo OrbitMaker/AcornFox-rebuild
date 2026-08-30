@@ -9,6 +9,7 @@ artifact or asserts a verified public-domain deployment.
 from __future__ import annotations
 
 import argparse
+import errno
 import gzip
 import hashlib
 import io
@@ -20,6 +21,8 @@ import stat
 import subprocess
 import tarfile
 import tempfile
+import time
+from contextlib import contextmanager
 from pathlib import Path
 
 RC0_SOURCE_COMMIT = "35a2b198ac52949af3477475d89d4813b46a9490"
@@ -88,6 +91,25 @@ INSTALLER_SCRIPTS = (
 
 class ProductionBundleError(RuntimeError):
     pass
+
+
+@contextmanager
+def private_temporary_directory(*, prefix: str, directory: Path):
+    path = Path(tempfile.mkdtemp(prefix=prefix, dir=directory))
+    try:
+        yield path
+    finally:
+        for attempt in range(8):
+            try:
+                shutil.rmtree(path)
+            except FileNotFoundError:
+                break
+            except OSError as error:
+                if error.errno != errno.ENOTEMPTY or attempt == 7:
+                    raise
+                time.sleep(0.01 * (attempt + 1))
+            else:
+                break
 
 
 def lowercase_hex(value: object, length: int) -> bool:
@@ -617,10 +639,9 @@ def assemble(
     ):
         raise ProductionBundleError("Live attestation and its pinned SHA-256 are required")
 
-    with tempfile.TemporaryDirectory(
-        prefix=f".{output.name}.inputs-", dir=stage.parent
-    ) as raw_inputs:
-        inputs = Path(raw_inputs)
+    with private_temporary_directory(
+        prefix=f".{output.name}.inputs-", directory=stage.parent
+    ) as inputs:
         repo_snapshot = inputs / "repository"
         repo_snapshot.mkdir(mode=0o700)
         snapshot_repo(repo, source_commit, repo_snapshot)
@@ -684,10 +705,9 @@ def assemble(
                 live_attestation_sha256,
             )
 
-        with tempfile.TemporaryDirectory(
-            prefix=f".{output.name}.build-", dir=inputs
-        ) as raw_build:
-            build_root = Path(raw_build)
+        with private_temporary_directory(
+            prefix=f".{output.name}.build-", directory=inputs
+        ) as build_root:
             release = build_root / "release"
             release.mkdir(mode=0o755)
             for binary in BINARIES:
