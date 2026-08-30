@@ -21,24 +21,55 @@ import (
 )
 
 const (
-	ManifestSchemaVersion      = 1
-	ManifestProduct            = "open-card"
-	AgentProtocolVersion       = "1.1"
-	PreviousAgentProtocol      = "1.0"
-	LegacyAgentProtocol        = "v1"
-	CurrentMigrationVersion    = "0024"
-	ProductionCandidateVersion = "0.8.0-rc.1"
-	ProductionNMinusOneVersion = "0.8.0-rc.0"
-	RC0SourceCommit            = "35a2b198ac52949af3477475d89d4813b46a9490"
-	RC0ReleaseManifestSHA256   = "3b3953c0a26f8706151583ad6c9cad6b5502da18b28f11ed66ca92fe604aa253"
-	RC0ArchiveSHA256           = "abc034ed24e8e8dc74b8eabc84dd3071a66f166abe65135502911e9153c0b9fc"
-	RC0BundleManifestSHA256    = "960ab65526b890009e1770ad190a70b1589f825e0f59cf8d757634a0a8848392"
-	DefaultInstallPrefix       = "/opt/open-card"
-	DefaultConfigDir           = "/etc/open-card"
-	DefaultDataDir             = "/var/lib/open-card"
-	DefaultEvidenceDir         = "/var/lib/open-card/evidence"
-	DefaultBackupDir           = "/var/lib/open-card/backups"
+	ManifestSchemaVersion         = 1
+	ManifestProduct               = "open-card"
+	AgentProtocolVersion          = "1.1"
+	PreviousAgentProtocol         = "1.0"
+	LegacyAgentProtocol           = "v1"
+	CurrentMigrationVersion       = "0024"
+	ProductionCandidateVersion    = "0.8.0-rc.1"
+	ProductionNMinusOneVersion    = "0.8.0-rc.0"
+	RC0SourceCommit               = "35a2b198ac52949af3477475d89d4813b46a9490"
+	RC0ReleaseManifestSHA256      = "3b3953c0a26f8706151583ad6c9cad6b5502da18b28f11ed66ca92fe604aa253"
+	RC0ArchiveSHA256              = "abc034ed24e8e8dc74b8eabc84dd3071a66f166abe65135502911e9153c0b9fc"
+	RC0BundleManifestSHA256       = "960ab65526b890009e1770ad190a70b1589f825e0f59cf8d757634a0a8848392"
+	ARM64RC0ReleaseManifestSHA256 = "e4f56105b3d184313d51365c7fff40b9f68111815def83c5e5985bc182177a57"
+	ARM64RC0ArchiveSHA256         = "9560df1d4a739c729d857cd93b989b99976da0e86983ffa026d13202339d57b9"
+	ARM64RC0BundleManifestSHA256  = "fdfd6b6108870118714b70c9007937585fc0429d14fa9d64010a80016edc2a15"
+	DefaultInstallPrefix          = "/opt/open-card"
+	DefaultConfigDir              = "/etc/open-card"
+	DefaultDataDir                = "/var/lib/open-card"
+	DefaultEvidenceDir            = "/var/lib/open-card/evidence"
+	DefaultBackupDir              = "/var/lib/open-card/backups"
 )
+
+// RC0Lineage is the architecture-scoped immutable predecessor tuple required
+// by an RC1 manifest. Its fields deliberately mirror NMinusOne without
+// extending that frozen schema.
+type RC0Lineage struct {
+	Architecture          string
+	SourceCommit          string
+	ReleaseManifestSHA256 string
+	ArchiveSHA256         string
+	BundleManifestSHA256  string
+}
+
+// RC0LineageForArchitecture returns the independently frozen RC0 evidence
+// for a normalized release architecture.
+func RC0LineageForArchitecture(architecture string) (RC0Lineage, error) {
+	normalized, err := NormalizeArchitecture(architecture)
+	if err != nil || normalized == "" {
+		return RC0Lineage{}, fmt.Errorf("unsupported RC0 lineage architecture %q", architecture)
+	}
+	switch normalized {
+	case "amd64":
+		return RC0Lineage{Architecture: normalized, SourceCommit: RC0SourceCommit, ReleaseManifestSHA256: RC0ReleaseManifestSHA256, ArchiveSHA256: RC0ArchiveSHA256, BundleManifestSHA256: RC0BundleManifestSHA256}, nil
+	case "arm64":
+		return RC0Lineage{Architecture: normalized, SourceCommit: RC0SourceCommit, ReleaseManifestSHA256: ARM64RC0ReleaseManifestSHA256, ArchiveSHA256: ARM64RC0ArchiveSHA256, BundleManifestSHA256: ARM64RC0BundleManifestSHA256}, nil
+	default:
+		return RC0Lineage{}, fmt.Errorf("unsupported RC0 lineage architecture %q", architecture)
+	}
+}
 
 var semanticVersionPattern = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$`)
 var digestPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -414,8 +445,12 @@ func (m Manifest) Validate() error {
 		if m.SourceCommit == "" || m.NMinusOne == nil {
 			return errors.New("rc1 manifest lineage is required")
 		}
+		lineage, err := RC0LineageForArchitecture(m.Architecture)
+		if err != nil {
+			return errors.New("rc1 manifest architecture lineage is invalid")
+		}
 		n := m.NMinusOne
-		if n.Version != "0.8.0-rc.0" || n.MigrationVersion != "0023" || n.SourceCommit != RC0SourceCommit || n.ReleaseManifestSHA256 != RC0ReleaseManifestSHA256 || n.ArchiveSHA256 != RC0ArchiveSHA256 || n.BundleManifestSHA256 != RC0BundleManifestSHA256 {
+		if n.Version != ProductionNMinusOneVersion || n.MigrationVersion != "0023" || n.SourceCommit != lineage.SourceCommit || n.ReleaseManifestSHA256 != lineage.ReleaseManifestSHA256 || n.ArchiveSHA256 != lineage.ArchiveSHA256 || n.BundleManifestSHA256 != lineage.BundleManifestSHA256 {
 			return errors.New("rc1 n_minus_one lineage is invalid")
 		}
 	} else if m.NMinusOne != nil {

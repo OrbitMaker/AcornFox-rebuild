@@ -496,7 +496,14 @@ if not isinstance(files, list) or not files:
 if value["version"] == "0.8.0-rc.1":
     if migration_version != "0024" or not isinstance(value.get("source_commit"), str) or not re.fullmatch(r"[a-f0-9]{40}", value["source_commit"]):
         raise SystemExit("0.8.0-rc.1 production candidate must declare source and migration 0024")
-    expected_n_minus_one = {"version":"0.8.0-rc.0","migration_version":"0023","source_commit":"35a2b198ac52949af3477475d89d4813b46a9490","release_manifest_sha256":"3b3953c0a26f8706151583ad6c9cad6b5502da18b28f11ed66ca92fe604aa253","archive_sha256":"abc034ed24e8e8dc74b8eabc84dd3071a66f166abe65135502911e9153c0b9fc","bundle_manifest_sha256":"960ab65526b890009e1770ad190a70b1589f825e0f59cf8d757634a0a8848392"}
+    lineage_by_architecture = {
+        "amd64": ("3b3953c0a26f8706151583ad6c9cad6b5502da18b28f11ed66ca92fe604aa253", "abc034ed24e8e8dc74b8eabc84dd3071a66f166abe65135502911e9153c0b9fc", "960ab65526b890009e1770ad190a70b1589f825e0f59cf8d757634a0a8848392"),
+        "arm64": ("e4f56105b3d184313d51365c7fff40b9f68111815def83c5e5985bc182177a57", "9560df1d4a739c729d857cd93b989b99976da0e86983ffa026d13202339d57b9", "fdfd6b6108870118714b70c9007937585fc0429d14fa9d64010a80016edc2a15"),
+    }
+    if architecture not in lineage_by_architecture:
+        raise SystemExit("0.8.0-rc.1 production candidate requires a supported architecture")
+    manifest_sha256, archive_sha256, bundle_manifest_sha256 = lineage_by_architecture[architecture]
+    expected_n_minus_one = {"version":"0.8.0-rc.0","migration_version":"0023","source_commit":"35a2b198ac52949af3477475d89d4813b46a9490","release_manifest_sha256":manifest_sha256,"archive_sha256":archive_sha256,"bundle_manifest_sha256":bundle_manifest_sha256}
     if value.get("n_minus_one") != expected_n_minus_one:
         raise SystemExit("0.8.0-rc.1 production candidate has invalid N-1 lineage")
     production_required = {

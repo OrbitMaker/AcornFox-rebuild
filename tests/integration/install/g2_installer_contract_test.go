@@ -72,7 +72,12 @@ func writeG2CandidateBundle(t *testing.T, directory string, includeEdge bool) st
 		}
 		entries = append(entries, install.FileDigest{Path: "systemd/" + unit, SHA256: digest, Mode: 0o644})
 	}
-	manifest := install.Manifest{SchemaVersion: install.ManifestSchemaVersion, Product: install.ManifestProduct, Version: install.ProductionCandidateVersion, ReleaseID: "release-0.8.0-rc.1", Architecture: install.RuntimeArchitecture(), MigrationVersion: install.CurrentMigrationVersion, SourceCommit: strings.Repeat("a", 40), NMinusOne: &install.NMinusOne{Version: install.ProductionNMinusOneVersion, MigrationVersion: "0023", SourceCommit: install.RC0SourceCommit, ReleaseManifestSHA256: install.RC0ReleaseManifestSHA256, ArchiveSHA256: install.RC0ArchiveSHA256, BundleManifestSHA256: install.RC0BundleManifestSHA256}, Protocol: install.AgentProtocolVersion, ConfigDir: install.DefaultConfigDir, DataDir: install.DefaultDataDir, Compatibility: install.Compatibility{MinDataVersion: 1, MaxDataVersion: 24, MinAgentProtocol: install.PreviousAgentProtocol, MaxAgentProtocol: install.AgentProtocolVersion}, Files: entries}
+	architecture := install.RuntimeArchitecture()
+	lineage, err := install.RC0LineageForArchitecture(architecture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := install.Manifest{SchemaVersion: install.ManifestSchemaVersion, Product: install.ManifestProduct, Version: install.ProductionCandidateVersion, ReleaseID: "release-0.8.0-rc.1", Architecture: architecture, MigrationVersion: install.CurrentMigrationVersion, SourceCommit: strings.Repeat("a", 40), NMinusOne: &install.NMinusOne{Version: install.ProductionNMinusOneVersion, MigrationVersion: "0023", SourceCommit: lineage.SourceCommit, ReleaseManifestSHA256: lineage.ReleaseManifestSHA256, ArchiveSHA256: lineage.ArchiveSHA256, BundleManifestSHA256: lineage.BundleManifestSHA256}, Protocol: install.AgentProtocolVersion, ConfigDir: install.DefaultConfigDir, DataDir: install.DefaultDataDir, Compatibility: install.Compatibility{MinDataVersion: 1, MaxDataVersion: 24, MinAgentProtocol: install.PreviousAgentProtocol, MaxAgentProtocol: install.AgentProtocolVersion}, Files: entries}
 	if err := install.SaveManifest(filepath.Join(bundle, "manifest.json"), manifest); err != nil {
 		t.Fatal(err)
 	}

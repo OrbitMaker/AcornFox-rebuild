@@ -33,6 +33,43 @@ def digest(path: Path) -> str:
 
 
 class ProductionBuildTests(unittest.TestCase):
+    def test_frozen_rc0_lineage_descriptors_are_architecture_complete(self) -> None:
+        tool = load_tool()
+        expected = {
+            "amd64": (
+                tool.N_MINUS_ONE_RELEASE_MANIFEST_SHA256,
+                tool.N_MINUS_ONE_ARCHIVE_SHA256,
+                tool.N_MINUS_ONE_BUNDLE_MANIFEST_SHA256,
+            ),
+            "arm64": (
+                tool.ARM64_N_MINUS_ONE_RELEASE_MANIFEST_SHA256,
+                tool.ARM64_N_MINUS_ONE_ARCHIVE_SHA256,
+                tool.ARM64_N_MINUS_ONE_BUNDLE_MANIFEST_SHA256,
+            ),
+        }
+        for arch, hashes in expected.items():
+            lineage = tool.frozen_rc0_lineage(arch)
+            self.assertEqual(
+                set(lineage),
+                {
+                    "architecture",
+                    "source_commit",
+                    "release_manifest_sha256",
+                    "archive_sha256",
+                    "bundle_manifest_sha256",
+                    "declared_file_count",
+                },
+            )
+            self.assertEqual(lineage["architecture"], arch)
+            self.assertEqual(
+                (
+                    lineage["release_manifest_sha256"],
+                    lineage["archive_sha256"],
+                    lineage["bundle_manifest_sha256"],
+                ),
+                hashes,
+            )
+
     def test_release_specs_select_exact_go_build_targets(self) -> None:
         tool = load_tool()
         self.assertEqual(tool.GO_TARGETS["open-card-upgrade"], "./cmd/open-card-upgrade")
@@ -54,7 +91,7 @@ class ProductionBuildTests(unittest.TestCase):
             TOOL.read_text(encoding="utf-8"),
         )
 
-    def test_arch_cli_dataflow_and_rc1_arm64_fail_closed_before_output(self) -> None:
+    def test_arch_cli_dataflow_and_rc1_arm64_requires_exact_evidence_before_output(self) -> None:
         tool = load_tool()
         help_result = subprocess.run(
             [sys.executable, str(TOOL), "--help"],
@@ -68,10 +105,15 @@ class ProductionBuildTests(unittest.TestCase):
             root = Path(raw)
             _, go_env, _ = tool.isolated_build_environments(root, "arm64")
             self.assertEqual(go_env["GOARCH"], "arm64")
+            lineage = tool.require_frozen_rc0_lineage("arm64")
+            self.assertEqual(
+                lineage["release_manifest_sha256"],
+                tool.ARM64_N_MINUS_ONE_RELEASE_MANIFEST_SHA256,
+            )
             output = root / "arm64-rc1"
             with self.assertRaisesRegex(
                 tool.ProductionBuildError,
-                "same-architecture RC0 lineage is frozen",
+                "N-1 candidate root",
             ):
                 tool.build_candidate(
                     source_worktree=root,
@@ -89,7 +131,9 @@ class ProductionBuildTests(unittest.TestCase):
                 )
             self.assertFalse(output.exists())
 
-    def n_minus_one_candidate(self, tool, root: Path) -> tuple[Path, dict[str, object]]:
+    def n_minus_one_candidate(
+        self, tool, root: Path, arch: str = "amd64"
+    ) -> tuple[Path, dict[str, object]]:
         candidate = root / "n-minus-one"
         release = candidate / "release"
         release.mkdir(parents=True)
@@ -105,7 +149,7 @@ class ProductionBuildTests(unittest.TestCase):
         manifest = {
             "version": tool.RC0_SPEC.version,
             "migration_version": tool.RC0_SPEC.migration,
-            "architecture": tool.ARCHITECTURE,
+            "architecture": arch,
             "source_commit": tool.RC0_SOURCE_COMMIT,
             "files": files,
         }
@@ -128,7 +172,7 @@ class ProductionBuildTests(unittest.TestCase):
             "candidate": {
                 "version": tool.RC0_SPEC.version,
                 "migration_version": tool.RC0_SPEC.migration,
-                "architecture": tool.ARCHITECTURE,
+                "architecture": arch,
                 "source_commit": tool.RC0_SOURCE_COMMIT,
             },
             "bundle": {
@@ -156,11 +200,12 @@ class ProductionBuildTests(unittest.TestCase):
         }
         (candidate / "production-bundle.json").write_text(json.dumps(production_bundle), encoding="utf-8")
         (candidate / "production-bundle.json").chmod(0o640)
+        prefix = "" if arch == "amd64" else "ARM64_"
         return candidate, {
-            "N_MINUS_ONE_RELEASE_MANIFEST_SHA256": manifest_digest,
-            "N_MINUS_ONE_ARCHIVE_SHA256": archive_digest,
-            "N_MINUS_ONE_BUNDLE_MANIFEST_SHA256": bundle_digest,
-            "N_MINUS_ONE_DECLARED_FILE_COUNT": len(files),
+            f"{prefix}N_MINUS_ONE_RELEASE_MANIFEST_SHA256": manifest_digest,
+            f"{prefix}N_MINUS_ONE_ARCHIVE_SHA256": archive_digest,
+            f"{prefix}N_MINUS_ONE_BUNDLE_MANIFEST_SHA256": bundle_digest,
+            f"{prefix}N_MINUS_ONE_DECLARED_FILE_COUNT": len(files),
         }
 
     @contextmanager
@@ -181,9 +226,28 @@ class ProductionBuildTests(unittest.TestCase):
             self.assertEqual(evidence.architecture, "amd64")
             self.assertEqual(evidence.archive_sha256, pins["N_MINUS_ONE_ARCHIVE_SHA256"])
 
+    def test_arm64_n_minus_one_candidate_requires_same_architecture(self) -> None:
+        tool = load_tool()
+        with tempfile.TemporaryDirectory() as raw:
+            candidate, pins = self.n_minus_one_candidate(tool, Path(raw), "arm64")
+            mixed_pins = {
+                **pins,
+                **{
+                    key.removeprefix("ARM64_"): value
+                    for key, value in pins.items()
+                },
+            }
+            with self.pinned_n_minus_one(tool, mixed_pins):
+                evidence = tool.verify_n_minus_one_candidate_root(candidate, arch="arm64")
+                self.assertEqual(evidence.architecture, "arm64")
+                with self.assertRaisesRegex(
+                    tool.ProductionBuildError, "manifest metadata is invalid"
+                ):
+                    tool.verify_n_minus_one_candidate_root(candidate, arch="amd64")
+
     def test_n_minus_one_candidate_rejects_every_frozen_boundary(self) -> None:
         tool = load_tool()
-        for mutation in ("missing", "extra", "symlink", "mode", "file-hash", "archive", "bundle-line", "bundle-file-hash", "build-record", "production-metadata", "source"):
+        for mutation in ("missing", "extra", "symlink", "mode", "file-hash", "archive", "bundle-line", "bundle-file-hash", "build-record", "production-metadata", "bootstrap-n1-shape", "source"):
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as raw:
                 candidate, pins = self.n_minus_one_candidate(tool, Path(raw))
                 release = candidate / "release"
@@ -212,6 +276,10 @@ class ProductionBuildTests(unittest.TestCase):
                 elif mutation == "production-metadata":
                     metadata = json.loads((candidate / "production-bundle.json").read_text(encoding="utf-8"))
                     metadata["candidate_status"] = "accepted"
+                    (candidate / "production-bundle.json").write_text(json.dumps(metadata), encoding="utf-8")
+                elif mutation == "bootstrap-n1-shape":
+                    metadata = json.loads((candidate / "production-bundle.json").read_text(encoding="utf-8"))
+                    metadata["n_minus_one"]["migration_version"] = None
                     (candidate / "production-bundle.json").write_text(json.dumps(metadata), encoding="utf-8")
                 elif mutation == "source":
                     manifest = json.loads((release / "manifest.json").read_text(encoding="utf-8"))

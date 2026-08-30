@@ -29,6 +29,9 @@ RC0_SOURCE_COMMIT = "35a2b198ac52949af3477475d89d4813b46a9490"
 N_MINUS_ONE_RELEASE_MANIFEST_SHA256 = "3b3953c0a26f8706151583ad6c9cad6b5502da18b28f11ed66ca92fe604aa253"
 N_MINUS_ONE_ARCHIVE_SHA256 = "abc034ed24e8e8dc74b8eabc84dd3071a66f166abe65135502911e9153c0b9fc"
 N_MINUS_ONE_BUNDLE_MANIFEST_SHA256 = "960ab65526b890009e1770ad190a70b1589f825e0f59cf8d757634a0a8848392"
+ARM64_N_MINUS_ONE_RELEASE_MANIFEST_SHA256 = "e4f56105b3d184313d51365c7fff40b9f68111815def83c5e5985bc182177a57"
+ARM64_N_MINUS_ONE_ARCHIVE_SHA256 = "9560df1d4a739c729d857cd93b989b99976da0e86983ffa026d13202339d57b9"
+ARM64_N_MINUS_ONE_BUNDLE_MANIFEST_SHA256 = "fdfd6b6108870118714b70c9007937585fc0429d14fa9d64010a80016edc2a15"
 
 ARCHES = ("amd64", "arm64")
 BINARIES = (
@@ -111,22 +114,27 @@ def frozen_rc0_lineage(arch: str) -> dict[str, str] | None:
     """Return the frozen RC0 predecessor lineage for a release architecture."""
     if arch == "amd64":
         return {
+            "architecture": arch,
             "source_commit": RC0_SOURCE_COMMIT,
             "release_manifest_sha256": N_MINUS_ONE_RELEASE_MANIFEST_SHA256,
             "archive_sha256": N_MINUS_ONE_ARCHIVE_SHA256,
             "bundle_manifest_sha256": N_MINUS_ONE_BUNDLE_MANIFEST_SHA256,
         }
     if arch == "arm64":
-        return None
+        return {
+            "architecture": arch,
+            "source_commit": RC0_SOURCE_COMMIT,
+            "release_manifest_sha256": ARM64_N_MINUS_ONE_RELEASE_MANIFEST_SHA256,
+            "archive_sha256": ARM64_N_MINUS_ONE_ARCHIVE_SHA256,
+            "bundle_manifest_sha256": ARM64_N_MINUS_ONE_BUNDLE_MANIFEST_SHA256,
+        }
     raise ProductionBundleError(f"unsupported release architecture: {arch}")
 
 
 def require_frozen_rc0_lineage(arch: str) -> dict[str, str]:
     lineage = frozen_rc0_lineage(arch)
     if lineage is None:
-        raise ProductionBundleError(
-            "RC1 arm64 is unavailable until same-architecture RC0 lineage is frozen"
-        )
+        raise ProductionBundleError("RC1 predecessor lineage is unavailable")
     return lineage
 
 
@@ -884,6 +892,26 @@ def assemble(
                     encoding="utf-8",
                 )
                 bundle_checksum.chmod(0o640)
+                n_minus_one_metadata = (
+                    {
+                        "version": spec["expected_n_minus_one_version"],
+                        "migration_version": spec["expected_n_minus_one_migration"],
+                        "source_commit": lineage["source_commit"],
+                        "status": "verified_local_candidate",
+                        "release_embedded": False,
+                        "manifest_sha256": n_minus_one_manifest_sha256,
+                        "archive_sha256": n_minus_one_archive_sha256,
+                        "bundle_manifest_sha256": n_minus_one_bundle_manifest_sha256,
+                    }
+                    if needs_n_minus_one
+                    else {
+                        "manifest_sha256": None,
+                        "release_embedded": False,
+                        "release_id": None,
+                        "status": "not_required_bootstrap",
+                        "version": None,
+                    }
+                )
                 metadata = {
                     "schema_version": 1,
                     "product": "open-card",
@@ -891,23 +919,7 @@ def assemble(
                     "source_commit": source_commit,
                     "production_accepted": False,
                     "candidate_status": candidate_status,
-                    "n_minus_one": {
-                        "version": spec["expected_n_minus_one_version"],
-                        "migration_version": spec["expected_n_minus_one_migration"],
-                        "source_commit": lineage["source_commit"] if lineage else None,
-                        "status": (
-                            "not_required_bootstrap"
-                            if not needs_n_minus_one
-                            else "verified_local_candidate"
-                        ),
-                        "release_embedded": False,
-                        "manifest_sha256": (
-                            n_minus_one_manifest_sha256 if n_minus_one else None
-                        ),
-                        "archive_sha256": n_minus_one_archive_sha256 if n_minus_one else None,
-                        "bundle_manifest_sha256": n_minus_one_bundle_manifest_sha256 if n_minus_one else None,
-                        "release_embedded": False,
-                    },
+                    "n_minus_one": n_minus_one_metadata,
                     "migration_version": migration_version,
                     "live_web": {
                         "status": "caller_evidence_digest_pinned",

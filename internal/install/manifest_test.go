@@ -48,6 +48,18 @@ func TestManifestValidateAndVerifyRelease(t *testing.T) {
 }
 
 func TestRCManifestLineageUsesOnlyFrozenTuplesAndDigests(t *testing.T) {
+	for architecture, expected := range map[string]string{
+		"amd64": RC0ReleaseManifestSHA256,
+		"arm64": ARM64RC0ReleaseManifestSHA256,
+	} {
+		lineage, err := RC0LineageForArchitecture(architecture)
+		if err != nil || lineage.Architecture != architecture || lineage.ReleaseManifestSHA256 != expected {
+			t.Fatalf("frozen %s lineage = %#v, %v", architecture, lineage, err)
+		}
+	}
+	if _, err := RC0LineageForArchitecture("mips64"); err == nil {
+		t.Fatal("unsupported architecture has a frozen lineage")
+	}
 	rc0, _ := testManifest(t, "0.8.0-rc.0", "bin/open-card-server", []byte("server"))
 	rc0.MigrationVersion = "0023"
 	rc0.SourceCommit = RC0SourceCommit
@@ -60,11 +72,22 @@ func TestRCManifestLineageUsesOnlyFrozenTuplesAndDigests(t *testing.T) {
 	}
 
 	rc1, _ := testManifest(t, "0.8.0-rc.1", "bin/open-card-server", []byte("server"))
+	rc1.Architecture = "amd64"
 	rc1.MigrationVersion = "0024"
 	rc1.SourceCommit = strings.Repeat("a", 40)
 	rc1.NMinusOne = &NMinusOne{Version: "0.8.0-rc.0", MigrationVersion: "0023", SourceCommit: RC0SourceCommit, ReleaseManifestSHA256: RC0ReleaseManifestSHA256, ArchiveSHA256: RC0ArchiveSHA256, BundleManifestSHA256: RC0BundleManifestSHA256}
 	if err := rc1.Validate(); err != nil {
 		t.Fatal(err)
+	}
+	arm64 := rc1
+	arm64.Architecture = "arm64"
+	arm64.NMinusOne = &NMinusOne{Version: ProductionNMinusOneVersion, MigrationVersion: "0023", SourceCommit: RC0SourceCommit, ReleaseManifestSHA256: ARM64RC0ReleaseManifestSHA256, ArchiveSHA256: ARM64RC0ArchiveSHA256, BundleManifestSHA256: ARM64RC0BundleManifestSHA256}
+	if err := arm64.Validate(); err != nil {
+		t.Fatalf("arm64 rc1 lineage rejected: %v", err)
+	}
+	arm64.NMinusOne.ReleaseManifestSHA256 = RC0ReleaseManifestSHA256
+	if err := arm64.Validate(); err == nil {
+		t.Fatal("arm64 rc1 accepted amd64 predecessor lineage")
 	}
 	manifestPath := filepath.Join(t.TempDir(), "manifest.json")
 	if err := SaveManifest(manifestPath, rc1); err != nil {
@@ -97,6 +120,7 @@ func TestRCManifestLineageUsesOnlyFrozenTuplesAndDigests(t *testing.T) {
 
 func TestProductionCandidateRequires0024PayloadAndRejectsFixtures(t *testing.T) {
 	manifest, _ := testManifest(t, ProductionCandidateVersion, "bin/open-card-admin", []byte("admin"))
+	manifest.Architecture = "amd64"
 	manifest.MigrationVersion = CurrentMigrationVersion
 	manifest.SourceCommit = strings.Repeat("a", 40)
 	manifest.NMinusOne = &NMinusOne{Version: "0.8.0-rc.0", MigrationVersion: "0023", SourceCommit: RC0SourceCommit, ReleaseManifestSHA256: RC0ReleaseManifestSHA256, ArchiveSHA256: RC0ArchiveSHA256, BundleManifestSHA256: RC0BundleManifestSHA256}

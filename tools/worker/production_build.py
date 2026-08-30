@@ -39,6 +39,10 @@ N_MINUS_ONE_RELEASE_MANIFEST_SHA256 = "3b3953c0a26f8706151583ad6c9cad6b5502da18b
 N_MINUS_ONE_ARCHIVE_SHA256 = "abc034ed24e8e8dc74b8eabc84dd3071a66f166abe65135502911e9153c0b9fc"
 N_MINUS_ONE_BUNDLE_MANIFEST_SHA256 = "960ab65526b890009e1770ad190a70b1589f825e0f59cf8d757634a0a8848392"
 N_MINUS_ONE_DECLARED_FILE_COUNT = 62
+ARM64_N_MINUS_ONE_RELEASE_MANIFEST_SHA256 = "e4f56105b3d184313d51365c7fff40b9f68111815def83c5e5985bc182177a57"
+ARM64_N_MINUS_ONE_ARCHIVE_SHA256 = "9560df1d4a739c729d857cd93b989b99976da0e86983ffa026d13202339d57b9"
+ARM64_N_MINUS_ONE_BUNDLE_MANIFEST_SHA256 = "fdfd6b6108870118714b70c9007937585fc0429d14fa9d64010a80016edc2a15"
+ARM64_N_MINUS_ONE_DECLARED_FILE_COUNT = 62
 
 
 @dataclass(frozen=True)
@@ -173,11 +177,11 @@ def frozen_rc0_lineage(arch: str) -> dict[str, object] | None:
     """Return the immutable RC0 predecessor contract for one architecture.
 
     Keep the amd64 values as compatibility constants because the frozen
-    candidate tests deliberately replace them with synthetic pins.  Phase A
-    has no arm64 RC0 candidate to pin, so RC1 must remain fail-closed there.
+    candidate tests deliberately replace them with synthetic pins.
     """
     if arch == "amd64":
         return {
+            "architecture": arch,
             "source_commit": RC0_SOURCE_COMMIT,
             "release_manifest_sha256": N_MINUS_ONE_RELEASE_MANIFEST_SHA256,
             "archive_sha256": N_MINUS_ONE_ARCHIVE_SHA256,
@@ -185,16 +189,21 @@ def frozen_rc0_lineage(arch: str) -> dict[str, object] | None:
             "declared_file_count": N_MINUS_ONE_DECLARED_FILE_COUNT,
         }
     if arch == "arm64":
-        return None
+        return {
+            "architecture": arch,
+            "source_commit": RC0_SOURCE_COMMIT,
+            "release_manifest_sha256": ARM64_N_MINUS_ONE_RELEASE_MANIFEST_SHA256,
+            "archive_sha256": ARM64_N_MINUS_ONE_ARCHIVE_SHA256,
+            "bundle_manifest_sha256": ARM64_N_MINUS_ONE_BUNDLE_MANIFEST_SHA256,
+            "declared_file_count": ARM64_N_MINUS_ONE_DECLARED_FILE_COUNT,
+        }
     raise ProductionBuildError(f"unsupported release architecture: {arch}")
 
 
 def require_frozen_rc0_lineage(arch: str) -> dict[str, object]:
     lineage = frozen_rc0_lineage(arch)
     if lineage is None:
-        raise ProductionBuildError(
-            "RC1 arm64 is unavailable until same-architecture RC0 lineage is frozen"
-        )
+        raise ProductionBuildError("RC1 predecessor lineage is unavailable")
     return lineage
 
 

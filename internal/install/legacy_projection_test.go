@@ -162,6 +162,21 @@ func TestLegacyProjectionPlanValidationAndSecretBoundary(t *testing.T) {
 	}
 }
 
+func TestLegacyProjectionRemainsAMD64OnlyAfterArm64RC0Freeze(t *testing.T) {
+	release := rc0ReleaseFixture()
+	release.Architecture = "arm64"
+	release.ManifestSHA256 = ARM64RC0ReleaseManifestSHA256
+	if validRC0Release(release) {
+		t.Fatal("legacy runtime upgrade accepted frozen arm64 RC0")
+	}
+	plan := legacyPlanFixture()
+	plan.Release = release
+	plan.CurrentTarget = legacyReleaseTarget(release)
+	if err := plan.Validate(); err == nil {
+		t.Fatal("legacy projection accepted frozen arm64 RC0")
+	}
+}
+
 func TestEdgeConfigPlanAndObservationContract(t *testing.T) {
 	plan := legacyPlanFixture()
 	edge := plan.EdgeConfigTransition
