@@ -13,12 +13,21 @@ class InstallerSecurityContractTests(unittest.TestCase):
         text = (SCRIPTS / "install-host.sh").read_text(encoding="utf-8")
         for value in ("--admin-password-file", "--auth-origin", "--edge-domain", "0:600", "OPEN_CARD_AUTH_ORIGIN", "open-card-admin bootstrap", "open-card-edge.service", "open-card-edge.Caddyfile"):
             self.assertIn(value, text)
-        self.assertIn("remain inactive until explicit password-file and HTTPS origin activation", text)
+        self.assertIn("loopback-safe Edge remains active and public routes stay absent", text)
         self.assertIn("existing production installation requires upgrade.sh", text)
         self.assertIn("--require-version 0.8.0-rc.2", text)
+        self.assertIn("--stage-native-bootstrap", text)
+        self.assertIn("prepare-bootstrap --expected-manifest-sha256", text)
+        self.assertIn("prepare-control", text)
+        self.assertIn("bootstrap-native --expected-manifest-sha256", text)
+        self.assertIn("bootstrap-verify --expected-manifest-sha256", text)
+        self.assertIn("bootstrap-finalize --expected-manifest-sha256", text)
+        self.assertIn("--resume-public", text)
         self.assertIn("activation_rollback", text)
         self.assertIn("activation_committed=1", text)
-        self.assertLess(text.index("systemctl enable --now open-card-edge.service"), text.index("open-card-admin bootstrap"))
+        self.assertLess(text.index("open-card-admin bootstrap"), text.index("systemctl reload open-card-edge.service"))
+        self.assertNotIn("CREATE DATABASE opencard", text)
+        self.assertNotIn('database_url="postgresql://', text)
 
     def test_root_backup_restore_and_purge_use_installation_id_not_clean_worker_marker(self) -> None:
         backup = (SCRIPTS / "backup-control-plane.sh").read_text(encoding="utf-8")

@@ -442,6 +442,26 @@ func TestG5BRecoverySubstrateStaysStageOnlyAndBootDisabled(t *testing.T) {
 			t.Fatalf("install substrate contract is missing %q", required)
 		}
 	}
+	for _, required := range []string{
+		"--stage-native-bootstrap",
+		"prepare-bootstrap --expected-manifest-sha256",
+		"prepare-control",
+		"bootstrap-native --expected-manifest-sha256",
+		"bootstrap-verify --expected-manifest-sha256",
+		"bootstrap-finalize --expected-manifest-sha256",
+		"--resume-public",
+		"fresh native bootstrap refuses global OPEN_CARD_DATABASE_URL in server.env",
+		"loopback-safe Edge remains active and public routes stay absent",
+	} {
+		if !strings.Contains(host, required) {
+			t.Fatalf("host native bootstrap contract is missing %q", required)
+		}
+	}
+	for _, forbidden := range []string{"CREATE DATABASE opencard", "database_url=\"postgresql://", "systemctl enable --now open-card-edge.service"} {
+		if strings.Contains(host, forbidden) {
+			t.Fatalf("host native bootstrap retains forbidden legacy surface %q", forbidden)
+		}
+	}
 	for _, unit := range []string{"open-card-upgrade-recover.service", "open-card-upgrade-finalize.service"} {
 		if strings.Contains(install, "enable "+unit) || strings.Contains(install, "start "+unit) {
 			t.Fatalf("installer enables or starts %s before the boot-safe gate", unit)
@@ -458,8 +478,20 @@ func TestG5BRecoverySubstrateStaysStageOnlyAndBootDisabled(t *testing.T) {
 	if releaseBranch < 0 || runtimeModes < releaseBranch || runtimeModes > stage {
 		t.Fatal("runtime traversal modes are not reconciled after existing and new release branches")
 	}
-	if !strings.Contains(host, "install -d -m 0711 -o root -g root /var/lib/open-card") || strings.Index(host, "\"${installer[@]}\"") > strings.Index(host, "installation_id=/var/lib/open-card/installation-id") {
+	dataParent := strings.Index(host, "install -d -m 0711 -o root -g root /var/lib/open-card")
+	installationID := strings.Index(host, "installation_id=/var/lib/open-card/installation-id")
+	installerCall := strings.Index(host, "\"${installer[@]}\"")
+	if dataParent < 0 || installationID < dataParent || installerCall < installationID {
 		t.Fatal("host installer does not establish a root-owned data parent before creating an installation id")
+	}
+	prepareBootstrap := strings.Index(host, "prepare-bootstrap --expected-manifest-sha256")
+	prepareControl := strings.Index(host, "prepare-control")
+	bootstrapNative := strings.Index(host, "bootstrap-native --expected-manifest-sha256")
+	adminBootstrap := strings.LastIndex(host, "open-card-admin bootstrap")
+	publicReload := strings.Index(host, "systemctl reload open-card-edge.service")
+	bootstrapFinalize := strings.Index(host, "bootstrap-finalize --expected-manifest-sha256")
+	if prepareBootstrap < installerCall || prepareControl < prepareBootstrap || bootstrapNative < prepareControl || adminBootstrap < bootstrapNative || publicReload < adminBootstrap || bootstrapFinalize < publicReload {
+		t.Fatal("host native bootstrap/public activation ordering is unsafe")
 	}
 	if !strings.Contains(host, "install -d -m 0711 -o root -g root /etc/open-card") || !strings.Contains(host, "install -d -m 0700 -o root -g root /var/lib/open-card/evidence") {
 		t.Fatal("host installer does not separate runtime traversal from root-only evidence")
@@ -476,7 +508,7 @@ func TestG5BRecoverySubstrateStaysStageOnlyAndBootDisabled(t *testing.T) {
 	}
 	skipBranch := strings.Index(host, "if (( ! skip_prerequisites )); then")
 	runtimeVerification := strings.LastIndex(host, "for command_name in docker psql runuser newuidmap newgidmap")
-	installerCall := strings.Index(host, "\"$"+"{installer[@]}\"")
+	installerCall = strings.Index(host, "\"$"+"{installer[@]}\"")
 	if skipBranch < 0 || runtimeVerification < skipBranch || installerCall < runtimeVerification {
 		t.Fatal("skip-prerequisites can bypass required runtime command verification")
 	}

@@ -9,6 +9,7 @@ usage() {
 usage: install-host.sh (--bundle BUNDLE | --url HTTPS_URL)
                         --expected-manifest-sha256 HEX
                         [--debs-dir DIRECTORY --debs-sha256 MANIFEST]
+                        [--resume-public]
                         [install.sh options]
 
 This command is intentionally system-root only. It requires an externally
@@ -25,8 +26,8 @@ set_env_line() {
   fi
 }
 
-bundle= url= expected= debs_dir= debs_sha256= migration_command= migration_dir= admin_password_file= auth_origin= edge_domain=
-offline=0 dry_run=0 skip_prerequisites=0
+bundle= url= expected= debs_dir= debs_sha256= admin_password_file= auth_origin= edge_domain=
+offline=0 dry_run=0 skip_prerequisites=0 resume_public=0
 forward=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -43,9 +44,10 @@ while [[ $# -gt 0 ]]; do
     --offline) offline=1; forward+=(--offline); shift ;;
     --dry-run) dry_run=1; forward+=(--dry-run); shift ;;
     --skip-prerequisites) skip_prerequisites=1; shift ;;
-    --allow-downgrade) forward+=(--allow-downgrade); shift ;;
+    --resume-public) resume_public=1; shift ;;
+    --allow-downgrade) die "native bootstrap refuses --allow-downgrade" ;;
     --health-command|--health-cmd|--migration-command|--migration-dir|--database-dump-command|--database-restore-command)
-      [[ $# -gt 1 ]] || die "$1 requires a value"; [[ "$1" != "--migration-command" ]] || migration_command=$2; [[ "$1" != "--migration-dir" ]] || migration_dir=$2; forward+=("$1" "$2"); shift 2 ;;
+      die "native bootstrap refuses $1" ;;
     -h|--help) usage; exit 0 ;;
     *) die "unsupported option $1" ;;
   esac
@@ -61,7 +63,6 @@ if [[ -n "$debs_sha256" ]]; then [[ "$debs_sha256" = /* && -f "$debs_sha256" && 
 [[ "${OPEN_CARD_DEDICATED_HOST_CONFIRMATION:-}" = "OPEN-CARD-DEDICATED-HOST" ]] || die "production install requires OPEN_CARD_DEDICATED_HOST_CONFIRMATION=OPEN-CARD-DEDICATED-HOST"
 [[ "${OPEN_CARD_M6_ENABLED:-false}" != "true" && "${OPEN_CARD_AI_ENABLED:-false}" != "true" ]] || die "production installer refuses AI-enabled environment"
 [[ "$EUID" -eq 0 ]] || die "production installation requires root"
-[[ -n "$migration_command" && -n "$migration_dir" ]] || die "production install requires --migration-command and --migration-dir"
 management_activation=0
 if [[ -n "$admin_password_file" || -n "$auth_origin" || -n "$edge_domain" ]]; then
   [[ -n "$admin_password_file" && -n "$auth_origin" && -n "$edge_domain" ]] || die "Edge/auth activation requires --admin-password-file, --auth-origin, and --edge-domain together"
@@ -82,6 +83,10 @@ PY
   [[ "$edge_domain" = "$origin_host" ]] || die "--edge-domain must exactly match the HTTPS origin host"
   management_activation=1
 fi
+if (( resume_public )); then
+  (( management_activation )) || die "--resume-public requires administrator and Edge activation inputs"
+  (( ! dry_run )) || die "--resume-public cannot be combined with --dry-run"
+fi
 runtime_task_prefix=${OPEN_CARD_RUNTIME_TASK_PREFIX:-opencard-host}
 runtime_network=${OPEN_CARD_RUNTIME_NETWORK:-${runtime_task_prefix}-runtime-network}
 runtime_group_network=${OPEN_CARD_RUNTIME_GROUP_NETWORK:-${runtime_task_prefix}-group-network}
@@ -101,23 +106,28 @@ early_preflight_receipt=$("$script_dir/host-preflight.sh" --allow-prerequisites-
 printf '%s\n' "$early_preflight_receipt"
 post_preflight_receipt=
 
-if [[ -L /opt/open-card/current ]] && (( ! dry_run )); then
-  die "existing production installation requires upgrade.sh; root upgrades remain fail-closed pending atomic PostgreSQL restore support"
+if [[ -L /opt/open-card/current ]] && (( ! dry_run && ! resume_public )); then
+  die "existing production installation requires upgrade.sh or --resume-public"
+fi
+if (( resume_public )) && [[ ! -L /opt/open-card/current ]]; then
+  die "--resume-public requires an existing native activation"
 fi
 
-installer=("$script_dir/install.sh" --root / --activate --require-version 0.8.0-rc.2 --expected-manifest-sha256 "$expected")
+installer=("$script_dir/install.sh" --root / --stage-native-bootstrap --require-version 0.8.0-rc.2 --expected-manifest-sha256 "$expected")
 installer+=("${forward[@]}")
 preflight=("$script_dir/install.sh" --root / --dry-run --validate-activation-intent --require-version 0.8.0-rc.2 --expected-manifest-sha256 "$expected")
 preflight+=("${forward[@]}")
-"${preflight[@]}" >/tmp/open-card-install-host-preflight-$$.log 2>&1 || {
-  status=$?
-  cat "/tmp/open-card-install-host-preflight-$$.log" >&2 || true
+if (( ! resume_public )); then
+  "${preflight[@]}" >/tmp/open-card-install-host-preflight-$$.log 2>&1 || {
+    status=$?
+    cat "/tmp/open-card-install-host-preflight-$$.log" >&2 || true
+    rm -f -- "/tmp/open-card-install-host-preflight-$$.log"
+    exit "$status"
+  }
   rm -f -- "/tmp/open-card-install-host-preflight-$$.log"
-  exit "$status"
-}
-rm -f -- "/tmp/open-card-install-host-preflight-$$.log"
-if (( dry_run )); then
-  exit 0
+  if (( dry_run )); then
+    exit 0
+  fi
 fi
 
 require_command() { command -v "$1" >/dev/null 2>&1 || die "required command is missing: $1"; }
@@ -358,24 +368,11 @@ EOF
   fi
   if systemctl list-unit-files docker.service >/dev/null 2>&1; then systemctl enable --now docker.service; fi
   if systemctl list-unit-files postgresql.service >/dev/null 2>&1; then systemctl enable --now postgresql.service; fi
-  db_password_file=/etc/open-card/postgres-password
-  if [[ ! -f "$db_password_file" ]]; then openssl rand -hex 24 >"$db_password_file"; fi
-  chmod 0600 "$db_password_file"
-  db_password=$(cat "$db_password_file")
-  database_url="postgresql://opencard:$db_password@127.0.0.1:5432/opencard?sslmode=disable"
-  if systemctl is-active --quiet postgresql.service; then
-    runuser -u postgres -- psql -v ON_ERROR_STOP=1 <<SQL
-SELECT 'CREATE ROLE opencard LOGIN PASSWORD ''$db_password''' WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'opencard')\gexec
-SELECT 'CREATE DATABASE opencard OWNER opencard' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'opencard')\gexec
-SQL
-  else
-    die "PostgreSQL service is not active; refusing an unbound control plane"
+  systemctl is-active --quiet postgresql.service || die "PostgreSQL service is not active; refusing an unbound control plane"
+  if grep -q '^OPEN_CARD_DATABASE_URL=' /etc/open-card/server.env; then
+    die "fresh native bootstrap refuses global OPEN_CARD_DATABASE_URL in server.env"
   fi
-  if ! grep -q '^OPEN_CARD_DATABASE_URL=' /etc/open-card/server.env; then
-    printf 'OPEN_CARD_DATABASE_URL=%s\n' "$database_url" >>/etc/open-card/server.env
-  fi
-  export OPEN_CARD_DATABASE_URL="$database_url"
-  export DATABASE_URL="$database_url"
+  unset OPEN_CARD_DATABASE_URL DATABASE_URL
 fi
 if (( skip_prerequisites )); then
   post_preflight_receipt=$("$script_dir/host-preflight.sh" --post-prerequisites)
@@ -385,25 +382,44 @@ for command_name in docker psql runuser newuidmap newgidmap; do require_command 
 for command_path in /usr/lib/postgresql/16/bin/psql /usr/lib/postgresql/16/bin/pg_dump /usr/lib/postgresql/16/bin/pg_restore; do
   [[ -x "$command_path" && ! -L "$command_path" ]] || die "required PostgreSQL 16 tool is missing or unsafe: $command_path"
 done
+installation_id=/var/lib/open-card/installation-id
+if [[ ! -e "$installation_id" && ! -L "$installation_id" ]]; then openssl rand -hex 24 >"$installation_id"; fi
+[[ -f "$installation_id" && ! -L "$installation_id" ]] || die "installation id is unsafe"
+chown root:root "$installation_id" && chmod 0600 "$installation_id"
+installation_value=$(cat -- "$installation_id")
+[[ "$installation_value" =~ ^[0-9a-f]{48}$ ]] || die "installation id is invalid"
 
-# Gate 6 capacity profile is an exact replay-only helper contract.
-capacity_receipt=$("$script_dir/buildkit-production-capacity.sh" install)
-capacity_created=0
-[[ "$capacity_receipt" = '{"status":"created"}' ]] && capacity_created=1
-[[ "$capacity_receipt" = '{"status":"created"}' || "$capacity_receipt" = '{"status":"existing"}' ]] || die "BuildKit production capacity helper failed"
-capacity_rollback() {
-  local status=$?
-  if (( status != 0 && capacity_created == 1 )); then
-    "$script_dir/buildkit-production-capacity.sh" remove >/dev/null 2>&1 || true
-    /usr/bin/systemctl daemon-reload >/dev/null 2>&1 || true
+if (( ! resume_public )); then
+  # Gate 6 capacity profile is an exact replay-only helper contract.
+  capacity_receipt=$("$script_dir/buildkit-production-capacity.sh" install)
+  capacity_created=0
+  [[ "$capacity_receipt" = '{"status":"created"}' ]] && capacity_created=1
+  [[ "$capacity_receipt" = '{"status":"created"}' || "$capacity_receipt" = '{"status":"existing"}' ]] || die "BuildKit production capacity helper failed"
+  capacity_rollback() {
+    local status=$?
+    if (( status != 0 && capacity_created == 1 )); then
+      "$script_dir/buildkit-production-capacity.sh" remove >/dev/null 2>&1 || true
+      /usr/bin/systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+    return "$status"
+  }
+  trap capacity_rollback EXIT
+  /usr/bin/systemctl daemon-reload || die "BuildKit capacity daemon-reload failed"
+
+  "${installer[@]}"
+  [[ -f /etc/open-card/server.env && ! -L /etc/open-card/server.env ]] || die "server.env is missing or unsafe"
+  if grep -q '^OPEN_CARD_DATABASE_URL=' /etc/open-card/server.env; then
+    die "fresh native bootstrap refuses global OPEN_CARD_DATABASE_URL in server.env"
   fi
-  return "$status"
-}
-trap capacity_rollback EXIT
-/usr/bin/systemctl daemon-reload || die "BuildKit capacity daemon-reload failed"
-
-"${installer[@]}"
-trap - EXIT
+  unset OPEN_CARD_DATABASE_URL DATABASE_URL
+  /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C LC_ALL=C /opt/open-card/upgrade-tools/open-card-upgrade prepare-bootstrap --expected-manifest-sha256 "$expected"
+  /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C LC_ALL=C /opt/open-card/upgrade-tools/open-card-upgrade prepare-control
+  /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C LC_ALL=C /opt/open-card/upgrade-tools/open-card-upgrade bootstrap-native --expected-manifest-sha256 "$expected" --confirm-installation-id "BOOTSTRAP:$installation_value"
+  trap - EXIT
+else
+  /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C LC_ALL=C /opt/open-card/upgrade-tools/open-card-upgrade bootstrap-verify --expected-manifest-sha256 "$expected" --confirm-installation-id "BOOTSTRAP:$installation_value"
+  /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C LC_ALL=C /opt/open-card/upgrade-tools/open-card-upgrade bootstrap-native --expected-manifest-sha256 "$expected" --confirm-installation-id "BOOTSTRAP:$installation_value"
+fi
 [[ -n "$post_preflight_receipt" ]] || die "post-prerequisite host preflight receipt is missing"
 python3 - /var/lib/open-card/evidence/host-preflight.json "$post_preflight_receipt" <<'PY'
 import json, os, stat, sys, tempfile
@@ -442,10 +458,6 @@ finally:
     try: os.unlink(temporary)
     except FileNotFoundError: pass
 PY
-installation_id=/var/lib/open-card/installation-id
-if [[ ! -e "$installation_id" ]]; then openssl rand -hex 24 >"$installation_id"; fi
-[[ -f "$installation_id" && ! -L "$installation_id" ]] || die "installation id is unsafe"
-chown root:root "$installation_id" && chmod 0600 "$installation_id"
 static_binary=/opt/open-card/current/bin/open-card-static-server
 if [[ -x "$static_binary" ]]; then
   if command -v sha256sum >/dev/null 2>&1; then static_digest="sha256:$(sha256sum -- "$static_binary" | awk '{print $1}')"; else static_digest="sha256:$(shasum -a 256 -- "$static_binary" | awk '{print $1}')"; fi
@@ -480,6 +492,10 @@ if (( management_activation )); then
     return "$status"
   }
   trap activation_rollback EXIT
+  # Bootstrap the administrator against the committed active database before
+  # any public listener or route is published. Edge is still running only the
+  # fixed loopback-safe configuration prepared by the Go helper.
+  /opt/open-card/current/bin/open-card-admin bootstrap --password-file "$admin_password_file"
   set_env_line /etc/open-card/server.env OPEN_CARD_AUTH_ORIGIN "$auth_origin"
   python3 - "/opt/open-card/current/caddy/open-card-edge.Caddyfile.example" /etc/open-card/.open-card-edge.Caddyfile.next "$edge_domain" <<'PY'
 import pathlib, sys
@@ -495,13 +511,11 @@ PY
   /opt/open-card/current/bin/caddy validate --config /etc/open-card/open-card-edge.Caddyfile --adapter caddyfile
   /opt/open-card/current/bin/caddy adapt --config /etc/open-card/open-card-edge.Caddyfile --adapter caddyfile --validate >/dev/null
   systemctl restart open-card-server.service
-  systemctl enable --now open-card-edge.service
-  # Bootstrap is intentionally last: earlier Edge/config/service failures can
-  # roll back without creating a credential that would block a retry.
-  /opt/open-card/current/bin/open-card-admin bootstrap --password-file "$admin_password_file"
+  systemctl reload open-card-edge.service
+  systemctl is-active --quiet open-card-edge.service || die "public Edge reload did not remain active"
   activation_committed=1
   trap - EXIT
 else
-  systemctl disable --now open-card-edge.service >/dev/null 2>&1 || true
-  echo "open-card install-host: core release staged; administrator HTTP and public Edge remain inactive until explicit password-file and HTTPS origin activation"
+  echo "open-card install-host: native release committed; loopback-safe Edge remains active and public routes stay absent until explicit password-file and HTTPS origin activation"
 fi
+/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C LC_ALL=C /opt/open-card/upgrade-tools/open-card-upgrade bootstrap-finalize --expected-manifest-sha256 "$expected" --confirm-installation-id "BOOTSTRAP:$installation_value"
