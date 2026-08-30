@@ -1,6 +1,7 @@
 package install
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -51,6 +52,27 @@ type BootstrapDatabaseResult struct {
 	RuntimeDatabaseEnvSHA256      string     `json:"runtime_database_env_sha256"`
 	ControlDatabaseIdentitySHA256 string     `json:"control_database_identity_sha256"`
 	RecoveryEvidenceSHA256        string     `json:"recovery_evidence_sha256"`
+}
+
+// BootstrapCandidateDatabase is the pre-migration identity persisted by the
+// CANDIDATE_DB_CREATED transition. DatabaseEnv remains secret in-memory data.
+type BootstrapCandidateDatabase struct {
+	Name                          string `json:"name"`
+	DatabaseEnv                   []byte `json:"-"`
+	RuntimeDatabaseEnvSHA256      string `json:"runtime_database_env_sha256"`
+	ControlDatabaseIdentitySHA256 string `json:"control_database_identity_sha256"`
+	RecoveryEvidenceSHA256        string `json:"recovery_evidence_sha256"`
+}
+
+func (c BootstrapCandidateDatabase) Validate() error {
+	if !candidateDatabaseName.MatchString(c.Name) || !validSHA(c.RuntimeDatabaseEnvSHA256) || !validSHA(c.ControlDatabaseIdentitySHA256) || !validSHA(c.RecoveryEvidenceSHA256) {
+		return errors.New("invalid bootstrap candidate database")
+	}
+	env, err := PostgresEnvironment(c.DatabaseEnv)
+	if err != nil || env.Descriptor.Database != c.Name {
+		return errors.New("invalid bootstrap candidate database")
+	}
+	return nil
 }
 
 func (r BootstrapDatabaseResult) Validate() error {
@@ -160,29 +182,68 @@ func (b *BootstrapDatabase) Close() error {
 	return closeFn()
 }
 
-// Provision creates/replays the exact candidate database and proves its
-// complete 0001..0024 ledger. It never exposes a destructive/drop operation.
-func (b *BootstrapDatabase) Provision(ctx context.Context) (BootstrapDatabaseResult, error) {
-	if b == nil || b.input.Validate() != nil || ctx.Err() != nil {
-		return BootstrapDatabaseResult{}, ErrPostgresOutcomeUnknown
+func (b *BootstrapDatabase) candidateIdentity() (BootstrapCandidateDatabase, error) {
+	if b == nil || b.input.Validate() != nil {
+		return BootstrapCandidateDatabase{}, ErrPostgresOutcomeUnknown
 	}
 	name, err := CandidateDatabaseName(b.input.CandidateActivationID)
 	if err != nil {
-		return BootstrapDatabaseResult{}, ErrPostgresOutcomeUnknown
+		return BootstrapCandidateDatabase{}, ErrPostgresOutcomeUnknown
 	}
 	candidateEnv, err := CandidateDatabaseEnv(b.runtimeEnv, name)
 	if err != nil {
+		return BootstrapCandidateDatabase{}, ErrPostgresOutcomeUnknown
+	}
+	identity := BootstrapCandidateDatabase{Name: name, DatabaseEnv: candidateEnv, RuntimeDatabaseEnvSHA256: b.runtimeSHA, ControlDatabaseIdentitySHA256: b.controlSHA, RecoveryEvidenceSHA256: bootstrapRecoveryEvidence(b.input, name, b.runtimeSHA, b.controlSHA)}
+	if identity.Validate() != nil {
+		return BootstrapCandidateDatabase{}, ErrPostgresOutcomeUnknown
+	}
+	return identity, nil
+}
+
+// Create verifies the complete RC2 migration payload before creating or
+// replaying the exact owner/comment-bound candidate database.
+func (b *BootstrapDatabase) Create(ctx context.Context) (BootstrapCandidateDatabase, error) {
+	if b == nil || b.input.Validate() != nil || ctx.Err() != nil {
+		return BootstrapCandidateDatabase{}, ErrPostgresOutcomeUnknown
+	}
+	identity, err := b.candidateIdentity()
+	if err != nil {
+		return BootstrapCandidateDatabase{}, err
+	}
+	migrations, err := b.load()
+	if err != nil || migrations.Validate() != nil {
+		return BootstrapCandidateDatabase{}, ErrPostgresOutcomeUnknown
+	}
+	if _, err := CreateCandidate(ctx, b.control, CreateCandidateRequest{ActivationID: b.input.CandidateActivationID, ExpectedExistingName: identity.Name, ExpectedExistingOwner: b.runtimeRole, RecoveryEvidence: identity.RecoveryEvidenceSHA256}); err != nil {
+		return BootstrapCandidateDatabase{}, bootstrapDatabaseError(err)
+	}
+	return identity, nil
+}
+
+// Migrate requires the exact candidate identity returned by Create and proves
+// that the database still exists with the same owner/comment before applying
+// any SQL. A missing database is drift, never an invitation to recreate it.
+func (b *BootstrapDatabase) Migrate(ctx context.Context, candidate BootstrapCandidateDatabase) (BootstrapDatabaseResult, error) {
+	if b == nil || ctx.Err() != nil || candidate.Validate() != nil {
 		return BootstrapDatabaseResult{}, ErrPostgresOutcomeUnknown
 	}
-	evidence := bootstrapRecoveryEvidence(b.input, name, b.runtimeSHA, b.controlSHA)
+	expected, err := b.candidateIdentity()
+	if err != nil || !sameBootstrapCandidateDatabase(expected, candidate) {
+		return BootstrapDatabaseResult{}, ErrCandidateConflict
+	}
 	migrations, err := b.load()
 	if err != nil || migrations.Validate() != nil {
 		return BootstrapDatabaseResult{}, ErrPostgresOutcomeUnknown
 	}
-	if _, err := CreateCandidate(ctx, b.control, CreateCandidateRequest{ActivationID: b.input.CandidateActivationID, ExpectedExistingName: name, ExpectedExistingOwner: b.runtimeRole, RecoveryEvidence: evidence}); err != nil {
-		return BootstrapDatabaseResult{}, bootstrapDatabaseError(err)
+	actual, err := b.control.CandidateEvidence(ctx, candidate.Name)
+	if err != nil {
+		return BootstrapDatabaseResult{}, ErrPostgresOutcomeUnknown
 	}
-	ledger, err := b.open(name)
+	if !actual.Exists || actual.Owner != b.runtimeRole || actual.Evidence != candidateDatabaseEvidence(candidate.RecoveryEvidenceSHA256) {
+		return BootstrapDatabaseResult{}, ErrCandidateConflict
+	}
+	ledger, err := b.open(candidate.Name)
 	if err != nil || ledger == nil {
 		return BootstrapDatabaseResult{}, ErrPostgresOutcomeUnknown
 	}
@@ -198,11 +259,26 @@ func (b *BootstrapDatabase) Provision(ctx context.Context) (BootstrapDatabaseRes
 	if err != nil || proof.To != CurrentMigrationVersion || !validSHA(proof.RowsSHA256) {
 		return BootstrapDatabaseResult{}, ErrPostgresOutcomeUnknown
 	}
-	result := BootstrapDatabaseResult{Database: DatabaseV1{Name: name, Migration: CurrentMigrationVersion, SchemaMigrationsSHA256: proof.RowsSHA256}, DatabaseEnv: candidateEnv, CandidateDatabaseName: name, RuntimeDatabaseEnvSHA256: b.runtimeSHA, ControlDatabaseIdentitySHA256: b.controlSHA, RecoveryEvidenceSHA256: evidence}
+	result := BootstrapDatabaseResult{Database: DatabaseV1{Name: candidate.Name, Migration: CurrentMigrationVersion, SchemaMigrationsSHA256: proof.RowsSHA256}, DatabaseEnv: append([]byte(nil), candidate.DatabaseEnv...), CandidateDatabaseName: candidate.Name, RuntimeDatabaseEnvSHA256: candidate.RuntimeDatabaseEnvSHA256, ControlDatabaseIdentitySHA256: candidate.ControlDatabaseIdentitySHA256, RecoveryEvidenceSHA256: candidate.RecoveryEvidenceSHA256}
 	if result.Validate() != nil {
 		return BootstrapDatabaseResult{}, ErrPostgresOutcomeUnknown
 	}
 	return result, nil
+}
+
+func sameBootstrapCandidateDatabase(left, right BootstrapCandidateDatabase) bool {
+	return left.Name == right.Name && bytes.Equal(left.DatabaseEnv, right.DatabaseEnv) && left.RuntimeDatabaseEnvSHA256 == right.RuntimeDatabaseEnvSHA256 && left.ControlDatabaseIdentitySHA256 == right.ControlDatabaseIdentitySHA256 && left.RecoveryEvidenceSHA256 == right.RecoveryEvidenceSHA256
+}
+
+// Provision is a convenience composition for task tests and callers that do
+// not need to persist the intermediate state. The bootstrap engine uses the
+// split Create/Migrate methods.
+func (b *BootstrapDatabase) Provision(ctx context.Context) (BootstrapDatabaseResult, error) {
+	candidate, err := b.Create(ctx)
+	if err != nil {
+		return BootstrapDatabaseResult{}, err
+	}
+	return b.Migrate(ctx, candidate)
 }
 
 func ledgerClose(value BootstrapMigrationControl) {

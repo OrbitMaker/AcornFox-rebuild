@@ -15,6 +15,7 @@ type bootstrapCandidateFake struct {
 	exists          bool
 	evidence, owner string
 	created         string
+	createCalls     int
 	createErr       error
 }
 
@@ -22,11 +23,43 @@ func (f *bootstrapCandidateFake) CandidateEvidence(_ context.Context, _ string) 
 	return CandidateDatabaseIdentity{Exists: f.exists, Evidence: f.evidence, Owner: f.owner}, nil
 }
 func (f *bootstrapCandidateFake) CreateCandidate(_ context.Context, name, evidence string) error {
+	f.createCalls++
 	if f.createErr != nil {
 		return f.createErr
 	}
 	f.created, f.exists, f.owner, f.evidence = name, true, "opencard", candidateDatabaseEvidence(evidence)
 	return nil
+}
+
+func TestBootstrapDatabasePersistsCreateBeforeMigration(t *testing.T) {
+	release, root := bootstrapRC2Release(t)
+	migrations, err := LoadTaskBootstrapMigrations(root, os.Getuid(), os.Getgid(), release)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidateControl := &bootstrapCandidateFake{}
+	ledger := &bootstrapLedgerFake{}
+	service, err := TaskBootstrapDatabase(bootstrapInput(release), bootstrapRuntimeEnv(t), strings.Repeat("c", 64), candidateControl, "opencard", func(string) (BootstrapMigrationControl, error) { return ledger, nil }, func() (BootstrapMigrations, error) { return migrations, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := service.Create(context.Background())
+	if err != nil || candidateControl.createCalls != 1 || !candidateControl.exists || len(ledger.rows) != 0 || len(ledger.lastSQL) != 0 {
+		t.Fatalf("create boundary candidate=%+v control=%+v rows=%d sql=%d err=%v", candidate, candidateControl, len(ledger.rows), len(ledger.lastSQL), err)
+	}
+	encoded, err := json.Marshal(candidate)
+	if err != nil || strings.Contains(string(encoded), "postgresql://") || strings.Contains(string(encoded), "bootstrap-password-sentinel") {
+		t.Fatalf("candidate identity leaked environment: %s %v", encoded, err)
+	}
+	result, err := service.Migrate(context.Background(), candidate)
+	if err != nil || len(ledger.rows) != 24 || result.Database.Name != candidate.Name {
+		t.Fatalf("migrate result=%+v rows=%d err=%v", result, len(ledger.rows), err)
+	}
+	candidateControl.exists = false
+	beforeCalls := candidateControl.createCalls
+	if _, err := service.Migrate(context.Background(), candidate); !errors.Is(err, ErrCandidateConflict) || candidateControl.createCalls != beforeCalls {
+		t.Fatalf("missing journaled candidate was recreated: calls=%d err=%v", candidateControl.createCalls, err)
+	}
 }
 
 type bootstrapLedgerFake struct {
