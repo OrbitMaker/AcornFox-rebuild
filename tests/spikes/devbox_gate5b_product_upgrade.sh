@@ -195,9 +195,10 @@ sudo -n virsh autostart "$domain" --disable >/dev/null
 REMOTE_CREATE
 
 COPYFILE_DISABLE=1 tar -C "$local_tmp" -cf - clean_worker_gate5b_product_guest.sh devbox_gate5b_product_upgrade.sh candidates source-commit.txt source-manifest.sha256 harness-binding.txt harness-commit.txt | ssh -o BatchMode=yes -o ConnectTimeout=15 "$remote" "sudo -n tar -C '$task/source' -xf -"
-ssh -o BatchMode=yes -o ConnectTimeout=15 "$remote" "bash -s -- '$network' '$task' '$prefix'" <<'REMOTE_GUEST'
+ssh -o BatchMode=yes -o ConnectTimeout=15 "$remote" "bash -s -- '$network' '$task' '$prefix' '$scenario'" <<'REMOTE_GUEST'
 set -Eeuo pipefail
-network=$1 task=$2 prefix=$3
+network=$1 task=$2 prefix=$3 scenario=$4
+[[ "$scenario" == success || "$scenario" == active-switch-crash ]]
 for _ in $(seq 1 240); do
   ip=$(sudo -n virsh net-dhcp-leases "$network" 2>/dev/null | awk '/ipv4/ {sub(/\/.*/,"",$5); print $5; exit}')
   if [[ -n "${ip:-}" && ! -s "$task/known_hosts" ]]; then sudo -n ssh-keyscan -T 3 -t ed25519 "$ip" 2>/dev/null | sudo -n tee "$task/known_hosts" >/dev/null || true; sudo -n chmod 0600 "$task/known_hosts"; fi
