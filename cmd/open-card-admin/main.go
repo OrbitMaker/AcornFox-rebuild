@@ -35,6 +35,10 @@ type adminValidationFunc func(commandConfig, install.ActiveDatabase) error
 type adminResolveFunc func(commandConfig) (install.ActiveDatabase, error)
 type adminLstatFunc func(string) (os.FileInfo, error)
 
+var newAdminAuthService = func(store *postgres.Store) (*auth.Service, error) {
+	return auth.NewService(auth.Config{Store: store})
+}
+
 func main() {
 	if err := runWithEUID(os.Args[1:], os.Stderr, os.Geteuid); err != nil {
 		fmt.Fprintln(os.Stderr, "open-card-admin:", err)
@@ -145,11 +149,7 @@ func resolveActiveDatabase(config commandConfig) (install.ActiveDatabase, error)
 }
 
 func applyCredential(ctx context.Context, store *postgres.Store, command string, password []byte, now time.Time) error {
-	service, err := auth.NewService(auth.Config{Store: store})
-	if err != nil {
-		return err
-	}
-	hash, err := service.HashPassword(string(password))
+	service, err := newAdminAuthService(store)
 	if err != nil {
 		return err
 	}
@@ -160,7 +160,19 @@ func applyCredential(ctx context.Context, store *postgres.Store, command string,
 			return fmt.Errorf("inspect administrator records: %w", err)
 		}
 		if exists {
-			return errors.New("administrator already exists; bootstrap is refused")
+			credential, credentialErr := store.ActiveAdminCredential(ctx)
+			if credentialErr != nil || credential.PasswordHashScheme != auth.PasswordHashScheme {
+				return errors.New("administrator already exists; bootstrap is refused")
+			}
+			matches, verifyErr := service.VerifyPasswordHash(string(password), credential.PasswordHash)
+			if verifyErr != nil || !matches {
+				return errors.New("administrator already exists; bootstrap is refused")
+			}
+			return nil
+		}
+		hash, err := service.HashPassword(string(password))
+		if err != nil {
+			return err
 		}
 		id, err := domain.NewID("admin")
 		if err != nil {
@@ -170,6 +182,10 @@ func applyCredential(ctx context.Context, store *postgres.Store, command string,
 			return err
 		}
 	case "reset-password":
+		hash, err := service.HashPassword(string(password))
+		if err != nil {
+			return err
+		}
 		credential, err := store.ActiveAdminCredential(ctx)
 		if err != nil {
 			if errors.Is(err, postgres.ErrNotFound) {

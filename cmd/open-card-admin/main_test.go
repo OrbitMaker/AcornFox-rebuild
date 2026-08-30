@@ -18,6 +18,10 @@ import (
 	"github.com/open-card/open-card/internal/persistence/postgres"
 )
 
+type adminFailReader struct{}
+
+func (adminFailReader) Read([]byte) (int, error) { return 0, errors.New("entropy unavailable") }
+
 type ownerOverrideInfo struct {
 	os.FileInfo
 	stat syscall.Stat_t
@@ -287,6 +291,14 @@ func TestAdminBootstrapAndResetOnTaskScopedPostgres(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
 	if err := applyCredential(ctx, store, "bootstrap", []byte("bootstrap correct horse battery staple 123"), now); err != nil {
 		t.Fatal(err)
+	}
+	originalService := newAdminAuthService
+	newAdminAuthService = func(store *postgres.Store) (*auth.Service, error) {
+		return auth.NewService(auth.Config{Store: store, Random: adminFailReader{}})
+	}
+	t.Cleanup(func() { newAdminAuthService = originalService })
+	if err := applyCredential(ctx, store, "bootstrap", []byte("bootstrap correct horse battery staple 123"), now.Add(time.Second)); err != nil {
+		t.Fatalf("exact bootstrap replay failed: %v", err)
 	}
 	if err := applyCredential(ctx, store, "bootstrap", []byte("another correct horse battery staple 456"), now); err == nil {
 		t.Fatal("second bootstrap was accepted")

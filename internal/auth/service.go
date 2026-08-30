@@ -265,6 +265,18 @@ func (s *Service) HashPassword(password string) (string, error) {
 	return fmt.Sprintf("$%s$i=%d,l=%d$%s$%s", PasswordHashPrefix, s.iterations, pbkdf2KeyBytes, base64.RawURLEncoding.EncodeToString(salt), base64.RawURLEncoding.EncodeToString(key)), nil
 }
 
+// VerifyPasswordHash is a pure credential-replay check used by the root-only
+// bootstrap command. It neither creates a session nor touches rate limits.
+func (s *Service) VerifyPasswordHash(password, encoded string) (bool, error) {
+	if s == nil {
+		return false, ErrAuthenticationUnavailable
+	}
+	if err := validatePassword(password); err != nil {
+		return false, err
+	}
+	return verifyPassword(password, encoded, s.minIterations)
+}
+
 func (s *Service) recordLoginFailure(ctx context.Context, adminID domain.ID, source domain.AuthDigest, now time.Time) error {
 	record, err := s.store.AdminLoginRateLimit(ctx, adminID, source)
 	if err != nil && !errors.Is(err, postgres.ErrNotFound) {
