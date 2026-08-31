@@ -638,7 +638,7 @@ def verify_n_minus_one_candidate_root(
             raise ProductionBuildError("N-1 release validation failed")
         record, metadata = load_strict_json(root / "build-record.json", "N-1 build record"), load_strict_json(root / "production-bundle.json", "N-1 bundle metadata")
         candidate = record.get("candidate")
-        predecessor_certification = {"certification_sha256": RC2_CERTIFICATION_SHA256, "release_index_sha256": RC2_RELEASE_INDEX_SHA256}
+        predecessor_certification = {"certification_sha256": RC1_CERTIFICATION_SHA256, "release_index_sha256": RC1_RELEASE_INDEX_SHA256}
         if record.get("production_accepted") is not False or not isinstance(candidate, dict) or (candidate.get("version"), candidate.get("migration_version"), candidate.get("architecture"), candidate.get("source_commit")) != (predecessor.version, predecessor.migration, arch, predecessor_source) or metadata.get("production_accepted") is not False or metadata.get("candidate_status") != "upgrade_candidate" or (predecessor_version == RC2_SPEC.version and (record.get("predecessor_certification") != predecessor_certification or metadata.get("predecessor_certification") != predecessor_certification)):
             raise ProductionBuildError("N-1 candidate metadata is invalid")
         return NMinusOneEvidence(root.resolve(), release.resolve(), arch, predecessor.version, predecessor.migration, predecessor_source, manifest_digest, archive_digest, bundle_digest)

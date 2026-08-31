@@ -259,6 +259,68 @@ class ProductionBuildTests(unittest.TestCase):
         with mock.patch.multiple(tool, **pins):
             yield
 
+    def rc2_n_minus_one_candidate(self, tool, root: Path) -> tuple[Path, dict[str, dict[str, str]]]:
+        candidate = root / "rc2-n-minus-one"
+        release = candidate / "release"
+        payload = release / "payload/file"
+        payload.parent.mkdir(parents=True)
+        payload.write_bytes(b"rc2 payload")
+        payload.chmod(0o644)
+        manifest = {
+            "version": tool.RC2_SPEC.version,
+            "migration_version": tool.RC2_SPEC.migration,
+            "architecture": "amd64",
+            "source_commit": tool.RC2_SOURCE_COMMIT,
+            "n_minus_one": {
+                "version": tool.RC1_SPEC.version,
+                "migration_version": tool.RC1_SPEC.migration,
+                "source_commit": tool.RC1_SOURCE_COMMIT,
+                **tool.RC1_LINEAGES["amd64"],
+            },
+            "files": [{"path": "payload/file", "sha256": digest(payload), "mode": 0o644}],
+        }
+        manifest_path = release / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+        manifest_path.chmod(0o644)
+        archive = candidate / f"open-card-{tool.RC2_SPEC.version}-production.tar.gz"
+        archive.write_bytes(b"rc2 archive")
+        archive.chmod(0o644)
+        bundle = candidate / "bundle-manifest.sha256"
+        bundle.write_text(f"{digest(archive)}  {archive.name}\n{digest(manifest_path)}  release/manifest.json\n", encoding="utf-8")
+        bundle.chmod(0o640)
+        pinned = {
+            "version": tool.RC2_SPEC.version,
+            "migration_version": tool.RC2_SPEC.migration,
+            "source_commit": tool.RC2_SOURCE_COMMIT,
+            "release_manifest_sha256": digest(manifest_path),
+            "archive_sha256": digest(archive),
+            "bundle_manifest_sha256": digest(bundle),
+        }
+        predecessor = {"certification_sha256": tool.RC1_CERTIFICATION_SHA256, "release_index_sha256": tool.RC1_RELEASE_INDEX_SHA256}
+        record = {"production_accepted": False, "candidate": {"version": tool.RC2_SPEC.version, "migration_version": tool.RC2_SPEC.migration, "architecture": "amd64", "source_commit": tool.RC2_SOURCE_COMMIT}, "predecessor_certification": predecessor}
+        metadata = {"production_accepted": False, "candidate_status": "upgrade_candidate", "predecessor_certification": predecessor, "n_minus_one": {"version": tool.RC1_SPEC.version, "migration_version": tool.RC1_SPEC.migration, "source_commit": tool.RC1_SOURCE_COMMIT, "status": "verified_local_candidate", "release_embedded": False, "manifest_sha256": tool.RC1_LINEAGES["amd64"]["release_manifest_sha256"], "archive_sha256": tool.RC1_LINEAGES["amd64"]["archive_sha256"], "bundle_manifest_sha256": tool.RC1_LINEAGES["amd64"]["bundle_manifest_sha256"]}}
+        (candidate / "build-record.json").write_text(json.dumps(record), encoding="utf-8")
+        (candidate / "build-record.json").chmod(0o640)
+        (candidate / "production-bundle.json").write_text(json.dumps(metadata), encoding="utf-8")
+        (candidate / "production-bundle.json").chmod(0o640)
+        return candidate, {"amd64": pinned, "arm64": tool.RC2_LINEAGES["arm64"]}
+
+    def test_rc2_n_minus_one_uses_its_embedded_rc1_certification_not_rc2_self_evidence(self) -> None:
+        tool = load_tool()
+        with tempfile.TemporaryDirectory() as raw:
+            candidate, lineages = self.rc2_n_minus_one_candidate(tool, Path(raw))
+            with mock.patch.object(tool, "RC2_LINEAGES", lineages):
+                evidence = tool.verify_n_minus_one_candidate_root(candidate, predecessor_version=tool.RC2_SPEC.version)
+            self.assertEqual(evidence.source_commit, tool.RC2_SOURCE_COMMIT)
+            for name in ("build-record.json", "production-bundle.json"):
+                path = candidate / name
+                value = json.loads(path.read_text(encoding="utf-8"))
+                value["predecessor_certification"] = {"certification_sha256": tool.RC2_CERTIFICATION_SHA256, "release_index_sha256": tool.RC2_RELEASE_INDEX_SHA256}
+                path.write_text(json.dumps(value), encoding="utf-8")
+            with mock.patch.object(tool, "RC2_LINEAGES", lineages):
+                with self.assertRaisesRegex(tool.ProductionBuildError, "candidate metadata"):
+                    tool.verify_n_minus_one_candidate_root(candidate, predecessor_version=tool.RC2_SPEC.version)
+
     def test_n_minus_one_candidate_is_complete_and_returns_frozen_evidence(self) -> None:
         tool = load_tool()
         with tempfile.TemporaryDirectory() as raw:
