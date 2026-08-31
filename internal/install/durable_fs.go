@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 )
 
@@ -92,6 +93,31 @@ type DurableWriter struct {
 	gid      int
 	rootPath string
 	rootInfo os.FileInfo
+}
+
+// DurableLock is an advisory process lock opened below a DurableWriter's
+// pinned root descriptor. It owns no path and can only be released.
+type DurableLock struct {
+	mu   sync.Mutex
+	file *os.File
+}
+
+func (l *DurableLock) Release() error {
+	if l == nil {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.file == nil {
+		return nil
+	}
+	file := l.file
+	l.file = nil
+	first := syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+	if err := file.Close(); err != nil && first == nil {
+		first = err
+	}
+	return first
 }
 
 func ProductionDurableWriter(root string) (*DurableWriter, error) {
@@ -271,6 +297,62 @@ func (w *DurableWriter) Close() error {
 	w.ops = nil
 	w.rootInfo = nil
 	return ops.Close()
+}
+
+// AcquireMetadataLock opens one single-component lock file through the pinned
+// root descriptor, verifies its exact inode/mode/owner, synchronizes a newly
+// created entry, and holds a nonblocking exclusive flock until Release.
+// Callers cannot supply a nested path or recover the underlying descriptor.
+func (w *DurableWriter) AcquireMetadataLock(name string) (*DurableLock, error) {
+	if w == nil || w.ops == nil || w.VerifyLiveRoot() != nil || cleanRelative(name) != nil || strings.Contains(filepath.ToSlash(name), "/") {
+		return nil, fmt.Errorf("durable lock path is unsafe")
+	}
+	if existing, err := w.ops.Lstat(name); err == nil {
+		if existing.Mode()&os.ModeSymlink != 0 || verifyDurableFile(existing, w.uid, w.gid) != nil {
+			return nil, fmt.Errorf("durable lock file is unsafe")
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	file, err := w.ops.OpenFile(name, os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW, durableFileMode)
+	if err != nil {
+		return nil, err
+	}
+	locked := false
+	defer func() {
+		if !locked {
+			_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+			_ = w.ops.CloseFile(file)
+		}
+	}()
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		return nil, err
+	}
+	if err := w.ops.Chmod(file, durableFileMode); err != nil {
+		return nil, err
+	}
+	if err := w.ops.Chown(file, w.uid, w.gid); err != nil {
+		return nil, err
+	}
+	info, err := w.ops.Stat(file)
+	if err != nil || verifyDurableFile(info, w.uid, w.gid) != nil {
+		return nil, fmt.Errorf("durable lock file is unsafe")
+	}
+	leaf, err := w.ops.Lstat(name)
+	if err != nil || leaf.Mode()&os.ModeSymlink != 0 || verifyDurableFile(leaf, w.uid, w.gid) != nil || !os.SameFile(info, leaf) {
+		return nil, fmt.Errorf("durable lock file identity changed")
+	}
+	if err := w.ops.Sync(file); err != nil {
+		return nil, err
+	}
+	if err := w.SyncRoot(); err != nil {
+		return nil, err
+	}
+	if err := w.VerifyLiveRoot(); err != nil {
+		return nil, err
+	}
+	locked = true
+	return &DurableLock{file: file}, nil
 }
 
 func (w *DurableWriter) WriteMetadata(name string, value []byte) error {

@@ -57,6 +57,94 @@ func TestDurableWriterRejectsLiveRootReplacement(t *testing.T) {
 	}
 }
 
+func TestDurableMetadataLockIsPinnedExclusiveAndRejectsReplacement(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, durableDirMode); err != nil {
+		t.Fatal(err)
+	}
+	firstWriter, err := TaskDurableWriter(root, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer firstWriter.Close()
+	secondWriter, err := TaskDurableWriter(root, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer secondWriter.Close()
+	lock, err := firstWriter.AcquireMetadataLock("health.lock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := secondWriter.AcquireMetadataLock("health.lock"); err == nil {
+		t.Fatal("concurrent durable lock acquired")
+	}
+	if err := lock.Release(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := secondWriter.AcquireMetadataLock("health.lock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.Release(); err != nil {
+		t.Fatal(err)
+	}
+
+	moved := root + "-moved"
+	if err := os.Rename(root, moved); err != nil {
+		t.Fatal(err)
+	}
+	replacement := t.TempDir()
+	if err := os.Symlink(replacement, root); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := firstWriter.AcquireMetadataLock("replacement.lock"); err == nil {
+		t.Fatal("lock acquired after live root replacement")
+	}
+	if _, err := os.Lstat(filepath.Join(replacement, "replacement.lock")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("replacement root received lock side effect: %v", err)
+	}
+}
+
+func TestDurableMetadataLockRejectsUnsafeLeaf(t *testing.T) {
+	for name, prepare := range map[string]func(*testing.T, string){
+		"symlink": func(t *testing.T, root string) {
+			if err := os.Symlink("target", filepath.Join(root, "health.lock")); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"wrong-mode": func(t *testing.T, root string) {
+			path := filepath.Join(root, "health.lock")
+			if err := os.WriteFile(path, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(path, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			if err := os.Chmod(root, durableDirMode); err != nil {
+				t.Fatal(err)
+			}
+			prepare(t, root)
+			writer, err := TaskDurableWriter(root, os.Getuid(), os.Getgid())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer writer.Close()
+			if _, err := writer.AcquireMetadataLock("health.lock"); err == nil {
+				t.Fatal("unsafe durable lock leaf accepted")
+			}
+		})
+	}
+	w, _ := faultWriter(t, "owner-mismatch", true)
+	if _, err := w.AcquireMetadataLock("owner.lock"); err == nil {
+		t.Fatal("durable lock accepted injected owner mismatch")
+	}
+}
+
 func TestChildWriterKeepsPinnedParentIdentity(t *testing.T) {
 	w, root := taskWriter(t)
 	if err := os.Chmod(filepath.Join(root, "activations"), activationSlotDirMode); err != nil {
