@@ -233,6 +233,8 @@ type postgresRows interface {
 }
 type postgresResult interface{}
 type postgresTx interface {
+	QueryRowContext(context.Context, string, ...any) postgresRow
+	QueryContext(context.Context, string, ...any) (postgresRows, error)
 	ExecContext(context.Context, string, ...any) (postgresResult, error)
 	Commit() error
 	Rollback() error
@@ -260,6 +262,12 @@ func (d databaseSQL) Close() error { return d.db.Close() }
 
 type databaseTx struct{ tx *sql.Tx }
 
+func (t databaseTx) QueryRowContext(c context.Context, q string, a ...any) postgresRow {
+	return t.tx.QueryRowContext(c, q, a...)
+}
+func (t databaseTx) QueryContext(c context.Context, q string, a ...any) (postgresRows, error) {
+	return t.tx.QueryContext(c, q, a...)
+}
 func (t databaseTx) ExecContext(c context.Context, q string, a ...any) (postgresResult, error) {
 	return t.tx.ExecContext(c, q, a...)
 }
@@ -922,13 +930,34 @@ func newSnapshotter(tool, restoreTool string, r PostgresRunner, prod bool) (*Pos
 	}
 	return &PostgresSnapshotter{tool, restoreTool, r}, nil
 }
-func (s *PostgresSnapshotter) Snapshot(ctx context.Context, tx, dir string, env PostgresProcessEnvironment, expect *SnapshotEvidence) (SnapshotEvidence, error) {
+
+// Snapshot creates the ordinary single-database dump. transactionID identifies
+// the backup journal transaction; it is not a PostgreSQL transaction handle.
+func (s *PostgresSnapshotter) Snapshot(ctx context.Context, transactionID, dir string, env PostgresProcessEnvironment, expect *SnapshotEvidence) (SnapshotEvidence, error) {
+	return s.snapshot(ctx, transactionID, dir, env, "", expect, false)
+}
+
+// SnapshotWithExportedSnapshot creates the same custom-format dump as Snapshot,
+// pinned to the PostgreSQL snapshot exported by the still-open read-only
+// transaction. The exported identifier is deliberately neither logged nor put
+// in the child environment.
+func (s *PostgresSnapshotter) SnapshotWithExportedSnapshot(ctx context.Context, transactionID, dir string, env PostgresProcessEnvironment, exportedSnapshotID string, expect *SnapshotEvidence) (SnapshotEvidence, error) {
+	if !validPostgresExportedSnapshotID(exportedSnapshotID) {
+		return SnapshotEvidence{}, ErrPostgresOutcomeUnknown
+	}
+	return s.snapshot(ctx, transactionID, dir, env, exportedSnapshotID, expect, true)
+}
+
+func (s *PostgresSnapshotter) snapshot(ctx context.Context, transactionID, dir string, env PostgresProcessEnvironment, exportedSnapshotID string, expect *SnapshotEvidence, rejectExisting bool) (SnapshotEvidence, error) {
 	i, e := os.Lstat(dir)
-	if s == nil || s.runner == nil || !validID(tx) || e != nil || !i.IsDir() || i.Mode()&os.ModeSymlink != 0 || i.Mode().Perm()&0o022 != 0 || len(env.ChildEnv) < 5 {
+	if s == nil || s.runner == nil || !validID(transactionID) || e != nil || !i.IsDir() || i.Mode()&os.ModeSymlink != 0 || i.Mode().Perm()&0o022 != 0 || len(env.ChildEnv) < 5 {
 		return SnapshotEvidence{}, ErrPostgresOutcomeUnknown
 	}
 	p := filepath.Join(dir, "control-plane.dump")
 	if _, e = os.Lstat(p); e == nil {
+		if rejectExisting {
+			return SnapshotEvidence{}, ErrSnapshotConflict
+		}
 		x, e := snapshotEvidence(p)
 		if e != nil || expect == nil || x != *expect {
 			return SnapshotEvidence{}, ErrSnapshotConflict
@@ -937,7 +966,11 @@ func (s *PostgresSnapshotter) Snapshot(ctx context.Context, tx, dir string, env 
 	}
 	// pg_dump has no --exit-on-error option (unlike pg_restore).  A non-zero
 	// process result is already a fail-closed snapshot outcome.
-	res := s.runner.Run(ctx, []string{s.tool, "--format=custom", "--file", p, "--no-owner", "--no-acl"}, append([]string(nil), env.ChildEnv...))
+	argv := []string{s.tool, "--format=custom", "--file", p, "--no-owner", "--no-acl"}
+	if exportedSnapshotID != "" {
+		argv = append(argv, "--snapshot="+exportedSnapshotID)
+	}
+	res := s.runner.Run(ctx, argv, append([]string(nil), env.ChildEnv...))
 	if res.Err != nil || res.ExitCode != 0 {
 		return SnapshotEvidence{}, fmt.Errorf("%w: pg_dump", ErrPostgresOutcomeUnknown)
 	}
@@ -951,16 +984,16 @@ func (s *PostgresSnapshotter) Snapshot(ctx context.Context, tx, dir string, env 
 	return x, nil
 }
 func snapshotEvidence(p string) (SnapshotEvidence, error) {
-	i, e := os.Lstat(p)
-	if e != nil || !i.Mode().IsRegular() || i.Mode()&os.ModeSymlink != 0 || i.Mode().Perm() != 0o600 || i.Size() < 1 {
+	file, e := os.OpenFile(p, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if e != nil {
 		return SnapshotEvidence{}, errors.New("snapshot unsafe")
 	}
-	b, e := os.ReadFile(p)
-	if e != nil {
-		return SnapshotEvidence{}, e
+	defer file.Close()
+	i, e := file.Stat()
+	if e != nil || !i.Mode().IsRegular() || i.Mode().Perm() != durableFileMode || i.Size() < 1 {
+		return SnapshotEvidence{}, errors.New("snapshot unsafe")
 	}
-	d := sha256.Sum256(b)
-	return SnapshotEvidence{hex.EncodeToString(d[:]), i.Size()}, nil
+	return snapshotEvidenceFromFile(file, i.Size())
 }
 
 // syncSnapshotEvidence verifies and fsyncs an already-created custom-format
@@ -983,16 +1016,74 @@ func syncSnapshotEvidence(path string) (SnapshotEvidence, error) {
 	if err := file.Sync(); err != nil {
 		return SnapshotEvidence{}, err
 	}
+	return snapshotEvidenceFromFile(file, info.Size())
+}
+
+func snapshotEvidenceFromFile(file *os.File, expectedSize int64) (SnapshotEvidence, error) {
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return SnapshotEvidence{}, err
 	}
-	content, err := io.ReadAll(file)
-	if err != nil {
-		return SnapshotEvidence{}, err
-	}
-	if int64(len(content)) != info.Size() {
+	hash := sha256.New()
+	size, err := io.Copy(hash, file)
+	if err != nil || size != expectedSize {
 		return SnapshotEvidence{}, errors.New("snapshot unsafe")
 	}
-	digest := sha256.Sum256(content)
-	return SnapshotEvidence{SHA256: hex.EncodeToString(digest[:]), Size: info.Size()}, nil
+	info, err := file.Stat()
+	if err != nil || info.Size() != expectedSize {
+		return SnapshotEvidence{}, errors.New("snapshot unsafe")
+	}
+	return SnapshotEvidence{SHA256: hex.EncodeToString(hash.Sum(nil)), Size: size}, nil
+}
+
+// snapshotPreparedExportedSnapshot consumes the one empty leaf pre-created by
+// CapturePlatformBackupDatabase's pinned DurableWriter. It is package-private
+// because accepting an existing dump is safe only under that writer contract.
+func (s *PostgresSnapshotter) snapshotPreparedExportedSnapshot(ctx context.Context, transactionID string, writer *DurableWriter, env PostgresProcessEnvironment, exportedSnapshotID string) (SnapshotEvidence, error) {
+	if s == nil || s.runner == nil || writer == nil || writer.VerifyLiveRoot() != nil || writer.rootInfo.Mode().Perm() != durableDirMode || !validID(transactionID) || !validPostgresExportedSnapshotID(exportedSnapshotID) || !validProcessEnv(env) || !preparedPlatformBackupDump(writer) {
+		return SnapshotEvidence{}, ErrPostgresOutcomeUnknown
+	}
+	path := filepath.Join(writer.rootPath, platformBackupDumpFile)
+	result := s.runner.Run(ctx, []string{s.tool, "--format=custom", "--file", path, "--no-owner", "--no-acl", "--snapshot=" + exportedSnapshotID}, append([]string(nil), env.ChildEnv...))
+	if result.Err != nil || result.ExitCode != 0 || writer.VerifyLiveRoot() != nil {
+		return SnapshotEvidence{}, ErrPostgresOutcomeUnknown
+	}
+	evidence, err := preparedPlatformBackupDumpEvidence(writer)
+	if err != nil {
+		return SnapshotEvidence{}, ErrPostgresOutcomeUnknown
+	}
+	return evidence, nil
+}
+
+func preparedPlatformBackupDump(writer *DurableWriter) bool {
+	if writer == nil || writer.VerifyLiveRoot() != nil {
+		return false
+	}
+	file, err := writer.ops.OpenFile(platformBackupDumpFile, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return false
+	}
+	defer writer.ops.CloseFile(file)
+	info, err := writer.ops.Stat(file)
+	return err == nil && verifyDurableFile(info, writer.uid, writer.gid) == nil && durableNlinkOne(info) && info.Size() == 0
+}
+
+func preparedPlatformBackupDumpEvidence(writer *DurableWriter) (SnapshotEvidence, error) {
+	file, err := writer.ops.OpenFile(platformBackupDumpFile, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return SnapshotEvidence{}, ErrPostgresOutcomeUnknown
+	}
+	defer writer.ops.CloseFile(file)
+	info, err := writer.ops.Stat(file)
+	if err != nil || verifyDurableFile(info, writer.uid, writer.gid) != nil || !durableNlinkOne(info) || info.Size() < 1 {
+		return SnapshotEvidence{}, ErrPostgresOutcomeUnknown
+	}
+	if err := writer.ops.Sync(file); err != nil {
+		return SnapshotEvidence{}, ErrPostgresOutcomeUnknown
+	}
+	return snapshotEvidenceFromFile(file, info.Size())
+}
+
+func durableNlinkOne(info os.FileInfo) bool {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	return ok && stat.Nlink == 1
 }

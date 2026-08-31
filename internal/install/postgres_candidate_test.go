@@ -134,12 +134,19 @@ func (r *adapterRows) Err() error   { return r.rowsErr }
 func (r *adapterRows) Close() error { return nil }
 
 type adapterTx struct {
+	row                             postgresRow
+	rows                            postgresRows
+	queryErr                        error
 	execSQL                         string
 	args                            []any
 	execErr, commitErr, rollbackErr error
 	committed, rolledBack           bool
 }
 
+func (t *adapterTx) QueryRowContext(_ context.Context, _ string, _ ...any) postgresRow { return t.row }
+func (t *adapterTx) QueryContext(_ context.Context, _ string, _ ...any) (postgresRows, error) {
+	return t.rows, t.queryErr
+}
 func (t *adapterTx) ExecContext(_ context.Context, q string, a ...any) (postgresResult, error) {
 	t.execSQL = q
 	t.args = a
@@ -745,6 +752,18 @@ func TestSnapshot(t *testing.T) {
 	_ = os.Chmod(d2, 0700)
 	if _, e = s.Snapshot(context.Background(), "txn-2", d2, env(t), nil); !errors.Is(e, ErrPostgresOutcomeUnknown) || strings.Contains(e.Error(), "secret") {
 		t.Fatal(e)
+	}
+}
+
+func TestSnapshotEvidenceStreamsLargeDump(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "control-plane.dump")
+	content := []byte(strings.Repeat("0123456789abcdef", 64*1024))
+	if err := os.WriteFile(path, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	evidence, err := snapshotEvidence(path)
+	if err != nil || evidence.Size != int64(len(content)) || evidence.SHA256 != sha256TextFrom(string(content)) {
+		t.Fatalf("evidence=%+v err=%v", evidence, err)
 	}
 }
 
