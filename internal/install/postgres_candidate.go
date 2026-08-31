@@ -296,6 +296,19 @@ func (s *SelectedPostgresDatabase) MigrationRows(ctx context.Context) ([]Migrati
 	}
 	return (&SQLMigrationControl{database: s.database}).MigrationRows(ctx)
 }
+
+// CurrentDatabase reads the server-reported database name from the already
+// selected connection. It exposes no connection settings or DSN material.
+func (s *SelectedPostgresDatabase) CurrentDatabase(ctx context.Context) (string, error) {
+	if s == nil || s.database == nil {
+		return "", ErrPostgresOutcomeUnknown
+	}
+	var name string
+	if err := s.database.QueryRowContext(ctx, "SELECT current_database()").Scan(&name); err != nil || name == "" {
+		return "", ErrPostgresOutcomeUnknown
+	}
+	return name, nil
+}
 func (p *ProductionPostgresControl) Close() error {
 	if p == nil || p.admin == nil {
 		return nil
@@ -527,16 +540,47 @@ func migrationEvidence(rows []MigrationRow) (MigrationEvidence, error) {
 	}
 	return MigrationEvidence{From: "0023", To: "0024", RowsSHA256: hex.EncodeToString(hash.Sum(nil))}, nil
 }
+
+// CanonicalMigrationRowsSHA256 validates the supported canonical migration
+// ledger shape and returns its stable rows digest. It is safe to persist or
+// compare because it never includes a DSN or SQL connection metadata.
+func CanonicalMigrationRowsSHA256(rows []MigrationRow) (string, error) {
+	if (len(rows) != 23 && len(rows) != 24) || !validMigrationRows(rows, len(rows)) {
+		return "", ErrPostgresOutcomeUnknown
+	}
+	evidence, err := migrationEvidence(rows)
+	if err != nil {
+		return "", ErrPostgresOutcomeUnknown
+	}
+	return evidence.RowsSHA256, nil
+}
 func validMigrationRows(rows []MigrationRow, length int) bool {
 	if len(rows) != length {
 		return false
 	}
 	seen := map[string]bool{}
 	for i, row := range rows {
-		if len(row.Version) < 4 || row.Version[:4] != fmt.Sprintf("%04d", i+1) || !lowercaseHex(row.Checksum, 64) || seen[row.Version] {
+		if !validMigrationVersion(row.Version, i+1) || !lowercaseHex(row.Checksum, 64) || seen[row.Version] {
 			return false
 		}
 		seen[row.Version] = true
+	}
+	return true
+}
+
+func validMigrationVersion(value string, sequence int) bool {
+	prefix := fmt.Sprintf("%04d", sequence)
+	if value == prefix {
+		return true
+	}
+	if !strings.HasPrefix(value, prefix+"_") || len(value) == len(prefix)+1 || strings.HasSuffix(value, "_") {
+		return false
+	}
+	for _, character := range value[len(prefix)+1:] {
+		if character >= 'a' && character <= 'z' || character >= '0' && character <= '9' || character == '_' {
+			continue
+		}
+		return false
 	}
 	return true
 }

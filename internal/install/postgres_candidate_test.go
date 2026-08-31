@@ -287,6 +287,39 @@ func TestSelectedPostgresDatabaseNeverRewritesActiveDatabaseToPostgres(t *testin
 	}
 }
 
+func TestSelectedPostgresDatabaseReadsServerCurrentDatabaseAndCanonicalRowsDigest(t *testing.T) {
+	db := &adapterDB{row: adapterRow{values: []any{"open_card_active"}}}
+	selected := &SelectedPostgresDatabase{database: db}
+	name, err := selected.CurrentDatabase(context.Background())
+	if err != nil || name != "open_card_active" || db.query != "SELECT current_database()" || len(db.args) != 0 {
+		t.Fatalf("name=%q err=%v query=%q args=%v", name, err, db.query, db.args)
+	}
+
+	rows := migrationRows(24)
+	digest, err := CanonicalMigrationRowsSHA256(rows)
+	if err != nil || digest != migrationDigest(rows) {
+		t.Fatalf("digest=%q err=%v", digest, err)
+	}
+	for _, bad := range [][]MigrationRow{
+		rows[:22],
+		append(append([]MigrationRow(nil), rows[:2]...), rows[3:]...),
+		func() []MigrationRow {
+			out := append([]MigrationRow(nil), rows...)
+			out[3].Checksum = "not-a-checksum"
+			return out
+		}(),
+		func() []MigrationRow {
+			out := append([]MigrationRow(nil), rows...)
+			out[0].Version = "0001extra"
+			return out
+		}(),
+	} {
+		if _, err := CanonicalMigrationRowsSHA256(bad); !errors.Is(err, ErrPostgresOutcomeUnknown) {
+			t.Fatalf("bad rows accepted: %#v err=%v", bad, err)
+		}
+	}
+}
+
 func TestProductionControlUsesFixedSeparateControlIdentity(t *testing.T) {
 	runtime := []byte("OPEN_CARD_DATABASE_URL=postgresql://opencard:runtime-password@127.0.0.1:5432/open_card_active?sslmode=require\n")
 	control := []byte("OPEN_CARD_DATABASE_URL=postgresql://open_card_upgrade_control:control-password@127.0.0.1:5432/postgres?sslmode=require\n")
