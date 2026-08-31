@@ -72,7 +72,7 @@ def contract(version: str) -> tuple[dict[str, dict[str, str]], int, dict[str, st
     if version == VERSION:
         return RC0_LINEAGES, 68, None
     if version == RC2_VERSION:
-        return RC1_LINEAGES, 71, {"certification_sha256": RC1_CERTIFICATION_SHA256, "release_index_sha256": RC1_RELEASE_INDEX_SHA256}
+        return RC1_LINEAGES, 73, {"certification_sha256": RC1_CERTIFICATION_SHA256, "release_index_sha256": RC1_RELEASE_INDEX_SHA256}
     raise CertificationError("unsupported certification release version")
 RC1_BINARIES = [
     "open-card-server", "open-card-agent", "open-card-static-server",

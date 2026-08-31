@@ -44,8 +44,16 @@ class ProductionCertificationTests(unittest.TestCase):
             for candidate_set in (candidates_a, candidates_b):
                 for arch in tool.ARCHES:
                     manifest = json.loads((candidate_set / arch / "release/manifest.json").read_text(encoding="utf-8"))
-                    self.assertEqual(len(manifest["files"]), 71)
-                    self.assertIn("tools/evidence/g6_validate.py", {entry["path"] for entry in manifest["files"]})
+                    self.assertEqual(len(manifest["files"]), 73)
+                    paths = {entry["path"] for entry in manifest["files"]}
+                    for required in {
+                        "scripts/mvp/host-preflight.sh",
+                        "scripts/mvp/buildkit-production-capacity.sh",
+                        "scripts/mvp/g6-staging-evidence.sh",
+                        "tools/evidence/g6_validate.py",
+                        "tools/evidence/g6_target_receipt.py",
+                    }:
+                        self.assertIn(required, paths)
             for mutation in ("missing-g6", "wrong-cert", "wrong-index", "cross-arch", "version"):
                 source_a, source_b, candidates_a, candidates_b, commit = self.fixture(root / mutation, tool, tool.RC2_VERSION)
                 candidate = candidates_b / "amd64"
@@ -111,7 +119,7 @@ class ProductionCertificationTests(unittest.TestCase):
         for index in range(65):
             payloads[f"payload/{index:02d}"] = f"{arch}:{index}\n".encode()
         if version == tool.RC2_VERSION:
-            payloads.update({"scripts/mvp/g6-staging-evidence.sh": b"g6\n", "tools/evidence/g6_validate.py": b"validate\n", "tools/evidence/g6_target_receipt.py": b"receipt\n"})
+            payloads.update({"scripts/mvp/host-preflight.sh": b"preflight\n", "scripts/mvp/buildkit-production-capacity.sh": b"capacity\n", "scripts/mvp/g6-staging-evidence.sh": b"g6\n", "tools/evidence/g6_validate.py": b"validate\n", "tools/evidence/g6_target_receipt.py": b"receipt\n"})
         entries = []
         for relative, value in sorted(payloads.items()):
             path = release / relative
