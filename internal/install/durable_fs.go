@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -72,6 +73,7 @@ type durableOps interface {
 	Chown(*os.File, int, int) error
 	Stat(*os.File) (os.FileInfo, error)
 	CloseFile(*os.File) error
+	ReadDir(*os.File, int) ([]os.DirEntry, error)
 }
 
 type realDurableOps struct{ durableRoot }
@@ -82,6 +84,9 @@ func (realDurableOps) Chmod(file *os.File, mode os.FileMode) error    { return f
 func (realDurableOps) Chown(file *os.File, uid, gid int) error        { return file.Chown(uid, gid) }
 func (realDurableOps) Stat(file *os.File) (os.FileInfo, error)        { return file.Stat() }
 func (realDurableOps) CloseFile(file *os.File) error                  { return file.Close() }
+func (realDurableOps) ReadDir(file *os.File, count int) ([]os.DirEntry, error) {
+	return file.ReadDir(count)
+}
 
 // DurableWriter is a fixed-root, ownership-enforcing writer for activation,
 // journal and marker metadata. It deliberately has no zero-value constructor.
@@ -93,6 +98,14 @@ type DurableWriter struct {
 	gid      int
 	rootPath string
 	rootInfo os.FileInfo
+}
+
+// DurableDirectChild is one direct entry observed below a pinned durable
+// root. Mode is descriptive only; callers must reopen a managed entry through
+// a typed DurableWriter API before trusting its contents.
+type DurableDirectChild struct {
+	Name string
+	Mode os.FileMode
 }
 
 // DurableLock is an advisory process lock opened below a DurableWriter's
@@ -186,6 +199,54 @@ func (w *DurableWriter) OpenChildWriter(name string, mode os.FileMode) (*Durable
 		return nil, err
 	}
 	return &DurableWriter{ops: realDurableOps{durableRoot: child}, uid: w.uid, gid: w.gid, rootPath: filepath.Join(w.rootPath, name), rootInfo: info}, nil
+}
+
+// ReadDirectChildren enumerates only the pinned root's immediate entries. It
+// never reopens rootPath and rechecks the live pathname after enumeration, so
+// a rename/replacement cannot redirect reads to another directory.
+func (w *DurableWriter) ReadDirectChildren() ([]DurableDirectChild, error) {
+	if w == nil || w.ops == nil || w.VerifyLiveRoot() != nil {
+		return nil, fmt.Errorf("durable writer is not initialized")
+	}
+	directory, err := w.ops.OpenFile(".", os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			_ = w.ops.CloseFile(directory)
+		}
+	}()
+	info, err := w.ops.Stat(directory)
+	if err != nil || !info.IsDir() || !os.SameFile(info, w.rootInfo) || verifyOwner(info, w.uid, w.gid) != nil {
+		return nil, fmt.Errorf("durable root descriptor is unsafe")
+	}
+	entries, err := w.ops.ReadDir(directory, -1)
+	if err != nil {
+		return nil, err
+	}
+	children := make([]DurableDirectChild, 0, len(entries))
+	for _, entry := range entries {
+		name := entry.Name()
+		if cleanRelative(name) != nil || strings.Contains(filepath.ToSlash(name), "/") {
+			return nil, fmt.Errorf("durable child name is unsafe")
+		}
+		child, err := w.ops.Lstat(name)
+		if err != nil {
+			return nil, err
+		}
+		children = append(children, DurableDirectChild{Name: name, Mode: child.Mode()})
+	}
+	if err := w.ops.CloseFile(directory); err != nil {
+		return nil, err
+	}
+	closed = true
+	if err := w.VerifyLiveRoot(); err != nil {
+		return nil, err
+	}
+	sort.Slice(children, func(i, j int) bool { return children[i].Name < children[j].Name })
+	return children, nil
 }
 
 // CreateChildDirectory creates one root-relative directory and synchronizes

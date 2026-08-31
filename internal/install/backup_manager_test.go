@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -16,16 +17,27 @@ type backupLockFake struct {
 	released int
 	err      error
 	release  error
+	lastID   string
+	held     bool
 }
 
 type backupLockHandle struct{ owner *backupLockFake }
 
-func (l *backupLockHandle) Release() error { l.owner.released++; return l.owner.release }
-func (l *backupLockFake) Acquire(context.Context, string) (UpgradeLock, error) {
+func (l *backupLockHandle) Release() error {
+	l.owner.released++
+	l.owner.held = false
+	return l.owner.release
+}
+func (l *backupLockFake) Acquire(_ context.Context, id string) (UpgradeLock, error) {
 	l.acquires++
+	l.lastID = id
 	if l.err != nil {
 		return nil, l.err
 	}
+	if l.held {
+		return nil, errors.New("backup lock already held")
+	}
+	l.held = true
 	return &backupLockHandle{owner: l}, nil
 }
 func (l *backupLockFake) PendingTransaction(context.Context) (PendingTransaction, error) {
@@ -95,6 +107,227 @@ func dumpWriter(payload string) func([]string) {
 			}
 		}
 	}
+}
+
+func createBackup(t *testing.T, m *BackupManager, id string, createdAt time.Time) ActiveDatabaseBackupV2 {
+	t.Helper()
+	m.now = func() time.Time { return createdAt.UTC() }
+	metadata, err := m.Create(context.Background(), BackupCreateRequest{BackupID: id, Reason: "manual"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return metadata
+}
+
+func TestBackupManagerLatestSelectsNewestAndBreaksTiesByID(t *testing.T) {
+	active := backupActive(t, "activation-latest")
+	m, _, _ := backupManager(t, &backupResolverFake{values: []ResolvedActiveDatabase{active, active}}, &fakePG{write: dumpWriter("custom-backup")})
+	createBackup(t, m, "backup-zulu", time.Unix(10, 0))
+	createBackup(t, m, "backup-old", time.Unix(1, 0))
+	createBackup(t, m, "backup-alpha", time.Unix(10, 0))
+
+	latest, err := m.Latest(context.Background())
+	if err != nil || latest.BackupID != "backup-alpha" || !latest.CreatedAt.Equal(time.Unix(10, 0).UTC()) {
+		t.Fatalf("latest=%+v err=%v", latest, err)
+	}
+}
+
+func TestBackupManagerLatestRequiresAndReleasesGlobalLock(t *testing.T) {
+	active := backupActive(t, "activation-latest-lock")
+	m, _, lock := backupManager(t, &backupResolverFake{values: []ResolvedActiveDatabase{active, active}}, &fakePG{write: dumpWriter("custom-backup")})
+	createBackup(t, m, "backup-lock", time.Unix(1, 0))
+	beforeAcquire, beforeRelease := lock.acquires, lock.released
+	if _, err := m.Latest(context.Background()); err != nil || lock.acquires != beforeAcquire+1 || lock.released != beforeRelease+1 || lock.lastID != backupLatestLockID {
+		t.Fatalf("acquires=%d releases=%d id=%q err=%v", lock.acquires, lock.released, lock.lastID, err)
+	}
+	lock.err = errors.New("busy token=secret")
+	if _, err := m.Latest(context.Background()); !errors.Is(err, ErrBackupUnavailable) || strings.Contains(err.Error(), "secret") {
+		t.Fatalf("acquire error=%v", err)
+	}
+	lock.err = nil
+	lock.release = errors.New("release token=secret")
+	if _, err := m.Latest(context.Background()); !errors.Is(err, ErrBackupUnavailable) || strings.Contains(err.Error(), "secret") {
+		t.Fatalf("release error=%v", err)
+	}
+}
+
+func TestBackupManagerLatestHoldsLockAcrossPinnedEnumeration(t *testing.T) {
+	active := backupActive(t, "activation-latest-held")
+	m, root, lock := backupManager(t, &backupResolverFake{values: []ResolvedActiveDatabase{active, active}}, &fakePG{write: dumpWriter("custom-backup")})
+	createBackup(t, m, "backup-held", time.Unix(1, 0))
+	writer, fault := renameHookWriter(t, root)
+	defer writer.Close()
+	m.writer = writer
+	fault.afterReadDir = func() error {
+		if !lock.held || lock.lastID != backupLatestLockID {
+			return errors.New("latest lock was not held during enumeration")
+		}
+		return nil
+	}
+	if _, err := m.Latest(context.Background()); err != nil || lock.held {
+		t.Fatalf("latest err=%v held_after=%t", err, lock.held)
+	}
+}
+
+type finalCancelContext struct {
+	calls    int
+	cancelAt int
+	done     chan struct{}
+	once     sync.Once
+}
+
+func (c *finalCancelContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (c *finalCancelContext) Done() <-chan struct{}       { return c.done }
+func (c *finalCancelContext) Value(any) any               { return nil }
+func (c *finalCancelContext) Err() error {
+	c.calls++
+	if c.calls >= c.cancelAt {
+		c.once.Do(func() { close(c.done) })
+		return context.Canceled
+	}
+	return nil
+}
+
+func TestBackupManagerLatestRejectsCancelledContext(t *testing.T) {
+	active := backupActive(t, "activation-latest-cancel")
+	m, _, _ := backupManager(t, &backupResolverFake{values: []ResolvedActiveDatabase{active, active}}, &fakePG{write: dumpWriter("custom-backup")})
+	createBackup(t, m, "backup-cancel", time.Unix(1, 0))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := m.Latest(ctx); !errors.Is(err, ErrBackupUnavailable) {
+		t.Fatalf("cancel error=%v", err)
+	}
+	late := &finalCancelContext{cancelAt: 3, done: make(chan struct{})}
+	if _, err := m.Latest(late); !errors.Is(err, ErrBackupUnavailable) || late.calls != 3 {
+		t.Fatalf("final cancel error=%v calls=%d", err, late.calls)
+	}
+}
+
+func TestBackupManagerLatestFailsClosedForManagedAmbiguity(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		prepare func(t *testing.T, root string, m *BackupManager)
+	}{
+		{
+			name: "partial directory",
+			prepare: func(t *testing.T, root string, _ *BackupManager) {
+				t.Helper()
+				if err := os.Mkdir(filepath.Join(root, "backup-partial"), durableDirMode); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "corrupt metadata",
+			prepare: func(t *testing.T, root string, m *BackupManager) {
+				t.Helper()
+				createBackup(t, m, "backup-corrupt", time.Unix(1, 0))
+				if err := os.WriteFile(filepath.Join(root, "backup-corrupt", activeDatabaseBackupMetadataName), []byte("not-json"), durableFileMode); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "wrong mode",
+			prepare: func(t *testing.T, root string, m *BackupManager) {
+				t.Helper()
+				createBackup(t, m, "backup-wrong-mode", time.Unix(1, 0))
+				if err := os.Chmod(filepath.Join(root, "backup-wrong-mode"), 0o750); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "symlink",
+			prepare: func(t *testing.T, root string, _ *BackupManager) {
+				t.Helper()
+				if err := os.Symlink("/tmp", filepath.Join(root, "backup-symlink")); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "unsafe managed ID",
+			prepare: func(t *testing.T, root string, _ *BackupManager) {
+				t.Helper()
+				if err := os.Mkdir(filepath.Join(root, "backup-"), durableDirMode); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			active := backupActive(t, "activation-latest")
+			m, root, _ := backupManager(t, &backupResolverFake{values: []ResolvedActiveDatabase{active, active}}, &fakePG{write: dumpWriter("custom-backup")})
+			createBackup(t, m, "backup-valid", time.Unix(2, 0))
+			tc.prepare(t, root, m)
+			if _, err := m.Latest(context.Background()); !errors.Is(err, ErrBackupUnavailable) {
+				t.Fatalf("err=%v", err)
+			}
+		})
+	}
+}
+
+func TestBackupManagerLatestIgnoresUnmanagedEntriesAndDoesNotMutate(t *testing.T) {
+	active := backupActive(t, "activation-latest")
+	m, root, _ := backupManager(t, &backupResolverFake{values: []ResolvedActiveDatabase{active, active}}, &fakePG{write: dumpWriter("custom-backup")})
+	created := createBackup(t, m, "backup-valid", time.Unix(2, 0))
+	if err := os.WriteFile(filepath.Join(root, "operator-note"), []byte("outside managed namespace"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	metadataPath := filepath.Join(root, "backup-valid", activeDatabaseBackupMetadataName)
+	before, err := os.ReadFile(metadataPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(root, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(root, durableDirMode) })
+
+	latest, err := m.Latest(context.Background())
+	after, readErr := os.ReadFile(metadataPath)
+	if err != nil || readErr != nil || latest != created || string(after) != string(before) {
+		t.Fatalf("latest=%+v err=%v readErr=%v metadata changed=%t", latest, err, readErr, string(after) != string(before))
+	}
+	if info, err := os.Stat(root); err != nil || info.Mode().Perm() != 0o500 {
+		t.Fatalf("root info=%v err=%v", info, err)
+	}
+}
+
+func TestBackupManagerLatestFailsClosedForEmptyRootReplacementAndSecretData(t *testing.T) {
+	t.Run("empty root", func(t *testing.T) {
+		active := backupActive(t, "activation-latest")
+		m, _, _ := backupManager(t, &backupResolverFake{values: []ResolvedActiveDatabase{active, active}}, &fakePG{write: dumpWriter("custom-backup")})
+		if _, err := m.Latest(context.Background()); !errors.Is(err, ErrBackupUnavailable) {
+			t.Fatalf("err=%v", err)
+		}
+	})
+	t.Run("root replacement", func(t *testing.T) {
+		active := backupActive(t, "activation-latest")
+		m, root, _ := backupManager(t, &backupResolverFake{values: []ResolvedActiveDatabase{active, active}}, &fakePG{write: dumpWriter("custom-backup")})
+		moved := root + "-replaced"
+		if err := os.Rename(root, moved); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(root, durableDirMode); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := m.Latest(context.Background()); !errors.Is(err, ErrBackupUnavailable) {
+			t.Fatalf("err=%v", err)
+		}
+	})
+	t.Run("secret safe error", func(t *testing.T) {
+		active := backupActive(t, "activation-latest")
+		m, root, _ := backupManager(t, &backupResolverFake{values: []ResolvedActiveDatabase{active, active}}, &fakePG{write: dumpWriter("custom-backup")})
+		createBackup(t, m, "backup-secret", time.Unix(2, 0))
+		if err := os.WriteFile(filepath.Join(root, "backup-secret", activeDatabaseBackupMetadataName), []byte("postgresql://user:secret@example.invalid/db"), durableFileMode); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := m.Latest(context.Background()); !errors.Is(err, ErrBackupUnavailable) || strings.Contains(err.Error(), "secret") {
+			t.Fatalf("err=%v", err)
+		}
+	})
 }
 
 func TestBackupManagerCreatesMetadataLastAndReplaysExactBackup(t *testing.T) {

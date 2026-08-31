@@ -8,11 +8,13 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 )
 
 const productionBackupRoot = "/var/lib/open-card/backups"
+const backupLatestLockID = "backup-latest-read"
 
 var (
 	ErrBackupConflict    = errors.New("backup conflicts with existing state")
@@ -191,6 +193,56 @@ func (m *BackupManager) Inspect(_ context.Context, backupID string) (ActiveDatab
 		return ActiveDatabaseBackupV2{}, ErrBackupUnavailable
 	}
 	return m.inspect(backupID)
+}
+
+// Latest returns the most recently created fully verified backup below the
+// manager's pinned root. Any entry in the managed backup namespace that does
+// not satisfy the exact durable backup contract makes the result ambiguous.
+func (m *BackupManager) Latest(ctx context.Context) (metadata ActiveDatabaseBackupV2, resultErr error) {
+	if m == nil || m.writer == nil || ctx == nil || ctx.Err() != nil {
+		return ActiveDatabaseBackupV2{}, ErrBackupUnavailable
+	}
+	lock, err := m.locker.Acquire(ctx, backupLatestLockID)
+	if err != nil || lock == nil {
+		return ActiveDatabaseBackupV2{}, ErrBackupUnavailable
+	}
+	defer func() {
+		if err := lock.Release(); err != nil && resultErr == nil {
+			metadata = ActiveDatabaseBackupV2{}
+			resultErr = ErrBackupUnavailable
+		}
+	}()
+	children, err := m.writer.ReadDirectChildren()
+	if err != nil {
+		return ActiveDatabaseBackupV2{}, ErrBackupUnavailable
+	}
+	var latest ActiveDatabaseBackupV2
+	found := false
+	for _, child := range children {
+		if ctx.Err() != nil {
+			return ActiveDatabaseBackupV2{}, ErrBackupUnavailable
+		}
+		// Only the backup-* namespace is managed here. Other direct entries do
+		// not participate in discovery and cannot affect its result.
+		if !strings.HasPrefix(child.Name, "backup-") {
+			continue
+		}
+		if !validBackupID(child.Name) || child.Mode&os.ModeSymlink != 0 || !child.Mode.IsDir() || child.Mode.Perm() != durableDirMode {
+			return ActiveDatabaseBackupV2{}, ErrBackupUnavailable
+		}
+		metadata, err := m.inspect(child.Name)
+		if err != nil {
+			return ActiveDatabaseBackupV2{}, ErrBackupUnavailable
+		}
+		if !found || metadata.CreatedAt.After(latest.CreatedAt) || (metadata.CreatedAt.Equal(latest.CreatedAt) && metadata.BackupID < latest.BackupID) {
+			latest = metadata
+			found = true
+		}
+	}
+	if !found || ctx.Err() != nil || m.writer.VerifyLiveRoot() != nil {
+		return ActiveDatabaseBackupV2{}, ErrBackupUnavailable
+	}
+	return latest, nil
 }
 
 func (m *BackupManager) inspect(backupID string) (ActiveDatabaseBackupV2, error) {

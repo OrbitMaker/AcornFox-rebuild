@@ -170,6 +170,56 @@ func TestChildWriterKeepsPinnedParentIdentity(t *testing.T) {
 	}
 }
 
+func TestDurableWriterEnumeratesOnlyPinnedDirectChildren(t *testing.T) {
+	w, root := taskWriter(t)
+	if err := os.Mkdir(filepath.Join(root, "backup-b"), durableDirMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "unmanaged"), []byte("x"), durableFileMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("backup-b", filepath.Join(root, "backup-a")); err != nil {
+		t.Fatal(err)
+	}
+	children, err := w.ReadDirectChildren()
+	byName := make(map[string]DurableDirectChild, len(children))
+	for _, child := range children {
+		byName[child.Name] = child
+	}
+	if err != nil || byName["backup-a"].Mode&os.ModeSymlink == 0 || !byName["backup-b"].Mode.IsDir() || !byName["unmanaged"].Mode.IsRegular() {
+		t.Fatalf("children=%#v err=%v", children, err)
+	}
+}
+
+func TestDurableWriterEnumerationRejectsFaultAndRootReplacement(t *testing.T) {
+	for _, failure := range []string{"readdir", "close"} {
+		t.Run(failure, func(t *testing.T) {
+			w, _ := faultWriter(t, failure, true)
+			if _, err := w.ReadDirectChildren(); err == nil {
+				t.Fatalf("%s failure was hidden", failure)
+			}
+		})
+	}
+
+	root := t.TempDir()
+	if err := os.Chmod(root, durableDirMode); err != nil {
+		t.Fatal(err)
+	}
+	writer, fault := renameHookWriter(t, root)
+	defer writer.Close()
+	replacement := t.TempDir()
+	fault.afterReadDir = func() error {
+		moved := root + "-moved"
+		if err := os.Rename(root, moved); err != nil {
+			return err
+		}
+		return os.Symlink(replacement, root)
+	}
+	if _, err := writer.ReadDirectChildren(); err == nil {
+		t.Fatal("enumeration accepted a replaced live root")
+	}
+}
+
 func TestTaskDurableWriterWritesAndRereadsMetadata(t *testing.T) {
 	w, root := taskWriter(t)
 	if err := w.WriteMetadata("journal/transaction.json", []byte(`{"state":"PREFLIGHTED"}`)); err != nil {
@@ -302,10 +352,27 @@ func TestReadAndRemoveActivationLinkPropagateFaults(t *testing.T) {
 
 type phaseFaultOps struct {
 	durableOps
-	fail        string
-	syncCalls   int
-	closeCalls  int
-	afterRename func() error
+	fail         string
+	syncCalls    int
+	closeCalls   int
+	afterRename  func() error
+	afterReadDir func() error
+}
+
+func (f *phaseFaultOps) ReadDir(file *os.File, count int) ([]os.DirEntry, error) {
+	if f.fail == "readdir" {
+		return nil, errors.New("injected readdir failure")
+	}
+	entries, err := f.durableOps.ReadDir(file, count)
+	if err != nil {
+		return nil, err
+	}
+	if f.afterReadDir != nil {
+		if err := f.afterReadDir(); err != nil {
+			return nil, err
+		}
+	}
+	return entries, nil
 }
 
 type restrictiveMkdirOps struct{ durableOps }
