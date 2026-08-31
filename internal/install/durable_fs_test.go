@@ -2,8 +2,10 @@ package install
 
 import (
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 )
@@ -646,6 +648,87 @@ func TestWriteMetadataPropagatesEveryPreRenameBoundaryFailure(t *testing.T) {
 				t.Fatalf("target exists or could not be inspected after %s: %v", phase, err)
 			}
 		})
+	}
+}
+
+type durableShortWriteOps struct{ durableOps }
+
+func (o durableShortWriteOps) Write(file *os.File, value []byte) (int, error) {
+	n, err := o.durableOps.Write(file, value)
+	if err == nil && len(value) > 0 && n > 0 {
+		return n - 1, nil
+	}
+	return n, err
+}
+
+func shortWriteWriter(t *testing.T) (*DurableWriter, string) {
+	t.Helper()
+	root := t.TempDir()
+	if err := os.Chmod(root, durableDirMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(root, "journal"), durableDirMode); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := os.OpenRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := realDurableOps{durableRoot: osDurableRoot{root: opened}}
+	writer, err := newDurableWriter(root, os.Getuid(), os.Getgid(), durableShortWriteOps{durableOps: base})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = writer.Close() })
+	return writer, root
+}
+
+func TestDurableMetadataRejectsNilErrorShortWrites(t *testing.T) {
+	for name, write := range map[string]func(*DurableWriter) error{
+		"metadata": func(w *DurableWriter) error { return w.WriteMetadata("journal/short.json", []byte("value")) },
+		"unit":     func(w *DurableWriter) error { return w.WriteSystemdServerUnit([]byte("value")) },
+		"create":   func(w *DurableWriter) error { return w.CreateMetadata("journal/short-create.json", []byte("value")) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			writer, root := shortWriteWriter(t)
+			if err := write(writer); !errors.Is(err, io.ErrShortWrite) {
+				t.Fatalf("short write=%v", err)
+			}
+			for _, path := range []string{"journal/short.json", "journal/short-create.json", systemdServerUnitName} {
+				if _, err := os.Lstat(filepath.Join(root, path)); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("short write published %s: %v", path, err)
+				}
+			}
+			for _, directory := range []string{root, filepath.Join(root, "journal")} {
+				entries, err := os.ReadDir(directory)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, entry := range entries {
+					if strings.HasPrefix(entry.Name(), ".open-card-") {
+						t.Fatalf("short write leaked temporary %s", entry.Name())
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestCreateMetadataAcceptsEmptyValue(t *testing.T) {
+	writer, root := shortWriteWriter(t)
+	// Use the regular writer because the injected short writer correctly reports
+	// zero bytes for an empty value and this regression is about normal behavior.
+	_ = writer.Close()
+	regular, err := TaskDurableWriter(root, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer regular.Close()
+	if err := regular.CreateMetadata("journal/empty", nil); err != nil {
+		t.Fatal(err)
+	}
+	if value, err := regular.ReadMetadata("journal/empty"); err != nil || len(value) != 0 {
+		t.Fatalf("empty value=%q err=%v", value, err)
 	}
 }
 

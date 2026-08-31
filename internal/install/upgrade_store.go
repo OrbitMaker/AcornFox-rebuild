@@ -1749,7 +1749,11 @@ func writeFixedOwnedFile(w *DurableWriter, name string, value []byte, mode os.Fi
 		}
 		_ = w.ops.Remove(temporary)
 	}()
-	if _, err = w.ops.Write(file, value); err != nil || w.ops.Sync(file) != nil || w.ops.Chmod(file, mode) != nil || w.ops.Chown(file, uid, gid) != nil {
+	written, writeErr := w.ops.Write(file, value)
+	if writeErr != nil || written != len(value) {
+		return ErrUpgradeJournalConflict
+	}
+	if w.ops.Sync(file) != nil || w.ops.Chmod(file, mode) != nil || w.ops.Chown(file, uid, gid) != nil {
 		return ErrUpgradeJournalConflict
 	}
 	info, err := w.ops.Stat(file)

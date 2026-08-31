@@ -1741,6 +1741,25 @@ func TestEdgeConfigPrepareFinalizeAndRereadAreFixedAndDurable(t *testing.T) {
 	}
 }
 
+func TestWriteFixedOwnedFileRejectsNilErrorShortWrite(t *testing.T) {
+	writer, root := shortWriteWriter(t)
+	if err := writeFixedOwnedFile(writer, "edge.conf", []byte("candidate\n"), 0o640, os.Getuid(), os.Getgid()); !errors.Is(err, ErrUpgradeJournalConflict) {
+		t.Fatalf("short write=%v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "edge.conf")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("short write published final: %v", err)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".open-card-edge-") {
+			t.Fatalf("short write leaked temporary %s", entry.Name())
+		}
+	}
+}
+
 func TestEdgeConfigRenderingAndInstalledOwnershipFailClosed(t *testing.T) {
 	source := edgeSourceTemplateFixture()
 	candidate := edgeCandidateTemplateFixture()

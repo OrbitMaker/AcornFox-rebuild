@@ -441,8 +441,10 @@ func (w *DurableWriter) WriteMetadata(name string, value []byte) error {
 		}
 		_ = w.ops.Remove(temporary)
 	}()
-	if _, err = w.ops.Write(file, value); err != nil {
-		return err
+	if written, writeErr := w.ops.Write(file, value); writeErr != nil {
+		return writeErr
+	} else if written != len(value) {
+		return io.ErrShortWrite
 	}
 	if err = w.ops.Sync(file); err != nil {
 		return err
@@ -524,8 +526,10 @@ func (w *DurableWriter) writeMetadataMode(name string, value []byte, mode os.Fil
 		}
 		_ = w.ops.Remove(temporary)
 	}()
-	if _, err = w.ops.Write(file, value); err != nil {
-		return err
+	if written, writeErr := w.ops.Write(file, value); writeErr != nil {
+		return writeErr
+	} else if written != len(value) {
+		return io.ErrShortWrite
 	}
 	if err = w.ops.Sync(file); err != nil {
 		return err
@@ -584,8 +588,10 @@ func (w *DurableWriter) CreateMetadata(name string, value []byte) error {
 		}
 		_ = w.ops.Remove(temporary)
 	}()
-	if _, err = w.ops.Write(file, value); err != nil {
-		return err
+	if written, writeErr := w.ops.Write(file, value); writeErr != nil {
+		return writeErr
+	} else if written != len(value) {
+		return io.ErrShortWrite
 	}
 	if err = w.ops.Sync(file); err != nil {
 		return err
