@@ -36,6 +36,12 @@ class InstallerSecurityContractTests(unittest.TestCase):
         self.assertNotIn("CREATE DATABASE opencard", text)
         self.assertNotIn('database_url="postgresql://', text)
 
+    def test_edge_domain_uses_a_bash_compatible_dns_hostname_pattern(self) -> None:
+        text = (SCRIPTS / "install-host.sh").read_text(encoding="utf-8")
+        validation = next(line for line in text.splitlines() if 'die "--edge-domain must be a DNS hostname"' in line)
+        self.assertNotIn("(?:", validation)
+        self.assertIn(r"^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+", validation)
+
     def test_root_backup_restore_and_purge_use_installation_id_not_clean_worker_marker(self) -> None:
         backup = (SCRIPTS / "backup-control-plane.sh").read_text(encoding="utf-8")
         restore = (SCRIPTS / "restore-control-plane.sh").read_text(encoding="utf-8")

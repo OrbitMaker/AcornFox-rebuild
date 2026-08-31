@@ -78,7 +78,7 @@ if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.
 print(parsed.hostname.lower())
 PY
 ) || die "--auth-origin must be an exact HTTPS origin"
-  [[ "$edge_domain" =~ ^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$ ]] || die "--edge-domain must be a DNS hostname"
+  [[ "$edge_domain" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]] || die "--edge-domain must be a DNS hostname"
   edge_domain=${edge_domain,,}
   [[ "$edge_domain" = "$origin_host" ]] || die "--edge-domain must exactly match the HTTPS origin host"
   management_activation=1
