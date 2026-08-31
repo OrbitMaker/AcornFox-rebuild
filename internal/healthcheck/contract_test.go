@@ -1,6 +1,7 @@
 package healthcheck
 
 import (
+	"bytes"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -143,15 +144,20 @@ func TestIncidentEscalationRecoveryAndIdempotence(t *testing.T) {
 		t.Fatalf("repeat=%#v %v", repeat, err)
 	}
 	healthy, err := Decide(&repeat.State, snapshotAt(start.Add(32*time.Minute), nil))
-	if err != nil || !healthy.Recovery || !healthy.State.Healthy || healthy.State.Fingerprint != HealthyFingerprint || !healthy.State.RecoveryPending || healthy.State.PendingNotification != "recovery" {
+	if err != nil || !healthy.Recovery || !healthy.State.Healthy || healthy.State.Fingerprint != HealthyFingerprint || !healthy.State.RecoveryPending || healthy.State.PendingNotification != "recovery" || healthy.State.RecoveryOf != repeat.State.Fingerprint {
 		t.Fatalf("healthy=%#v %v", healthy, err)
 	}
 	retryRecovery, err := Decide(&healthy.State, snapshotAt(start.Add(33*time.Minute), nil))
 	if err != nil || !retryRecovery.Recovery || retryRecovery.State != healthy.State {
 		t.Fatalf("retry recovery=%#v %v", retryRecovery, err)
 	}
+	invalidRecovery := healthy.State
+	invalidRecovery.RecoveryOf = ""
+	if invalidRecovery.Validate() == nil {
+		t.Fatal("recovery without recovered incident identity was accepted")
+	}
 	ackRecovery, err := AcknowledgeDelivery(healthy.State)
-	if err != nil || ackRecovery.RecoveryPending || ackRecovery.PendingNotification != "" {
+	if err != nil || ackRecovery.RecoveryPending || ackRecovery.PendingNotification != "" || ackRecovery.RecoveryOf != "" {
 		t.Fatalf("ack recovery=%#v %v", ackRecovery, err)
 	}
 	stable, err := Decide(&ackRecovery, snapshotAt(start.Add(33*time.Minute), nil))
@@ -227,5 +233,47 @@ func TestStrictMarshalParseAndSecretFreeSurface(t *testing.T) {
 	encoded, _ := json.Marshal(CheckResult{})
 	if strings.Contains(string(encoded), "message") || strings.Contains(string(encoded), "path") {
 		t.Fatal("result has unsafe field")
+	}
+}
+
+func TestIncidentParserMigratesOnlySafeLegacyState(t *testing.T) {
+	now := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
+	decision, err := Decide(nil, unhealthy(now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := MarshalIncident(decision.State)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := bytes.Replace(raw, []byte(`,"recovery_of":""`), nil, 1)
+	parsed, err := ParseIncident(legacy)
+	if err != nil || parsed != decision.State {
+		t.Fatalf("legacy state=%#v err=%v", parsed, err)
+	}
+	acknowledged, err := AcknowledgeDelivery(decision.State)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acknowledgedRaw, err := MarshalIncident(acknowledged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyAcknowledged := bytes.Replace(acknowledgedRaw, []byte(`,"recovery_of":""`), nil, 1)
+	parsedAcknowledged, err := ParseIncident(legacyAcknowledged)
+	if err != nil || parsedAcknowledged != acknowledged {
+		t.Fatalf("legacy acknowledged=%#v err=%v", parsedAcknowledged, err)
+	}
+	recovery, err := Decide(&acknowledged, snapshotAt(now.Add(time.Minute), nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	recoveryRaw, err := MarshalIncident(recovery.State)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyRecovery := bytes.Replace(recoveryRaw, []byte(`,"recovery_of":"`+recovery.State.RecoveryOf+`"`), nil, 1)
+	if _, err := ParseIncident(legacyRecovery); err == nil {
+		t.Fatal("legacy pending recovery without incident identity was accepted")
 	}
 }

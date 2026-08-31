@@ -349,7 +349,7 @@ func TestTaskStateStoreRejectsUnsafeStateAndStrictJSON(t *testing.T) {
 	}
 	for name, raw := range map[string][]byte{
 		"corrupt":   []byte("not-json"),
-		"unknown":   []byte(`{"schema_version":1,"revision":1,"fingerprint":"healthy","first_observed":"2026-08-31T01:00:00Z","last_observed":"2026-08-31T01:00:00Z","severity":"ok","notification_stage":0,"thirty_minute_notified":false,"pending_notification":"","recovery_pending":false,"healthy":true,"extra":true}`),
+		"unknown":   []byte(`{"schema_version":1,"revision":1,"fingerprint":"healthy","first_observed":"2026-08-31T01:00:00Z","last_observed":"2026-08-31T01:00:00Z","severity":"ok","notification_stage":0,"thirty_minute_notified":false,"pending_notification":"","recovery_pending":false,"recovery_of":"","healthy":true,"extra":true}`),
 		"duplicate": []byte(`{"schema_version":1,"schema_version":1,"revision":1}`),
 		"trailing":  []byte(`{"schema_version":1} {}`),
 	} {

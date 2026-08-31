@@ -69,6 +69,7 @@ type IncidentState struct {
 	ThirtyMinuteNotified bool      `json:"thirty_minute_notified"`
 	PendingNotification  string    `json:"pending_notification"`
 	RecoveryPending      bool      `json:"recovery_pending"`
+	RecoveryOf           string    `json:"recovery_of"`
 	Healthy              bool      `json:"healthy"`
 }
 
@@ -122,12 +123,12 @@ func (s IncidentState) Validate() error {
 		return errors.New("invalid incident state")
 	}
 	if s.Healthy {
-		if s.Fingerprint != HealthyFingerprint || s.Severity != SeverityOK || s.NotificationStage != 0 || s.ThirtyMinuteNotified || s.PendingNotification != "" && s.PendingNotification != "recovery" {
+		if s.Fingerprint != HealthyFingerprint || s.Severity != SeverityOK || s.NotificationStage != 0 || s.ThirtyMinuteNotified || s.PendingNotification != "" && s.PendingNotification != "recovery" || s.RecoveryPending != shaPattern.MatchString(s.RecoveryOf) || !s.RecoveryPending && s.RecoveryOf != "" {
 			return errors.New("invalid incident state")
 		}
 		return nil
 	}
-	if !shaPattern.MatchString(s.Fingerprint) || s.Severity == SeverityOK || s.NotificationStage < 1 {
+	if !shaPattern.MatchString(s.Fingerprint) || s.Severity == SeverityOK || s.NotificationStage < 1 || s.RecoveryOf != "" {
 		return errors.New("invalid incident state")
 	}
 	if s.PendingNotification == "occurrence" && s.NotificationStage != 1 || s.PendingNotification == "escalation" && s.NotificationStage < 2 || s.PendingNotification == "recovery" {
@@ -236,7 +237,7 @@ func Decide(previous *IncidentState, snapshot Snapshot) (Decision, error) {
 			next.LastObserved = snapshot.ObservedAt
 			return Decision{State: next, Noop: true}, nil
 		}
-		next := IncidentState{SchemaVersion: SchemaVersion, Revision: previous.Revision + 1, Fingerprint: HealthyFingerprint, FirstObserved: snapshot.ObservedAt, LastObserved: snapshot.ObservedAt, Severity: SeverityOK, PendingNotification: "recovery", RecoveryPending: true, Healthy: true}
+		next := IncidentState{SchemaVersion: SchemaVersion, Revision: previous.Revision + 1, Fingerprint: HealthyFingerprint, FirstObserved: snapshot.ObservedAt, LastObserved: snapshot.ObservedAt, Severity: SeverityOK, PendingNotification: "recovery", RecoveryPending: true, RecoveryOf: previous.Fingerprint, Healthy: true}
 		return Decision{State: next, Recovery: true}, nil
 	}
 	if previous.Healthy || previous.Fingerprint != fingerprint {
@@ -291,6 +292,7 @@ func AcknowledgeDelivery(previous IncidentState) (IncidentState, error) {
 	next.Revision++
 	next.PendingNotification = ""
 	next.RecoveryPending = false
+	next.RecoveryOf = ""
 	if next.Validate() != nil {
 		return IncidentState{}, errors.New("invalid acknowledged incident")
 	}
@@ -324,8 +326,18 @@ func ParseIncident(raw []byte) (IncidentState, error) {
 	if err := strictDecode(raw, &v); err != nil {
 		return v, err
 	}
+	// recovery_of was added before the first production healthcheck release.
+	// Accept the known earlier shape only when it has no pending recovery; the
+	// recovered fingerprint cannot be reconstructed for a legacy pending state.
 	if err := requireObjectFields(raw, []string{"schema_version", "revision", "fingerprint", "first_observed", "last_observed", "severity", "notification_stage", "thirty_minute_notified", "pending_notification", "recovery_pending", "healthy"}); err != nil {
 		return v, err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return v, err
+	}
+	if _, present := fields["recovery_of"]; !present && v.RecoveryPending {
+		return v, errors.New("legacy pending recovery has no incident identity")
 	}
 	return v, v.Validate()
 }
