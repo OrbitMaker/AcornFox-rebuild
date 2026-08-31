@@ -59,6 +59,22 @@ func NewTaskStateStore(root string) (*TaskStateStore, error) {
 	return &TaskStateStore{writer: writer, lock: lock}, nil
 }
 
+// NewProductionStateStore opens the one fixed, root-owned incident-state
+// store used by the production runner. It deliberately exposes neither a
+// caller-selected root nor ownership parameters.
+func NewProductionStateStore() (*TaskStateStore, error) {
+	writer, err := install.ProductionDurableWriter(productionHealthStateRoot)
+	if err != nil {
+		return nil, errors.New("health state root is unavailable")
+	}
+	lock, err := writer.AcquireMetadataLock(incidentLockFile)
+	if err != nil {
+		_ = writer.Close()
+		return nil, errors.New("health state is already in use")
+	}
+	return &TaskStateStore{writer: writer, lock: lock}, nil
+}
+
 // Close releases the pinned task-root descriptor. A closed store cannot be
 // reused, which prevents later writes through an unverified root.
 func (s *TaskStateStore) Close() error {
@@ -281,6 +297,22 @@ func (c *TaskHostCollector) AcknowledgeEvent(event WebhookDeliveryEventV1) (Inci
 		return IncidentState{}, err
 	}
 	return next, nil
+}
+
+// CurrentIncident returns the exact durable incident state under the store
+// transaction lock. Production composition uses it to prove a dispatcher
+// acknowledgement reached storage before reporting delivery success.
+func (c *TaskHostCollector) CurrentIncident() (IncidentState, error) {
+	if c == nil || c.store == nil {
+		return IncidentState{}, errors.New("health collector is unavailable")
+	}
+	c.store.mu.Lock()
+	defer c.store.mu.Unlock()
+	current, err := c.store.loadLocked()
+	if err != nil || current == nil {
+		return IncidentState{}, errors.New("health state is unavailable")
+	}
+	return *current, nil
 }
 
 func acknowledgeIncidentLocked(previous IncidentState, expected *WebhookDeliveryEventV1) (IncidentState, error) {

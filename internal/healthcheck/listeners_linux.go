@@ -14,6 +14,10 @@ import (
 // a no-follow, bounded regular-file read.
 func NewLinuxListenerSource() ListenerSource { return linuxListenerSource{} }
 
+// NewProductionListenerSource is the platform production entrypoint. Linux
+// listener facts are intentionally read only from the fixed proc files.
+func NewProductionListenerSource() (ListenerSource, error) { return NewLinuxListenerSource(), nil }
+
 type linuxListenerSource struct{}
 
 func (linuxListenerSource) Capture(ctx context.Context) (ListenerFacts, error) {

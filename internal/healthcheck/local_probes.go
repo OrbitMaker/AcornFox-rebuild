@@ -67,6 +67,12 @@ func NewTaskLocalProbes(source ServiceSnapshotSource, client *http.Client, statf
 	return []HostProbe{fiveUnits, NewControlAPIProbe(client), NewEdgeProbe(client), disk, inode}, nil
 }
 
+// NewProductionLocalProbes binds the five local checks to their fixed host
+// boundaries. The caller owns the service adapter's lifecycle.
+func NewProductionLocalProbes(source ServiceSnapshotSource) ([]HostProbe, error) {
+	return NewTaskLocalProbes(source, &http.Client{}, productionStatFS)
+}
+
 // NewFiveUnitsProbe evaluates the exact install snapshot. The production
 // boot contract requires every unit, including public Edge, to be active and
 // enabled; an inactive Edge is therefore unhealthy rather than a bypass.

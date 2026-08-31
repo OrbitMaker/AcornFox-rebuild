@@ -1,6 +1,7 @@
 package secret
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -34,6 +35,179 @@ func testProvider(t *testing.T, now time.Time, ttl time.Duration) (*Provider, st
 
 func testReference(id string) domain.SecretReference {
 	return domain.SecretReference{ID: domain.ID(id), Name: "registry_token", Provider: "local", Version: "v1"}
+}
+
+func TestOpenExistingIsConstructorReadOnlyAndSupportsOperations(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	provider, root, materialRoot, keyPath := testProvider(t, now, time.Minute)
+	reference := testReference("open-existing")
+	if _, err := provider.Store(context.Background(), contracts.SecretRequest{Reference: reference, Value: []byte(canary), Operation: operation("open-existing-store")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := provider.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before := providerFilesystemSnapshot(t, root, materialRoot, keyPath)
+	opened, err := OpenExisting(Config{Root: root, MaterialRoot: materialRoot, MasterKeyPath: keyPath, MaterialTTL: time.Minute, Clock: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = opened.Close() })
+	if after := providerFilesystemSnapshot(t, root, materialRoot, keyPath); after != before {
+		t.Fatalf("OpenExisting mutated storage\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+	material, err := opened.ResolveBuildSecret(context.Background(), reference, operation("open-existing-resolve"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := opened.RevokeBuildSecret(context.Background(), material, operation("open-existing-revoke")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestOpenExistingRejectsAbsentOrStagedStorageWithoutMutation(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	for _, missing := range []string{"root", "vault", "metadata", "material", "key"} {
+		t.Run(missing, func(t *testing.T) {
+			provider, root, materialRoot, keyPath := testProvider(t, now, time.Minute)
+			if err := provider.Close(); err != nil {
+				t.Fatal(err)
+			}
+			switch missing {
+			case "root":
+				if err := os.RemoveAll(root); err != nil {
+					t.Fatal(err)
+				}
+			case "vault":
+				if err := os.RemoveAll(filepath.Join(root, "vault")); err != nil {
+					t.Fatal(err)
+				}
+			case "metadata":
+				if err := os.RemoveAll(filepath.Join(root, "metadata")); err != nil {
+					t.Fatal(err)
+				}
+			case "material":
+				if err := os.RemoveAll(materialRoot); err != nil {
+					t.Fatal(err)
+				}
+			case "key":
+				if err := os.Remove(keyPath); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before := providerFilesystemSnapshot(t, root, materialRoot, keyPath)
+			if _, err := OpenExisting(Config{Root: root, MaterialRoot: materialRoot, MasterKeyPath: keyPath, MaterialTTL: time.Minute}); err == nil {
+				t.Fatal("OpenExisting accepted missing storage")
+			}
+			if after := providerFilesystemSnapshot(t, root, materialRoot, keyPath); after != before {
+				t.Fatalf("OpenExisting recreated storage\nbefore:\n%s\nafter:\n%s", before, after)
+			}
+		})
+	}
+
+	provider, root, materialRoot, keyPath := testProvider(t, now, time.Minute)
+	if err := provider.Close(); err != nil {
+		t.Fatal(err)
+	}
+	stage := filepath.Join(root, "vault", ".secret-stage-open-existing")
+	if err := os.WriteFile(stage, []byte("staged"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before := providerFilesystemSnapshot(t, root, materialRoot, keyPath)
+	if _, err := OpenExisting(Config{Root: root, MaterialRoot: materialRoot, MasterKeyPath: keyPath, MaterialTTL: time.Minute}); err == nil {
+		t.Fatal("OpenExisting accepted staged storage")
+	}
+	if after := providerFilesystemSnapshot(t, root, materialRoot, keyPath); after != before {
+		t.Fatalf("OpenExisting removed stage\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+}
+
+func TestOpenExistingOperationsDoNotRepairRemovedOrChangedStorage(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	for _, changed := range []string{"vault", "metadata", "material", "key", "key_changed"} {
+		t.Run(changed, func(t *testing.T) {
+			provider, root, materialRoot, keyPath := testProvider(t, now, time.Minute)
+			reference := testReference("open-existing-operation-" + changed)
+			if _, err := provider.Store(context.Background(), contracts.SecretRequest{Reference: reference, Value: []byte(canary), Operation: operation("open-existing-store-" + changed)}); err != nil {
+				t.Fatal(err)
+			}
+			material, err := provider.ResolveBuildSecret(context.Background(), reference, operation("open-existing-material-"+changed))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := provider.Close(); err != nil {
+				t.Fatal(err)
+			}
+			opened, err := OpenExisting(Config{Root: root, MaterialRoot: materialRoot, MasterKeyPath: keyPath, MaterialTTL: time.Minute, Clock: func() time.Time { return now }})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer opened.Close()
+			switch changed {
+			case "vault":
+				err = os.RemoveAll(filepath.Join(root, "vault"))
+			case "metadata":
+				err = os.RemoveAll(filepath.Join(root, "metadata"))
+			case "material":
+				err = os.RemoveAll(materialRoot)
+			case "key":
+				err = os.Remove(keyPath)
+			case "key_changed":
+				err = os.WriteFile(keyPath, bytes.Repeat([]byte{0x7f}, 32), 0o600)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			before := providerFilesystemSnapshot(t, root, materialRoot, keyPath)
+			if _, err := opened.ResolveBuildSecret(context.Background(), reference, operation("open-existing-resolve-after-"+changed)); err == nil {
+				t.Fatal("ResolveBuildSecret repaired unavailable storage")
+			}
+			if err := opened.RevokeBuildSecret(context.Background(), material, operation("open-existing-revoke-after-"+changed)); err == nil {
+				t.Fatal("RevokeBuildSecret repaired unavailable storage")
+			}
+			if after := providerFilesystemSnapshot(t, root, materialRoot, keyPath); after != before {
+				t.Fatalf("operation repaired storage\nbefore:\n%s\nafter:\n%s", before, after)
+			}
+		})
+	}
+}
+
+func providerFilesystemSnapshot(t *testing.T, roots ...string) string {
+	t.Helper()
+	var result strings.Builder
+	for _, root := range roots {
+		info, err := os.Lstat(root)
+		if errors.Is(err, fs.ErrNotExist) {
+			result.WriteString(root + "=missing\n")
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !info.IsDir() {
+			result.WriteString(root + "=" + info.Mode().String() + "\n")
+			continue
+		}
+		err = filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			entryInfo, err := entry.Info()
+			if err != nil {
+				return err
+			}
+			rel, err := filepath.Rel(root, path)
+			if err != nil {
+				return err
+			}
+			result.WriteString(root + "/" + rel + "=" + entryInfo.Mode().String() + ":" + fmt.Sprint(entryInfo.Size()) + "\n")
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	return result.String()
 }
 
 func operation(key string) contracts.OperationContext {

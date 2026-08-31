@@ -15,6 +15,7 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -98,6 +99,7 @@ type Provider struct {
 	masterKey     [32]byte
 	ttl           time.Duration
 	clock         func() time.Time
+	existingOnly  bool
 
 	mu sync.Mutex
 
@@ -144,11 +146,28 @@ type materialMetadata struct {
 // key if needed, and removes stale materializations left by an interrupted
 // process. No request-controlled path is ever used for filesystem access.
 func New(config Config) (*Provider, error) {
-	root, err := normalizeDirectory(config.Root, "secret root")
+	return newProvider(config, false)
+}
+
+// OpenExisting opens an already provisioned provider without creating a
+// directory or master key and without stage/material recovery. It is for
+// consumers that must not mutate secret storage merely by starting up.
+func OpenExisting(config Config) (*Provider, error) {
+	return newProvider(config, true)
+}
+
+func newProvider(config Config, existingOnly bool) (*Provider, error) {
+	normalize := normalizeDirectory
+	loadKey := loadOrCreateMasterKey
+	if existingOnly {
+		normalize = normalizeExistingDirectory
+		loadKey = loadExistingMasterKey
+	}
+	root, err := normalize(config.Root, "secret root")
 	if err != nil {
 		return nil, err
 	}
-	materialRoot, err := normalizeDirectory(config.MaterialRoot, "secret material root")
+	materialRoot, err := normalize(config.MaterialRoot, "secret material root")
 	if err != nil {
 		return nil, err
 	}
@@ -170,7 +189,7 @@ func New(config Config) (*Provider, error) {
 		clock = time.Now
 	}
 
-	keyPath, key, err := loadOrCreateMasterKey(config.MasterKeyPath)
+	keyPath, key, err := loadKey(config.MasterKeyPath)
 	if err != nil {
 		return nil, err
 	}
@@ -186,17 +205,23 @@ func New(config Config) (*Provider, error) {
 			SensitiveInputs: []string{"secret.value", "master_key", "build_secret.material"},
 		},
 		root: root, vaultRoot: filepath.Join(root, "vault"), metadataRoot: filepath.Join(root, "metadata"),
-		materialRoot: materialRoot, masterKeyPath: keyPath, masterKey: key, ttl: ttl, clock: clock,
+		materialRoot: materialRoot, masterKeyPath: keyPath, masterKey: key, ttl: ttl, clock: clock, existingOnly: existingOnly,
 		storeOps: make(map[string]operationRecord), resolveOps: make(map[string]operationRecord), revokeOps: make(map[string]operationRecord),
 	}
-	if err := p.ensureLayout(); err != nil {
+	if existingOnly {
+		if err := p.validateExistingLayout(); err != nil {
+			return nil, p.failure(contracts.OperationContext{}, contracts.CapabilitySecretManage, "open", contracts.ErrUnavailable, "secret provider storage is unavailable", err)
+		}
+	} else if err := p.ensureLayout(); err != nil {
 		return nil, p.failure(contracts.OperationContext{}, contracts.CapabilitySecretManage, "initialize", contracts.ErrUnavailable, "secret provider storage is unavailable", err)
 	}
-	if err := p.recoverSecretStages(); err != nil {
-		return nil, p.failure(contracts.OperationContext{}, contracts.CapabilitySecretManage, "recover", contracts.ErrUnavailable, "secret stage recovery failed", err)
-	}
-	if err := p.recoverMaterials(); err != nil {
-		return nil, p.failure(contracts.OperationContext{}, contracts.CapabilitySecretResolve, "recover", contracts.ErrUnavailable, "secret material recovery failed", err)
+	if !existingOnly {
+		if err := p.recoverSecretStages(); err != nil {
+			return nil, p.failure(contracts.OperationContext{}, contracts.CapabilitySecretManage, "recover", contracts.ErrUnavailable, "secret stage recovery failed", err)
+		}
+		if err := p.recoverMaterials(); err != nil {
+			return nil, p.failure(contracts.OperationContext{}, contracts.CapabilitySecretResolve, "recover", contracts.ErrUnavailable, "secret material recovery failed", err)
+		}
 	}
 	if err := p.loadOperationIndexes(); err != nil {
 		return nil, p.failure(contracts.OperationContext{}, contracts.CapabilitySecretManage, "recover", contracts.ErrUnavailable, "secret operation recovery failed", err)
@@ -479,6 +504,111 @@ func (p *Provider) ensureLayout() error {
 		return err
 	}
 	return nil
+}
+
+func (p *Provider) validateExistingLayout() error {
+	if err := ensureSecureDirectory(p.root, false); err != nil {
+		return err
+	}
+	for _, path := range []string{p.vaultRoot, p.metadataRoot} {
+		if err := ensureExistingChildDirectory(p.root, path); err != nil {
+			return err
+		}
+	}
+	if err := ensureSecureDirectory(p.materialRoot, false); err != nil {
+		return err
+	}
+	if err := p.validateExistingMasterKey(); err != nil {
+		return err
+	}
+	return p.validateExistingFiles()
+}
+
+func (p *Provider) validateExistingMasterKey() error {
+	path, key, err := loadExistingMasterKey(p.masterKeyPath)
+	defer zeroBytes(key[:])
+	if err != nil || path != p.masterKeyPath || subtle.ConstantTimeCompare(key[:], p.masterKey[:]) != 1 {
+		return errUnsafePath
+	}
+	return nil
+}
+
+func (p *Provider) validateExistingFiles() error {
+	vault, err := existingProviderFiles(p.vaultRoot, ".enc")
+	if err != nil {
+		return err
+	}
+	metadata, err := existingProviderFiles(p.metadataRoot, ".json")
+	if err != nil || !sameExistingProviderFiles(vault, metadata) {
+		return errUnsafePath
+	}
+	for name := range vault {
+		if !hashPattern.MatchString(name) {
+			return errUnsafePath
+		}
+	}
+	secrets, err := existingProviderFiles(p.materialRoot, ".secret", ".json")
+	if err != nil {
+		return err
+	}
+	materials, err := existingProviderFiles(p.materialRoot, ".json", ".secret")
+	if err != nil || !sameExistingProviderFiles(secrets, materials) {
+		return errUnsafePath
+	}
+	for name := range secrets {
+		if !materialPattern.MatchString(name) {
+			return errUnsafePath
+		}
+	}
+	return nil
+}
+
+func existingProviderFiles(directory, suffix string, allowedOther ...string) (map[string]struct{}, error) {
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return nil, err
+	}
+	files := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasSuffix(name, suffix) {
+			allowed := false
+			for _, other := range allowedOther {
+				if strings.HasSuffix(name, other) {
+					allowed = true
+					break
+				}
+			}
+			if allowed {
+				continue
+			}
+			return nil, errUnsafePath
+		}
+		base := strings.TrimSuffix(name, suffix)
+		if !hashPattern.MatchString(base) && !materialPattern.MatchString(base) {
+			return nil, errUnsafePath
+		}
+		if _, err := securePathState(filepath.Join(directory, name)); err != nil {
+			return nil, err
+		}
+		if _, exists := files[base]; exists {
+			return nil, errUnsafePath
+		}
+		files[base] = struct{}{}
+	}
+	return files, nil
+}
+
+func sameExistingProviderFiles(left, right map[string]struct{}) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for name := range left {
+		if _, exists := right[name]; !exists {
+			return false
+		}
+	}
+	return true
 }
 
 func (p *Provider) publishSecret(reference domain.SecretReference, value []byte, plainDigest, opDigest, fingerprint string) error {
@@ -1033,7 +1163,11 @@ func (p *Provider) check(ctx context.Context, operation contracts.OperationConte
 	if err := contextError(ctx, operation); err != nil {
 		return p.classify(operation, capability, action, err)
 	}
-	if err := p.ensureLayout(); err != nil {
+	validateLayout := p.ensureLayout
+	if p.existingOnly {
+		validateLayout = p.validateExistingLayout
+	}
+	if err := validateLayout(); err != nil {
 		return p.classify(operation, capability, action, err)
 	}
 	return nil
@@ -1158,6 +1292,28 @@ func normalizeDirectory(value, label string) (string, error) {
 	return abs, nil
 }
 
+func normalizeExistingDirectory(value, label string) (string, error) {
+	if strings.TrimSpace(value) == "" {
+		return "", fmt.Errorf("%s is required", label)
+	}
+	abs, err := filepath.Abs(value)
+	if err != nil {
+		return "", fmt.Errorf("%s is invalid", label)
+	}
+	abs = filepath.Clean(abs)
+	info, err := os.Lstat(abs)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return "", fmt.Errorf("%s does not exist", label)
+		}
+		return "", fmt.Errorf("%s is unavailable", label)
+	}
+	if info.Mode()&fs.ModeSymlink != 0 || !info.IsDir() || ensureSecureDirectory(abs, false) != nil {
+		return "", fmt.Errorf("%s is not secure", label)
+	}
+	return abs, nil
+}
+
 func loadOrCreateMasterKey(value string) (string, [32]byte, error) {
 	var key [32]byte
 	if strings.TrimSpace(value) == "" {
@@ -1214,6 +1370,39 @@ func loadOrCreateMasterKey(value string) (string, [32]byte, error) {
 	return abs, key, nil
 }
 
+func loadExistingMasterKey(value string) (string, [32]byte, error) {
+	var key [32]byte
+	if strings.TrimSpace(value) == "" {
+		return "", key, errors.New("secret master key path is required")
+	}
+	abs, err := filepath.Abs(value)
+	if err != nil {
+		return "", key, errors.New("secret master key path is invalid")
+	}
+	abs = filepath.Clean(abs)
+	if err := ensureParentSecure(filepath.Dir(abs)); err != nil {
+		return "", key, errors.New("secret master key parent is unsafe")
+	}
+	info, err := os.Lstat(abs)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return "", key, errors.New("secret master key does not exist")
+		}
+		return "", key, errors.New("secret master key is unavailable")
+	}
+	if info.Mode()&fs.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 || info.Size() != int64(len(key)) {
+		return "", key, errors.New("secret master key file is unsafe")
+	}
+	data, err := readSecureFile(abs, len(key))
+	if err != nil || len(data) != len(key) {
+		zeroBytes(data)
+		return "", key, errors.New("secret master key could not be read")
+	}
+	copy(key[:], data)
+	zeroBytes(data)
+	return abs, key, nil
+}
+
 func ensureParentSecure(path string) error {
 	info, err := os.Lstat(path)
 	if err != nil {
@@ -1255,6 +1444,14 @@ func ensureChildDirectory(root, path string) error {
 	}
 	if err := os.MkdirAll(path, 0o700); err != nil {
 		return err
+	}
+	return ensureSecureDirectory(path, false)
+}
+
+func ensureExistingChildDirectory(root, path string) error {
+	rel, err := filepath.Rel(root, path)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return errUnsafePath
 	}
 	return ensureSecureDirectory(path, false)
 }
