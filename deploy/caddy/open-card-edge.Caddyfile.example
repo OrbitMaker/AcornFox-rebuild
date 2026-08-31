@@ -22,13 +22,21 @@
 
 (control_plane_identity_headers) {
 	# Only the loopback control plane may treat this value as a client source.
-	# Delete any external input before deriving it from Caddy's connection peer.
+	# Delete every currently defined trusted/internal input before deriving the
+	# client source at Edge. X-Open-Card-CSRF is deliberately absent: it is an
+	# untrusted browser proof that the control plane verifies with the session
+	# cookie and Origin, not an identity assertion.
 	header_up -Open-Card-*
-	header_up -X-Open-Card-*
-	# CSRF is a browser-supplied proof, not a trusted identity assertion. Restore
-	# it after stripping the wider header namespace so authenticated writes can
-	# still bind the cookie, Origin and CSRF token at the control plane.
-	header_up X-Open-Card-CSRF {http.vars.open_card_csrf}
+	header_up -X-Open-Card-Client-IP
+	header_up -X-Open-Card-Role
+	header_up -X-Open-Card-Actor
+	header_up -X-Open-Card-Task-Scope
+	header_up -X-Open-Card-Rollout-ID
+	header_up -X-Open-Card-Route-Digest
+	header_up -X-Open-Card-Event-ID
+	header_up -X-Open-Card-Event-Type
+	header_up -X-Open-Card-Timestamp
+	header_up -X-Open-Card-Signature
 	header_up X-Open-Card-Client-IP {remote_host}
 }
 
@@ -63,7 +71,6 @@ console.example.invalid {
 	}
 	@control_plane path /api*
 	handle @control_plane {
-		vars open_card_csrf {http.request.header.X-Open-Card-CSRF}
 		reverse_proxy 127.0.0.1:8080 {
 			import control_plane_identity_headers
 			import control_plane_transport

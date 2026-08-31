@@ -64,8 +64,12 @@ class EdgeConfigContractTests(unittest.TestCase):
         self.assertIn("reverse_proxy 127.0.0.1:8080", self.caddyfile)
         self.assertIn("header_up -Open-Card-*", self.caddyfile)
         self.assertIn("header_up -X-Open-Card-*", self.caddyfile)
-        self.assertIn("vars open_card_csrf {http.request.header.X-Open-Card-CSRF}", self.caddyfile)
-        self.assertIn("header_up X-Open-Card-CSRF {http.vars.open_card_csrf}", self.caddyfile)
+        control = self.caddyfile.split("(control_plane_identity_headers) {", 1)[1].split("\n}\n\n(control_plane_transport)", 1)[0]
+        self.assertNotIn("header_up -X-Open-Card-*", control)
+        self.assertNotIn("header_up -X-Open-Card-CSRF", control)
+        for name in ("Client-IP", "Role", "Actor", "Task-Scope", "Rollout-ID", "Route-Digest", "Event-ID", "Event-Type", "Timestamp", "Signature"):
+            self.assertIn(f"header_up -X-Open-Card-{name}", control)
+        self.assertIn("header_up X-Open-Card-Client-IP {remote_host}", control)
         self.assertIn("import control_plane_identity_headers", self.caddyfile)
         self.assertIn("header_up X-Open-Card-Client-IP {remote_host}", self.caddyfile)
         trusted_source = self.fixture["routes"]["trusted_client_source_header"]
