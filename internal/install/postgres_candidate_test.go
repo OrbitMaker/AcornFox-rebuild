@@ -86,6 +86,30 @@ func (r adapterRow) Scan(dest ...any) error {
 			*p = r.values[i].(int)
 		case *string:
 			*p = r.values[i].(string)
+		case *sql.NullString:
+			if r.values[i] == nil {
+				*p = sql.NullString{}
+			} else {
+				*p = sql.NullString{String: r.values[i].(string), Valid: true}
+			}
+		case *sql.NullInt64:
+			if r.values[i] == nil {
+				*p = sql.NullInt64{}
+			} else {
+				*p = sql.NullInt64{Int64: int64(r.values[i].(int)), Valid: true}
+			}
+		case *sql.NullBool:
+			if r.values[i] == nil {
+				*p = sql.NullBool{}
+			} else {
+				*p = sql.NullBool{Bool: r.values[i].(bool), Valid: true}
+			}
+		case *sql.NullTime:
+			if r.values[i] == nil {
+				*p = sql.NullTime{}
+			} else {
+				*p = sql.NullTime{Time: r.values[i].(time.Time), Valid: true}
+			}
 		}
 	}
 	return nil
@@ -316,6 +340,56 @@ func TestSelectedPostgresDatabaseReadsServerCurrentDatabaseAndCanonicalRowsDiges
 	} {
 		if _, err := CanonicalMigrationRowsSHA256(bad); !errors.Is(err, ErrPostgresOutcomeUnknown) {
 			t.Fatalf("bad rows accepted: %#v err=%v", bad, err)
+		}
+	}
+}
+
+func TestSelectedPostgresDatabaseReadsFixedHealthProjectionsIncludingNulls(t *testing.T) {
+	notAfter := time.Date(2026, 8, 31, 12, 0, 0, 0, time.FixedZone("test", 8*60*60))
+	acquired := notAfter.Add(-time.Hour)
+	database := &adapterDB{rows: &adapterRows{rows: [][]any{{"lease-1", "app-1", "deployment-1", "web", "127.0.0.1", 18081, acquired, nil, nil, "serving", true}}}}
+	selected := &SelectedPostgresDatabase{database: database}
+	runtime, err := selected.RuntimePortFacts(context.Background())
+	if err != nil || database.query != RuntimePortFactsSQL || len(database.args) != 0 || len(runtime) != 1 || runtime[0].Port != 18081 || runtime[0].DeploymentState == nil || runtime[0].ReleasedAt != nil {
+		t.Fatalf("runtime=%#v err=%v query=%q args=%v", runtime, err, database.query, database.args)
+	}
+
+	database.rows = &adapterRows{rows: [][]any{{"platform-1", "example.test", "verified", false}}}
+	platform, err := selected.PlatformCertificateCoverage(context.Background())
+	if err != nil || database.query != PlatformCertificateCoverageSQL || len(platform) != 1 || platform[0].PlatformVerificationStatus != "verified" || platform[0].PlatformWildcardEnabled {
+		t.Fatalf("platform=%#v err=%v query=%q", platform, err, database.query)
+	}
+
+	database.rows = &adapterRows{rows: [][]any{{"route-1", "app.example.test", "app-1", "deployment-1", "web", "active", true, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil}}}
+	routes, err := selected.ServingCertificateCoverage(context.Background())
+	if err != nil || database.query != ServingCertificateCoverageSQL || len(routes) != 1 || routes[0].DomainVerificationStatus != nil || routes[0].RuntimeHealthy != nil || routes[0].CertificateSecretReference != nil {
+		t.Fatalf("routes=%#v err=%v query=%q", routes, err, database.query)
+	}
+}
+
+func TestSelectedPostgresDatabaseHealthProjectionsFailClosed(t *testing.T) {
+	for _, read := range []func(*SelectedPostgresDatabase) error{
+		func(s *SelectedPostgresDatabase) error {
+			_, err := s.RuntimePortFacts(context.Background())
+			return err
+		},
+		func(s *SelectedPostgresDatabase) error {
+			_, err := s.PlatformCertificateCoverage(context.Background())
+			return err
+		},
+		func(s *SelectedPostgresDatabase) error {
+			_, err := s.ServingCertificateCoverage(context.Background())
+			return err
+		},
+	} {
+		if err := read(&SelectedPostgresDatabase{}); !errors.Is(err, ErrPostgresOutcomeUnknown) {
+			t.Fatalf("nil selected error=%v", err)
+		}
+		if err := read(&SelectedPostgresDatabase{database: &adapterDB{queryErr: errors.New("postgresql://user:secret@db.invalid/private")}}); !errors.Is(err, ErrPostgresOutcomeUnknown) || strings.Contains(fmt.Sprint(err), "secret") {
+			t.Fatalf("query error=%v", err)
+		}
+		if err := read(&SelectedPostgresDatabase{database: &adapterDB{rows: &adapterRows{rows: [][]any{{"bad"}}, scanErr: errors.New("private reference")}}}); !errors.Is(err, ErrPostgresOutcomeUnknown) || strings.Contains(fmt.Sprint(err), "private") {
+			t.Fatalf("scan error=%v", err)
 		}
 	}
 }

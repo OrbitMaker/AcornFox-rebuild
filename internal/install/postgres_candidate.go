@@ -84,6 +84,80 @@ type MigrationTx interface {
 type MigrationRow struct{ Version, Checksum string }
 type MigrationEvidence struct{ From, To, RowsSHA256 string }
 
+// RuntimePortFact is the fixed, public-safe projection of one active runtime
+// deployment. It deliberately contains no database connection material.
+type RuntimePortFact struct {
+	LeaseID           string
+	ApplicationID     string
+	DeploymentID      string
+	ServiceName       string
+	BindHost          string
+	Port              int
+	AcquiredAt        time.Time
+	ExpiresAt         *time.Time
+	ReleasedAt        *time.Time
+	DeploymentState   *string
+	DeploymentHealthy *bool
+}
+
+// CertificateCoverageFact is the public-safe certificate projection used by
+// the health package. Optional fields preserve missing joins so callers can
+// fail closed instead of silently treating incomplete control-plane facts as
+// absent.
+type CertificateCoverageFact struct {
+	PlatformVerificationStatus string
+	PlatformWildcardEnabled    bool
+	ID                         string
+	Hostname                   string
+	ApplicationID              string
+	DeploymentID               string
+	ServiceName                string
+	DesiredState               string
+	RouteVerified              bool
+	PointerDeploymentID        *string
+	PointerLeaseID             *string
+	LeaseApplicationID         *string
+	LeaseDeploymentID          *string
+	LeaseServiceName           *string
+	LeaseBindHost              *string
+	LeasePort                  *int
+	LeaseExpiresAt             *time.Time
+	LeaseReleasedAt            *time.Time
+	DomainVerificationStatus   *string
+	RuntimeHealthy             *bool
+	RuntimeState               *string
+	CertificateStatus          *string
+	CertificateSubject         *string
+	CertificateSecretReference *string
+	CertificateNotBefore       *time.Time
+	CertificateNotAfter        *time.Time
+}
+
+const RuntimePortFactsSQL = `SELECT l.id,l.application_id,l.deployment_id,l.service_name,l.bind_host,l.port,
+       l.acquired_at,l.expires_at,l.released_at,d.state,d.runtime_healthy
+FROM m3_port_leases l
+LEFT JOIN deployments d ON d.id=l.deployment_id
+WHERE l.released_at IS NULL
+ORDER BY l.id`
+
+const PlatformCertificateCoverageSQL = `SELECT p.id,p.hostname,p.verification_status,p.wildcard_enabled
+FROM m3_platform_domains p
+ORDER BY p.id`
+
+const ServingCertificateCoverageSQL = `SELECT r.id,r.hostname,r.application_id,r.deployment_id,r.service_name,r.desired_state,r.verified,
+       p.deployment_id,p.port_lease_id,
+       l.application_id,l.deployment_id,l.service_name,l.bind_host,l.port,l.expires_at,l.released_at,
+       ad.verification_status,d.runtime_healthy,d.state,
+       c.status,c.subject_hostname,c.secret_reference_id,c.not_before,c.not_after
+FROM m3_desired_routes r
+LEFT JOIN m3_route_pointers p ON p.route_id=r.id
+LEFT JOIN m3_port_leases l ON l.id=p.port_lease_id
+LEFT JOIN m3_application_domains ad ON ad.id=r.application_domain_id
+LEFT JOIN deployments d ON d.id=r.deployment_id
+LEFT JOIN m3_certificate_references c ON c.id=r.certificate_reference_id
+WHERE r.serving=true
+ORDER BY r.id`
+
 func CreateCandidate(ctx context.Context, control CandidateControl, request CreateCandidateRequest) (string, error) {
 	if control == nil || !validSHA(request.RecoveryEvidence) {
 		return "", ErrPostgresOutcomeUnknown
@@ -308,6 +382,144 @@ func (s *SelectedPostgresDatabase) CurrentDatabase(ctx context.Context) (string,
 		return "", ErrPostgresOutcomeUnknown
 	}
 	return name, nil
+}
+
+// RuntimePortFacts reads every unreleased port lease together with its
+// deployment projection. The query intentionally retains missing deployment
+// joins for the health adapter to reject rather than hiding malformed state.
+func (s *SelectedPostgresDatabase) RuntimePortFacts(ctx context.Context) ([]RuntimePortFact, error) {
+	if s == nil || s.database == nil {
+		return nil, ErrPostgresOutcomeUnknown
+	}
+	rows, err := s.database.QueryContext(ctx, RuntimePortFactsSQL)
+	if err != nil {
+		return nil, ErrPostgresOutcomeUnknown
+	}
+	defer rows.Close()
+	result := make([]RuntimePortFact, 0)
+	for rows.Next() {
+		var fact RuntimePortFact
+		var expiresAt, releasedAt sql.NullTime
+		var state sql.NullString
+		var healthy sql.NullBool
+		if err := rows.Scan(&fact.LeaseID, &fact.ApplicationID, &fact.DeploymentID, &fact.ServiceName, &fact.BindHost, &fact.Port,
+			&fact.AcquiredAt, &expiresAt, &releasedAt, &state, &healthy); err != nil {
+			return nil, ErrPostgresOutcomeUnknown
+		}
+		fact.ExpiresAt = nullableTime(expiresAt)
+		fact.ReleasedAt = nullableTime(releasedAt)
+		fact.DeploymentState = nullableString(state)
+		fact.DeploymentHealthy = nullableBool(healthy)
+		result = append(result, fact)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, ErrPostgresOutcomeUnknown
+	}
+	return result, nil
+}
+
+// PlatformCertificateCoverage reads every platform-domain candidate. Console
+// certificate truth is observed live; G3 does not persist a console
+// certificate observation and must not be made to look as if it did.
+func (s *SelectedPostgresDatabase) PlatformCertificateCoverage(ctx context.Context) ([]CertificateCoverageFact, error) {
+	if s == nil || s.database == nil {
+		return nil, ErrPostgresOutcomeUnknown
+	}
+	rows, err := s.database.QueryContext(ctx, PlatformCertificateCoverageSQL)
+	if err != nil {
+		return nil, ErrPostgresOutcomeUnknown
+	}
+	defer rows.Close()
+	result := make([]CertificateCoverageFact, 0)
+	for rows.Next() {
+		var fact CertificateCoverageFact
+		if err := rows.Scan(&fact.ID, &fact.Hostname, &fact.PlatformVerificationStatus, &fact.PlatformWildcardEnabled); err != nil {
+			return nil, ErrPostgresOutcomeUnknown
+		}
+		result = append(result, fact)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, ErrPostgresOutcomeUnknown
+	}
+	return result, nil
+}
+
+// ServingCertificateCoverage reads every serving desired route. LEFT JOINs are
+// intentional: a missing application domain, deployment, or certificate is a
+// health failure rather than an omitted target.
+func (s *SelectedPostgresDatabase) ServingCertificateCoverage(ctx context.Context) ([]CertificateCoverageFact, error) {
+	if s == nil || s.database == nil {
+		return nil, ErrPostgresOutcomeUnknown
+	}
+	rows, err := s.database.QueryContext(ctx, ServingCertificateCoverageSQL)
+	if err != nil {
+		return nil, ErrPostgresOutcomeUnknown
+	}
+	defer rows.Close()
+	result := make([]CertificateCoverageFact, 0)
+	for rows.Next() {
+		var fact CertificateCoverageFact
+		var pointerDeployment, pointerLease, leaseApplication, leaseDeployment, leaseService, leaseBind, domainStatus, runtimeState, certificateStatus, certificateSubject, reference sql.NullString
+		var leasePort sql.NullInt64
+		var leaseExpires, leaseReleased sql.NullTime
+		var healthy sql.NullBool
+		var notBefore, notAfter sql.NullTime
+		if err := rows.Scan(&fact.ID, &fact.Hostname, &fact.ApplicationID, &fact.DeploymentID, &fact.ServiceName, &fact.DesiredState, &fact.RouteVerified,
+			&pointerDeployment, &pointerLease,
+			&leaseApplication, &leaseDeployment, &leaseService, &leaseBind, &leasePort, &leaseExpires, &leaseReleased,
+			&domainStatus, &healthy, &runtimeState, &certificateStatus, &certificateSubject, &reference, &notBefore, &notAfter); err != nil {
+			return nil, ErrPostgresOutcomeUnknown
+		}
+		fact.DomainVerificationStatus = nullableString(domainStatus)
+		fact.PointerDeploymentID = nullableString(pointerDeployment)
+		fact.PointerLeaseID = nullableString(pointerLease)
+		fact.LeaseApplicationID = nullableString(leaseApplication)
+		fact.LeaseDeploymentID = nullableString(leaseDeployment)
+		fact.LeaseServiceName = nullableString(leaseService)
+		fact.LeaseBindHost = nullableString(leaseBind)
+		if leasePort.Valid {
+			value := int(leasePort.Int64)
+			fact.LeasePort = &value
+		}
+		fact.LeaseExpiresAt = nullableTime(leaseExpires)
+		fact.LeaseReleasedAt = nullableTime(leaseReleased)
+		fact.RuntimeHealthy = nullableBool(healthy)
+		fact.RuntimeState = nullableString(runtimeState)
+		fact.CertificateStatus = nullableString(certificateStatus)
+		fact.CertificateSubject = nullableString(certificateSubject)
+		fact.CertificateSecretReference = nullableString(reference)
+		fact.CertificateNotBefore = nullableTime(notBefore)
+		fact.CertificateNotAfter = nullableTime(notAfter)
+		result = append(result, fact)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, ErrPostgresOutcomeUnknown
+	}
+	return result, nil
+}
+
+func nullableString(value sql.NullString) *string {
+	if !value.Valid {
+		return nil
+	}
+	copy := value.String
+	return &copy
+}
+
+func nullableBool(value sql.NullBool) *bool {
+	if !value.Valid {
+		return nil
+	}
+	copy := value.Bool
+	return &copy
+}
+
+func nullableTime(value sql.NullTime) *time.Time {
+	if !value.Valid {
+		return nil
+	}
+	copy := value.Time.UTC()
+	return &copy
 }
 func (p *ProductionPostgresControl) Close() error {
 	if p == nil || p.admin == nil {
