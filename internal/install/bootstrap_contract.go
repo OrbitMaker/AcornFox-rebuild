@@ -64,7 +64,7 @@ func bootstrapRank(s BootstrapState) int {
 }
 func (j BootstrapJournalV1) Validate() error {
 	architecture, architectureErr := NormalizeArchitecture(j.Release.Architecture)
-	if j.SchemaVersion != 1 || !validID(j.TransactionID) || j.Revision < 1 || !validSHA(j.InstallationIDSHA256) || !j.Release.valid() || j.Release.Version != Gate6CandidateVersion || architectureErr != nil || architecture != j.Release.Architecture || !validID(j.CandidateActivationID) || !candidateDatabaseName.MatchString(j.CandidateDatabaseName) || j.MarkerTransactionID != j.TransactionID || j.CreatedAt.IsZero() || j.UpdatedAt.Before(j.CreatedAt) {
+	if j.SchemaVersion != 1 || !validID(j.TransactionID) || j.Revision < 1 || !validSHA(j.InstallationIDSHA256) || !j.Release.valid() || (j.Release.Version != Gate6CandidateVersion && j.Release.Version != Gate7CandidateVersion) || architectureErr != nil || architecture != j.Release.Architecture || !validID(j.CandidateActivationID) || !candidateDatabaseName.MatchString(j.CandidateDatabaseName) || j.MarkerTransactionID != j.TransactionID || j.CreatedAt.IsZero() || j.UpdatedAt.Before(j.CreatedAt) {
 		return errors.New("invalid bootstrap journal")
 	}
 	if int64(len(j.History)) != j.Revision || len(j.History) == 0 {

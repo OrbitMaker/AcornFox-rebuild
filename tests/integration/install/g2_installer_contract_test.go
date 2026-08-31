@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/open-card/open-card/internal/install"
@@ -25,7 +26,7 @@ func writeG2CandidateBundleVersion(t *testing.T, directory string, includeEdge b
 		{"bin/open-card-server", 0o755}, {"bin/open-card-agent", 0o755}, {"bin/open-card-buildkit", 0o755}, {"bin/open-card-caddy", 0o755}, {"bin/open-card-admin", 0o755}, {"bin/open-card-upgrade", 0o755},
 		{"caddy/open-card-edge.Caddyfile.example", 0o644}, {"caddy/open-card-edge.env.example", 0o640}, {"migrations/control-plane/0024_dns_change_ledger.sql", 0o644}, {"web/dist/index.html", 0o644}, {"docs/licenses/licenses-manifest.json", 0o644}, {"sbom.spdx.json", 0o644}, {"source-manifest.sha256", 0o640},
 	}
-	if version == install.Gate6CandidateVersion {
+	if version == install.Gate6CandidateVersion || version == install.Gate7CandidateVersion {
 		files = append(files,
 			struct {
 				path string
@@ -47,6 +48,22 @@ func writeG2CandidateBundleVersion(t *testing.T, directory string, includeEdge b
 				path string
 				mode os.FileMode
 			}{"tools/evidence/g6_target_receipt.py", 0o755},
+		)
+	}
+	if version == install.Gate7CandidateVersion {
+		files = append(files,
+			struct {
+				path string
+				mode os.FileMode
+			}{"bin/open-card-healthcheck", 0o755},
+			struct {
+				path string
+				mode os.FileMode
+			}{"systemd/open-card-healthcheck.service", 0o644},
+			struct {
+				path string
+				mode os.FileMode
+			}{"systemd/open-card-healthcheck.timer", 0o644},
 		)
 	}
 	for _, item := range files {
@@ -112,6 +129,12 @@ func writeG2CandidateBundleVersion(t *testing.T, directory string, includeEdge b
 			t.Fatal(err)
 		}
 		predecessorVersion, predecessorMigration = install.Gate6NMinusOneVersion, "0024"
+	} else if version == install.Gate7CandidateVersion {
+		lineage, err = install.RC2LineageForArchitecture(architecture)
+		if err != nil {
+			t.Fatal(err)
+		}
+		predecessorVersion, predecessorMigration = install.Gate7NMinusOneVersion, "0024"
 	}
 	manifest := install.Manifest{SchemaVersion: install.ManifestSchemaVersion, Product: install.ManifestProduct, Version: version, ReleaseID: "release-" + version, Architecture: architecture, MigrationVersion: install.CurrentMigrationVersion, SourceCommit: strings.Repeat("a", 40), NMinusOne: &install.NMinusOne{Version: predecessorVersion, MigrationVersion: predecessorMigration, SourceCommit: lineage.SourceCommit, ReleaseManifestSHA256: lineage.ReleaseManifestSHA256, ArchiveSHA256: lineage.ArchiveSHA256, BundleManifestSHA256: lineage.BundleManifestSHA256}, Protocol: install.AgentProtocolVersion, ConfigDir: install.DefaultConfigDir, DataDir: install.DefaultDataDir, Compatibility: install.Compatibility{MinDataVersion: 1, MaxDataVersion: 24, MinAgentProtocol: install.PreviousAgentProtocol, MaxAgentProtocol: install.AgentProtocolVersion}, Files: entries}
 	if err := install.SaveManifest(filepath.Join(bundle, "manifest.json"), manifest); err != nil {
@@ -405,9 +428,9 @@ func TestG2StageUpgradeSubstrateLeavesLegacyRuntimeUntouched(t *testing.T) {
 	}
 }
 
-func TestG2StageNativeBootstrapPublishesNoPointersOrRuntimeState(t *testing.T) {
+func TestG2StageRC3NativeBootstrapPublishesNoPointersOrRuntimeState(t *testing.T) {
 	directory := t.TempDir()
-	bundle := writeG2CandidateBundleVersion(t, directory, true, install.Gate6CandidateVersion)
+	bundle := writeG2CandidateBundleVersion(t, directory, true, install.Gate7CandidateVersion)
 	_, sourceFile, _, _ := runtime.Caller(0)
 	repo := filepath.Clean(filepath.Join(filepath.Dir(sourceFile), "..", "..", ".."))
 	installScript := filepath.Join(repo, "scripts", "mvp", "install.sh")
@@ -423,9 +446,11 @@ func TestG2StageNativeBootstrapPublishesNoPointersOrRuntimeState(t *testing.T) {
 		}
 	}
 	for relative, mode := range map[string]os.FileMode{
-		"opt/open-card/releases/release-0.8.0-rc.2":                          0o755,
+		"opt/open-card/releases/release-0.8.0-rc.3":                          0o755,
 		"opt/open-card/activations":                                          0o711,
 		"var/lib/open-card/bootstrap-transactions":                           0o700,
+		"var/lib/open-card/healthcheck":                                      0o700,
+		"var/lib/open-card/health-secret-materials":                          0o700,
 		"var/lib/open-card/upgrade-transactions":                             0o700,
 		"opt/open-card/upgrade-tools/open-card-upgrade":                      0o755,
 		"etc/systemd/system/open-card-server.service":                        0o644,
@@ -433,12 +458,17 @@ func TestG2StageNativeBootstrapPublishesNoPointersOrRuntimeState(t *testing.T) {
 		"etc/systemd/system/open-card-buildkit.service":                      0o644,
 		"etc/systemd/system/open-card-caddy.service":                         0o644,
 		"etc/systemd/system/open-card-edge.service":                          0o644,
+		"etc/systemd/system/open-card-healthcheck.service":                   0o644,
+		"etc/systemd/system/open-card-healthcheck.timer":                     0o644,
 		"etc/systemd/system/open-card-upgrade-safe.target":                   0o644,
 		"etc/systemd/system/open-card-edge.service.d/10-upgrade-marker.conf": 0o644,
 	} {
 		info, err := os.Lstat(filepath.Join(root, filepath.FromSlash(relative)))
 		if err != nil || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != mode {
 			t.Fatalf("native stage %s mode=%v err=%v", relative, info.Mode(), err)
+		}
+		if info, err := os.Stat(filepath.Join(root, filepath.FromSlash(relative))); err != nil || int(info.Sys().(*syscall.Stat_t).Uid) != os.Getuid() {
+			t.Fatalf("native stage %s owner=%v err=%v", relative, info, err)
 		}
 	}
 	replay := exec.Command("bash", installScript, "--root", root, "--bundle", bundle, "--stage-native-bootstrap", "--test-safe-prefix", directory)
@@ -530,7 +560,7 @@ func TestG2StageUpgradeSubstrateDataRootFaultsFailClosed(t *testing.T) {
 	}
 }
 
-func TestG2StageUpgradeSubstrateRequiresRC1OrRC2Candidate(t *testing.T) {
+func TestG2StageUpgradeSubstrateRequiresRC1RC2OrRC3Candidate(t *testing.T) {
 	directory := t.TempDir()
 	bundle := writeG2CandidateBundle(t, directory, true)
 	manifestPath := filepath.Join(bundle, "manifest.json")
@@ -548,7 +578,7 @@ func TestG2StageUpgradeSubstrateRequiresRC1OrRC2Candidate(t *testing.T) {
 	_, sourceFile, _, _ := runtime.Caller(0)
 	repo := filepath.Clean(filepath.Join(filepath.Dir(sourceFile), "..", "..", ".."))
 	command := exec.Command("bash", filepath.Join(repo, "scripts", "mvp", "install.sh"), "--root", filepath.Join(directory, "root"), "--bundle", bundle, "--stage-upgrade-substrate", "--test-safe-prefix", directory)
-	if output, err := command.CombinedOutput(); err == nil || !strings.Contains(string(output), "requires an RC1 or RC2 production candidate") {
+	if output, err := command.CombinedOutput(); err == nil || !strings.Contains(string(output), "requires an RC1, RC2 or RC3 production candidate") {
 		t.Fatalf("RC0 substrate stage was accepted: %v\n%s", err, output)
 	}
 }
@@ -568,17 +598,28 @@ func TestG2ActivationIntentValidationRejectsFreshRC1WithoutMutation(t *testing.T
 	}
 }
 
-func TestG2ActivationIntentValidationAcceptsFreshRC2WithoutMutation(t *testing.T) {
+func TestG2ActivationIntentValidationAcceptsFreshRC3WithoutMutation(t *testing.T) {
 	directory := t.TempDir()
-	bundle := writeG2CandidateBundleVersion(t, directory, true, install.Gate6CandidateVersion)
+	bundle := writeG2CandidateBundleVersion(t, directory, true, install.Gate7CandidateVersion)
 	_, sourceFile, _, _ := runtime.Caller(0)
 	repo := filepath.Clean(filepath.Join(filepath.Dir(sourceFile), "..", "..", ".."))
 	root := filepath.Join(directory, "root")
 	command := exec.Command("bash", filepath.Join(repo, "scripts", "mvp", "install.sh"), "--root", root, "--bundle", bundle, "--dry-run", "--validate-activation-intent", "--test-safe-prefix", directory)
 	if output, err := command.CombinedOutput(); err != nil || !strings.Contains(string(output), "would stage verified native bootstrap release") {
-		t.Fatalf("fresh RC2 activation intent: %v\n%s", err, output)
+		t.Fatalf("fresh RC3 activation intent: %v\n%s", err, output)
 	}
 	if _, err := os.Lstat(root); !os.IsNotExist(err) {
 		t.Fatalf("activation intent validation created task root: %v", err)
+	}
+}
+
+func TestG2RC2NativeBootstrapStagingIsRejected(t *testing.T) {
+	directory := t.TempDir()
+	bundle := writeG2CandidateBundleVersion(t, directory, true, install.Gate6CandidateVersion)
+	_, sourceFile, _, _ := runtime.Caller(0)
+	repo := filepath.Clean(filepath.Join(filepath.Dir(sourceFile), "..", "..", ".."))
+	command := exec.Command("bash", filepath.Join(repo, "scripts", "mvp", "install.sh"), "--root", filepath.Join(directory, "root"), "--bundle", bundle, "--stage-native-bootstrap", "--test-safe-prefix", directory)
+	if output, err := command.CombinedOutput(); err == nil || !strings.Contains(string(output), "requires the RC3 production candidate") {
+		t.Fatalf("RC2 native bootstrap staging was accepted: %v\n%s", err, output)
 	}
 }

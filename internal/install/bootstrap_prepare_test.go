@@ -61,7 +61,7 @@ func (o *bootstrapOneShotRenameFailureOps) Rename(oldName, newName string) error
 
 func newTaskBootstrapRuntimePreparer(t *testing.T, random []byte, runner *upgradeControlRunnerFake) (*BootstrapRuntimePreparer, *DurableWriter, string, ReleaseV1) {
 	t.Helper()
-	release, activeRoot := bootstrapRC2Release(t)
+	release, activeRoot := bootstrapRC3Release(t)
 	configRoot := t.TempDir()
 	if err := os.Chmod(configRoot, durableDirMode); err != nil {
 		t.Fatal(err)
@@ -75,7 +75,7 @@ func newTaskBootstrapRuntimePreparer(t *testing.T, random []byte, runner *upgrad
 		_ = config.Close()
 		t.Fatal(err)
 	}
-	p, err := NewTaskBootstrapRuntimePreparer(config, active, os.Getuid(), os.Getgid(), os.Getgid(), bytes.NewReader(random), runner, selectBootstrapRC2Release)
+	p, err := NewTaskBootstrapRuntimePreparer(config, active, os.Getuid(), os.Getgid(), os.Getgid(), bytes.NewReader(random), runner, selectBootstrapRC3Release)
 	if err != nil {
 		_ = config.Close()
 		_ = active.Close()

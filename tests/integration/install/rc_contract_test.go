@@ -372,6 +372,7 @@ func TestSystemRootUpgradeUsesStagedRC1DelegationInsteadOfLegacyMutation(t *test
 		"candidate manifest identity is ambiguous",
 		"(\"0.8.0-rc.0\", \"0.8.0-rc.1\"): \"rc0-legacy\"",
 		"(\"0.8.0-rc.1\", \"0.8.0-rc.2\"): \"native\"",
+		"(\"0.8.0-rc.2\", \"0.8.0-rc.3\"): \"native\"",
 	} {
 		if !strings.Contains(upgrade, required) {
 			t.Fatalf("missing system-root upgrade delegation %q", required)

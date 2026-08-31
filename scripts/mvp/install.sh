@@ -56,7 +56,7 @@ if [[ -n "$expected_manifest_sha256" ]]; then
   [[ "$expected_manifest_sha256" =~ ^[0-9a-fA-F]{64}$ ]] || die "expected manifest sha256 must be 64 hexadecimal characters"
   expected_manifest_sha256=$(tr '[:upper:]' '[:lower:]' <<< "$expected_manifest_sha256")
 fi
-if [[ -n "$required_version" && "$required_version" != "0.8.0-rc.2" ]]; then die "--require-version only accepts the current production candidate"; fi
+if [[ -n "$required_version" && "$required_version" != "0.8.0-rc.3" ]]; then die "--require-version only accepts the current production candidate"; fi
 system_root=0
 if [[ "$root" = "/" ]]; then
   system_root=1
@@ -500,7 +500,7 @@ if tuple(map(int, minimum_protocol.split("."))) > tuple(map(int, maximum_protoco
 files = value["files"]
 if not isinstance(files, list) or not files:
     raise SystemExit("manifest files are empty")
-if value["version"] in {"0.8.0-rc.1", "0.8.0-rc.2"}:
+if value["version"] in {"0.8.0-rc.1", "0.8.0-rc.2", "0.8.0-rc.3"}:
     candidate_version = value["version"]
     if migration_version != "0024" or not isinstance(value.get("source_commit"), str) or not re.fullmatch(r"[a-f0-9]{40}", value["source_commit"]):
         raise SystemExit(candidate_version + " production candidate must declare source and migration 0024")
@@ -510,12 +510,18 @@ if value["version"] in {"0.8.0-rc.1", "0.8.0-rc.2"}:
             "arm64": ("e4f56105b3d184313d51365c7fff40b9f68111815def83c5e5985bc182177a57", "9560df1d4a739c729d857cd93b989b99976da0e86983ffa026d13202339d57b9", "fdfd6b6108870118714b70c9007937585fc0429d14fa9d64010a80016edc2a15"),
         }
         predecessor = ("0.8.0-rc.0", "0023", "35a2b198ac52949af3477475d89d4813b46a9490")
-    else:
+    elif candidate_version == "0.8.0-rc.2":
         lineage_by_architecture = {
             "amd64": ("1cf02e4a111e38a4061c692de418b67755a2e55f97a04cbc92cee8cb9f82a7be", "9056cb46537537f6cab21482d900160486098d857955d23b0ca8f131a9cc4233", "d0e8c111dcaa334c89bb815fc2ddc9b122887cddbbf7c59b6eb51436b931706f"),
             "arm64": ("6bf1e590c3054d373d9319f03581d7a623ee3093b53ddba7b343cf8af7f85fed", "56a697aed3a8f77261cfeb3074a7d7ab0cfb6389ab5d75225ad9931b665bfa86", "5fda1e9d0f80deadf6b87cb281d80793c9d1e910386624bc5975cdd0464a2650"),
         }
         predecessor = ("0.8.0-rc.1", "0024", "0d5c96bf7b7bd1c641b108cbbd54511d814f2aa0")
+    else:
+        lineage_by_architecture = {
+            "amd64": ("b494b4ed085adc0f769f2cca17ff5295e271f0588309747f61e01bb9527573e5", "4a12f07e68af068d28f7335176de4abf13f1fea9d72269131eb0f1f6fdbc53c9", "8fd533147df1b73b730eb93e62bc7acded2bb0116410fc2eaced5bfb605a6ca3"),
+            "arm64": ("3a63c553bfcff0936bc3a365218e7293de531f000fc361c7977c16ea2b40a0a7", "99e1a57a7a7570cc73cfc0c8483fbbfcb18b1ee8c788742c51807bb958670d6c", "b515c41fdd1fc6744c1af929752bb3eb6619a33d838144f71bafff964349bb7d"),
+        }
+        predecessor = ("0.8.0-rc.2", "0024", "250a14601890a63aa329651b205312c04d870a98")
     if architecture not in lineage_by_architecture:
         raise SystemExit(candidate_version + " production candidate requires a supported architecture")
     manifest_sha256, archive_sha256, bundle_manifest_sha256 = lineage_by_architecture[architecture]
@@ -531,8 +537,10 @@ if value["version"] in {"0.8.0-rc.1", "0.8.0-rc.2"}:
         "migrations/control-plane/0024_dns_change_ledger.sql", "web/dist/index.html",
         "docs/licenses/licenses-manifest.json", "sbom.spdx.json", "source-manifest.sha256",
     }
-    if candidate_version == "0.8.0-rc.2":
+    if candidate_version in {"0.8.0-rc.2", "0.8.0-rc.3"}:
         production_required |= {"scripts/mvp/g6-staging-evidence.sh", "scripts/mvp/host-preflight.sh", "scripts/mvp/buildkit-production-capacity.sh", "tools/evidence/g6_validate.py", "tools/evidence/g6_target_receipt.py"}
+    if candidate_version == "0.8.0-rc.3":
+        production_required |= {"bin/open-card-healthcheck", "systemd/open-card-healthcheck.service", "systemd/open-card-healthcheck.timer"}
     candidate_paths = {item.get("path") for item in files if isinstance(item, dict)}
     missing = sorted(production_required - candidate_paths)
     if missing:
@@ -580,13 +588,13 @@ release_id=$(sed -n '2p' <<< "$manifest_info")
 release_name="$release_id"
 release_dir="$releases/$release_name"
 installation_id="$data_dir/installation-id"
-if (( stage_upgrade_substrate )) && [[ "$version" != "0.8.0-rc.1" && "$version" != "0.8.0-rc.2" ]]; then
-  die "--stage-upgrade-substrate requires an RC1 or RC2 production candidate"
+if (( stage_upgrade_substrate )) && [[ "$version" != "0.8.0-rc.1" && "$version" != "0.8.0-rc.2" && "$version" != "0.8.0-rc.3" ]]; then
+  die "--stage-upgrade-substrate requires an RC1, RC2 or RC3 production candidate"
 fi
-if (( stage_native_bootstrap )) && [[ "$version" != "0.8.0-rc.2" ]]; then
-  die "--stage-native-bootstrap requires the RC2 production candidate"
+if (( stage_native_bootstrap )) && [[ "$version" != "0.8.0-rc.3" ]]; then
+  die "--stage-native-bootstrap requires the RC3 production candidate"
 fi
-if (( validate_activation_intent )) && [[ "$version" != "0.8.0-rc.2" ]]; then
+if (( validate_activation_intent )) && [[ "$version" != "0.8.0-rc.3" ]]; then
   die "$version system-root activation is not the native bootstrap candidate"
 fi
 if (( system_root && ! stage_upgrade_substrate && ! stage_native_bootstrap )); then
@@ -594,7 +602,7 @@ if (( system_root && ! stage_upgrade_substrate && ! stage_native_bootstrap )); t
     die "existing production installation requires upgrade.sh or --stage-upgrade-substrate"
   fi
   if [[ "$version" = "0.8.0-rc.1" && $activate -eq 1 ]]; then die "$version system-root activation is not supported by native bootstrap"; fi
-  if [[ "$version" = "0.8.0-rc.2" && $activate -eq 1 ]]; then die "$version system-root activation requires --stage-native-bootstrap and bootstrap-native"; fi
+  if [[ "$version" = "0.8.0-rc.2" || "$version" = "0.8.0-rc.3" ]] && (( activate )); then die "$version system-root activation requires --stage-native-bootstrap and bootstrap-native"; fi
 fi
 if (( stage_native_bootstrap )); then
   for native_existing in "$prefix/active" "$prefix/current" "$prefix/previous" "$prefix/previous-active"; do
@@ -710,6 +718,8 @@ if (( stage_upgrade_substrate || stage_native_bootstrap )); then
   prepare_upgrade_substrate "$expected_owner"
   if (( stage_native_bootstrap )); then
     prepare_upgrade_layout_directory "$data_dir/bootstrap-transactions" "$expected_owner" 700
+    prepare_upgrade_layout_directory "$data_dir/healthcheck" "$expected_owner" 700
+    prepare_upgrade_layout_directory "$data_dir/health-secret-materials" "$expected_owner" 700
   fi
   if (( system_root )); then
     command -v systemctl >/dev/null 2>&1 || die "systemctl is required for system-root upgrade substrate staging"
@@ -734,7 +744,7 @@ if (( ! dry_run )); then
     chmod 0750 "$backups" "$evidence"
     chmod 0750 "$config_dir"
   fi
-  if [[ "$version" = "0.8.0-rc.1" || "$version" = "0.8.0-rc.2" ]]; then
+  if [[ "$version" = "0.8.0-rc.1" || "$version" = "0.8.0-rc.2" || "$version" = "0.8.0-rc.3" ]]; then
     expected_owner=$(id -u)
     prepare_upgrade_substrate "$expected_owner"
   else
@@ -745,8 +755,14 @@ if (( ! dry_run )); then
   units=(open-card-server.service open-card-agent.service open-card-buildkit.service open-card-caddy.service)
   if [[ -f "$bundle_dir/systemd/open-card-edge.service" && ! -L "$bundle_dir/systemd/open-card-edge.service" ]]; then
     units+=(open-card-edge.service)
-  elif [[ "$version" = "0.8.0-rc.1" || "$version" = "0.8.0-rc.2" ]]; then
+  elif [[ "$version" = "0.8.0-rc.1" || "$version" = "0.8.0-rc.2" || "$version" = "0.8.0-rc.3" ]]; then
     die "$version production candidate is missing open-card-edge.service"
+  fi
+  if [[ "$version" = "0.8.0-rc.3" ]]; then
+    for unit in open-card-healthcheck.service open-card-healthcheck.timer; do
+      [[ -f "$bundle_dir/systemd/$unit" && ! -L "$bundle_dir/systemd/$unit" ]] || die "$version production candidate is missing $unit"
+      units+=("$unit")
+    done
   fi
   for unit in "${units[@]}"; do
     [[ -f "$bundle_dir/systemd/$unit" && ! -L "$bundle_dir/systemd/$unit" ]] || die "bundle is missing $unit"

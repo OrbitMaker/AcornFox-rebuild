@@ -30,7 +30,7 @@ func (o *bootstrapOwnerMismatchOps) Lstat(name string) (os.FileInfo, error) {
 
 func bootstrapCLIInput(t *testing.T) (ReleaseV1, string, string, string) {
 	t.Helper()
-	release, activeRoot := bootstrapRC2Release(t)
+	release, activeRoot := bootstrapRC3Release(t)
 	configRoot := filepath.Join(t.TempDir(), "open-card-config")
 	if err := os.MkdirAll(configRoot, 0o700); err != nil {
 		t.Fatal(err)
@@ -60,6 +60,22 @@ func TestDeriveBootstrapRequestForTaskBindsFixedReleaseAndInstallationIdentity(t
 	raw, _ := json.Marshal(first)
 	if strings.Contains(string(raw), id) || strings.Contains(first.InstallationIDSHA256, id) {
 		t.Fatal("bootstrap request exposed raw installation identity")
+	}
+}
+
+func TestRC2ReleaseSelectorRemainsAvailableForHistoricalRecoveryInspection(t *testing.T) {
+	release, activeRoot := bootstrapRC2Release(t)
+	writer, err := TaskDurableWriter(activeRoot, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	selected, err := selectBootstrapRC2Release(writer, release.ManifestSHA256)
+	if err != nil || selected != release {
+		t.Fatalf("historical RC2 selection = %#v, %v", selected, err)
+	}
+	if _, err := selectBootstrapRC3Release(writer, release.ManifestSHA256); err == nil {
+		t.Fatal("current fresh-bootstrap selector accepted an RC2 release")
 	}
 }
 
@@ -154,19 +170,19 @@ func TestSelectBootstrapReleaseRejectsAmbiguousUnsafeAndForeignEntries(t *testin
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			release, activeRoot := bootstrapRC2Release(t)
+			release, activeRoot := bootstrapRC3Release(t)
 			arrange(t, activeRoot, release)
 			writer, err := TaskDurableWriter(activeRoot, os.Getuid(), os.Getgid())
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer writer.Close()
-			if _, err := selectBootstrapRC2Release(writer, release.ManifestSHA256); err == nil {
+			if _, err := selectBootstrapRC3Release(writer, release.ManifestSHA256); err == nil {
 				t.Fatalf("%s entry accepted", name)
 			}
 		})
 	}
-	release, activeRoot := bootstrapRC2Release(t)
+	release, activeRoot := bootstrapRC3Release(t)
 	writer, err := TaskDurableWriter(activeRoot, os.Getuid(), os.Getgid())
 	if err != nil {
 		t.Fatal(err)
@@ -174,12 +190,12 @@ func TestSelectBootstrapReleaseRejectsAmbiguousUnsafeAndForeignEntries(t *testin
 	defer writer.Close()
 	original := writer.ops
 	writer.ops = &bootstrapOwnerMismatchOps{durableOps: original, target: filepath.ToSlash(filepath.Join("releases", release.ID))}
-	if _, err := selectBootstrapRC2Release(writer, release.ManifestSHA256); err == nil {
+	if _, err := selectBootstrapRC3Release(writer, release.ManifestSHA256); err == nil {
 		t.Fatal("foreign-owned release entry accepted")
 	}
 }
 
-func TestDeriveBootstrapRequestRejectsRC2ManifestAndPayloadDrift(t *testing.T) {
+func TestDeriveBootstrapRequestRejectsRC3ManifestAndPayloadDrift(t *testing.T) {
 	for name, mutate := range map[string]func(*testing.T, string, ReleaseV1) string{
 		"payload": func(t *testing.T, activeRoot string, release ReleaseV1) string {
 			t.Helper()

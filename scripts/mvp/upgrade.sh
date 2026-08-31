@@ -214,7 +214,7 @@ for entry in os.scandir(root_fd):
     raw, manifest = read_release(entry.name)
     if hashlib.sha256(raw).hexdigest() != expected:
         continue
-    if not isinstance(manifest, dict) or manifest.get("version") not in {"0.8.0-rc.1", "0.8.0-rc.2"} or manifest.get("migration_version") != "0024" or manifest.get("release_id") != entry.name or manifest.get("architecture") not in {"amd64", "arm64"} or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", entry.name):
+    if not isinstance(manifest, dict) or manifest.get("version") not in {"0.8.0-rc.1", "0.8.0-rc.2", "0.8.0-rc.3"} or manifest.get("migration_version") != "0024" or manifest.get("release_id") != entry.name or manifest.get("architecture") not in {"amd64", "arm64"} or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", entry.name):
         raise SystemExit("candidate manifest is not a supported RC/0024 release")
     matches.append((entry.name, manifest["version"], manifest["architecture"]))
 if len(matches) != 1:
@@ -224,7 +224,7 @@ if os.path.dirname(current_release_path) != root:
 _, current = read_release(os.path.basename(current_release_path))
 candidate_id, candidate_version, candidate_arch = matches[0]
 current_version, current_arch = current.get("version"), current.get("architecture")
-matrix = {("0.8.0-rc.0", "0.8.0-rc.1"): "rc0-legacy", ("0.8.0-rc.1", "0.8.0-rc.2"): "native"}
+matrix = {("0.8.0-rc.0", "0.8.0-rc.1"): "rc0-legacy", ("0.8.0-rc.1", "0.8.0-rc.2"): "native", ("0.8.0-rc.2", "0.8.0-rc.3"): "native"}
 layout = matrix.get((current_version, candidate_version))
 if layout is None or current_arch != candidate_arch:
     raise SystemExit("unsupported production upgrade matrix")
@@ -233,7 +233,7 @@ os.close(root_fd)
 PY
   ) || die "candidate release identity is unavailable"
   IFS=$'\t' read -r candidate_release_id candidate_release_version expected_layout <<<"$candidate_identity"
-  [[ -n "$candidate_release_id" && "$candidate_release_version" =~ ^0\.8\.0-rc\.[12]$ && ( "$expected_layout" = rc0-legacy || "$expected_layout" = native ) ]] || die "candidate release matrix is invalid"
+  [[ -n "$candidate_release_id" && "$candidate_release_version" =~ ^0\.8\.0-rc\.[123]$ && ( "$expected_layout" = rc0-legacy || "$expected_layout" = native ) ]] || die "candidate release matrix is invalid"
 
   run_upgrade_helper prepare-control
 

@@ -31,6 +31,8 @@ const (
 	ProductionNMinusOneVersion    = "0.8.0-rc.0"
 	Gate6CandidateVersion         = "0.8.0-rc.2"
 	Gate6NMinusOneVersion         = "0.8.0-rc.1"
+	Gate7CandidateVersion         = "0.8.0-rc.3"
+	Gate7NMinusOneVersion         = "0.8.0-rc.2"
 	RC1SourceCommit               = "0d5c96bf7b7bd1c641b108cbbd54511d814f2aa0"
 	RC1ReleaseManifestSHA256      = "1cf02e4a111e38a4061c692de418b67755a2e55f97a04cbc92cee8cb9f82a7be"
 	RC1ArchiveSHA256              = "9056cb46537537f6cab21482d900160486098d857955d23b0ca8f131a9cc4233"
@@ -38,6 +40,13 @@ const (
 	ARM64RC1ReleaseManifestSHA256 = "6bf1e590c3054d373d9319f03581d7a623ee3093b53ddba7b343cf8af7f85fed"
 	ARM64RC1ArchiveSHA256         = "56a697aed3a8f77261cfeb3074a7d7ab0cfb6389ab5d75225ad9931b665bfa86"
 	ARM64RC1BundleManifestSHA256  = "5fda1e9d0f80deadf6b87cb281d80793c9d1e910386624bc5975cdd0464a2650"
+	RC2SourceCommit               = "250a14601890a63aa329651b205312c04d870a98"
+	RC2ReleaseManifestSHA256      = "b494b4ed085adc0f769f2cca17ff5295e271f0588309747f61e01bb9527573e5"
+	RC2ArchiveSHA256              = "4a12f07e68af068d28f7335176de4abf13f1fea9d72269131eb0f1f6fdbc53c9"
+	RC2BundleManifestSHA256       = "8fd533147df1b73b730eb93e62bc7acded2bb0116410fc2eaced5bfb605a6ca3"
+	ARM64RC2ReleaseManifestSHA256 = "3a63c553bfcff0936bc3a365218e7293de531f000fc361c7977c16ea2b40a0a7"
+	ARM64RC2ArchiveSHA256         = "99e1a57a7a7570cc73cfc0c8483fbbfcb18b1ee8c788742c51807bb958670d6c"
+	ARM64RC2BundleManifestSHA256  = "b515c41fdd1fc6744c1af929752bb3eb6619a33d838144f71bafff964349bb7d"
 	RC0SourceCommit               = "35a2b198ac52949af3477475d89d4813b46a9490"
 	RC0ReleaseManifestSHA256      = "3b3953c0a26f8706151583ad6c9cad6b5502da18b28f11ed66ca92fe604aa253"
 	RC0ArchiveSHA256              = "abc034ed24e8e8dc74b8eabc84dd3071a66f166abe65135502911e9153c0b9fc"
@@ -61,6 +70,21 @@ type RC0Lineage struct {
 	ReleaseManifestSHA256 string
 	ArchiveSHA256         string
 	BundleManifestSHA256  string
+}
+
+// RC2LineageForArchitecture is the immutable predecessor tuple for RC3.
+func RC2LineageForArchitecture(architecture string) (RC0Lineage, error) {
+	normalized, err := NormalizeArchitecture(architecture)
+	if err != nil {
+		return RC0Lineage{}, fmt.Errorf("unsupported RC2 lineage architecture %q", architecture)
+	}
+	if normalized == "amd64" {
+		return RC0Lineage{Architecture: normalized, SourceCommit: RC2SourceCommit, ReleaseManifestSHA256: RC2ReleaseManifestSHA256, ArchiveSHA256: RC2ArchiveSHA256, BundleManifestSHA256: RC2BundleManifestSHA256}, nil
+	}
+	if normalized == "arm64" {
+		return RC0Lineage{Architecture: normalized, SourceCommit: RC2SourceCommit, ReleaseManifestSHA256: ARM64RC2ReleaseManifestSHA256, ArchiveSHA256: ARM64RC2ArchiveSHA256, BundleManifestSHA256: ARM64RC2BundleManifestSHA256}, nil
+	}
+	return RC0Lineage{}, fmt.Errorf("unsupported RC2 lineage architecture %q", architecture)
 }
 
 // RC1LineageForArchitecture is the immutable predecessor tuple for RC2.
@@ -117,7 +141,7 @@ func ValidateProductionCandidate(manifest Manifest) error {
 	if err := manifest.Validate(); err != nil {
 		return err
 	}
-	if (manifest.Version != ProductionCandidateVersion && manifest.Version != Gate6CandidateVersion) || manifest.MigrationVersion != CurrentMigrationVersion {
+	if (manifest.Version != ProductionCandidateVersion && manifest.Version != Gate6CandidateVersion && manifest.Version != Gate7CandidateVersion) || manifest.MigrationVersion != CurrentMigrationVersion {
 		return errors.New("manifest is not a supported 0.8.0 production candidate")
 	}
 	required := map[string]bool{
@@ -135,13 +159,22 @@ func ValidateProductionCandidate(manifest Manifest) error {
 		"sbom.spdx.json":                                          false,
 		"source-manifest.sha256":                                  false,
 	}
-	if manifest.Version == Gate6CandidateVersion {
+	if manifest.Version == Gate6CandidateVersion || manifest.Version == Gate7CandidateVersion {
 		for _, path := range []string{
 			"scripts/mvp/host-preflight.sh",
 			"scripts/mvp/buildkit-production-capacity.sh",
 			"scripts/mvp/g6-staging-evidence.sh",
 			"tools/evidence/g6_validate.py",
 			"tools/evidence/g6_target_receipt.py",
+		} {
+			required[path] = false
+		}
+	}
+	if manifest.Version == Gate7CandidateVersion {
+		for _, path := range []string{
+			"bin/open-card-healthcheck",
+			"systemd/open-card-healthcheck.service",
+			"systemd/open-card-healthcheck.timer",
 		} {
 			required[path] = false
 		}
@@ -162,10 +195,10 @@ func ValidateProductionCandidate(manifest Manifest) error {
 	return nil
 }
 
-// IsProductionCandidateVersion recognizes the immutable historical RC1 and
-// the Gate 6 RC2 line without changing legacy RC0 identity constants.
+// IsProductionCandidateVersion recognizes the immutable RC1, RC2 and current
+// RC3 lines without changing legacy RC0 identity constants.
 func IsProductionCandidateVersion(version string) bool {
-	return version == ProductionCandidateVersion || version == Gate6CandidateVersion
+	return version == ProductionCandidateVersion || version == Gate6CandidateVersion || version == Gate7CandidateVersion
 }
 
 // Compatibility describes the oldest and newest data/protocol contracts that
@@ -506,10 +539,22 @@ func (m Manifest) Validate() error {
 		if n.Version != Gate6NMinusOneVersion || n.MigrationVersion != "0024" || n.SourceCommit != lineage.SourceCommit || n.ReleaseManifestSHA256 != lineage.ReleaseManifestSHA256 || n.ArchiveSHA256 != lineage.ArchiveSHA256 || n.BundleManifestSHA256 != lineage.BundleManifestSHA256 {
 			return errors.New("rc2 n_minus_one lineage is invalid")
 		}
+	} else if m.Version == Gate7CandidateVersion && m.MigrationVersion == "0024" {
+		if m.SourceCommit == "" || m.NMinusOne == nil {
+			return errors.New("rc3 manifest lineage is required")
+		}
+		lineage, err := RC2LineageForArchitecture(m.Architecture)
+		if err != nil {
+			return errors.New("rc3 manifest architecture lineage is invalid")
+		}
+		n := m.NMinusOne
+		if n.Version != Gate7NMinusOneVersion || n.MigrationVersion != "0024" || n.SourceCommit != lineage.SourceCommit || n.ReleaseManifestSHA256 != lineage.ReleaseManifestSHA256 || n.ArchiveSHA256 != lineage.ArchiveSHA256 || n.BundleManifestSHA256 != lineage.BundleManifestSHA256 {
+			return errors.New("rc3 n_minus_one lineage is invalid")
+		}
 	} else if m.NMinusOne != nil {
-		return errors.New("only rc1/0024 and rc2/0024 manifests may carry n_minus_one lineage")
+		return errors.New("only rc1/0024, rc2/0024 and rc3/0024 manifests may carry n_minus_one lineage")
 	} else if m.SourceCommit != "" {
-		return errors.New("only rc0/0023, rc1/0024 and rc2/0024 manifests may carry source_commit")
+		return errors.New("only rc0/0023, rc1/0024, rc2/0024 and rc3/0024 manifests may carry source_commit")
 	}
 	if _, err := NormalizeProtocolVersion(m.Protocol); err != nil {
 		return errors.New("manifest protocol is invalid")

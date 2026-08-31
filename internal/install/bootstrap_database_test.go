@@ -425,9 +425,17 @@ func TestBootstrapDatabaseProductionBoundariesAndNoDestructiveSurface(t *testing
 }
 
 func bootstrapRC2Release(t *testing.T) (ReleaseV1, string) {
+	return bootstrapRelease(t, Gate6CandidateVersion)
+}
+
+func bootstrapRC3Release(t *testing.T) (ReleaseV1, string) {
+	return bootstrapRelease(t, Gate7CandidateVersion)
+}
+
+func bootstrapRelease(t *testing.T, version string) (ReleaseV1, string) {
 	t.Helper()
 	activeRoot := filepath.Join(t.TempDir(), "open-card")
-	root := filepath.Join(activeRoot, "releases", "release-rc2")
+	root := filepath.Join(activeRoot, "releases", "release-"+version)
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -452,6 +460,20 @@ func bootstrapRC2Release(t *testing.T) (ReleaseV1, string) {
 			raw  []byte
 			mode os.FileMode
 		}{[]byte("#!/bin/sh\nexit 0\n"), 0o755}
+	}
+	if version == Gate7CandidateVersion {
+		for _, path := range []string{"bin/open-card-healthcheck", "systemd/open-card-healthcheck.service", "systemd/open-card-healthcheck.timer"} {
+			files[path] = struct {
+				raw  []byte
+				mode os.FileMode
+			}{[]byte("healthcheck\n"), 0o755}
+			if strings.HasPrefix(path, "systemd/") {
+				files[path] = struct {
+					raw  []byte
+					mode os.FileMode
+				}{[]byte("[Unit]\nDescription=healthcheck\n"), 0o644}
+			}
+		}
 	}
 	for _, path := range []string{
 		"systemd/open-card-edge.service", "systemd/open-card-upgrade-recover.service", "systemd/open-card-upgrade-safe.target", "systemd/open-card-upgrade-finalize.service", "systemd/open-card-edge.service.d/10-upgrade-marker.conf", "caddy/open-card-edge.Caddyfile.example", "web/dist/index.html", "docs/licenses/licenses-manifest.json", "sbom.spdx.json", "source-manifest.sha256",
@@ -481,7 +503,15 @@ func bootstrapRC2Release(t *testing.T) (ReleaseV1, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	manifest := Manifest{SchemaVersion: ManifestSchemaVersion, Product: ManifestProduct, Version: Gate6CandidateVersion, ReleaseID: filepath.Base(root), Architecture: architecture, MigrationVersion: CurrentMigrationVersion, SourceCommit: strings.Repeat("b", 40), NMinusOne: &NMinusOne{Version: Gate6NMinusOneVersion, MigrationVersion: "0024", SourceCommit: lineage.SourceCommit, ReleaseManifestSHA256: lineage.ReleaseManifestSHA256, ArchiveSHA256: lineage.ArchiveSHA256, BundleManifestSHA256: lineage.BundleManifestSHA256}, Protocol: AgentProtocolVersion, ConfigDir: DefaultConfigDir, DataDir: DefaultDataDir, Compatibility: Compatibility{MinDataVersion: 23, MaxDataVersion: 24, MinAgentProtocol: PreviousAgentProtocol, MaxAgentProtocol: AgentProtocolVersion}, Files: manifestFiles}
+	predecessor := Gate6NMinusOneVersion
+	if version == Gate7CandidateVersion {
+		lineage, err = RC2LineageForArchitecture(architecture)
+		if err != nil {
+			t.Fatal(err)
+		}
+		predecessor = Gate7NMinusOneVersion
+	}
+	manifest := Manifest{SchemaVersion: ManifestSchemaVersion, Product: ManifestProduct, Version: version, ReleaseID: filepath.Base(root), Architecture: architecture, MigrationVersion: CurrentMigrationVersion, SourceCommit: strings.Repeat("b", 40), NMinusOne: &NMinusOne{Version: predecessor, MigrationVersion: "0024", SourceCommit: lineage.SourceCommit, ReleaseManifestSHA256: lineage.ReleaseManifestSHA256, ArchiveSHA256: lineage.ArchiveSHA256, BundleManifestSHA256: lineage.BundleManifestSHA256}, Protocol: AgentProtocolVersion, ConfigDir: DefaultConfigDir, DataDir: DefaultDataDir, Compatibility: Compatibility{MinDataVersion: 23, MaxDataVersion: 24, MinAgentProtocol: PreviousAgentProtocol, MaxAgentProtocol: AgentProtocolVersion}, Files: manifestFiles}
 	if err := SaveManifest(filepath.Join(root, "manifest.json"), manifest); err != nil {
 		t.Fatal(err)
 	}

@@ -62,7 +62,7 @@ func deriveProductionBootstrapRequest(releases, config *DurableWriter, expectedM
 	if confirmation != "BOOTSTRAP:"+installationID {
 		return BootstrapRequest{}, ErrBootstrapConflict
 	}
-	release, err := selectBootstrapRC2Release(releases, expectedManifestSHA256)
+	release, err := selectBootstrapRC3Release(releases, expectedManifestSHA256)
 	if err != nil {
 		return BootstrapRequest{}, ErrBootstrapConflict
 	}
@@ -80,6 +80,17 @@ func deriveProductionBootstrapRequest(releases, config *DurableWriter, expectedM
 }
 
 func selectBootstrapRC2Release(writer *DurableWriter, expectedManifestSHA256 string) (ReleaseV1, error) {
+	return selectBootstrapRelease(writer, expectedManifestSHA256, Gate6CandidateVersion)
+}
+
+// selectBootstrapRC3Release selects the current fresh-bootstrap candidate.
+// RC2 remains separately selectable for recovery and inspection of journals
+// that were created before RC3 became current.
+func selectBootstrapRC3Release(writer *DurableWriter, expectedManifestSHA256 string) (ReleaseV1, error) {
+	return selectBootstrapRelease(writer, expectedManifestSHA256, Gate7CandidateVersion)
+}
+
+func selectBootstrapRelease(writer *DurableWriter, expectedManifestSHA256, version string) (ReleaseV1, error) {
 	if writer == nil || writer.ops == nil || writer.VerifyLiveRoot() != nil {
 		return ReleaseV1{}, errors.New("invalid release root")
 	}
@@ -111,7 +122,7 @@ func selectBootstrapRC2Release(writer *DurableWriter, expectedManifestSHA256 str
 			continue
 		}
 		manifest, err := parseReleaseManifest(raw)
-		if err != nil || manifest.ReleaseID != entry.Name() || manifest.Version != Gate6CandidateVersion || manifest.MigrationVersion != CurrentMigrationVersion || manifest.Architecture != RuntimeArchitecture() || ValidateProductionCandidate(manifest) != nil || verifySecureRelease(writer, entry.Name(), manifest) != nil {
+		if err != nil || manifest.ReleaseID != entry.Name() || manifest.Version != version || manifest.MigrationVersion != CurrentMigrationVersion || manifest.Architecture != RuntimeArchitecture() || ValidateProductionCandidate(manifest) != nil || verifySecureRelease(writer, entry.Name(), manifest) != nil {
 			return ReleaseV1{}, errors.New("invalid matching release")
 		}
 		if found {

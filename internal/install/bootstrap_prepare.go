@@ -52,7 +52,7 @@ type BootstrapRuntimePreparer struct {
 }
 
 // PrepareProductionBootstrapRuntime is the production-only entrypoint.
-// expectedManifestSHA256 selects exactly one verified RC2 release beneath the
+// expectedManifestSHA256 selects exactly one verified RC3 release beneath the
 // fixed active root; callers cannot name a release or provide an environment.
 func PrepareProductionBootstrapRuntime(ctx context.Context, expectedManifestSHA256 string) (BootstrapRuntimeReceipt, error) {
 	if os.Geteuid() != 0 || !validSHA(expectedManifestSHA256) {
@@ -76,7 +76,7 @@ func PrepareProductionBootstrapRuntime(ctx context.Context, expectedManifestSHA2
 	if err != nil || edgeGID < 0 || verifyUpgradeControlProductionPrerequisites() != nil {
 		return BootstrapRuntimeReceipt{}, ErrBootstrapRuntimePreparation
 	}
-	p, err := newBootstrapRuntimePreparer(config, active, 0, 0, edgeGID, rand.Reader, productionUpgradeControlRunner{}, selectBootstrapRC2Release, true)
+	p, err := newBootstrapRuntimePreparer(config, active, 0, 0, edgeGID, rand.Reader, productionUpgradeControlRunner{}, selectBootstrapRC3Release, true)
 	if err != nil {
 		return BootstrapRuntimeReceipt{}, ErrBootstrapRuntimePreparation
 	}
@@ -101,7 +101,7 @@ func (p *BootstrapRuntimePreparer) Prepare(ctx context.Context, expectedManifest
 		return BootstrapRuntimeReceipt{}, ErrBootstrapRuntimePreparation
 	}
 	release, err := p.selectRelease(p.active, expectedManifestSHA256)
-	if err != nil || !release.valid() || release.Version != Gate6CandidateVersion || release.ManifestSHA256 != expectedManifestSHA256 {
+	if err != nil || !release.valid() || release.Version != Gate7CandidateVersion || release.ManifestSHA256 != expectedManifestSHA256 {
 		return BootstrapRuntimeReceipt{}, ErrBootstrapRuntimePreparation
 	}
 	databaseEnv, err := p.prepareRuntimeDatabaseEnv()

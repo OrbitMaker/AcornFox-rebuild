@@ -15,7 +15,7 @@ class InstallerSecurityContractTests(unittest.TestCase):
             self.assertIn(value, text)
         self.assertIn("loopback-safe Edge remains active and public routes stay absent", text)
         self.assertIn("existing production installation requires upgrade.sh", text)
-        self.assertIn("--require-version 0.8.0-rc.2", text)
+        self.assertIn("--require-version 0.8.0-rc.3", text)
         self.assertIn("--stage-native-bootstrap", text)
         self.assertIn("installation-identity-migrate", text)
         self.assertIn("prepare-bootstrap --expected-manifest-sha256", text)
@@ -63,6 +63,9 @@ class InstallerSecurityContractTests(unittest.TestCase):
         self.assertIn("systemd/open-card-upgrade-safe.target", text)
         self.assertIn("systemd/open-card-upgrade-finalize.service", text)
         self.assertIn("systemd/open-card-edge.service.d/10-upgrade-marker.conf", text)
+        self.assertIn("bin/open-card-healthcheck", text)
+        self.assertIn("systemd/open-card-healthcheck.service", text)
+        self.assertIn("systemd/open-card-healthcheck.timer", text)
         self.assertIn("--stage-upgrade-substrate", text)
         self.assertIn("--stage-native-bootstrap", text)
         self.assertIn("prepare_upgrade_substrate", text)
@@ -79,6 +82,7 @@ class InstallerSecurityContractTests(unittest.TestCase):
         self.assertIn('candidate_version + " production candidate must declare source and migration 0024"', text)
         self.assertIn('candidate_version + " production manifest contains test-only payload"', text)
         self.assertIn('candidate_version == "0.8.0-rc.2"', text)
+        self.assertIn('candidate_version == "0.8.0-rc.3"', text)
         self.assertIn("Edge stays disabled until install-host", text)
         self.assertIn("opencard-edge", text)
 
@@ -101,6 +105,7 @@ class InstallerSecurityContractTests(unittest.TestCase):
         self.assertIn("/proc/sys/kernel/random/uuid", text)
         self.assertIn('("0.8.0-rc.0", "0.8.0-rc.1"): "rc0-legacy"', text)
         self.assertIn('("0.8.0-rc.1", "0.8.0-rc.2"): "native"', text)
+        self.assertIn('("0.8.0-rc.2", "0.8.0-rc.3"): "native"', text)
         self.assertLess(text.index("unsupported production upgrade matrix"), text.index("run_upgrade_helper prepare-control"))
         self.assertIn("os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)", text)
         self.assertIn('os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)', text)
@@ -111,6 +116,16 @@ class InstallerSecurityContractTests(unittest.TestCase):
         legacy_backup = text.index('backup_args=(--root "$root"')
         self.assertLess(production, delegated_exit)
         self.assertLess(delegated_exit, legacy_backup)
+
+    def test_healthcheck_timer_is_staged_without_pre_dns_activation(self) -> None:
+        install = (SCRIPTS / "install.sh").read_text(encoding="utf-8")
+        host = (SCRIPTS / "install-host.sh").read_text(encoding="utf-8")
+        for value in ("open-card-healthcheck.service", "open-card-healthcheck.timer"):
+            self.assertIn(value, install)
+        self.assertIn("/var/lib/open-card/healthcheck /var/lib/open-card/health-secret-materials", host)
+        self.assertNotIn("enable open-card-healthcheck.timer", install)
+        self.assertNotIn("start open-card-healthcheck.timer", install)
+        self.assertNotIn("enable --now open-card-healthcheck.timer", host)
 
     def test_gate6_host_capacity_profile_is_fixed_and_not_an_install_option(self) -> None:
         host = (SCRIPTS / "install-host.sh").read_text(encoding="utf-8")

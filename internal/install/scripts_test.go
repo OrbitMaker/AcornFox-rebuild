@@ -516,10 +516,14 @@ func TestG5BRecoverySubstrateStaysStageOnlyAndBootDisabled(t *testing.T) {
 		}
 	}
 	skipBranch := strings.Index(host, "if (( ! skip_prerequisites )); then")
+	healthRoots := strings.Index(host, "install -d -m 0700 -o root -g root /var/lib/open-card/healthcheck /var/lib/open-card/health-secret-materials")
 	runtimeVerification := strings.LastIndex(host, "for command_name in docker psql runuser newuidmap newgidmap")
 	installerCall = strings.Index(host, "\"$"+"{installer[@]}\"")
 	if skipBranch < 0 || runtimeVerification < skipBranch || installerCall < runtimeVerification {
 		t.Fatal("skip-prerequisites can bypass required runtime command verification")
+	}
+	if healthRoots < 0 || healthRoots > skipBranch || healthRoots > installerCall {
+		t.Fatal("healthcheck roots are not staged before bootstrap outside optional prerequisites")
 	}
 	if preflight := strings.Index(host, "--validate-activation-intent"); preflight < 0 || preflight > strings.Index(host, "require_command()") {
 		t.Fatal("host activation-intent preflight does not precede mutable prerequisites")
@@ -552,6 +556,7 @@ func TestG5BSystemRootUpgradeUsesOnlyVerifiedEngineDelegation(t *testing.T) {
 		"/proc/sys/kernel/random/uuid",
 		"(\"0.8.0-rc.0\", \"0.8.0-rc.1\"): \"rc0-legacy\"",
 		"(\"0.8.0-rc.1\", \"0.8.0-rc.2\"): \"native\"",
+		"(\"0.8.0-rc.2\", \"0.8.0-rc.3\"): \"native\"",
 		"--expect-layout \"$expected_layout\"",
 		"os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)",
 		"os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)",

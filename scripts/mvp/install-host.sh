@@ -113,9 +113,9 @@ if (( resume_public )) && [[ ! -L /opt/open-card/current ]]; then
   die "--resume-public requires an existing native activation"
 fi
 
-installer=("$script_dir/install.sh" --root / --stage-native-bootstrap --require-version 0.8.0-rc.2 --expected-manifest-sha256 "$expected")
+installer=("$script_dir/install.sh" --root / --stage-native-bootstrap --require-version 0.8.0-rc.3 --expected-manifest-sha256 "$expected")
 installer+=("${forward[@]}")
-preflight=("$script_dir/install.sh" --root / --dry-run --validate-activation-intent --require-version 0.8.0-rc.2 --expected-manifest-sha256 "$expected")
+preflight=("$script_dir/install.sh" --root / --dry-run --validate-activation-intent --require-version 0.8.0-rc.3 --expected-manifest-sha256 "$expected")
 preflight+=("${forward[@]}")
 if (( ! resume_public )); then
   "${preflight[@]}" >/tmp/open-card-install-host-preflight-$$.log 2>&1 || {
@@ -133,6 +133,12 @@ fi
 require_command() { command -v "$1" >/dev/null 2>&1 || die "required command is missing: $1"; }
 required_commands=(install useradd getent openssl systemctl)
 for command_name in "${required_commands[@]}"; do require_command "$command_name"; done
+# These roots are needed by the staged RC3 healthcheck before the first
+# bootstrap. They are intentionally outside the optional package setup: a
+# supported --skip-prerequisites host must still receive the exact durable
+# root-only state contract.
+install -d -m 0711 -o root -g root /var/lib/open-card
+install -d -m 0700 -o root -g root /var/lib/open-card/healthcheck /var/lib/open-card/health-secret-materials
 if (( ! skip_prerequisites )); then
   missing_packages=()
   for command_name in docker psql runuser newuidmap newgidmap; do command -v "$command_name" >/dev/null 2>&1 || missing_packages+=("$command_name"); done
@@ -186,7 +192,6 @@ PY
   done
   grep -Eq '^opencard-buildkit:' /etc/subuid || printf '%s\n' 'opencard-buildkit:231072:65536' >>/etc/subuid
   grep -Eq '^opencard-buildkit:' /etc/subgid || printf '%s\n' 'opencard-buildkit:231072:65536' >>/etc/subgid
-  install -d -m 0711 -o root -g root /var/lib/open-card
   install -d -m 0750 -o opencard -g opencard /var/log/open-card /var/lib/open-card/uploads /var/lib/open-card/workspaces /var/lib/open-card/build-work /var/lib/open-card/oci /var/lib/open-card/secrets /var/lib/open-card/secret-materials
   install -d -m 0750 -o opencard-agent -g opencard-agent /var/lib/open-card-agent /var/log/open-card-agent /var/lib/open-card-agent/runtime
   install -d -m 0700 -o opencard-buildkit -g opencard-buildkit /var/lib/open-card-buildkit /run/open-card-buildkit

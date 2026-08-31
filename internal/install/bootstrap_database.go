@@ -33,7 +33,7 @@ type BootstrapDatabaseInput struct {
 }
 
 func (i BootstrapDatabaseInput) Validate() error {
-	if !validID(i.TransactionID) || !validSHA(i.InstallationIDSHA256) || !validID(i.CandidateActivationID) || !i.Release.valid() || i.Release.Version != Gate6CandidateVersion {
+	if !validID(i.TransactionID) || !validSHA(i.InstallationIDSHA256) || !validID(i.CandidateActivationID) || !i.Release.valid() || (i.Release.Version != Gate6CandidateVersion && i.Release.Version != Gate7CandidateVersion) {
 		return errors.New("invalid bootstrap database input")
 	}
 	if _, err := CandidateDatabaseName(i.CandidateActivationID); err != nil {
@@ -93,8 +93,9 @@ type BootstrapMigrationControl interface {
 	EnsureMigrationLedger(context.Context) error
 }
 
-// BootstrapMigrations is a verified, ordered RC2 migration payload. SQL is
-// retained only in memory for the per-migration transaction that consumes it.
+// BootstrapMigrations is a verified, ordered native-bootstrap migration
+// payload. SQL is retained only in memory for the per-migration transaction
+// that consumes it.
 type BootstrapMigrations struct {
 	Rows []MigrationRow `json:"rows"`
 	SQL  []string       `json:"-"`
@@ -352,7 +353,7 @@ func (s *SQLMigrationControl) EnsureMigrationLedger(ctx context.Context) error {
 // LoadProductionBootstrapMigrations is pinned beneath the production release
 // root. It does not accept caller-controlled release directories.
 func LoadProductionBootstrapMigrations(release ReleaseV1) (BootstrapMigrations, error) {
-	if release.Version != Gate6CandidateVersion || !release.valid() {
+	if (release.Version != Gate6CandidateVersion && release.Version != Gate7CandidateVersion) || !release.valid() {
 		return BootstrapMigrations{}, ErrPostgresOutcomeUnknown
 	}
 	writer, err := ProductionDurableWriter(productionBootstrapActiveRoot)
@@ -378,7 +379,7 @@ func LoadTaskBootstrapMigrations(activeRoot string, uid, gid int, release Releas
 }
 
 func loadBootstrapMigrations(writer *DurableWriter, release ReleaseV1) (BootstrapMigrations, error) {
-	if writer == nil || release.Version != Gate6CandidateVersion || !release.valid() {
+	if writer == nil || (release.Version != Gate6CandidateVersion && release.Version != Gate7CandidateVersion) || !release.valid() {
 		return BootstrapMigrations{}, ErrPostgresOutcomeUnknown
 	}
 	manifestRaw, err := secureReleaseFile(writer, release.ID, "manifest.json", 0o644)
@@ -386,7 +387,7 @@ func loadBootstrapMigrations(writer *DurableWriter, release ReleaseV1) (Bootstra
 		return BootstrapMigrations{}, ErrPostgresOutcomeUnknown
 	}
 	manifest, err := parseReleaseManifest(manifestRaw)
-	if err != nil || manifest.ReleaseID != release.ID || manifest.Version != Gate6CandidateVersion || manifest.MigrationVersion != CurrentMigrationVersion || manifest.SourceCommit != release.SourceCommit || manifest.Architecture != release.Architecture || ValidateProductionCandidate(manifest) != nil || verifySecureRelease(writer, release.ID, manifest) != nil {
+	if err != nil || manifest.ReleaseID != release.ID || manifest.Version != release.Version || manifest.MigrationVersion != CurrentMigrationVersion || manifest.SourceCommit != release.SourceCommit || manifest.Architecture != release.Architecture || ValidateProductionCandidate(manifest) != nil || verifySecureRelease(writer, release.ID, manifest) != nil {
 		return BootstrapMigrations{}, ErrPostgresOutcomeUnknown
 	}
 	byPath := make(map[string]FileDigest, len(manifest.Files))
