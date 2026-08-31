@@ -75,22 +75,31 @@ type upgradeRuntime struct {
 	close            func() error
 }
 
+// installationIdentityMigrationStore keeps the privileged migration command
+// limited to its two required operations and makes its construction testable
+// without accepting roots or identity values from CLI arguments.
+type installationIdentityMigrationStore interface {
+	Migrate(context.Context) (install.InstallationIdentity, error)
+	Close() error
+}
+
 type upgradeDependencies struct {
-	euid                      func() int
-	derive                    func(upgradeCommandConfig) (install.UpgradeCLIIdentity, error)
-	verifyExecutable          func() error
-	prepareControl            func(context.Context) (string, error)
-	prepareBootstrap          func(context.Context, string) (install.BootstrapRuntimeReceipt, error)
-	verifyCandidateExecutable func(string) error
-	newRuntime                func(context.Context) (upgradeRuntime, error)
-	newStatusRuntime          func(context.Context) (upgradeRuntime, error)
-	newPrepareRuntime         func(context.Context) (upgradeRuntime, error)
-	newFinalizeRuntime        func(context.Context) (upgradeRuntime, error)
-	newBackupRuntime          func(context.Context) (upgradeRuntime, error)
-	deriveBootstrap           func(upgradeCommandConfig) (install.BootstrapRequest, error)
-	newBootstrapRuntime       func(context.Context) (upgradeRuntime, error)
-	verifyCommittedBootstrap  func(context.Context, install.BootstrapRequest) error
-	finalizeBootstrap         func(context.Context, install.BootstrapRequest) (install.BootstrapFinalizationReceipt, error)
+	euid                         func() int
+	derive                       func(upgradeCommandConfig) (install.UpgradeCLIIdentity, error)
+	verifyExecutable             func() error
+	prepareControl               func(context.Context) (string, error)
+	prepareBootstrap             func(context.Context, string) (install.BootstrapRuntimeReceipt, error)
+	verifyCandidateExecutable    func(string) error
+	newRuntime                   func(context.Context) (upgradeRuntime, error)
+	newStatusRuntime             func(context.Context) (upgradeRuntime, error)
+	newPrepareRuntime            func(context.Context) (upgradeRuntime, error)
+	newFinalizeRuntime           func(context.Context) (upgradeRuntime, error)
+	newBackupRuntime             func(context.Context) (upgradeRuntime, error)
+	deriveBootstrap              func(upgradeCommandConfig) (install.BootstrapRequest, error)
+	newBootstrapRuntime          func(context.Context) (upgradeRuntime, error)
+	verifyCommittedBootstrap     func(context.Context, install.BootstrapRequest) error
+	finalizeBootstrap            func(context.Context, install.BootstrapRequest) (install.BootstrapFinalizationReceipt, error)
+	newInstallationIdentityStore func() (installationIdentityMigrationStore, error)
 }
 
 type productionBootstrapRuntimeDependencies struct {
@@ -202,6 +211,9 @@ func productionUpgradeDependencies() upgradeDependencies {
 		newBootstrapRuntime:      newProductionBootstrapRuntime,
 		verifyCommittedBootstrap: install.VerifyProductionCommittedBootstrap,
 		finalizeBootstrap:        install.FinalizeProductionBootstrapEnvironment,
+		newInstallationIdentityStore: func() (installationIdentityMigrationStore, error) {
+			return install.NewProductionInstallationIdentityStore()
+		},
 	}
 }
 
@@ -285,6 +297,25 @@ func runWithDependenciesCore(ctx context.Context, args []string, stdout, stderr 
 	}
 	if deps.euid == nil || deps.euid() != 0 {
 		return writeUpgradeError(stderr, exitPrivilege, "root_required")
+	}
+	if config.command == "installation-identity-migrate" {
+		if deps.newInstallationIdentityStore == nil {
+			return writeUpgradeError(stderr, exitInternal, "installation_identity_migration_failed")
+		}
+		store, openErr := deps.newInstallationIdentityStore()
+		if openErr != nil || store == nil {
+			if store != nil {
+				_ = store.Close()
+			}
+			return writeUpgradeError(stderr, exitInternal, "installation_identity_migration_failed")
+		}
+		identity, migrateErr := store.Migrate(ctx)
+		closeErr := store.Close()
+		identitySHA256 := identity.SHA256()
+		if migrateErr != nil || closeErr != nil || !validCLISHA(identitySHA256) {
+			return writeUpgradeError(stderr, exitInternal, "installation_identity_migration_failed")
+		}
+		return writeUpgradeJSON(stdout, exitOK, map[string]any{"installation_id_sha256": identitySHA256})
 	}
 	// prepare-control deliberately precedes all runtime construction and the
 	// safe-target fence. It provisions only the root-owned control identity;
@@ -588,6 +619,10 @@ func parseUpgradeArgs(args []string) (upgradeCommandConfig, error) {
 	}
 	config := upgradeCommandConfig{command: args[0]}
 	switch config.command {
+	case "installation-identity-migrate":
+		if len(args) != 1 {
+			return upgradeCommandConfig{}, errors.New("installation identity migration takes no flags")
+		}
 	case "prepare-control":
 		if len(args) != 1 {
 			return upgradeCommandConfig{}, errors.New("prepare-control takes no flags")

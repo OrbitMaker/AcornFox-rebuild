@@ -389,6 +389,22 @@ chown root:root "$installation_id" && chmod 0600 "$installation_id"
 installation_value=$(cat -- "$installation_id")
 [[ "$installation_value" =~ ^[0-9a-f]{48}$ ]] || die "installation id is invalid"
 
+migrate_installation_identity() {
+  local expected_sha receipt
+  expected_sha=$(printf '%s' "$installation_value" | /usr/bin/sha256sum | /usr/bin/awk '{print $1}') || die "installation identity digest failed"
+  [[ "$expected_sha" =~ ^[0-9a-f]{64}$ ]] || die "installation identity digest is invalid"
+  receipt=$(/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C LC_ALL=C /opt/open-card/upgrade-tools/open-card-upgrade installation-identity-migrate) || die "installation identity migration failed"
+  /usr/bin/python3 - "$receipt" "$expected_sha" <<'PY' || die "installation identity migration receipt is invalid"
+import json, re, sys
+try:
+    value = json.loads(sys.argv[1])
+except (TypeError, ValueError) as error:
+    raise SystemExit(1) from error
+if set(value) != {"installation_id_sha256"} or not re.fullmatch(r"[0-9a-f]{64}", value["installation_id_sha256"]) or value["installation_id_sha256"] != sys.argv[2]:
+    raise SystemExit(1)
+PY
+}
+
 if (( ! resume_public )); then
   # Gate 6 capacity profile is an exact replay-only helper contract.
   capacity_receipt=$("$script_dir/buildkit-production-capacity.sh" install)
@@ -407,6 +423,7 @@ if (( ! resume_public )); then
   /usr/bin/systemctl daemon-reload || die "BuildKit capacity daemon-reload failed"
 
   "${installer[@]}"
+  migrate_installation_identity
   [[ -f /etc/open-card/server.env && ! -L /etc/open-card/server.env ]] || die "server.env is missing or unsafe"
   if grep -q '^OPEN_CARD_DATABASE_URL=' /etc/open-card/server.env; then
     die "fresh native bootstrap refuses global OPEN_CARD_DATABASE_URL in server.env"
@@ -417,6 +434,9 @@ if (( ! resume_public )); then
   /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C LC_ALL=C /opt/open-card/upgrade-tools/open-card-upgrade bootstrap-native --expected-manifest-sha256 "$expected" --confirm-installation-id "BOOTSTRAP:$installation_value"
   trap - EXIT
 else
+  # A new bootstrap publishes current only after the canonical identity was
+  # migrated above. Historical RC2 helpers do not implement that command and
+  # still bind resume verification to the preserved legacy mirror.
   /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C LC_ALL=C /opt/open-card/upgrade-tools/open-card-upgrade bootstrap-verify --expected-manifest-sha256 "$expected" --confirm-installation-id "BOOTSTRAP:$installation_value"
   /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C LC_ALL=C /opt/open-card/upgrade-tools/open-card-upgrade bootstrap-native --expected-manifest-sha256 "$expected" --confirm-installation-id "BOOTSTRAP:$installation_value"
 fi

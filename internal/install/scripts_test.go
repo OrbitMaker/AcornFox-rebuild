@@ -444,6 +444,7 @@ func TestG5BRecoverySubstrateStaysStageOnlyAndBootDisabled(t *testing.T) {
 	}
 	for _, required := range []string{
 		"--stage-native-bootstrap",
+		"installation-identity-migrate",
 		"prepare-bootstrap --expected-manifest-sha256",
 		"prepare-control",
 		"bootstrap-native --expected-manifest-sha256",
@@ -485,13 +486,21 @@ func TestG5BRecoverySubstrateStaysStageOnlyAndBootDisabled(t *testing.T) {
 		t.Fatal("host installer does not establish a root-owned data parent before creating an installation id")
 	}
 	prepareBootstrap := strings.Index(host, "prepare-bootstrap --expected-manifest-sha256")
+	freshMigration := strings.Index(host[installerCall:], "migrate_installation_identity")
+	if freshMigration >= 0 {
+		freshMigration += installerCall
+	}
 	prepareControl := strings.Index(host, "prepare-control")
 	bootstrapNative := strings.Index(host, "bootstrap-native --expected-manifest-sha256")
 	adminBootstrap := strings.LastIndex(host, "open-card-admin bootstrap")
 	publicReload := strings.Index(host, "systemctl reload open-card-edge.service")
 	bootstrapFinalize := strings.Index(host, "bootstrap-finalize --expected-manifest-sha256")
-	if prepareBootstrap < installerCall || prepareControl < prepareBootstrap || bootstrapNative < prepareControl || adminBootstrap < bootstrapNative || publicReload < adminBootstrap || bootstrapFinalize < publicReload {
+	if freshMigration < installerCall || prepareBootstrap < freshMigration || prepareControl < prepareBootstrap || bootstrapNative < prepareControl || adminBootstrap < bootstrapNative || publicReload < adminBootstrap || bootstrapFinalize < publicReload {
 		t.Fatal("host native bootstrap/public activation ordering is unsafe")
+	}
+	resumeCompatibility := "Historical RC2 helpers do not implement that command"
+	if !strings.Contains(host, resumeCompatibility) || strings.Count(host[freshMigration:], "migrate_installation_identity") != 1 {
+		t.Fatal("host resume path does not preserve the historical RC2 helper boundary")
 	}
 	if !strings.Contains(host, "install -d -m 0711 -o root -g root /etc/open-card") || !strings.Contains(host, "install -d -m 0700 -o root -g root /var/lib/open-card/evidence") {
 		t.Fatal("host installer does not separate runtime traversal from root-only evidence")

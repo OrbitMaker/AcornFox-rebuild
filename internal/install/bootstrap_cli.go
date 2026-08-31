@@ -10,7 +10,7 @@ import (
 )
 
 const productionBootstrapReleaseRoot = "/opt/open-card"
-const productionBootstrapDataRoot = "/var/lib/open-card"
+const productionBootstrapConfigRoot = "/etc/open-card"
 const productionInstallationIDName = "installation-id"
 
 // DeriveProductionBootstrapRequest derives every bootstrap identity from the
@@ -22,43 +22,43 @@ func DeriveProductionBootstrapRequest(expectedManifestSHA256, confirmation strin
 		return BootstrapRequest{}, ErrBootstrapConflict
 	}
 	defer releases.Close()
-	data, err := ProductionDurableWriter(productionBootstrapDataRoot)
+	config, err := ProductionDurableWriter(productionBootstrapConfigRoot)
 	if err != nil {
 		return BootstrapRequest{}, ErrBootstrapConflict
 	}
-	defer data.Close()
-	return deriveProductionBootstrapRequest(releases, data, expectedManifestSHA256, confirmation)
+	defer config.Close()
+	return deriveProductionBootstrapRequest(releases, config, expectedManifestSHA256, confirmation)
 }
 
 // deriveProductionBootstrapRequestForTask is intentionally unexported: task
-// tests must supply their active/data roots and owner explicitly.
-func deriveProductionBootstrapRequestForTask(activeRoot, dataRoot string, uid, gid int, expectedManifestSHA256, confirmation string) (BootstrapRequest, error) {
+// tests must supply their active/config roots and owner explicitly.
+func deriveProductionBootstrapRequestForTask(activeRoot, configRoot string, uid, gid int, expectedManifestSHA256, confirmation string) (BootstrapRequest, error) {
 	releases, err := TaskDurableWriter(activeRoot, uid, gid)
 	if err != nil {
 		return BootstrapRequest{}, ErrBootstrapConflict
 	}
 	defer releases.Close()
-	data, err := TaskDurableWriter(dataRoot, uid, gid)
+	config, err := TaskDurableWriter(configRoot, uid, gid)
 	if err != nil {
 		return BootstrapRequest{}, ErrBootstrapConflict
 	}
-	defer data.Close()
-	return deriveProductionBootstrapRequest(releases, data, expectedManifestSHA256, confirmation)
+	defer config.Close()
+	return deriveProductionBootstrapRequest(releases, config, expectedManifestSHA256, confirmation)
 }
 
-func deriveProductionBootstrapRequest(releases, data *DurableWriter, expectedManifestSHA256, confirmation string) (BootstrapRequest, error) {
-	if !validSHA(expectedManifestSHA256) || releases == nil || data == nil || releases.VerifyLiveRoot() != nil || data.VerifyLiveRoot() != nil {
+func deriveProductionBootstrapRequest(releases, config *DurableWriter, expectedManifestSHA256, confirmation string) (BootstrapRequest, error) {
+	if !validSHA(expectedManifestSHA256) || releases == nil || config == nil || releases.VerifyLiveRoot() != nil || config.VerifyLiveRoot() != nil {
 		return BootstrapRequest{}, ErrBootstrapConflict
 	}
-	installationInfo, err := data.ops.Lstat(productionInstallationIDName)
-	if err != nil || !installationInfo.Mode().IsRegular() || installationInfo.Mode()&os.ModeSymlink != 0 || installationInfo.Mode().Perm() != durableFileMode || verifyOwner(installationInfo, data.uid, data.gid) != nil {
+	installationInfo, err := config.ops.Lstat(productionInstallationIDName)
+	if err != nil || verifyDurableFile(installationInfo, config.uid, config.gid) != nil {
 		return BootstrapRequest{}, ErrBootstrapConflict
 	}
-	installationRaw, err := data.ReadMetadata(productionInstallationIDName)
-	if err != nil || len(installationRaw) != 49 || installationRaw[48] != '\n' || !isLowerHex(string(installationRaw[:48])) {
+	installation, state := readInstallationIdentity(config)
+	if state != installationIdentityPresent {
 		return BootstrapRequest{}, ErrBootstrapConflict
 	}
-	installationID := string(installationRaw[:48])
+	installationID := installation.value
 	if confirmation != "BOOTSTRAP:"+installationID {
 		return BootstrapRequest{}, ErrBootstrapConflict
 	}

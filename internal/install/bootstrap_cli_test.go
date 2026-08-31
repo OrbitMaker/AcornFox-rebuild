@@ -31,11 +31,11 @@ func (o *bootstrapOwnerMismatchOps) Lstat(name string) (os.FileInfo, error) {
 func bootstrapCLIInput(t *testing.T) (ReleaseV1, string, string, string) {
 	t.Helper()
 	release, activeRoot := bootstrapRC2Release(t)
-	dataRoot := filepath.Join(t.TempDir(), "open-card-data")
-	if err := os.MkdirAll(dataRoot, 0o700); err != nil {
+	configRoot := filepath.Join(t.TempDir(), "open-card-config")
+	if err := os.MkdirAll(configRoot, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	writer, err := TaskDurableWriter(dataRoot, os.Getuid(), os.Getgid())
+	writer, err := TaskDurableWriter(configRoot, os.Getuid(), os.Getgid())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,22 +44,44 @@ func bootstrapCLIInput(t *testing.T) (ReleaseV1, string, string, string) {
 	if err := writer.WriteMetadata(productionInstallationIDName, []byte(id+"\n")); err != nil {
 		t.Fatal(err)
 	}
-	return release, activeRoot, dataRoot, id
+	return release, activeRoot, configRoot, id
 }
 
 func TestDeriveBootstrapRequestForTaskBindsFixedReleaseAndInstallationIdentity(t *testing.T) {
-	release, activeRoot, dataRoot, id := bootstrapCLIInput(t)
-	first, err := deriveProductionBootstrapRequestForTask(activeRoot, dataRoot, os.Getuid(), os.Getgid(), release.ManifestSHA256, "BOOTSTRAP:"+id)
+	release, activeRoot, configRoot, id := bootstrapCLIInput(t)
+	first, err := deriveProductionBootstrapRequestForTask(activeRoot, configRoot, os.Getuid(), os.Getgid(), release.ManifestSHA256, "BOOTSTRAP:"+id)
 	if err != nil || first.Validate() != nil || first.Release != release {
 		t.Fatalf("derive bootstrap request: %#v %v", first, err)
 	}
-	second, err := deriveProductionBootstrapRequestForTask(activeRoot, dataRoot, os.Getuid(), os.Getgid(), release.ManifestSHA256, "BOOTSTRAP:"+id)
+	second, err := deriveProductionBootstrapRequestForTask(activeRoot, configRoot, os.Getuid(), os.Getgid(), release.ManifestSHA256, "BOOTSTRAP:"+id)
 	if err != nil || first != second || !strings.HasPrefix(first.TransactionID, "bootstrap-") || !strings.HasPrefix(first.CandidateActivationID, "activation-") || first.TransactionID == first.CandidateActivationID || strings.TrimPrefix(first.TransactionID, "bootstrap-") == strings.TrimPrefix(first.CandidateActivationID, "activation-") {
 		t.Fatalf("bootstrap derivation is not deterministic and domain-separated: %#v %v", second, err)
 	}
 	raw, _ := json.Marshal(first)
 	if strings.Contains(string(raw), id) || strings.Contains(first.InstallationIDSHA256, id) {
 		t.Fatal("bootstrap request exposed raw installation identity")
+	}
+}
+
+func TestDeriveBootstrapRequestForTaskNeverFallsBackToLegacyIdentity(t *testing.T) {
+	release, activeRoot, configRoot, id := bootstrapCLIInput(t)
+	if err := os.Remove(filepath.Join(configRoot, productionInstallationIDName)); err != nil {
+		t.Fatal(err)
+	}
+	legacyRoot := filepath.Join(t.TempDir(), "var/lib/open-card")
+	if err := os.MkdirAll(legacyRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := TaskDurableWriter(legacyRoot, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer legacy.Close()
+	if err := legacy.WriteMetadata(productionInstallationIDName, []byte(id+"\n")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := deriveProductionBootstrapRequestForTask(activeRoot, configRoot, os.Getuid(), os.Getgid(), release.ManifestSHA256, "BOOTSTRAP:"+id); err == nil {
+		t.Fatal("bootstrap fell back to legacy installation identity")
 	}
 }
 

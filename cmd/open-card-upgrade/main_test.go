@@ -43,6 +43,64 @@ func bootstrapCLIArgs() []string {
 	return []string{"bootstrap-native", "--expected-manifest-sha256", testManifest, "--confirm-installation-id", testBootstrapConfirmation}
 }
 
+type cliInstallationIdentityLock struct{}
+
+func (cliInstallationIdentityLock) Release() error { return nil }
+
+type cliInstallationIdentityLocker struct{}
+
+func (cliInstallationIdentityLocker) Acquire(context.Context, string) (install.UpgradeLock, error) {
+	return cliInstallationIdentityLock{}, nil
+}
+
+func (cliInstallationIdentityLocker) PendingTransaction(context.Context) (install.PendingTransaction, error) {
+	return install.PendingTransaction{Marker: install.UpgradeMarkerAbsent}, nil
+}
+
+func testInstallationIdentity(t *testing.T) install.InstallationIdentity {
+	t.Helper()
+	root := t.TempDir()
+	canonical := root + "/etc/open-card"
+	legacy := root + "/var/lib/open-card"
+	for _, path := range []string{canonical, legacy} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	legacyWriter, err := install.TaskDurableWriter(legacy, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := legacyWriter.WriteMetadata("installation-id", []byte(strings.Repeat("b", 48)+"\n")); err != nil {
+		_ = legacyWriter.Close()
+		t.Fatal(err)
+	}
+	if err := legacyWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := install.NewTaskInstallationIdentityStore(canonical, legacy, os.Getuid(), os.Getgid(), cliInstallationIdentityLocker{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := store.Migrate(context.Background())
+	closeErr := store.Close()
+	if err != nil || closeErr != nil || identity.SHA256() == "" {
+		t.Fatalf("identity migration err=%v close=%v hash=%q", err, closeErr, identity.SHA256())
+	}
+	return identity
+}
+
+type cliInstallationIdentityStore struct {
+	migrate func(context.Context) (install.InstallationIdentity, error)
+	close   func() error
+}
+
+func (s cliInstallationIdentityStore) Migrate(ctx context.Context) (install.InstallationIdentity, error) {
+	return s.migrate(ctx)
+}
+
+func (s cliInstallationIdentityStore) Close() error { return s.close() }
+
 func testBootstrapRequest() install.BootstrapRequest {
 	return install.BootstrapRequest{TransactionID: "bootstrap-cli-test", InstallationIDSHA256: testManifest, CandidateActivationID: "activation-cli-test", Release: install.ReleaseV1{ID: "release-rc2-cli", Version: install.Gate6CandidateVersion, SourceCommit: "0123456789abcdef0123456789abcdef01234567", Architecture: install.RuntimeArchitecture(), ManifestSHA256: testManifest}}
 }
@@ -99,6 +157,17 @@ func TestParseUpgradeArgsIsExactAndForbidsDangerousInputs(t *testing.T) {
 			t.Fatalf("accepted unsafe bootstrap args %#v", args)
 		}
 	}
+	if config, err := parseUpgradeArgs([]string{"installation-identity-migrate"}); err != nil || config.command != "installation-identity-migrate" {
+		t.Fatalf("installation identity migration parse=%+v err=%v", config, err)
+	}
+	for _, args := range [][]string{
+		{"installation-identity-migrate", "--task-root", "/tmp/x"},
+		{"installation-identity-migrate", "--confirm-installation-id", testBootstrapConfirmation},
+	} {
+		if _, err := parseUpgradeArgs(args); err == nil {
+			t.Fatalf("installation identity migration accepted flags %#v", args)
+		}
+	}
 	if config, err := parseUpgradeArgs([]string{"recover", "--pending"}); err != nil || !config.pending {
 		t.Fatalf("pending parse failed: %#v %v", config, err)
 	}
@@ -153,6 +222,84 @@ func TestParseUpgradeArgsIsExactAndForbidsDangerousInputs(t *testing.T) {
 		if _, err := parseUpgradeArgs(args); err == nil {
 			t.Fatalf("accepted unsafe backup/restore args %#v", args)
 		}
+	}
+}
+
+func TestInstallationIdentityMigrationCommandIsRootOnlyClosedAndRedacted(t *testing.T) {
+	identity := testInstallationIdentity(t)
+	rawIdentity := strings.Repeat("b", 48)
+	var stdout, stderr bytes.Buffer
+	constructed, migrated, closed := false, false, 0
+	deps := upgradeDependencies{
+		euid: func() int { return 0 },
+		newInstallationIdentityStore: func() (installationIdentityMigrationStore, error) {
+			constructed = true
+			return cliInstallationIdentityStore{
+				migrate: func(context.Context) (install.InstallationIdentity, error) {
+					migrated = true
+					return identity, nil
+				},
+				close: func() error { closed++; return nil },
+			}, nil
+		},
+	}
+	if code := runWithDependencies(context.Background(), []string{"installation-identity-migrate"}, &stdout, &stderr, deps); code != exitOK || !constructed || !migrated || closed != 1 || stderr.Len() != 0 || strings.Contains(stdout.String(), rawIdentity) {
+		t.Fatalf("code=%d constructed=%v migrated=%v closed=%d out=%q err=%q", code, constructed, migrated, closed, stdout.String(), stderr.String())
+	}
+	var result map[string]string
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil || len(result) != 1 || result["installation_id_sha256"] != identity.SHA256() {
+		t.Fatalf("result=%#v err=%v", result, err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	constructed, migrated, closed = false, false, 0
+	deps.euid = func() int { return 99 }
+	if code := runWithDependencies(context.Background(), []string{"installation-identity-migrate"}, &stdout, &stderr, deps); code != exitPrivilege || constructed || migrated || closed != 0 || !strings.Contains(stderr.String(), "root_required") {
+		t.Fatalf("non-root code=%d constructed=%v migrated=%v closed=%d out=%q err=%q", code, constructed, migrated, closed, stdout.String(), stderr.String())
+	}
+}
+
+func TestInstallationIdentityMigrationCommandFailsClosedOnCancellationAndCloseError(t *testing.T) {
+	identity := testInstallationIdentity(t)
+	rawIdentity := strings.Repeat("b", 48)
+	for name, scenario := range map[string]struct {
+		migrate func(context.Context) (install.InstallationIdentity, error)
+		close   func() error
+	}{
+		"cancellation": {
+			migrate: func(ctx context.Context) (install.InstallationIdentity, error) {
+				if ctx.Err() == nil {
+					t.Fatal("migration did not receive cancelled context")
+				}
+				return install.InstallationIdentity{}, errors.New("/etc/open-card/" + rawIdentity)
+			},
+			close: func() error { return nil },
+		},
+		"close-error": {
+			migrate: func(context.Context) (install.InstallationIdentity, error) { return identity, nil },
+			close:   func() error { return errors.New("/etc/open-card/" + rawIdentity) },
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			closed := 0
+			deps := upgradeDependencies{
+				euid: func() int { return 0 },
+				newInstallationIdentityStore: func() (installationIdentityMigrationStore, error) {
+					return cliInstallationIdentityStore{migrate: scenario.migrate, close: func() error { closed++; return scenario.close() }}, nil
+				},
+			}
+			ctx := context.Background()
+			if name == "cancellation" {
+				cancelled, cancel := context.WithCancel(ctx)
+				cancel()
+				ctx = cancelled
+			}
+			if code := runWithDependencies(ctx, []string{"installation-identity-migrate"}, &stdout, &stderr, deps); code != exitInternal || closed != 1 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "installation_identity_migration_failed") || strings.Contains(stderr.String(), rawIdentity) || strings.Contains(stderr.String(), identity.SHA256()) {
+				t.Fatalf("code=%d closed=%d out=%q err=%q", code, closed, stdout.String(), stderr.String())
+			}
+		})
 	}
 }
 
