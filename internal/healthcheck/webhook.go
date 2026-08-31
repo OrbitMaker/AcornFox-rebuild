@@ -19,6 +19,8 @@ import (
 const (
 	webhookConfigSchema         = "open_card.host_alert_webhook.config.v1"
 	deliveryHealthSchema        = "open_card.host_alert_webhook.delivery_health.v1"
+	webhookDeliveryEventSchema  = "open_card.host_alert_webhook.delivery_event.v1"
+	webhookDeliveryEventVersion = "webhook_delivery_event_v1"
 	webhookHealthSubjectVersion = "webhook_health_v1"
 	maxWebhookEndpointID        = 128
 	maxWebhookURL               = 2048
@@ -51,11 +53,70 @@ type WebhookConfigV1 struct {
 type WebhookDeliveryHealthStatus string
 
 const (
-	WebhookDeliveryUnproven         WebhookDeliveryHealthStatus = "unproven"
+	WebhookDeliveryUnproven WebhookDeliveryHealthStatus = "unproven"
+	// WebhookDeliveryPending records an accepted delivery before any provider
+	// attempt has been made. It is deliberately distinct from a retryable
+	// failure so health can retain the oldest accepted occurrence precisely.
+	WebhookDeliveryPending          WebhookDeliveryHealthStatus = "pending"
 	WebhookDeliveryDelivered        WebhookDeliveryHealthStatus = "delivered"
 	WebhookDeliveryRetryableFailure WebhookDeliveryHealthStatus = "retryable_failure"
 	WebhookDeliveryFailed           WebhookDeliveryHealthStatus = "failed"
 )
+
+// WebhookDeliveryEventV1 is the strict, secret-free identity of one durable
+// host-health notification. Recovery notifications retain the recovered
+// incident fingerprint rather than the synthetic healthy fingerprint.
+type WebhookDeliveryEventV1 struct {
+	Schema              string `json:"schema"`
+	EventID             string `json:"event_id"`
+	IncidentFingerprint string `json:"incident_fingerprint"`
+	IncidentRevision    int64  `json:"incident_revision"`
+	PendingNotification string `json:"pending_notification"`
+	NotificationStage   int    `json:"notification_stage"`
+}
+
+func (v WebhookDeliveryEventV1) Validate() error {
+	if v.Schema != webhookDeliveryEventSchema || !webhookDigestPattern.MatchString(v.EventID) || !shaPattern.MatchString(v.IncidentFingerprint) || v.IncidentRevision < 1 || v.IncidentRevision > maxWebhookRevision || !validWebhookPendingNotification(v.PendingNotification) || !validWebhookNotificationStage(v.PendingNotification, v.NotificationStage) || v.EventID != canonicalWebhookDeliveryEventID(v.IncidentFingerprint, v.IncidentRevision, v.PendingNotification, v.NotificationStage) {
+		return errors.New("invalid webhook delivery event")
+	}
+	return nil
+}
+
+// WebhookDeliveryEventFromIncident derives the one stable delivery identity
+// for a currently pending host-health notification.
+func WebhookDeliveryEventFromIncident(state IncidentState) (WebhookDeliveryEventV1, error) {
+	if state.Validate() != nil || state.PendingNotification == "" {
+		return WebhookDeliveryEventV1{}, errors.New("invalid webhook delivery incident")
+	}
+	fingerprint := state.Fingerprint
+	if state.PendingNotification == "recovery" {
+		fingerprint = state.RecoveryOf
+	}
+	event := WebhookDeliveryEventV1{Schema: webhookDeliveryEventSchema, IncidentFingerprint: fingerprint, IncidentRevision: state.Revision, PendingNotification: state.PendingNotification, NotificationStage: state.NotificationStage}
+	event.EventID = canonicalWebhookDeliveryEventID(event.IncidentFingerprint, event.IncidentRevision, event.PendingNotification, event.NotificationStage)
+	return event, event.Validate()
+}
+
+func canonicalWebhookDeliveryEventID(fingerprint string, revision int64, pending string, stage int) string {
+	sum := sha256.Sum256([]byte(webhookDeliveryEventVersion + "\n" + fingerprint + "\n" + strconv.FormatInt(revision, 10) + "\n" + pending + "\n" + strconv.Itoa(stage)))
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+func validWebhookPendingNotification(value string) bool {
+	return value == "occurrence" || value == "escalation" || value == "recovery"
+}
+
+func validWebhookNotificationStage(kind string, stage int) bool {
+	switch kind {
+	case "occurrence":
+		return stage == 1
+	case "escalation":
+		return stage == 2 || stage == 3
+	case "recovery":
+		return stage == 0
+	}
+	return false
+}
 
 // DeliveryHealthV1 is the root-owned delivery observation associated with one
 // exact WebhookConfigV1 digest. An absent observation is represented by a nil
@@ -70,6 +131,7 @@ type DeliveryHealthV1 struct {
 	Status                  WebhookDeliveryHealthStatus `json:"status"`
 	ConsecutiveFailureCount int64                       `json:"consecutive_failure_count"`
 	TerminalFailureCount    int64                       `json:"terminal_failure_count"`
+	Event                   *WebhookDeliveryEventV1     `json:"event,omitempty"`
 }
 
 // WebhookHealthObservation is the only host-health read boundary for the
@@ -113,7 +175,11 @@ func (v DeliveryHealthV1) Validate() error {
 	}
 	switch v.Status {
 	case WebhookDeliveryUnproven:
-		if v.OldestPendingAt != nil || v.LastAttemptAt != nil || v.LastDeliveredAt != nil || v.ConsecutiveFailureCount != 0 || v.TerminalFailureCount != 0 {
+		if v.OldestPendingAt != nil || v.LastAttemptAt != nil || v.LastDeliveredAt != nil || v.ConsecutiveFailureCount != 0 || v.TerminalFailureCount != 0 || v.Event != nil {
+			return errors.New("invalid webhook delivery health")
+		}
+	case WebhookDeliveryPending:
+		if v.OldestPendingAt == nil || v.LastAttemptAt != nil || v.ConsecutiveFailureCount != 0 || v.TerminalFailureCount != 0 {
 			return errors.New("invalid webhook delivery health")
 		}
 	case WebhookDeliveryDelivered:
@@ -129,6 +195,9 @@ func (v DeliveryHealthV1) Validate() error {
 			return errors.New("invalid webhook delivery health")
 		}
 	}
+	if v.Status != WebhookDeliveryUnproven && (v.Event == nil || v.Event.Validate() != nil) {
+		return errors.New("invalid webhook delivery health")
+	}
 	return nil
 }
 
@@ -137,7 +206,7 @@ func validWebhookSecretReference(value domain.SecretReference) bool {
 }
 
 func validDeliveryStatus(value WebhookDeliveryHealthStatus) bool {
-	return value == WebhookDeliveryUnproven || value == WebhookDeliveryDelivered || value == WebhookDeliveryRetryableFailure || value == WebhookDeliveryFailed
+	return value == WebhookDeliveryUnproven || value == WebhookDeliveryPending || value == WebhookDeliveryDelivered || value == WebhookDeliveryRetryableFailure || value == WebhookDeliveryFailed
 }
 
 // MarshalWebhookConfig emits the one strict, canonical config representation.
@@ -194,6 +263,21 @@ func ParseDeliveryHealth(raw []byte) (DeliveryHealthV1, error) {
 	}
 	if err := requireObjectFields(raw, []string{"schema", "config_digest", "revision", "status", "consecutive_failure_count", "terminal_failure_count"}); err != nil {
 		return value, err
+	}
+	var fields struct {
+		Status WebhookDeliveryHealthStatus `json:"status"`
+		Event  json.RawMessage             `json:"event"`
+	}
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return value, err
+	}
+	if fields.Status != WebhookDeliveryUnproven {
+		if err := requireObjectFields(raw, []string{"event"}); err != nil {
+			return value, err
+		}
+		if err := requireObjectFields(fields.Event, []string{"schema", "event_id", "incident_fingerprint", "incident_revision", "pending_notification", "notification_stage"}); err != nil {
+			return value, err
+		}
 	}
 	return value, value.Validate()
 }
@@ -266,6 +350,10 @@ func checkWebhookHealth(ctx context.Context, source WebhookHealthSource, clock f
 	switch delivery.Status {
 	case WebhookDeliveryUnproven:
 		return webhookFact("unproven", digest), nil
+	case WebhookDeliveryPending:
+		if delivery.LastDeliveredAt == nil {
+			return webhookFact("reachability_unproven", digest), nil
+		}
 	case WebhookDeliveryFailed:
 		return webhookFact("terminal_failure", digest), nil
 	}

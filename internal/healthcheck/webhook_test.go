@@ -33,7 +33,7 @@ func TestWebhookConfigAndDeliveryStrictRoundTrip(t *testing.T) {
 	if err != nil || !webhookDigestPattern.MatchString(digest) {
 		t.Fatalf("digest=%q err=%v", digest, err)
 	}
-	delivery := DeliveryHealthV1{Schema: deliveryHealthSchema, ConfigDigest: digest, Revision: 9, LastAttemptAt: webhookTime(now.Add(time.Minute)), LastDeliveredAt: webhookTime(now.Add(time.Minute)), Status: WebhookDeliveryDelivered}
+	delivery := DeliveryHealthV1{Schema: deliveryHealthSchema, ConfigDigest: digest, Revision: 9, LastAttemptAt: webhookTime(now.Add(time.Minute)), LastDeliveredAt: webhookTime(now.Add(time.Minute)), Status: WebhookDeliveryDelivered, Event: webhookDeliveryEventFixture(t, 9, "occurrence", 1)}
 	deliveryRaw, err := MarshalDeliveryHealth(delivery)
 	if err != nil {
 		t.Fatal(err)
@@ -69,6 +69,33 @@ func TestWebhookConfigAndDeliveryStrictRoundTrip(t *testing.T) {
 	}
 }
 
+func TestWebhookDeliveryEventBindsTheOriginalIncidentIdentity(t *testing.T) {
+	now := time.Date(2026, 8, 31, 2, 0, 0, 0, time.UTC)
+	incident := IncidentState{SchemaVersion: SchemaVersion, Revision: 7, Fingerprint: strings.Repeat("a", 64), FirstObserved: now, LastObserved: now, Severity: SeverityCritical, NotificationStage: 2, PendingNotification: "escalation"}
+	event, err := WebhookDeliveryEventFromIncident(incident)
+	if err != nil || event.Validate() != nil || event.IncidentFingerprint != incident.Fingerprint || event.IncidentRevision != incident.Revision || event.PendingNotification != incident.PendingNotification || event.NotificationStage != incident.NotificationStage {
+		t.Fatalf("event=%+v err=%v", event, err)
+	}
+	recovery := IncidentState{SchemaVersion: SchemaVersion, Revision: 8, Fingerprint: HealthyFingerprint, FirstObserved: now, LastObserved: now, Severity: SeverityOK, PendingNotification: "recovery", RecoveryPending: true, RecoveryOf: strings.Repeat("b", 64), Healthy: true}
+	recoveryEvent, err := WebhookDeliveryEventFromIncident(recovery)
+	if err != nil || recoveryEvent.IncidentFingerprint != recovery.RecoveryOf {
+		t.Fatalf("recovery event=%+v err=%v", recoveryEvent, err)
+	}
+	delivery := DeliveryHealthV1{Schema: deliveryHealthSchema, ConfigDigest: "sha256:" + strings.Repeat("c", 64), Revision: 3, OldestPendingAt: webhookTime(now), Status: WebhookDeliveryPending, Event: &event}
+	raw, err := MarshalDeliveryHealth(delivery)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ParseDeliveryHealth([]byte(strings.Replace(string(raw), `"event":{`, `"event":{"extra":true,`, 1))); err == nil {
+		t.Fatal("delivery event with an unknown nested field was accepted")
+	}
+	withoutEvent := delivery
+	withoutEvent.Event = nil
+	if _, err := MarshalDeliveryHealth(withoutEvent); err == nil {
+		t.Fatal("pending delivery without an event was accepted")
+	}
+}
+
 func TestWebhookConfigRejectsNonPublicOrNonCanonicalURL(t *testing.T) {
 	now := time.Date(2026, 8, 31, 2, 0, 0, 0, time.UTC)
 	for _, target := range []string{
@@ -96,7 +123,7 @@ func TestTaskWebhookProbeClassifiesHealthAndThresholds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	delivered := DeliveryHealthV1{Schema: deliveryHealthSchema, ConfigDigest: digest, Revision: 1, LastAttemptAt: webhookTime(now.Add(-time.Minute)), LastDeliveredAt: webhookTime(now.Add(-time.Minute)), Status: WebhookDeliveryDelivered}
+	delivered := DeliveryHealthV1{Schema: deliveryHealthSchema, ConfigDigest: digest, Revision: 1, LastAttemptAt: webhookTime(now.Add(-time.Minute)), LastDeliveredAt: webhookTime(now.Add(-time.Minute)), Status: WebhookDeliveryDelivered, Event: webhookDeliveryEventFixture(t, 1, "occurrence", 1)}
 	for _, tc := range []struct {
 		name     string
 		config   *WebhookConfigV1
@@ -245,7 +272,7 @@ func webhookConfigFixture(configuredAt time.Time) WebhookConfigV1 {
 }
 
 func retryableWebhookDelivery(digest string, pending time.Time) DeliveryHealthV1 {
-	return DeliveryHealthV1{Schema: deliveryHealthSchema, ConfigDigest: digest, Revision: 2, OldestPendingAt: webhookTime(pending), LastAttemptAt: webhookTime(pending), Status: WebhookDeliveryRetryableFailure, ConsecutiveFailureCount: 1}
+	return DeliveryHealthV1{Schema: deliveryHealthSchema, ConfigDigest: digest, Revision: 2, OldestPendingAt: webhookTime(pending), LastAttemptAt: webhookTime(pending), Status: WebhookDeliveryRetryableFailure, ConsecutiveFailureCount: 1, Event: webhookDeliveryEventFixtureNoTest(2, "occurrence", 1)}
 }
 
 func retryableAfterDelivery(digest string, pending, delivered time.Time) DeliveryHealthV1 {
@@ -257,7 +284,12 @@ func retryableAfterDelivery(digest string, pending, delivered time.Time) Deliver
 func webhookTime(value time.Time) *time.Time { return &value }
 
 func webhookConfigPointer(value WebhookConfigV1) *WebhookConfigV1 { return &value }
-func deliveryPointer(value DeliveryHealthV1) *DeliveryHealthV1    { return &value }
+func deliveryPointer(value DeliveryHealthV1) *DeliveryHealthV1 {
+	if value.Status != WebhookDeliveryUnproven && value.Event == nil {
+		value.Event = webhookDeliveryEventFixtureNoTest(value.Revision, "occurrence", 1)
+	}
+	return &value
+}
 
 func disabledWebhookConfig(value WebhookConfigV1) WebhookConfigV1 {
 	value.Enabled = false
@@ -268,6 +300,23 @@ func sameDeliveryHealth(left, right DeliveryHealthV1) bool {
 	leftRaw, leftErr := MarshalDeliveryHealth(left)
 	rightRaw, rightErr := MarshalDeliveryHealth(right)
 	return leftErr == nil && rightErr == nil && string(leftRaw) == string(rightRaw)
+}
+
+func webhookDeliveryEventFixture(t *testing.T, revision int64, kind string, stage int) *WebhookDeliveryEventV1 {
+	t.Helper()
+	return webhookDeliveryEventFixtureNoTest(revision, kind, stage)
+}
+
+func webhookDeliveryEventFixtureNoTest(revision int64, kind string, stage int) *WebhookDeliveryEventV1 {
+	state := IncidentState{SchemaVersion: SchemaVersion, Revision: revision, Fingerprint: strings.Repeat("a", 64), FirstObserved: time.Date(2026, 8, 31, 0, 0, 0, 0, time.UTC), LastObserved: time.Date(2026, 8, 31, 0, 0, 0, 0, time.UTC), Severity: SeverityCritical, NotificationStage: stage, PendingNotification: kind}
+	if kind == "recovery" {
+		state = IncidentState{SchemaVersion: SchemaVersion, Revision: revision, Fingerprint: HealthyFingerprint, FirstObserved: time.Date(2026, 8, 31, 0, 0, 0, 0, time.UTC), LastObserved: time.Date(2026, 8, 31, 0, 0, 0, 0, time.UTC), Severity: SeverityOK, PendingNotification: "recovery", RecoveryPending: true, RecoveryOf: strings.Repeat("b", 64), Healthy: true}
+	}
+	event, err := WebhookDeliveryEventFromIncident(state)
+	if err != nil {
+		panic(err)
+	}
+	return &event
 }
 
 func taskWebhookProbe(t *testing.T, source WebhookHealthSource, now time.Time) HostProbe {
