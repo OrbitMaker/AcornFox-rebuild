@@ -143,7 +143,7 @@ type platformBackupLocalReader struct {
 }
 
 func (r *platformBackupLocalReader) Read(value []byte) (int, error) {
-	if r == nil || r.file == nil {
+	if r == nil || r.store == nil || r.store.transaction == nil || r.file == nil || r.store.transaction.VerifyLiveRoot() != nil {
 		return 0, ErrPlatformBackupLocal
 	}
 	n, err := r.file.Read(value)
@@ -153,7 +153,7 @@ func (r *platformBackupLocalReader) Read(value []byte) (int, error) {
 	return n, err
 }
 func (r *platformBackupLocalReader) Seek(offset int64, whence int) (int64, error) {
-	if r == nil || r.file == nil {
+	if r == nil || r.store == nil || r.store.transaction == nil || r.file == nil || r.store.transaction.VerifyLiveRoot() != nil {
 		return 0, ErrPlatformBackupLocal
 	}
 	position, err := r.file.Seek(offset, whence)
@@ -163,12 +163,18 @@ func (r *platformBackupLocalReader) Seek(offset int64, whence int) (int64, error
 	return position, nil
 }
 func (r *platformBackupLocalReader) Close() error {
-	if r == nil || r.store == nil || r.file == nil {
+	if r == nil || r.file == nil {
 		return ErrPlatformBackupLocal
 	}
 	file := r.file
 	r.file = nil
-	if r.store.transaction.ops.CloseFile(file) != nil {
+	if r.store == nil || r.store.transaction == nil {
+		_ = file.Close()
+		return ErrPlatformBackupLocal
+	}
+	live := r.store.transaction.VerifyLiveRoot() == nil
+	closeErr := r.store.transaction.ops.CloseFile(file)
+	if !live || closeErr != nil {
 		return ErrPlatformBackupLocal
 	}
 	return nil

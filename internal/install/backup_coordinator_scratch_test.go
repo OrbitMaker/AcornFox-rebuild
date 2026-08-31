@@ -543,6 +543,118 @@ func TestPlatformBackupLocalReadbackClosePreservesStaleRootEvidence(t *testing.T
 	}
 }
 
+type scratchReaderCloseCountOps struct {
+	durableOps
+	closeCalls int
+}
+
+func (o *scratchReaderCloseCountOps) CloseFile(file *os.File) error {
+	o.closeCalls++
+	return o.durableOps.CloseFile(file)
+}
+
+func staleAcceptedReader(t *testing.T) (*platformBackupLocalReader, *scratchReaderCloseCountOps, string) {
+	t.Helper()
+	root := t.TempDir()
+	if err := os.Chmod(root, durableDirMode); err != nil {
+		t.Fatal(err)
+	}
+	seed, err := TaskDurableWriter(root, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := []byte("reader")
+	if err := seed.WriteMetadata("package.tar", body); err != nil {
+		t.Fatal(err)
+	}
+	if err := seed.Close(); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := os.OpenRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := realDurableOps{durableRoot: osDurableRoot{root: opened}}
+	ops := &scratchReaderCloseCountOps{durableOps: base}
+	writer, err := newDurableWriter(root, os.Getuid(), os.Getgid(), ops)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = writer.Close() })
+	store, err := newPlatformBackupLocalStore(writer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := store.openAccepted(platformBackupLocalPackage, int64(len(body)), scratchDigest(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	localReader, ok := reader.(*platformBackupLocalReader)
+	if !ok {
+		t.Fatal("accepted reader type changed")
+	}
+	moved := root + "-moved"
+	if err := os.Rename(root, moved); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(root, durableDirMode); err != nil {
+		t.Fatal(err)
+	}
+	return localReader, ops, root
+}
+
+func TestPlatformBackupLocalAcceptedReaderRejectsStaleRootAndCloses(t *testing.T) {
+	for name, exercise := range map[string]func(*platformBackupLocalReader) error{
+		"read":  func(reader *platformBackupLocalReader) error { _, err := reader.Read(make([]byte, 1)); return err },
+		"seek":  func(reader *platformBackupLocalReader) error { _, err := reader.Seek(0, io.SeekStart); return err },
+		"close": func(reader *platformBackupLocalReader) error { return reader.Close() },
+	} {
+		t.Run(name, func(t *testing.T) {
+			reader, ops, _ := staleAcceptedReader(t)
+			if err := exercise(reader); !errors.Is(err, ErrPlatformBackupLocal) {
+				t.Fatalf("stale %s=%v", name, err)
+			}
+			if name != "close" {
+				if err := reader.Close(); !errors.Is(err, ErrPlatformBackupLocal) {
+					t.Fatalf("stale cleanup close=%v", err)
+				}
+			}
+			// One constructor close plus the reader close proves the stale reader
+			// descriptor was released exactly once.
+			if ops.closeCalls != 2 {
+				t.Fatalf("close calls=%d", ops.closeCalls)
+			}
+			if err := reader.Close(); !errors.Is(err, ErrPlatformBackupLocal) {
+				t.Fatalf("second close=%v", err)
+			}
+			if ops.closeCalls != 2 {
+				t.Fatalf("second close changed count=%d", ops.closeCalls)
+			}
+		})
+	}
+}
+
+func TestPlatformBackupLocalAcceptedReaderNormalUse(t *testing.T) {
+	store, writer, _ := scratchTaskStore(t)
+	body := []byte("normal reader")
+	if err := writer.WriteMetadata("package.tar", body); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := store.openAccepted(platformBackupLocalPackage, int64(len(body)), scratchDigest(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := io.ReadAll(reader); err != nil || !bytes.Equal(got, body) {
+		t.Fatalf("read=%q err=%v", got, err)
+	}
+	if _, err := reader.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestPlatformBackupLocalLargeStreaming(t *testing.T) {
 	store, _, _ := scratchTaskStore(t)
 	body := bytes.Repeat([]byte("chunk"), backupEncryptionChunkSize/5+3)
