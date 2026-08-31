@@ -896,23 +896,23 @@ def validate_release(
         or manifest.get("source_commit") != source_commit
     ):
         raise ProductionBuildError("release manifest does not match the candidate contract")
-    if version in {RC1_SPEC.version, RC2_SPEC.version}:
-        lineage = require_frozen_rc0_lineage(arch) if version == RC1_SPEC.version else {
-            "source_commit": "0d5c96bf7b7bd1c641b108cbbd54511d814f2aa0",
-            "release_manifest_sha256": {"amd64": "1cf02e4a111e38a4061c692de418b67755a2e55f97a04cbc92cee8cb9f82a7be", "arm64": "6bf1e590c3054d373d9319f03581d7a623ee3093b53ddba7b343cf8af7f85fed"}[arch],
-            "archive_sha256": {"amd64": "9056cb46537537f6cab21482d900160486098d857955d23b0ca8f131a9cc4233", "arm64": "56a697aed3a8f77261cfeb3074a7d7ab0cfb6389ab5d75225ad9931b665bfa86"}[arch],
-            "bundle_manifest_sha256": {"amd64": "d0e8c111dcaa334c89bb815fc2ddc9b122887cddbbf7c59b6eb51436b931706f", "arm64": "5fda1e9d0f80deadf6b87cb281d80793c9d1e910386624bc5975cdd0464a2650"}[arch],
-        }
+    if version in {RC1_SPEC.version, RC2_SPEC.version, RC3_SPEC.version}:
+        predecessor = (
+            RC0_SPEC if version == RC1_SPEC.version
+            else RC1_SPEC if version == RC2_SPEC.version
+            else RC2_SPEC
+        )
+        lineage = frozen_predecessor_lineage(version, arch)
         expected_lineage = {
-            "version": RC0_SPEC.version if version == RC1_SPEC.version else RC1_SPEC.version,
-            "migration_version": RC0_SPEC.migration if version == RC1_SPEC.version else RC1_SPEC.migration,
+            "version": predecessor.version,
+            "migration_version": predecessor.migration,
             "source_commit": lineage["source_commit"],
             "release_manifest_sha256": lineage["release_manifest_sha256"],
             "archive_sha256": lineage["archive_sha256"],
             "bundle_manifest_sha256": lineage["bundle_manifest_sha256"],
         }
         if manifest.get("n_minus_one") != expected_lineage:
-            raise ProductionBuildError("RC1 release manifest has invalid frozen N-1 lineage")
+            raise ProductionBuildError("release manifest has invalid frozen N-1 lineage")
     elif "n_minus_one" in manifest:
         raise ProductionBuildError("RC0 release manifest must not carry N-1 lineage")
     files = manifest.get("files")

@@ -699,6 +699,42 @@ class ProductionBuildTests(unittest.TestCase):
                 digest(release / "manifest.json"),
             )
 
+    def test_release_validation_accepts_only_the_rc3_frozen_rc2_lineage(self) -> None:
+        tool = load_tool()
+        with tempfile.TemporaryDirectory() as raw:
+            release = Path(raw) / "release"
+            payload = release / "bin/open-card-healthcheck"
+            payload.parent.mkdir(parents=True)
+            payload.write_bytes(b"healthcheck")
+            payload.chmod(0o755)
+            source_commit = "a" * 40
+            manifest = {
+                "version": tool.RC3_SPEC.version,
+                "migration_version": tool.RC3_SPEC.migration,
+                "architecture": "amd64",
+                "source_commit": source_commit,
+                "n_minus_one": {
+                    "version": tool.RC2_SPEC.version,
+                    "migration_version": tool.RC2_SPEC.migration,
+                    **tool.frozen_predecessor_lineage(tool.RC3_SPEC.version, "amd64"),
+                },
+                "files": [{"path": "bin/open-card-healthcheck", "sha256": digest(payload), "mode": 0o755}],
+            }
+            manifest_path = release / "manifest.json"
+            manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+            self.assertEqual(
+                tool.validate_release(release, version=tool.RC3_SPEC.version, migration_version=tool.RC3_SPEC.migration, arch="amd64", source_commit=source_commit),
+                digest(manifest_path),
+            )
+            manifest["n_minus_one"] = {
+                "version": tool.RC1_SPEC.version,
+                "migration_version": tool.RC1_SPEC.migration,
+                **tool.frozen_predecessor_lineage(tool.RC2_SPEC.version, "amd64"),
+            }
+            manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+            with self.assertRaisesRegex(tool.ProductionBuildError, "frozen N-1 lineage"):
+                tool.validate_release(release, version=tool.RC3_SPEC.version, migration_version=tool.RC3_SPEC.migration, arch="amd64", source_commit=source_commit)
+
     def test_post_publish_verification_rejects_a_replaced_archive(self) -> None:
         tool = load_tool()
         with tempfile.TemporaryDirectory() as raw:
