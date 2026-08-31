@@ -21,6 +21,7 @@ type fakeAPI struct {
 	putErr      error
 	putCalls    int
 	putBody     []byte
+	putReadSize int
 	head        map[string]ObjectVersion
 	headErr     error
 	headCalls   int
@@ -44,7 +45,13 @@ func (f *fakeAPI) VersioningStatus(context.Context) (VersioningStatus, error) {
 }
 func (f *fakeAPI) Put(_ context.Context, _ string, body io.Reader, _ int64, _ string) (ObjectVersion, error) {
 	f.putCalls++
-	f.putBody, _ = io.ReadAll(body)
+	if f.putReadSize > 0 {
+		buffer := make([]byte, f.putReadSize)
+		n, _ := body.Read(buffer)
+		f.putBody = append([]byte(nil), buffer[:n]...)
+	} else {
+		f.putBody, _ = io.ReadAll(body)
+	}
 	return f.put, f.putErr
 }
 func (f *fakeAPI) Head(_ context.Context, key, versionID string) (ObjectVersion, error) {
@@ -279,4 +286,169 @@ func errString(err error) string {
 		return ""
 	}
 	return err.Error()
+}
+
+func testPlatformStore(t *testing.T, api *fakeAPI) (*PlatformAdapter, install.BackupConfigV1, string) {
+	t.Helper()
+	_, config, installation := testStore(t, api)
+	store, err := NewTaskPlatformBackupVersionedStore(context.Background(), config, installation, api)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return store, config, installation
+}
+
+func platformExpected(t *testing.T, config install.BackupConfigV1, id string, receipt bool) install.PlatformBackupExpectedObject {
+	t.Helper()
+	key, err := config.ObjectKey(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if receipt {
+		key = strings.TrimSuffix(key, ".ocbkp") + ".receipt.json"
+	}
+	return install.PlatformBackupExpectedObject{ObjectKey: key, SHA256: digest("payload"), Size: int64(len("payload"))}
+}
+func platformVersion(expected install.PlatformBackupExpectedObject, id string) ObjectVersion {
+	return ObjectVersion{Key: expected.ObjectKey, VersionID: id, SHA256: expected.SHA256, Size: expected.Size}
+}
+
+func TestPlatformAdapterAcceptsDataAndReceiptOnlyAndReconcilesExactVersion(t *testing.T) {
+	api := &fakeAPI{status: VersioningEnabled, head: map[string]ObjectVersion{}}
+	store, config, _ := testPlatformStore(t, api)
+	for _, receipt := range []bool{false, true} {
+		want := platformExpected(t, config, "backup-platform-adapter", receipt)
+		stored := platformVersion(want, map[bool]string{false: "data-v1", true: "receipt-v1"}[receipt])
+		api.put, api.putErr, api.head = stored, nil, map[string]ObjectVersion{want.ObjectKey + "\x00" + stored.VersionID: stored}
+		api.listCalls, api.putCalls = 0, 0
+		api.list = []VersionPage{{}, {Versions: []ObjectVersion{stored}}}
+		got, err := store.PutReconciled(context.Background(), want, strings.NewReader("payload"))
+		if err != nil || got.ObjectKey != want.ObjectKey || got.VersionID != stored.VersionID || api.putCalls != 1 {
+			t.Fatalf("receipt=%v got=%+v err=%v puts=%d", receipt, got, err, api.putCalls)
+		}
+	}
+	bad := platformExpected(t, config, "backup-platform-bad", false)
+	bad.ObjectKey = strings.TrimSuffix(bad.ObjectKey, ".ocbkp") + ".other"
+	if _, err := store.PutReconciled(context.Background(), bad, strings.NewReader("payload")); !errors.Is(err, ErrContract) {
+		t.Fatalf("unmanaged key err=%v", err)
+	}
+}
+
+func TestPlatformAdapterRejectsSuccessfulPutUnlessCOSConsumedExactDeclaredBytes(t *testing.T) {
+	for name, test := range map[string]struct {
+		source  string
+		mutate  func(*install.PlatformBackupExpectedObject)
+		partial int
+	}{
+		"mismatched": {source: "payload", mutate: func(value *install.PlatformBackupExpectedObject) { value.SHA256 = digest("different") }},
+		"short":      {source: "short"},
+		"partial":    {source: "payload", partial: 3},
+	} {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeAPI{status: VersioningEnabled, head: map[string]ObjectVersion{}, putReadSize: test.partial}
+			store, config, _ := testPlatformStore(t, api)
+			want := platformExpected(t, config, "backup-platform-evidence", false)
+			if test.mutate != nil {
+				test.mutate(&want)
+			}
+			api.put = platformVersion(want, "data-v1")
+			api.list = []VersionPage{{}}
+			if _, err := store.PutReconciled(context.Background(), want, strings.NewReader(test.source)); !errors.Is(err, ErrTransport) {
+				t.Fatalf("err=%v", err)
+			}
+		})
+	}
+}
+
+func TestPlatformAdapterAmbiguousPutHeadAndExactGetAreFailClosed(t *testing.T) {
+	api := &fakeAPI{status: VersioningEnabled, putErr: errors.New("https://bucket/credential=secret"), head: map[string]ObjectVersion{}}
+	store, config, _ := testPlatformStore(t, api)
+	want := platformExpected(t, config, "backup-platform-ambiguous", false)
+	stored := platformVersion(want, "data-v1")
+	api.list = []VersionPage{{}, {Versions: []ObjectVersion{stored, platformVersion(want, "data-v2")}}}
+	if _, err := store.PutReconciled(context.Background(), want, strings.NewReader("payload")); !errors.Is(err, ErrTransport) {
+		t.Fatalf("ambiguous put err=%v", err)
+	}
+	api.head[want.ObjectKey+"\x00"] = ObjectVersion{Key: want.ObjectKey, VersionID: "data-v1", IsDeleteMarker: true}
+	if _, err := store.HeadCurrentVersion(context.Background(), want.ObjectKey); !errors.Is(err, ErrTransport) {
+		t.Fatalf("delete current err=%v", err)
+	}
+	badStream := &closingReader{Reader: bytes.NewReader(nil)}
+	api.get, api.getStream = ObjectVersion{Key: want.ObjectKey, VersionID: "other", SHA256: want.SHA256, Size: want.Size}, badStream
+	if _, _, err := store.Get(context.Background(), want.ObjectKey, "data-v1"); !errors.Is(err, ErrTransport) || !badStream.closed {
+		t.Fatalf("exact get err=%v closed=%v", err, badStream.closed)
+	}
+}
+
+func TestPlatformAdapterListsExactInstallationNamespaceAndPagination(t *testing.T) {
+	api := &fakeAPI{status: VersioningEnabled}
+	store, config, installation := testPlatformStore(t, api)
+	data := platformExpected(t, config, "backup-platform-list-data", false)
+	receipt := platformExpected(t, config, "backup-platform-list-receipt", true)
+	v1, v2 := platformVersion(data, "data-v1"), platformVersion(receipt, "receipt-v1")
+	api.list = []VersionPage{{Versions: []ObjectVersion{v1}, IsTruncated: true, NextKeyMarker: data.ObjectKey, NextVersionIDMarker: ""}, {Versions: []ObjectVersion{v2}}}
+	prefix := config.Prefix + "/" + installation
+	objects, err := store.ListVersions(context.Background(), prefix)
+	if err != nil || len(objects) != 2 || len(api.markers) != 2 || api.markers[1] != [2]string{data.ObjectKey, ""} {
+		t.Fatalf("objects=%+v err=%v markers=%+v", objects, err, api.markers)
+	}
+	api.listCalls, api.markers = 0, nil
+	foreign := v1
+	foreign.Key = config.Prefix + "/" + digest("other-installation") + "/backup-platform-list-data.ocbkp"
+	api.list = []VersionPage{{Versions: []ObjectVersion{foreign}}}
+	if _, err := store.ListVersions(context.Background(), prefix); !errors.Is(err, ErrTransport) {
+		t.Fatalf("cross namespace err=%v", err)
+	}
+}
+
+func TestPlatformAdapterDeleteRequiresExactAbsenceAndSanitizesBackendError(t *testing.T) {
+	api := &fakeAPI{status: VersioningEnabled, head: map[string]ObjectVersion{}}
+	store, config, _ := testPlatformStore(t, api)
+	want := platformExpected(t, config, "backup-platform-delete", true)
+	if err := store.DeleteVersion(context.Background(), want.ObjectKey, "receipt-v1"); err != nil || api.deleteKey != want.ObjectKey || api.deleteVer != "receipt-v1" {
+		t.Fatalf("delete err=%v key=%q version=%q", err, api.deleteKey, api.deleteVer)
+	}
+	api.deleteErr = ErrNotFound
+	if err := store.DeleteVersion(context.Background(), want.ObjectKey, "receipt-v1"); err != nil {
+		t.Fatalf("not-found delete replay err=%v", err)
+	}
+	api.deleteErr = errors.New("https://bucket/credential=secret")
+	if err := store.DeleteVersion(context.Background(), want.ObjectKey, "receipt-v1"); !errors.Is(err, ErrTransport) || strings.Contains(errString(err), "secret") {
+		t.Fatalf("redaction err=%v", err)
+	}
+}
+
+func TestPlatformAdapterP2ContextVersioningCurrentAndStreamBoundaries(t *testing.T) {
+	api := &fakeAPI{status: VersioningEnabled, head: map[string]ObjectVersion{}}
+	store, config, _ := testPlatformStore(t, api)
+	want := platformExpected(t, config, "backup-platform-boundaries", false)
+	if _, err := store.HeadCurrentVersion(nil, want.ObjectKey); !errors.Is(err, ErrTransport) || api.statusCalls != 0 {
+		t.Fatalf("nil context err=%v status=%d", err, api.statusCalls)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := store.HeadCurrentVersion(ctx, want.ObjectKey); !errors.Is(err, ErrTransport) || api.statusCalls != 0 {
+		t.Fatalf("cancelled context err=%v status=%d", err, api.statusCalls)
+	}
+	api.status = "Suspended"
+	if _, err := store.HeadCurrentVersion(context.Background(), want.ObjectKey); !errors.Is(err, ErrTransport) {
+		t.Fatalf("disabled versioning err=%v", err)
+	}
+	api.status = VersioningEnabled
+	stored := platformVersion(want, "data-v1")
+	api.head[want.ObjectKey+"\x00"] = stored
+	got, err := store.HeadCurrentVersion(context.Background(), want.ObjectKey)
+	if err != nil || got.VersionID != stored.VersionID {
+		t.Fatalf("current=%+v err=%v", got, err)
+	}
+	api.listCalls = 0
+	api.list = []VersionPage{{Versions: []ObjectVersion{{Key: want.ObjectKey, VersionID: "delete-v1", IsDeleteMarker: true}}}}
+	if _, err := store.PutReconciled(context.Background(), want, strings.NewReader("payload")); !errors.Is(err, ErrTransport) {
+		t.Fatalf("delete marker list err=%v", err)
+	}
+	badStream := &closingReader{Reader: bytes.NewReader(nil)}
+	api.getStream, api.getErr = badStream, errors.New("backend credential must not escape")
+	if _, _, err := store.Get(context.Background(), want.ObjectKey, "data-v1"); !errors.Is(err, ErrTransport) || !badStream.closed || strings.Contains(errString(err), "credential") {
+		t.Fatalf("get error err=%v closed=%v", err, badStream.closed)
+	}
 }

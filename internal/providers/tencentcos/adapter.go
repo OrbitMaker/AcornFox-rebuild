@@ -5,7 +5,10 @@ package tencentcos
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"hash"
 	"io"
 	"regexp"
 	"sort"
@@ -118,6 +121,13 @@ type Adapter struct {
 
 var _ install.BackupObjectStore = (*Adapter)(nil)
 
+// PlatformAdapter is the V3 companion-receipt adapter. It intentionally has a
+// different Get signature from Adapter, so V1 wire compatibility remains
+// compile-time separated.
+type PlatformAdapter struct{ base *Adapter }
+
+var _ install.PlatformBackupVersionedStore = (*PlatformAdapter)(nil)
+
 // NewTaskBackupObjectStore creates the test/task-only adapter. There is
 // intentionally no production constructor until a reviewed official SDK port
 // and credential acquisition path are approved.
@@ -126,6 +136,17 @@ func NewTaskBackupObjectStore(_ context.Context, config install.BackupConfigV1, 
 		return nil, ErrContract
 	}
 	return &Adapter{config: config, api: api, namespacePrefix: config.Prefix + "/" + config.InstallationIDSHA256 + "/"}, nil
+}
+
+// NewTaskPlatformBackupVersionedStore creates the task/test-only V3 adapter.
+// It does not acquire credentials, sign requests, or create production SDK
+// clients; COSAPI remains the sole injected boundary.
+func NewTaskPlatformBackupVersionedStore(ctx context.Context, config install.BackupConfigV1, expectedInstallationSHA256 string, api COSAPI) (*PlatformAdapter, error) {
+	base, err := NewTaskBackupObjectStore(ctx, config, expectedInstallationSHA256, api)
+	if err != nil {
+		return nil, ErrContract
+	}
+	return &PlatformAdapter{base: base}, nil
 }
 
 func (a *Adapter) PutIfAbsent(ctx context.Context, expected install.RemoteBackupExpectedObject, body io.Reader) (install.RemoteBackupObject, error) {
@@ -384,4 +405,250 @@ func validVersionID(versionID string) bool {
 
 func validMarker(marker string) bool {
 	return len(marker) > 0 && len(marker) <= maxObjectKeyLength && !strings.ContainsAny(marker, "\\\x00\r\n")
+}
+
+func (a *PlatformAdapter) PutReconciled(ctx context.Context, expected install.PlatformBackupExpectedObject, body io.Reader) (install.PlatformBackupStoreObject, error) {
+	if a == nil || a.base == nil || body == nil || !a.validExpected(expected) {
+		return install.PlatformBackupStoreObject{}, ErrContract
+	}
+	if err := a.base.versioningEnabled(ctx); err != nil {
+		return install.PlatformBackupStoreObject{}, err
+	}
+	versions, err := a.listExact(ctx, expected.ObjectKey)
+	if err != nil {
+		return install.PlatformBackupStoreObject{}, err
+	}
+	if len(versions) == 1 {
+		if !platformMatchesExpected(versions[0], expected) {
+			return install.PlatformBackupStoreObject{}, ErrTransport
+		}
+		return a.headAndListExpected(ctx, expected, versions[0].VersionID)
+	}
+	if len(versions) != 0 {
+		return install.PlatformBackupStoreObject{}, ErrTransport
+	}
+	evidence := &platformPutEvidenceReader{source: body, hash: sha256.New()}
+	put, putErr := a.base.api.Put(ctx, expected.ObjectKey, evidence, expected.Size, expected.SHA256)
+	if putErr != nil {
+		versions, err = a.listExact(ctx, expected.ObjectKey)
+		if err != nil || len(versions) != 1 || !platformMatchesExpected(versions[0], expected) {
+			return install.PlatformBackupStoreObject{}, ErrTransport
+		}
+		return a.headAndListExpected(ctx, expected, versions[0].VersionID)
+	}
+	if !evidence.matches(expected) {
+		return install.PlatformBackupStoreObject{}, ErrTransport
+	}
+	if !platformMatchesExpected(put, expected) {
+		return install.PlatformBackupStoreObject{}, ErrTransport
+	}
+	return a.headAndListExpected(ctx, expected, put.VersionID)
+}
+
+func (a *PlatformAdapter) HeadCurrentVersion(ctx context.Context, key string) (install.PlatformBackupStoreObject, error) {
+	if a == nil || a.base == nil || !a.validManagedKey(key) {
+		return install.PlatformBackupStoreObject{}, ErrContract
+	}
+	if err := a.base.versioningEnabled(ctx); err != nil {
+		return install.PlatformBackupStoreObject{}, err
+	}
+	version, err := a.base.api.Head(ctx, key, "")
+	if err != nil {
+		return install.PlatformBackupStoreObject{}, mapAPIError(err)
+	}
+	if version.Validate() != nil || version.IsDeleteMarker || version.Key != key {
+		return install.PlatformBackupStoreObject{}, ErrTransport
+	}
+	return platformObject(version)
+}
+
+func (a *PlatformAdapter) Get(ctx context.Context, key, versionID string) (io.ReadCloser, install.PlatformBackupStoreObject, error) {
+	if a == nil || a.base == nil || !a.validManagedKey(key) || !validVersionID(versionID) {
+		return nil, install.PlatformBackupStoreObject{}, ErrContract
+	}
+	if err := a.base.versioningEnabled(ctx); err != nil {
+		return nil, install.PlatformBackupStoreObject{}, err
+	}
+	stream, version, err := a.base.api.Get(ctx, key, versionID)
+	if err != nil {
+		closeQuietly(stream)
+		return nil, install.PlatformBackupStoreObject{}, mapAPIError(err)
+	}
+	if stream == nil || version.Validate() != nil || version.IsDeleteMarker || version.Key != key || version.VersionID != versionID {
+		closeQuietly(stream)
+		return nil, install.PlatformBackupStoreObject{}, ErrTransport
+	}
+	object, err := platformObject(version)
+	if err != nil {
+		closeQuietly(stream)
+		return nil, install.PlatformBackupStoreObject{}, ErrTransport
+	}
+	return stream, object, nil
+}
+
+func (a *PlatformAdapter) ListVersions(ctx context.Context, prefix string) ([]install.PlatformBackupStoreObject, error) {
+	if a == nil || a.base == nil || prefix != strings.TrimSuffix(a.base.namespacePrefix, "/") {
+		return nil, ErrContract
+	}
+	if err := a.base.versioningEnabled(ctx); err != nil {
+		return nil, err
+	}
+	versions, err := a.listVersions(ctx, a.base.namespacePrefix, false)
+	if err != nil {
+		return nil, err
+	}
+	objects := make([]install.PlatformBackupStoreObject, 0, len(versions))
+	for _, version := range versions {
+		object, err := platformObject(version)
+		if err != nil {
+			return nil, ErrTransport
+		}
+		objects = append(objects, object)
+	}
+	sort.Slice(objects, func(i, j int) bool {
+		if objects[i].ObjectKey == objects[j].ObjectKey {
+			return objects[i].VersionID < objects[j].VersionID
+		}
+		return objects[i].ObjectKey < objects[j].ObjectKey
+	})
+	return objects, nil
+}
+
+func (a *PlatformAdapter) DeleteVersion(ctx context.Context, key, versionID string) error {
+	if a == nil || a.base == nil || !a.validManagedKey(key) || !validVersionID(versionID) {
+		return ErrContract
+	}
+	if err := a.base.versioningEnabled(ctx); err != nil {
+		return err
+	}
+	if err := a.base.api.DeleteVersion(ctx, key, versionID); err != nil && !errors.Is(err, ErrNotFound) {
+		return mapAPIError(err)
+	}
+	_, err := a.base.api.Head(ctx, key, versionID)
+	if errors.Is(err, ErrNotFound) {
+		return nil
+	}
+	return ErrTransport
+}
+
+func (a *PlatformAdapter) headAndListExpected(ctx context.Context, expected install.PlatformBackupExpectedObject, versionID string) (install.PlatformBackupStoreObject, error) {
+	version, err := a.base.api.Head(ctx, expected.ObjectKey, versionID)
+	if err != nil || !platformMatchesExpected(version, expected) || version.VersionID != versionID {
+		return install.PlatformBackupStoreObject{}, mapPlatformHeadError(err)
+	}
+	object, err := platformObject(version)
+	if err != nil {
+		return install.PlatformBackupStoreObject{}, ErrTransport
+	}
+	versions, err := a.listExact(ctx, expected.ObjectKey)
+	if err != nil || len(versions) != 1 || versions[0] != version || !platformMatchesExpected(versions[0], expected) {
+		return install.PlatformBackupStoreObject{}, ErrTransport
+	}
+	return object, nil
+}
+
+func (a *PlatformAdapter) listExact(ctx context.Context, key string) ([]ObjectVersion, error) {
+	return a.listVersions(ctx, key, true)
+}
+
+func (a *PlatformAdapter) listVersions(ctx context.Context, prefix string, exact bool) ([]ObjectVersion, error) {
+	var versions []ObjectVersion
+	seenVersions, seenMarkers := map[string]struct{}{}, map[string]struct{}{}
+	keyMarker, versionMarker := "", ""
+	for {
+		if ctx == nil || ctx.Err() != nil {
+			return nil, ErrTransport
+		}
+		page, err := a.base.api.ListVersions(ctx, prefix, keyMarker, versionMarker, maxListPageSize)
+		if err != nil || page.Validate() != nil {
+			return nil, ErrTransport
+		}
+		for _, version := range page.Versions {
+			if version.IsDeleteMarker || !a.validManagedKey(version.Key) || (exact && version.Key != prefix) || (!exact && !strings.HasPrefix(version.Key, prefix)) {
+				return nil, ErrTransport
+			}
+			identity := version.Key + "\x00" + version.VersionID
+			if _, exists := seenVersions[identity]; exists {
+				return nil, ErrTransport
+			}
+			seenVersions[identity] = struct{}{}
+			versions = append(versions, version)
+		}
+		if !page.IsTruncated {
+			return versions, nil
+		}
+		next, current := page.NextKeyMarker+"\x00"+page.NextVersionIDMarker, keyMarker+"\x00"+versionMarker
+		if next == current {
+			return nil, ErrTransport
+		}
+		if _, exists := seenMarkers[next]; exists {
+			return nil, ErrTransport
+		}
+		seenMarkers[next] = struct{}{}
+		keyMarker, versionMarker = page.NextKeyMarker, page.NextVersionIDMarker
+	}
+}
+
+func (a *PlatformAdapter) validExpected(expected install.PlatformBackupExpectedObject) bool {
+	return a.validManagedKey(expected.ObjectKey) && sha256Text.MatchString(expected.SHA256) && expected.Size > 0 && expected.Size <= maxObjectSize
+}
+func (a *PlatformAdapter) validManagedKey(key string) bool {
+	if a == nil || a.base == nil || !strings.HasPrefix(key, a.base.namespacePrefix) {
+		return false
+	}
+	relative := strings.TrimPrefix(key, a.base.namespacePrefix)
+	var backupID string
+	switch {
+	case strings.HasSuffix(relative, ".ocbkp"):
+		backupID = strings.TrimSuffix(relative, ".ocbkp")
+		canonical, err := a.base.config.ObjectKey(backupID)
+		return err == nil && key == canonical
+	case strings.HasSuffix(relative, ".receipt.json"):
+		backupID = strings.TrimSuffix(relative, ".receipt.json")
+		dataKey, err := a.base.config.ObjectKey(backupID)
+		return err == nil && key == strings.TrimSuffix(dataKey, ".ocbkp")+".receipt.json"
+	default:
+		return false
+	}
+}
+func platformMatchesExpected(version ObjectVersion, expected install.PlatformBackupExpectedObject) bool {
+	return version.Validate() == nil && !version.IsDeleteMarker && version.Key == expected.ObjectKey && version.SHA256 == expected.SHA256 && version.Size == expected.Size
+}
+func platformObject(version ObjectVersion) (install.PlatformBackupStoreObject, error) {
+	if version.Validate() != nil || version.IsDeleteMarker {
+		return install.PlatformBackupStoreObject{}, ErrTransport
+	}
+	return install.PlatformBackupStoreObject{ObjectKey: version.Key, VersionID: version.VersionID, SHA256: version.SHA256, Size: version.Size}, nil
+}
+func mapPlatformHeadError(err error) error {
+	if err != nil {
+		return mapAPIError(err)
+	}
+	return ErrTransport
+}
+
+// platformPutEvidenceReader records only bytes read by COSAPI.Put. A provider
+// claiming success after a short or partially consumed stream is rejected
+// before its metadata can make that content visible.
+type platformPutEvidenceReader struct {
+	source  io.Reader
+	hash    hash.Hash
+	size    int64
+	readErr error
+}
+
+func (r *platformPutEvidenceReader) Read(value []byte) (int, error) {
+	n, err := r.source.Read(value)
+	if n > 0 {
+		_, _ = r.hash.Write(value[:n])
+		r.size += int64(n)
+	}
+	if err != nil && err != io.EOF {
+		r.readErr = err
+	}
+	return n, err
+}
+
+func (r *platformPutEvidenceReader) matches(expected install.PlatformBackupExpectedObject) bool {
+	return r.readErr == nil && r.size == expected.Size && hex.EncodeToString(r.hash.Sum(nil)) == expected.SHA256
 }
