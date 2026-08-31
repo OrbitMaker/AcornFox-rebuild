@@ -55,7 +55,7 @@ func TestApplicationPublishSuccessUsesDerivedSafeRequest(t *testing.T) {
 	if recorder.Code != http.StatusAccepted || strings.Contains(body, "workspace") || strings.Contains(body, "locator") || !strings.Contains(body, "op_publish") {
 		t.Fatalf("status=%d body=%s", recorder.Code, body)
 	}
-	if publisher.request.Actor != "admin_1" || publisher.request.IdempotencyKey != "publish-key" || publisher.request.BuildNetwork.Mode != "none" || publisher.request.ContextPath != "." || publisher.request.BuildResources.CPUMillis != 500 || publisher.request.BuildResources.PIDs != 0 || publisher.request.RuntimeResources.PIDs != 64 {
+	if publisher.request.Actor != "admin_1" || publisher.request.IdempotencyKey != "publish-key" || publisher.request.ServiceGroupID != "legacy" || publisher.request.BuildNetwork.Mode != "none" || publisher.request.ContextPath != "." || publisher.request.BuildResources.CPUMillis != 500 || publisher.request.BuildResources.PIDs != 0 || publisher.request.RuntimeResources.PIDs != 64 {
 		t.Fatalf("request=%+v", publisher.request)
 	}
 }
