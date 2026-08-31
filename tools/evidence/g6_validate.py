@@ -16,7 +16,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 SCHEMA = "open-card-g6-receipt.v1"
+SCHEMA_V2 = "open-card-g6-receipt.v2"
 FINAL_SCHEMA = "open-card-g6-final-manifest.v1"
+FINAL_SCHEMA_V2 = "open-card-g6-final-manifest.v2"
 PHASES = ("SNAPSHOT_PREINSTALL", "INSTALL_VERIFY", "RESTART_DRILL", "REBOOT_HANDOFF", "REBOOT_VERIFY", "EXTERNAL_IMPORT")
 EXTERNAL = {"curl_resolve": 6, "external_tcp": 7, "browser": 8}
 UNITS = ("open-card-server.service", "open-card-agent.service", "open-card-buildkit.service", "open-card-caddy.service", "open-card-edge.service")
@@ -25,6 +27,9 @@ SIGN_NAMESPACE = "open-card-g6"
 SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 HEX40 = re.compile(r"^[a-f0-9]{40}$")
 HEX64 = re.compile(r"^[a-f0-9]{64}$")
+ACCOUNT_ID = re.compile(r"^[0-9]{6,20}$")
+REGION = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+ALIYUN_INSTANCE = re.compile(r"^i-[a-z0-9]{8,63}$")
 SENSITIVE = re.compile(r"(?:api[_-]?key|authorization|password|dsn|cookie|token|private.?key|key.?material|credential|secret|confirmation|(?:^|[_-])installation_id(?:$|[_-])(?!sha256))", re.I)
 FORBIDDEN_VALUE = re.compile(r"(?:https?://|postgres(?:ql)?://|[A-Za-z]:[\\/]|/(?:Users|home|var|etc|opt|tmp)/)", re.I)
 ALLOWED_MODES = {0o600, 0o640, 0o644}
@@ -158,21 +163,76 @@ def source(value: Any) -> dict[str, str]:
     return {"tag": value["tag"], "commit": value["commit"], "bundle_manifest_sha256": safe_sha(value["bundle_manifest_sha256"])}
 
 
-def target(value: Any) -> dict[str, str]:
-    value = exact(value, {"provider", "product", "instance_id", "public_ipv4"})
-    product, instance = value["product"], value["instance_id"]
-    if value["provider"] != "tencent" or product not in {"cvm", "lighthouse"} or not isinstance(instance, str):
-        fail()
-    prefix = "ins-" if product == "cvm" else "lhins-"
-    if not instance.startswith(prefix) or not SAFE_ID.fullmatch(instance):
-        fail()
+def public_ipv4(value: Any) -> str:
     try:
-        address = ipaddress.IPv4Address(value["public_ipv4"])
+        address = ipaddress.IPv4Address(value)
     except (ipaddress.AddressValueError, TypeError):
         fail()
     if not address.is_global or address.is_loopback:
         fail()
-    return {"provider": "tencent", "product": product, "instance_id": instance, "public_ipv4": str(address)}
+    return str(address)
+
+
+def private_ipv4(value: Any) -> str:
+    try:
+        address = ipaddress.IPv4Address(value)
+    except (ipaddress.AddressValueError, TypeError):
+        fail()
+    private_ranges = (
+        ipaddress.IPv4Network("10.0.0.0/8"),
+        ipaddress.IPv4Network("172.16.0.0/12"),
+        ipaddress.IPv4Network("192.168.0.0/16"),
+    )
+    if not any(address in network for network in private_ranges):
+        fail()
+    return str(address)
+
+
+def target(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        fail()
+    v1_fields = {"provider", "product", "instance_id", "public_ipv4"}
+    v2_fields = {"provider", "product", "account_id", "region", "instance_id", "public_ipv4", "private_ipv4"}
+    fields = set(value)
+    if fields == v1_fields:
+        provider, product, instance = value["provider"], value["product"], value["instance_id"]
+        if provider != "tencent" or product not in {"cvm", "lighthouse"} or not isinstance(instance, str):
+            fail()
+        prefix = "ins-" if product == "cvm" else "lhins-"
+        if not instance.startswith(prefix) or not SAFE_ID.fullmatch(instance):
+            fail()
+        return {"provider": "tencent", "product": product, "instance_id": instance, "public_ipv4": public_ipv4(value["public_ipv4"])}
+    if fields != v2_fields or any(value[name] is None for name in v2_fields):
+        fail()
+    provider, product, instance = value["provider"], value["product"], value["instance_id"]
+    if not isinstance(provider, str) or not isinstance(product, str) or not isinstance(instance, str):
+        fail()
+    provider, product = provider.lower(), product.lower()
+    if provider == "tencent" and product in {"cvm", "lighthouse"}:
+        prefix = "ins-" if product == "cvm" else "lhins-"
+        if not instance.startswith(prefix) or not SAFE_ID.fullmatch(instance):
+            fail()
+    elif provider == "aliyun" and product == "ecs":
+        if not ALIYUN_INSTANCE.fullmatch(instance):
+            fail()
+    else:
+        fail()
+    account_id, region = value["account_id"], value["region"]
+    if not isinstance(account_id, str) or not ACCOUNT_ID.fullmatch(account_id) or not isinstance(region, str) or not REGION.fullmatch(region):
+        fail()
+    return {"provider": provider, "product": product, "account_id": account_id, "region": region, "instance_id": instance, "public_ipv4": public_ipv4(value["public_ipv4"]), "private_ipv4": private_ipv4(value["private_ipv4"])}
+
+
+def receipt_schema_for_target(value: dict[str, str]) -> str:
+    return SCHEMA_V2 if "account_id" in value else SCHEMA
+
+
+def final_schema_for_receipt(schema: str) -> str:
+    if schema == SCHEMA:
+        return FINAL_SCHEMA
+    if schema == SCHEMA_V2:
+        return FINAL_SCHEMA_V2
+    fail()
 
 
 def artifact_list(value: Any, root: Path | None = None, *, owner: int | None = None) -> list[dict[str, Any]]:
@@ -291,9 +351,12 @@ def external_artifacts(method: str, artifacts: list[dict[str, Any]]) -> list[dic
 
 def validate_receipt(value: Any, artifact_root: Path | None = None, *, owner: int | None = None) -> dict[str, Any]:
     receipt = exact(value, {"schema", "run_id", "phase", "source", "target", "facts", "artifacts", "result"}, {"installation_id_sha256"})
-    if receipt["schema"] != SCHEMA or receipt["phase"] not in PHASES or receipt["result"] not in {"pass", "fail"}:
+    if receipt["schema"] not in {SCHEMA, SCHEMA_V2} or receipt["phase"] not in PHASES or receipt["result"] not in {"pass", "fail"}:
         fail()
     s = source(receipt["source"]); phase = receipt["phase"]
+    normalized_target = target(receipt["target"])
+    if receipt["schema"] != receipt_schema_for_target(normalized_target):
+        fail()
     if not isinstance(receipt["facts"], dict): fail()
     facts = phase_facts(phase, receipt["facts"], s)
     if phase == "SNAPSHOT_PREINSTALL":
@@ -303,7 +366,7 @@ def validate_receipt(value: Any, artifact_root: Path | None = None, *, owner: in
     installation = safe_sha(receipt["installation_id_sha256"]) if "installation_id_sha256" in receipt else None
     artifacts = artifact_list(receipt["artifacts"], artifact_root, owner=owner)
     if phase == "EXTERNAL_IMPORT": external_artifacts(facts["method"], artifacts)
-    return {"schema": SCHEMA, "run_id": safe_id(receipt["run_id"]), "phase": phase, "source": s, "target": target(receipt["target"]), **({"installation_id_sha256": installation} if installation else {}), "facts": facts, "artifacts": artifacts, "result": receipt["result"]}
+    return {"schema": receipt["schema"], "run_id": safe_id(receipt["run_id"]), "phase": phase, "source": s, "target": normalized_target, **({"installation_id_sha256": installation} if installation else {}), "facts": facts, "artifacts": artifacts, "result": receipt["result"]}
 
 
 def receipt_from_path(path: Path, *, owner: int | None = None) -> dict[str, Any]:
@@ -367,10 +430,10 @@ def finalize(receipts: list[tuple[dict[str, Any], Path]], output: Path, allowed_
     phases = [value["phase"] for value in values]
     if phases[:5] != ["SNAPSHOT_PREINSTALL", "INSTALL_VERIFY", "RESTART_DRILL", "REBOOT_HANDOFF", "REBOOT_VERIFY"] or [value["facts"]["method"] for value in values[5:]] != ["curl_resolve", "external_tcp", "browser"]:
         fail()
-    first = values[0]; identity = (first["run_id"], first["source"], first["target"])
+    first = values[0]; identity = (first["run_id"], first["source"], first["target"], first["schema"])
     installation: str | None = None
     for index, value in enumerate(values):
-        if value["result"] != "pass" or (value["run_id"], value["source"], value["target"]) != identity:
+        if value["result"] != "pass" or (value["run_id"], value["source"], value["target"], value["schema"]) != identity:
             fail()
         if index == 0:
             if "installation_id_sha256" in value: fail()
@@ -383,7 +446,7 @@ def finalize(receipts: list[tuple[dict[str, Any], Path]], output: Path, allowed_
     trust_owner = owner if owner is not None else os.getuid()
     allowed_raw, _ = secure_file(allowed_signers, owner=trust_owner, modes=ALLOWED_MODES)
     for receipt, (_, root) in zip(values[5:], receipts[5:]): verify_external_receipt(receipt, root, allowed_raw, owner=trust_owner)
-    manifest = {"schema": FINAL_SCHEMA, "run_id": first["run_id"], "source": first["source"], "target": first["target"], "installation_id_sha256": installation, "receipt_sha256": [sha(canonical_bytes(value)) for value in values], "allowed_signers_sha256": sha(allowed_raw), "production_accepted": False, "scope": "staging_pre_dns_only"}
+    manifest = {"schema": final_schema_for_receipt(first["schema"]), "run_id": first["run_id"], "source": first["source"], "target": first["target"], "installation_id_sha256": installation, "receipt_sha256": [sha(canonical_bytes(value)) for value in values], "allowed_signers_sha256": sha(allowed_raw), "production_accepted": False, "scope": "staging_pre_dns_only"}
     atomic_no_replace(output, canonical_bytes(manifest), owner=owner)
     return manifest
 

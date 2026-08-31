@@ -91,7 +91,7 @@ class TargetReceiptTest(unittest.TestCase):
             "output": output,
         }
 
-    def identity(self, fixture: dict[str, object], *, with_installation: bool, name: str = "identity") -> Path:
+    def identity(self, fixture: dict[str, object], *, with_installation: bool, name: str = "identity", target: dict[str, str] | None = None) -> Path:
         manifest_path = fixture["manifest_path"]
         bundle = fixture["bundle"]
         value = {
@@ -101,7 +101,7 @@ class TargetReceiptTest(unittest.TestCase):
                 "commit": fixture["commit"],
                 "bundle_manifest_sha256": digest(bundle.read_bytes()),
             },
-            "target": {
+            "target": target or {
                 "provider": "tencent",
                 "product": "cvm",
                 "instance_id": "ins-g6-target",
@@ -162,16 +162,16 @@ class TargetReceiptTest(unittest.TestCase):
         self.write_json(facts_path, facts)
         return facts_path, declarations
 
-    def publish(self, fixture: dict[str, object], phase: str, previous: Path | None = None):
+    def publish(self, fixture: dict[str, object], phase: str, previous: Path | None = None, *, target: dict[str, str] | None = None):
         facts, declarations = self.phase_inputs(fixture, phase)
-        identity = self.identity(fixture, with_installation=phase != "snapshot-preinstall", name=f"identity-{phase}")
+        identity = self.identity(fixture, with_installation=phase != "snapshot-preinstall", name=f"identity-{phase}", target=target)
         return builder.publish(phase, identity, facts, declarations, fixture["output"], previous, owner=os.getuid())
 
-    def full_sequence(self, fixture: dict[str, object]) -> dict[str, Path]:
+    def full_sequence(self, fixture: dict[str, object], *, target: dict[str, str] | None = None) -> dict[str, Path]:
         receipts: dict[str, Path] = {}
         previous = None
         for phase in ("snapshot-preinstall", "install-verify", "restart-drill", "reboot-handoff", "reboot-verify"):
-            self.assertEqual(self.publish(fixture, phase, previous)["result"], "pass")
+            self.assertEqual(self.publish(fixture, phase, previous, target=target)["result"], "pass")
             previous = fixture["output"] / phase / "receipt.json"
             receipts[phase] = previous
         return receipts
@@ -190,6 +190,18 @@ class TargetReceiptTest(unittest.TestCase):
             self.write_json(receipts["reboot-handoff"], wrong)
             with self.assertRaises(g6.ValidationError):
                 self.publish(fixture, "reboot-verify", receipts["reboot-handoff"])
+
+    def test_v2_alibaba_identity_publishes_and_binds_predecessors(self) -> None:
+        target = {"provider": "aliyun", "product": "ecs", "account_id": "<account-id>", "region": "cn-shanghai", "instance_id": "i-REDACTED", "public_ipv4": "<server-ip>", "private_ipv4": "172.20.81.108"}
+        with self.temporary() as raw:
+            fixture = self.fixture(Path(raw)); receipts = self.full_sequence(fixture, target=target)
+            value = g6.receipt_from_path(receipts["reboot-verify"], owner=os.getuid())
+            self.assertEqual(value["schema"], g6.SCHEMA_V2)
+            self.assertEqual(value["target"], target)
+            wrong = self.identity(fixture, with_installation=True, name="wrong-target", target={**target, "private_ipv4": "172.20.81.109"})
+            facts, declarations = self.phase_inputs(fixture, "reboot-verify")
+            with self.assertRaises(g6.ValidationError):
+                builder.publish("reboot-verify", wrong, facts, declarations, fixture["output"], receipts["reboot-handoff"], owner=os.getuid())
 
     def test_git_and_tag_provenance_fail_closed(self) -> None:
         with self.temporary() as raw:

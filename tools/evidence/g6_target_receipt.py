@@ -123,7 +123,7 @@ def publish(phase_arg: str, identity_path: Path, facts_path: Path, declarations:
         if phase=="SNAPSHOT_PREINSTALL":
             if "installation_id_sha256" in ident: g6.fail()
         elif "installation_id_sha256" not in ident: g6.fail()
-        facts={**facts,"sequence":sequence}; receipt={"schema":g6.SCHEMA,"run_id":ident["run_id"],"phase":phase,"source":ident["source"],"target":ident["target"],"facts":facts,"artifacts":declared,"result":"pass",**({"installation_id_sha256":ident["installation_id_sha256"]} if "installation_id_sha256" in ident else {})}
+        facts={**facts,"sequence":sequence}; receipt={"schema":g6.receipt_schema_for_target(ident["target"]),"run_id":ident["run_id"],"phase":phase,"source":ident["source"],"target":ident["target"],"facts":facts,"artifacts":declared,"result":"pass",**({"installation_id_sha256":ident["installation_id_sha256"]} if "installation_id_sha256" in ident else {})}
         validated=g6.validate_receipt(receipt)
         predecessor(phase,previous_path,validated,owner)
         g6.safe_root(output_dir,owner=owner); final=output_dir/phase_arg

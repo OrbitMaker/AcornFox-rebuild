@@ -99,6 +99,17 @@ class G6CollectorTest(unittest.TestCase):
                 self.assertNotIn("installation-g6", encoded)
                 self.assertNotIn("test-cookie", encoded)
 
+    def test_v2_alibaba_identity_runs_through_local_collector(self) -> None:
+        target = {"provider":"aliyun","product":"ecs","account_id":"<account-id>","region":"cn-shanghai","instance_id":"i-REDACTED","public_ipv4":"<server-ip>","private_ipv4":"172.20.81.108"}
+        with tempfile.TemporaryDirectory(dir=ROOT,prefix=".g6-collector-") as raw:
+            fixture = self.setup_fixture(Path(raw))
+            for identity in (fixture["identity_pre"], fixture["identity_post"]):
+                value = json.loads(Path(identity).read_text(encoding="utf-8")); value["target"] = target; self.write_json(Path(identity), value)
+            self.full_sequence(fixture)
+            receipt = json.loads((fixture["root"] / "var/lib/open-card/evidence/gate6/g6-collector-1/reboot-verify/receipt.json").read_text(encoding="utf-8"))
+            self.assertEqual(receipt["schema"], "open-card-g6-receipt.v2")
+            self.assertEqual(receipt["target"], target)
+
     def test_confirmation_state_cookie_and_order_fail_closed(self) -> None:
         for mutation in ("missing-predecessor","wrong-confirmation","cookie-mode","cookie-symlink","disabled-unit","marker","pointer","post-host-status","post-host-mode","post-host-capacity","sse-no-event","same-boot"):
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory(dir=ROOT,prefix=".g6-collector-") as raw:

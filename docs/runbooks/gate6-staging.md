@@ -1,9 +1,9 @@
-# Gate 6 Tencent staging acceptance
+# Gate 6 staging evidence acceptance
 
 Status: `RUNBOOK_CONTRACT_ONLY` / `NOT_RUN`.
 
 This runbook defines the pre-DNS staging evidence sequence. It has not been
-executed against Tencent Cloud, a staging server, a firewall, public DNS, or a
+executed against any provider, a staging server, a firewall, public DNS, or a
 browser. A command exit or a receipt file by itself is not acceptance; the
 final validator must verify all five target receipts and three signed
 outside-target observations.
@@ -19,12 +19,21 @@ independently certify a future `v0.8.0-rc.N` candidate first, then freeze:
 - bundle-manifest SHA-256;
 - clean source clone used by the target receipt builder.
 
-The identity JSON contains those non-secret facts plus the selected Tencent
-product, instance ID and public IPv4. It contains absolute local paths used by
-the builder, so it remains root-only evidence input and is never copied into a
-receipt.
+The identity JSON contains those non-secret facts plus the selected target. The
+legacy Tencent v1 target contains provider, product, instance ID and public
+IPv4. The v2 target additionally binds `account_id`, `region` and RFC1918
+`private_ipv4`; its normalized provider/product must be lowercase. It contains
+absolute local paths used by the builder, so it remains root-only evidence input
+and is never copied into a receipt.
 
 ## Target and firewall prerequisite
+
+Before any resource query, select the exact provider, account, region, product,
+instance, public IPv4 and (for v2) private IPv4. Keep the sequence
+pre-DNS: the final manifest remains `production_accepted=false`, and this
+runbook authorizes neither DNS nor installation.
+
+### Tencent CVM or Lighthouse branch
 
 Before any resource query, select the exact Tencent profile, account, region,
 product (`cvm` or `lighthouse`) and instance. Read identity and inventory with
@@ -41,6 +50,32 @@ The output must remain `DRAFT_UNEXECUTABLE`. Re-read identity and old rules,
 show the exact additions/removals and rollback snapshot, then obtain separate
 user confirmation before any later provider-specific write. This runbook does
 not authorize that write and never writes DNS.
+
+`g6_firewall_plan.py` remains Tencent-only. Do not use it to model Alibaba
+security-group changes.
+
+### Alibaba ECS branch
+
+Use an external, read-only security-group snapshot and independently preserve
+the selected v2 target. No Alibaba CLI query or cloud write is run by these
+evidence tools. The current positive local fixture is:
+
+```json
+{
+  "provider": "aliyun",
+  "product": "ecs",
+  "account_id": "<account-id>",
+  "region": "cn-shanghai",
+  "instance_id": "i-REDACTED",
+  "public_ipv4": "<server-ip>",
+  "private_ipv4": "172.20.81.108"
+}
+```
+
+Alibaba security-group mutation, DNS, and installation need separate explicit
+authorization. If the target is reachable only inside its VPC, use a separately
+authorized private jump SSH path; do not treat that path as public reachability
+evidence.
 
 ## Target phase sequence
 
