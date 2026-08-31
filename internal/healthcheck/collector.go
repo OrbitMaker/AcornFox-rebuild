@@ -249,7 +249,7 @@ func (c *TaskHostCollector) Acknowledge() (IncidentState, error) {
 	if err != nil || previous == nil {
 		return IncidentState{}, errors.New("health state is unavailable")
 	}
-	next, err := AcknowledgeDelivery(*previous)
+	next, err := acknowledgeIncidentLocked(*previous, nil)
 	if err != nil {
 		return IncidentState{}, err
 	}
@@ -257,4 +257,38 @@ func (c *TaskHostCollector) Acknowledge() (IncidentState, error) {
 		return IncidentState{}, err
 	}
 	return next, nil
+}
+
+// AcknowledgeEvent clears a pending notification only when the caller proves
+// it delivered the exact durable event it was given. A newer incident or a
+// changed pending notification therefore cannot be acknowledged by a stale
+// dispatcher result.
+func (c *TaskHostCollector) AcknowledgeEvent(event WebhookDeliveryEventV1) (IncidentState, error) {
+	if c == nil || c.store == nil || event.Validate() != nil {
+		return IncidentState{}, errors.New("health collector is unavailable")
+	}
+	c.store.mu.Lock()
+	defer c.store.mu.Unlock()
+	previous, err := c.store.loadLocked()
+	if err != nil || previous == nil {
+		return IncidentState{}, errors.New("health state is unavailable")
+	}
+	next, err := acknowledgeIncidentLocked(*previous, &event)
+	if err != nil {
+		return IncidentState{}, err
+	}
+	if err := c.store.saveLocked(next); err != nil {
+		return IncidentState{}, err
+	}
+	return next, nil
+}
+
+func acknowledgeIncidentLocked(previous IncidentState, expected *WebhookDeliveryEventV1) (IncidentState, error) {
+	if expected != nil {
+		actual, err := WebhookDeliveryEventFromIncident(previous)
+		if err != nil || !sameWebhookDeliveryEvent(actual, *expected) {
+			return IncidentState{}, errors.New("health delivery event is stale")
+		}
+	}
+	return AcknowledgeDelivery(previous)
 }
