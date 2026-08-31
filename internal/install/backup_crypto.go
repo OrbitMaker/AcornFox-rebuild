@@ -121,6 +121,8 @@ func backupContextDigest(context BackupEncryptionContext) (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
+type backupPlaintextEvidence func(io.ReadSeeker) (int64, string, uint32, error)
+
 func newGCM(key []byte) (cipher.AEAD, error) {
 	if len(key) != 32 {
 		return nil, ErrBackupEncryption
@@ -172,6 +174,17 @@ func writeAll(writer io.Writer, value []byte) error {
 // EncryptBackup rejects empty plaintext by contract. It performs a complete
 // first pass over source before any ciphertext is emitted.
 func EncryptBackup(destination io.Writer, source io.ReadSeeker, key []byte, context BackupEncryptionContext, random io.Reader) (BackupEncryptionReceipt, error) {
+	contextDigest, err := backupContextDigest(context)
+	if err != nil {
+		return BackupEncryptionReceipt{}, err
+	}
+	return encryptBackup(destination, source, key, contextDigest, random, plaintextEvidence)
+}
+
+// encryptBackup is the sole AES-256-GCM-CHUNKED framing implementation. The
+// caller supplies only the authenticated context digest and evidence pass, so
+// context schema evolution cannot accidentally fork the ciphertext wire.
+func encryptBackup(destination io.Writer, source io.ReadSeeker, key []byte, contextDigest string, random io.Reader, evidence backupPlaintextEvidence) (BackupEncryptionReceipt, error) {
 	if destination == nil || source == nil || random == nil {
 		return BackupEncryptionReceipt{}, ErrBackupEncryption
 	}
@@ -179,11 +192,7 @@ func EncryptBackup(destination io.Writer, source io.ReadSeeker, key []byte, cont
 	if err != nil {
 		return BackupEncryptionReceipt{}, err
 	}
-	size, plainDigest, chunks, err := plaintextEvidence(source)
-	if err != nil {
-		return BackupEncryptionReceipt{}, err
-	}
-	contextDigest, err := backupContextDigest(context)
+	size, plainDigest, chunks, err := evidence(source)
 	if err != nil {
 		return BackupEncryptionReceipt{}, err
 	}
@@ -208,6 +217,7 @@ func EncryptBackup(destination io.Writer, source io.ReadSeeker, key []byte, cont
 		return BackupEncryptionReceipt{}, ErrBackupEncryption
 	}
 	buffer := make([]byte, backupEncryptionChunkSize)
+	plainHash := sha256.New()
 	for index := uint32(0); index < chunks; index++ {
 		remaining := size - int64(index)*backupEncryptionChunkSize
 		want := backupEncryptionChunkSize
@@ -215,6 +225,9 @@ func EncryptBackup(destination io.Writer, source io.ReadSeeker, key []byte, cont
 			want = int(remaining)
 		}
 		if _, err := io.ReadFull(source, buffer[:want]); err != nil {
+			return BackupEncryptionReceipt{}, ErrBackupEncryption
+		}
+		if _, err := plainHash.Write(buffer[:want]); err != nil {
 			return BackupEncryptionReceipt{}, ErrBackupEncryption
 		}
 		nonce := make([]byte, gcm.NonceSize())
@@ -227,6 +240,9 @@ func EncryptBackup(destination io.Writer, source io.ReadSeeker, key []byte, cont
 		}
 	}
 	if extra := make([]byte, 1); func() bool { n, e := source.Read(extra); return n != 0 || (e != nil && e != io.EOF) }() {
+		return BackupEncryptionReceipt{}, ErrBackupEncryption
+	}
+	if hex.EncodeToString(plainHash.Sum(nil)) != plainDigest {
 		return BackupEncryptionReceipt{}, ErrBackupEncryption
 	}
 	objectSum := objectHash.Sum(nil)
@@ -269,16 +285,87 @@ func decodeHeader(raw []byte) (backupEncryptionHeader, error) {
 	return header, nil
 }
 
+type backupScratchTruncater interface {
+	Truncate(int64) error
+}
+
+// resetBackupScratch establishes an empty, caller-owned quarantine. A
+// truncatable scratch file is required: merely seeking would leave old bytes
+// reachable after a short or failed decrypt.
+func resetBackupScratch(scratch io.ReadWriteSeeker) (backupScratchTruncater, error) {
+	truncater, ok := scratch.(backupScratchTruncater)
+	if !ok {
+		return nil, ErrBackupEncryption
+	}
+	if _, err := scratch.Seek(0, io.SeekStart); err != nil {
+		return nil, ErrBackupEncryption
+	}
+	if err := truncater.Truncate(0); err != nil {
+		return nil, ErrBackupEncryption
+	}
+	if _, err := scratch.Seek(0, io.SeekStart); err != nil {
+		return nil, ErrBackupEncryption
+	}
+	return truncater, nil
+}
+
+// clearBackupScratch deliberately follows the same seek/truncate/seek order
+// on every rejection so stale or partially authenticated plaintext cannot be
+// read through a reused scratch handle.
+func clearBackupScratch(scratch io.ReadWriteSeeker, truncater backupScratchTruncater) error {
+	if _, err := scratch.Seek(0, io.SeekStart); err != nil {
+		return ErrBackupEncryption
+	}
+	if err := truncater.Truncate(0); err != nil {
+		return ErrBackupEncryption
+	}
+	if _, err := scratch.Seek(0, io.SeekStart); err != nil {
+		return ErrBackupEncryption
+	}
+	return nil
+}
+
+func rejectBackupDecryption(scratch io.ReadWriteSeeker) {
+	if scratch == nil {
+		return
+	}
+	truncater, err := resetBackupScratch(scratch)
+	if err == nil {
+		_ = clearBackupScratch(scratch, truncater)
+	}
+}
+
 // DecryptBackup verifies context, receipt, every frame, and the absence of
 // trailing bytes before accepting plaintext.
 func DecryptBackup(destination io.Writer, scratch io.ReadWriteSeeker, source io.Reader, key []byte, context BackupEncryptionContext, receipt BackupEncryptionReceipt) error {
-	if destination == nil || scratch == nil || source == nil || receipt.Validate() != nil {
+	contextDigest, err := backupContextDigest(context)
+	if err != nil {
+		rejectBackupDecryption(scratch)
+		return ErrBackupEncryption
+	}
+	return decryptBackup(destination, scratch, source, key, contextDigest, receipt, nil)
+}
+
+// decryptBackup quarantines plaintext in scratch until every ciphertext and
+// receipt check, plus an optional typed plaintext verifier, has succeeded.
+func decryptBackup(destination io.Writer, scratch io.ReadWriteSeeker, source io.Reader, key []byte, contextDigest string, receipt BackupEncryptionReceipt, verifyPlaintext func(io.ReadSeeker) error) error {
+	if scratch == nil {
 		return ErrBackupEncryption
 	}
 	// Scratch is the private, caller-owned quarantine for unverified plaintext.
 	// Always overwrite it from the beginning so a reused file or an arbitrary
 	// caller offset cannot affect the plaintext accepted after verification.
-	if _, err := scratch.Seek(0, io.SeekStart); err != nil {
+	truncater, err := resetBackupScratch(scratch)
+	if err != nil {
+		return err
+	}
+	accepted := false
+	defer func() {
+		if !accepted {
+			_ = clearBackupScratch(scratch, truncater)
+		}
+	}()
+	if destination == nil || source == nil || receipt.Validate() != nil {
 		return ErrBackupEncryption
 	}
 	gcm, err := newGCM(key)
@@ -309,8 +396,7 @@ func DecryptBackup(destination io.Writer, scratch io.ReadWriteSeeker, source io.
 		return err
 	}
 	headerSum := sha256.Sum256(headerRaw)
-	contextDigest, err := backupContextDigest(context)
-	if err != nil || header.ContextSHA256 != contextDigest || hex.EncodeToString(headerSum[:]) != receipt.HeaderSHA256 || header.PlaintextSize != receipt.PlaintextSize || header.PlaintextSHA256 != receipt.PlaintextSHA256 || header.ChunkCount != receipt.ChunkCount {
+	if header.ContextSHA256 != contextDigest || hex.EncodeToString(headerSum[:]) != receipt.HeaderSHA256 || header.PlaintextSize != receipt.PlaintextSize || header.PlaintextSHA256 != receipt.PlaintextSHA256 || header.ChunkCount != receipt.ChunkCount {
 		return ErrBackupEncryption
 	}
 	prefix, _ := hex.DecodeString(header.NoncePrefix)
@@ -357,9 +443,21 @@ func DecryptBackup(destination io.Writer, scratch io.ReadWriteSeeker, source io.
 	if _, err := scratch.Seek(0, io.SeekStart); err != nil {
 		return ErrBackupEncryption
 	}
+	if verifyPlaintext != nil {
+		if err := verifyPlaintext(scratch); err != nil {
+			return ErrBackupEncryption
+		}
+		if _, err := scratch.Seek(0, io.SeekStart); err != nil {
+			return ErrBackupEncryption
+		}
+	}
 	written, err := io.CopyN(destination, scratch, plainSize)
 	if err != nil || written != plainSize {
 		return ErrBackupEncryption
 	}
+	accepted = true
+	// Destination has been accepted. Cleanup remains best effort so a cleanup
+	// I/O error cannot turn a completed destination into an ambiguous failure.
+	_ = clearBackupScratch(scratch, truncater)
 	return nil
 }

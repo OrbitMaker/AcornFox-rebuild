@@ -3,7 +3,9 @@ package install
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"strings"
@@ -58,6 +60,9 @@ func TestChunkedBackupAEADRandomPrefixAndInjectedDeterminism(t *testing.T) {
 	}
 	if !bytes.Equal(first.Bytes(), second.Bytes()) {
 		t.Fatal("injected randomness was not deterministic")
+	}
+	if got := sha256.Sum256(first.Bytes()); hex.EncodeToString(got[:]) != "df5842f5a9d6965aa099d4306ae420f3dc5d496957c5c8ef83061d6c7d800d05" {
+		t.Fatalf("V1 ciphertext golden changed: %x", got)
 	}
 	if _, err := EncryptBackup(&randomA, bytes.NewReader(plain), key, cryptoContext(), rand.Reader); err != nil {
 		t.Fatal(err)
