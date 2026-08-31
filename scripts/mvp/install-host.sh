@@ -434,6 +434,12 @@ if (( ! resume_public )); then
     die "fresh native bootstrap refuses global OPEN_CARD_DATABASE_URL in server.env"
   fi
   unset OPEN_CARD_DATABASE_URL DATABASE_URL
+  # Start the recovery barrier before the bootstrap marker and global lock
+  # exist. Starting an internal unit later must reuse this active barrier;
+  # otherwise systemd starts recover-prepare inside the bootstrap lock and
+  # turns a fresh install into RECOVERY_REQUIRED.
+  /usr/bin/systemctl start open-card-upgrade-safe.target
+  /usr/bin/systemctl is-active --quiet open-card-upgrade-safe.target || die "upgrade-safe target did not become active before bootstrap"
   /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C LC_ALL=C /opt/open-card/upgrade-tools/open-card-upgrade prepare-bootstrap --expected-manifest-sha256 "$expected"
   /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C LC_ALL=C /opt/open-card/upgrade-tools/open-card-upgrade prepare-control
   /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C LC_ALL=C /opt/open-card/upgrade-tools/open-card-upgrade bootstrap-native --expected-manifest-sha256 "$expected" --confirm-installation-id "BOOTSTRAP:$installation_value"

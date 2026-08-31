@@ -42,6 +42,14 @@ class InstallerSecurityContractTests(unittest.TestCase):
         self.assertNotIn("(?:", validation)
         self.assertIn(r"^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+", validation)
 
+    def test_recovery_barrier_is_active_before_bootstrap_holds_the_lock(self) -> None:
+        text = (SCRIPTS / "install-host.sh").read_text(encoding="utf-8")
+        barrier = text.index("systemctl start open-card-upgrade-safe.target")
+        bootstrap = text.index("prepare-bootstrap --expected-manifest-sha256")
+        self.assertLess(text.index('"${installer[@]}"'), barrier)
+        self.assertLess(barrier, bootstrap)
+        self.assertIn("is-active --quiet open-card-upgrade-safe.target", text[barrier:bootstrap])
+
     def test_root_backup_restore_and_purge_use_installation_id_not_clean_worker_marker(self) -> None:
         backup = (SCRIPTS / "backup-control-plane.sh").read_text(encoding="utf-8")
         restore = (SCRIPTS / "restore-control-plane.sh").read_text(encoding="utf-8")
