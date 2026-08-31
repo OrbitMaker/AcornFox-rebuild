@@ -13,6 +13,7 @@ class InstallerSecurityContractTests(unittest.TestCase):
         text = (SCRIPTS / "install-host.sh").read_text(encoding="utf-8")
         for value in ("--admin-password-file", "--auth-origin", "--edge-domain", "0:600", "OPEN_CARD_AUTH_ORIGIN", "open-card-admin bootstrap", "open-card-edge.service", "open-card-edge.Caddyfile"):
             self.assertIn(value, text)
+        self.assertIn("OPEN_CARD_BUILDKIT_COMMAND=/opt/open-card/current/bin/buildctl", text)
         self.assertIn("loopback-safe Edge remains active and public routes stay absent", text)
         self.assertIn("existing production installation requires upgrade.sh", text)
         self.assertIn("--require-version 0.8.0-rc.3", text)

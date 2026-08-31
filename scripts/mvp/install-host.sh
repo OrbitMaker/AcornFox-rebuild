@@ -322,6 +322,7 @@ OPEN_CARD_M5_ENABLED=true
 OPEN_CARD_AGENT_TLS_CA=/etc/open-card/agent-ca.crt
 OPEN_CARD_AGENT_TLS_CERT=/etc/open-card/server.crt
 OPEN_CARD_AGENT_TLS_KEY=/etc/open-card/server.key
+OPEN_CARD_BUILDKIT_COMMAND=/opt/open-card/current/bin/buildctl
 OPEN_CARD_BUILDKIT_WORKER=host-rootless
 OPEN_CARD_BUILDKIT_ADDRESS=unix:///run/open-card-buildkit/buildkitd.sock
 OPEN_CARD_M6_ENABLED=false
@@ -354,6 +355,7 @@ EOF
   # populating a newly-created file above.
   set_env_line /etc/open-card/server.env OPEN_CARD_CADDY_ADMIN_URL http://127.0.0.1:2019
   set_env_line /etc/open-card/server.env OPEN_CARD_CADDY_LISTEN 127.0.0.1:18481
+  set_env_line /etc/open-card/server.env OPEN_CARD_BUILDKIT_COMMAND /opt/open-card/current/bin/buildctl
   set_env_line /etc/open-card/server.env OPEN_CARD_M4_ROLLOUT_ENABLED true
   set_env_line /etc/open-card/server.env OPEN_CARD_M4_ROLLOUT_INTERVAL 3s
 
