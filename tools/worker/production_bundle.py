@@ -9,6 +9,7 @@ artifact or asserts a verified public-domain deployment.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import errno
 import gzip
 import hashlib
@@ -19,6 +20,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tarfile
 import tempfile
 import time
@@ -36,6 +38,13 @@ RC1_LINEAGES = {
     "amd64": {"version": "0.8.0-rc.1", "migration_version": "0024", "source_commit": RC1_SOURCE_COMMIT, "release_manifest_sha256": "1cf02e4a111e38a4061c692de418b67755a2e55f97a04cbc92cee8cb9f82a7be", "archive_sha256": "9056cb46537537f6cab21482d900160486098d857955d23b0ca8f131a9cc4233", "bundle_manifest_sha256": "d0e8c111dcaa334c89bb815fc2ddc9b122887cddbbf7c59b6eb51436b931706f"},
     "arm64": {"version": "0.8.0-rc.1", "migration_version": "0024", "source_commit": RC1_SOURCE_COMMIT, "release_manifest_sha256": "6bf1e590c3054d373d9319f03581d7a623ee3093b53ddba7b343cf8af7f85fed", "archive_sha256": "56a697aed3a8f77261cfeb3074a7d7ab0cfb6389ab5d75225ad9931b665bfa86", "bundle_manifest_sha256": "5fda1e9d0f80deadf6b87cb281d80793c9d1e910386624bc5975cdd0464a2650"},
 }
+RC2_SOURCE_COMMIT = "250a14601890a63aa329651b205312c04d870a98"
+RC2_CERTIFICATION_SHA256 = "ea7cbf1e8244aaedc77df4bd01acfb58aeda24b465100dd75ec1ad60fefd7822"
+RC2_RELEASE_INDEX_SHA256 = "6714c7a447bb3c04060265646795e39fb0ab90552ea17cd38668177a513d0e11"
+RC2_LINEAGES = {
+    "amd64": {"version": "0.8.0-rc.2", "migration_version": "0024", "source_commit": RC2_SOURCE_COMMIT, "release_manifest_sha256": "b494b4ed085adc0f769f2cca17ff5295e271f0588309747f61e01bb9527573e5", "archive_sha256": "4a12f07e68af068d28f7335176de4abf13f1fea9d72269131eb0f1f6fdbc53c9", "bundle_manifest_sha256": "8fd533147df1b73b730eb93e62bc7acded2bb0116410fc2eaced5bfb605a6ca3"},
+    "arm64": {"version": "0.8.0-rc.2", "migration_version": "0024", "source_commit": RC2_SOURCE_COMMIT, "release_manifest_sha256": "3a63c553bfcff0936bc3a365218e7293de531f000fc361c7977c16ea2b40a0a7", "archive_sha256": "99e1a57a7a7570cc73cfc0c8483fbbfcb18b1ee8c788742c51807bb958670d6c", "bundle_manifest_sha256": "b515c41fdd1fc6744c1af929752bb3eb6619a33d838144f71bafff964349bb7d"},
+}
 ARM64_N_MINUS_ONE_RELEASE_MANIFEST_SHA256 = "e4f56105b3d184313d51365c7fff40b9f68111815def83c5e5985bc182177a57"
 ARM64_N_MINUS_ONE_ARCHIVE_SHA256 = "9560df1d4a739c729d857cd93b989b99976da0e86983ffa026d13202339d57b9"
 ARM64_N_MINUS_ONE_BUNDLE_MANIFEST_SHA256 = "fdfd6b6108870118714b70c9007937585fc0429d14fa9d64010a80016edc2a15"
@@ -52,6 +61,7 @@ BINARIES = (
     "open-card-upgrade",
 )
 RC0_BINARIES = tuple(binary for binary in BINARIES if binary != "open-card-upgrade")
+RC3_BINARIES = (*BINARIES, "open-card-healthcheck")
 
 
 def release_binaries(version: str) -> tuple[str, ...]:
@@ -60,6 +70,8 @@ def release_binaries(version: str) -> tuple[str, ...]:
         return RC0_BINARIES
     if version in {"0.8.0-rc.1", "0.8.0-rc.2"}:
         return BINARIES
+    if version == "0.8.0-rc.3":
+        return RC3_BINARIES
     raise ProductionBundleError("unsupported release version")
 
 
@@ -85,6 +97,7 @@ RC1_UNITS = (
     "open-card-upgrade-finalize.service",
 )
 UNITS = RC1_UNITS
+RC3_UNITS = (*RC1_UNITS, "open-card-healthcheck.service", "open-card-healthcheck.timer")
 UNIT_DROP_INS = (
     "open-card-edge.service.d/10-upgrade-marker.conf",
 )
@@ -101,6 +114,8 @@ def systemd_files(version: str) -> tuple[str, ...]:
         return RC0_UNITS
     if version in {"0.8.0-rc.1", "0.8.0-rc.2"}:
         return (*UNITS, *UNIT_DROP_INS)
+    if version == "0.8.0-rc.3":
+        return (*RC3_UNITS, *UNIT_DROP_INS)
     raise ProductionBundleError("unsupported release version")
 RC0_INSTALLER_SCRIPTS = (
     "install.sh",
@@ -123,6 +138,7 @@ RC1_INSTALLER_SCRIPTS = (
     "control-plane-migrate.sh",
 )
 RC2_INSTALLER_SCRIPTS = (*RC1_INSTALLER_SCRIPTS, "g6-staging-evidence.sh")
+RC3_INSTALLER_SCRIPTS = RC2_INSTALLER_SCRIPTS
 INSTALLER_SCRIPTS = RC1_INSTALLER_SCRIPTS
 
 
@@ -134,6 +150,8 @@ def installer_scripts(version: str) -> tuple[str, ...]:
         return RC1_INSTALLER_SCRIPTS
     if version == "0.8.0-rc.2":
         return RC2_INSTALLER_SCRIPTS
+    if version == "0.8.0-rc.3":
+        return RC3_INSTALLER_SCRIPTS
     raise ProductionBundleError("unsupported release version")
 
 
@@ -464,6 +482,7 @@ def make_source_manifest(
             }
             or path in installers
             or (version == "0.8.0-rc.2" and path in {"tools/evidence/g6_validate.py", "tools/evidence/g6_target_receipt.py"})
+            or (version == "0.8.0-rc.3" and path in {"tools/evidence/g6_validate.py", "tools/evidence/g6_target_receipt.py"})
             or (path.startswith("web/tsconfig") and path.endswith(".json"))
         ):
             return True
@@ -532,6 +551,34 @@ def write_tar(root: Path, release: Path, version: str) -> Path:
     return archive
 
 
+def publish_no_replace(candidate: Path, output: Path) -> None:
+    """Atomically publish a complete candidate without replacing a raced output."""
+    if candidate.parent.resolve() != output.parent.resolve():
+        raise ProductionBundleError("bundle candidate and output must share one parent")
+    libc = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == "darwin":
+        rename = getattr(libc, "renamex_np", None)
+        if rename is None:
+            raise ProductionBundleError("atomic no-replace bundle publication is unavailable")
+        rename.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint)
+        rename.restype = ctypes.c_int
+        result = rename(os.fsencode(candidate), os.fsencode(output), 0x00000004)
+    elif sys.platform.startswith("linux"):
+        rename = getattr(libc, "renameat2", None)
+        if rename is None:
+            raise ProductionBundleError("atomic no-replace bundle publication is unavailable")
+        rename.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+        rename.restype = ctypes.c_int
+        result = rename(-100, os.fsencode(candidate), -100, os.fsencode(output), 0x00000001)
+    else:
+        raise ProductionBundleError("atomic no-replace bundle publication is unavailable")
+    if result == 0:
+        return
+    if ctypes.get_errno() == errno.EEXIST:
+        raise ProductionBundleError("refusing to overwrite production bundle output")
+    raise ProductionBundleError("atomic no-replace production bundle publication failed")
+
+
 def release_spec(version: str, migration_version: str) -> dict[str, str | None]:
     if (version, migration_version) == ("0.8.0-rc.0", "0023"):
         return {"expected_n_minus_one_version": None, "expected_n_minus_one_migration": None}
@@ -539,6 +586,8 @@ def release_spec(version: str, migration_version: str) -> dict[str, str | None]:
         return {"expected_n_minus_one_version": "0.8.0-rc.0", "expected_n_minus_one_migration": "0023"}
     if (version, migration_version) == ("0.8.0-rc.2", "0024"):
         return {"expected_n_minus_one_version": "0.8.0-rc.1", "expected_n_minus_one_migration": "0024"}
+    if (version, migration_version) == ("0.8.0-rc.3", "0024"):
+        return {"expected_n_minus_one_version": "0.8.0-rc.2", "expected_n_minus_one_migration": "0024"}
     raise ProductionBundleError("unsupported release specification")
 
 
@@ -702,6 +751,8 @@ def assemble(
         require_frozen_rc0_lineage(arch)
         if spec["expected_n_minus_one_version"] == "0.8.0-rc.0"
         else RC1_LINEAGES[arch]
+        if spec["expected_n_minus_one_version"] == "0.8.0-rc.1"
+        else RC2_LINEAGES[arch]
         if needs_n_minus_one
         else None
     )
@@ -729,16 +780,23 @@ def assemble(
             or n_minus_one_bundle_manifest_sha256 != lineage["bundle_manifest_sha256"]
         ):
             raise ProductionBundleError("N-1 lineage digests must match the frozen local candidate")
-    if version == "0.8.0-rc.2" and not structure_only:
+    predecessor_certification_contract = (
+        (RC1_CERTIFICATION_SHA256, RC1_RELEASE_INDEX_SHA256)
+        if version == "0.8.0-rc.2"
+        else (RC2_CERTIFICATION_SHA256, RC2_RELEASE_INDEX_SHA256)
+        if version == "0.8.0-rc.3"
+        else None
+    )
+    if predecessor_certification_contract is not None and not structure_only:
         if (
             predecessor_certification is None
             or predecessor_release_index is None
-            or predecessor_certification_sha256 != RC1_CERTIFICATION_SHA256
-            or predecessor_release_index_sha256 != RC1_RELEASE_INDEX_SHA256
+            or predecessor_certification_sha256 != predecessor_certification_contract[0]
+            or predecessor_release_index_sha256 != predecessor_certification_contract[1]
             or sha256(predecessor_certification) != predecessor_certification_sha256
             or sha256(predecessor_release_index) != predecessor_release_index_sha256
         ):
-            raise ProductionBundleError("RC2 requires exact RC1 certification and release-index evidence")
+            raise ProductionBundleError("upgrade candidate requires exact predecessor certification and release-index evidence")
     if not structure_only and (
         live_attestation is None
         or not lowercase_hex(live_attestation_sha256, 64)
@@ -813,7 +871,7 @@ def assemble(
             )
 
         with private_temporary_directory(
-            prefix=f".{output.name}.build-", directory=inputs
+            prefix=f".{output.name}.build-", directory=output.parent
         ) as build_root:
             release = build_root / "release"
             release.mkdir(mode=0o755)
@@ -869,7 +927,7 @@ def assemble(
                     0o640,
                 )
                 live_attestation_digest = sha256(release / "attestations/live-web.json")
-            if version == "0.8.0-rc.2":
+            if version in {"0.8.0-rc.2", "0.8.0-rc.3"}:
                 for evidence_tool in ("g6_validate.py", "g6_target_receipt.py"):
                     copy_file(repo_snapshot / "tools/evidence" / evidence_tool, release / "tools/evidence" / evidence_tool, 0o755)
             make_source_manifest(repo_snapshot, release, source_commit, tracked, installer_payload, version)
@@ -997,15 +1055,13 @@ def assemble(
                     ],
                     **(
                         {"predecessor_certification": {"certification_sha256": predecessor_certification_sha256, "release_index_sha256": predecessor_release_index_sha256}}
-                        if version == "0.8.0-rc.2"
+                        if predecessor_certification_contract is not None
                         else {}
                     ),
                 }
                 write_json(build_root / "production-bundle.json", metadata)
 
-            if output.exists():
-                raise ProductionBundleError("refusing to overwrite production bundle output")
-            os.replace(build_root, output)
+            publish_no_replace(build_root, output)
             return metadata
 
 

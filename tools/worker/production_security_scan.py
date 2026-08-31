@@ -20,7 +20,7 @@ from pathlib import Path, PurePosixPath
 
 
 ARCHES = ("amd64", "arm64")
-RELEASE_VERSIONS = {"0.8.0-rc.1", "0.8.0-rc.2"}
+RELEASE_VERSIONS = {"0.8.0-rc.1", "0.8.0-rc.2", "0.8.0-rc.3"}
 GOVULNCHECK_VERSION = "v1.7.0"
 POLICY = {
     "content_patterns": ("pem_private_key", "tencent_akid", "aws_akia", "github_token", "openai_token"),

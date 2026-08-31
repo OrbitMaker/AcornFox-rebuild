@@ -27,9 +27,13 @@ ARCHES = ("amd64", "arm64")
 VERSION = "0.8.0-rc.1"
 MIGRATION = "0024"
 RC2_VERSION = "0.8.0-rc.2"
+RC3_VERSION = "0.8.0-rc.3"
 RC1_SOURCE_COMMIT = "0d5c96bf7b7bd1c641b108cbbd54511d814f2aa0"
 RC1_CERTIFICATION_SHA256 = "22b41c0221f0c159520209dc385557f1918e7205c6b71b2dd1fa9564ac55bc87"
 RC1_RELEASE_INDEX_SHA256 = "784199b3faceb3f757a5b1dbdc1b1ee55a02ab84131a6ea86724a76d965a54a6"
+RC2_SOURCE_COMMIT = "250a14601890a63aa329651b205312c04d870a98"
+RC2_CERTIFICATION_SHA256 = "ea7cbf1e8244aaedc77df4bd01acfb58aeda24b465100dd75ec1ad60fefd7822"
+RC2_RELEASE_INDEX_SHA256 = "6714c7a447bb3c04060265646795e39fb0ab90552ea17cd38668177a513d0e11"
 RC0_SOURCE_COMMIT = "35a2b198ac52949af3477475d89d4813b46a9490"
 RC0_LINEAGES = {
     "amd64": {
@@ -53,6 +57,10 @@ RC1_LINEAGES = {
     "amd64": {"version": VERSION, "migration_version": MIGRATION, "source_commit": RC1_SOURCE_COMMIT, "release_manifest_sha256": "1cf02e4a111e38a4061c692de418b67755a2e55f97a04cbc92cee8cb9f82a7be", "archive_sha256": "9056cb46537537f6cab21482d900160486098d857955d23b0ca8f131a9cc4233", "bundle_manifest_sha256": "d0e8c111dcaa334c89bb815fc2ddc9b122887cddbbf7c59b6eb51436b931706f"},
     "arm64": {"version": VERSION, "migration_version": MIGRATION, "source_commit": RC1_SOURCE_COMMIT, "release_manifest_sha256": "6bf1e590c3054d373d9319f03581d7a623ee3093b53ddba7b343cf8af7f85fed", "archive_sha256": "56a697aed3a8f77261cfeb3074a7d7ab0cfb6389ab5d75225ad9931b665bfa86", "bundle_manifest_sha256": "5fda1e9d0f80deadf6b87cb281d80793c9d1e910386624bc5975cdd0464a2650"},
 }
+RC2_LINEAGES = {
+    "amd64": {"version": RC2_VERSION, "migration_version": MIGRATION, "source_commit": RC2_SOURCE_COMMIT, "release_manifest_sha256": "b494b4ed085adc0f769f2cca17ff5295e271f0588309747f61e01bb9527573e5", "archive_sha256": "4a12f07e68af068d28f7335176de4abf13f1fea9d72269131eb0f1f6fdbc53c9", "bundle_manifest_sha256": "8fd533147df1b73b730eb93e62bc7acded2bb0116410fc2eaced5bfb605a6ca3"},
+    "arm64": {"version": RC2_VERSION, "migration_version": MIGRATION, "source_commit": RC2_SOURCE_COMMIT, "release_manifest_sha256": "3a63c553bfcff0936bc3a365218e7293de531f000fc361c7977c16ea2b40a0a7", "archive_sha256": "99e1a57a7a7570cc73cfc0c8483fbbfcb18b1ee8c788742c51807bb958670d6c", "bundle_manifest_sha256": "b515c41fdd1fc6744c1af929752bb3eb6619a33d838144f71bafff964349bb7d"},
+}
 def artifacts(version: str) -> dict[str, str]:
     return {
     "release_manifest": "release/manifest.json",
@@ -73,12 +81,15 @@ def contract(version: str) -> tuple[dict[str, dict[str, str]], int, dict[str, st
         return RC0_LINEAGES, 68, None
     if version == RC2_VERSION:
         return RC1_LINEAGES, 73, {"certification_sha256": RC1_CERTIFICATION_SHA256, "release_index_sha256": RC1_RELEASE_INDEX_SHA256}
+    if version == RC3_VERSION:
+        return RC2_LINEAGES, 76, {"certification_sha256": RC2_CERTIFICATION_SHA256, "release_index_sha256": RC2_RELEASE_INDEX_SHA256}
     raise CertificationError("unsupported certification release version")
 RC1_BINARIES = [
     "open-card-server", "open-card-agent", "open-card-static-server",
     "open-card-secretctl", "open-card-security-probe", "open-card-imagegc",
     "open-card-admin", "open-card-upgrade",
 ]
+RC3_BINARIES = [*RC1_BINARIES, "open-card-healthcheck"]
 HEX_40 = re.compile(r"^[a-f0-9]{40}$")
 HEX_64 = re.compile(r"^[a-f0-9]{64}$")
 
@@ -365,6 +376,12 @@ def verify_candidate(
             actual.add(item.relative_to(release).as_posix())
     if actual != set(release_entries):
         raise CertificationError("release file set does not match manifest")
+    if version == RC3_VERSION and not {
+        "bin/open-card-healthcheck",
+        "systemd/open-card-healthcheck.service",
+        "systemd/open-card-healthcheck.timer",
+    }.issubset(actual):
+        raise CertificationError(f"{arch} RC3 healthcheck payload is incomplete")
     archive = root / artifact_paths["archive"]
     verify_archive(archive, release_entries, release / "manifest.json")
     bundle_manifest = root / artifact_paths["bundle_manifest"]
@@ -455,7 +472,7 @@ def verify_candidate(
         not isinstance(live_web_metadata, dict)
         or set(live_web_metadata) != {"status", "bundle_structure_verified", "public_domain_verified", "attestation_sha256"}
         or live_web_metadata.get("attestation_sha256") != hashes["live_web_attestation"]
-        or metadata.get("production_binaries") != RC1_BINARIES
+        or metadata.get("production_binaries") != (RC3_BINARIES if version == RC3_VERSION else RC1_BINARIES)
         or metadata.get("excluded") != ["open-card-caddy-fixture", "integration test binaries", "fixture archives"]
     ):
         raise CertificationError(f"{arch} production bundle metadata is not bound to candidate artifacts")
@@ -554,7 +571,7 @@ def main() -> int:
     parser.add_argument("--candidates-b", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--source-commit", required=True)
-    parser.add_argument("--version", default=VERSION, choices=(VERSION, RC2_VERSION))
+    parser.add_argument("--version", default=VERSION, choices=(VERSION, RC2_VERSION, RC3_VERSION))
     args = parser.parse_args()
     try:
         value = certify(args.source_a, args.source_b, args.candidates_a, args.candidates_b, args.output, args.source_commit, args.version)

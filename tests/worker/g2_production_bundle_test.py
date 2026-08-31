@@ -77,6 +77,29 @@ def minimal_repo(
 
 class ProductionBundleTests(unittest.TestCase):
 
+    def test_rc3_selector_adds_only_healthcheck_payload_and_pins_rc2_evidence(self) -> None:
+        tool = load_tool()
+        self.assertEqual(tool.release_spec("0.8.0-rc.3", "0024")["expected_n_minus_one_version"], "0.8.0-rc.2")
+        self.assertEqual(tool.release_binaries("0.8.0-rc.3"), (*tool.BINARIES, "open-card-healthcheck"))
+        self.assertTrue({"open-card-healthcheck.service", "open-card-healthcheck.timer"}.issubset(tool.systemd_files("0.8.0-rc.3")))
+        self.assertEqual(tool.installer_scripts("0.8.0-rc.3"), tool.installer_scripts("0.8.0-rc.2"))
+        self.assertEqual(tool.RC2_LINEAGES["arm64"]["source_commit"], tool.RC2_SOURCE_COMMIT)
+        self.assertEqual(tool.RC2_CERTIFICATION_SHA256, "ea7cbf1e8244aaedc77df4bd01acfb58aeda24b465100dd75ec1ad60fefd7822")
+        self.assertEqual(tool.RC2_RELEASE_INDEX_SHA256, "6714c7a447bb3c04060265646795e39fb0ab90552ea17cd38668177a513d0e11")
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            repo, commit = minimal_repo(root, "0024")
+            dist, attestation = self.live_web(root, tool, commit)
+            output = root / "rc3-output"
+            with self.assertRaisesRegex(tool.ProductionBundleError, "N-1 lineage"):
+                tool.assemble(
+                    self.stage(root, binaries=tool.RC3_BINARIES), repo, output, "amd64",
+                    None, None, dist, version="0.8.0-rc.3", migration_version="0024",
+                    source_commit=commit, live_attestation=attestation,
+                    live_attestation_sha256=self.attestation_digest(attestation),
+                )
+            self.assertFalse(output.exists())
+
     def test_rc2_keeps_the_complete_boot_safe_unit_payload(self) -> None:
         tool = load_tool()
         self.assertEqual(tool.systemd_files("0.8.0-rc.2"), tool.systemd_files("0.8.0-rc.1"))
@@ -127,11 +150,38 @@ class ProductionBundleTests(unittest.TestCase):
                 hashes,
             )
 
-    def test_private_workspaces_stay_below_the_build_stage(self) -> None:
+    def test_input_workspace_stays_below_stage_and_publication_candidate_shares_output_parent(self) -> None:
         source = TOOL.read_text(encoding="utf-8")
-        self.assertNotIn("directory=output.parent", source)
         self.assertIn('prefix=f".{output.name}.inputs-", directory=stage.parent', source)
-        self.assertIn('prefix=f".{output.name}.build-", directory=inputs', source)
+        self.assertIn('prefix=f".{output.name}.build-", directory=output.parent', source)
+        self.assertIn("publish_no_replace(build_root, output)", source)
+
+    def test_raced_output_is_never_replaced_and_own_candidate_is_cleaned(self) -> None:
+        tool = load_tool()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            repo, commit = minimal_repo(root, "0023")
+            dist = root / "dist"
+            dist.mkdir()
+            (dist / "index.html").write_text("x", encoding="utf-8")
+            output = root / "raced-output"
+            original_publish = tool.publish_no_replace
+
+            def publish_after_race(candidate: Path, destination: Path) -> None:
+                destination.mkdir()
+                (destination / "winner").write_bytes(b"concurrent candidate")
+                original_publish(candidate, destination)
+
+            with mock.patch.object(tool, "publish_no_replace", side_effect=publish_after_race):
+                with self.assertRaisesRegex(tool.ProductionBundleError, "refusing to overwrite"):
+                    tool.assemble(
+                        self.stage(root), repo, output, "amd64", None, None, dist,
+                        version="0.8.0-rc.0", migration_version="0023",
+                        source_commit=commit, structure_only=True,
+                    )
+            self.assertEqual((output / "winner").read_bytes(), b"concurrent candidate")
+            self.assertEqual({path.name for path in output.iterdir()}, {"winner"})
+            self.assertFalse(list(root.glob(f".{output.name}.build-*")))
 
     def test_private_workspace_cleanup_retries_directory_not_empty(self) -> None:
         tool = load_tool()

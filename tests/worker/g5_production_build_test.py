@@ -33,6 +33,41 @@ def digest(path: Path) -> str:
 
 
 class ProductionBuildTests(unittest.TestCase):
+    def test_rc3_selector_pins_rc2_lineage_and_refuses_pre_output_evidence_gaps(self) -> None:
+        tool = load_tool()
+        self.assertEqual(tool.release_spec("0.8.0-rc.3").migration, "0024")
+        self.assertEqual(tool.go_targets(tool.RC3_SPEC)["open-card-healthcheck"], "./cmd/open-card-healthcheck")
+        self.assertEqual(
+            tool.frozen_predecessor_lineage("0.8.0-rc.3", "amd64"),
+            {"source_commit": tool.RC2_SOURCE_COMMIT, **tool.RC2_LINEAGES["amd64"]},
+        )
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            output = root / "rc3-output"
+            with self.assertRaisesRegex(tool.ProductionBuildError, "N-1 evidence"):
+                tool.build_candidate(
+                    source_worktree=root, source_commit="a" * 40,
+                    runtime_inputs=root / "inputs.json", runtime_inputs_sha256="0" * 64,
+                    runtime_dir=root, output=output, bundle_tool=root / "bundle.py",
+                    bundle_tool_sha256="0" * 64, driver_sha256="0" * 64,
+                    version=tool.RC3_SPEC.version, arch="amd64",
+                )
+            self.assertFalse(output.exists())
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            output = root / "rc3-missing-cert-output"
+            with mock.patch.object(tool, "verify_n_minus_one_candidate_root", return_value=object()):
+                with self.assertRaisesRegex(tool.ProductionBuildError, "exact predecessor certification"):
+                    tool.build_candidate(
+                        source_worktree=root, source_commit="a" * 40,
+                        runtime_inputs=root / "inputs.json", runtime_inputs_sha256="0" * 64,
+                        runtime_dir=root, output=output, bundle_tool=root / "bundle.py",
+                        bundle_tool_sha256="0" * 64, driver_sha256="0" * 64,
+                        version=tool.RC3_SPEC.version, n_minus_one_candidate_root=root,
+                        arch="amd64",
+                    )
+            self.assertFalse(output.exists())
+
     def test_rc2_selector_uses_frozen_rc1_predecessor_and_refuses_missing_evidence(self) -> None:
         tool = load_tool()
         self.assertEqual((tool.release_spec("0.8.0-rc.2").migration, tool.release_spec("0.8.0-rc.2").bootstrap), ("0024", False))

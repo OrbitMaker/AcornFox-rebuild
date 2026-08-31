@@ -32,6 +32,36 @@ def digest(path: Path) -> str:
 
 
 class ProductionCertificationTests(unittest.TestCase):
+    def test_rc3_requires_two_architectures_rc2_lineage_and_healthcheck_payload(self) -> None:
+        tool = load_tool()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source_a, source_b, candidates_a, candidates_b, commit = self.fixture(root, tool, tool.RC3_VERSION)
+            output = root / "rc3-certification"
+            result = tool.certify(source_a, source_b, candidates_a, candidates_b, output, commit, tool.RC3_VERSION)
+            self.assertEqual(result["version"], tool.RC3_VERSION)
+            self.assertEqual(json.loads((output / "release-index.json").read_text(encoding="utf-8"))["architectures"]["amd64"]["predecessor_lineage"], tool.RC2_LINEAGES["amd64"])
+            for candidate_set in (candidates_a, candidates_b):
+                for arch in tool.ARCHES:
+                    manifest = json.loads((candidate_set / arch / "release/manifest.json").read_text(encoding="utf-8"))
+                    self.assertEqual(len(manifest["files"]), 76)
+                    self.assertTrue({"bin/open-card-healthcheck", "systemd/open-card-healthcheck.service", "systemd/open-card-healthcheck.timer"}.issubset({entry["path"] for entry in manifest["files"]}))
+            (candidates_b / "amd64/release/systemd/open-card-healthcheck.timer").unlink()
+            with self.assertRaises(tool.CertificationError):
+                tool.certify(source_a, source_b, candidates_a, candidates_b, root / "bad-rc3", commit, tool.RC3_VERSION)
+            self.assertFalse((root / "bad-rc3").exists())
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source_a, source_b, candidates_a, candidates_b, commit = self.fixture(root, tool, tool.RC3_VERSION)
+            record_path = candidates_b / "amd64/build-record.json"
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            record["predecessor_certification"]["release_index_sha256"] = "0" * 64
+            record_path.write_text(json.dumps(record), encoding="utf-8")
+            output = root / "bad-rc3-index"
+            with self.assertRaises(tool.CertificationError):
+                tool.certify(source_a, source_b, candidates_a, candidates_b, output, commit, tool.RC3_VERSION)
+            self.assertFalse(output.exists())
+
     def test_rc2_two_build_candidates_bind_frozen_rc1_evidence(self) -> None:
         tool = load_tool()
         with tempfile.TemporaryDirectory() as raw:
@@ -118,8 +148,10 @@ class ProductionCertificationTests(unittest.TestCase):
         }
         for index in range(65):
             payloads[f"payload/{index:02d}"] = f"{arch}:{index}\n".encode()
-        if version == tool.RC2_VERSION:
+        if version in {tool.RC2_VERSION, tool.RC3_VERSION}:
             payloads.update({"scripts/mvp/host-preflight.sh": b"preflight\n", "scripts/mvp/buildkit-production-capacity.sh": b"capacity\n", "scripts/mvp/g6-staging-evidence.sh": b"g6\n", "tools/evidence/g6_validate.py": b"validate\n", "tools/evidence/g6_target_receipt.py": b"receipt\n"})
+        if version == tool.RC3_VERSION:
+            payloads.update({"bin/open-card-healthcheck": b"healthcheck\n", "systemd/open-card-healthcheck.service": b"[Service]\n", "systemd/open-card-healthcheck.timer": b"[Timer]\n"})
         entries = []
         for relative, value in sorted(payloads.items()):
             path = release / relative
@@ -140,7 +172,7 @@ class ProductionCertificationTests(unittest.TestCase):
             "config_dir": "/etc/open-card",
             "data_dir": "/var/lib/open-card",
             "compatibility": {"min_data_version": 1, "max_data_version": 24, "min_agent_protocol": "1.0", "max_agent_protocol": "1.1", "requires_data_backup": True},
-            "n_minus_one": tool.RC0_LINEAGES[arch] if version == tool.VERSION else tool.RC1_LINEAGES[arch],
+            "n_minus_one": tool.RC0_LINEAGES[arch] if version == tool.VERSION else tool.RC1_LINEAGES[arch] if version == tool.RC2_VERSION else tool.RC2_LINEAGES[arch],
             "files": entries,
         }
         manifest_path = release / "manifest.json"
@@ -196,11 +228,11 @@ class ProductionCertificationTests(unittest.TestCase):
             "stage_files": entries,
             "live_web": {"build_metadata_sha256": "1" * 64, "dist_tree_sha256": "2" * 64, "attestation_sha256": digest(release / "attestations/live-web.json"), "gate3_status": "pass_limited_external_linux_required"},
             "bundle": {"archive": archive.name, "archive_sha256": digest(archive), "manifest_sha256": digest(manifest_path), "bundle_manifest_sha256": digest(bundle)},
-            "n_minus_one": {**(tool.RC0_LINEAGES[arch] if version == tool.VERSION else tool.RC1_LINEAGES[arch]), "status": "verified_local_candidate", "release_embedded": False},
+            "n_minus_one": {**(tool.RC0_LINEAGES[arch] if version == tool.VERSION else tool.RC1_LINEAGES[arch] if version == tool.RC2_VERSION else tool.RC2_LINEAGES[arch]), "status": "verified_local_candidate", "release_embedded": False},
             "commands": [["go", "build", str(root)]],
         }
-        if version == tool.RC2_VERSION:
-            record["predecessor_certification"] = {"certification_sha256": tool.RC1_CERTIFICATION_SHA256, "release_index_sha256": tool.RC1_RELEASE_INDEX_SHA256}
+        if version in {tool.RC2_VERSION, tool.RC3_VERSION}:
+            record["predecessor_certification"] = {"certification_sha256": tool.RC1_CERTIFICATION_SHA256, "release_index_sha256": tool.RC1_RELEASE_INDEX_SHA256} if version == tool.RC2_VERSION else {"certification_sha256": tool.RC2_CERTIFICATION_SHA256, "release_index_sha256": tool.RC2_RELEASE_INDEX_SHA256}
         (candidate / "build-record.json").write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
         (candidate / "build-record.json").chmod(0o640)
         metadata = {
@@ -212,21 +244,21 @@ class ProductionCertificationTests(unittest.TestCase):
             "production_accepted": False,
             "candidate_status": "upgrade_candidate",
             "n_minus_one": {
-                "version": (tool.RC0_LINEAGES if version == tool.VERSION else tool.RC1_LINEAGES)[arch]["version"],
-                "migration_version": (tool.RC0_LINEAGES if version == tool.VERSION else tool.RC1_LINEAGES)[arch]["migration_version"],
-                "source_commit": (tool.RC0_LINEAGES if version == tool.VERSION else tool.RC1_LINEAGES)[arch]["source_commit"],
+                "version": (tool.RC0_LINEAGES if version == tool.VERSION else tool.RC1_LINEAGES if version == tool.RC2_VERSION else tool.RC2_LINEAGES)[arch]["version"],
+                "migration_version": (tool.RC0_LINEAGES if version == tool.VERSION else tool.RC1_LINEAGES if version == tool.RC2_VERSION else tool.RC2_LINEAGES)[arch]["migration_version"],
+                "source_commit": (tool.RC0_LINEAGES if version == tool.VERSION else tool.RC1_LINEAGES if version == tool.RC2_VERSION else tool.RC2_LINEAGES)[arch]["source_commit"],
                 "status": "verified_local_candidate",
                 "release_embedded": False,
-                "manifest_sha256": (tool.RC0_LINEAGES if version == tool.VERSION else tool.RC1_LINEAGES)[arch]["release_manifest_sha256"],
-                "archive_sha256": (tool.RC0_LINEAGES if version == tool.VERSION else tool.RC1_LINEAGES)[arch]["archive_sha256"],
-                "bundle_manifest_sha256": (tool.RC0_LINEAGES if version == tool.VERSION else tool.RC1_LINEAGES)[arch]["bundle_manifest_sha256"],
+                "manifest_sha256": (tool.RC0_LINEAGES if version == tool.VERSION else tool.RC1_LINEAGES if version == tool.RC2_VERSION else tool.RC2_LINEAGES)[arch]["release_manifest_sha256"],
+                "archive_sha256": (tool.RC0_LINEAGES if version == tool.VERSION else tool.RC1_LINEAGES if version == tool.RC2_VERSION else tool.RC2_LINEAGES)[arch]["archive_sha256"],
+                "bundle_manifest_sha256": (tool.RC0_LINEAGES if version == tool.VERSION else tool.RC1_LINEAGES if version == tool.RC2_VERSION else tool.RC2_LINEAGES)[arch]["bundle_manifest_sha256"],
             },
             "live_web": {"status": "caller_evidence_digest_pinned", "bundle_structure_verified": True, "public_domain_verified": False, "attestation_sha256": digest(release / "attestations/live-web.json")},
-            "production_binaries": tool.RC1_BINARIES,
+            "production_binaries": tool.RC3_BINARIES if version == tool.RC3_VERSION else tool.RC1_BINARIES,
             "excluded": ["open-card-caddy-fixture", "integration test binaries", "fixture archives"],
         }
-        if version == tool.RC2_VERSION:
-            metadata["predecessor_certification"] = {"certification_sha256": tool.RC1_CERTIFICATION_SHA256, "release_index_sha256": tool.RC1_RELEASE_INDEX_SHA256}
+        if version in {tool.RC2_VERSION, tool.RC3_VERSION}:
+            metadata["predecessor_certification"] = record["predecessor_certification"]
         (candidate / artifact_paths["production_bundle"]).write_text(json.dumps(metadata), encoding="utf-8")
         (candidate / artifact_paths["production_bundle"]).chmod(0o640)
 

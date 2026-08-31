@@ -27,6 +27,23 @@ def load_tool():
 
 
 class ProductionSecurityScanTests(unittest.TestCase):
+    def test_rc3_accepts_only_dual_arch_candidate_set_with_matching_version(self) -> None:
+        tool = load_tool()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source, commit = self.source(root)
+            candidates = self.candidates(root, tool, "0.8.0-rc.3")
+            certification = self.certification(root, "0.8.0-rc.3")
+            report = tool.scan(source, commit, candidates, certification, self.fake_govuln(root, requires_go=True), self.fake_go(root), root / "scan", "0.8.0-rc.3")
+            self.assertEqual(report["version"], "0.8.0-rc.3")
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source, commit = self.source(root)
+            candidates = self.candidates(root, tool, "0.8.0-rc.3")
+            (candidates / "arm64").rename(candidates / "wrong-arch")
+            with self.assertRaises(tool.SecurityScanError):
+                tool.scan(source, commit, candidates, self.certification(root, "0.8.0-rc.3"), self.fake_govuln(root, requires_go=True), self.fake_go(root), root / "scan", "0.8.0-rc.3")
+
     def test_rejects_explicit_version_mismatch_before_publication(self) -> None:
         tool = load_tool()
         with tempfile.TemporaryDirectory() as raw:
@@ -69,7 +86,7 @@ class ProductionSecurityScanTests(unittest.TestCase):
         commit = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, text=True, capture_output=True).stdout.strip()
         return repo, commit
 
-    def candidates(self, root: Path, tool) -> Path:
+    def candidates(self, root: Path, tool, version: str = "0.8.0-rc.1") -> Path:
         candidate_set = root / "candidates"
         for arch in tool.ARCHES:
             directory = candidate_set / arch
@@ -82,16 +99,19 @@ class ProductionSecurityScanTests(unittest.TestCase):
                 data = payload.read_bytes()
                 info.size = len(data)
                 archive.addfile(info, io.BytesIO(data))
-            (directory / "build-record.json").write_text('{"candidate":{"version":"0.8.0-rc.1"}}\n', encoding="utf-8")
-            (release / "manifest.json").write_text('{"version":"0.8.0-rc.1"}\n', encoding="utf-8")
-            (directory / "production-bundle.json").write_text('{"version":"0.8.0-rc.1"}\n', encoding="utf-8")
+            (directory / "build-record.json").write_text(json.dumps({"candidate": {"version": version}}) + "\n", encoding="utf-8")
+            (release / "manifest.json").write_text(json.dumps({"version": version}) + "\n", encoding="utf-8")
+            (directory / "production-bundle.json").write_text(json.dumps({"version": version}) + "\n", encoding="utf-8")
         return candidate_set
 
-    def certification(self, root: Path) -> Path:
+    def certification(self, root: Path, version: str = "0.8.0-rc.1") -> Path:
         directory = root / "certification"
         directory.mkdir()
-        (directory / "certification.json").write_text('{"schema":"open-card-production-certification.v1"}\n', encoding="utf-8")
-        (directory / "release-index.json").write_text('{"schema":"open-card-release-index.v1","version":"0.8.0-rc.1"}\n', encoding="utf-8")
+        certificate = {"schema": "open-card-production-certification.v1"}
+        if version != "0.8.0-rc.1":
+            certificate["version"] = version
+        (directory / "certification.json").write_text(json.dumps(certificate) + "\n", encoding="utf-8")
+        (directory / "release-index.json").write_text(json.dumps({"schema": "open-card-release-index.v1", "version": version}) + "\n", encoding="utf-8")
         return directory
 
     def fake_go(self, root: Path, *, version: str = "go1.25.13", goroot: str = "/fixture/go") -> Path:
