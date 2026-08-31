@@ -25,6 +25,10 @@
 	# Delete any external input before deriving it from Caddy's connection peer.
 	header_up -Open-Card-*
 	header_up -X-Open-Card-*
+	# CSRF is a browser-supplied proof, not a trusted identity assertion. Restore
+	# it after stripping the wider header namespace so authenticated writes can
+	# still bind the cookie, Origin and CSRF token at the control plane.
+	header_up X-Open-Card-CSRF {http.request.header.X-Open-Card-CSRF}
 	header_up X-Open-Card-Client-IP {remote_host}
 }
 
