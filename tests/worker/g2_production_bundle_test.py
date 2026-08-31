@@ -76,6 +76,12 @@ def minimal_repo(
 
 
 class ProductionBundleTests(unittest.TestCase):
+
+    def test_rc2_keeps_the_complete_boot_safe_unit_payload(self) -> None:
+        tool = load_tool()
+        self.assertEqual(tool.systemd_files("0.8.0-rc.2"), tool.systemd_files("0.8.0-rc.1"))
+        self.assertIn("open-card-upgrade-safe.target", tool.systemd_files("0.8.0-rc.2"))
+        self.assertIn("open-card-edge.service.d/10-upgrade-marker.conf", tool.systemd_files("0.8.0-rc.2"))
     def test_rc2_selector_adds_only_rc2_g6_payload(self) -> None:
         tool = load_tool()
         self.assertEqual(tool.release_spec("0.8.0-rc.2", "0024")["expected_n_minus_one_version"], "0.8.0-rc.1")

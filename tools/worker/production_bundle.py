@@ -99,7 +99,7 @@ def systemd_files(version: str) -> tuple[str, ...]:
     """
     if version == "0.8.0-rc.0":
         return RC0_UNITS
-    if version == "0.8.0-rc.1":
+    if version in {"0.8.0-rc.1", "0.8.0-rc.2"}:
         return (*UNITS, *UNIT_DROP_INS)
     raise ProductionBundleError("unsupported release version")
 RC0_INSTALLER_SCRIPTS = (
