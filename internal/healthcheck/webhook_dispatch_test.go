@@ -14,7 +14,7 @@ import (
 )
 
 func TestWebhookDispatcherDeliversRecordsAndAcknowledgesInOrder(t *testing.T) {
-	now := time.Date(2026, 8, 31, 5, 0, 0, 0, time.UTC)
+	now := webhookDispatchTestNow()
 	config, incident, event := webhookDispatchFixture(t, now)
 	config.URL = "https://hooks.example.test/super-secret-url"
 	config.SecretReference.Name = "super-secret-reference"
@@ -59,7 +59,7 @@ func TestWebhookDispatcherDeliversRecordsAndAcknowledgesInOrder(t *testing.T) {
 }
 
 func TestWebhookDispatcherUsesLastObservedAndRecoveryOf(t *testing.T) {
-	now := time.Date(2026, 8, 31, 5, 0, 0, 0, time.UTC)
+	now := webhookDispatchTestNow()
 	config, incident, event := webhookDispatchFixture(t, now)
 	incident.Revision = 2
 	incident.LastObserved = now.Add(-time.Minute)
@@ -94,7 +94,7 @@ func TestWebhookDispatcherUsesLastObservedAndRecoveryOf(t *testing.T) {
 }
 
 func TestWebhookDispatcherClassifiesFailuresWithoutAcknowledging(t *testing.T) {
-	now := time.Date(2026, 8, 31, 5, 0, 0, 0, time.UTC)
+	now := webhookDispatchTestNow()
 	config, incident, event := webhookDispatchFixture(t, now)
 	for _, tc := range []struct {
 		name    string
@@ -121,7 +121,7 @@ func TestWebhookDispatcherClassifiesFailuresWithoutAcknowledging(t *testing.T) {
 }
 
 func TestWebhookDispatcherDeliveredReplayAcknowledgesWithoutResend(t *testing.T) {
-	now := time.Date(2026, 8, 31, 5, 0, 0, 0, time.UTC)
+	now := webhookDispatchTestNow()
 	config, incident, event := webhookDispatchFixture(t, now)
 	store := newWebhookDispatchStore(t, config, event, incident.FirstObserved, nil)
 	delivered := store.begin
@@ -143,7 +143,7 @@ func TestWebhookDispatcherDeliveredReplayAcknowledgesWithoutResend(t *testing.T)
 }
 
 func TestWebhookDispatcherRejectsCancellationAndStoreProtocolErrors(t *testing.T) {
-	now := time.Date(2026, 8, 31, 5, 0, 0, 0, time.UTC)
+	now := webhookDispatchTestNow()
 	config, incident, event := webhookDispatchFixture(t, now)
 	for _, tc := range []struct {
 		name        string
@@ -186,7 +186,7 @@ func TestWebhookDispatcherRejectsCancellationAndStoreProtocolErrors(t *testing.T
 }
 
 func TestWebhookDispatcherRejectsNilProviderAndConcurrentDuplicateSendsOnce(t *testing.T) {
-	now := time.Date(2026, 8, 31, 5, 0, 0, 0, time.UTC)
+	now := webhookDispatchTestNow()
 	config, incident, event := webhookDispatchFixture(t, now)
 	store := newWebhookDispatchStore(t, config, event, incident.FirstObserved, nil)
 	dispatcher := &WebhookDispatcher{Store: store, Resolver: webhookDispatchResolver{}, Acknowledger: &webhookDispatchAcknowledger{}, Clock: func() time.Time { return now }}
@@ -216,7 +216,7 @@ func TestWebhookDispatcherRejectsNilProviderAndConcurrentDuplicateSendsOnce(t *t
 }
 
 func TestWebhookDispatcherRejectsClockConfigAndGenerationDrift(t *testing.T) {
-	now := time.Date(2026, 8, 31, 5, 0, 0, 0, time.UTC)
+	now := webhookDispatchTestNow()
 	config, incident, event := webhookDispatchFixture(t, now)
 	for _, mutation := range []string{"clock", "config", "generation"} {
 		t.Run(mutation, func(t *testing.T) {
@@ -250,7 +250,7 @@ func TestTaskHostCollectorAcknowledgeEventRequiresExactPendingEvent(t *testing.T
 		t.Fatal(err)
 	}
 	defer store.Close()
-	now := time.Date(2026, 8, 31, 5, 0, 0, 0, time.UTC)
+	now := webhookDispatchTestNow()
 	collector, err := NewTaskHostCollector(collectorProbes(nil, map[CheckKind]Severity{CheckDatabase: SeverityCritical}), store, func() time.Time { return now })
 	if err != nil {
 		t.Fatal(err)
@@ -392,6 +392,13 @@ func webhookDispatchTrace(trace *[]string, value string) {
 	if trace != nil {
 		*trace = append(*trace, value)
 	}
+}
+
+// Keep the injected domain clock deterministic within each test while leaving
+// enough real-time margin for context.WithDeadline. A fixed wall-clock value
+// eventually turns every provider attempt into an immediate timeout.
+func webhookDispatchTestNow() time.Time {
+	return time.Now().UTC().Add(time.Minute).Truncate(time.Microsecond)
 }
 
 func webhookDispatchFixture(t *testing.T, now time.Time) (WebhookConfigV1, IncidentState, WebhookDeliveryEventV1) {
