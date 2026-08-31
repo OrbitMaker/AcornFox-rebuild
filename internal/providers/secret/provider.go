@@ -404,7 +404,9 @@ func (p *Provider) RevokeBuildSecret(ctx context.Context, material contracts.Bui
 	}
 	fingerprint := digestStrings("revoke_build", material.MountID, referenceDigest(material.Reference))
 	opDigest := digestStrings(operation.IdempotencyKey)
-	p.mu.Lock()
+	if err := p.lockForRevoke(ctx, operation); err != nil {
+		return p.classify(operation, contracts.CapabilitySecretResolve, "revoke_build_secret", err)
+	}
 	defer p.mu.Unlock()
 	if previous, ok := p.revokeOps[opDigest]; ok {
 		if previous.fingerprint != fingerprint {
@@ -418,6 +420,32 @@ func (p *Provider) RevokeBuildSecret(ctx context.Context, material contracts.Bui
 	delete(p.resolveOps, opDigest)
 	p.revokeOps[opDigest] = operationRecord{fingerprint: fingerprint}
 	return nil
+}
+
+// lockForRevoke keeps a cleanup caller from waiting indefinitely behind an
+// unrelated secret operation. It rechecks context and operation deadlines both
+// before and after TryLock, so an expired revoke never enters the critical
+// section merely because the mutex became available concurrently.
+func (p *Provider) lockForRevoke(ctx context.Context, operation contracts.OperationContext) error {
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if err := contextError(ctx, operation); err != nil {
+			return err
+		}
+		if p.mu.TryLock() {
+			if err := contextError(ctx, operation); err != nil {
+				p.mu.Unlock()
+				return err
+			}
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
 // CleanupExpiredMaterializations is useful for a supervisor that wants an

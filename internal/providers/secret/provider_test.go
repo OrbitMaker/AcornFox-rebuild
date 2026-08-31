@@ -104,6 +104,31 @@ func TestStoreResolveRevokeNeverPersistsCanary(t *testing.T) {
 	assertNoCanary(t, canary, root, materialRoot, keyPath)
 }
 
+func TestRevokeBuildSecretHonorsContextWhileProviderLockIsHeld(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	provider, _, _, _ := testProvider(t, now, time.Minute)
+	reference := testReference("secret_revoke_context")
+	if _, err := provider.Store(context.Background(), contracts.SecretRequest{Reference: reference, Value: []byte("secret"), Operation: operation("store-revoke-context")}); err != nil {
+		t.Fatal(err)
+	}
+	material, err := provider.ResolveBuildSecret(context.Background(), reference, operation("resolve-revoke-context"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider.mu.Lock()
+	defer provider.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	err = provider.RevokeBuildSecret(ctx, material, contracts.OperationContext{IdempotencyKey: "revoke-context", Deadline: time.Now().Add(30 * time.Millisecond)})
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("revoke waited behind held mutex for %v", elapsed)
+	}
+	if !hasCode(err, contracts.ErrTimeout) {
+		t.Fatalf("revoke error=%v", err)
+	}
+}
+
 func TestEdgeCaddyCertificateObservationCanNeverBeResolvedAsASecret(t *testing.T) {
 	provider, _, _, _ := testProvider(t, time.Unix(1_700_000_000, 0).UTC(), time.Minute)
 	reference := domain.SecretReference{ID: "edge-caddy-observation:sha256:deadbeef", Name: "edge-observation", Provider: "edge-caddy"}
