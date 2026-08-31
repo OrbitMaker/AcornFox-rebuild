@@ -42,16 +42,19 @@ var (
 // it includes a database dump. It MUST be independently encrypted before it
 // leaves root-only staging.
 type PlatformBackupV3 struct {
-	Schema                     string                     `json:"schema"`
-	BackupID                   string                     `json:"backup_id"`
-	CreatedAt                  time.Time                  `json:"created_at"`
-	Reason                     string                     `json:"reason"`
-	SourceInstallationIDSHA256 string                     `json:"source_installation_id_sha256"`
-	SourceActivationID         string                     `json:"source_activation_id"`
-	SourceActivationJSONSHA256 string                     `json:"source_activation_json_sha256"`
-	SourceRelease              ReleaseV1                  `json:"source_release"`
-	SourceDatabase             DatabaseV1                 `json:"source_database"`
-	Artifacts                  []PlatformBackupArtifactV1 `json:"artifacts"`
+	Schema                     string    `json:"schema"`
+	BackupID                   string    `json:"backup_id"`
+	CreatedAt                  time.Time `json:"created_at"`
+	Reason                     string    `json:"reason"`
+	SourceInstallationIDSHA256 string    `json:"source_installation_id_sha256"`
+	SourceActivationID         string    `json:"source_activation_id"`
+	SourceActivationJSONSHA256 string    `json:"source_activation_json_sha256"`
+	// DatabaseSnapshotSHA256 is the pg_export_snapshot producer assertion. It
+	// is not the dump hash; B3 must recompute row digests after restore.
+	DatabaseSnapshotSHA256 string                     `json:"database_snapshot_sha256"`
+	SourceRelease          ReleaseV1                  `json:"source_release"`
+	SourceDatabase         DatabaseV1                 `json:"source_database"`
+	Artifacts              []PlatformBackupArtifactV1 `json:"artifacts"`
 }
 
 type PlatformBackupArtifactV1 struct {
@@ -105,17 +108,19 @@ type PlatformBackupKeyReferenceV1 struct {
 	Provider   string `json:"provider"`
 	KeyID      string `json:"key_id"`
 	KeyVersion string `json:"key_version"`
+	Revoked    bool   `json:"revoked"`
 }
 type PlatformBackupKeyReferencesV1 struct {
-	SchemaVersion int                            `json:"schema_version"`
-	References    []PlatformBackupKeyReferenceV1 `json:"references"`
+	SchemaVersion          int                            `json:"schema_version"`
+	DatabaseSnapshotSHA256 string                         `json:"database_snapshot_sha256"`
+	References             []PlatformBackupKeyReferenceV1 `json:"references"`
 }
 
 func (a PlatformBackupArtifactV1) valid() bool {
 	return platformBackupMember(a.Path) && validSHA(a.SHA256) && a.Size > 0 && a.Size <= platformBackupMemberLimit(a.Path) && a.Mode == platformBackupV3Mode
 }
 func (m PlatformBackupV3) validIdentity() bool {
-	return m.Schema == PlatformBackupV3Schema && validBackupID(m.BackupID) && !m.CreatedAt.IsZero() && m.CreatedAt.Location() == time.UTC && validBackupReason(m.Reason) && validSHA(m.SourceInstallationIDSHA256) && validID(m.SourceActivationID) && validSHA(m.SourceActivationJSONSHA256) && m.SourceRelease.valid() && m.SourceDatabase.valid()
+	return m.Schema == PlatformBackupV3Schema && validBackupID(m.BackupID) && !m.CreatedAt.IsZero() && m.CreatedAt.Location() == time.UTC && validBackupReason(m.Reason) && validSHA(m.SourceInstallationIDSHA256) && validID(m.SourceActivationID) && validSHA(m.SourceActivationJSONSHA256) && validSHA(m.DatabaseSnapshotSHA256) && m.SourceRelease.valid() && m.SourceDatabase.valid()
 }
 func (m PlatformBackupV3) Validate() error {
 	if !m.validIdentity() || len(m.Artifacts) != len(platformBackupV3Members) {
@@ -129,7 +134,7 @@ func (m PlatformBackupV3) Validate() error {
 	return nil
 }
 func (r PlatformBackupKeyReferenceV1) valid() bool {
-	return validID(r.Provider) && validID(r.KeyID) && validID(r.KeyVersion)
+	return (r.Provider == "control-plane-secret" || r.Provider == "local-backup-key") && validID(r.KeyID) && validID(r.KeyVersion)
 }
 func keyRefLess(left, right PlatformBackupKeyReferenceV1) bool {
 	if left.Provider != right.Provider {
@@ -141,7 +146,7 @@ func keyRefLess(left, right PlatformBackupKeyReferenceV1) bool {
 	return left.KeyVersion < right.KeyVersion
 }
 func (r PlatformBackupKeyReferencesV1) Validate() error {
-	if r.SchemaVersion != 1 || len(r.References) > 128 {
+	if r.SchemaVersion != 1 || !validSHA(r.DatabaseSnapshotSHA256) || len(r.References) > 128 {
 		return ErrPlatformBackupPackage
 	}
 	for i, ref := range r.References {
@@ -159,10 +164,28 @@ func MarshalPlatformBackupKeyReferencesV1(value PlatformBackupKeyReferencesV1) (
 }
 func ParsePlatformBackupKeyReferencesV1(raw []byte) (PlatformBackupKeyReferencesV1, error) {
 	var value PlatformBackupKeyReferencesV1
-	if decodeStrict(raw, &value) != nil || requireStrictFields(raw, []string{"schema_version", "references"}) != nil || value.Validate() != nil {
+	if decodeStrict(raw, &value) != nil || requireStrictFields(raw, []string{"schema_version", "database_snapshot_sha256", "references"}) != nil || value.Validate() != nil || !platformBackupKeyReferenceFields(raw) {
+		return PlatformBackupKeyReferencesV1{}, ErrPlatformBackupPackage
+	}
+	canonical, err := MarshalPlatformBackupKeyReferencesV1(value)
+	if err != nil || !bytes.Equal(raw, canonical) {
 		return PlatformBackupKeyReferencesV1{}, ErrPlatformBackupPackage
 	}
 	return value, nil
+}
+func platformBackupKeyReferenceFields(raw []byte) bool {
+	var value struct {
+		References []json.RawMessage `json:"references"`
+	}
+	if json.Unmarshal(raw, &value) != nil {
+		return false
+	}
+	for _, item := range value.References {
+		if requireStrictFields(item, []string{"provider", "key_id", "key_version", "revoked"}) != nil {
+			return false
+		}
+	}
+	return true
 }
 func MarshalPlatformBackupV3(value PlatformBackupV3) ([]byte, error) {
 	if value.Validate() != nil {
@@ -172,7 +195,11 @@ func MarshalPlatformBackupV3(value PlatformBackupV3) ([]byte, error) {
 }
 func ParsePlatformBackupV3(raw []byte) (PlatformBackupV3, error) {
 	var value PlatformBackupV3
-	if decodeStrict(raw, &value) != nil || requireStrictFields(raw, []string{"schema", "backup_id", "created_at", "reason", "source_installation_id_sha256", "source_activation_id", "source_activation_json_sha256", "source_release", "source_database", "artifacts"}) != nil || value.Validate() != nil {
+	if decodeStrict(raw, &value) != nil || requireStrictFields(raw, []string{"schema", "backup_id", "created_at", "reason", "source_installation_id_sha256", "source_activation_id", "source_activation_json_sha256", "database_snapshot_sha256", "source_release", "source_database", "artifacts"}) != nil || value.Validate() != nil {
+		return PlatformBackupV3{}, ErrPlatformBackupPackage
+	}
+	canonical, err := MarshalPlatformBackupV3(value)
+	if err != nil || !bytes.Equal(raw, canonical) {
 		return PlatformBackupV3{}, ErrPlatformBackupPackage
 	}
 	return value, nil
@@ -199,6 +226,7 @@ func BuildPlatformBackupV3Package(sink PlatformBackupBuildSink, input PlatformBa
 	sort.Slice(artifacts, func(i, j int) bool { return artifacts[i].Path < artifacts[j].Path })
 	manifest := input.Manifest
 	manifest.Artifacts = make([]PlatformBackupArtifactV1, len(artifacts))
+	textMembers := make(map[string][]byte, len(artifacts))
 	for i, artifact := range artifacts {
 		if artifact.Path != platformBackupV3Members[i] || artifact.Source == nil || artifact.Size <= 0 || artifact.Size > platformBackupMemberLimit(artifact.Path) || artifact.Mode != platformBackupV3Mode {
 			return ErrPlatformBackupPackage
@@ -208,12 +236,22 @@ func BuildPlatformBackupV3Package(sink PlatformBackupBuildSink, input PlatformBa
 			return ErrPlatformBackupPackage
 		}
 		manifest.Artifacts[i] = PlatformBackupArtifactV1{Path: artifact.Path, SHA256: digest, Size: artifact.Size, Mode: artifact.Mode}
+		if artifact.Path != "database/control-plane.dump" {
+			text, textErr := platformBackupArtifactText(artifact.Source, artifact.Size, artifact.Path)
+			if textErr != nil {
+				return ErrPlatformBackupPackage
+			}
+			textMembers[artifact.Path] = text
+		}
 	}
 	if manifest.Validate() != nil {
 		return ErrPlatformBackupPackage
 	}
 	manifestRaw, err := MarshalPlatformBackupV3(manifest)
 	if err != nil || !validPlatformBackupText(PlatformBackupV3Manifest, manifestRaw) || !platformBackupArchiveSizeOK(int64(len(manifestRaw)), manifest.Artifacts) {
+		return ErrPlatformBackupPackage
+	}
+	if ValidatePlatformBackupFacts(manifest, textMembers) != nil {
 		return ErrPlatformBackupPackage
 	}
 	destination, err := sink.Open()
@@ -270,6 +308,7 @@ func VerifyPlatformBackupV3Package(source io.Reader, sink PlatformBackupQuaranti
 	if err != nil || !platformBackupArchiveSizeOK(size, manifest.Artifacts) {
 		return PlatformBackupV3{}, ErrPlatformBackupPackage
 	}
+	textMembers := make(map[string][]byte, len(manifest.Artifacts))
 	for _, artifact := range manifest.Artifacts {
 		if !platformBackupReadCanonicalHeaders(source, artifact.Path, artifact.Size, artifact.Mode) {
 			return PlatformBackupV3{}, ErrPlatformBackupPackage
@@ -285,6 +324,9 @@ func VerifyPlatformBackupV3Package(source io.Reader, sink PlatformBackupQuaranti
 		if hex.EncodeToString(data.hashBytes) != artifact.SHA256 || data.text != nil && !validPlatformBackupText(artifact.Path, data.text) {
 			return PlatformBackupV3{}, ErrPlatformBackupPackage
 		}
+		if data.text != nil {
+			textMembers[artifact.Path] = data.text
+		}
 	}
 	end, err := platformBackupReadExact(source, 1024)
 	if err != nil || !bytes.Equal(end, make([]byte, 1024)) {
@@ -292,6 +334,9 @@ func VerifyPlatformBackupV3Package(source io.Reader, sink PlatformBackupQuaranti
 	}
 	var trailing [1]byte
 	if count, readErr := source.Read(trailing[:]); count != 0 || readErr != io.EOF {
+		return PlatformBackupV3{}, ErrPlatformBackupPackage
+	}
+	if ValidatePlatformBackupFacts(manifest, textMembers) != nil {
 		return PlatformBackupV3{}, ErrPlatformBackupPackage
 	}
 	if sink.Commit() != nil {
@@ -493,12 +538,55 @@ func validPlatformBackupText(path string, data []byte) bool {
 		if _, ok := value.(map[string]any); !ok {
 			return false
 		}
-		if path == "facts/key-references.json" {
-			_, err := ParsePlatformBackupKeyReferencesV1(data)
-			return err == nil
-		}
+		return platformBackupParseTypedJSON(path, data)
 	}
 	return true
+}
+
+func platformBackupArtifactText(source io.ReadSeeker, size int64, path string) ([]byte, error) {
+	if _, err := source.Seek(0, io.SeekStart); err != nil {
+		return nil, ErrPlatformBackupPackage
+	}
+	data := make([]byte, size)
+	if _, err := io.ReadFull(source, data); err != nil {
+		return nil, ErrPlatformBackupPackage
+	}
+	var extra [1]byte
+	if n, err := source.Read(extra[:]); n != 0 || err != io.EOF || !validPlatformBackupText(path, data) {
+		return nil, ErrPlatformBackupPackage
+	}
+	return data, nil
+}
+
+func platformBackupParseTypedJSON(path string, data []byte) bool {
+	switch path {
+	case PlatformBackupV3Manifest:
+		_, err := ParsePlatformBackupV3(data)
+		return err == nil
+	case "config/runtime.json":
+		_, err := ParsePlatformBackupRuntimeConfigV1(data)
+		return err == nil
+	case "edge/tls.json":
+		_, err := ParsePlatformBackupTLSV1(data)
+		return err == nil
+	case "facts/audit.json":
+		_, err := ParsePlatformBackupAuditV1(data)
+		return err == nil
+	case "facts/key-references.json":
+		_, err := ParsePlatformBackupKeyReferencesV1(data)
+		return err == nil
+	case "facts/release.json":
+		_, err := ParsePlatformBackupReleaseV1(data)
+		return err == nil
+	case "facts/routes.json":
+		_, err := ParsePlatformBackupRoutesV1(data)
+		return err == nil
+	case "facts/tasks-outbox.json":
+		_, err := ParsePlatformBackupTasksOutboxV1(data)
+		return err == nil
+	default:
+		return false
+	}
 }
 func platformBackupArchiveSizeOK(manifestSize int64, artifacts []PlatformBackupArtifactV1) bool {
 	total := int64(1024)
