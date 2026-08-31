@@ -48,7 +48,13 @@ http://127.0.0.1:18482 {
 # API/SSE must match before the SPA fallback so a deep link never consumes it.
 console.example.invalid {
 	log {
-		output file {$OPEN_CARD_EDGE_LOG_DIR}/console-access.log
+		output file {$OPEN_CARD_EDGE_LOG_DIR}/console-access.log {
+			mode 0600
+			roll_at 00:00
+			roll_size 100MiB
+			roll_keep -1
+			roll_keep_for 336h
+		}
 		format json
 	}
 	@control_plane path /api*
@@ -78,7 +84,13 @@ http:// {
 
 https:// {
 	log {
-		output file {$OPEN_CARD_EDGE_LOG_DIR}/application-access.log
+		output file {$OPEN_CARD_EDGE_LOG_DIR}/application-access.log {
+			mode 0600
+			roll_at 00:00
+			roll_size 100MiB
+			roll_keep -1
+			roll_keep_for 336h
+		}
 		format json
 	}
 	tls {

@@ -33,6 +33,32 @@ class EdgeConfigContractTests(unittest.TestCase):
         self.assertIn("OPEN_CARD_EDGE_LOG_DIR=/var/log/open-card-edge", self.environment)
         self.assertNotIn("admin 0.0.0.0", self.caddyfile)
 
+    def test_access_log_writers_roll_daily_and_retain_exactly_fourteen_days(self) -> None:
+        writers = re.findall(
+            r"(?m)^\t\toutput file (?P<filename>\{\$OPEN_CARD_EDGE_LOG_DIR\}/(?:console|application)-access\.log) \{\n"
+            r"(?P<policy>(?:\t\t\t[^\n]+\n)+)\t\t\}$",
+            self.caddyfile,
+        )
+        expected_policy = (
+            "mode 0600",
+            "roll_at 00:00",
+            "roll_size 100MiB",
+            "roll_keep -1",
+            "roll_keep_for 336h",
+        )
+        self.assertEqual(
+            {
+                filename: tuple(line.strip() for line in policy.splitlines())
+                for filename, policy in writers
+            },
+            {
+                "{$OPEN_CARD_EDGE_LOG_DIR}/console-access.log": expected_policy,
+                "{$OPEN_CARD_EDGE_LOG_DIR}/application-access.log": expected_policy,
+            },
+        )
+        self.assertNotIn("roll_disabled", self.caddyfile)
+        self.assertNotIn("log_credentials", self.caddyfile)
+
     def test_console_api_precedes_spa_and_rebuilds_trusted_client_source(self) -> None:
         self.assertLess(self.caddyfile.index("@control_plane path /api*"), self.caddyfile.index("try_files {path} /index.html"))
         self.assertIn("reverse_proxy 127.0.0.1:8080", self.caddyfile)
