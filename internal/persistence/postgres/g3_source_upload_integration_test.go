@@ -205,8 +205,11 @@ func TestG3SourceUploadPersistsAndApplicationClaimIsAtomic(t *testing.T) {
 	if err := db.QueryRowContext(ctx, `SELECT provider,git_commit,source_ref,workspace_lifecycle FROM source_revisions WHERE id=$1`, gitCreated.SourceRevisionID.String()).Scan(&provider, &commit, &sourceRef, &lifecycle); err != nil || provider != "git" || commit != strings.Repeat("d", 40) || sourceRef != "main" || lifecycle != string(WorkspacePrepared) {
 		t.Fatalf("Git source persistence provider=%q commit=%q ref=%q lifecycle=%q err=%v", provider, commit, sourceRef, lifecycle, err)
 	}
-	if replayed, err := gitController.CreateApplicationWithSource(ctx, "git-backed", gitSource, "create-git"); err != nil || replayed.Application.ID != gitCreated.Application.ID || replayed.SourceRevisionID != gitCreated.SourceRevisionID || gitPreparer.prepareCount() != 1 {
-		t.Fatalf("Git replay=%+v err=%v prepares=%d", replayed, err, gitPreparer.prepareCount())
+	freshGitPreparer := &postgresGitSourcePreparer{}
+	recreatedGitController := application.NewController(store)
+	recreatedGitController.SetSourcePreparer(freshGitPreparer)
+	if replayed, err := recreatedGitController.CreateApplicationWithSource(ctx, "git-backed", gitSource, "create-git"); err != nil || replayed.Application.ID != gitCreated.Application.ID || replayed.SourceRevisionID != gitCreated.SourceRevisionID || gitPreparer.prepareCount() != 1 || freshGitPreparer.prepareCount() != 0 {
+		t.Fatalf("durable Git replay=%+v err=%v original_prepares=%d fresh_prepares=%d", replayed, err, gitPreparer.prepareCount(), freshGitPreparer.prepareCount())
 	}
 	if _, err := gitController.CreateApplicationWithSource(ctx, "git-backed", &application.CreateApplicationSource{Kind: application.CreateApplicationSourceGit, RepositoryURL: gitSource.RepositoryURL, Ref: "release"}, "create-git"); !errors.Is(err, ErrIdempotencyConflict) {
 		t.Fatalf("Git idempotency conflict=%v", err)

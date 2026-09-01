@@ -72,8 +72,8 @@ const (
 )
 
 // CreateApplicationSource has no client filesystem locator. Uploads refer to
-// one durable, private upload ID; git remains contract-only until a later
-// source preparation path can perform a real remote fetch.
+// one durable, private upload ID; public HTTPS Git is prepared through the
+// configured SourceProvider and then persisted as an immutable revision.
 type CreateApplicationSource struct {
 	Kind          CreateApplicationSourceKind
 	UploadID      domain.ID
@@ -112,7 +112,6 @@ type EventFilter struct {
 type Repository interface {
 	PreflightCreateApplication(context.Context, CreateApplicationPreflight) (CreateApplicationResult, bool, error)
 	CreateApplication(context.Context, CreateApplicationRecord) (CreateApplicationResult, error)
-	HasSourceWorkspaceReference(context.Context, string) (bool, error)
 	ListApplications(context.Context) ([]domain.Application, error)
 	GetApplication(context.Context, domain.ID) (domain.Application, error)
 	ListEvents(context.Context, EventFilter) ([]Event, error)
@@ -232,7 +231,7 @@ func (c *Controller) CreateApplicationWithSource(ctx context.Context, name strin
 	if err == nil || preparedSource == nil {
 		return result, err
 	}
-	return c.compensateFailedSourceCreate(ctx, preflight, *preparedSource, err)
+	return c.compensateFailedSourceCreate(ctx, preflight, err)
 }
 
 // PreparedSourceMatches ensures the source provider's immutable result is the
@@ -250,24 +249,14 @@ func PreparedSourceMatches(source CreateApplicationSource, revision domain.Sourc
 	}
 }
 
-// compensateFailedSourceCreate first resolves the durable outcome. It releases
-// only a workspace which has no committed source_revision reference, so a
-// content-addressed workspace shared by another revision is never removed.
-func (c *Controller) compensateFailedSourceCreate(ctx context.Context, preflight CreateApplicationPreflight, revision domain.SourceRevision, createErr error) (CreateApplicationResult, error) {
+// compensateFailedSourceCreate first resolves the durable outcome. A failed
+// application write retains a finalized content-addressed workspace: deleting
+// it synchronously can race an outcome-unknown commit or a shared immutable
+// digest. Provider Prepare already removes transient stage/object directories;
+// a future reconciled GC owns finalized workspace reclamation.
+func (c *Controller) compensateFailedSourceCreate(ctx context.Context, preflight CreateApplicationPreflight, createErr error) (CreateApplicationResult, error) {
 	if replay, found, err := c.repository.PreflightCreateApplication(ctx, preflight); err == nil && found {
 		return replay, nil
-	} else if err != nil {
-		return CreateApplicationResult{}, createErr
-	}
-	referenced, err := c.repository.HasSourceWorkspaceReference(ctx, revision.WorkspaceRef)
-	if err != nil || referenced {
-		return CreateApplicationResult{}, createErr
-	}
-	cleanupContext, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	cleanupErr := c.sourcePreparer.Release(cleanupContext, contracts.ReleaseSourceRequest{Revision: revision, Operation: contracts.OperationContext{IdempotencyKey: preflight.IdempotencyKey + ":source-cleanup:" + revision.ID.String(), Actor: "control-plane"}})
-	if cleanupErr != nil {
-		return CreateApplicationResult{}, errors.Join(createErr, domain.WrapError(domain.ErrUnavailable, "discard unclaimed source workspace", cleanupErr))
 	}
 	return CreateApplicationResult{}, createErr
 }

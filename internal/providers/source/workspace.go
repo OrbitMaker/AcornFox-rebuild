@@ -23,16 +23,38 @@ import (
 // final worktree would be small. The directory is removed by materializeGit on
 // every success or failure path.
 func boundedGitObjectDirectory(root string, limits foundation.ArchiveLimits) error {
-	var files, bytes int64
+	var files, directories, bytes int64
 	return filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil || entry.Type()&fs.ModeSymlink != 0 {
+		// Git creates and removes its own temporary pack files while the fetch
+		// monitor is walking the bare object directory. A vanished entry is not
+		// retained material and must not become a false size-limit rejection;
+		// every other traversal error remains fail-closed.
+		if walkErr != nil {
+			if path != root && errors.Is(walkErr, fs.ErrNotExist) {
+				return nil
+			}
+			return errGitTooLarge
+		}
+		if entry.Type()&fs.ModeSymlink != 0 {
 			return errGitTooLarge
 		}
 		if entry.IsDir() {
+			if path != root {
+				directories++
+				if directories > limits.MaxFiles {
+					return errGitTooLarge
+				}
+			}
 			return nil
 		}
 		info, err := entry.Info()
-		if err != nil || !info.Mode().IsRegular() || info.Size() < 0 {
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
+			return errGitTooLarge
+		}
+		if !info.Mode().IsRegular() || info.Size() < 0 {
 			return errGitTooLarge
 		}
 		files++
@@ -49,6 +71,7 @@ func boundedGitObjectDirectory(root string, limits foundation.ArchiveLimits) err
 // file metadata that may change while an upload handler is finalizing a file.
 func copyDirectory(source, destination string, limits foundation.ArchiveLimits) error {
 	var files, bytes int64
+	directories := make(map[string]struct{})
 	return filepath.WalkDir(source, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return errUploadRejected
@@ -65,6 +88,9 @@ func copyDirectory(source, destination string, limits foundation.ArchiveLimits) 
 				return filepath.SkipDir
 			}
 			return nil
+		}
+		if err := admitMaterializedDirectories(filepath.ToSlash(rel), infoIsDirectory(path), directories, limits.MaxFiles); err != nil {
+			return errUploadRejected
 		}
 		info, err := os.Lstat(path)
 		if err != nil || info.Mode()&fs.ModeSymlink != 0 {
@@ -149,17 +175,26 @@ func extractZIP(source, destination string, limits foundation.ArchiveLimits) err
 		return errUploadRejected
 	}
 	allowed := allowedEntries(report)
-	var bytes int64
+	var files, bytes int64
+	directories := make(map[string]struct{})
 	for _, file := range reader.File {
 		normalized, violation := foundation.NormalizeArchivePath(file.Name)
 		if violation != "" || !allowed[normalized] {
 			continue
 		}
-		if file.FileInfo().IsDir() {
+		isDirectory := file.FileInfo().IsDir()
+		if err := admitMaterializedDirectories(normalized, isDirectory, directories, limits.MaxFiles); err != nil {
+			return errUploadRejected
+		}
+		if isDirectory {
 			if err := makeDestinationDir(destination, normalized); err != nil {
 				return err
 			}
 			continue
+		}
+		files++
+		if files > limits.MaxFiles {
+			return errUploadRejected
 		}
 		input, err := file.Open()
 		if err != nil {
@@ -204,6 +239,7 @@ func extractTarFile(source, destination string, limits foundation.ArchiveLimits,
 func extractTar(reader *tar.Reader, destination string, limits foundation.ArchiveLimits) error {
 	seen := make(map[string]struct{})
 	var files, bytes int64
+	directories := make(map[string]struct{})
 	for {
 		header, err := reader.Next()
 		if errors.Is(err, io.EOF) {
@@ -242,6 +278,9 @@ func extractTar(reader *tar.Reader, destination string, limits foundation.Archiv
 		if decision.Ignored {
 			continue
 		}
+		if err := admitMaterializedDirectories(decision.NormalizedPath, header.Typeflag == tar.TypeDir, directories, limits.MaxFiles); err != nil {
+			return errUploadRejected
+		}
 		if header.Typeflag == tar.TypeDir {
 			if err := makeDestinationDir(destination, decision.NormalizedPath); err != nil {
 				return err
@@ -263,6 +302,30 @@ func extractTar(reader *tar.Reader, destination string, limits foundation.Archiv
 		}
 		bytes += header.Size
 	}
+}
+
+func infoIsDirectory(path string) bool {
+	info, err := os.Lstat(path)
+	return err == nil && info.IsDir()
+}
+
+func admitMaterializedDirectories(relative string, includeLeaf bool, directories map[string]struct{}, maximum int64) error {
+	parts := strings.Split(strings.Trim(relative, "/"), "/")
+	limit := len(parts) - 1
+	if includeLeaf {
+		limit = len(parts)
+	}
+	for index := 1; index <= limit; index++ {
+		path := strings.Join(parts[:index], "/")
+		if _, exists := directories[path]; exists {
+			continue
+		}
+		directories[path] = struct{}{}
+		if int64(len(directories)) > maximum {
+			return errUploadRejected
+		}
+	}
+	return nil
 }
 
 func allowedEntries(report foundation.ArchiveReport) map[string]bool {

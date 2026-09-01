@@ -25,11 +25,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/open-card/open-card/internal/application"
 	"github.com/open-card/open-card/internal/contracts"
 	"github.com/open-card/open-card/internal/domain"
 )
 
-func TestPreparePublicGitHTTPSFixturePinsAuthorityAndReplaysWithoutClone(t *testing.T) {
+func TestPreparePublicGitHTTPSFixturePinsImmutableRevisionAcrossMovedMain(t *testing.T) {
 	fixture := newHTTPSGitFixture(t, false)
 	provider := fixture.provider(t)
 	request := contracts.PrepareSourceRequest{ApplicationID: "app_git_fixture", Kind: domain.SourceGitHTTPS, Locator: fixture.URL("repo.git"), Ref: "main", Operation: contracts.OperationContext{IdempotencyKey: "fixture-git"}}
@@ -43,10 +44,24 @@ func TestPreparePublicGitHTTPSFixturePinsAuthorityAndReplaysWithoutClone(t *test
 	if contents, err := os.ReadFile(filepath.Join(first.Revision.WorkspaceRef, "README.md")); err != nil || string(contents) != "fixture\n" {
 		t.Fatalf("fixture workspace=%q err=%v", contents, err)
 	}
+	firstCommit, firstDigest, firstWorkspace := first.Revision.Commit, first.Revision.ContentDigest, first.Revision.WorkspaceRef
+	fixture.advanceMain(t, "fixture v2\n")
 	requests := fixture.requests.Load()
 	second, err := provider.Prepare(context.Background(), request)
-	if err != nil || second.Revision.ID != first.Revision.ID || fixture.requests.Load() != requests {
+	if err != nil || second.Revision.ID != first.Revision.ID || second.Revision.Commit != firstCommit || second.Revision.ContentDigest != firstDigest || second.Revision.WorkspaceRef != firstWorkspace || fixture.requests.Load() != requests {
 		t.Fatalf("Git idempotency replay=%+v err=%v requests=%d before=%d", second.Revision, err, fixture.requests.Load(), requests)
+	}
+	nextRequest := request
+	nextRequest.Operation.IdempotencyKey = "fixture-git-next"
+	next, err := provider.Prepare(context.Background(), nextRequest)
+	if err != nil || next.Revision.Commit == firstCommit || next.Revision.ContentDigest == firstDigest || next.Revision.WorkspaceRef == firstWorkspace || fixture.requests.Load() <= requests {
+		t.Fatalf("moved main was not captured as a new immutable revision: next=%+v err=%v requests=%d before=%d", next.Revision, err, fixture.requests.Load(), requests)
+	}
+	if contents, err := os.ReadFile(filepath.Join(next.Revision.WorkspaceRef, "README.md")); err != nil || string(contents) != "fixture v2\n" {
+		t.Fatalf("moved-main workspace=%q err=%v", contents, err)
+	}
+	if contents, err := os.ReadFile(filepath.Join(firstWorkspace, "README.md")); err != nil || string(contents) != "fixture\n" {
+		t.Fatalf("first immutable workspace changed=%q err=%v", contents, err)
 	}
 }
 
@@ -84,6 +99,7 @@ func TestPreparePublicGitHTTPSFixtureRejectsRedirectAndTimeoutWithoutWorkspace(t
 type httpsGitFixture struct {
 	server    *httptest.Server
 	root      string
+	work      string
 	workspace string
 	caPath    string
 	requests  atomic.Int64
@@ -124,7 +140,7 @@ func newHTTPSGitFixture(t *testing.T, redirect bool) *httpsGitFixture {
 	if err := os.WriteFile(caPath, caPEM, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	fixture := &httpsGitFixture{root: projects, workspace: filepath.Join(root, "workspaces"), caPath: caPath, redirect: redirect}
+	fixture := &httpsGitFixture{root: projects, work: work, workspace: filepath.Join(root, "workspaces"), caPath: caPath, redirect: redirect}
 	server := httptest.NewUnstartedServer(http.HandlerFunc(fixture.serveHTTP))
 	server.TLS = &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{certificate}}
 	server.StartTLS()
@@ -132,6 +148,81 @@ func newHTTPSGitFixture(t *testing.T, redirect bool) *httpsGitFixture {
 	t.Cleanup(server.Close)
 	t.Cleanup(func() { makeTreeWritable(t, fixture.workspace) })
 	return fixture
+}
+
+func (f *httpsGitFixture) advanceMain(t *testing.T, readme string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(f.work, "README.md"), []byte(readme), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runFixtureGit(t, "-C", f.work, "add", "README.md")
+	runFixtureGit(t, "-C", f.work, "commit", "-m", "advance main")
+	runFixtureGit(t, "-C", f.work, "push", "origin", "main")
+}
+
+type fixtureApplicationSourceProvider struct {
+	inner   *Provider
+	fixture *httpsGitFixture
+}
+
+func (p fixtureApplicationSourceProvider) Metadata(ctx context.Context) contracts.ProviderMetadata {
+	return p.inner.Metadata(ctx)
+}
+
+func (p fixtureApplicationSourceProvider) Prepare(ctx context.Context, request contracts.PrepareSourceRequest) (contracts.PrepareSourceResult, error) {
+	fixtureRequest := request
+	fixtureRequest.Locator = p.fixture.URL("repo.git")
+	prepared, err := p.inner.Prepare(ctx, fixtureRequest)
+	if err != nil {
+		return contracts.PrepareSourceResult{}, err
+	}
+	// The production controller correctly accepts only default-HTTPS locators;
+	// this package-local fixture needs an ephemeral port. Keep that transport
+	// substitution test-only while returning the exact canonical caller locator.
+	prepared.Revision.Locator = request.Locator
+	return prepared, nil
+}
+
+func (p fixtureApplicationSourceProvider) Release(ctx context.Context, request contracts.ReleaseSourceRequest) error {
+	return p.inner.Release(ctx, request)
+}
+
+type fixtureFailingApplicationRepository struct {
+	*application.MemoryRepository
+	err error
+}
+
+func (r fixtureFailingApplicationRepository) CreateApplication(context.Context, application.CreateApplicationRecord) (application.CreateApplicationResult, error) {
+	return application.CreateApplicationResult{}, r.err
+}
+
+func TestRealPublicGitProviderFailedApplicationCreateRetainsFinalizedWorkspaceOnly(t *testing.T) {
+	fixture := newHTTPSGitFixture(t, false)
+	provider := fixture.provider(t)
+	controller := application.NewController(fixtureFailingApplicationRepository{MemoryRepository: application.NewMemoryRepository(), err: errors.New("forced application transaction failure")})
+	controller.SetSourcePreparer(fixtureApplicationSourceProvider{inner: provider, fixture: fixture})
+	input := &application.CreateApplicationSource{Kind: application.CreateApplicationSourceGit, RepositoryURL: "https://git.fixture.test/repo.git", Ref: "main"}
+	if _, err := controller.CreateApplicationWithSource(context.Background(), "failed git source", input, "fixture-git-create-failure"); err == nil || !strings.Contains(err.Error(), "forced application transaction failure") {
+		t.Fatalf("create failure=%v", err)
+	}
+	assertRetainedGitWorkspaceWithoutTransientEntries(t, fixture.workspace, "fixture\n")
+}
+
+func TestPreparePublicGitRejectsCredentialCanaryWithoutProviderLeak(t *testing.T) {
+	provider := newTestProvider(t, t.TempDir(), filepath.Join(t.TempDir(), "workspaces"))
+	canary := "ACORNFOX_GIT_CANARY_9c8d"
+	request := contracts.PrepareSourceRequest{ApplicationID: "app_git_canary", Kind: domain.SourceGitHTTPS, Locator: "https://user:" + canary + "@git.public.org/repo.git", Ref: "main", Operation: contracts.OperationContext{IdempotencyKey: "fixture-canary"}}
+	_, err := provider.Prepare(context.Background(), request)
+	assertProviderCode(t, err, contracts.ErrValidation)
+	var providerErr *contracts.ProviderError
+	if !errors.As(err, &providerErr) {
+		t.Fatalf("provider error=%T", err)
+	}
+	for _, value := range append([]string{err.Error(), providerErr.Message}, providerErr.Details["evidence_ref"], providerErr.Details["log_ref"]) {
+		if strings.Contains(value, canary) || strings.Contains(value, request.Locator) {
+			t.Fatalf("credential-bearing locator leaked in provider result: %q", value)
+		}
+	}
 }
 
 func (f *httpsGitFixture) URL(repository string) string {
@@ -269,7 +360,33 @@ func assertNoPublishedGitWorkspace(t *testing.T, workspace string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 0 {
+	if entries = workspacePoolEntries(entries); len(entries) != 0 {
 		t.Fatalf("failed Git source published workspace entries: %#v", entries)
 	}
+}
+
+func assertRetainedGitWorkspaceWithoutTransientEntries(t *testing.T, workspace, wantReadme string) {
+	t.Helper()
+	entries, err := os.ReadDir(workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries = workspacePoolEntries(entries)
+	if len(entries) != 1 || !entries[0].IsDir() || strings.HasPrefix(entries[0].Name(), ".source-stage-") || strings.HasPrefix(entries[0].Name(), ".git-objects-") {
+		t.Fatalf("expected one retained finalized workspace and no transient entries: %#v", entries)
+	}
+	contents, err := os.ReadFile(filepath.Join(workspace, entries[0].Name(), "README.md"))
+	if err != nil || string(contents) != wantReadme {
+		t.Fatalf("retained finalized workspace content=%q err=%v", contents, err)
+	}
+}
+
+func workspacePoolEntries(entries []os.DirEntry) []os.DirEntry {
+	filtered := make([]os.DirEntry, 0, len(entries))
+	for _, entry := range entries {
+		if entry.Name() != workspaceLockName {
+			filtered = append(filtered, entry)
+		}
+	}
+	return filtered
 }

@@ -192,21 +192,6 @@ func (s *Store) PreflightCreateApplication(ctx context.Context, input applicatio
 	return application.CreateApplicationResult{}, false, nil
 }
 
-func (s *Store) HasSourceWorkspaceReference(ctx context.Context, workspace string) (bool, error) {
-	if err := s.requireDB(); err != nil {
-		return false, err
-	}
-	workspace = strings.TrimSpace(workspace)
-	if workspace == "" {
-		return false, domain.ValidationError("source workspace reference is required")
-	}
-	var referenced bool
-	if err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM source_revisions WHERE workspace_ref=$1 AND source_kind IS NOT NULL)`, workspace).Scan(&referenced); err != nil {
-		return false, err
-	}
-	return referenced, nil
-}
-
 // CreateApplication writes the application, its default environment, the
 // initial operation and task, the first outbox event, and the completed
 // idempotency response in one transaction. An existing request with a

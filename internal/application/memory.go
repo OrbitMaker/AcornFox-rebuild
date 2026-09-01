@@ -22,7 +22,6 @@ type MemoryRepository struct {
 	applications map[domain.ID]domain.Application
 	idempotency  map[string]memoryIdempotency
 	uploads      map[domain.ID]domain.SourceUploadRecord
-	workspaces   map[string]domain.ID
 	events       []Event
 	nextSequence uint64
 }
@@ -32,7 +31,6 @@ func NewMemoryRepository() *MemoryRepository {
 		applications: make(map[domain.ID]domain.Application),
 		idempotency:  make(map[string]memoryIdempotency),
 		uploads:      make(map[domain.ID]domain.SourceUploadRecord),
-		workspaces:   make(map[string]domain.ID),
 	}
 }
 
@@ -117,20 +115,10 @@ func (r *MemoryRepository) CreateApplication(_ context.Context, record CreateApp
 	record.Event.Sequence = r.nextSequence
 	record.Event.ID = eventID(record.Event.Sequence)
 	r.applications[record.Application.ID] = record.Application
-	if record.PreparedSource != nil {
-		r.workspaces[record.PreparedSource.WorkspaceRef] = record.PreparedSource.ID
-	}
 	result := CreateApplicationResult{Application: record.Application, EnvironmentID: record.EnvironmentID, OperationID: record.OperationID, SourceRevisionID: preparedSourceID(record.PreparedSource), Event: cloneEvent(record.Event)}
 	r.events = append(r.events, cloneEvent(record.Event))
 	r.idempotency[record.IdempotencyKey] = memoryIdempotency{digest: record.RequestDigest, result: cloneCreateResult(result)}
 	return result, nil
-}
-
-func (r *MemoryRepository) HasSourceWorkspaceReference(_ context.Context, workspace string) (bool, error) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	_, found := r.workspaces[workspace]
-	return found, nil
 }
 
 func preparedSourceID(source *domain.SourceRevision) domain.ID {

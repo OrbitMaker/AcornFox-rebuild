@@ -3,6 +3,7 @@ package application
 import (
 	"context"
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -137,20 +138,28 @@ func TestControllerCreateWithUploadCarriesImmutableSourceRevision(t *testing.T) 
 
 func TestControllerCreateWithPublicGitReplaysPreparedRevision(t *testing.T) {
 	repository := NewMemoryRepository()
-	preparer := &testSourcePreparer{}
+	firstPreparer := &testSourcePreparer{}
 	controller := NewController(repository)
-	controller.SetSourcePreparer(preparer)
+	controller.SetSourcePreparer(firstPreparer)
 	source := &CreateApplicationSource{Kind: CreateApplicationSourceGit, RepositoryURL: "https://git.public.example/project/repo.git", Ref: "main"}
 	first, err := controller.CreateApplicationWithSource(context.Background(), "git app", source, "git-create")
 	if err != nil || first.SourceRevisionID.Empty() {
 		t.Fatalf("first=%+v err=%v", first, err)
 	}
-	replay, err := controller.CreateApplicationWithSource(context.Background(), "git app", source, "git-create")
+	// A fresh Controller/process must use durable preflight replay before it
+	// invokes its newly composed source provider.
+	freshPreparer := &testSourcePreparer{}
+	recreated := NewController(repository)
+	recreated.SetSourcePreparer(freshPreparer)
+	replay, err := recreated.CreateApplicationWithSource(context.Background(), "git app", source, "git-create")
 	if err != nil || replay.Application.ID != first.Application.ID || replay.SourceRevisionID != first.SourceRevisionID {
 		t.Fatalf("replay=%+v err=%v", replay, err)
 	}
-	if prepares, releases := preparer.counts(); prepares != 1 || releases != 0 {
-		t.Fatalf("Git replay source side effect: prepares=%d releases=%d", prepares, releases)
+	if prepares, releases := firstPreparer.counts(); prepares != 1 || releases != 0 {
+		t.Fatalf("first Git source preparation: prepares=%d releases=%d", prepares, releases)
+	}
+	if prepares, releases := freshPreparer.counts(); prepares != 0 || releases != 0 {
+		t.Fatalf("recreated controller replay invoked fresh source provider: prepares=%d releases=%d", prepares, releases)
 	}
 	changed := &CreateApplicationSource{Kind: CreateApplicationSourceGit, RepositoryURL: source.RepositoryURL, Ref: "release"}
 	if _, err := controller.CreateApplicationWithSource(context.Background(), "git app", changed, "git-create"); !errors.Is(err, ErrIdempotencyConflict) {
@@ -243,7 +252,7 @@ func TestControllerConcurrentUploadReplayPreparesOnlyOnce(t *testing.T) {
 	}
 }
 
-func TestControllerCompensatesFailedSourceCreateWithoutWorkspaceOrphan(t *testing.T) {
+func TestControllerFailedSourceCreateRetainsFinalizedWorkspaceWithoutProviderRelease(t *testing.T) {
 	now := time.Now().UTC()
 	base := NewMemoryRepository()
 	upload := testReadyUpload("upload_cleanup", now.Add(time.Hour))
@@ -259,6 +268,19 @@ func TestControllerCompensatesFailedSourceCreateWithoutWorkspaceOrphan(t *testin
 		t.Fatal(err)
 	}
 	workspaceRoot := filepath.Join(t.TempDir(), "workspaces")
+	t.Cleanup(func() {
+		if err := filepath.WalkDir(workspaceRoot, func(path string, entry fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			if entry.IsDir() {
+				return os.Chmod(path, 0o700)
+			}
+			return os.Chmod(path, 0o600)
+		}); err != nil && !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("restore retained workspace permissions for test cleanup: %v", err)
+		}
+	})
 	provider, err := source.New(source.Config{UploadRoot: uploadRoot, WorkspaceRoot: workspaceRoot})
 	if err != nil {
 		t.Fatal(err)
@@ -273,12 +295,26 @@ func TestControllerCompensatesFailedSourceCreateWithoutWorkspaceOrphan(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 0 {
-		t.Fatalf("failed source create left workspace entries: %#v", entries)
+	entries = filterControllerWorkspaceEntries(entries)
+	if len(entries) != 1 || !entries[0].IsDir() || strings.HasPrefix(entries[0].Name(), ".source-stage-") || strings.HasPrefix(entries[0].Name(), ".git-objects-") {
+		t.Fatalf("failed source create did not retain exactly one finalized workspace: %#v", entries)
+	}
+	if contents, err := os.ReadFile(filepath.Join(workspaceRoot, entries[0].Name(), "main.go")); err != nil || string(contents) != "package main\n" {
+		t.Fatalf("retained finalized workspace content=%q err=%v", contents, err)
 	}
 }
 
-func TestControllerCompensatesFailedPublicGitCreate(t *testing.T) {
+func filterControllerWorkspaceEntries(entries []os.DirEntry) []os.DirEntry {
+	filtered := make([]os.DirEntry, 0, len(entries))
+	for _, entry := range entries {
+		if entry.Name() != ".workspace.lock" {
+			filtered = append(filtered, entry)
+		}
+	}
+	return filtered
+}
+
+func TestControllerFailedPublicGitCreateDoesNotInvokeProviderRelease(t *testing.T) {
 	base := NewMemoryRepository()
 	createFailure := errors.New("forced Git application transaction failure")
 	preparer := &testSourcePreparer{}
@@ -288,8 +324,8 @@ func TestControllerCompensatesFailedPublicGitCreate(t *testing.T) {
 	if _, err := controller.CreateApplicationWithSource(context.Background(), "git cleanup", source, "git-cleanup-failure"); !errors.Is(err, createFailure) {
 		t.Fatalf("create failure=%v", err)
 	}
-	if prepares, releases := preparer.counts(); prepares != 1 || releases != 1 {
-		t.Fatalf("Git cleanup side effect: prepares=%d releases=%d", prepares, releases)
+	if prepares, releases := preparer.counts(); prepares != 1 || releases != 0 {
+		t.Fatalf("failed Git create provider side effect: prepares=%d releases=%d", prepares, releases)
 	}
 }
 

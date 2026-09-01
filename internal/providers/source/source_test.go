@@ -301,7 +301,7 @@ func TestPrepareRejectsCompressionBombBeforeWorkspacePublication(t *testing.T) {
 	if readErr != nil {
 		t.Fatal(readErr)
 	}
-	if len(entries) != 0 {
+	if entries = workspacePoolEntries(entries); len(entries) != 0 {
 		t.Fatalf("compression bomb published workspace entries: %#v", entries)
 	}
 }

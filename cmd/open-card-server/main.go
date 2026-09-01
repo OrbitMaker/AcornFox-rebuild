@@ -149,7 +149,11 @@ func main() {
 			if err != nil {
 				log.Fatal(err)
 			}
-			sourceProvider, err := source.New(source.Config{UploadRoot: uploadRoot, WorkspaceRoot: workspaceRoot, GitResolverEndpoints: sourceGitResolverEndpoints(os.Getenv("OPEN_CARD_SOURCE_GIT_RESOLVERS"))})
+			workspaceCapacityBytes, workspaceCapacityEntries, workspaceOperationalReserveBytes, workspaceOperationalReserveEntries, capacityErr := sourceWorkspaceCapacityConfig(os.Getenv)
+			if capacityErr != nil {
+				log.Fatal("invalid source workspace capacity configuration")
+			}
+			sourceProvider, err := source.New(source.Config{UploadRoot: uploadRoot, WorkspaceRoot: workspaceRoot, WorkspaceCapacityBytes: workspaceCapacityBytes, WorkspaceCapacityEntries: workspaceCapacityEntries, WorkspaceOperationalReserveBytes: workspaceOperationalReserveBytes, WorkspaceOperationalReserveEntries: workspaceOperationalReserveEntries, GitResolverEndpoints: sourceGitResolverEndpoints(os.Getenv("OPEN_CARD_SOURCE_GIT_RESOLVERS"))})
 			if err != nil {
 				log.Fatal(err)
 			}
@@ -517,4 +521,29 @@ func sourceGitResolverEndpoints(raw string) []string {
 		}
 	}
 	return result
+}
+
+func sourceWorkspaceCapacityConfig(getenv func(string) string) (int64, int64, int64, int64, error) {
+	if getenv == nil {
+		return 0, 0, 0, 0, errors.New("source workspace environment is unavailable")
+	}
+	names := []string{
+		"OPEN_CARD_SOURCE_WORKSPACE_CAPACITY_BYTES",
+		"OPEN_CARD_SOURCE_WORKSPACE_CAPACITY_ENTRIES",
+		"OPEN_CARD_SOURCE_WORKSPACE_OPERATIONAL_RESERVE_BYTES",
+		"OPEN_CARD_SOURCE_WORKSPACE_OPERATIONAL_RESERVE_ENTRIES",
+	}
+	values := [4]int64{}
+	for index, name := range names {
+		raw := strings.TrimSpace(getenv(name))
+		if raw == "" {
+			continue
+		}
+		parsed, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || parsed < 0 {
+			return 0, 0, 0, 0, errors.New("source workspace capacity environment is invalid")
+		}
+		values[index] = parsed
+	}
+	return values[0], values[1], values[2], values[3], nil
 }

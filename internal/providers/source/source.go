@@ -44,10 +44,14 @@ var commitPattern = regexp.MustCompile(`^[0-9a-f]{40}([0-9a-f]{24})?$`)
 // Both paths are resolved once at construction, preventing a caller from
 // selecting arbitrary host paths in a PrepareSourceRequest.
 type Config struct {
-	UploadRoot    string
-	WorkspaceRoot string
-	Limits        foundation.ArchiveLimits
-	GitBinary     string
+	UploadRoot                         string
+	WorkspaceRoot                      string
+	WorkspaceCapacityBytes             int64
+	WorkspaceCapacityEntries           int64
+	WorkspaceOperationalReserveBytes   int64
+	WorkspaceOperationalReserveEntries int64
+	Limits                             foundation.ArchiveLimits
+	GitBinary                          string
 	// GitResolvers and GitResolverEndpoints are a fail-closed public-DNS
 	// boundary. When both are empty, uploads remain available but public Git
 	// preparation is deliberately unavailable rather than using the host
@@ -61,13 +65,18 @@ type Config struct {
 // covers a complete preparation: it makes retries deterministic and avoids
 // two callers racing to publish different content for one idempotency key.
 type Provider struct {
-	metadata      contracts.ProviderMetadata
-	uploadRoot    string
-	workspaceRoot string
-	limits        foundation.ArchiveLimits
-	gitBinary     string
-	gitResolvers  []GitResolver
-	clock         func() time.Time
+	metadata                           contracts.ProviderMetadata
+	uploadRoot                         string
+	workspaceRoot                      string
+	workspaceCapacityBytes             int64
+	workspaceCapacityEntries           int64
+	workspaceOperationalReserveBytes   int64
+	workspaceOperationalReserveEntries int64
+	filesystemAvailability             func(string) (workspaceFilesystemAvailability, error)
+	limits                             foundation.ArchiveLimits
+	gitBinary                          string
+	gitResolvers                       []GitResolver
+	clock                              func() time.Time
 
 	// testGitFixture and gitTLSCAFile have no Config surface. They exist only
 	// for the package-local HTTPS fixture which proves Git's TLS/pinned-address
@@ -104,6 +113,14 @@ func New(config Config) (*Provider, error) {
 	if limits.MaxFiles <= 0 || limits.MaxUnpackedBytes <= 0 {
 		return nil, errors.New("source limits must be finite and positive")
 	}
+	workspaceCapacityBytes, workspaceCapacityEntries, err := normalizedWorkspaceCapacity(config.WorkspaceCapacityBytes, config.WorkspaceCapacityEntries, limits)
+	if err != nil {
+		return nil, err
+	}
+	workspaceOperationalReserveBytes, workspaceOperationalReserveEntries, err := normalizedWorkspaceOperationalReserve(config.WorkspaceOperationalReserveBytes, config.WorkspaceOperationalReserveEntries)
+	if err != nil {
+		return nil, err
+	}
 	gitBinary := strings.TrimSpace(config.GitBinary)
 	if gitBinary == "" {
 		gitBinary = "git"
@@ -124,7 +141,8 @@ func New(config Config) (*Provider, error) {
 			Capabilities:    contracts.NewCapabilitySet(contracts.CapabilitySourcePrepare, contracts.CapabilitySourceRelease),
 			SensitiveInputs: []string{"source.locator", "source.workspace_ref"},
 		},
-		uploadRoot: uploadRoot, workspaceRoot: workspaceRoot, limits: limits,
+		uploadRoot: uploadRoot, workspaceRoot: workspaceRoot, limits: limits, workspaceCapacityBytes: workspaceCapacityBytes, workspaceCapacityEntries: workspaceCapacityEntries,
+		workspaceOperationalReserveBytes: workspaceOperationalReserveBytes, workspaceOperationalReserveEntries: workspaceOperationalReserveEntries, filesystemAvailability: workspaceFilesystemAvailabilityForRoot,
 		gitBinary: gitBinary, gitResolvers: gitResolvers, clock: clock, byKey: make(map[string]storedResult),
 	}, nil
 }
@@ -136,12 +154,19 @@ func (p *Provider) Metadata(context.Context) contracts.ProviderMetadata { return
 // provider. It is idempotent and refuses caller-selected paths outside the
 // configured workspace root.
 func (p *Provider) Release(ctx context.Context, request contracts.ReleaseSourceRequest) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if err := p.checkFor(ctx, request.Operation, contracts.CapabilitySourceRelease); err != nil {
 		return err
 	}
 	if err := request.Revision.Validate(); err != nil {
 		return p.failure(request.Operation, contracts.ErrValidation, "source revision is invalid", nil)
 	}
+	releaseLock, err := acquireWorkspaceRootLock(p.workspaceRoot)
+	if err != nil {
+		return p.failure(request.Operation, contracts.ErrUnavailable, "source workspace is unavailable", nil)
+	}
+	defer releaseLock()
 	workspace, err := filepath.Abs(request.Revision.WorkspaceRef)
 	if err != nil || !withinSourceRoot(p.workspaceRoot, workspace) || filepath.Clean(workspace) == filepath.Clean(p.workspaceRoot) {
 		return p.failure(request.Operation, contracts.ErrForbidden, "source workspace is outside provider boundary", nil)
@@ -173,6 +198,7 @@ func (p *Provider) Release(ctx context.Context, request contracts.ReleaseSourceR
 	if err := os.RemoveAll(resolved); err != nil {
 		return p.failure(request.Operation, contracts.ErrUnavailable, "source workspace release failed", nil)
 	}
+	p.invalidateCachedWorkspace(workspace)
 	return nil
 }
 
@@ -180,7 +206,7 @@ func (p *Provider) Release(ctx context.Context, request contracts.ReleaseSourceR
 // partially copied workspace is ever returned. A SourceRevision only becomes
 // visible after its tree has been written, hashed, and made read-only.
 func (p *Provider) Prepare(ctx context.Context, request contracts.PrepareSourceRequest) (contracts.PrepareSourceResult, error) {
-	if err := p.check(ctx, request.Operation); err != nil {
+	if err := p.checkPrepare(ctx, request.Operation); err != nil {
 		return contracts.PrepareSourceResult{}, err
 	}
 	ctx, cancel := operationContext(ctx, request.Operation)
@@ -206,7 +232,39 @@ func (p *Provider) Prepare(ctx context.Context, request contracts.PrepareSourceR
 		if previous.fingerprint != fingerprint {
 			return contracts.PrepareSourceResult{}, p.failure(request.Operation, contracts.ErrConflict, "idempotency key was reused for a different source", nil)
 		}
+		if err := p.ensureWorkspaceRoot(); err != nil {
+			return contracts.PrepareSourceResult{}, p.failure(request.Operation, contracts.ErrUnavailable, "source workspace is unavailable", nil)
+		}
+		replayLock, err := acquireWorkspaceRootLock(p.workspaceRoot)
+		if err != nil {
+			return contracts.PrepareSourceResult{}, p.failure(request.Operation, contracts.ErrUnavailable, "source workspace is unavailable", nil)
+		}
+		defer replayLock()
+		if err := p.verifyCachedRevision(previous.result.Revision); err != nil {
+			delete(p.byKey, request.Operation.IdempotencyKey)
+			return contracts.PrepareSourceResult{}, p.failure(request.Operation, contracts.ErrUnavailable, "source workspace is unavailable", nil)
+		}
 		return cloneResult(previous.result), nil
+	}
+	if err := p.ensureWorkspaceRoot(); err != nil {
+		return contracts.PrepareSourceResult{}, p.failure(request.Operation, contracts.ErrUnavailable, "source workspace is unavailable", nil)
+	}
+	prepareLock, err := acquireWorkspaceRootLock(p.workspaceRoot)
+	if err != nil {
+		return contracts.PrepareSourceResult{}, p.failure(request.Operation, contracts.ErrUnavailable, "source workspace is unavailable", nil)
+	}
+	defer prepareLock()
+	usage, err := measureWorkspacePool(p.workspaceRoot)
+	if err != nil {
+		return contracts.PrepareSourceResult{}, p.failure(request.Operation, contracts.ErrUnavailable, "source workspace is unavailable", nil)
+	}
+	reserve, err := workspaceAdmissionReserve(request.Kind, p.limits)
+	if err != nil || !workspaceAdmissionAllowed(usage, reserve, p.workspaceCapacityBytes, p.workspaceCapacityEntries) {
+		return contracts.PrepareSourceResult{}, p.failure(request.Operation, contracts.ErrUnavailable, "source workspace capacity is unavailable", nil)
+	}
+	availability, err := p.filesystemAvailability(p.workspaceRoot)
+	if err != nil || !workspaceFilesystemAdmissionAllowed(availability, reserve, p.workspaceOperationalReserveBytes, p.workspaceOperationalReserveEntries) {
+		return contracts.PrepareSourceResult{}, p.failure(request.Operation, contracts.ErrUnavailable, "source workspace capacity is unavailable", nil)
 	}
 
 	stage, err := os.MkdirTemp(p.workspaceRoot, ".source-stage-")
@@ -251,11 +309,21 @@ func (p *Provider) Prepare(ctx context.Context, request contracts.PrepareSourceR
 
 var errUnsupportedSource = errors.New("unsupported source kind")
 
-func (p *Provider) check(ctx context.Context, operation contracts.OperationContext) error {
-	return p.checkFor(ctx, operation, contracts.CapabilitySourcePrepare)
+func (p *Provider) checkFor(ctx context.Context, operation contracts.OperationContext, capability contracts.Capability) error {
+	if err := p.checkPrepareFor(ctx, operation, capability); err != nil {
+		return err
+	}
+	if err := p.ensureWorkspaceRoot(); err != nil {
+		return p.failure(operation, contracts.ErrUnavailable, "source workspace is unavailable", nil)
+	}
+	return nil
 }
 
-func (p *Provider) checkFor(ctx context.Context, operation contracts.OperationContext, capability contracts.Capability) error {
+func (p *Provider) checkPrepare(ctx context.Context, operation contracts.OperationContext) error {
+	return p.checkPrepareFor(ctx, operation, contracts.CapabilitySourcePrepare)
+}
+
+func (p *Provider) checkPrepareFor(ctx context.Context, operation contracts.OperationContext, capability contracts.Capability) error {
 	if err := p.metadata.Validate(); err != nil {
 		return err
 	}
@@ -268,14 +336,45 @@ func (p *Provider) checkFor(ctx context.Context, operation contracts.OperationCo
 	if err := contextError(ctx, operation); err != nil {
 		return p.classify(operation, err)
 	}
+	return nil
+}
+
+func (p *Provider) ensureWorkspaceRoot() error {
 	if err := os.MkdirAll(p.workspaceRoot, 0o700); err != nil {
-		return p.failure(operation, contracts.ErrUnavailable, "source workspace is unavailable", nil)
+		return errWorkspaceUnavailable
 	}
-	info, err := os.Stat(p.workspaceRoot)
-	if err != nil || !info.IsDir() {
-		return p.failure(operation, contracts.ErrUnavailable, "source workspace is unavailable", nil)
+	info, err := os.Lstat(p.workspaceRoot)
+	if err != nil || !info.IsDir() || info.Mode()&fs.ModeSymlink != 0 {
+		return errWorkspaceUnavailable
 	}
 	return nil
+}
+
+func (p *Provider) verifyCachedRevision(revision domain.SourceRevision) error {
+	if err := revision.Validate(); err != nil {
+		return errWorkspaceUnavailable
+	}
+	workspace, err := filepath.Abs(revision.WorkspaceRef)
+	if err != nil || !withinSourceRoot(p.workspaceRoot, workspace) || filepath.Clean(workspace) == filepath.Clean(p.workspaceRoot) {
+		return errWorkspaceUnavailable
+	}
+	info, err := os.Lstat(workspace)
+	if err != nil || !info.IsDir() || info.Mode()&fs.ModeSymlink != 0 {
+		return errWorkspaceUnavailable
+	}
+	digest, err := foundation.HashDirectory(workspace)
+	if err != nil || !sameDigest(revision.ContentDigest, digest) {
+		return errWorkspaceUnavailable
+	}
+	return nil
+}
+
+func (p *Provider) invalidateCachedWorkspace(workspace string) {
+	for key, result := range p.byKey {
+		if result.result.Revision.WorkspaceRef == workspace {
+			delete(p.byKey, key)
+		}
+	}
 }
 
 func withinSourceRoot(root, path string) bool {
