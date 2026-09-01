@@ -188,6 +188,10 @@ func TestCT_BUILD_004_FakeBuildRejectsControlledEgressAndKeepsItsOperationTableE
 	provider := NewFakeBuildProvider(true)
 	request := validBuildRequest("controlled-fake")
 	request.Network = NetworkPolicy{Mode: NetworkModeControlledEgressV1, WorkerPolicyDigest: "sha256:" + strings.Repeat("a", 64)}
+	request.Plan.AcornFoxDefinitionDigest = "sha256:" + strings.Repeat("b", 64)
+	request.Plan.AcornFoxDockerfileDigest = "sha256:" + strings.Repeat("c", 64)
+	request.Plan.AcornFoxNetworkMode = string(request.Network.Mode)
+	request.Plan.AcornFoxWorkerPolicyDigest = request.Network.WorkerPolicyDigest
 	providerErrorCode(t, mustBuildError(provider, request), ErrForbidden)
 	provider.mu.Lock()
 	attempts := provider.attempts[request.Operation.IdempotencyKey]
@@ -199,6 +203,20 @@ func TestCT_BUILD_004_FakeBuildRejectsControlledEgressAndKeepsItsOperationTableE
 
 	request.Network.AllowedCIDRs = []string{"10.0.0.0/8"}
 	providerErrorCode(t, mustBuildError(provider, request), ErrValidation)
+
+	mismatch := validBuildRequest("controlled-fake-mismatch")
+	mismatch.Plan.AcornFoxDefinitionDigest = "sha256:" + strings.Repeat("b", 64)
+	mismatch.Plan.AcornFoxDockerfileDigest = "sha256:" + strings.Repeat("c", 64)
+	mismatch.Plan.AcornFoxNetworkMode = string(NetworkModeControlledEgressV1)
+	mismatch.Plan.AcornFoxWorkerPolicyDigest = "sha256:" + strings.Repeat("a", 64)
+	providerErrorCode(t, mustBuildError(provider, mismatch), ErrForbidden)
+	provider.mu.Lock()
+	mismatchAttempts := provider.attempts[mismatch.Operation.IdempotencyKey]
+	_, mismatchRecorded := provider.request[mismatch.Operation.IdempotencyKey]
+	provider.mu.Unlock()
+	if mismatchAttempts != 0 || mismatchRecorded {
+		t.Fatalf("network mismatch changed fake operation state: attempts=%d recorded=%t", mismatchAttempts, mismatchRecorded)
+	}
 }
 
 func mustBuildError(provider *FakeBuildProvider, request BuildRequest, contexts ...context.Context) error {

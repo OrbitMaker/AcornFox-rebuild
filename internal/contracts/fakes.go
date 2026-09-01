@@ -412,8 +412,15 @@ func NewFakeBuildProvider(enabled bool) *FakeBuildProvider {
 func (f *FakeBuildProvider) Metadata(context.Context) ProviderMetadata { return f.Info }
 
 func (f *FakeBuildProvider) Build(ctx context.Context, request BuildRequest) (BuildResult, error) {
+	if err := request.Plan.Validate(); err != nil {
+		return BuildResult{}, fakeValidation(f.Info, request.Operation, CapabilityBuild, "build", "build plan is invalid", err)
+	}
 	if err := request.Network.Validate(); err != nil {
 		return BuildResult{}, fakeValidation(f.Info, request.Operation, CapabilityBuild, "build", "build network policy is invalid", err)
+	}
+	planMode, planWorkerPolicyDigest := request.Plan.EffectiveAcornFoxNetworkPolicy()
+	if string(request.Network.EffectiveMode()) != planMode || request.Network.WorkerPolicyDigest != planWorkerPolicyDigest {
+		return BuildResult{}, fakeProviderError(f.Info, request.Operation, CapabilityBuild, "build", ErrForbidden, "build network policy does not match the immutable build plan", RetryNever, false, nil)
 	}
 	if request.Network.EffectiveMode() == NetworkModeControlledEgressV1 {
 		return BuildResult{}, fakeProviderError(f.Info, request.Operation, CapabilityBuild, "build", ErrForbidden, "controlled egress worker policy is unavailable", RetryNever, false, nil)
@@ -425,16 +432,13 @@ func (f *FakeBuildProvider) Build(ctx context.Context, request BuildRequest) (Bu
 	if err := fakeCheck(ctx, f.Info, CapabilityBuild, request.Operation, f.Behavior, "build", attempt); err != nil {
 		return BuildResult{}, err
 	}
-	if err := request.Plan.Validate(); err != nil {
-		return BuildResult{}, fakeValidation(f.Info, request.Operation, CapabilityBuild, "build", "build plan is invalid", err)
-	}
 	if err := domain.RequireID(request.BuildID, "build id"); err != nil {
 		return BuildResult{}, fakeValidation(f.Info, request.Operation, CapabilityBuild, "build", "build id is invalid", err)
 	}
 	if err := request.Source.Validate(); err != nil || request.Source.ID != request.Plan.SourceRevisionID || request.Source.ContentDigest != request.Plan.SourceDigest {
 		return BuildResult{}, fakeValidation(f.Info, request.Operation, CapabilityBuild, "build", "source revision binding is invalid", err)
 	}
-	fingerprint := fakeHash(string(request.BuildID), string(request.Plan.ID), string(request.Plan.SourceRevisionID), request.Plan.SourceDigest, request.Plan.ServiceName, string(request.Plan.Kind), request.Plan.ContextPath, request.Plan.DockerfilePath, request.Plan.StaticRuntimeDigest, request.Plan.TargetRepository, request.Plan.Output.StorageKey, string(request.Network.EffectiveMode()), request.Network.WorkerPolicyDigest, request.Plan.IdempotencyKey)
+	fingerprint := fakeHash(string(request.BuildID), string(request.Plan.ID), string(request.Plan.SourceRevisionID), request.Plan.SourceDigest, request.Plan.ServiceName, string(request.Plan.Kind), request.Plan.ContextPath, request.Plan.DockerfilePath, request.Plan.StaticRuntimeDigest, request.Plan.AcornFoxDefinitionDigest, request.Plan.AcornFoxDockerfileDigest, request.Plan.AcornFoxNetworkMode, request.Plan.AcornFoxWorkerPolicyDigest, request.Plan.TargetRepository, request.Plan.Output.StorageKey, string(request.Network.EffectiveMode()), request.Network.WorkerPolicyDigest, request.Plan.IdempotencyKey)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.cancelled[request.Operation.IdempotencyKey] {

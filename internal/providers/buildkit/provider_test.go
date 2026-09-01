@@ -418,7 +418,10 @@ func TestControlledEgressIsUnavailableBeforeAnyDownstreamEffect(t *testing.T) {
 	provider.config.SecretResolver = secrets
 
 	request := testRequest("controlled-unavailable", source)
+	bindAcornFoxDigests(t, &request)
 	request.Network = contracts.NetworkPolicy{Mode: contracts.NetworkModeControlledEgressV1, WorkerPolicyDigest: policyDigest}
+	request.Plan.AcornFoxNetworkMode = string(request.Network.Mode)
+	request.Plan.AcornFoxWorkerPolicyDigest = request.Network.WorkerPolicyDigest
 	request.Source.WorkspaceRef = filepath.Join(root, "must-not-evaluate")
 	assertProviderCode(t, mustBuild(provider, request), contracts.ErrForbidden)
 	if runner.callCount() != 0 || logs.callCount() != 0 || store.callCount() != 0 || capacity.activations != 0 || secrets.calls != 0 {
@@ -432,7 +435,18 @@ func TestControlledEgressIsUnavailableBeforeAnyDownstreamEffect(t *testing.T) {
 	bound := testRequest("controlled-acornfox-bound", source)
 	bindAcornFoxDigests(t, &bound)
 	bound.Network = contracts.NetworkPolicy{Mode: contracts.NetworkModeControlledEgressV1, WorkerPolicyDigest: policyDigest}
+	bound.Plan.AcornFoxNetworkMode = string(bound.Network.Mode)
+	bound.Plan.AcornFoxWorkerPolicyDigest = bound.Network.WorkerPolicyDigest
 	assertProviderCode(t, mustBuild(provider, bound), contracts.ErrForbidden)
+
+	mismatchedMode := bound
+	mismatchedMode.Operation.IdempotencyKey = "controlled-plan-offline-request"
+	mismatchedMode.Network = contracts.NetworkPolicy{Mode: contracts.NetworkModeOffline}
+	assertProviderCode(t, mustBuild(provider, mismatchedMode), contracts.ErrForbidden)
+	mismatchedDigest := bound
+	mismatchedDigest.Operation.IdempotencyKey = "controlled-plan-other-digest"
+	mismatchedDigest.Network.WorkerPolicyDigest = "sha256:" + strings.Repeat("e", 64)
+	assertProviderCode(t, mustBuild(provider, mismatchedDigest), contracts.ErrForbidden)
 
 	static := testRequest("controlled-static", source)
 	static.Plan.Kind = domain.BuildStatic
@@ -452,6 +466,9 @@ func TestControlledEgressChangesFingerprintWithoutExecuting(t *testing.T) {
 	offline := testRequest("network-fingerprint", source)
 	controlled := offline
 	controlled.Network = contracts.NetworkPolicy{Mode: contracts.NetworkModeControlledEgressV1, WorkerPolicyDigest: policyDigest}
+	bindAcornFoxDigests(t, &controlled)
+	controlled.Plan.AcornFoxNetworkMode = string(controlled.Network.Mode)
+	controlled.Plan.AcornFoxWorkerPolicyDigest = controlled.Network.WorkerPolicyDigest
 	differentPolicy := controlled
 	differentPolicy.Network.WorkerPolicyDigest = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
 	if requestFingerprint(offline) == requestFingerprint(controlled) || requestFingerprint(controlled) == requestFingerprint(differentPolicy) {

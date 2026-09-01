@@ -275,11 +275,14 @@ func (p *Provider) validateRequest(ctx context.Context, request contracts.BuildR
 	if err := request.Operation.Validate(); err != nil {
 		return p.providerError(request.Operation, contracts.ErrInvalidArgument, "provider idempotency key is required", contracts.RetryNever, false, err)
 	}
-	if err := p.validateNetwork(request.Network); err != nil {
-		return p.providerError(request.Operation, contracts.ErrForbidden, "build network policy is unavailable", contracts.RetryNever, false, err)
-	}
 	if err := request.Plan.Validate(); err != nil {
 		return p.providerError(request.Operation, contracts.ErrValidation, "build plan is invalid", contracts.RetryNever, false, err)
+	}
+	if err := validatePlanNetworkIdentity(request.Plan, request.Network); err != nil {
+		return p.providerError(request.Operation, contracts.ErrForbidden, "build network policy does not match the immutable build plan", contracts.RetryNever, false, err)
+	}
+	if err := p.validateNetwork(request.Network); err != nil {
+		return p.providerError(request.Operation, contracts.ErrForbidden, "build network policy is unavailable", contracts.RetryNever, false, err)
 	}
 	if err := validateAcornFoxPlan(request.Plan); err != nil {
 		return p.providerError(request.Operation, contracts.ErrValidation, "AcornFox build plan is invalid", contracts.RetryNever, false, err)
@@ -309,6 +312,17 @@ func (p *Provider) validateRequest(ctx context.Context, request contracts.BuildR
 	}
 	if requiresDurableLog(request.Plan) && p.config.LogSink == nil {
 		return p.providerError(request.Operation, contracts.ErrUnavailable, "build durable log sink is unavailable", contracts.RetryUserAction, false, nil)
+	}
+	return nil
+}
+
+func validatePlanNetworkIdentity(plan domain.BuildPlan, network contracts.NetworkPolicy) error {
+	if err := network.Validate(); err != nil {
+		return err
+	}
+	mode, workerPolicyDigest := plan.EffectiveAcornFoxNetworkPolicy()
+	if string(network.EffectiveMode()) != mode || network.WorkerPolicyDigest != workerPolicyDigest {
+		return errors.New("build request network policy does not match immutable build plan")
 	}
 	return nil
 }
@@ -804,7 +818,7 @@ func requestFingerprint(request contracts.BuildRequest) string {
 		secretIDs = append(secretIDs, string(reference.ID)+":"+reference.Version)
 	}
 	sort.Strings(secretIDs)
-	return hashText(string(request.BuildID), string(request.Plan.ID), string(request.Plan.SourceRevisionID), request.Plan.SourceDigest, request.Plan.ServiceName, string(request.Plan.Kind), request.Plan.ContextPath, request.Plan.DockerfilePath, request.Plan.StaticRuntimeDigest, request.Plan.AcornFoxDefinitionDigest, request.Plan.AcornFoxDockerfileDigest, request.Plan.TargetRepository, request.Plan.Output.StorageKey, string(request.Network.EffectiveMode()), request.Network.WorkerPolicyDigest, strings.Join(secretIDs, ","), request.Plan.IdempotencyKey)
+	return hashText(string(request.BuildID), string(request.Plan.ID), string(request.Plan.SourceRevisionID), request.Plan.SourceDigest, request.Plan.ServiceName, string(request.Plan.Kind), request.Plan.ContextPath, request.Plan.DockerfilePath, request.Plan.StaticRuntimeDigest, request.Plan.AcornFoxDefinitionDigest, request.Plan.AcornFoxDockerfileDigest, request.Plan.AcornFoxNetworkMode, request.Plan.AcornFoxWorkerPolicyDigest, request.Plan.TargetRepository, request.Plan.Output.StorageKey, string(request.Network.EffectiveMode()), request.Network.WorkerPolicyDigest, strings.Join(secretIDs, ","), request.Plan.IdempotencyKey)
 }
 
 func digestFile(path string) (string, error) {

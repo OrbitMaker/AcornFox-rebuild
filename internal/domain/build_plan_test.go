@@ -90,3 +90,69 @@ func TestBuildPlanAcornFoxDigestBindingIsOptionalAndPaired(t *testing.T) {
 		}
 	}
 }
+
+func TestBuildPlanAcornFoxNetworkPolicyIsNullableOfflineOrBoundControlledEgress(t *testing.T) {
+	base := BuildPlan{
+		ID: "plan_egress", SourceRevisionID: "src_egress", SourceDigest: "sha256:" + strings.Repeat("a", 64),
+		ServiceName: "web", Kind: BuildDockerfile, ContextPath: ".", DockerfilePath: "Dockerfile", TargetRepository: "registry.example/open-card/web",
+		Output: BuildOutputContract{Format: BuildOutputOCI, Retention: BuildRetentionPersist, StorageKey: "app_1/src_egress/web"}, IdempotencyKey: "build-plan-egress",
+	}
+	for name, plan := range map[string]BuildPlan{
+		"legacy_null_is_offline": base,
+		"explicit_offline":       func() BuildPlan { value := base; value.AcornFoxNetworkMode = "none"; return value }(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := plan.Validate(); err != nil {
+				t.Fatalf("valid offline plan rejected: %v", err)
+			}
+			mode, digest := plan.EffectiveAcornFoxNetworkPolicy()
+			if mode != "none" || digest != "" {
+				t.Fatalf("effective offline identity = %q/%q", mode, digest)
+			}
+		})
+	}
+
+	controlled := base
+	controlled.AcornFoxDefinitionDigest = "sha256:" + strings.Repeat("b", 64)
+	controlled.AcornFoxDockerfileDigest = "sha256:" + strings.Repeat("c", 64)
+	controlled.AcornFoxNetworkMode = "controlled_egress_v1"
+	controlled.AcornFoxWorkerPolicyDigest = "sha256:" + strings.Repeat("d", 64)
+	if err := controlled.Validate(); err != nil {
+		t.Fatalf("bound controlled plan rejected: %v", err)
+	}
+	if mode, digest := controlled.EffectiveAcornFoxNetworkPolicy(); mode != controlled.AcornFoxNetworkMode || digest != controlled.AcornFoxWorkerPolicyDigest {
+		t.Fatalf("controlled identity = %q/%q", mode, digest)
+	}
+
+	for name, plan := range map[string]BuildPlan{
+		"legacy_digest": func() BuildPlan {
+			value := base
+			value.AcornFoxWorkerPolicyDigest = controlled.AcornFoxWorkerPolicyDigest
+			return value
+		}(),
+		"offline_digest": func() BuildPlan {
+			value := base
+			value.AcornFoxNetworkMode = "none"
+			value.AcornFoxWorkerPolicyDigest = controlled.AcornFoxWorkerPolicyDigest
+			return value
+		}(),
+		"unknown_mode": func() BuildPlan { value := base; value.AcornFoxNetworkMode = "default"; return value }(),
+		"controlled_unbound": func() BuildPlan {
+			value := base
+			value.AcornFoxNetworkMode = "controlled_egress_v1"
+			value.AcornFoxWorkerPolicyDigest = controlled.AcornFoxWorkerPolicyDigest
+			return value
+		}(),
+		"controlled_uppercase": func() BuildPlan {
+			value := controlled
+			value.AcornFoxWorkerPolicyDigest = "sha256:" + strings.Repeat("D", 64)
+			return value
+		}(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := plan.Validate(); err == nil {
+				t.Fatalf("invalid network policy accepted: %+v", plan)
+			}
+		})
+	}
+}

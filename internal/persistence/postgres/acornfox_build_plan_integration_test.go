@@ -5,6 +5,7 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -34,7 +35,7 @@ func TestAcornFoxBuildPlanBindingRoundTripsOnTaskScopedPostgres(t *testing.T) {
 	}
 	resetAcornFoxBuildPlanTestSchema(t, ctx, db, expectedDatabase)
 	applyControlPlaneMigrations(t, ctx, db)
-	assertAcornFoxBuildPlanMigrationIdempotent(t, ctx, db)
+	assertAcornFoxBuildPlanMigrationsIdempotent(t, ctx, db)
 
 	now := time.Unix(1_700_000_000, 0).UTC()
 	source := domain.ID("src_afb_build")
@@ -52,36 +53,47 @@ func TestAcornFoxBuildPlanBindingRoundTripsOnTaskScopedPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if persistedLegacy.AcornFoxDefinitionDigest != "" || persistedLegacy.AcornFoxDockerfileDigest != "" {
+	if persistedLegacy.AcornFoxDefinitionDigest != "" || persistedLegacy.AcornFoxDockerfileDigest != "" || persistedLegacy.AcornFoxNetworkMode != "" || persistedLegacy.AcornFoxWorkerPolicyDigest != "" {
 		t.Fatalf("legacy plan unexpectedly bound: %+v", persistedLegacy)
 	}
 	loadedLegacy, err := store.GetBuildPlan(ctx, legacy.ID)
-	if err != nil || loadedLegacy.AcornFoxDefinitionDigest != "" || loadedLegacy.AcornFoxDockerfileDigest != "" {
+	if err != nil || loadedLegacy.AcornFoxDefinitionDigest != "" || loadedLegacy.AcornFoxDockerfileDigest != "" || loadedLegacy.AcornFoxNetworkMode != "" || loadedLegacy.AcornFoxWorkerPolicyDigest != "" {
 		t.Fatalf("legacy roundtrip=%+v err=%v", loadedLegacy, err)
+	}
+	if mode, digest := loadedLegacy.EffectiveAcornFoxNetworkPolicy(); mode != "none" || digest != "" {
+		t.Fatalf("legacy effective network identity = %q/%q", mode, digest)
 	}
 
 	bound := acornFoxBuildPlan("plan_afb_bound", source, sourceDigest, "bound", "build-afb-bound", now)
 	bound.AcornFoxDefinitionDigest = "sha256:" + strings.Repeat("b", 64)
 	bound.AcornFoxDockerfileDigest = "sha256:" + strings.Repeat("c", 64)
+	bound.AcornFoxNetworkMode = "controlled_egress_v1"
+	bound.AcornFoxWorkerPolicyDigest = "sha256:" + strings.Repeat("d", 64)
 	persistedBound, err := store.CreateBuildPlan(ctx, bound)
 	if err != nil {
 		t.Fatal(err)
 	}
 	loadedBound, err := store.GetBuildPlan(ctx, bound.ID)
-	if err != nil || loadedBound.ID != bound.ID || loadedBound.SourceRevisionID != bound.SourceRevisionID || loadedBound.SourceDigest != bound.SourceDigest || loadedBound.AcornFoxDefinitionDigest != bound.AcornFoxDefinitionDigest || loadedBound.AcornFoxDockerfileDigest != bound.AcornFoxDockerfileDigest {
+	if err != nil || loadedBound.ID != bound.ID || loadedBound.SourceRevisionID != bound.SourceRevisionID || loadedBound.SourceDigest != bound.SourceDigest || loadedBound.AcornFoxDefinitionDigest != bound.AcornFoxDefinitionDigest || loadedBound.AcornFoxDockerfileDigest != bound.AcornFoxDockerfileDigest || loadedBound.AcornFoxNetworkMode != bound.AcornFoxNetworkMode || loadedBound.AcornFoxWorkerPolicyDigest != bound.AcornFoxWorkerPolicyDigest {
 		t.Fatalf("bound roundtrip persisted=%+v loaded=%+v err=%v", persistedBound, loadedBound, err)
 	}
 	replayed, err := store.CreateBuildPlan(ctx, bound)
-	if err != nil || replayed.ID != loadedBound.ID || replayed.AcornFoxDefinitionDigest != loadedBound.AcornFoxDefinitionDigest || replayed.AcornFoxDockerfileDigest != loadedBound.AcornFoxDockerfileDigest {
+	if err != nil || replayed.ID != loadedBound.ID || replayed.AcornFoxDefinitionDigest != loadedBound.AcornFoxDefinitionDigest || replayed.AcornFoxDockerfileDigest != loadedBound.AcornFoxDockerfileDigest || replayed.AcornFoxNetworkMode != loadedBound.AcornFoxNetworkMode || replayed.AcornFoxWorkerPolicyDigest != loadedBound.AcornFoxWorkerPolicyDigest {
 		t.Fatalf("bound replay=%+v err=%v", replayed, err)
 	}
-
-	var legacyDefinition, legacyDockerfile, boundDefinition, boundDockerfile sql.NullString
-	if err := db.QueryRowContext(ctx, `SELECT acornfox_definition_digest,acornfox_dockerfile_digest FROM build_plans WHERE id=$1`, legacy.ID.String()).Scan(&legacyDefinition, &legacyDockerfile); err != nil || legacyDefinition.Valid || legacyDockerfile.Valid {
-		t.Fatalf("legacy persisted binding definition=%+v dockerfile=%+v err=%v", legacyDefinition, legacyDockerfile, err)
+	changedNetwork := bound
+	changedNetwork.AcornFoxNetworkMode = "none"
+	changedNetwork.AcornFoxWorkerPolicyDigest = ""
+	if _, err := store.CreateBuildPlan(ctx, changedNetwork); !errors.Is(err, ErrIdempotencyConflict) {
+		t.Fatalf("changed durable network policy replay err=%v, want idempotency conflict", err)
 	}
-	if err := db.QueryRowContext(ctx, `SELECT acornfox_definition_digest,acornfox_dockerfile_digest FROM build_plans WHERE id=$1`, bound.ID.String()).Scan(&boundDefinition, &boundDockerfile); err != nil || !boundDefinition.Valid || !boundDockerfile.Valid || boundDefinition.String != bound.AcornFoxDefinitionDigest || boundDockerfile.String != bound.AcornFoxDockerfileDigest {
-		t.Fatalf("bound persisted binding definition=%+v dockerfile=%+v err=%v", boundDefinition, boundDockerfile, err)
+
+	var legacyDefinition, legacyDockerfile, legacyMode, legacyPolicy, boundDefinition, boundDockerfile, boundMode, boundPolicy sql.NullString
+	if err := db.QueryRowContext(ctx, `SELECT acornfox_definition_digest,acornfox_dockerfile_digest,acornfox_network_mode,acornfox_worker_policy_digest FROM build_plans WHERE id=$1`, legacy.ID.String()).Scan(&legacyDefinition, &legacyDockerfile, &legacyMode, &legacyPolicy); err != nil || legacyDefinition.Valid || legacyDockerfile.Valid || legacyMode.Valid || legacyPolicy.Valid {
+		t.Fatalf("legacy persisted binding definition=%+v dockerfile=%+v mode=%+v policy=%+v err=%v", legacyDefinition, legacyDockerfile, legacyMode, legacyPolicy, err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT acornfox_definition_digest,acornfox_dockerfile_digest,acornfox_network_mode,acornfox_worker_policy_digest FROM build_plans WHERE id=$1`, bound.ID.String()).Scan(&boundDefinition, &boundDockerfile, &boundMode, &boundPolicy); err != nil || !boundDefinition.Valid || !boundDockerfile.Valid || !boundMode.Valid || !boundPolicy.Valid || boundDefinition.String != bound.AcornFoxDefinitionDigest || boundDockerfile.String != bound.AcornFoxDockerfileDigest || boundMode.String != bound.AcornFoxNetworkMode || boundPolicy.String != bound.AcornFoxWorkerPolicyDigest {
+		t.Fatalf("bound persisted binding definition=%+v dockerfile=%+v mode=%+v policy=%+v err=%v", boundDefinition, boundDockerfile, boundMode, boundPolicy, err)
 	}
 	if _, err := db.ExecContext(ctx, `
 		INSERT INTO build_plans(id,source_revision_id,source_digest,service_name,build_kind,context_path,dockerfile_path,acornfox_definition_digest,target_repository,output_contract,secret_refs,idempotency_key,created_at)
@@ -106,25 +118,50 @@ func TestAcornFoxBuildPlanBindingRoundTripsOnTaskScopedPostgres(t *testing.T) {
 			t.Fatalf("database accepted bound AcornFox %s build plan", variant.name)
 		}
 	}
+	for _, variant := range []struct {
+		name, mode, workerPolicy, definition, dockerfile string
+	}{
+		{name: "network_unpaired", mode: "controlled_egress_v1", workerPolicy: bound.AcornFoxWorkerPolicyDigest},
+		{name: "network_uppercase", mode: "controlled_egress_v1", workerPolicy: "sha256:" + strings.Repeat("D", 64), definition: bound.AcornFoxDefinitionDigest, dockerfile: bound.AcornFoxDockerfileDigest},
+		{name: "offline_with_policy", mode: "none", workerPolicy: bound.AcornFoxWorkerPolicyDigest, definition: bound.AcornFoxDefinitionDigest, dockerfile: bound.AcornFoxDockerfileDigest},
+	} {
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO build_plans(id,source_revision_id,source_digest,service_name,build_kind,context_path,dockerfile_path,acornfox_definition_digest,acornfox_dockerfile_digest,acornfox_network_mode,acornfox_worker_policy_digest,target_repository,output_contract,secret_refs,idempotency_key,created_at)
+			VALUES ($1,$2,$3,$4,'dockerfile','.','Dockerfile',NULLIF($5,''),NULLIF($6,''),$7,$8,'registry.example/open-card/rejected','{"format":"oci","retention":"persistent","storage_key":"app_afb_build/network"}'::jsonb,'[]'::jsonb,$9,$10)`, "plan_afb_"+variant.name, source.String(), sourceDigest, variant.name, variant.definition, variant.dockerfile, variant.mode, variant.workerPolicy, "build-afb-"+variant.name, now); err == nil {
+			t.Fatalf("database accepted invalid AcornFox network policy %s", variant.name)
+		}
+	}
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO build_plans(id,source_revision_id,source_digest,service_name,build_kind,context_path,dockerfile_path,acornfox_definition_digest,acornfox_dockerfile_digest,acornfox_network_mode,acornfox_worker_policy_digest,target_repository,output_contract,secret_refs,idempotency_key,created_at)
+		VALUES ('plan_afb_network_null_policy',$1,$2,'network_null_policy','dockerfile','.','Dockerfile',$3,$4,'controlled_egress_v1',NULL,'registry.example/open-card/rejected','{"format":"oci","retention":"persistent","storage_key":"app_afb_build/network-null"}'::jsonb,'[]'::jsonb,'build-afb-network-null-policy',$5)`, source.String(), sourceDigest, bound.AcornFoxDefinitionDigest, bound.AcornFoxDockerfileDigest, now); err == nil {
+		t.Fatal("database accepted controlled egress with a NULL worker policy digest")
+	}
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO build_plans(id,source_revision_id,source_digest,service_name,build_kind,context_path,dockerfile_path,acornfox_definition_digest,acornfox_dockerfile_digest,acornfox_network_mode,acornfox_worker_policy_digest,target_repository,output_contract,secret_refs,idempotency_key,created_at)
+		VALUES ('plan_afb_null_network_mode',$1,$2,'null_network_mode','dockerfile','.','Dockerfile',$3,$4,NULL,$5,'registry.example/open-card/rejected','{"format":"oci","retention":"persistent","storage_key":"app_afb_build/null-mode"}'::jsonb,'[]'::jsonb,'build-afb-null-network-mode',$6)`, source.String(), sourceDigest, bound.AcornFoxDefinitionDigest, bound.AcornFoxDockerfileDigest, bound.AcornFoxWorkerPolicyDigest, now); err == nil {
+		t.Fatal("database accepted a NULL network mode with a worker policy digest")
+	}
 }
 
-func assertAcornFoxBuildPlanMigrationIdempotent(t *testing.T, ctx context.Context, db *sql.DB) {
+func assertAcornFoxBuildPlanMigrationsIdempotent(t *testing.T, ctx context.Context, db *sql.DB) {
 	t.Helper()
-	payload, err := os.ReadFile(filepath.Join("..", "..", "..", "migrations", "control-plane", "0025_acornfox_build_plan_binding.sql"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	for run := 1; run <= 2; run++ {
-		tx, err := db.BeginTx(ctx, nil)
+	for _, migration := range []string{"0025_acornfox_build_plan_binding.sql", "0026_acornfox_build_network_policy.sql"} {
+		payload, err := os.ReadFile(filepath.Join("..", "..", "..", "migrations", "control-plane", migration))
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := tx.ExecContext(ctx, string(payload)); err != nil {
-			_ = tx.Rollback()
-			t.Fatalf("rerun 0025 migration %d: %v", run, err)
-		}
-		if err := tx.Commit(); err != nil {
-			t.Fatalf("commit rerun 0025 migration %d: %v", run, err)
+		for run := 1; run <= 2; run++ {
+			tx, err := db.BeginTx(ctx, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.ExecContext(ctx, string(payload)); err != nil {
+				_ = tx.Rollback()
+				t.Fatalf("rerun %s migration %d: %v", migration[:4], run, err)
+			}
+			if err := tx.Commit(); err != nil {
+				t.Fatalf("commit rerun %s migration %d: %v", migration[:4], run, err)
+			}
 		}
 	}
 }

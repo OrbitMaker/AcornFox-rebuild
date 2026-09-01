@@ -113,3 +113,38 @@ func TestAcornFoxBuildPlanBindingMigrationIsAdditiveAndPaired(t *testing.T) {
 		}
 	}
 }
+
+func TestAcornFoxBuildPlanNetworkPolicyMigrationIsAdditiveAndConstrained(t *testing.T) {
+	payload, err := os.ReadFile("../../../migrations/control-plane/0026_acornfox_build_network_policy.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(payload)
+	for _, fragment := range []string{
+		"ADD COLUMN IF NOT EXISTS acornfox_network_mode text",
+		"ADD COLUMN IF NOT EXISTS acornfox_worker_policy_digest text",
+		"build_plans_acornfox_network_policy_check",
+		"acornfox_network_mode IS NULL AND acornfox_worker_policy_digest IS NULL",
+		"acornfox_network_mode = 'none' AND acornfox_worker_policy_digest IS NULL",
+		"acornfox_network_mode IS NOT NULL",
+		"acornfox_network_mode = 'controlled_egress_v1'",
+		"acornfox_worker_policy_digest IS NOT NULL",
+		"acornfox_worker_policy_digest ~ '^sha256:[a-f0-9]{64}$'",
+		"acornfox_definition_digest IS NOT NULL",
+		"acornfox_dockerfile_digest IS NOT NULL",
+		"build_kind = 'dockerfile'",
+		"context_path = '.'",
+		"dockerfile_path = 'Dockerfile'",
+		"static_runtime_digest IS NULL",
+		"output_contract @> '{\"format\":\"oci\",\"retention\":\"persistent\"}'::jsonb",
+	} {
+		if !strings.Contains(text, fragment) {
+			t.Errorf("0026 migration is missing %q", fragment)
+		}
+	}
+	for _, forbidden := range []string{"DROP COLUMN", "DROP TABLE", "DELETE FROM", "UPDATE build_plans"} {
+		if strings.Contains(strings.ToUpper(text), forbidden) {
+			t.Errorf("0026 migration must not contain %q", forbidden)
+		}
+	}
+}

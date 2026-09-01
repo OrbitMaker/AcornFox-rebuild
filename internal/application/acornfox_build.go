@@ -54,7 +54,7 @@ func (AcornFoxBuildBinder) bind(def contracts.AcornFoxDockerfileDefinition, sour
 	}
 	sum := sha256.Sum256([]byte(source.ID.String() + "\x00" + source.ContentDigest + "\x00" + def.DefinitionDigest + "\x00" + def.DockerfileDigest + "\x00" + string(network.EffectiveMode()) + "\x00" + network.WorkerPolicyDigest + "\x00" + idempotency))
 	suffix := hex.EncodeToString(sum[:])
-	plan := domain.BuildPlan{ID: domain.ID("plan_" + suffix[:32]), SourceRevisionID: source.ID, SourceDigest: source.ContentDigest, ServiceName: "web", Kind: domain.BuildDockerfile, ContextPath: ".", DockerfilePath: "Dockerfile", TargetRepository: targetRepository, Output: domain.BuildOutputContract{Format: domain.BuildOutputOCI, Retention: domain.BuildRetentionPersist, StorageKey: storageKey}, IdempotencyKey: idempotency, CreatedAt: acceptedAt.UTC(), AcornFoxDefinitionDigest: def.DefinitionDigest, AcornFoxDockerfileDigest: def.DockerfileDigest}
+	plan := domain.BuildPlan{ID: domain.ID("plan_" + suffix[:32]), SourceRevisionID: source.ID, SourceDigest: source.ContentDigest, ServiceName: "web", Kind: domain.BuildDockerfile, ContextPath: ".", DockerfilePath: "Dockerfile", TargetRepository: targetRepository, Output: domain.BuildOutputContract{Format: domain.BuildOutputOCI, Retention: domain.BuildRetentionPersist, StorageKey: storageKey}, IdempotencyKey: idempotency, CreatedAt: acceptedAt.UTC(), AcornFoxDefinitionDigest: def.DefinitionDigest, AcornFoxDockerfileDigest: def.DockerfileDigest, AcornFoxNetworkMode: string(network.EffectiveMode()), AcornFoxWorkerPolicyDigest: network.WorkerPolicyDigest}
 	if err := plan.Validate(); err != nil {
 		return contracts.BuildRequest{}, err
 	}

@@ -573,7 +573,7 @@ func (s *Store) CreateBuildPlan(ctx context.Context, plan domain.BuildPlan) (dom
 	if actualSourceDigest != plan.SourceDigest {
 		return rollback(domain.ValidationError("build plan source digest does not match source revision"))
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO build_plans(id,source_revision_id,source_digest,service_name,build_kind,context_path,dockerfile_path,static_runtime_digest,acornfox_definition_digest,acornfox_dockerfile_digest,target_repository,output_contract,secret_refs,idempotency_key,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13::jsonb,$14,$15)`, plan.ID.String(), plan.SourceRevisionID.String(), plan.SourceDigest, plan.ServiceName, string(plan.Kind), plan.ContextPath, nullableString(plan.DockerfilePath), nullableString(plan.StaticRuntimeDigest), nullableString(plan.AcornFoxDefinitionDigest), nullableString(plan.AcornFoxDockerfileDigest), plan.TargetRepository, output, secrets, plan.IdempotencyKey, plan.CreatedAt); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO build_plans(id,source_revision_id,source_digest,service_name,build_kind,context_path,dockerfile_path,static_runtime_digest,acornfox_definition_digest,acornfox_dockerfile_digest,acornfox_network_mode,acornfox_worker_policy_digest,target_repository,output_contract,secret_refs,idempotency_key,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,$15::jsonb,$16,$17)`, plan.ID.String(), plan.SourceRevisionID.String(), plan.SourceDigest, plan.ServiceName, string(plan.Kind), plan.ContextPath, nullableString(plan.DockerfilePath), nullableString(plan.StaticRuntimeDigest), nullableString(plan.AcornFoxDefinitionDigest), nullableString(plan.AcornFoxDockerfileDigest), nullableString(plan.AcornFoxNetworkMode), nullableString(plan.AcornFoxWorkerPolicyDigest), plan.TargetRepository, output, secrets, plan.IdempotencyKey, plan.CreatedAt); err != nil {
 		return rollback(fmt.Errorf("insert build plan: %w", err))
 	}
 	if err := s.appendM1FactsTx(ctx, tx, "build_plan", plan.ID.String(), "build_plan.created", plan, plan.CreatedAt); err != nil {
@@ -599,7 +599,7 @@ func (s *Store) GetBuildPlan(ctx context.Context, id domain.ID) (domain.BuildPla
 	if err := domain.RequireID(id, "build plan id"); err != nil {
 		return domain.BuildPlan{}, err
 	}
-	row := s.db.QueryRowContext(ctx, `SELECT id,source_revision_id,source_digest,service_name,build_kind,context_path,COALESCE(dockerfile_path,''),COALESCE(static_runtime_digest,''),COALESCE(acornfox_definition_digest,''),COALESCE(acornfox_dockerfile_digest,''),target_repository,output_contract,secret_refs,idempotency_key,created_at FROM build_plans WHERE id=$1`, id.String())
+	row := s.db.QueryRowContext(ctx, `SELECT id,source_revision_id,source_digest,service_name,build_kind,context_path,COALESCE(dockerfile_path,''),COALESCE(static_runtime_digest,''),COALESCE(acornfox_definition_digest,''),COALESCE(acornfox_dockerfile_digest,''),COALESCE(acornfox_network_mode,''),COALESCE(acornfox_worker_policy_digest,''),target_repository,output_contract,secret_refs,idempotency_key,created_at FROM build_plans WHERE id=$1`, id.String())
 	return scanBuildPlan(row)
 }
 
@@ -1095,14 +1095,14 @@ func loadM1DeploymentQuery(row interface{ Scan(...any) error }) (domain.Deployme
 }
 
 func loadBuildPlanTx(ctx context.Context, tx *sql.Tx, sourceID domain.ID, service, key string) (domain.BuildPlan, error) {
-	return scanBuildPlan(tx.QueryRowContext(ctx, `SELECT id,source_revision_id,source_digest,service_name,build_kind,context_path,COALESCE(dockerfile_path,''),COALESCE(static_runtime_digest,''),COALESCE(acornfox_definition_digest,''),COALESCE(acornfox_dockerfile_digest,''),target_repository,output_contract,secret_refs,idempotency_key,created_at FROM build_plans WHERE source_revision_id=$1 AND service_name=$2 AND idempotency_key=$3`, sourceID.String(), service, key))
+	return scanBuildPlan(tx.QueryRowContext(ctx, `SELECT id,source_revision_id,source_digest,service_name,build_kind,context_path,COALESCE(dockerfile_path,''),COALESCE(static_runtime_digest,''),COALESCE(acornfox_definition_digest,''),COALESCE(acornfox_dockerfile_digest,''),COALESCE(acornfox_network_mode,''),COALESCE(acornfox_worker_policy_digest,''),target_repository,output_contract,secret_refs,idempotency_key,created_at FROM build_plans WHERE source_revision_id=$1 AND service_name=$2 AND idempotency_key=$3`, sourceID.String(), service, key))
 }
 
 func scanBuildPlan(row interface{ Scan(...any) error }) (domain.BuildPlan, error) {
 	var plan domain.BuildPlan
 	var kind string
 	var output, secrets []byte
-	err := row.Scan(&plan.ID, &plan.SourceRevisionID, &plan.SourceDigest, &plan.ServiceName, &kind, &plan.ContextPath, &plan.DockerfilePath, &plan.StaticRuntimeDigest, &plan.AcornFoxDefinitionDigest, &plan.AcornFoxDockerfileDigest, &plan.TargetRepository, &output, &secrets, &plan.IdempotencyKey, &plan.CreatedAt)
+	err := row.Scan(&plan.ID, &plan.SourceRevisionID, &plan.SourceDigest, &plan.ServiceName, &kind, &plan.ContextPath, &plan.DockerfilePath, &plan.StaticRuntimeDigest, &plan.AcornFoxDefinitionDigest, &plan.AcornFoxDockerfileDigest, &plan.AcornFoxNetworkMode, &plan.AcornFoxWorkerPolicyDigest, &plan.TargetRepository, &output, &secrets, &plan.IdempotencyKey, &plan.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return domain.BuildPlan{}, ErrNotFound
 	}
