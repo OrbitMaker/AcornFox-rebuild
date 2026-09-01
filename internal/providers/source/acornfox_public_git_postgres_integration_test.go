@@ -165,7 +165,7 @@ func applyAcornFoxSourceMigrations(t *testing.T, ctx context.Context, dsn string
 	repositoryRoot := filepath.Clean(filepath.Join(filepath.Dir(file), "..", "..", ".."))
 	command := exec.CommandContext(ctx, filepath.Join(repositoryRoot, "scripts", "mvp", "control-plane-migrate.sh"), "migrations/control-plane")
 	command.Dir = repositoryRoot
-	command.Env = append(os.Environ(), "DATABASE_URL="+dsn, "OPEN_CARD_REQUIRED_MIGRATION_VERSION=0024")
+	command.Env = append(os.Environ(), "DATABASE_URL="+dsn, "OPEN_CARD_REQUIRED_MIGRATION_VERSION=0025")
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("apply task migrations: %v (%s)", err, output)
 	}

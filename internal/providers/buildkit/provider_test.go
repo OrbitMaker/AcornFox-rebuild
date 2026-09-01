@@ -3,6 +3,7 @@ package buildkit
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +17,7 @@ import (
 	"github.com/open-card/open-card/internal/contracts"
 	"github.com/open-card/open-card/internal/domain"
 	"github.com/open-card/open-card/internal/foundation"
+	"github.com/open-card/open-card/internal/importers/dockerfile"
 	secretprovider "github.com/open-card/open-card/internal/providers/secret"
 )
 
@@ -25,6 +27,63 @@ type fakeRunner struct {
 	mu    sync.Mutex
 	calls [][]string
 	run   func(context.Context, []string, io.Writer, io.Writer) error
+}
+
+type fakeBuildLogSink struct {
+	mu      sync.Mutex
+	calls   int
+	ref     string
+	err     error
+	events  *[]string
+	content string
+}
+
+func (s *fakeBuildLogSink) StoreBuildLog(_ context.Context, _ contracts.BuildRequest, content string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls++
+	s.content = content
+	if s.events != nil {
+		*s.events = append(*s.events, "log")
+	}
+	if s.err != nil {
+		return "", s.err
+	}
+	return s.ref, nil
+}
+
+func (s *fakeBuildLogSink) callCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
+}
+
+type countingImageStore struct {
+	contracts.ImageStore
+	mu     sync.Mutex
+	calls  int
+	err    error
+	events *[]string
+}
+
+func (s *countingImageStore) StoreOCI(ctx context.Context, request contracts.StoreOCIRequest) (contracts.StoreOCIResult, error) {
+	s.mu.Lock()
+	s.calls++
+	if s.events != nil {
+		*s.events = append(*s.events, "oci")
+	}
+	err := s.err
+	s.mu.Unlock()
+	if err != nil {
+		return contracts.StoreOCIResult{}, err
+	}
+	return s.ImageStore.StoreOCI(ctx, request)
+}
+
+func (s *countingImageStore) callCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
 }
 
 func (r *fakeRunner) Run(ctx context.Context, command string, args []string, stdout, stderr io.Writer) error {
@@ -140,11 +199,25 @@ func testProvider(t *testing.T, runner CommandRunner) (*Provider, string, domain
 		ImageStore:         contracts.NewFakeImageStore(true),
 		Capacity:           fakeCapacity{},
 		SecretResolver:     fakeSecretResolver{root: secretRoot},
+		LogSink:            &fakeBuildLogSink{ref: "memory://build-log/default"},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return provider, root, source
+}
+
+func bindAcornFoxDigests(t *testing.T, request *contracts.BuildRequest) {
+	t.Helper()
+	definition, err := dockerfile.Import(request.Source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if definition.Status != contracts.AcornFoxDockerfileReady {
+		t.Fatalf("test Dockerfile definition is not ready: %#v", definition)
+	}
+	request.Plan.AcornFoxDefinitionDigest = definition.DefinitionDigest
+	request.Plan.AcornFoxDockerfileDigest = definition.DockerfileDigest
 }
 
 func testRequest(key string, source domain.SourceRevision) contracts.BuildRequest {
@@ -204,6 +277,9 @@ func TestBuildUsesAllowlistedRootlessBuildxBoundaryAndCleansWorkspace(t *testing
 				t.Fatalf("unsafe flag %q in %#v", forbidden, args)
 			}
 		}
+	}
+	if !strings.Contains(strings.Join(args, " "), "--opt network=none") {
+		t.Fatalf("offline BuildKit network option is missing: %#v", args)
 	}
 	if !strings.Contains(strings.Join(args, " "), "--secret id=registry_token,src=") {
 		t.Fatalf("secret was not materialized as a temp file: %#v", args)
@@ -376,6 +452,226 @@ func TestBuildCommandFailureDoesNotLeakSecret(t *testing.T) {
 	}
 }
 
+func TestBuildPersistsReadableBuildKitRawJSONLog(t *testing.T) {
+	marker := "AFB_NETWORK_PROBE all_attempted_all_denied\n"
+	runner := writingRunner(t, rawJSONLogsProgress("vertex one\r\n", marker))
+	provider, _, source := testProvider(t, runner)
+	request := testRequest("readable-rawjson", source)
+	request.Plan.SecretRefs = nil
+	result, err := provider.Build(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink, ok := provider.config.LogSink.(*fakeBuildLogSink)
+	if !ok || sink.content != "vertex one\n"+marker || !strings.Contains(result.Evidence.Digest, "sha256:") {
+		t.Fatalf("successful rawjson log was not normalized before persistence: sink=%#v result=%#v", sink, result)
+	}
+}
+
+func TestNormalizeBuildKitRawJSONLogFallbackAndBound(t *testing.T) {
+	raw := `{"vertex":"progress-only"}` + "\n" + rawJSONLogsProgress("first \r", "\nsecond\n")
+	if got := normalizeBuildKitRawJSONLog(raw); got != "first \nsecond\n" {
+		t.Fatalf("rawjson event ordering changed: %q", got)
+	}
+	if got := normalizeBuildKitRawJSONLog(rawJSONProgress("compatibility\n")); got != "compatibility\n" {
+		t.Fatalf("top-level rawjson data compatibility changed: %q", got)
+	}
+	malformed := rawJSONLogsProgress("recognized\n") + `{"logs":[{"data":123}]}` + "\n"
+	if got := normalizeBuildKitRawJSONLog(malformed); got != malformed {
+		t.Fatalf("malformed rawjson did not retain raw fallback: %q", got)
+	}
+	noData := `{"vertex":"only","logs":[{"vertex":"also-progress-only"}]}` + "\n"
+	if got := normalizeBuildKitRawJSONLog(noData); got != noData {
+		t.Fatalf("data-free rawjson did not retain raw fallback: %q", got)
+	}
+	tooLarge := rawJSONLogsProgress(strings.Repeat("x", maxCaptureBytes+1))
+	if got := normalizeBuildKitRawJSONLog(tooLarge); len(got) != maxCaptureBytes {
+		t.Fatalf("normalized log was not bounded: %d", len(got))
+	}
+}
+
+func rawJSONProgress(value string) string {
+	return `{"data":"` + base64.StdEncoding.EncodeToString([]byte(value)) + `"}` + "\n"
+}
+
+func rawJSONLogsProgress(values ...string) string {
+	entries := make([]string, 0, len(values))
+	for _, value := range values {
+		entries = append(entries, `{"vertex":"sha256:fixture","stream":1,"data":"`+base64.StdEncoding.EncodeToString([]byte(value))+`","timestamp":"2026-09-01T00:00:00Z"}`)
+	}
+	return `{"logs":[` + strings.Join(entries, ",") + `]}` + "\n"
+}
+
+func TestAcornFoxBuildRejectsCopiedDockerfileMismatchBeforeEffects(t *testing.T) {
+	runner := writingRunner(t, "")
+	provider, _, source := testProvider(t, runner)
+	request := testRequest("acornfox-digest-mismatch", source)
+	bindAcornFoxDigests(t, &request)
+	request.Plan.AcornFoxDockerfileDigest = "sha256:" + strings.Repeat("0", 64)
+	logs := &fakeBuildLogSink{ref: "memory://build-log/mismatch"}
+	store := &countingImageStore{ImageStore: contracts.NewFakeImageStore(true)}
+	provider.config.LogSink = logs
+	provider.config.ImageStore = store
+	err := mustBuild(provider, request)
+	assertProviderCode(t, err, contracts.ErrValidation)
+	if runner.callCount() != 0 || logs.callCount() != 0 || store.callCount() != 0 {
+		t.Fatalf("mismatched copied Dockerfile caused effects: runner=%d logs=%d oci=%d", runner.callCount(), logs.callCount(), store.callCount())
+	}
+}
+
+func TestAcornFoxBuildRejectsDefinitionSemanticMismatchBeforeEffects(t *testing.T) {
+	runner := writingRunner(t, "")
+	provider, _, source := testProvider(t, runner)
+	request := testRequest("acornfox-definition-mismatch", source)
+	bindAcornFoxDigests(t, &request)
+	if err := os.Chmod(source.WorkspaceRef, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	dockerfilePath := filepath.Join(source.WorkspaceRef, "Dockerfile")
+	if err := os.Chmod(dockerfilePath, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dockerfilePath, []byte("FROM scratch\nCMD [\"/changed\"]\n"), 0o400); err != nil {
+		t.Fatal(err)
+	}
+	updatedSourceDigest, err := foundation.HashDirectory(source.WorkspaceRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updatedDockerfileDigest, err := digestFile(dockerfilePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Source.ContentDigest = "sha256:" + updatedSourceDigest
+	request.Plan.SourceDigest = request.Source.ContentDigest
+	request.Plan.AcornFoxDockerfileDigest = updatedDockerfileDigest
+	logs := &fakeBuildLogSink{ref: "memory://build-log/mismatch"}
+	store := &countingImageStore{ImageStore: contracts.NewFakeImageStore(true)}
+	provider.config.LogSink = logs
+	provider.config.ImageStore = store
+	err = mustBuild(provider, request)
+	assertProviderCode(t, err, contracts.ErrValidation)
+	if runner.callCount() != 0 || logs.callCount() != 0 || store.callCount() != 0 {
+		t.Fatalf("definition mismatch caused effects: runner=%d logs=%d oci=%d", runner.callCount(), logs.callCount(), store.callCount())
+	}
+}
+
+func TestAcornFoxBuildRequiresDurableLogBeforeOCI(t *testing.T) {
+	runner := writingRunner(t, "normal build output\n")
+	provider, _, source := testProvider(t, runner)
+	request := testRequest("acornfox-log-order", source)
+	bindAcornFoxDigests(t, &request)
+	events := []string{}
+	logs := &fakeBuildLogSink{ref: "memory://build-log/durable", events: &events}
+	store := &countingImageStore{ImageStore: contracts.NewFakeImageStore(true), events: &events}
+	provider.config.LogSink = logs
+	provider.config.ImageStore = store
+	result, err := provider.Build(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.LogRef != logs.ref || len(events) != 2 || events[0] != "log" || events[1] != "oci" {
+		t.Fatalf("durable log was not persisted before OCI with its actual reference: result=%#v events=%#v", result, events)
+	}
+	if len(result.Evidence.Refs) == 0 || result.Evidence.Refs[0].Locator != logs.ref {
+		t.Fatalf("build log evidence does not use durable log reference: %#v", result.Evidence.Refs)
+	}
+}
+
+func TestAcornFoxBuildLogFailurePreventsOCIAndOCIErrorRetainsTruthfulLog(t *testing.T) {
+	t.Run("log failure", func(t *testing.T) {
+		runner := writingRunner(t, "")
+		provider, _, source := testProvider(t, runner)
+		request := testRequest("acornfox-log-failure", source)
+		bindAcornFoxDigests(t, &request)
+		logs := &fakeBuildLogSink{err: errors.New("durable log unavailable")}
+		store := &countingImageStore{ImageStore: contracts.NewFakeImageStore(true)}
+		provider.config.LogSink = logs
+		provider.config.ImageStore = store
+		assertProviderCode(t, mustBuild(provider, request), contracts.ErrUnavailable)
+		if logs.callCount() != 1 || store.callCount() != 0 {
+			t.Fatalf("log failure must prevent OCI storage: logs=%d oci=%d", logs.callCount(), store.callCount())
+		}
+	})
+	t.Run("OCI failure", func(t *testing.T) {
+		runner := writingRunner(t, "")
+		provider, _, source := testProvider(t, runner)
+		request := testRequest("acornfox-oci-failure", source)
+		bindAcornFoxDigests(t, &request)
+		logs := &fakeBuildLogSink{ref: "memory://build-log/retained"}
+		store := &countingImageStore{ImageStore: contracts.NewFakeImageStore(true), err: errors.New("OCI store unavailable")}
+		provider.config.LogSink = logs
+		provider.config.ImageStore = store
+		result, err := provider.Build(context.Background(), request)
+		assertProviderCode(t, err, contracts.ErrUnavailable)
+		var providerErr *contracts.ProviderError
+		if !errors.As(err, &providerErr) || providerErr.Details["log_ref"] != logs.ref {
+			t.Fatalf("OCI failure did not expose the actual retained durable log reference: %#v", err)
+		}
+		if result.Artifact != nil || logs.callCount() != 1 || store.callCount() != 1 {
+			t.Fatalf("OCI failure did not leave only truthful durable log evidence: result=%#v logs=%d oci=%d", result, logs.callCount(), store.callCount())
+		}
+	})
+}
+
+func TestAcornFoxBuildWithoutLogSinkFailsBeforeRunner(t *testing.T) {
+	runner := writingRunner(t, "")
+	provider, _, source := testProvider(t, runner)
+	request := testRequest("acornfox-no-log-sink", source)
+	bindAcornFoxDigests(t, &request)
+	provider.config.LogSink = nil
+	assertProviderCode(t, mustBuild(provider, request), contracts.ErrUnavailable)
+	if runner.callCount() != 0 {
+		t.Fatal("AcornFox build ran without a durable log sink")
+	}
+}
+
+func TestAcornFoxBuildSameKeyTargetDriftConflictsWithoutSecondRunner(t *testing.T) {
+	runner := writingRunner(t, "")
+	provider, _, source := testProvider(t, runner)
+	request := testRequest("acornfox-target-drift", source)
+	bindAcornFoxDigests(t, &request)
+	if _, err := provider.Build(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	drift := request
+	drift.Plan.TargetRepository = "registry.open-card.local/apps/other"
+	assertProviderCode(t, mustBuild(provider, drift), contracts.ErrConflict)
+	if runner.callCount() != 1 {
+		t.Fatalf("same-key target drift invoked a second runner: %d", runner.callCount())
+	}
+}
+
+func TestAcornFoxBuildRejectsNonRootPlanBeforeRunner(t *testing.T) {
+	runner := writingRunner(t, "")
+	provider, _, source := testProvider(t, runner)
+	request := testRequest("acornfox-non-root", source)
+	bindAcornFoxDigests(t, &request)
+	request.Plan.DockerfilePath = "container/Dockerfile"
+	assertProviderCode(t, mustBuild(provider, request), contracts.ErrValidation)
+	if runner.callCount() != 0 {
+		t.Fatal("non-root AcornFox plan invoked BuildKit")
+	}
+}
+
+func TestLogSinkRequirementDoesNotBreakLegacyOptionalBuilds(t *testing.T) {
+	runner := writingRunner(t, "")
+	provider, _, source := testProvider(t, runner)
+	provider.config.LogSink = nil
+	result, err := provider.Build(context.Background(), testRequest("legacy-no-log", source))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.LogRef != "" {
+		t.Fatalf("legacy build fabricated a durable log reference: %#v", result)
+	}
+	config := provider.config
+	config.RequireLogSink = true
+	if _, err := New(config); err == nil {
+		t.Fatal("required durable log sink was accepted when absent")
+	}
+}
+
 func TestRealSecretResolverSuppressesCanaryAndRevokesMaterial(t *testing.T) {
 	canary := []byte("OPENCARD_M1_CANARY_7f53d923")
 	root := t.TempDir()
@@ -420,6 +716,10 @@ func TestRealSecretResolverSuppressesCanaryAndRevokesMaterial(t *testing.T) {
 	}
 	if strings.Contains(fmt.Sprintf("%#v", result), string(canary)) {
 		t.Fatal("build result leaked canary")
+	}
+	sink, ok := provider.config.LogSink.(*fakeBuildLogSink)
+	if !ok || sink.content != "build output suppressed while secrets were mounted" || strings.Contains(sink.content, string(canary)) {
+		t.Fatalf("secret-mounted build log was not suppressed: %#v", sink)
 	}
 	entries, err := os.ReadDir(materials)
 	if err != nil {

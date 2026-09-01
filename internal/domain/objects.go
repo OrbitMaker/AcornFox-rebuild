@@ -361,19 +361,21 @@ const (
 )
 
 type BuildPlan struct {
-	ID                  ID                  `json:"id"`
-	SourceRevisionID    ID                  `json:"source_revision_id"`
-	SourceDigest        string              `json:"source_digest"`
-	ServiceName         string              `json:"service_name"`
-	Kind                BuildKind           `json:"kind"`
-	ContextPath         string              `json:"context_path"`
-	DockerfilePath      string              `json:"dockerfile_path,omitempty"`
-	StaticRuntimeDigest string              `json:"static_runtime_digest,omitempty"`
-	TargetRepository    string              `json:"target_repository"`
-	Output              BuildOutputContract `json:"output"`
-	SecretRefs          []SecretReference   `json:"secret_refs,omitempty"`
-	IdempotencyKey      string              `json:"idempotency_key"`
-	CreatedAt           time.Time           `json:"created_at"`
+	ID                       ID                  `json:"id"`
+	SourceRevisionID         ID                  `json:"source_revision_id"`
+	SourceDigest             string              `json:"source_digest"`
+	ServiceName              string              `json:"service_name"`
+	Kind                     BuildKind           `json:"kind"`
+	ContextPath              string              `json:"context_path"`
+	DockerfilePath           string              `json:"dockerfile_path,omitempty"`
+	StaticRuntimeDigest      string              `json:"static_runtime_digest,omitempty"`
+	TargetRepository         string              `json:"target_repository"`
+	Output                   BuildOutputContract `json:"output"`
+	SecretRefs               []SecretReference   `json:"secret_refs,omitempty"`
+	IdempotencyKey           string              `json:"idempotency_key"`
+	CreatedAt                time.Time           `json:"created_at"`
+	AcornFoxDefinitionDigest string              `json:"acornfox_definition_digest,omitempty"`
+	AcornFoxDockerfileDigest string              `json:"acornfox_dockerfile_digest,omitempty"`
 }
 
 const (
@@ -445,6 +447,12 @@ func (p BuildPlan) Validate() error {
 	}
 	if strings.TrimSpace(p.IdempotencyKey) == "" {
 		return ValidationError("build plan idempotency key is required")
+	}
+	if (p.AcornFoxDefinitionDigest == "") != (p.AcornFoxDockerfileDigest == "") || p.AcornFoxDefinitionDigest != "" && (!validSHA256(p.AcornFoxDefinitionDigest) || !validSHA256(p.AcornFoxDockerfileDigest)) {
+		return ValidationError("AcornFox build plan digests are invalid")
+	}
+	if p.AcornFoxDefinitionDigest != "" && (p.Kind != BuildDockerfile || p.ContextPath != "." || p.DockerfilePath != "Dockerfile" || p.StaticRuntimeDigest != "") {
+		return ValidationError("AcornFox build plan must bind the root Dockerfile")
 	}
 	return nil
 }

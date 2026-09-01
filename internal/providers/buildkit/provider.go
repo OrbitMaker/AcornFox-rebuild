@@ -26,6 +26,7 @@ import (
 	"github.com/open-card/open-card/internal/contracts"
 	"github.com/open-card/open-card/internal/domain"
 	"github.com/open-card/open-card/internal/foundation"
+	"github.com/open-card/open-card/internal/importers/dockerfile"
 )
 
 const (
@@ -45,7 +46,10 @@ type CommandRunner interface {
 	Run(ctx context.Context, command string, args []string, stdout, stderr io.Writer) error
 }
 type BuildLogSink interface {
-	StoreBuildLog(context.Context, contracts.BuildRequest, string) error
+	// StoreBuildLog durably persists a completed BuildKit log and returns the
+	// durable reference that callers may expose in BuildResult. A sink must not
+	// synthesize a reference for content it did not persist.
+	StoreBuildLog(context.Context, contracts.BuildRequest, string) (string, error)
 }
 
 type execRunner struct{}
@@ -73,6 +77,10 @@ type Config struct {
 	SecretResolver     contracts.BuildSecretResolver
 	Runner             CommandRunner
 	LogSink            BuildLogSink
+	// RequireLogSink keeps legacy BuildKit composition optional while allowing
+	// a composition root to require durable logs for every build it serves.
+	// AcornFox-bound plans require a sink regardless of this switch.
+	RequireLogSink bool
 }
 
 func (c Config) normalized() (Config, error) {
@@ -121,6 +129,9 @@ func (c Config) normalized() (Config, error) {
 	}
 	if c.Runner == nil {
 		c.Runner = execRunner{}
+	}
+	if c.RequireLogSink && c.LogSink == nil {
+		return Config{}, fmt.Errorf("buildkit durable log sink is required")
 	}
 	return c, nil
 }
@@ -267,6 +278,9 @@ func (p *Provider) validateRequest(ctx context.Context, request contracts.BuildR
 	if err := request.Plan.Validate(); err != nil {
 		return p.providerError(request.Operation, contracts.ErrValidation, "build plan is invalid", contracts.RetryNever, false, err)
 	}
+	if err := validateAcornFoxPlan(request.Plan); err != nil {
+		return p.providerError(request.Operation, contracts.ErrValidation, "AcornFox build plan is invalid", contracts.RetryNever, false, err)
+	}
 	if err := domain.RequireID(request.BuildID, "build id"); err != nil {
 		return p.providerError(request.Operation, contracts.ErrValidation, "build id is invalid", contracts.RetryNever, false, err)
 	}
@@ -292,6 +306,37 @@ func (p *Provider) validateRequest(ctx context.Context, request contracts.BuildR
 	}
 	if err := validateNetwork(request.Network); err != nil {
 		return p.providerError(request.Operation, contracts.ErrForbidden, "build network policy must be none", contracts.RetryNever, false, err)
+	}
+	if requiresDurableLog(request.Plan) && p.config.LogSink == nil {
+		return p.providerError(request.Operation, contracts.ErrUnavailable, "build durable log sink is unavailable", contracts.RetryUserAction, false, nil)
+	}
+	return nil
+}
+
+func requiresDurableLog(plan domain.BuildPlan) bool {
+	return plan.AcornFoxDefinitionDigest != "" && plan.AcornFoxDockerfileDigest != ""
+}
+
+func validateAcornFoxPlan(plan domain.BuildPlan) error {
+	if !requiresDurableLog(plan) {
+		return nil
+	}
+	if plan.Kind != domain.BuildDockerfile || plan.ContextPath != "." || plan.DockerfilePath != "Dockerfile" {
+		return errors.New("AcornFox build plan must use the root Dockerfile")
+	}
+	return nil
+}
+
+func validateAcornFoxDefinitionAgainstPlan(source domain.SourceRevision, plan domain.BuildPlan) error {
+	if !requiresDurableLog(plan) {
+		return nil
+	}
+	definition, err := dockerfile.Import(source)
+	if err != nil {
+		return err
+	}
+	if definition.Status != contracts.AcornFoxDockerfileReady || definition.DefinitionDigest != plan.AcornFoxDefinitionDigest || definition.DockerfileDigest != plan.AcornFoxDockerfileDigest {
+		return errors.New("bound AcornFox Dockerfile definition digest changed")
 	}
 	return nil
 }
@@ -364,6 +409,9 @@ func (p *Provider) run(ctx context.Context, request contracts.BuildRequest, reco
 	if err != nil {
 		return contracts.BuildResult{}, p.providerError(request.Operation, contracts.ErrValidation, safePreparationFailure(err), contracts.RetryNever, false, err)
 	}
+	if err := validateAcornFoxDefinitionAgainstPlan(request.Source, request.Plan); err != nil {
+		return contracts.BuildResult{}, p.providerError(request.Operation, contracts.ErrValidation, "AcornFox Dockerfile definition does not match build plan", contracts.RetryNever, false, err)
+	}
 	secretArgs, secretMaterials, err := p.mountSecrets(runCtx, request.Plan.SecretRefs, request.Operation)
 	if err != nil {
 		return contracts.BuildResult{}, p.providerError(request.Operation, contracts.ErrUnavailable, "prepare build secrets", contracts.RetryBackoff, true, err)
@@ -386,6 +434,10 @@ func (p *Provider) run(ctx context.Context, request contracts.BuildRequest, reco
 	if err := p.config.Runner.Run(runCtx, p.config.Command, args, logs, logs); err != nil {
 		return contracts.BuildResult{}, p.commandError(request.Operation, err, logs.String(), len(secretMaterials) > 0)
 	}
+	successLogs := logs.String()
+	if !logs.suppressed {
+		successLogs = normalizeBuildKitRawJSONLog(successLogs)
+	}
 	metadata, err := os.ReadFile(metadataPath)
 	if err != nil {
 		return contracts.BuildResult{}, p.providerError(request.Operation, contracts.ErrValidation, "build did not produce metadata", contracts.RetryNever, false, err)
@@ -400,30 +452,33 @@ func (p *Provider) run(ctx context.Context, request contracts.BuildRequest, reco
 		}
 		return contracts.BuildResult{}, p.providerError(request.Operation, contracts.ErrValidation, "build did not produce OCI output", contracts.RetryNever, false, err)
 	}
+	image, err := domain.ParseImageDigest(request.Plan.TargetRepository, digest)
+	if err != nil {
+		return contracts.BuildResult{}, p.providerError(request.Operation, contracts.ErrValidation, "build image digest is invalid", contracts.RetryNever, false, err)
+	}
+	logRef := ""
+	if p.config.LogSink != nil {
+		logRef, err = p.config.LogSink.StoreBuildLog(runCtx, request, successLogs)
+		if err != nil {
+			return contracts.BuildResult{}, p.providerError(request.Operation, contracts.ErrUnavailable, "persist build log", contracts.RetryBackoff, true, nil)
+		}
+		if strings.TrimSpace(logRef) == "" {
+			return contracts.BuildResult{}, p.providerError(request.Operation, contracts.ErrUnavailable, "persist build log", contracts.RetryBackoff, true, nil)
+		}
+	}
 	archive, err := os.Open(outputPath)
 	if err != nil {
 		return contracts.BuildResult{}, p.providerError(request.Operation, contracts.ErrUnavailable, "open OCI output", contracts.RetryBackoff, true, err)
 	}
-	image, err := domain.ParseImageDigest(request.Plan.TargetRepository, digest)
-	if err != nil {
-		archive.Close()
-		return contracts.BuildResult{}, p.providerError(request.Operation, contracts.ErrValidation, "build image digest is invalid", contracts.RetryNever, false, err)
-	}
 	stored, storeErr := p.config.ImageStore.StoreOCI(runCtx, contracts.StoreOCIRequest{Image: image, StorageKey: request.Plan.Output.StorageKey, Archive: archive, Operation: request.Operation})
 	closeErr := archive.Close()
 	if storeErr != nil {
-		return contracts.BuildResult{}, storeErr
+		return contracts.BuildResult{}, p.providerErrorWithLogRef(request.Operation, contracts.ErrUnavailable, "store OCI output", contracts.RetryBackoff, true, storeErr, logRef)
 	}
 	if closeErr != nil {
 		return contracts.BuildResult{}, p.providerError(request.Operation, contracts.ErrUnavailable, "close OCI output", contracts.RetryBackoff, true, closeErr)
 	}
-	result := p.success(request, stored, metadata, logs.String())
-	if p.config.LogSink != nil {
-		if err := p.config.LogSink.StoreBuildLog(ctx, request, logs.String()); err != nil {
-			return contracts.BuildResult{}, p.providerError(request.Operation, contracts.ErrUnavailable, "persist build log", contracts.RetryBackoff, true, nil)
-		}
-	}
-	return result, nil
+	return p.success(request, stored, metadata, successLogs, logRef), nil
 }
 
 func safePreparationFailure(err error) string {
@@ -432,6 +487,7 @@ func safePreparationFailure(err error) string {
 		"source workspace is invalid", "source workspace digest changed", "build context escapes workspace root",
 		"build context is not a directory", "symbolic links are not allowed", "non-regular build-context file",
 		"dockerfile escapes build context", "dockerfile must be a regular file", "static server binary is unavailable",
+		"copied Dockerfile digest does not match AcornFox build plan", "AcornFox build plan must use the root Dockerfile",
 		"static server binary digest does not match build plan", "source conflicts with reserved static runtime path",
 		"copy static server binary",
 	} {
@@ -517,6 +573,15 @@ func (p *Provider) copyBuildContext(sourceRevision domain.SourceRevision, plan d
 		}
 		if !info.Mode().IsRegular() {
 			return "", "", errors.New("dockerfile must be a regular file")
+		}
+		if plan.AcornFoxDockerfileDigest != "" {
+			if plan.ContextPath != "." || plan.DockerfilePath != "Dockerfile" {
+				return "", "", errors.New("AcornFox build plan must use the root Dockerfile")
+			}
+			copiedDigest, digestErr := digestFile(dockerfile)
+			if digestErr != nil || copiedDigest != plan.AcornFoxDockerfileDigest {
+				return "", "", errors.New("copied Dockerfile digest does not match AcornFox build plan")
+			}
 		}
 	} else if plan.Kind == domain.BuildStatic {
 		if p.config.StaticServerBinary == "" {
@@ -656,6 +721,7 @@ func (p *Provider) commandArgs(contextPath, dockerfilePath, metadataPath, output
 		"--local", "context=" + contextPath,
 		"--local", "dockerfile=" + dockerfileDirectory,
 		"--opt", "filename=" + dockerfileName,
+		"--opt", "network=none",
 		"--progress", "rawjson",
 		"--metadata-file", metadataPath,
 		"--output", "type=oci,dest=" + outputPath,
@@ -664,7 +730,7 @@ func (p *Provider) commandArgs(contextPath, dockerfilePath, metadataPath, output
 	return args
 }
 
-func (p *Provider) success(request contracts.BuildRequest, stored contracts.StoreOCIResult, metadata []byte, logs string) contracts.BuildResult {
+func (p *Provider) success(request contracts.BuildRequest, stored contracts.StoreOCIResult, metadata []byte, logs, logRef string) contracts.BuildResult {
 	fingerprint := requestFingerprint(request)
 	buildID := request.BuildID
 	artifactID := domain.ID("artifact_" + hashText(string(buildID), stored.Image.Digest)[:32])
@@ -672,9 +738,11 @@ func (p *Provider) success(request contracts.BuildRequest, stored contracts.Stor
 	evidenceDigest := digestBytes([]byte(logs), metadata)
 	base := "buildkit://" + p.config.Builder + "/" + fingerprint
 	refs := []domain.EvidenceRef{
-		{ID: domain.ID("ev_" + hashText("log", fingerprint)[:32]), Kind: "build.log", Digest: digestBytes([]byte(logs)), Locator: base + "/log"},
 		{ID: domain.ID("ev_" + hashText("metadata", fingerprint)[:32]), Kind: "build.metadata", Digest: digestBytes(metadata), Locator: base + "/metadata"},
 		{ID: domain.ID("ev_" + hashText("oci", image.Digest)[:32]), Kind: "build.oci", Digest: image.Digest, Locator: stored.StorageRef},
+	}
+	if logRef != "" {
+		refs = append([]domain.EvidenceRef{{ID: domain.ID("ev_" + hashText("log", fingerprint)[:32]), Kind: "build.log", Digest: digestBytes([]byte(logs)), Locator: logRef}}, refs...)
 	}
 	refs = append(refs, stored.Evidence.Refs...)
 	now := time.Now().UTC()
@@ -683,7 +751,7 @@ func (p *Provider) success(request contracts.BuildRequest, stored contracts.Stor
 		Build:    domain.Build{ID: buildID, PlanID: request.Plan.ID, Status: domain.BuildSucceeded, ArtifactID: artifactID, CreatedAt: now, UpdatedAt: now},
 		Artifact: artifact,
 		Evidence: contracts.Evidence{Refs: refs, Summary: "rootless BuildKit OCI output", Digest: evidenceDigest, Redacted: true},
-		LogRef:   base + "/log",
+		LogRef:   logRef,
 	}
 }
 
@@ -714,9 +782,20 @@ func (p *Provider) providerError(operation contracts.OperationContext, code cont
 		Capability: contracts.CapabilityBuild, Operation: "build", Cause: cause,
 		Details: map[string]string{
 			"evidence_ref": "ev_" + hashText("error", fingerprint)[:32],
-			"log_ref":      "buildkit://" + p.config.Builder + "/" + fingerprint + "/log",
+			// Error log references are stable correlation locators, not an
+			// assertion that a durable log was written. Successful results use
+			// only the durable reference returned by BuildLogSink.
+			"log_ref": "buildkit://" + p.config.Builder + "/" + fingerprint + "/log",
 		},
 	}
+}
+
+func (p *Provider) providerErrorWithLogRef(operation contracts.OperationContext, code contracts.ErrorCode, message string, retry contracts.RetryClass, retryable bool, cause error, logRef string) *contracts.ProviderError {
+	result := p.providerError(operation, code, message, retry, retryable, cause)
+	if strings.TrimSpace(logRef) != "" {
+		result.Details["log_ref"] = logRef
+	}
+	return result
 }
 
 func requestFingerprint(request contracts.BuildRequest) string {
@@ -725,7 +804,7 @@ func requestFingerprint(request contracts.BuildRequest) string {
 		secretIDs = append(secretIDs, string(reference.ID)+":"+reference.Version)
 	}
 	sort.Strings(secretIDs)
-	return hashText(string(request.BuildID), string(request.Plan.ID), string(request.Plan.SourceRevisionID), request.Plan.SourceDigest, request.Plan.ServiceName, string(request.Plan.Kind), request.Plan.ContextPath, request.Plan.DockerfilePath, request.Plan.StaticRuntimeDigest, request.Plan.TargetRepository, request.Plan.Output.StorageKey, strings.Join(secretIDs, ","), request.Plan.IdempotencyKey)
+	return hashText(string(request.BuildID), string(request.Plan.ID), string(request.Plan.SourceRevisionID), request.Plan.SourceDigest, request.Plan.ServiceName, string(request.Plan.Kind), request.Plan.ContextPath, request.Plan.DockerfilePath, request.Plan.StaticRuntimeDigest, request.Plan.AcornFoxDefinitionDigest, request.Plan.AcornFoxDockerfileDigest, request.Plan.TargetRepository, request.Plan.Output.StorageKey, strings.Join(secretIDs, ","), request.Plan.IdempotencyKey)
 }
 
 func digestFile(path string) (string, error) {
@@ -808,6 +887,117 @@ func (b *redactingBuffer) String() string {
 		return "build output suppressed while secrets were mounted"
 	}
 	return b.buf.String()
+}
+
+// normalizeBuildKitRawJSONLog converts BuildKit rawjson progress records into
+// readable stream text for successful durable logs. BuildKit encodes its data
+// field as a JSON []byte (base64 on the wire). Any malformed record or absence
+// of a data field falls back to the already bounded raw capture so this helper
+// never invents a partial success log.
+func normalizeBuildKitRawJSONLog(raw string) string {
+	if raw == "" {
+		return raw
+	}
+	var normalized bytes.Buffer
+	foundData := false
+	pendingCarriageReturn := false
+	for _, line := range strings.SplitAfter(raw, "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(line), &fields); err != nil {
+			return raw
+		}
+		matched, err := appendBuildKitRawJSONData(fields, &normalized, &pendingCarriageReturn)
+		if err != nil {
+			return raw
+		}
+		foundData = foundData || matched
+	}
+	if !foundData {
+		return raw
+	}
+	if pendingCarriageReturn && normalized.Len() < maxCaptureBytes {
+		_ = normalized.WriteByte('\n')
+	}
+	return normalized.String()
+}
+
+// appendBuildKitRawJSONData understands the observed BuildKit rawjson record
+// shape: progress fields at the top level and log data in a top-level logs
+// array. Top-level data is retained for compatibility with older fixtures.
+// Any data-bearing malformed object fails the whole normalization so callers
+// retain the original raw record rather than a partial readable log.
+func appendBuildKitRawJSONData(fields map[string]json.RawMessage, destination *bytes.Buffer, pendingCarriageReturn *bool) (bool, error) {
+	foundData := false
+	if value, ok := fields["data"]; ok {
+		decoded, err := decodeBuildKitRawJSONData(value)
+		if err != nil {
+			return false, err
+		}
+		appendBoundedNormalizedLog(destination, decoded, pendingCarriageReturn)
+		foundData = true
+	}
+	logs, ok := fields["logs"]
+	if !ok {
+		return foundData, nil
+	}
+	var entries []json.RawMessage
+	if err := json.Unmarshal(logs, &entries); err != nil {
+		return false, err
+	}
+	for _, entry := range entries {
+		var logFields map[string]json.RawMessage
+		if err := json.Unmarshal(entry, &logFields); err != nil {
+			return false, err
+		}
+		value, ok := logFields["data"]
+		if !ok {
+			continue
+		}
+		decoded, err := decodeBuildKitRawJSONData(value)
+		if err != nil {
+			return false, err
+		}
+		appendBoundedNormalizedLog(destination, decoded, pendingCarriageReturn)
+		foundData = true
+	}
+	return foundData, nil
+}
+
+func decodeBuildKitRawJSONData(value json.RawMessage) ([]byte, error) {
+	if len(value) < 2 || value[0] != '"' {
+		return nil, errors.New("BuildKit rawjson data is not base64 text")
+	}
+	var decoded []byte
+	if err := json.Unmarshal(value, &decoded); err != nil {
+		return nil, err
+	}
+	return decoded, nil
+}
+
+func appendBoundedNormalizedLog(destination *bytes.Buffer, value []byte, pendingCarriageReturn *bool) {
+	for _, current := range value {
+		if destination.Len() >= maxCaptureBytes {
+			return
+		}
+		if *pendingCarriageReturn {
+			_ = destination.WriteByte('\n')
+			*pendingCarriageReturn = false
+			if current == '\n' {
+				continue
+			}
+			if destination.Len() >= maxCaptureBytes {
+				return
+			}
+		}
+		if current == '\r' {
+			*pendingCarriageReturn = true
+			continue
+		}
+		_ = destination.WriteByte(current)
+	}
 }
 
 var _ contracts.BuildProvider = (*Provider)(nil)

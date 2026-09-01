@@ -81,3 +81,35 @@ func TestM1MigrationCarriesImmutableBuildReleaseGuards(t *testing.T) {
 		}
 	}
 }
+
+func TestAcornFoxBuildPlanBindingMigrationIsAdditiveAndPaired(t *testing.T) {
+	payload, err := os.ReadFile("../../../migrations/control-plane/0025_acornfox_build_plan_binding.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(payload)
+	for _, fragment := range []string{
+		"ADD COLUMN IF NOT EXISTS acornfox_definition_digest text",
+		"ADD COLUMN IF NOT EXISTS acornfox_dockerfile_digest text",
+		"build_plans_acornfox_binding_check",
+		"acornfox_definition_digest IS NULL AND acornfox_dockerfile_digest IS NULL",
+		"acornfox_definition_digest IS NOT NULL",
+		"acornfox_dockerfile_digest IS NOT NULL",
+		"build_kind = 'dockerfile'",
+		"context_path = '.'",
+		"dockerfile_path = 'Dockerfile'",
+		"static_runtime_digest IS NULL",
+		"output_contract @> '{\"format\":\"oci\",\"retention\":\"persistent\"}'::jsonb",
+		"acornfox_definition_digest ~ '^sha256:[0-9A-Fa-f]{64}$'",
+		"acornfox_dockerfile_digest ~ '^sha256:[0-9A-Fa-f]{64}$'",
+	} {
+		if !strings.Contains(text, fragment) {
+			t.Errorf("0025 migration is missing %q", fragment)
+		}
+	}
+	for _, forbidden := range []string{"DROP COLUMN", "DROP TABLE", "DELETE FROM", "UPDATE build_plans"} {
+		if strings.Contains(strings.ToUpper(text), forbidden) {
+			t.Errorf("0025 migration must not contain %q", forbidden)
+		}
+	}
+}
