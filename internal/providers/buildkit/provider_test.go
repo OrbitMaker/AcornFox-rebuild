@@ -152,6 +152,26 @@ func (fakeCapacity) Release(context.Context, contracts.CapacityLease, contracts.
 	return nil
 }
 
+type countingCapacity struct {
+	fakeCapacity
+	activations int
+}
+
+func (c *countingCapacity) Activate(context.Context, contracts.CapacityLease, contracts.OperationContext) error {
+	c.activations++
+	return nil
+}
+
+type countingSecretResolver struct {
+	fakeSecretResolver
+	calls int
+}
+
+func (c *countingSecretResolver) ResolveBuildSecret(ctx context.Context, reference domain.SecretReference, operation contracts.OperationContext) (contracts.BuildSecretMaterial, error) {
+	c.calls++
+	return c.fakeSecretResolver.ResolveBuildSecret(ctx, reference, operation)
+}
+
 func testProvider(t *testing.T, runner CommandRunner) (*Provider, string, domain.SourceRevision) {
 	t.Helper()
 	root := t.TempDir()
@@ -378,6 +398,69 @@ func TestBuildRejectsPolicyEscapesBeforeCallingEndpoint(t *testing.T) {
 	assertProviderCode(t, mustBuild(provider, request), contracts.ErrValidation)
 	if runner.callCount() != 0 {
 		t.Fatalf("policy rejection invoked endpoint %d times", runner.callCount())
+	}
+}
+
+func TestControlledEgressIsUnavailableBeforeAnyDownstreamEffect(t *testing.T) {
+	const policyDigest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	runner := writingRunner(t, "")
+	provider, root, source := testProvider(t, runner)
+	logs := &fakeBuildLogSink{ref: "memory://build-log/controlled"}
+	store := &countingImageStore{ImageStore: contracts.NewFakeImageStore(true)}
+	capacity := &countingCapacity{}
+	secrets := &countingSecretResolver{fakeSecretResolver: fakeSecretResolver{root: filepath.Join(root, "counted-secrets")}}
+	if err := os.Mkdir(secrets.root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	provider.config.LogSink = logs
+	provider.config.ImageStore = store
+	provider.config.Capacity = capacity
+	provider.config.SecretResolver = secrets
+
+	request := testRequest("controlled-unavailable", source)
+	request.Network = contracts.NetworkPolicy{Mode: contracts.NetworkModeControlledEgressV1, WorkerPolicyDigest: policyDigest}
+	request.Source.WorkspaceRef = filepath.Join(root, "must-not-evaluate")
+	assertProviderCode(t, mustBuild(provider, request), contracts.ErrForbidden)
+	if runner.callCount() != 0 || logs.callCount() != 0 || store.callCount() != 0 || capacity.activations != 0 || secrets.calls != 0 {
+		t.Fatalf("controlled-egress rejection had downstream effects: runner=%d logs=%d store=%d capacity=%d secrets=%d", runner.callCount(), logs.callCount(), store.callCount(), capacity.activations, secrets.calls)
+	}
+
+	nested := testRequest("controlled-nested-exceptions", source)
+	nested.Network = contracts.NetworkPolicy{Mode: contracts.NetworkModeControlledEgressV1, WorkerPolicyDigest: policyDigest, AllowedCIDRs: []string{"10.0.0.0/8"}, AllowMetadata: true}
+	assertProviderCode(t, mustBuild(provider, nested), contracts.ErrForbidden)
+
+	bound := testRequest("controlled-acornfox-bound", source)
+	bindAcornFoxDigests(t, &bound)
+	bound.Network = contracts.NetworkPolicy{Mode: contracts.NetworkModeControlledEgressV1, WorkerPolicyDigest: policyDigest}
+	assertProviderCode(t, mustBuild(provider, bound), contracts.ErrForbidden)
+
+	static := testRequest("controlled-static", source)
+	static.Plan.Kind = domain.BuildStatic
+	static.Plan.DockerfilePath = ""
+	static.Plan.StaticRuntimeDigest = testDigest
+	static.Network = contracts.NetworkPolicy{Mode: contracts.NetworkModeControlledEgressV1, WorkerPolicyDigest: policyDigest}
+	assertProviderCode(t, mustBuild(provider, static), contracts.ErrForbidden)
+	if runner.callCount() != 0 || logs.callCount() != 0 || store.callCount() != 0 || capacity.activations != 0 || secrets.calls != 0 {
+		t.Fatal("legacy, AcornFox-bound, static, or nested controlled requests had downstream effects")
+	}
+}
+
+func TestControlledEgressChangesFingerprintWithoutExecuting(t *testing.T) {
+	const policyDigest = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	runner := writingRunner(t, "")
+	provider, _, source := testProvider(t, runner)
+	offline := testRequest("network-fingerprint", source)
+	controlled := offline
+	controlled.Network = contracts.NetworkPolicy{Mode: contracts.NetworkModeControlledEgressV1, WorkerPolicyDigest: policyDigest}
+	differentPolicy := controlled
+	differentPolicy.Network.WorkerPolicyDigest = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+	if requestFingerprint(offline) == requestFingerprint(controlled) || requestFingerprint(controlled) == requestFingerprint(differentPolicy) {
+		t.Fatal("network mode or worker policy digest was omitted from idempotency fingerprint")
+	}
+	assertProviderCode(t, mustBuild(provider, controlled), contracts.ErrForbidden)
+	assertProviderCode(t, mustBuild(provider, differentPolicy), contracts.ErrForbidden)
+	if runner.callCount() != 0 {
+		t.Fatalf("controlled egress executed despite dormant contract: %d", runner.callCount())
 	}
 }
 

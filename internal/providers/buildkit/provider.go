@@ -275,6 +275,9 @@ func (p *Provider) validateRequest(ctx context.Context, request contracts.BuildR
 	if err := request.Operation.Validate(); err != nil {
 		return p.providerError(request.Operation, contracts.ErrInvalidArgument, "provider idempotency key is required", contracts.RetryNever, false, err)
 	}
+	if err := p.validateNetwork(request.Network); err != nil {
+		return p.providerError(request.Operation, contracts.ErrForbidden, "build network policy is unavailable", contracts.RetryNever, false, err)
+	}
 	if err := request.Plan.Validate(); err != nil {
 		return p.providerError(request.Operation, contracts.ErrValidation, "build plan is invalid", contracts.RetryNever, false, err)
 	}
@@ -303,9 +306,6 @@ func (p *Provider) validateRequest(ctx context.Context, request contracts.BuildR
 	}
 	if request.Capacity == nil || request.Capacity.Scope != contracts.CapacityBuild || !sameCapacityResources(request.Capacity.Resources, request.Resources) {
 		return p.providerError(request.Operation, contracts.ErrCapacity, "build capacity lease is missing or does not match resources", contracts.RetryBackoff, true, nil)
-	}
-	if err := validateNetwork(request.Network); err != nil {
-		return p.providerError(request.Operation, contracts.ErrForbidden, "build network policy must be none", contracts.RetryNever, false, err)
 	}
 	if requiresDurableLog(request.Plan) && p.config.LogSink == nil {
 		return p.providerError(request.Operation, contracts.ErrUnavailable, "build durable log sink is unavailable", contracts.RetryUserAction, false, nil)
@@ -367,12 +367,12 @@ func validateResources(resources contracts.ResourceLimits) error {
 	return nil
 }
 
-func validateNetwork(network contracts.NetworkPolicy) error {
-	if network.Mode != "" && network.Mode != "none" {
-		return fmt.Errorf("network mode %q is not allowed", network.Mode)
+func (p *Provider) validateNetwork(network contracts.NetworkPolicy) error {
+	if err := network.Validate(); err != nil {
+		return err
 	}
-	if len(network.AllowedCIDRs) != 0 || network.AllowMetadata {
-		return errors.New("network exceptions are not allowed")
+	if network.EffectiveMode() == contracts.NetworkModeControlledEgressV1 {
+		return errors.New("controlled egress worker policy is unavailable")
 	}
 	return nil
 }
@@ -804,7 +804,7 @@ func requestFingerprint(request contracts.BuildRequest) string {
 		secretIDs = append(secretIDs, string(reference.ID)+":"+reference.Version)
 	}
 	sort.Strings(secretIDs)
-	return hashText(string(request.BuildID), string(request.Plan.ID), string(request.Plan.SourceRevisionID), request.Plan.SourceDigest, request.Plan.ServiceName, string(request.Plan.Kind), request.Plan.ContextPath, request.Plan.DockerfilePath, request.Plan.StaticRuntimeDigest, request.Plan.AcornFoxDefinitionDigest, request.Plan.AcornFoxDockerfileDigest, request.Plan.TargetRepository, request.Plan.Output.StorageKey, strings.Join(secretIDs, ","), request.Plan.IdempotencyKey)
+	return hashText(string(request.BuildID), string(request.Plan.ID), string(request.Plan.SourceRevisionID), request.Plan.SourceDigest, request.Plan.ServiceName, string(request.Plan.Kind), request.Plan.ContextPath, request.Plan.DockerfilePath, request.Plan.StaticRuntimeDigest, request.Plan.AcornFoxDefinitionDigest, request.Plan.AcornFoxDockerfileDigest, request.Plan.TargetRepository, request.Plan.Output.StorageKey, string(request.Network.EffectiveMode()), request.Network.WorkerPolicyDigest, strings.Join(secretIDs, ","), request.Plan.IdempotencyKey)
 }
 
 func digestFile(path string) (string, error) {

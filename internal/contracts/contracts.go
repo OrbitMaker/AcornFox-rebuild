@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/open-card/open-card/internal/domain"
@@ -380,10 +381,66 @@ type CapacityProvider interface {
 	Release(context.Context, CapacityLease, OperationContext) error
 }
 
+type NetworkMode string
+
+const (
+	// NetworkModeOffline is the default build mode. It remains the only mode
+	// available to compositions that do not explicitly pin a worker policy.
+	NetworkModeOffline NetworkMode = "none"
+	// NetworkModeControlledEgressV1 is a request-scoped, versioned contract.
+	// It does not itself configure a worker or grant any network access.
+	NetworkModeControlledEgressV1 NetworkMode = "controlled_egress_v1"
+)
+
 type NetworkPolicy struct {
-	Mode          string   `json:"mode"`
-	AllowedCIDRs  []string `json:"allowed_cidrs,omitempty"`
-	AllowMetadata bool     `json:"allow_metadata"`
+	Mode               NetworkMode `json:"mode"`
+	WorkerPolicyDigest string      `json:"worker_policy_digest,omitempty"`
+	AllowedCIDRs       []string    `json:"allowed_cidrs,omitempty"`
+	AllowMetadata      bool        `json:"allow_metadata"`
+}
+
+// EffectiveMode preserves the historical empty value as the offline default.
+func (p NetworkPolicy) EffectiveMode() NetworkMode {
+	if p.Mode == "" {
+		return NetworkModeOffline
+	}
+	return p.Mode
+}
+
+// Validate rejects caller-selected network exceptions. Controlled egress is
+// only a digest-bound request contract; a provider must still match that
+// digest to an independently provisioned worker before it can run.
+func (p NetworkPolicy) Validate() error {
+	if len(p.AllowedCIDRs) != 0 || p.AllowMetadata {
+		return errors.New("network exceptions are not allowed")
+	}
+	switch p.EffectiveMode() {
+	case NetworkModeOffline:
+		if p.WorkerPolicyDigest != "" {
+			return errors.New("offline network must not carry a worker policy digest")
+		}
+	case NetworkModeControlledEgressV1:
+		if !IsSHA256Digest(p.WorkerPolicyDigest) {
+			return errors.New("controlled egress worker policy digest is invalid")
+		}
+	default:
+		return errors.New("build network mode is unsupported")
+	}
+	return nil
+}
+
+// IsSHA256Digest accepts only the immutable digest shape used to bind a
+// controlled-egress request to one reviewed worker policy.
+func IsSHA256Digest(value string) bool {
+	if !strings.HasPrefix(value, "sha256:") || len(value) != len("sha256:")+64 {
+		return false
+	}
+	for _, character := range value[len("sha256:"):] {
+		if !(character >= '0' && character <= '9') && !(character >= 'a' && character <= 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 type RuntimeSpec struct {

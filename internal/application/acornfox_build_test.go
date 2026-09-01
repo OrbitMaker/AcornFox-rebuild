@@ -44,6 +44,16 @@ func TestAcornFoxBuildBinderPinsReadyRootDockerfileOffline(t *testing.T) {
 	if first.Plan.Kind != domain.BuildDockerfile || first.Plan.ContextPath != "." || first.Plan.DockerfilePath != "Dockerfile" || first.Resources != (contracts.ResourceLimits{CPUMillis: 500, MemoryBytes: 512 << 20, DiskBytes: 1 << 30, TimeoutSeconds: 300, ConcurrencySlot: 1}) || first.Network.Mode != "none" || first.Resources.PIDs != 0 {
 		t.Fatalf("binder did not enforce the offline one-build policy: %#v", first)
 	}
+	controlled, err := binder.BindControlledEgress(definition, source, "publish-1", "registry.open-card.local/apps/web", "builds/src_1/web", "sha256:"+strings.Repeat("b", 64), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if controlled.Network.Mode != contracts.NetworkModeControlledEgressV1 || controlled.Network.WorkerPolicyDigest != "sha256:"+strings.Repeat("b", 64) || controlled.BuildID == first.BuildID || controlled.Plan.ID == first.Plan.ID {
+		t.Fatalf("controlled egress was not separately bound: offline=%#v controlled=%#v", first, controlled)
+	}
+	if _, err := binder.BindControlledEgress(definition, source, "publish-1", "registry.open-card.local/apps/web", "builds/src_1/web", "sha256:malformed", now); err == nil {
+		t.Fatal("malformed controlled-egress policy digest was accepted")
+	}
 }
 
 func TestAcornFoxBuildBinderRejectsStaleDefinitionDigestAndZeroAcceptedTime(t *testing.T) {

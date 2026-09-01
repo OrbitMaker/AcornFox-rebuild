@@ -55,6 +55,35 @@ func validImage() domain.ImageDigest {
 	return domain.ImageDigest{Repository: "example/web", Digest: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", ResolvedTag: "stable"}
 }
 
+func TestCT_BUILD_003_NetworkPolicyIsOfflineByDefaultAndDigestBoundForControlledEgress(t *testing.T) {
+	validDigest := "sha256:" + strings.Repeat("a", 64)
+	for name, policy := range map[string]NetworkPolicy{
+		"empty_defaults_offline": {},
+		"explicit_offline":       {Mode: NetworkModeOffline},
+		"controlled":             {Mode: NetworkModeControlledEgressV1, WorkerPolicyDigest: validDigest},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := policy.Validate(); err != nil {
+				t.Fatalf("valid policy rejected: %v", err)
+			}
+		})
+	}
+	for name, policy := range map[string]NetworkPolicy{
+		"unknown_mode":          {Mode: "default"},
+		"offline_policy_digest": {Mode: NetworkModeOffline, WorkerPolicyDigest: validDigest},
+		"controlled_empty":      {Mode: NetworkModeControlledEgressV1},
+		"controlled_malformed":  {Mode: NetworkModeControlledEgressV1, WorkerPolicyDigest: "sha256:ABC"},
+		"cidr_exception":        {Mode: NetworkModeControlledEgressV1, WorkerPolicyDigest: validDigest, AllowedCIDRs: []string{"10.0.0.0/8"}},
+		"metadata_exception":    {Mode: NetworkModeControlledEgressV1, WorkerPolicyDigest: validDigest, AllowMetadata: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := policy.Validate(); err == nil {
+				t.Fatal("unsafe network policy was accepted")
+			}
+		})
+	}
+}
+
 func TestCT_OBJECT_001_ObjectStorageCapabilityFailsClosed(t *testing.T) {
 	provider := NewFakeObjectStorageProvider(false)
 	operation := OperationContext{IdempotencyKey: "object-1"}
@@ -153,6 +182,23 @@ func TestCT_BUILD_001_FakeBuildIsIdempotentAndEvidenceBacked(t *testing.T) {
 		t.Fatal(err)
 	}
 	providerErrorCode(t, mustBuildError(cancelProvider, BuildRequest{BuildID: request.BuildID, Plan: request.Plan, Source: request.Source, Operation: OperationContext{IdempotencyKey: "build-cleanup"}}), ErrCancelled)
+}
+
+func TestCT_BUILD_004_FakeBuildRejectsControlledEgressAndKeepsItsOperationTableEmpty(t *testing.T) {
+	provider := NewFakeBuildProvider(true)
+	request := validBuildRequest("controlled-fake")
+	request.Network = NetworkPolicy{Mode: NetworkModeControlledEgressV1, WorkerPolicyDigest: "sha256:" + strings.Repeat("a", 64)}
+	providerErrorCode(t, mustBuildError(provider, request), ErrForbidden)
+	provider.mu.Lock()
+	attempts := provider.attempts[request.Operation.IdempotencyKey]
+	_, recorded := provider.request[request.Operation.IdempotencyKey]
+	provider.mu.Unlock()
+	if attempts != 0 || recorded {
+		t.Fatalf("controlled egress changed fake operation state: attempts=%d recorded=%t", attempts, recorded)
+	}
+
+	request.Network.AllowedCIDRs = []string{"10.0.0.0/8"}
+	providerErrorCode(t, mustBuildError(provider, request), ErrValidation)
 }
 
 func mustBuildError(provider *FakeBuildProvider, request BuildRequest, contexts ...context.Context) error {
