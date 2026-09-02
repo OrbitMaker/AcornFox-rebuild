@@ -220,11 +220,11 @@ func TestM4WebhookLogAndOperationFactsPersist(t *testing.T) {
 	if lifecycle, err := store.ListPendingWebhookLifecycleEvents(ctx, 10); err != nil || len(lifecycle) != 0 {
 		t.Fatalf("event-type expansion backfilled historic lifecycle: values=%+v err=%v", lifecycle, err)
 	}
-	if err := store.AppendLogIndex(ctx, LogIndex{ID: domain.ID("log_runtime_" + suffix), ApplicationID: appID, ServiceName: "frontend", ReleaseID: currentRelease, DeploymentID: currentDeployment, OperationID: operationID, Category: LogIndexRuntime, Path: "/var/lib/open-card/logs/runtime/segment.log", Segment: 1, ByteSize: 12}, now); err != nil {
+	if err := store.AppendLogIndex(ctx, LogIndex{ID: domain.ID("log_runtime_" + suffix), ApplicationID: appID, ServiceName: "frontend", ReleaseID: currentRelease, DeploymentID: currentDeployment, OperationID: operationID, Category: LogIndexRuntime, Path: "/var/lib/open-card/logs/runtime/segment.log", Segment: 1, ByteSize: 12, ContentDigest: "sha256:" + strings.Repeat("b", 64)}, now); err != nil {
 		t.Fatal(err)
 	}
 	auditID := domain.ID("log_audit_" + suffix)
-	if err := store.AppendLogIndex(ctx, LogIndex{ID: auditID, ApplicationID: appID, ServiceName: "audit", OperationID: operationID, Category: LogIndexAudit, Path: "/var/lib/open-card/logs/audit/segment.log", Segment: 1, ByteSize: 12}, now); err != nil {
+	if err := store.AppendLogIndex(ctx, LogIndex{ID: auditID, ApplicationID: appID, ServiceName: "audit", OperationID: operationID, Category: LogIndexAudit, Path: "/var/lib/open-card/logs/audit/segment.log", Segment: 1, ByteSize: 12, ContentDigest: "sha256:" + strings.Repeat("c", 64)}, now); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.RetireOrdinaryLogIndex(ctx, auditID, now.Add(time.Second)); !errors.Is(err, ErrAuditLogImmutable) {

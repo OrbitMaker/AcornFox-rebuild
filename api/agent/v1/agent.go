@@ -75,6 +75,9 @@ const (
 	// AgentCapabilityAcornFoxProbe is separate from lifecycle control: it can
 	// observe a runtime-derived loopback address but cannot deploy or mutate.
 	AgentCapabilityAcornFoxProbe = "acornfox.probe.v1"
+	// AgentCapabilityAcornFoxLogs permits only bounded, redacted collection
+	// from an immutable single-service runtime fact.
+	AgentCapabilityAcornFoxLogs = "acornfox.logs.v1"
 )
 
 func (t TaskKind) RequiredCapability() string {
@@ -92,6 +95,12 @@ func (t TaskKind) RequiredCapability() string {
 // restart/rollback/redeploy merely because it supports a single-container
 // task with the same wire kind.
 func RequiredCapabilityForTaskRequest(task TaskRequest) string {
+	if marker, present := acornFoxLogsPayloadMarker(task.Parameters); present {
+		if marker == "logs" {
+			return AgentCapabilityAcornFoxLogs
+		}
+		return "acornfox_logs.unknown_payload"
+	}
 	if marker, present := acornFoxProbePayloadMarker(task.Parameters); present {
 		if marker == "probe" {
 			return AgentCapabilityAcornFoxProbe
@@ -135,6 +144,22 @@ func RequiredCapabilityForTaskRequest(task TaskRequest) string {
 	default:
 		return task.Kind.RequiredCapability()
 	}
+}
+
+func acornFoxLogsPayloadMarker(data json.RawMessage) (string, bool) {
+	var object map[string]json.RawMessage
+	if json.NewDecoder(bytes.NewReader(data)).Decode(&object) != nil {
+		return "", false
+	}
+	raw, present := object["acornfox_log_payload_type"]
+	if !present {
+		return "", false
+	}
+	var marker string
+	if json.Unmarshal(raw, &marker) != nil || strings.TrimSpace(marker) == "" {
+		return "", true
+	}
+	return marker, true
 }
 
 func acornFoxProbePayloadMarker(data json.RawMessage) (string, bool) {
@@ -384,11 +409,12 @@ func (c CancelTask) Validate() error {
 }
 
 type LogChunk struct {
-	TaskID   string `json:"task_id"`
-	Sequence uint64 `json:"sequence"`
-	Stream   string `json:"stream"`
-	Data     string `json:"data"`
-	Final    bool   `json:"final"`
+	TaskID        string `json:"task_id"`
+	Sequence      uint64 `json:"sequence"`
+	Stream        string `json:"stream"`
+	Data          string `json:"data"`
+	Final         bool   `json:"final"`
+	SourceLimited bool   `json:"source_limited,omitempty"`
 }
 
 func (l LogChunk) Validate() error {
@@ -399,7 +425,7 @@ func (l LogChunk) Validate() error {
 		return ValidationError("agent log chunk sequence must be positive")
 	}
 	switch l.Stream {
-	case LogStreamStdout, LogStreamStderr:
+	case LogStreamStdout, LogStreamStderr, LogStreamCombined:
 	default:
 		return ValidationError("agent log chunk stream is unsupported")
 	}
@@ -441,6 +467,9 @@ func (o Observation) Validate() error {
 const (
 	LogStreamStdout = "stdout"
 	LogStreamStderr = "stderr"
+	// LogStreamCombined is used only where the provider cannot preserve
+	// stdout/stderr provenance through its runtime boundary.
+	LogStreamCombined = "combined"
 
 	TaskStatePending     = "pending"
 	TaskStateAccepted    = "accepted"

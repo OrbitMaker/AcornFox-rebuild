@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -668,6 +669,19 @@ func (a *m4PostgresAdapter) ProjectAgentEvidence(ctx context.Context, task postg
 	if a == nil || task.DeploymentID.Empty() {
 		return nil
 	}
+	// AcornFox logs are projected by the clean single-service projector before
+	// this commercial M4 adapter. Keep this branch a no-op so one Agent chunk
+	// cannot be persisted twice when M4 is enabled too.
+	if _, marked, err := decodeServerAcornFoxLogsTask(task.Task.Payload); marked || err != nil {
+		return err
+	}
+	// Lifecycle, probe, and malformed AcornFox control tasks are not ordinary
+	// application-log sources. Their evidence remains in the append-only Agent
+	// ledger, but M4 must never create a runtime log pointer that could later be
+	// confused with a dedicated acornfox.logs.v1 collection record.
+	if isAcornFoxControlTask(task.Task.Payload) {
+		return nil
+	}
 	if handled, err := a.projectAcornFoxProbeEvidence(ctx, task, envelope); handled || err != nil {
 		return err
 	}
@@ -704,6 +718,23 @@ func (a *m4PostgresAdapter) ProjectAgentEvidence(ctx context.Context, task postg
 	}
 }
 
+func isAcornFoxControlTask(payload json.RawMessage) bool {
+	var task controllers.AgentTaskSpec
+	if decodeAcornFoxLogsStrictJSON(payload, &task) != nil {
+		return false
+	}
+	var fields map[string]json.RawMessage
+	if decodeAcornFoxLogsStrictJSON(task.Parameters, &fields) != nil {
+		return false
+	}
+	for _, key := range []string{"acornfox_payload_type", "acornfox_probe_payload_type", "acornfox_log_payload_type"} {
+		if _, marked := fields[key]; marked {
+			return true
+		}
+	}
+	return false
+}
+
 func (a *m4PostgresAdapter) projectLogChunk(ctx context.Context, task postgres.ControllerTask, sequence uint64, chunk v1.LogChunk) error {
 	stream := "task-" + task.Task.ID.String() + "-" + fmt.Sprint(sequence)
 	if prior, err := a.logs.Read(observability.LogCategoryRuntime, stream); err != nil {
@@ -723,6 +754,10 @@ func (a *m4PostgresAdapter) projectLogChunk(ctx context.Context, task postgres.C
 	}
 	serviceName := m4LogTaskServiceName(task.Task.Payload)
 	for _, file := range files {
+		contentDigest, size, err := acornFoxLogSegmentDigest(filepath.Join(a.logs.RootDir(), string(observability.LogCategoryRuntime)), file.Path)
+		if err != nil || size != file.Bytes {
+			return errors.New("M4 runtime log segment integrity is unavailable")
+		}
 		indexID := m4AdapterID("log", task.Task.ID.String()+":"+fmt.Sprint(sequence)+":"+fmt.Sprint(file.Sequence))
 		var exists bool
 		if err := a.store.DB().QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM m4_log_indexes WHERE id=$1)`, indexID.String()).Scan(&exists); err != nil {
@@ -731,7 +766,7 @@ func (a *m4PostgresAdapter) projectLogChunk(ctx context.Context, task postgres.C
 		if exists {
 			continue
 		}
-		if err := a.store.AppendLogIndex(ctx, postgres.LogIndex{ID: indexID, ApplicationID: task.Operation.ApplicationID, ServiceName: serviceName, ReleaseID: domain.ID(releaseID), DeploymentID: task.DeploymentID, OperationID: task.Operation.ID, Category: postgres.LogIndexRuntime, Path: file.Path, Segment: file.Sequence, ByteSize: file.Bytes, CreatedAt: a.now()}, a.now()); err != nil {
+		if err := a.store.AppendLogIndex(ctx, postgres.LogIndex{ID: indexID, ApplicationID: task.Operation.ApplicationID, ServiceName: serviceName, ReleaseID: domain.ID(releaseID), DeploymentID: task.DeploymentID, OperationID: task.Operation.ID, Category: postgres.LogIndexRuntime, Path: file.Path, Segment: file.Sequence, ByteSize: file.Bytes, ContentDigest: contentDigest, CreatedAt: a.now()}, a.now()); err != nil {
 			return err
 		}
 	}

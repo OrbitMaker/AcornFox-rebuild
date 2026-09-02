@@ -33,6 +33,7 @@ type OutboundHandler struct {
 	m4Runtime       *M4OutboundExecutor
 	acornFoxRuntime *AcornFoxOutboundExecutor
 	acornFoxProbe   *AcornFoxProbeOutboundExecutor
+	acornFoxLogs    *AcornFoxLogsOutboundExecutor
 	clock           func() time.Time
 	healthProbe     func(context.Context, int, time.Time) error
 	mu              sync.Mutex
@@ -87,6 +88,9 @@ func NewOutboundHandlerWithProvidersAndAcornFoxRuntime(instanceID, nodeID string
 // authority without widening lifecycle or legacy task handling.
 func NewOutboundHandlerWithAcornFoxProbe(instanceID, nodeID string, facts DockerFactsReader, runtime contracts.RuntimeDriver, groupRuntime contracts.ServiceGroupRuntimeDriver, volumeRuntime contracts.VolumeProvider, acornFoxRuntime contracts.AcornFoxRuntimeDriver, prober acornFoxRuntimeProber) *OutboundHandler {
 	handler := NewOutboundHandlerWithProvidersAndAcornFoxRuntime(instanceID, nodeID, facts, runtime, groupRuntime, volumeRuntime, acornFoxRuntime)
+	if boundedLogs, ok := runtime.(contracts.AcornFoxBoundedLogReader); ok {
+		handler.acornFoxLogs = NewAcornFoxLogsOutboundExecutor(instanceID, nodeID, boundedLogs)
+	}
 	if acornFoxRuntime != nil && prober != nil {
 		handler.acornFoxProbe = NewAcornFoxProbeOutboundExecutor(instanceID, nodeID, acornFoxRuntime, prober)
 	}
@@ -165,6 +169,15 @@ func semanticTaskFingerprint(task v1.TaskRequest) ([32]byte, error) {
 
 func (h *OutboundHandler) executeTask(ctx context.Context, task v1.TaskRequest) ([]v1.Envelope, error) {
 	ack := v1.TaskAck{TaskID: task.TaskID, Status: v1.AckAccepted}
+	if acornFoxLogsPayloadMarked(task.Parameters) {
+		var result acornFoxLogsOutboundResult
+		if h.acornFoxLogs == nil {
+			result = rejectedAcornFoxLogs(task, "unsupported_capability", "AcornFox logs capability is unavailable")
+		} else {
+			result = h.acornFoxLogs.Execute(ctx, task)
+		}
+		return h.wrapAcornFoxLogsTaskEvents(task, ack, result)
+	}
 	if acornFoxProbePayloadMarked(task.Parameters) {
 		var result acornFoxProbeOutboundResult
 		if h.acornFoxProbe == nil {
@@ -234,6 +247,25 @@ func (h *OutboundHandler) executeTask(ctx context.Context, task v1.TaskRequest) 
 	log := &v1.LogChunk{TaskID: task.TaskID, Sequence: 1, Stream: v1.LogStreamStdout, Data: "read-only Docker node facts collected", Final: true}
 	result := v1.TaskResult{TaskID: task.TaskID, IdempotencyKey: task.IdempotencyKey, Succeeded: true, Status: v1.TaskResultSucceeded, EvidenceRefs: observation.EvidenceRefs}
 	return h.wrapTaskEvents(task, ack, log, *observation, result)
+}
+
+func (h *OutboundHandler) wrapAcornFoxLogsTaskEvents(task v1.TaskRequest, ack v1.TaskAck, result acornFoxLogsOutboundResult) ([]v1.Envelope, error) {
+	if !result.Result.Succeeded && (result.Result.ErrorCode == "invalid_argument" || result.Result.ErrorCode == "unsupported_capability") {
+		ack.Status = v1.AckRejected
+		ack.Reason = "AcornFox logs task was rejected"
+	}
+	events := []v1.Envelope{h.envelope(v1.KindTaskAck, task.IdempotencyKey, ack)}
+	for _, log := range result.Logs {
+		events = append(events, h.envelope(v1.KindLogChunk, task.IdempotencyKey, log))
+	}
+	events = append(events, h.envelope(v1.KindTaskResult, task.IdempotencyKey, result.Result))
+	for index := range events {
+		events[index].AgentSequence = uint64(index + 1)
+		if err := v1.ValidateEnvelopePayload(events[index]); err != nil {
+			return nil, err
+		}
+	}
+	return events, nil
 }
 
 func (h *OutboundHandler) wrapAcornFoxProbeTaskEvents(task v1.TaskRequest, ack v1.TaskAck, result acornFoxProbeOutboundResult) ([]v1.Envelope, error) {

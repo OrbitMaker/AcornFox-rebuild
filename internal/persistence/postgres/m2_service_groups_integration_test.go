@@ -179,7 +179,7 @@ func TestM2ServiceGroupRevisionPersistsIdentityAndRetainedClaims(t *testing.T) {
 	if err != nil || len(logCandidates) != 1 || logCandidates[0].Deployment.ID != deploymentID || logCandidates[0].ServiceName != "web" {
 		t.Fatalf("M4 log collection candidates=%+v err=%v", logCandidates, err)
 	}
-	if err := store.AppendLogIndex(ctx, LogIndex{ID: domain.ID("log_" + suffix), ApplicationID: appID, ServiceName: "web", ReleaseID: release.ID, DeploymentID: deploymentID, Category: LogIndexRuntime, Path: "/var/lib/open-card/build-work/m4-logs/runtime/task-fixture/segment-000001.log", Segment: 1, ByteSize: 12}, time.Now().UTC()); err != nil {
+	if err := store.AppendLogIndex(ctx, LogIndex{ID: domain.ID("log_" + suffix), ApplicationID: appID, ServiceName: "web", ReleaseID: release.ID, DeploymentID: deploymentID, Category: LogIndexRuntime, Path: "/var/lib/open-card/build-work/m4-logs/runtime/task-fixture/segment-000001.log", Segment: 1, ByteSize: 12, ContentDigest: "sha256:" + strings.Repeat("a", 64)}, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
 	if logCandidates, err := store.ListM4LogCollectionCandidates(ctx, time.Now().UTC().Add(-time.Minute), 10); err != nil || len(logCandidates) != 0 {

@@ -221,6 +221,7 @@ var acornFoxPublicRoutes = [...]AcornFoxPublicRoute{
 	{Path: "/api/v1/acornfox/apps/{applicationId}/deliveries/{deploymentId}/restart", Methods: []string{"post"}},
 	{Path: "/api/v1/acornfox/apps/{applicationId}/deliveries/{deploymentId}/redeploy", Methods: []string{"post"}},
 	{Path: "/api/v1/acornfox/apps/{applicationId}/deliveries/{deploymentId}/probes", Methods: []string{"post"}},
+	{Path: "/api/v1/acornfox/apps/{applicationId}/deliveries/{deploymentId}/logs", Methods: []string{"get"}},
 }
 
 type AcornFoxPublicRoute struct {

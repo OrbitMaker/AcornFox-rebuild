@@ -157,3 +157,95 @@ func TestM4LogIndexProtectsAuditAndOperationFactsAreTyped(t *testing.T) {
 		t.Fatal("digest shape validation mismatch")
 	}
 }
+
+func TestAcornFoxLogIndexMetadataRejectsInventedOrInvalidIdentity(t *testing.T) {
+	valid := LogIndex{
+		ID:            "log_build_1",
+		ApplicationID: "app_1",
+		ServiceName:   "web",
+		BuildID:       "build_1",
+		Category:      LogIndexBuild,
+		LogStream:     LogStreamStderr,
+		Truncation:    LogTruncationSourceLimited,
+		Path:          "/safe/build/0001.log",
+		Segment:       1,
+		ByteSize:      1,
+	}
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("valid AcornFox build log metadata rejected: %v", err)
+	}
+	for _, invalid := range []LogIndex{
+		func() LogIndex { item := valid; item.Category, item.BuildID = LogIndexRuntime, "build_1"; return item }(),
+		func() LogIndex { item := valid; item.LogTaskID = "task_1"; return item }(),
+		func() LogIndex { item := valid; item.LogStream = "file"; return item }(),
+		func() LogIndex { item := valid; item.Truncation = "partial"; return item }(),
+	} {
+		if err := invalid.Validate(); err == nil {
+			t.Errorf("invalid AcornFox log metadata accepted: %#v", invalid)
+		}
+	}
+	legacy := valid
+	legacy.LogStream, legacy.Truncation, legacy.BuildID = "", "", ""
+	if normalized := legacy.normalizedLogMetadata(); normalized.LogStream != LogStreamUnknown || normalized.Truncation != LogTruncationUnknown {
+		t.Fatalf("legacy metadata normalization=%+v, want explicit unknown values", normalized)
+	}
+	if err := (AcornFoxLogIndexCursor{RecordedAt: time.Unix(1, 0).UTC(), RecordKey: "record_1"}).Validate(); err != nil {
+		t.Fatalf("valid AcornFox log cursor rejected: %v", err)
+	}
+	if err := (AcornFoxLogIndexCursor{}).Validate(); err == nil {
+		t.Fatal("empty AcornFox log cursor accepted")
+	}
+}
+
+func TestAcornFoxLogMetadataMigrationIsAdditiveAndBounded(t *testing.T) {
+	payload, err := os.ReadFile("../../../migrations/control-plane/0028_acornfox_log_metadata.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := strings.ToLower(string(payload))
+	for _, fragment := range []string{
+		"add column if not exists build_id text references builds(id)",
+		"add column if not exists log_stream text",
+		"add column if not exists truncation text",
+		"add column if not exists content_digest text",
+		"build_id is null or category = 'build'",
+		"log_stream in ('stdout', 'stderr', 'combined', 'unknown')",
+		"truncation in ('complete', 'source_limited', 'unknown')",
+		"m4_log_indexes_content_digest_sha256",
+		"content_digest ~ '^sha256:[0-9a-f]{64}$'",
+		"m4_log_indexes_active_build_delivery_idx",
+		"m4_log_indexes_active_runtime_delivery_idx",
+		"retired_at is null",
+	} {
+		if !strings.Contains(text, fragment) {
+			t.Errorf("AcornFox log metadata migration missing %q", fragment)
+		}
+	}
+	for _, forbidden := range []string{"log_content", "log_bytes", "delete from", "drop table"} {
+		if strings.Contains(text, forbidden) {
+			t.Errorf("AcornFox log metadata migration must not contain %q", forbidden)
+		}
+	}
+}
+
+func TestAcornFoxLogProvenanceMigrationDoesNotStoreLogBytes(t *testing.T) {
+	payload, err := os.ReadFile("../../../migrations/control-plane/0029_acornfox_log_provenance.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := strings.ToLower(string(payload))
+	for _, fragment := range []string{
+		"add column if not exists log_task_id text references task_leases(task_id)",
+		"log_task_id is null or category = 'runtime'",
+		"m4_log_indexes_active_runtime_task_idx",
+	} {
+		if !strings.Contains(text, fragment) {
+			t.Errorf("AcornFox log provenance migration missing %q", fragment)
+		}
+	}
+	for _, forbidden := range []string{"log_content", "log_bytes", "delete from", "drop table"} {
+		if strings.Contains(text, forbidden) {
+			t.Errorf("AcornFox log provenance migration must not contain %q", forbidden)
+		}
+	}
+}

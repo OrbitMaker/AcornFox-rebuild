@@ -19,18 +19,22 @@ const testDigest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef01234
 const testContainerID = "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
 
 type fakeRunner struct {
-	mu    sync.Mutex
-	calls [][]string
-	run   func([]string, io.Writer) error
+	mu         sync.Mutex
+	calls      [][]string
+	run        func([]string, io.Writer) error
+	runStreams func([]string, io.Writer, io.Writer) error
 }
 
-func (r *fakeRunner) Run(_ context.Context, command string, args []string, stdout, _ io.Writer) error {
+func (r *fakeRunner) Run(_ context.Context, command string, args []string, stdout, stderr io.Writer) error {
 	if command != "docker" {
 		return fmt.Errorf("unexpected command %q", command)
 	}
 	r.mu.Lock()
 	r.calls = append(r.calls, append([]string(nil), args...))
 	r.mu.Unlock()
+	if r.runStreams != nil {
+		return r.runStreams(args, stdout, stderr)
+	}
 	return r.run(args, stdout)
 }
 
@@ -340,6 +344,89 @@ func TestLifecycleObservesLogsRestartsAndDestroysWithoutDocker(t *testing.T) {
 	assertCode(t, provider.Scale(context.Background(), contracts.ScaleRequest{DeploymentID: deployment.ID, Replicas: 2, Operation: contracts.OperationContext{IdempotencyKey: "scale"}}), contracts.ErrUnsupportedCapability)
 	_, err = provider.Rollback(context.Background(), contracts.RollbackRequest{DeploymentID: deployment.ID, ReleaseID: "rel_other", Operation: contracts.OperationContext{IdempotencyKey: "rollback"}})
 	assertCode(t, err, contracts.ErrUnsupportedCapability)
+}
+
+func TestReadAcornFoxLogsBoundsDockerProcessStreamsBeforeCapture(t *testing.T) {
+	runner := dockerHappyRunner(t)
+	legacyRun := runner.run
+	runner.runStreams = func(args []string, stdout, stderr io.Writer) error {
+		if len(args) > 0 && args[0] == "logs" {
+			if _, err := io.WriteString(stdout, "stdout first\nstdout second\n"); err != nil {
+				return err
+			}
+			if _, err := io.WriteString(stderr, "stderr first\n"); err != nil {
+				return err
+			}
+			// One oversized write must be accepted without a short-write, but
+			// only the shared public allowance may be retained.
+			_, err := io.WriteString(stdout, strings.Repeat("x", contracts.AcornFoxLogsMaxBytes+1))
+			return err
+		}
+		return legacyRun(args, stdout)
+	}
+	provider := testProvider(t, runner, &fixedPorts{port: 39124})
+	deployment, err := provider.Deploy(context.Background(), testRequest("acornfox-bounded-logs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := provider.ReadAcornFoxLogs(context.Background(), contracts.LogsRequest{DeploymentID: deployment.ID, ServiceName: "web", Since: time.Unix(1_700_000_000, 0).UTC(), Tail: 3, Operation: contracts.OperationContext{IdempotencyKey: "acornfox-bounded-logs"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.SourceLimited || len(result.Records) < 3 {
+		t.Fatalf("bounded result=%#v", result)
+	}
+	var total int
+	var stdout, stderr strings.Builder
+	for _, record := range result.Records {
+		total += len(record.Data)
+		switch record.Stream {
+		case contracts.AcornFoxLogStreamStdout:
+			stdout.WriteString(record.Data)
+		case contracts.AcornFoxLogStreamStderr:
+			stderr.WriteString(record.Data)
+		default:
+			t.Fatalf("provider invented combined/unknown stream: %#v", record)
+		}
+		if strings.HasPrefix(record.Data, "stdout ") || strings.HasPrefix(record.Data, "stderr ") {
+			if !strings.HasSuffix(record.Data, "\n") {
+				t.Fatalf("logical newline was not preserved: %#v", record)
+			}
+		}
+	}
+	if total > contracts.AcornFoxLogsMaxBytes || !strings.Contains(stdout.String(), "stdout first\n") || !strings.Contains(stderr.String(), "stderr first\n") {
+		t.Fatalf("stream capture exceeded bound or lost provenance: total=%d stdout=%q stderr=%q", total, stdout.String()[:min(stdout.Len(), 32)], stderr.String())
+	}
+	logsCalls := runner.callsFor("logs")
+	if len(logsCalls) != 1 || !containsArg(logsCalls[0], "--tail") || !containsArg(logsCalls[0], "3") || !containsArg(logsCalls[0], "--since") || !containsArg(logsCalls[0], "2023-11-14T22:13:20Z") {
+		t.Fatalf("bounded logs did not constrain Docker call: %#v", logsCalls)
+	}
+}
+
+func TestBoundedAcornFoxLogCaptureLimitsRecordsWithoutShortWrites(t *testing.T) {
+	capture := newBoundedAcornFoxLogCapture(1024)
+	stdout, stderr := capture.stdoutWriter(), capture.stderrWriter()
+	for index := 0; index < contracts.AcornFoxLogsMaxRecords+1; index++ {
+		if written, err := io.WriteString(stdout, "line\n"); err != nil || written != len("line\n") {
+			t.Fatalf("stdout write %d=%d,%v", index, written, err)
+		}
+	}
+	if written, err := io.WriteString(stderr, strings.Repeat("x", 1024)); err != nil || written != 1024 {
+		t.Fatalf("overflow stderr returned short write: %d,%v", written, err)
+	}
+	result := capture.result()
+	if !result.SourceLimited || len(result.Records) != contracts.AcornFoxLogsMaxRecords {
+		t.Fatalf("record cap was not marked: %#v", result)
+	}
+}
+
+func containsArg(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestDeployRejectsEscapesAndDigestVerificationFailuresBeforeRun(t *testing.T) {

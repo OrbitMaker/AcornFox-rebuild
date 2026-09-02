@@ -147,6 +147,7 @@ func TestAcornFoxOptionsUsesExactRouteMethodParity(t *testing.T) {
 		"/api/v1/acornfox/apps/app_1/deliveries/dep_1/restart":  "POST, OPTIONS",
 		"/api/v1/acornfox/apps/app_1/deliveries/dep_1/redeploy": "POST, OPTIONS",
 		"/api/v1/acornfox/apps/app_1/deliveries/dep_1/probes":   "POST, OPTIONS",
+		"/api/v1/acornfox/apps/app_1/deliveries/dep_1/logs":     "GET, OPTIONS",
 	} {
 		request := httptest.NewRequest(http.MethodOptions, path, nil)
 		request.AddCookie(session)

@@ -609,14 +609,7 @@ func (p *Provider) Logs(ctx context.Context, request contracts.LogsRequest) (<-c
 	if request.ServiceName != "" && request.ServiceName != state.service {
 		return nil, p.failure(request.Operation, contracts.CapabilityRuntimeLogs, "logs", contracts.ErrValidation, "runtime service does not match deployment", contracts.RetryNever, false, nil)
 	}
-	args := []string{"logs", "--timestamps"}
-	if request.Tail > 0 {
-		args = append(args, "--tail", fmt.Sprint(request.Tail))
-	}
-	if !request.Since.IsZero() {
-		args = append(args, "--since", request.Since.UTC().Format(time.RFC3339))
-	}
-	args = append(args, state.container)
+	args := dockerLogsArgs(request, state.container)
 	output, err := p.output(ctx, args)
 	if err != nil {
 		return nil, p.commandError(request.Operation, contracts.CapabilityRuntimeLogs, "logs", err)
@@ -629,6 +622,124 @@ func (p *Provider) Logs(ctx context.Context, request contracts.LogsRequest) (<-c
 	}
 	close(lines)
 	return lines, nil
+}
+
+// ReadAcornFoxLogs is the bounded AcornFox-only log reader. Unlike the legacy
+// RuntimeDriver.Logs method, it keeps stdout and stderr provenance and bounds
+// all Docker process output before a buffer can grow beyond the public limit.
+func (p *Provider) ReadAcornFoxLogs(ctx context.Context, request contracts.LogsRequest) (contracts.AcornFoxBoundedLogs, error) {
+	if err := p.check(ctx, request.Operation, contracts.CapabilityRuntimeLogs, "logs"); err != nil {
+		return contracts.AcornFoxBoundedLogs{}, err
+	}
+	state, err := p.state(request.DeploymentID, request.Operation, contracts.CapabilityRuntimeLogs, "logs")
+	if err != nil {
+		return contracts.AcornFoxBoundedLogs{}, err
+	}
+	if request.ServiceName != "" && request.ServiceName != state.service {
+		return contracts.AcornFoxBoundedLogs{}, p.failure(request.Operation, contracts.CapabilityRuntimeLogs, "logs", contracts.ErrValidation, "runtime service does not match deployment", contracts.RetryNever, false, nil)
+	}
+	capture := newBoundedAcornFoxLogCapture(contracts.AcornFoxLogsMaxBytes)
+	if err := p.config.Runner.Run(ctx, p.config.Command, dockerLogsArgs(request, state.container), capture.stdoutWriter(), capture.stderrWriter()); err != nil {
+		return contracts.AcornFoxBoundedLogs{}, p.commandError(request.Operation, contracts.CapabilityRuntimeLogs, "logs", err)
+	}
+	return capture.result(), nil
+}
+
+func dockerLogsArgs(request contracts.LogsRequest, container string) []string {
+	args := []string{"logs", "--timestamps"}
+	if request.Tail > 0 {
+		args = append(args, "--tail", fmt.Sprint(request.Tail))
+	}
+	if !request.Since.IsZero() {
+		args = append(args, "--since", request.Since.UTC().Format(time.RFC3339))
+	}
+	return append(args, container)
+}
+
+// boundedAcornFoxLogCapture shares one byte allowance between Docker's stdout
+// and stderr. Write intentionally reports success for discarded overflow: the
+// command must never block or observe a short write merely because collection
+// reached its public boundary.
+type boundedAcornFoxLogCapture struct {
+	mu            sync.Mutex
+	remaining     int
+	stdout        bytes.Buffer
+	stderr        bytes.Buffer
+	sourceLimited bool
+}
+
+type boundedAcornFoxLogWriter struct {
+	capture *boundedAcornFoxLogCapture
+	stream  string
+}
+
+func newBoundedAcornFoxLogCapture(limit int) *boundedAcornFoxLogCapture {
+	return &boundedAcornFoxLogCapture{remaining: limit}
+}
+
+func (capture *boundedAcornFoxLogCapture) stdoutWriter() io.Writer {
+	return boundedAcornFoxLogWriter{capture: capture, stream: contracts.AcornFoxLogStreamStdout}
+}
+
+func (capture *boundedAcornFoxLogCapture) stderrWriter() io.Writer {
+	return boundedAcornFoxLogWriter{capture: capture, stream: contracts.AcornFoxLogStreamStderr}
+}
+
+func (writer boundedAcornFoxLogWriter) Write(data []byte) (int, error) {
+	if writer.capture == nil || len(data) == 0 {
+		return len(data), nil
+	}
+	writer.capture.mu.Lock()
+	defer writer.capture.mu.Unlock()
+	allowed := len(data)
+	if allowed > writer.capture.remaining {
+		allowed = writer.capture.remaining
+		writer.capture.sourceLimited = true
+	}
+	if allowed > 0 {
+		if writer.stream == contracts.AcornFoxLogStreamStderr {
+			_, _ = writer.capture.stderr.Write(data[:allowed])
+		} else {
+			_, _ = writer.capture.stdout.Write(data[:allowed])
+		}
+		writer.capture.remaining -= allowed
+	}
+	if allowed < len(data) {
+		writer.capture.sourceLimited = true
+	}
+	return len(data), nil
+}
+
+func (capture *boundedAcornFoxLogCapture) result() contracts.AcornFoxBoundedLogs {
+	capture.mu.Lock()
+	defer capture.mu.Unlock()
+	result := contracts.AcornFoxBoundedLogs{Records: make([]contracts.AcornFoxLogRecord, 0), SourceLimited: capture.sourceLimited}
+	for _, stream := range []struct {
+		name string
+		data string
+	}{
+		{name: contracts.AcornFoxLogStreamStdout, data: capture.stdout.String()},
+		{name: contracts.AcornFoxLogStreamStderr, data: capture.stderr.String()},
+	} {
+		if stream.data == "" {
+			continue
+		}
+		for len(stream.data) > 0 {
+			if len(result.Records) == contracts.AcornFoxLogsMaxRecords {
+				result.SourceLimited = true
+				return result
+			}
+			end := strings.IndexByte(stream.data, '\n')
+			if end < 0 {
+				result.Records = append(result.Records, contracts.AcornFoxLogRecord{Stream: stream.name, Data: stream.data})
+				break
+			}
+			end++
+			result.Records = append(result.Records, contracts.AcornFoxLogRecord{Stream: stream.name, Data: stream.data[:end]})
+			stream.data = stream.data[end:]
+		}
+	}
+	return result
 }
 
 func (p *Provider) Restart(ctx context.Context, request contracts.RestartRequest) error {

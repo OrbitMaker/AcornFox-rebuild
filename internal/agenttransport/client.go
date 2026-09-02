@@ -142,7 +142,7 @@ func (c *Client) connect(ctx context.Context) error {
 	}
 	if response.NegotiatedVersion == "" {
 		response.NegotiatedVersion = v1.PreviousProtocolVersion
-		response.DisabledCapabilities = append(response.DisabledCapabilities, "agent_sequence", "observation_details", v1.AgentCapabilityRuntimeDeployGroup, v1.AgentCapabilityRuntimeObserveGroup, v1.AgentCapabilityRuntimeRollbackGroup, v1.AgentCapabilityRuntimeDestroyGroup)
+		response.DisabledCapabilities = append(response.DisabledCapabilities, "agent_sequence", "observation_details", v1.AgentCapabilityAcornFoxRuntime, v1.AgentCapabilityAcornFoxProbe, v1.AgentCapabilityAcornFoxLogs, v1.AgentCapabilityRuntimeDeployGroup, v1.AgentCapabilityRuntimeObserveGroup, v1.AgentCapabilityRuntimeRollbackGroup, v1.AgentCapabilityRuntimeDestroyGroup)
 	}
 	negotiatedVersion, err := v1.NormalizeProtocolVersion(response.NegotiatedVersion)
 	if err != nil {

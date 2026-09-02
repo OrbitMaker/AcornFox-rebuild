@@ -135,6 +135,18 @@ paths:
         '409': {$ref: '#/components/responses/IdempotencyConflict'}
         '422': {$ref: '#/components/responses/ValidationFailed'}
         '503': {$ref: '#/components/responses/TemporarilyUnavailable'}
+  /api/v1/acornfox/apps/{applicationId}/deliveries/{deploymentId}/logs:
+    parameters: [{$ref: '#/components/parameters/ApplicationId'}, {$ref: '#/components/parameters/DeploymentId'}]
+    get:
+      operationId: listAcornFoxDeliveryLogs
+      security: [{AdministratorSession: []}]
+      parameters: [{$ref: '#/components/parameters/LogSource'}, {$ref: '#/components/parameters/LogLimit'}, {$ref: '#/components/parameters/LogCursor'}]
+      responses:
+        '200': {description: Already-collected build or runtime records. This read does not start collection or make runtime calls., content: {application/json: {schema: {$ref: '#/components/schemas/DeliveryLogsResponse'}}}}
+        '401': {$ref: '#/components/responses/AuthenticationFailed'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/InvalidLogQuery'}
+        '503': {$ref: '#/components/responses/LogsUnavailable'}
   /api/v1/acornfox/apps/{applicationId}/deliveries/{deploymentId}/probes:
     parameters: [{$ref: '#/components/parameters/ApplicationId'}, {$ref: '#/components/parameters/DeploymentId'}]
     post:
@@ -161,6 +173,9 @@ components:
     SourceRevisionId: {name: sourceRevisionId, in: path, required: true, schema: {type: string, minLength: 1}}
     DeploymentId: {name: deploymentId, in: path, required: true, schema: {type: string, minLength: 1}}
     IdempotencyKey: {name: Idempotency-Key, in: header, required: true, schema: {type: string, minLength: 1}}
+    LogSource: {name: source, in: query, required: true, schema: {type: string, enum: [build, runtime]}}
+    LogLimit: {name: limit, in: query, required: false, schema: {type: integer, minimum: 1, maximum: 100, default: 50}}
+    LogCursor: {name: cursor, in: query, required: false, schema: {type: string, minLength: 1}, description: Opaque base64url cursor bound to this application deployment and source.}
     CSRFToken:
       name: X-AcornFox-CSRF
       in: header
@@ -175,6 +190,8 @@ components:
     IdempotencyConflict: {description: Idempotency key conflicts with prior input or accepted work, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
     ValidationFailed: {description: Request is syntactically valid but violates an AcornFox boundary, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
     TemporarilyUnavailable: {description: Capability dependency or persisted readback is temporarily unavailable, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+    InvalidLogQuery: {description: Log source limit or opaque cursor is invalid, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+    LogsUnavailable: {description: Collected log storage or its integrity reconciliation is temporarily unavailable, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
   schemas:
     Error:
       type: object
@@ -304,3 +321,22 @@ components:
       required: [protocol, outcome, observed_at, fact_digest]
       additionalProperties: false
       properties: {protocol: {type: string, enum: [tcp, http]}, outcome: {type: string}, http_status: {type: integer, nullable: true}, latency_ms: {type: integer, format: int64}, error_code: {type: string}, observed_at: {type: string, format: date-time}, fact_digest: {type: string}}
+    DeliveryLogItem:
+      type: object
+      required: [stream, recorded_at, content, truncation]
+      additionalProperties: false
+      properties:
+        stream: {type: string, enum: [stdout, stderr, combined, unknown]}
+        recorded_at: {type: string, format: date-time}
+        content: {type: string, description: "Redacted log text; returned as the newest suffix when response limits apply."}
+        truncation: {type: string, enum: [complete, source_limited, response_limited, unknown]}
+    DeliveryLogsResponse:
+      type: object
+      required: [source, availability, items, next_cursor, retention_limited]
+      additionalProperties: false
+      properties:
+        source: {type: string, enum: [build, runtime]}
+        availability: {type: string, enum: [available, not_collected, retired]}
+        items: {type: array, items: {$ref: '#/components/schemas/DeliveryLogItem'}}
+        next_cursor: {type: string, nullable: true}
+        retention_limited: {type: boolean, description: "True when source-specific older log indexes were retired; active items, if present, remain readable."}

@@ -101,6 +101,10 @@ func (s *Server) handleAcornFoxAPI(w http.ResponseWriter, r *http.Request) bool 
 		return true
 	}
 	if len(parts) == 4 && parts[1] == "deliveries" {
+		if parts[3] == "logs" {
+			s.handleAcornFoxDeliveryLogs(w, r, domain.ID(parts[0]), domain.ID(parts[2]))
+			return true
+		}
 		s.handleAcornFoxDeliveryAction(w, r, domain.ID(parts[0]), domain.ID(parts[2]), parts[3])
 		return true
 	}
@@ -129,9 +133,24 @@ func acornFoxRouteAllow(path string) (string, bool) {
 		switch parts[3] {
 		case "restart", "redeploy", "probes":
 			return "POST", true
+		case "logs":
+			return "GET", true
 		}
 	}
 	return "", false
+}
+
+func (s *Server) handleAcornFoxDeliveryLogs(w http.ResponseWriter, r *http.Request, applicationID, deploymentID domain.ID) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET, OPTIONS")
+		writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+		return
+	}
+	if s.acornFoxLogs == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "logs_unavailable", "logs are unavailable")
+		return
+	}
+	s.acornFoxLogs.Handle(w, r, applicationID, deploymentID)
 }
 
 func (s *Server) handleAcornFoxApps(w http.ResponseWriter, r *http.Request) {

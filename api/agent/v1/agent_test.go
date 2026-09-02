@@ -205,11 +205,11 @@ func TestAGENT_CT_004_WireMessageValidation(t *testing.T) {
 		}{
 			{name: "missing task", mutate: func(value *LogChunk) { value.TaskID = "" }},
 			{name: "zero sequence", mutate: func(value *LogChunk) { value.Sequence = 0 }},
-			{name: "unsupported stream", mutate: func(value *LogChunk) { value.Stream = "combined" }},
+			{name: "unsupported stream", mutate: func(value *LogChunk) { value.Stream = "unknown" }},
 			{name: "blank stream", mutate: func(value *LogChunk) { value.Stream = " " }},
 		}
 		assertInvalidCases(t, base, cases)
-		for _, stream := range []string{LogStreamStdout, LogStreamStderr} {
+		for _, stream := range []string{LogStreamStdout, LogStreamStderr, LogStreamCombined} {
 			chunk := base
 			chunk.Stream = stream
 			if err := chunk.Validate(); err != nil {

@@ -95,6 +95,7 @@ func main() {
 		server.SetG3Access(newG3AccessHTTPHandler(store))
 		server.SetG3SourceUpload(&G3SourceUploadHTTPHandler{Store: store})
 		server.AgentGateway().SetEventSink(&controllers.DurableAgentSink{Store: store})
+		var acornFoxProjector controllers.AgentEvidenceProjector
 		applicationWorker := &controllers.Worker{
 			Store: store, Handler: applicationTaskHandler{}, Owner: "control-plane-application",
 			Kinds: []string{applicationCreateTaskKind},
@@ -118,26 +119,42 @@ func main() {
 				}
 			}
 			server.SetG3SourceUpload(newG3SourceUploadHTTPHandler(store))
-			var m4LogStore *observability.LogStore
-			var buildLogSink buildkit.BuildLogSink
-			if os.Getenv("OPEN_CARD_M4_ENABLED") == "true" {
-				logRoot := os.Getenv("OPEN_CARD_LOG_ROOT")
-				if logRoot == "" {
-					logRoot = buildWorkRoot + "/m4-logs"
-				}
-				logConfig, configErr := m4LogStoreConfig(logRoot, os.Getenv("OPEN_CARD_LOG_MAX_FILE_BYTES"), os.Getenv("OPEN_CARD_LOG_MAX_TOTAL_BYTES"))
-				if configErr != nil {
-					log.Fatal(configErr)
-				}
-				m4LogStore, err = observability.NewLogStore(logConfig)
-				if err != nil {
-					log.Fatal(err)
-				}
-				if err := m4ReconcileOrdinaryLogIndexes(context.Background(), store, m4LogStore, time.Now().UTC()); err != nil {
-					log.Fatal(err)
-				}
-				buildLogSink = &m4BuildLogSink{store: store, logs: m4LogStore}
+			logRoot := os.Getenv("OPEN_CARD_LOG_ROOT")
+			if logRoot == "" {
+				logRoot = buildWorkRoot + "/m4-logs"
 			}
+			logConfig, configErr := m4LogStoreConfig(logRoot, os.Getenv("OPEN_CARD_LOG_MAX_FILE_BYTES"), os.Getenv("OPEN_CARD_LOG_MAX_TOTAL_BYTES"))
+			if configErr != nil {
+				log.Fatal(configErr)
+			}
+			// Static host roots are known before any log write. Dynamic source
+			// provenance is added by the build sink and Agent-event hook below.
+			logConfig.Secrets = append(logConfig.Secrets, uploadRoot, workspaceRoot, buildWorkRoot, logRoot)
+			acornFoxLogStore, err := observability.NewLogStore(logConfig)
+			if err != nil {
+				log.Fatal(err)
+			}
+			if err := m4ReconcileOrdinaryLogIndexes(context.Background(), store, acornFoxLogStore, time.Now().UTC()); err != nil {
+				log.Fatal(err)
+			}
+			redactionRoots := []string{uploadRoot, workspaceRoot, buildWorkRoot, logRoot}
+			buildLogSink := buildkit.BuildLogSink(&m4BuildLogSink{store: store, logs: acornFoxLogStore, redactionRoots: redactionRoots})
+			acornFoxLogsHandler := newAcornFoxLogsHTTPHandler(store, acornFoxLogStore, uploadRoot, workspaceRoot, buildWorkRoot)
+			server.SetAcornFoxLogs(acornFoxLogsHandler)
+			acornFoxProjector = &acornFoxLogProjector{store: store, logs: acornFoxLogStore}
+			server.AgentGateway().SetEventSink(&controllers.DurableAgentSink{Store: store, Projector: acornFoxProjector, RedactEnvelope: newAcornFoxAgentLogEnvelopeRedactor(store, redactionRoots...)})
+			acornFoxLogCollector := &AcornFoxLogCollectionScheduler{Store: store}
+			go func() {
+				ticker := time.NewTicker(application.AcornFoxLogsCollectionInterval)
+				defer ticker.Stop()
+				for range ticker.C {
+					ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+					if _, err := acornFoxLogCollector.ScheduleOnce(ctx, acornFoxLogCollectorMaximumPerTick); err != nil {
+						log.Printf("AcornFox runtime log collection failed: %v", err)
+					}
+					cancel()
+				}
+			}()
 			imageStore, err := imageprovider.New(imageprovider.Config{Root: os.Getenv("OPEN_CARD_OCI_STORE_ROOT")})
 			if err != nil {
 				log.Fatal(err)
@@ -167,7 +184,7 @@ func main() {
 				log.Fatal(err)
 			}
 			server.controller.SetSourcePreparer(sourceProvider)
-			buildProvider, err := buildkit.New(buildkit.Config{Command: os.Getenv("OPEN_CARD_BUILDKIT_COMMAND"), Builder: os.Getenv("OPEN_CARD_BUILDKIT_WORKER"), Address: os.Getenv("OPEN_CARD_BUILDKIT_ADDRESS"), WorkspaceRoot: workspaceRoot, WorkRoot: buildWorkRoot, StaticServerBinary: os.Getenv("OPEN_CARD_STATIC_SERVER_BINARY"), ImageStore: imageStore, Capacity: capacityProvider, SecretResolver: secretProvider, LogSink: buildLogSink})
+			buildProvider, err := buildkit.New(buildkit.Config{Command: os.Getenv("OPEN_CARD_BUILDKIT_COMMAND"), Builder: os.Getenv("OPEN_CARD_BUILDKIT_WORKER"), Address: os.Getenv("OPEN_CARD_BUILDKIT_ADDRESS"), WorkspaceRoot: workspaceRoot, WorkRoot: buildWorkRoot, StaticServerBinary: os.Getenv("OPEN_CARD_STATIC_SERVER_BINARY"), ImageStore: imageStore, Capacity: capacityProvider, SecretResolver: secretProvider, LogSink: buildLogSink, RequireLogSink: true})
 			if err != nil {
 				log.Fatal(err)
 			}
@@ -273,10 +290,10 @@ func main() {
 					if err := validateM4RolloutComposition(rolloutEnabled, m3RouteProvider != nil, store != nil); err != nil {
 						log.Fatal(err)
 					}
-					logStore := m4LogStore
+					logStore := acornFoxLogStore
 					adapter := &m4PostgresAdapter{store: store, logs: logStore, metrics: observability.NewMetricStore(store.DB())}
 					server.SetM4Logs(&M4LogsHTTPHandler{store: store, logs: logStore})
-					server.AgentGateway().SetEventSink(&controllers.DurableAgentSink{Store: store, Projector: adapter})
+					server.AgentGateway().SetEventSink(&controllers.DurableAgentSink{Store: store, Projector: agentEvidenceProjectorChain{acornFoxProjector, adapter}, RedactEnvelope: newAcornFoxAgentLogEnvelopeRedactor(store, redactionRoots...)})
 					operations := &controllers.M4OperationsController{Store: adapter, Runtime: &m4AgentRuntimeExecutor{store: store}}
 					server.SetM4Operations(&M4OperationsHTTPHandler{Operations: operations, Views: adapter})
 					allowM4LoopbackFixture := os.Getenv("OPEN_CARD_M4_ALLOW_LOOPBACK_WEBHOOK_FIXTURE") == "true" && os.Getenv("OPEN_CARD_RUNTIME_TASK_PREFIX") == "opencard-mvp-fa8f8eab"

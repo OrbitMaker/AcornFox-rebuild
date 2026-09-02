@@ -53,9 +53,8 @@ func (r Redactor) RedactString(input string) string {
 		replacement = RedactedValue
 	}
 	output := input
-	// Remove values behind sensitive field/header names first. This prevents
-	// the replacement marker itself from being mistaken for a second secret
-	// assignment by the generic value matcher below.
+	// Remove values behind sensitive field/header names first, then redact
+	// generic secret assignments and known encoded variants.
 	output = redactCookieHeaders(output, replacement)
 	output = redactAuthorizationHeaders(output, replacement)
 	output = redactSecretAssignments(output, replacement)
@@ -180,16 +179,13 @@ var (
 	// Assignment values stop at common delimiters so JSON, query-string and
 	// shell-style logs can all be handled without parsing or rewriting the
 	// entire record.
-	secretAssignmentRE = regexp.MustCompile(`(?i)(["']?(?:password|passwd|passphrase|token|access[_-]?token|refresh[_-]?token|api[_-]?key|secret|client[_-]?secret|private[_-]?key|signing[_-]?key|credential|authorization)["']?\s*[:=]\s*["']?)([^"'\s,;&}\]]+)`)
+	secretAssignmentRE = regexp.MustCompile(`(?i)(["']?(?:password|passwd|passphrase|token|access[_-]?token|refresh[_-]?token|api[_-]?key|secret|client[_-]?secret|private[_-]?key|signing[_-]?key|credential|authorization)["']?\s*[:=]\s*(?:(?:bearer|basic)\s+)?["']?)([^"'\s,;&}]+)`)
 	cookieHeaderRE     = regexp.MustCompile(`(?i)(\bcookie\s*[:=]\s*)([^\r\n]+)`)
 	authorizationRE    = regexp.MustCompile(`(?i)(\bauthorization\s*[:=]\s*)((?:bearer|basic)\s+)([^\r\n,}]+)`)
 )
 
 func redactSecretAssignments(input, replacement string) string {
 	return secretAssignmentRE.ReplaceAllStringFunc(input, func(match string) string {
-		if strings.Contains(match, replacement) {
-			return match
-		}
 		locations := secretAssignmentRE.FindStringSubmatchIndex(match)
 		if len(locations) < 4 {
 			return replacement
@@ -206,9 +202,6 @@ func redactSecretAssignments(input, replacement string) string {
 
 func redactCookieHeaders(input, replacement string) string {
 	return cookieHeaderRE.ReplaceAllStringFunc(input, func(match string) string {
-		if strings.Contains(match, replacement) {
-			return match
-		}
 		locations := cookieHeaderRE.FindStringSubmatchIndex(match)
 		if len(locations) < 4 {
 			return replacement
@@ -219,9 +212,6 @@ func redactCookieHeaders(input, replacement string) string {
 
 func redactAuthorizationHeaders(input, replacement string) string {
 	return authorizationRE.ReplaceAllStringFunc(input, func(match string) string {
-		if strings.Contains(match, replacement) {
-			return match
-		}
 		locations := authorizationRE.FindStringSubmatchIndex(match)
 		if len(locations) < 6 {
 			return replacement

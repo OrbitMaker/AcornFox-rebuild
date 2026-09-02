@@ -177,7 +177,7 @@ func TestComposeAcornFoxRuntimeWithProbeBuildsOnlyAfterReconcile(t *testing.T) {
 		builtAfterReconcile = provider.reconcileCalls == 1
 		return &fakeAcornFoxProber{}, nil
 	})
-	if err != nil || !builtAfterReconcile || legacy != provider || runtime == nil || prober == nil || !compositionHasCapability(capabilities, v1.AgentCapabilityAcornFoxProbe) {
+	if err != nil || !builtAfterReconcile || legacy != provider || runtime == nil || prober == nil || !compositionHasCapability(capabilities, v1.AgentCapabilityAcornFoxProbe) || compositionHasCapability(capabilities, v1.AgentCapabilityAcornFoxLogs) {
 		t.Fatalf("probe composition order/capability failed: legacy=%#v runtime=%#v prober=%#v capabilities=%v reconciles=%d err=%v", legacy, runtime, prober, capabilities, provider.reconcileCalls, err)
 	}
 	failed := &reconcileOrderingRuntime{RuntimeDriver: contracts.NewFakeRuntimeDriver(true)}

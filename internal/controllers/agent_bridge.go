@@ -176,9 +176,10 @@ type AgentResultStore interface {
 }
 
 type DurableAgentSink struct {
-	Store     AgentResultStore
-	Projector AgentEvidenceProjector
-	Clock     func() time.Time
+	Store          AgentResultStore
+	Projector      AgentEvidenceProjector
+	RedactEnvelope AgentEnvelopeRedactor
+	Clock          func() time.Time
 }
 
 // AgentEvidenceProjector is invoked after the immutable Agent event has been
@@ -188,6 +189,13 @@ type DurableAgentSink struct {
 type AgentEvidenceProjector interface {
 	ProjectAgentEvidence(context.Context, postgres.ControllerTask, v1.Envelope) error
 }
+
+// AgentEnvelopeRedactor is a narrow pre-persistence boundary for task event
+// payloads. It must return a wire-valid copy; DurableAgentSink records and
+// projects that exact copy so no raw event can diverge from derived evidence.
+// It is intentionally optional because most Agent task kinds have no log
+// content and must retain their existing durable representation.
+type AgentEnvelopeRedactor func(context.Context, postgres.ControllerTask, v1.Envelope) (v1.Envelope, error)
 
 func (s *DurableAgentSink) RecordAgentEnvelope(ctx context.Context, envelope v1.Envelope) error {
 	if s.Store == nil {
@@ -227,6 +235,20 @@ func (s *DurableAgentSink) RecordAgentEnvelope(ctx context.Context, envelope v1.
 	// mutating terminal state so one stale cursor cannot poison reconnection.
 	if task.Operation.Status.IsTerminal() {
 		return nil
+	}
+	if s.RedactEnvelope != nil {
+		envelope, err = s.RedactEnvelope(ctx, task, envelope)
+		if err != nil {
+			return err
+		}
+		if err := v1.ValidateEnvelopePayload(envelope); err != nil {
+			return fmt.Errorf("redacted Agent envelope is invalid: %w", err)
+		}
+		redactedTaskID, redactedKey, redactedEvidence, redactedResult, decodeErr := decodeAgentTaskEnvelope(envelope)
+		if decodeErr != nil || redactedTaskID != taskID || redactedKey != idempotencyKey {
+			return errors.New("redacted Agent envelope changed durable task identity")
+		}
+		evidence, result = redactedEvidence, redactedResult
 	}
 	expectedIdempotencyKey := agentTaskWireIdempotency(task.Task.Payload, task.Operation.IdempotencyKey)
 	if expectedIdempotencyKey != idempotencyKey || envelope.NodeID != task.Task.LeaseOwner && !task.Operation.Status.IsTerminal() {

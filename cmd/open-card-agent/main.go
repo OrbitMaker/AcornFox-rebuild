@@ -214,5 +214,9 @@ func composeAcornFoxRuntimeWithProbe(ctx context.Context, provider acornFoxRunti
 		}
 		return nil, nil, nil, nil, err
 	}
-	return runtime, acornFoxRuntime, prober, append(capabilities, v1.AgentCapabilityAcornFoxProbe), nil
+	capabilities = append(capabilities, v1.AgentCapabilityAcornFoxProbe)
+	if _, ok := provider.(contracts.AcornFoxBoundedLogReader); ok {
+		capabilities = append(capabilities, v1.AgentCapabilityAcornFoxLogs)
+	}
+	return runtime, acornFoxRuntime, prober, capabilities, nil
 }

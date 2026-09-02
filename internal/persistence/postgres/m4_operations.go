@@ -17,6 +17,8 @@ import (
 	"strings"
 	"time"
 
+	v1 "github.com/open-card/open-card/api/agent/v1"
+	"github.com/open-card/open-card/internal/contracts"
 	"github.com/open-card/open-card/internal/domain"
 	"github.com/open-card/open-card/internal/foundation"
 )
@@ -168,21 +170,97 @@ const (
 	LogIndexAudit   LogIndexCategory = "audit"
 )
 
+// LogStream describes the bytes represented by one indexed segment. Unknown
+// is an explicit fact used when an older producer did not retain this detail.
+// It must never be guessed from a path or a user-supplied stream name.
+type LogStream string
+
+const (
+	LogStreamStdout   LogStream = "stdout"
+	LogStreamStderr   LogStream = "stderr"
+	LogStreamCombined LogStream = "combined"
+	LogStreamUnknown  LogStream = "unknown"
+)
+
+// LogTruncation describes whether the indexed source was complete before it
+// reached AcornFox. It says nothing about an application's runtime health.
+type LogTruncation string
+
+const (
+	LogTruncationComplete      LogTruncation = "complete"
+	LogTruncationSourceLimited LogTruncation = "source_limited"
+	LogTruncationUnknown       LogTruncation = "unknown"
+)
+
 // LogIndex is metadata for an on-disk segment. It must not be used to place
 // log content in PostgreSQL or to copy audit evidence into ordinary GC state.
 type LogIndex struct {
-	ID            domain.ID        `json:"id"`
-	ApplicationID domain.ID        `json:"application_id"`
-	ServiceName   string           `json:"service_name"`
-	ReleaseID     domain.ID        `json:"release_id,omitempty"`
-	DeploymentID  domain.ID        `json:"deployment_id,omitempty"`
-	OperationID   domain.ID        `json:"operation_id,omitempty"`
+	ID            domain.ID `json:"id"`
+	ApplicationID domain.ID `json:"application_id"`
+	ServiceName   string    `json:"service_name"`
+	ReleaseID     domain.ID `json:"release_id,omitempty"`
+	DeploymentID  domain.ID `json:"deployment_id,omitempty"`
+	OperationID   domain.ID `json:"operation_id,omitempty"`
+	BuildID       domain.ID `json:"build_id,omitempty"`
+	// LogTaskID is set only by the dedicated AcornFox runtime-log projector.
+	// It is deliberately distinct from OperationID: a deployment operation can
+	// emit lifecycle/probe evidence, while only a strict TaskLogs request may
+	// become a public application-log record.
+	LogTaskID     domain.ID        `json:"log_task_id,omitempty"`
 	Category      LogIndexCategory `json:"category"`
+	LogStream     LogStream        `json:"log_stream"`
+	Truncation    LogTruncation    `json:"truncation"`
 	Path          string           `json:"path"`
 	Segment       int              `json:"segment"`
 	ByteSize      int64            `json:"byte_size"`
+	ContentDigest string           `json:"content_digest,omitempty"`
 	RetiredAt     *time.Time       `json:"retired_at,omitempty"`
 	CreatedAt     time.Time        `json:"created_at"`
+}
+
+// AcornFoxLogIndexCursor is the stable, opaque-to-callers boundary between two
+// descending logical-record pages. Callers must preserve both values;
+// timestamps alone do not provide a deterministic ordering when records share
+// a time. RecordKey is internal cursor material, never a filesystem path.
+type AcornFoxLogIndexCursor struct {
+	RecordedAt time.Time
+	RecordKey  string
+}
+
+// AcornFoxDeliveryLogRecord is one public logical record. It groups every
+// active physical segment for one build+stream or runtime-operation+stream;
+// callers must never paginate individual files. Segments stay JSON-hidden so
+// host paths remain internal to the server projection.
+type AcornFoxDeliveryLogRecord struct {
+	Category    LogIndexCategory `json:"category"`
+	BuildID     domain.ID        `json:"build_id,omitempty"`
+	OperationID domain.ID        `json:"operation_id,omitempty"`
+	LogStream   LogStream        `json:"log_stream"`
+	Truncation  LogTruncation    `json:"truncation"`
+	RecordedAt  time.Time        `json:"recorded_at"`
+	Segments    []LogIndex       `json:"-"`
+
+	recordKey string
+}
+
+// AcornFoxDeliveryLogIndexes contains only ordinary logical records proven to
+// belong to one application deployment. Retired segments are not returned,
+// but their existence is exposed separately so the API can describe an
+// unavailable historical record without treating it as active content.
+type AcornFoxDeliveryLogIndexes struct {
+	Records           []AcornFoxDeliveryLogRecord
+	NextCursor        *AcornFoxLogIndexCursor
+	HasRetiredIndexes bool
+}
+
+// AcornFoxLogCollectionCandidate is an AcornFox deployment whose durable,
+// strict deploy task and runtime state make a bounded logs task meaningful.
+// It intentionally carries identifiers only; the scheduler must reload the
+// exact runtime request before it can create any Agent task.
+type AcornFoxLogCollectionCandidate struct {
+	ApplicationID domain.ID
+	EnvironmentID domain.ID
+	DeploymentID  domain.ID
 }
 
 // OperationFact is deliberately a single shared projection for ordinary and
@@ -419,8 +497,43 @@ func (v LogIndex) Validate() error {
 	if v.Category != LogIndexBuild && v.Category != LogIndexRuntime && v.Category != LogIndexAudit {
 		return domain.ValidationError("log index category is unsupported")
 	}
+	if !v.BuildID.Empty() && v.Category != LogIndexBuild {
+		return domain.ValidationError("log index build id is only valid for build logs")
+	}
+	if !v.LogTaskID.Empty() && v.Category != LogIndexRuntime {
+		return domain.ValidationError("log index task id is only valid for runtime logs")
+	}
+	if v.LogStream != "" && v.LogStream != LogStreamStdout && v.LogStream != LogStreamStderr && v.LogStream != LogStreamCombined && v.LogStream != LogStreamUnknown {
+		return domain.ValidationError("log index stream is unsupported")
+	}
+	if v.Truncation != "" && v.Truncation != LogTruncationComplete && v.Truncation != LogTruncationSourceLimited && v.Truncation != LogTruncationUnknown {
+		return domain.ValidationError("log index truncation is unsupported")
+	}
+	if v.ContentDigest != "" && !m4SHA256(v.ContentDigest) {
+		return domain.ValidationError("log index content digest is invalid")
+	}
 	if v.Category == LogIndexAudit && v.RetiredAt != nil {
 		return domain.ValidationError("audit log index cannot be retired")
+	}
+	return nil
+}
+
+func (v LogIndex) normalizedLogMetadata() LogIndex {
+	if v.LogStream == "" {
+		v.LogStream = LogStreamUnknown
+	}
+	if v.Truncation == "" {
+		v.Truncation = LogTruncationUnknown
+	}
+	return v
+}
+
+func (v AcornFoxLogIndexCursor) Validate() error {
+	if v.RecordedAt.IsZero() {
+		return domain.ValidationError("AcornFox log cursor record time is required")
+	}
+	if strings.TrimSpace(v.RecordKey) == "" || strings.ContainsAny(v.RecordKey, "\r\n\x00") {
+		return domain.ValidationError("AcornFox log cursor record key is invalid")
 	}
 	return nil
 }
@@ -691,6 +804,245 @@ func (s *Store) ListM4ObservationCandidates(ctx context.Context, olderThan time.
 		return nil, err
 	}
 	return values, nil
+}
+
+// ListAcornFoxLogCollectionCandidates returns only deployment identifiers the
+// dedicated AcornFox logs scheduler may consider. It does not construct a
+// request or task: callers must reload the exact immutable runtime request.
+// M2, legacy, probe, and malformed marker payloads are excluded by requiring
+// a strict AcornFox deploy/redeploy task as well as a readable runtime state.
+func (s *Store) ListAcornFoxLogCollectionCandidates(ctx context.Context, olderThan time.Time, limit int) ([]AcornFoxLogCollectionCandidate, error) {
+	if err := s.requireDB(); err != nil {
+		return nil, err
+	}
+	if olderThan.IsZero() {
+		return nil, domain.ValidationError("AcornFox log collection cutoff is required")
+	}
+	if limit < 1 || limit > 100 {
+		return nil, domain.ValidationError("AcornFox log collection limit must be between 1 and 100")
+	}
+	// Strict AcornFox task validation is deliberately Go-side rather than a
+	// JSON predicate. Fetch a bounded ordered batch first, close the cursor,
+	// then validate it so a one-connection pool cannot deadlock on a nested
+	// query. A malformed legacy prefix may never silently starve a later valid
+	// deployment: callers get an explicit exhaustion error and can repair or
+	// quarantine the bad rows before retrying.
+	scanLimit := limit * 10
+	if scanLimit < 100 {
+		scanLimit = 100
+	}
+	if scanLimit > 1000 {
+		scanLimit = 1000
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT deployment.id,environment.application_id,deployment.environment_id,deployment.release_id
+		  FROM deployments deployment
+		  JOIN environments environment ON environment.id=deployment.environment_id
+		 WHERE deployment.state IN ('runtime_ready','degraded','serving')
+		   AND NOT EXISTS (
+		     SELECT 1 FROM operations active
+		      WHERE active.environment_id=deployment.environment_id
+		        AND active.state IN ('pending','leased','running','waiting','cancelling','rolling_back')
+		   )
+		   AND NOT EXISTS (
+		     SELECT 1 FROM m4_log_indexes logs
+		      WHERE logs.deployment_id=deployment.id
+		        AND logs.category='runtime'
+		        AND logs.retired_at IS NULL
+		        AND logs.content_digest IS NOT NULL
+		        AND char_length(logs.content_digest)=71
+		        AND logs.content_digest ~ '^sha256:[0-9a-f]{64}$'
+		        AND logs.created_at>$1
+		   )
+		 ORDER BY (
+		   SELECT MAX(logs.created_at)
+		     FROM m4_log_indexes logs
+		    WHERE logs.deployment_id=deployment.id
+		      AND logs.category='runtime'
+		      AND logs.retired_at IS NULL
+		 ) NULLS FIRST,deployment.id
+		 LIMIT $2`, olderThan.UTC(), scanLimit)
+	if err != nil {
+		return nil, fmt.Errorf("list AcornFox log collection candidates: %w", err)
+	}
+	raw := make([]struct {
+		candidate AcornFoxLogCollectionCandidate
+		releaseID domain.ID
+	}, 0, scanLimit)
+	for rows.Next() {
+		var value struct {
+			candidate AcornFoxLogCollectionCandidate
+			releaseID domain.ID
+		}
+		if err := rows.Scan(&value.candidate.DeploymentID, &value.candidate.ApplicationID, &value.candidate.EnvironmentID, &value.releaseID); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		raw = append(raw, value)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+
+	values := make([]AcornFoxLogCollectionCandidate, 0, limit)
+	for _, value := range raw {
+		strict, err := s.hasStrictAcornFoxRuntimeTask(ctx, value.candidate.ApplicationID, value.candidate.EnvironmentID, value.releaseID, value.candidate.DeploymentID)
+		if err != nil {
+			return nil, err
+		}
+		if !strict {
+			continue
+		}
+		collected, err := s.hasRecentSuccessfulAcornFoxLogsTask(ctx, value.candidate.ApplicationID, value.candidate.EnvironmentID, value.releaseID, value.candidate.DeploymentID, olderThan)
+		if err != nil {
+			return nil, err
+		}
+		if collected {
+			continue
+		}
+		values = append(values, value.candidate)
+		if len(values) == limit {
+			return values, nil
+		}
+	}
+	if len(raw) == scanLimit {
+		return nil, fmt.Errorf("AcornFox log candidate scan exhausted after %d rows before finding %d valid candidates", scanLimit, limit)
+	}
+	return values, nil
+}
+
+// GetAcornFoxDeliveryLogRedactionValues returns private source provenance only
+// for server-side redaction. It intentionally exposes neither source IDs nor
+// values through any JSON projection. The complete deployment→release→
+// definition→source relation is checked in one query, so a cross-application
+// read is indistinguishable from a missing delivery.
+func (s *Store) GetAcornFoxDeliveryLogRedactionValues(ctx context.Context, applicationID, deploymentID domain.ID) ([]string, error) {
+	if err := s.requireDB(); err != nil {
+		return nil, err
+	}
+	if err := domain.RequireID(applicationID, "AcornFox log redaction application id"); err != nil {
+		return nil, err
+	}
+	if err := domain.RequireID(deploymentID, "AcornFox log redaction deployment id"); err != nil {
+		return nil, err
+	}
+	var locator, workspace string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT source.locator,source.workspace_ref
+		  FROM deployments deployment
+		  JOIN environments environment ON environment.id=deployment.environment_id
+		  JOIN releases release ON release.id=deployment.release_id
+		  JOIN delivery_definitions definition ON definition.id=release.definition_id
+		  JOIN source_revisions source ON source.id=definition.source_revision_id
+		 WHERE deployment.id=$1
+		   AND environment.application_id=$2
+		   AND release.application_id=$2
+		   AND definition.application_id=$2
+		   AND source.application_id=$2
+		   AND source.source_kind IS NOT NULL
+		   AND source.locator IS NOT NULL
+		   AND source.workspace_ref IS NOT NULL`, deploymentID.String(), applicationID.String()).Scan(&locator, &workspace)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("load AcornFox log redaction values: %w", err)
+	}
+	locator, workspace = strings.TrimSpace(locator), strings.TrimSpace(workspace)
+	if locator == "" || workspace == "" || strings.ContainsRune(locator, 0) || strings.ContainsRune(workspace, 0) {
+		return nil, domain.ValidationError("AcornFox log redaction provenance is invalid")
+	}
+	return []string{locator, workspace}, nil
+}
+
+func (s *Store) hasStrictAcornFoxRuntimeTask(ctx context.Context, applicationID, environmentID, releaseID, deploymentID domain.ID) (bool, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT task.payload
+		  FROM task_leases task
+		  JOIN operations operation ON operation.id=task.operation_id
+		 WHERE operation.deployment_id=$1
+		 ORDER BY task.created_at,task.task_id`, deploymentID.String())
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var payload json.RawMessage
+		if err := rows.Scan(&payload); err != nil {
+			return false, err
+		}
+		request, ok, err := decodeAcornFoxRuntimeTask(payload)
+		if err != nil || !ok {
+			continue
+		}
+		expected, err := contracts.AcornFoxRuntimeDeploymentID(request.Fact)
+		if err == nil && expected == deploymentID && request.Fact.ApplicationID == applicationID && request.Fact.EnvironmentID == environmentID && request.Fact.ReleaseID == releaseID {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
+}
+
+// hasRecentSuccessfulAcornFoxLogsTask is an empty-collection watermark. A
+// completed successful logs task means the agent accepted and finished the
+// bounded collection even when it produced no LogChunk/index rows. Failed or
+// cancelled tasks deliberately do not count, so a temporary collection fault
+// cannot suppress the next scheduler attempt forever.
+func (s *Store) hasRecentSuccessfulAcornFoxLogsTask(ctx context.Context, applicationID, environmentID, releaseID, deploymentID domain.ID, olderThan time.Time) (bool, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT task.payload
+		  FROM task_leases task
+		  JOIN operations operation ON operation.id=task.operation_id
+		 WHERE operation.deployment_id=$1
+		   AND operation.state='succeeded'
+		   AND task.state='completed'
+		   AND task.updated_at>$2
+		   AND task.payload->>'kind'='logs'
+		 ORDER BY task.updated_at DESC,task.task_id DESC`, deploymentID.String(), olderThan.UTC())
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var payload json.RawMessage
+		if err := rows.Scan(&payload); err != nil {
+			return false, err
+		}
+		request, ok, err := decodeAcornFoxLogsTask(payload)
+		if err != nil || !ok {
+			continue
+		}
+		expected, err := contracts.AcornFoxRuntimeDeploymentID(request.Reference.Fact)
+		if err == nil && expected == deploymentID && request.DeploymentID == deploymentID && request.Reference.Fact.ApplicationID == applicationID && request.Reference.Fact.EnvironmentID == environmentID && request.Reference.Fact.ReleaseID == releaseID {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
+}
+
+func decodeAcornFoxLogsTask(payload json.RawMessage) (contracts.AcornFoxLogsRequest, bool, error) {
+	var task struct {
+		Kind       v1.TaskKind     `json:"kind"`
+		Parameters json.RawMessage `json:"parameters"`
+	}
+	if err := decodeControllerTaskJSON(payload, &task); err != nil || task.Kind != v1.TaskLogs {
+		return contracts.AcornFoxLogsRequest{}, false, nil
+	}
+	var wrapper struct {
+		PayloadType string                        `json:"acornfox_log_payload_type"`
+		Request     contracts.AcornFoxLogsRequest `json:"request"`
+	}
+	if err := decodeControllerTaskJSON(task.Parameters, &wrapper); err != nil || wrapper.PayloadType != "logs" {
+		return contracts.AcornFoxLogsRequest{}, false, nil
+	}
+	if err := wrapper.Request.Validate(); err != nil {
+		return contracts.AcornFoxLogsRequest{}, true, domain.ValidationError("AcornFox logs task is invalid")
+	}
+	return wrapper.Request, true, nil
 }
 
 // ListM4LogCollectionCandidates selects at most limit service snapshots that
@@ -1070,8 +1422,12 @@ func (s *Store) AppendLogIndex(ctx context.Context, index LogIndex, now time.Tim
 	if index.CreatedAt.IsZero() {
 		index.CreatedAt = now
 	}
+	index = index.normalizedLogMetadata()
 	if err := index.Validate(); err != nil {
 		return err
+	}
+	if !m4SHA256(index.ContentDigest) {
+		return domain.ValidationError("new log index content digest is required")
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -1080,7 +1436,7 @@ func (s *Store) AppendLogIndex(ctx context.Context, index LogIndex, now time.Tim
 	if err := m4ValidateLogAssociationsTx(ctx, tx, index); err != nil {
 		return rollbackTx(tx, err)
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO m4_log_indexes(id,application_id,service_name,release_id,deployment_id,operation_id,category,path,segment,byte_size,retired_at,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`, index.ID.String(), index.ApplicationID.String(), index.ServiceName, nullableM4ID(index.ReleaseID), nullableM4ID(index.DeploymentID), nullableM4ID(index.OperationID), index.Category, index.Path, index.Segment, index.ByteSize, index.RetiredAt, index.CreatedAt.UTC())
+	_, err = tx.ExecContext(ctx, `INSERT INTO m4_log_indexes(id,application_id,service_name,release_id,deployment_id,operation_id,build_id,log_task_id,category,log_stream,truncation,path,segment,byte_size,content_digest,retired_at,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`, index.ID.String(), index.ApplicationID.String(), index.ServiceName, nullableM4ID(index.ReleaseID), nullableM4ID(index.DeploymentID), nullableM4ID(index.OperationID), nullableM4ID(index.BuildID), nullableM4ID(index.LogTaskID), index.Category, index.LogStream, index.Truncation, index.Path, index.Segment, index.ByteSize, index.ContentDigest, index.RetiredAt, index.CreatedAt.UTC())
 	if err != nil {
 		return rollbackTx(tx, err)
 	}
@@ -1125,7 +1481,7 @@ func (s *Store) ListLogIndexes(ctx context.Context, applicationID domain.ID, inc
 		return nil, err
 	}
 	limit = normalizeM4Limit(limit)
-	statement := `SELECT id,application_id,service_name,release_id,deployment_id,operation_id,category,path,segment,byte_size,retired_at,created_at FROM m4_log_indexes WHERE application_id=$1`
+	statement := `SELECT id,application_id,service_name,release_id,deployment_id,operation_id,build_id,log_task_id,category,log_stream,truncation,path,segment,byte_size,content_digest,retired_at,created_at FROM m4_log_indexes WHERE application_id=$1`
 	if !includeRetired {
 		statement += ` AND retired_at IS NULL`
 	}
@@ -1156,7 +1512,7 @@ func (s *Store) ListActiveOrdinaryLogIndexes(ctx context.Context, limit int) ([]
 	if limit <= 0 || limit > 10000 {
 		return nil, domain.ValidationError("ordinary log reconciliation limit must be between 1 and 10000")
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id,application_id,service_name,release_id,deployment_id,operation_id,category,path,segment,byte_size,retired_at,created_at FROM m4_log_indexes WHERE retired_at IS NULL AND category IN ('build','runtime') ORDER BY created_at,id LIMIT $1`, limit)
+	rows, err := s.db.QueryContext(ctx, `SELECT id,application_id,service_name,release_id,deployment_id,operation_id,build_id,log_task_id,category,log_stream,truncation,path,segment,byte_size,content_digest,retired_at,created_at FROM m4_log_indexes WHERE retired_at IS NULL AND category IN ('build','runtime') ORDER BY created_at,id LIMIT $1`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -1170,6 +1526,212 @@ func (s *Store) ListActiveOrdinaryLogIndexes(ctx context.Context, limit int) ([]
 		result = append(result, item)
 	}
 	return result, rows.Err()
+}
+
+// ListAcornFoxDeliveryLogIndexes returns one active logical-source page tied
+// to exactly one AcornFox application deployment. Runtime records are keyed by
+// operation+stream and selected by exact deployment. Build records are keyed
+// by build+stream and selected only when their persisted build ID is reachable
+// through that deployment's immutable release artifact set. Path, service, and
+// stream names are deliberately not identity inputs. Audit, retired, legacy
+// NULL-metadata, and unassociated rows never enter this public read model.
+// Source filtering and logical grouping happen before keyset pagination, so no
+// physical segment can split, duplicate, or skip a build/runtime record.
+func (s *Store) ListAcornFoxDeliveryLogIndexes(ctx context.Context, applicationID, deploymentID domain.ID, source LogIndexCategory, after *AcornFoxLogIndexCursor, limit int) (AcornFoxDeliveryLogIndexes, error) {
+	if err := s.requireDB(); err != nil {
+		return AcornFoxDeliveryLogIndexes{}, err
+	}
+	if err := domain.RequireID(applicationID, "AcornFox log application id"); err != nil {
+		return AcornFoxDeliveryLogIndexes{}, err
+	}
+	if err := domain.RequireID(deploymentID, "AcornFox log deployment id"); err != nil {
+		return AcornFoxDeliveryLogIndexes{}, err
+	}
+	if source != LogIndexBuild && source != LogIndexRuntime {
+		return AcornFoxDeliveryLogIndexes{}, domain.ValidationError("AcornFox log source must be build or runtime")
+	}
+	if after != nil {
+		if err := after.Validate(); err != nil {
+			return AcornFoxDeliveryLogIndexes{}, err
+		}
+	}
+	limit = normalizeM4Limit(limit)
+
+	var owned bool
+	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(
+		SELECT 1
+		  FROM deployments deployment
+		  JOIN environments environment ON environment.id=deployment.environment_id
+		 WHERE deployment.id=$1 AND environment.application_id=$2
+	)`, deploymentID.String(), applicationID.String()).Scan(&owned)
+	if err != nil {
+		return AcornFoxDeliveryLogIndexes{}, err
+	}
+	if !owned {
+		return AcornFoxDeliveryLogIndexes{}, ErrNotFound
+	}
+
+	const deliveryScope = `
+		logs.application_id=$1
+		AND logs.category=$3
+		AND logs.log_stream IS NOT NULL
+		AND logs.truncation IS NOT NULL
+		AND logs.content_digest IS NOT NULL
+		AND char_length(logs.content_digest)=71
+		AND logs.content_digest ~ '^sha256:[0-9a-f]{64}$'
+		AND (
+			(
+				logs.category='runtime'
+				AND logs.deployment_id=$2
+				AND logs.operation_id IS NOT NULL
+				AND logs.log_task_id IS NOT NULL
+				AND EXISTS (
+					SELECT 1
+					  FROM task_leases task
+					  JOIN operations task_operation ON task_operation.id=task.operation_id
+					  JOIN deployments task_deployment ON task_deployment.id=task_operation.deployment_id
+					 WHERE task.task_id=logs.log_task_id
+					   AND task.operation_id=logs.operation_id
+					   AND task_operation.application_id=logs.application_id
+					   AND task_operation.deployment_id=logs.deployment_id
+					   AND task_deployment.id=$2
+					   AND task.payload->>'kind'='logs'
+					   AND task.payload#>>'{parameters,acornfox_log_payload_type}'='logs'
+					   AND task.payload#>>'{parameters,request,deployment_id}'=logs.deployment_id
+					   AND task.payload#>>'{parameters,request,service_name}'=logs.service_name
+					   AND task.payload#>>'{parameters,request,runtime_reference,fact,application_id}'=logs.application_id
+					   AND task.payload#>>'{parameters,request,runtime_reference,fact,environment_id}'=task_deployment.environment_id
+					   AND task.payload#>>'{parameters,request,runtime_reference,fact,release_id}'=task_deployment.release_id
+				)
+			)
+			OR (
+				logs.category='build'
+				AND logs.build_id IS NOT NULL
+				AND EXISTS (
+					SELECT 1
+					  FROM deployments deployment
+					  JOIN release_artifacts release_artifact ON release_artifact.release_id=deployment.release_id
+					  JOIN artifacts artifact ON artifact.id=release_artifact.artifact_id
+					  JOIN builds build ON build.id=artifact.build_id
+					  JOIN build_plans plan ON plan.id=build.plan_id
+					 WHERE deployment.id=$2
+					   AND artifact.build_id=logs.build_id
+					   AND release_artifact.service_name=logs.service_name
+					   AND plan.service_name=release_artifact.service_name
+					   AND plan.acornfox_definition_digest IS NOT NULL
+					   AND plan.acornfox_dockerfile_digest IS NOT NULL
+				)
+			)
+		)`
+
+	retiredStatement := `SELECT EXISTS(SELECT 1 FROM m4_log_indexes logs WHERE logs.retired_at IS NOT NULL AND ` + deliveryScope + `)`
+	result := AcornFoxDeliveryLogIndexes{}
+	if err := s.db.QueryRowContext(ctx, retiredStatement, applicationID.String(), deploymentID.String(), source).Scan(&result.HasRetiredIndexes); err != nil {
+		return AcornFoxDeliveryLogIndexes{}, err
+	}
+
+	statement := `WITH eligible AS (
+			SELECT logs.*,
+				CASE WHEN logs.category='build' THEN logs.build_id ELSE logs.operation_id END AS record_identity
+			FROM m4_log_indexes logs
+			WHERE logs.retired_at IS NULL AND ` + deliveryScope + `
+		), logical AS (
+			SELECT record_identity,log_stream,
+				MAX(created_at) AS recorded_at,
+				CASE
+					WHEN bool_or(truncation='source_limited') THEN 'source_limited'
+					WHEN bool_or(truncation='unknown') THEN 'unknown'
+					ELSE 'complete'
+				END AS truncation,
+				record_identity || chr(31) || log_stream AS record_key
+			FROM eligible
+			GROUP BY record_identity,log_stream
+		), paged AS (
+			SELECT record_identity,log_stream,recorded_at,truncation,record_key
+			FROM logical`
+	args := []any{applicationID.String(), deploymentID.String(), source}
+	if after != nil {
+		statement += ` WHERE (recorded_at < $4 OR (recorded_at = $4 AND record_key < $5))`
+		args = append(args, after.RecordedAt.UTC(), after.RecordKey)
+	}
+	statement += ` ORDER BY recorded_at DESC,record_key DESC LIMIT $` + fmt.Sprint(len(args)+1) + `
+		)
+		SELECT paged.record_identity,paged.log_stream,paged.truncation,paged.recorded_at,paged.record_key,
+			logs.id,logs.application_id,logs.service_name,logs.release_id,logs.deployment_id,logs.operation_id,logs.build_id,logs.log_task_id,
+			logs.category,logs.log_stream,logs.truncation,logs.path,logs.segment,logs.byte_size,logs.content_digest,logs.retired_at,logs.created_at
+		FROM paged
+		JOIN eligible logs ON logs.record_identity=paged.record_identity AND logs.log_stream=paged.log_stream
+		ORDER BY paged.recorded_at DESC,paged.record_key DESC,logs.segment ASC,logs.created_at ASC,logs.id ASC`
+	args = append(args, limit+1)
+	rows, err := s.db.QueryContext(ctx, statement, args...)
+	if err != nil {
+		return AcornFoxDeliveryLogIndexes{}, err
+	}
+	defer rows.Close()
+	result.Records = make([]AcornFoxDeliveryLogRecord, 0, limit)
+	currentKey := ""
+	for rows.Next() {
+		var recordIdentity, recordKey string
+		var stream LogStream
+		var truncation LogTruncation
+		var recordedAt time.Time
+		var item LogIndex
+		var release, deployment, operation, build, logTask, persistedStream, persistedTruncation, contentDigest sql.NullString
+		var retired sql.NullTime
+		err := rows.Scan(&recordIdentity, &stream, &truncation, &recordedAt, &recordKey,
+			&item.ID, &item.ApplicationID, &item.ServiceName, &release, &deployment, &operation, &build, &logTask,
+			&item.Category, &persistedStream, &persistedTruncation, &item.Path, &item.Segment, &item.ByteSize, &contentDigest, &retired, &item.CreatedAt)
+		if err != nil {
+			return AcornFoxDeliveryLogIndexes{}, err
+		}
+		if release.Valid {
+			item.ReleaseID = domain.ID(release.String)
+		}
+		if deployment.Valid {
+			item.DeploymentID = domain.ID(deployment.String)
+		}
+		if operation.Valid {
+			item.OperationID = domain.ID(operation.String)
+		}
+		if build.Valid {
+			item.BuildID = domain.ID(build.String)
+		}
+		if logTask.Valid {
+			item.LogTaskID = domain.ID(logTask.String)
+		}
+		item.LogStream = LogStream(persistedStream.String)
+		item.Truncation = LogTruncation(persistedTruncation.String)
+		item.ContentDigest = contentDigest.String
+		if retired.Valid {
+			at := retired.Time.UTC()
+			item.RetiredAt = &at
+		}
+		item.CreatedAt = item.CreatedAt.UTC()
+		if err := item.Validate(); err != nil {
+			return AcornFoxDeliveryLogIndexes{}, fmt.Errorf("invalid persisted AcornFox log segment: %w", err)
+		}
+		if currentKey != recordKey {
+			if len(result.Records) == limit {
+				last := result.Records[len(result.Records)-1]
+				result.NextCursor = &AcornFoxLogIndexCursor{RecordedAt: last.RecordedAt.UTC(), RecordKey: last.recordKey}
+				break
+			}
+			record := AcornFoxDeliveryLogRecord{Category: source, LogStream: stream, Truncation: truncation, RecordedAt: recordedAt.UTC(), Segments: make([]LogIndex, 0), recordKey: recordKey}
+			if source == LogIndexBuild {
+				record.BuildID = domain.ID(recordIdentity)
+			} else {
+				record.OperationID = domain.ID(recordIdentity)
+			}
+			result.Records = append(result.Records, record)
+			currentKey = recordKey
+		}
+		record := &result.Records[len(result.Records)-1]
+		record.Segments = append(record.Segments, item)
+	}
+	if err := rows.Err(); err != nil {
+		return AcornFoxDeliveryLogIndexes{}, err
+	}
+	return result, nil
 }
 
 func (s *Store) GetOperationFact(ctx context.Context, operationID domain.ID) (OperationFact, error) {
@@ -1252,7 +1814,7 @@ func m4ValidateLogAssociationsTx(ctx context.Context, tx *sql.Tx, index LogIndex
 		id        domain.ID
 		statement string
 		label     string
-	}{{index.ReleaseID, `SELECT application_id FROM releases WHERE id=$1`, `release`}, {index.DeploymentID, `SELECT e.application_id FROM deployments d JOIN environments e ON e.id=d.environment_id WHERE d.id=$1`, `deployment`}, {index.OperationID, `SELECT application_id FROM operations WHERE id=$1`, `operation`}}
+	}{{index.ReleaseID, `SELECT application_id FROM releases WHERE id=$1`, `release`}, {index.DeploymentID, `SELECT e.application_id FROM deployments d JOIN environments e ON e.id=d.environment_id WHERE d.id=$1`, `deployment`}, {index.OperationID, `SELECT application_id FROM operations WHERE id=$1`, `operation`}, {index.BuildID, `SELECT source.application_id FROM builds build JOIN build_plans plan ON plan.id=build.plan_id JOIN source_revisions source ON source.id=plan.source_revision_id WHERE build.id=$1`, `build`}}
 	for _, check := range checks {
 		if check.id.Empty() {
 			continue
@@ -1267,6 +1829,26 @@ func m4ValidateLogAssociationsTx(ctx context.Context, tx *sql.Tx, index LogIndex
 		}
 		if app != index.ApplicationID.String() {
 			return domain.ValidationError("log index " + check.label + " does not belong to application")
+		}
+	}
+	if !index.LogTaskID.Empty() {
+		if index.Category != LogIndexRuntime || index.OperationID.Empty() || index.DeploymentID.Empty() {
+			return domain.ValidationError("runtime log task provenance is incomplete")
+		}
+		var operationID, deploymentID, applicationID string
+		err := tx.QueryRowContext(ctx, `
+			SELECT operation.id,COALESCE(operation.deployment_id,''),operation.application_id
+			  FROM task_leases task
+			  JOIN operations operation ON operation.id=task.operation_id
+			 WHERE task.task_id=$1`, index.LogTaskID.String()).Scan(&operationID, &deploymentID, &applicationID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if operationID != index.OperationID.String() || deploymentID != index.DeploymentID.String() || applicationID != index.ApplicationID.String() {
+			return domain.ValidationError("runtime log task provenance does not match index scope")
 		}
 	}
 	return nil
@@ -1331,9 +1913,9 @@ func scanM4WebhookEvent(scanner interface{ Scan(...any) error }) (WebhookEventLe
 
 func scanM4LogIndex(scanner interface{ Scan(...any) error }) (LogIndex, error) {
 	var value LogIndex
-	var release, deployment, operation sql.NullString
+	var release, deployment, operation, build, logTask, stream, truncation, contentDigest sql.NullString
 	var retired sql.NullTime
-	err := scanner.Scan(&value.ID, &value.ApplicationID, &value.ServiceName, &release, &deployment, &operation, &value.Category, &value.Path, &value.Segment, &value.ByteSize, &retired, &value.CreatedAt)
+	err := scanner.Scan(&value.ID, &value.ApplicationID, &value.ServiceName, &release, &deployment, &operation, &build, &logTask, &value.Category, &stream, &truncation, &value.Path, &value.Segment, &value.ByteSize, &contentDigest, &retired, &value.CreatedAt)
 	if err != nil {
 		return LogIndex{}, err
 	}
@@ -1345,6 +1927,25 @@ func scanM4LogIndex(scanner interface{ Scan(...any) error }) (LogIndex, error) {
 	}
 	if operation.Valid {
 		value.OperationID = domain.ID(operation.String)
+	}
+	if build.Valid {
+		value.BuildID = domain.ID(build.String)
+	}
+	if logTask.Valid {
+		value.LogTaskID = domain.ID(logTask.String)
+	}
+	if stream.Valid {
+		value.LogStream = LogStream(stream.String)
+	} else {
+		value.LogStream = LogStreamUnknown
+	}
+	if truncation.Valid {
+		value.Truncation = LogTruncation(truncation.String)
+	} else {
+		value.Truncation = LogTruncationUnknown
+	}
+	if contentDigest.Valid {
+		value.ContentDigest = contentDigest.String
 	}
 	if retired.Valid {
 		time := retired.Time.UTC()

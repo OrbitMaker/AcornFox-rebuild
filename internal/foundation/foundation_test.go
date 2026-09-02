@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -188,6 +189,61 @@ func TestUnitREDACT001SecretsAndEncodedVariants(t *testing.T) {
 	nested := redacted["nested"].(map[string]any)
 	if nested["token"] == secret || nested["ok"] != "yes" {
 		t.Fatalf("nested map redaction incorrect: %v", nested)
+	}
+}
+
+func TestUnitREDACT002RedactionIsIdempotentForMarkersAndBracketedValues(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{name: "plain assignment", input: "runtime one token=server-secret", want: "runtime one token=[REDACTED]"},
+		{name: "already redacted assignment", input: "runtime one token=[REDACTED]", want: "runtime one token=[REDACTED]"},
+		{name: "replacement prefix is not a bypass", input: "token=[REDACTED]server-secret", want: "token=[REDACTED]"},
+		{name: "json string and array marker", input: `{"token":"server-secret","items":["[REDACTED]","safe"]}`, want: `{"token":"[REDACTED]","items":["[REDACTED]","safe"]}`},
+		{name: "bracketed assignment value", input: "items=[safe,other] token=[server-secret]", want: "items=[safe,other] token=[REDACTED]"},
+		{name: "authorization", input: "Authorization: Bearer server-secret", want: "Authorization: Bearer [REDACTED]"},
+		{name: "authorization assignment", input: "authorization=server-secret", want: "authorization=[REDACTED]"},
+		{name: "authorization replacement prefix is not a bypass", input: "Authorization: Bearer [REDACTED]server-secret", want: "Authorization: Bearer [REDACTED]"},
+		{name: "cookie", input: "Cookie: sid=server-secret; theme=dark", want: "Cookie: [REDACTED]"},
+		{name: "cookie replacement prefix is not a bypass", input: "Cookie: sid=[REDACTED]server-secret; theme=dark", want: "Cookie: [REDACTED]"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			redactor := NewRedactor()
+			first := redactor.RedactString(tt.input)
+			if first != tt.want {
+				t.Fatalf("first pass = %q, want %q", first, tt.want)
+			}
+			next := first
+			for pass := 2; pass <= 3; pass++ {
+				got := redactor.RedactString(next)
+				if got != first {
+					t.Fatalf("pass %d = %q, want idempotent %q", pass, got, first)
+				}
+				next = got
+			}
+		})
+	}
+}
+
+func TestUnitREDACT003CustomReplacementRedactsKnownSecretVariantsIdempotently(t *testing.T) {
+	secret := "tok+en/with=chars"
+	encoded := base64.StdEncoding.EncodeToString([]byte(secret))
+	urlEncoded := url.QueryEscape(secret)
+	hexEncoded := hex.EncodeToString([]byte(secret))
+	redactor := NewRedactor(secret)
+	redactor.Replacement = "<masked>"
+	input := fmt.Sprintf("token=%s Authorization: Bearer %s Cookie: sid=%s direct=%s b64=%s url=%s hex=%s", secret, secret, secret, secret, encoded, urlEncoded, hexEncoded)
+	first := redactor.RedactString(input)
+	for _, leaked := range []string{secret, encoded, urlEncoded, hexEncoded} {
+		if strings.Contains(first, leaked) {
+			t.Fatalf("first pass leaks %q: %s", leaked, first)
+		}
+	}
+	if got := redactor.RedactString(first); got != first {
+		t.Fatalf("custom replacement second pass = %q, want %q", got, first)
 	}
 }
 

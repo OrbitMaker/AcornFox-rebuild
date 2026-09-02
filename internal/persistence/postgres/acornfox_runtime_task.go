@@ -26,7 +26,7 @@ func (s *Store) GetAcornFoxRuntimeRequest(ctx context.Context, applicationID, de
 		return contracts.AcornFoxRuntimeDeployRequest{}, err
 	}
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT t.payload
+		SELECT t.payload,d.environment_id,d.release_id
 		  FROM task_leases t
 		  JOIN operations o ON o.id=t.operation_id
 		  JOIN deployments d ON d.id=o.deployment_id
@@ -38,7 +38,8 @@ func (s *Store) GetAcornFoxRuntimeRequest(ctx context.Context, applicationID, de
 	defer rows.Close()
 	for rows.Next() {
 		var payload json.RawMessage
-		if err := rows.Scan(&payload); err != nil {
+		var environmentID, releaseID domain.ID
+		if err := rows.Scan(&payload, &environmentID, &releaseID); err != nil {
 			return contracts.AcornFoxRuntimeDeployRequest{}, err
 		}
 		request, ok, err := decodeAcornFoxRuntimeTask(payload)
@@ -49,7 +50,7 @@ func (s *Store) GetAcornFoxRuntimeRequest(ctx context.Context, applicationID, de
 			continue
 		}
 		expected, err := contracts.AcornFoxRuntimeDeploymentID(request.Fact)
-		if err != nil || expected != deploymentID || request.Fact.ApplicationID != applicationID {
+		if err != nil || expected != deploymentID || request.Fact.ApplicationID != applicationID || request.Fact.EnvironmentID != environmentID || request.Fact.ReleaseID != releaseID {
 			return contracts.AcornFoxRuntimeDeployRequest{}, domain.ValidationError("AcornFox runtime task identity is invalid")
 		}
 		return request, nil

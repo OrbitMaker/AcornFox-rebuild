@@ -196,6 +196,25 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/acornfox/apps/{applicationId}/deliveries/{deploymentId}/logs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                applicationId: components["parameters"]["ApplicationId"];
+                deploymentId: components["parameters"]["DeploymentId"];
+            };
+            cookie?: never;
+        };
+        get: operations["listAcornFoxDeliveryLogs"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/acornfox/apps/{applicationId}/deliveries/{deploymentId}/probes": {
         parameters: {
             query?: never;
@@ -375,6 +394,26 @@ export interface components {
             observed_at: string;
             fact_digest: string;
         };
+        DeliveryLogItem: {
+            /** @enum {string} */
+            stream: "stdout" | "stderr" | "combined" | "unknown";
+            /** Format: date-time */
+            recorded_at: string;
+            /** @description Redacted log text; returned as the newest suffix when response limits apply. */
+            content: string;
+            /** @enum {string} */
+            truncation: "complete" | "source_limited" | "response_limited" | "unknown";
+        };
+        DeliveryLogsResponse: {
+            /** @enum {string} */
+            source: "build" | "runtime";
+            /** @enum {string} */
+            availability: "available" | "not_collected" | "retired";
+            items: components["schemas"]["DeliveryLogItem"][];
+            next_cursor: string | null;
+            /** @description True when source-specific older log indexes were retired; active items, if present, remain readable. */
+            retention_limited: boolean;
+        };
     };
     responses: {
         /** @description Request JSON content type or body shape is invalid */
@@ -440,12 +479,34 @@ export interface components {
                 "application/json": components["schemas"]["Error"];
             };
         };
+        /** @description Log source limit or opaque cursor is invalid */
+        InvalidLogQuery: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description Collected log storage or its integrity reconciliation is temporarily unavailable */
+        LogsUnavailable: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
     };
     parameters: {
         ApplicationId: string;
         SourceRevisionId: string;
         DeploymentId: string;
         IdempotencyKey: string;
+        LogSource: "build" | "runtime";
+        LogLimit: number;
+        /** @description Opaque base64url cursor bound to this application deployment and source. */
+        LogCursor: string;
         /** @description Must equal the non-HttpOnly __Host-acornfox_csrf cookie and use the allowed Origin. */
         CSRFToken: string;
     };
@@ -794,6 +855,38 @@ export interface operations {
             409: components["responses"]["IdempotencyConflict"];
             422: components["responses"]["ValidationFailed"];
             503: components["responses"]["TemporarilyUnavailable"];
+        };
+    };
+    listAcornFoxDeliveryLogs: {
+        parameters: {
+            query: {
+                source: components["parameters"]["LogSource"];
+                limit?: components["parameters"]["LogLimit"];
+                /** @description Opaque base64url cursor bound to this application deployment and source. */
+                cursor?: components["parameters"]["LogCursor"];
+            };
+            header?: never;
+            path: {
+                applicationId: components["parameters"]["ApplicationId"];
+                deploymentId: components["parameters"]["DeploymentId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Already-collected build or runtime records. This read does not start collection or make runtime calls. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeliveryLogsResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationFailed"];
+            404: components["responses"]["NotFound"];
+            422: components["responses"]["InvalidLogQuery"];
+            503: components["responses"]["LogsUnavailable"];
         };
     };
     probeAcornFoxDeliveryOnce: {
