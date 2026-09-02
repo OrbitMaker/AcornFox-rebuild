@@ -15,6 +15,7 @@ import (
 	"github.com/open-card/open-card/internal/application"
 	"github.com/open-card/open-card/internal/contracts"
 	"github.com/open-card/open-card/internal/domain"
+	acornfoxprobe "github.com/open-card/open-card/internal/probe"
 	"github.com/open-card/open-card/internal/providers/capacity"
 	imageprovider "github.com/open-card/open-card/internal/providers/image"
 	"github.com/open-card/open-card/internal/providers/standalone"
@@ -81,6 +82,7 @@ func runOutboundAgent(controlPlaneURL, instanceID, nodeID, version string) {
 	var groupRuntime contracts.ServiceGroupRuntimeDriver
 	var volumeRuntime contracts.VolumeProvider
 	var acornFoxRuntime contracts.AcornFoxRuntimeDriver
+	var acornFoxProber acornFoxRuntimeProber
 	capabilities := []string{"docker.read.facts"}
 	if os.Getenv("OPEN_CARD_RUNTIME_ENABLED") == "true" {
 		if os.Getenv("OPEN_CARD_WORKER_NETWORK_ISOLATED") != "true" {
@@ -122,7 +124,9 @@ func runOutboundAgent(controlPlaneURL, instanceID, nodeID, version string) {
 			log.Fatal(storeErr)
 		}
 		var runtimeCapabilities []string
-		runtime, acornFoxRuntime, runtimeCapabilities, storeErr = composeAcornFoxRuntime(context.Background(), standaloneRuntime)
+		runtime, acornFoxRuntime, acornFoxProber, runtimeCapabilities, storeErr = composeAcornFoxRuntimeWithProbe(context.Background(), standaloneRuntime, func() (acornFoxRuntimeProber, error) {
+			return acornfoxprobe.New(acornfoxprobe.DefaultConfig(), time.Now)
+		})
 		if storeErr != nil {
 			log.Fatal(storeErr)
 		}
@@ -151,7 +155,7 @@ func runOutboundAgent(controlPlaneURL, instanceID, nodeID, version string) {
 			capabilities = append(capabilities, v1.AgentCapabilityRuntimeDeployGroup, v1.AgentCapabilityRuntimeObserveGroup, v1.AgentCapabilityRuntimeLogsGroup, v1.AgentCapabilityRuntimeRollbackGroup, v1.AgentCapabilityRuntimeDestroyGroup, v1.AgentCapabilityRuntimeRestartGroupService, v1.AgentCapabilityRuntimeRestartGroup)
 		}
 	}
-	handler := NewOutboundHandlerWithProvidersAndAcornFoxRuntime(instanceID, nodeID, facts, runtime, groupRuntime, volumeRuntime, acornFoxRuntime)
+	handler := NewOutboundHandlerWithAcornFoxProbe(instanceID, nodeID, facts, runtime, groupRuntime, volumeRuntime, acornFoxRuntime, acornFoxProber)
 	certificateID := ""
 	if len(tlsConfig.Certificates) == 1 && len(tlsConfig.Certificates[0].Certificate) > 0 {
 		certificate, parseErr := x509.ParseCertificate(tlsConfig.Certificates[0].Certificate[0])
@@ -193,4 +197,22 @@ func composeAcornFoxRuntime(ctx context.Context, provider acornFoxRuntimeProvide
 		return nil, nil, nil, err
 	}
 	return provider, acornFoxRuntime, []string{"runtime.deploy.digest", "runtime.observe", "runtime.logs", "runtime.restart", "runtime.destroy", v1.AgentCapabilityAcornFoxRuntime}, nil
+}
+
+func composeAcornFoxRuntimeWithProbe(ctx context.Context, provider acornFoxRuntimeProvider, buildProbe func() (acornFoxRuntimeProber, error)) (contracts.RuntimeDriver, contracts.AcornFoxRuntimeDriver, acornFoxRuntimeProber, []string, error) {
+	if buildProbe == nil {
+		return nil, nil, nil, nil, errors.New("AcornFox probe constructor is unavailable")
+	}
+	runtime, acornFoxRuntime, capabilities, err := composeAcornFoxRuntime(ctx, provider)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	prober, err := buildProbe()
+	if err != nil || prober == nil {
+		if err == nil {
+			err = errors.New("AcornFox probe is unavailable")
+		}
+		return nil, nil, nil, nil, err
+	}
+	return runtime, acornFoxRuntime, prober, append(capabilities, v1.AgentCapabilityAcornFoxProbe), nil
 }

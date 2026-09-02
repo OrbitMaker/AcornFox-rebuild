@@ -72,6 +72,9 @@ const (
 	// surface. It is intentionally one capability because all five accepted
 	// actions share the same immutable runtime fact boundary.
 	AgentCapabilityAcornFoxRuntime = "acornfox.runtime.v1"
+	// AgentCapabilityAcornFoxProbe is separate from lifecycle control: it can
+	// observe a runtime-derived loopback address but cannot deploy or mutate.
+	AgentCapabilityAcornFoxProbe = "acornfox.probe.v1"
 )
 
 func (t TaskKind) RequiredCapability() string {
@@ -89,6 +92,12 @@ func (t TaskKind) RequiredCapability() string {
 // restart/rollback/redeploy merely because it supports a single-container
 // task with the same wire kind.
 func RequiredCapabilityForTaskRequest(task TaskRequest) string {
+	if marker, present := acornFoxProbePayloadMarker(task.Parameters); present {
+		if marker == "probe" {
+			return AgentCapabilityAcornFoxProbe
+		}
+		return "acornfox_probe.unknown_payload"
+	}
 	if marker, present := acornFoxPayloadMarker(task.Parameters); present {
 		switch marker {
 		case "deploy", "redeploy", "observe", "restart", "destroy":
@@ -126,6 +135,22 @@ func RequiredCapabilityForTaskRequest(task TaskRequest) string {
 	default:
 		return task.Kind.RequiredCapability()
 	}
+}
+
+func acornFoxProbePayloadMarker(data json.RawMessage) (string, bool) {
+	var object map[string]json.RawMessage
+	if json.NewDecoder(bytes.NewReader(data)).Decode(&object) != nil {
+		return "", false
+	}
+	raw, present := object["acornfox_probe_payload_type"]
+	if !present {
+		return "", false
+	}
+	var marker string
+	if json.Unmarshal(raw, &marker) != nil || strings.TrimSpace(marker) == "" {
+		return "", true
+	}
+	return marker, true
 }
 
 // acornFoxPayloadMarker recognizes only a top-level marker. A nested field

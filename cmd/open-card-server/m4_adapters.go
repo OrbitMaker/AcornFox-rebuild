@@ -665,7 +665,13 @@ func appendM4OutboxTx(ctx context.Context, tx *sql.Tx, event application.Event, 
 // deterministic task+sequence identity. A failed projector can therefore be
 // retried by the Agent without duplicating operational facts.
 func (a *m4PostgresAdapter) ProjectAgentEvidence(ctx context.Context, task postgres.ControllerTask, envelope v1.Envelope) error {
-	if a == nil || a.store == nil || task.DeploymentID.Empty() {
+	if a == nil || task.DeploymentID.Empty() {
+		return nil
+	}
+	if handled, err := a.projectAcornFoxProbeEvidence(ctx, task, envelope); handled || err != nil {
+		return err
+	}
+	if a.store == nil {
 		return nil
 	}
 	switch envelope.Kind {

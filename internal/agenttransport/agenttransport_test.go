@@ -154,6 +154,45 @@ func TestGatewayNegotiatesAndGatesAcornFoxRuntimeOnlyOnCurrentProtocol(t *testin
 	}
 }
 
+func TestGatewayNegotiatesAndGatesAcornFoxProbeOnlyOnCurrentProtocol(t *testing.T) {
+	gateway := NewGateway(nil)
+	fixture := newAgentTLSServer(t, gateway, tls.RequireAndVerifyClientCert)
+	taskFor := func(instanceID, nodeID, taskID string) v1.Envelope {
+		return makeAgentEnvelope(t, instanceID, nodeID, v1.KindTaskRequest, "message-"+taskID, v1.TaskRequest{
+			TaskID: taskID, InstanceID: instanceID, NodeID: nodeID, Kind: v1.TaskObserve, IdempotencyKey: "idem-" + taskID, LeaseID: "lease-" + taskID,
+			Parameters: json.RawMessage(`{"acornfox_probe_payload_type":"probe","request":{}}`), Deadline: time.Now().Add(time.Minute).UTC(),
+		})
+	}
+	missing := testHello("instance-probe-missing", "node-probe-missing", fixture.clientCertificate.SerialNumber.String())
+	status, response := postAgentJSON(t, fixture.client, fixture.server.URL+"/v1/agent/connect", ConnectRequest{Hello: missing, MinVersion: v1.ProtocolVersion, MaxVersion: v1.ProtocolVersion}, &ConnectResponse{})
+	if status != http.StatusOK || !containsCapability(response.(*ConnectResponse).DisabledCapabilities, v1.AgentCapabilityAcornFoxProbe) {
+		t.Fatalf("missing probe capability was not explicit: status=%d response=%#v", status, response)
+	}
+	if _, err := gateway.Enqueue(missing.InstanceID, missing.NodeID, taskFor(missing.InstanceID, missing.NodeID, "probe-missing")); err == nil || !strings.Contains(err.Error(), v1.AgentCapabilityAcornFoxProbe) {
+		t.Fatalf("Agent without probe capability accepted task: %v", err)
+	}
+
+	capable := testHello("instance-probe", "node-probe", fixture.clientCertificate.SerialNumber.String())
+	capable.Capabilities = append(capable.Capabilities, v1.AgentCapabilityAcornFoxProbe)
+	status, response = postAgentJSON(t, fixture.client, fixture.server.URL+"/v1/agent/connect", ConnectRequest{Hello: capable, MinVersion: v1.ProtocolVersion, MaxVersion: v1.ProtocolVersion}, &ConnectResponse{})
+	if status != http.StatusOK || !containsCapability(response.(*ConnectResponse).EnabledCapabilities, v1.AgentCapabilityAcornFoxProbe) {
+		t.Fatalf("probe capability was not negotiated: status=%d response=%#v", status, response)
+	}
+	if cursor, err := gateway.Enqueue(capable.InstanceID, capable.NodeID, taskFor(capable.InstanceID, capable.NodeID, "probe-current")); err != nil || cursor != 1 {
+		t.Fatalf("current capable Agent rejected probe task: cursor=%d err=%v", cursor, err)
+	}
+
+	legacy := testHello("instance-probe-old", "node-probe-old", fixture.clientCertificate.SerialNumber.String())
+	legacy.Capabilities = append(legacy.Capabilities, v1.AgentCapabilityAcornFoxProbe)
+	status, response = postAgentJSON(t, fixture.client, fixture.server.URL+"/v1/agent/connect", ConnectRequest{Hello: legacy, MinVersion: v1.PreviousProtocolVersion, MaxVersion: v1.PreviousProtocolVersion}, &ConnectResponse{})
+	if status != http.StatusOK || containsCapability(response.(*ConnectResponse).EnabledCapabilities, v1.AgentCapabilityAcornFoxProbe) || !containsCapability(response.(*ConnectResponse).DisabledCapabilities, v1.AgentCapabilityAcornFoxProbe) {
+		t.Fatalf("N-1 Agent did not fail closed for probe capability: status=%d response=%#v", status, response)
+	}
+	if _, err := gateway.Enqueue(legacy.InstanceID, legacy.NodeID, taskFor(legacy.InstanceID, legacy.NodeID, "probe-old")); err == nil || !strings.Contains(err.Error(), "protocol cannot accept") {
+		t.Fatalf("probe task silently downgraded to N-1: %v", err)
+	}
+}
+
 func TestGatewayRejectsGroupLogsBeforeDispatchWithoutDedicatedCapability(t *testing.T) {
 	gateway := NewGateway(nil)
 	fixture := newAgentTLSServer(t, gateway, tls.RequireAndVerifyClientCert)

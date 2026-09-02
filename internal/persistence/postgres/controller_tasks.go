@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -8,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
@@ -560,6 +562,10 @@ func (s *Store) StartControllerTask(ctx context.Context, taskID domain.ID, owner
 	if err != nil {
 		return rollback(err)
 	}
+	_, probeTask, err := decodeAcornFoxProbeTaskPayload(task.Payload)
+	if err != nil {
+		return rollback(err)
+	}
 	operation, deploymentID, version, err := loadOperationTx(ctx, tx, task.OperationID, true)
 	if err != nil {
 		return rollback(err)
@@ -573,7 +579,7 @@ func (s *Store) StartControllerTask(ctx context.Context, taskID domain.ID, owner
 			return rollback(err)
 		}
 	}
-	if !deploymentID.Empty() {
+	if !probeTask && !deploymentID.Empty() {
 		deployment, deploymentVersion, err := loadDeploymentTx(ctx, tx, deploymentID, true)
 		if err != nil {
 			return rollback(err)
@@ -652,6 +658,27 @@ func (s *Store) RecordAgentEvent(ctx context.Context, request AgentEventRequest)
 	if err != nil {
 		return rollback(err)
 	}
+	probeRequest, probeTask, err := decodeAcornFoxProbeTaskPayload(task.Payload)
+	if err != nil {
+		return rollback(err)
+	}
+	var operation domain.Operation
+	var deploymentID domain.ID
+	operationLoaded := false
+	var probeObservation *AcornFoxProbeObservation
+	if probeTask && request.Kind == string(v1.KindObservation) {
+		operation, deploymentID, _, err = loadOperationTx(ctx, tx, task.OperationID, false)
+		if err != nil {
+			return rollback(err)
+		}
+		operationLoaded = true
+		result, err := validateAcornFoxProbeAgentObservation(payload, request.TaskID, request.Sequence, deploymentID, probeRequest)
+		if err != nil {
+			return rollback(err)
+		}
+		fact := acornFoxProbeObservationForAgentEvent(request.TaskID, request.Sequence, result, request.Now)
+		probeObservation = &fact
+	}
 	var lastSequence uint64
 	if err := tx.QueryRowContext(ctx, `SELECT last_agent_sequence FROM task_leases WHERE task_id=$1 FOR UPDATE`, request.TaskID.String()).Scan(&lastSequence); err != nil {
 		return rollback(err)
@@ -660,6 +687,11 @@ func (s *Store) RecordAgentEvent(ctx context.Context, request AgentEventRequest)
 		var storedDigest string
 		err := tx.QueryRowContext(ctx, `SELECT event_digest FROM task_agent_events WHERE task_id=$1 AND sequence=$2`, request.TaskID.String(), request.Sequence).Scan(&storedDigest)
 		if err == nil && storedDigest == digest {
+			if probeObservation != nil {
+				if err := verifyAcornFoxProbeObservationReplayTx(ctx, tx, *probeObservation); err != nil {
+					return rollback(err)
+				}
+			}
 			if err := tx.Commit(); err != nil {
 				return AgentEventResult{}, fmt.Errorf("%w: commit agent replay: %v", ErrOutcomeUnknown, err)
 			}
@@ -670,6 +702,12 @@ func (s *Store) RecordAgentEvent(ctx context.Context, request AgentEventRequest)
 	if request.Sequence != lastSequence+1 {
 		return rollback(ErrOutOfOrderAgentEvent)
 	}
+	if !operationLoaded {
+		operation, deploymentID, _, err = loadOperationTx(ctx, tx, task.OperationID, false)
+		if err != nil {
+			return rollback(err)
+		}
+	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO task_agent_events(task_id,sequence,event_type,payload,event_digest,created_at,wire_version,compatibility_report)
 		VALUES ($1,$2,$3,$4::jsonb,$5,$6,$7,$8::jsonb)
@@ -679,11 +717,12 @@ func (s *Store) RecordAgentEvent(ctx context.Context, request AgentEventRequest)
 	if err := execExactlyOneTx(ctx, tx, `UPDATE task_leases SET last_agent_sequence=$1, wire_version=$2, negotiated_capabilities=$3::jsonb, updated_at=$4 WHERE task_id=$5`, request.Sequence, request.WireVersion, disabledCapabilities, request.Now, request.TaskID.String()); err != nil {
 		return rollback(err)
 	}
-	operation, deploymentID, _, err := loadOperationTx(ctx, tx, task.OperationID, false)
-	if err != nil {
-		return rollback(err)
+	if probeObservation != nil {
+		if _, _, err := appendAcornFoxProbeObservationTx(ctx, tx, *probeObservation); err != nil {
+			return rollback(err)
+		}
 	}
-	if request.Kind == "observation" && !deploymentID.Empty() {
+	if request.Kind == "observation" && !probeTask && !deploymentID.Empty() {
 		var wire struct {
 			Healthy bool            `json:"healthy"`
 			At      time.Time       `json:"at"`
@@ -737,6 +776,102 @@ func (s *Store) RecordAgentEvent(ctx context.Context, request AgentEventRequest)
 		return AgentEventResult{}, fmt.Errorf("%w: commit agent event: %v", ErrOutcomeUnknown, err)
 	}
 	return AgentEventResult{Event: event}, nil
+}
+
+// decodeAcornFoxProbeTaskPayload recognizes only the complete marker shape.
+// A top-level probe marker is a security boundary: malformed typed payloads
+// must not fall through to historical runtime-health projection.
+func decodeAcornFoxProbeTaskPayload(payload json.RawMessage) (contracts.AcornFoxProbeRequest, bool, error) {
+	var task struct {
+		Kind       v1.TaskKind     `json:"kind"`
+		Parameters json.RawMessage `json:"parameters"`
+	}
+	if err := decodeControllerTaskJSON(payload, &task); err != nil {
+		return contracts.AcornFoxProbeRequest{}, false, nil
+	}
+	var marker map[string]json.RawMessage
+	if json.Unmarshal(task.Parameters, &marker) != nil {
+		return contracts.AcornFoxProbeRequest{}, false, nil
+	}
+	if _, present := marker["acornfox_probe_payload_type"]; !present {
+		return contracts.AcornFoxProbeRequest{}, false, nil
+	}
+	if task.Kind != v1.TaskObserve {
+		return contracts.AcornFoxProbeRequest{}, true, domain.ValidationError("AcornFox probe task kind is invalid")
+	}
+	var wrapped struct {
+		PayloadType string                         `json:"acornfox_probe_payload_type"`
+		Request     contracts.AcornFoxProbeRequest `json:"request"`
+	}
+	if err := decodeControllerTaskJSON(task.Parameters, &wrapped); err != nil || wrapped.PayloadType != "probe" || wrapped.Request.Validate() != nil {
+		return contracts.AcornFoxProbeRequest{}, true, domain.ValidationError("AcornFox probe task payload is invalid")
+	}
+	return wrapped.Request, true, nil
+}
+
+func validateAcornFoxProbeAgentObservation(payload json.RawMessage, taskID domain.ID, agentSequence uint64, deploymentID domain.ID, request contracts.AcornFoxProbeRequest) (contracts.AcornFoxProbeResult, error) {
+	if deploymentID.Empty() {
+		return contracts.AcornFoxProbeResult{}, domain.ValidationError("AcornFox probe task has no deployment")
+	}
+	expectedDeployment, err := contracts.AcornFoxRuntimeDeploymentID(request.Reference.Fact)
+	if err != nil || expectedDeployment != deploymentID {
+		return contracts.AcornFoxProbeResult{}, domain.ValidationError("AcornFox probe task deployment does not match immutable reference")
+	}
+	var wire v1.Observation
+	if err := decodeControllerTaskJSON(payload, &wire); err != nil || wire.Validate() != nil {
+		return contracts.AcornFoxProbeResult{}, domain.ValidationError("AcornFox probe observation is invalid")
+	}
+	if wire.TaskID != taskID.String() || wire.Sequence != 1 || agentSequence == 0 || wire.Healthy || wire.Status != "unknown" || wire.TargetRef != "deployment/"+deploymentID.String()+"/probe/"+request.Reference.Fact.ServiceName {
+		return contracts.AcornFoxProbeResult{}, domain.ValidationError("AcornFox probe observation identity is invalid")
+	}
+	var result contracts.AcornFoxProbeResult
+	if err := decodeControllerTaskJSON(wire.Details, &result); err != nil || result.Validate() != nil {
+		return contracts.AcornFoxProbeResult{}, domain.ValidationError("AcornFox probe observation details are invalid")
+	}
+	if result.ApplicationID != request.Reference.Fact.ApplicationID || result.EnvironmentID != request.Reference.Fact.EnvironmentID || result.ReleaseID != request.Reference.Fact.ReleaseID || result.DeploymentID != deploymentID || result.ServiceName != request.Reference.Fact.ServiceName || result.Protocol != request.Protocol || result.TargetClass != contracts.AcornFoxProbeTargetClassLoopback {
+		return contracts.AcornFoxProbeResult{}, domain.ValidationError("AcornFox probe observation details do not match durable task")
+	}
+	if wire.At.UTC() != result.ObservedAt.UTC() || len(wire.EvidenceRefs) != 1 || wire.EvidenceRefs[0] != "acornfox-probe:"+result.FactDigest {
+		return contracts.AcornFoxProbeResult{}, domain.ValidationError("AcornFox probe observation evidence does not match durable result")
+	}
+	return result, nil
+}
+
+func acornFoxProbeObservationForAgentEvent(taskID domain.ID, sequence uint64, result contracts.AcornFoxProbeResult, createdAt time.Time) AcornFoxProbeObservation {
+	sampleID := "acornfox-probe:" + taskID.String() + ":" + fmt.Sprint(sequence)
+	return AcornFoxProbeObservation{
+		ID:            "probe_" + strings.TrimPrefix(digestBytes([]byte(sampleID)), "sha256:")[:32],
+		SampleID:      sampleID,
+		TaskID:        taskID.String(),
+		AgentSequence: sequence,
+		ApplicationID: result.ApplicationID.String(),
+		EnvironmentID: result.EnvironmentID.String(),
+		ReleaseID:     result.ReleaseID.String(),
+		DeploymentID:  result.DeploymentID.String(),
+		ServiceName:   result.ServiceName,
+		Protocol:      result.Protocol,
+		TargetClass:   contracts.AcornFoxProbeTargetClassLoopback,
+		Outcome:       result.Outcome,
+		HTTPStatus:    result.HTTPStatus,
+		LatencyMS:     result.LatencyMS,
+		ErrorCode:     result.ErrorCode,
+		ObservedAt:    result.ObservedAt.UTC(),
+		CreatedAt:     createdAt.UTC(),
+		FactDigest:    result.FactDigest,
+	}
+}
+
+func decodeControllerTaskJSON(data []byte, into any) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(into); err != nil {
+		return err
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return errors.New("multiple JSON values")
+	}
+	return nil
 }
 
 func decodeM2GroupTaskSpec(payload json.RawMessage) (contracts.ServiceGroupRuntimeSpec, bool) {
@@ -857,6 +992,10 @@ func (s *Store) FinishControllerTask(ctx context.Context, request FinishControll
 	if task.State != TaskLeased || task.LeaseOwner != strings.TrimSpace(request.Owner) || task.LeaseUntil == nil || !task.LeaseUntil.After(request.Now) {
 		return rollback(ErrLeaseLost)
 	}
+	_, probeTask, err := decodeAcornFoxProbeTaskPayload(task.Payload)
+	if err != nil {
+		return rollback(err)
+	}
 	operation, deploymentID, operationVersion, err := loadOperationTx(ctx, tx, task.OperationID, true)
 	if err != nil {
 		return rollback(err)
@@ -926,7 +1065,7 @@ func (s *Store) FinishControllerTask(ctx context.Context, request FinishControll
 		}
 	}
 	var deployment *domain.Deployment
-	if !deploymentID.Empty() {
+	if !probeTask && !deploymentID.Empty() {
 		value, version, err := loadDeploymentTx(ctx, tx, deploymentID, true)
 		if err != nil {
 			return rollback(err)
@@ -993,7 +1132,7 @@ func (s *Store) FinishControllerTask(ctx context.Context, request FinishControll
 	`, string(taskState), resultDigest, resultPayload, request.Now, task.ID.String()); err != nil {
 		return rollback(err)
 	}
-	if request.Outcome == ControllerTaskSucceeded && request.DeferOperationTerminal && !candidateCleanup {
+	if !probeTask && request.Outcome == ControllerTaskSucceeded && request.DeferOperationTerminal && !candidateCleanup {
 		updated, err := tx.ExecContext(ctx, `UPDATE m4_rollout_coordinations SET phase='candidate_ready',lease_owner=NULL,lease_until=NULL,updated_at=$1 WHERE replacement_task_id=$2 AND operation_id=$3 AND candidate_deployment_id=$4 AND phase='candidate_requested'`, request.Now, task.ID.String(), operation.ID.String(), deploymentID.String())
 		if err != nil {
 			return rollback(err)
@@ -1056,6 +1195,10 @@ func (s *Store) FailControllerTask(ctx context.Context, request FailControllerTa
 	if err != nil {
 		return rollback(err)
 	}
+	_, probeTask, err := decodeAcornFoxProbeTaskPayload(task.Payload)
+	if err != nil {
+		return rollback(err)
+	}
 	operation, deploymentID, version, err := loadOperationTx(ctx, tx, task.OperationID, true)
 	if err != nil {
 		return rollback(err)
@@ -1091,7 +1234,7 @@ func (s *Store) FailControllerTask(ctx context.Context, request FailControllerTa
 		return rollback(err)
 	}
 	var deployment *domain.Deployment
-	if !deploymentID.Empty() && operation.Type != domain.OperationObserve {
+	if !probeTask && !deploymentID.Empty() && operation.Type != domain.OperationObserve {
 		value, deploymentVersion, err := loadDeploymentTx(ctx, tx, deploymentID, true)
 		if err != nil {
 			return rollback(err)
