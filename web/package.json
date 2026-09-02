@@ -8,6 +8,8 @@
     "build": "tsc --noEmit && vite build",
     "build:stub": "VITE_API_MODE=stub VITE_API_BASE_URL=/api/v1 tsc --noEmit && VITE_API_MODE=stub VITE_API_BASE_URL=/api/v1 vite build --mode stub",
     "generate:api": "node scripts/generate-api.mjs",
+    "generate:acornfox-api": "node scripts/generate-acornfox-api.mjs",
+    "check:acornfox-api": "node scripts/generate-acornfox-api.mjs --check",
     "lint": "eslint . --ignore-pattern dist-stub",
     "preview": "vite preview --host 127.0.0.1 --port 4175",
     "test": "vitest run --exclude scripts/live-build-contract.test.mjs",

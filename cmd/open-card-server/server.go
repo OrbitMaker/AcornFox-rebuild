@@ -66,10 +66,14 @@ func (b *eventBroker) subscribe(operationID string) (chan application.Event, fun
 }
 
 type Server struct {
-	controller        *application.Controller
-	releaseController *controllers.ReleaseController
-	m2Controller      *controllers.M2ReleaseController
-	m2Store           interface {
+	controller *application.Controller
+	// legacyRoutesEnabled is intentionally opt-in. A new AcornFox install
+	// exposes only its small /api/v1/acornfox façade; upgraded installations
+	// can enable their historical Open Card routes explicitly during migration.
+	legacyRoutesEnabled bool
+	releaseController   *controllers.ReleaseController
+	m2Controller        *controllers.M2ReleaseController
+	m2Store             interface {
 		GetSourceRevision(context.Context, domain.ID) (domain.SourceRevision, error)
 		GetSourceWorkspaceLifecycle(context.Context, domain.ID) (postgres.WorkspaceLifecycle, error)
 		CreateDeliveryDefinition(context.Context, domain.ApplicationDeliveryDefinition) (domain.ApplicationDeliveryDefinition, error)
@@ -107,6 +111,8 @@ type Server struct {
 	applicationAccessProvider  applicationAccessProvider
 	publishInputStore          publishInputStore
 	applicationPublisher       applicationPublisher
+	acornFoxDeployments        acornFoxDeploymentStore
+	acornFoxDeliveryCommand    acornFoxDeliveryCommand
 	broker                     *eventBroker
 	agentGateway               *agenttransport.Gateway
 	repositoryHealth           interface {
@@ -117,11 +123,26 @@ type Server struct {
 }
 
 func NewServer() *Server {
-	return NewServerWithRepository(application.NewMemoryRepository())
+	// NewServer preserves the historical compatibility constructor for existing
+	// upgraded-install integrations and tests. New product composition must use
+	// NewAcornFoxServer instead.
+	return newServerWithRepository(application.NewMemoryRepository(), true)
 }
 
 func NewServerWithRepository(repository application.Repository) *Server {
-	server := &Server{controller: application.NewController(repository), broker: newEventBroker(), agentGateway: agenttransport.NewStrictGateway(nil), logger: log.Default()}
+	return newServerWithRepository(repository, true)
+}
+
+func NewAcornFoxServer() *Server {
+	return newServerWithRepository(application.NewMemoryRepository(), false)
+}
+
+func NewAcornFoxServerWithRepository(repository application.Repository) *Server {
+	return newServerWithRepository(repository, false)
+}
+
+func newServerWithRepository(repository application.Repository, legacyRoutesEnabled bool) *Server {
+	server := &Server{controller: application.NewController(repository), legacyRoutesEnabled: legacyRoutesEnabled, broker: newEventBroker(), agentGateway: agenttransport.NewStrictGateway(nil), logger: log.Default()}
 	if health, ok := repository.(interface {
 		PingContext(context.Context) error
 	}); ok {
@@ -167,6 +188,10 @@ func (s *Server) SetApplicationAccessProvider(provider applicationAccessProvider
 func (s *Server) SetApplicationPublisher(store publishInputStore, publisher applicationPublisher) {
 	s.publishInputStore, s.applicationPublisher = store, publisher
 }
+func (s *Server) SetAcornFoxDeploymentStore(store acornFoxDeploymentStore) {
+	s.acornFoxDeployments = store
+}
+func (s *Server) SetLegacyRoutesEnabled(enabled bool)   { s.legacyRoutesEnabled = enabled }
 func (s *Server) Handler() http.Handler                 { return http.HandlerFunc(s.serveHTTP) }
 func (s *Server) AgentGateway() *agenttransport.Gateway { return s.agentGateway }
 func (s *Server) HTTPServer(addr string) *http.Server {
@@ -186,7 +211,14 @@ func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
 		s.handleHealth(writer, request, request.URL.Path == "/readyz")
 		return
 	}
-	if isAuthRoute(request.URL.Path) && strings.HasPrefix(request.URL.Path, apiPrefix) {
+	// A clean install exposes no legacy API path, including unauthenticated
+	// aliases. Reject before session authentication so route discovery does not
+	// turn a known-absent route into an authentication-dependent response.
+	if !s.legacyRoutesEnabled && strings.HasPrefix(request.URL.Path, apiPrefix) && !strings.HasPrefix(request.URL.Path, "/api/v1/acornfox/") {
+		writeJSONError(writer, http.StatusNotFound, "not_found", "route not found")
+		return
+	}
+	if s.legacyRoutesEnabled && isAuthRoute(request.URL.Path) && strings.HasPrefix(request.URL.Path, apiPrefix) {
 		version, disabled, err := negotiateAPIRequest(request)
 		if err != nil {
 			writeJSONError(writer, http.StatusUpgradeRequired, "api_version_incompatible", err.Error())
@@ -206,11 +238,24 @@ func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
 		authHTTPError(writer, http.StatusServiceUnavailable, "authentication unavailable")
 		return
 	}
-	var authenticated bool
-	if request, authenticated = s.authenticateControlPlane(writer, request); !authenticated {
+	if isAcornFoxAuthRoute(request.URL.Path) {
+		if s.auth != nil && s.auth.HandleAcornFox(writer, request) {
+			return
+		}
+		authNoStore(writer)
+		authHTTPError(writer, http.StatusServiceUnavailable, "authentication unavailable")
 		return
 	}
-	if strings.HasPrefix(request.URL.Path, apiPrefix) {
+	var authenticated bool
+	if strings.HasPrefix(request.URL.Path, "/api/v1/acornfox/") {
+		request, authenticated = s.authenticateAcornFoxControlPlane(writer, request)
+	} else {
+		request, authenticated = s.authenticateControlPlane(writer, request)
+	}
+	if !authenticated {
+		return
+	}
+	if strings.HasPrefix(request.URL.Path, apiPrefix) && s.legacyRoutesEnabled {
 		version, disabled, err := negotiateAPIRequest(request)
 		if err != nil {
 			writeJSONError(writer, http.StatusUpgradeRequired, "api_version_incompatible", err.Error())
@@ -222,9 +267,20 @@ func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
 		}
 		request = withAPIVersion(request, version)
 	}
+	if s.handleAcornFoxAPI(writer, request) {
+		return
+	}
 	if request.Method == http.MethodOptions {
+		if strings.HasPrefix(request.URL.Path, apiPrefix) && !s.legacyRoutesEnabled {
+			writeJSONError(writer, http.StatusNotFound, "not_found", "route not found")
+			return
+		}
 		writer.Header().Set("Allow", "GET, POST, OPTIONS")
 		writer.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if strings.HasPrefix(request.URL.Path, apiPrefix) && !s.legacyRoutesEnabled {
+		writeJSONError(writer, http.StatusNotFound, "not_found", "route not found")
 		return
 	}
 	switch request.URL.Path {

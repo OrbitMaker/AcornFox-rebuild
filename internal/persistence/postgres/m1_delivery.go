@@ -26,6 +26,9 @@ const m1BuildPlanIdempotencyScope = "m1.build_plan"
 
 var ErrBuildNotSuccessful = errors.New("release requires successful persistent artifacts")
 var ErrPublishPreviouslyFailed = errors.New("publish request previously failed")
+var ErrAcornFoxPublishAbandoned = errors.New("AcornFox publish request was abandoned")
+
+const acornFoxPublishAbandonedReason = "AcornFox delivery did not reach durable task commit before its recovery lease expired"
 
 func (s *Store) ReplayPublish(ctx context.Context, key, requestDigest string) (json.RawMessage, bool, error) {
 	if err := s.requireDB(); err != nil {
@@ -51,7 +54,7 @@ func (s *Store) ReplayPublish(ctx context.Context, key, requestDigest string) (j
 		}
 		return append(json.RawMessage(nil), response...), true, nil
 	case "failed":
-		return nil, false, fmt.Errorf("%w: %s", ErrPublishPreviouslyFailed, failure.String)
+		return nil, false, publishFailureError(key, failure.String)
 	default:
 		return nil, false, ErrIdempotencyInProgress
 	}
@@ -106,10 +109,88 @@ func (s *Store) ReservePublish(ctx context.Context, key, requestDigest string, n
 		}
 		return append(json.RawMessage(nil), response...), true, nil
 	case "failed":
-		return rollback(fmt.Errorf("%w: %s", ErrPublishPreviouslyFailed, failure.String))
+		return rollback(publishFailureError(key, failure.String))
 	default:
 		return rollback(ErrIdempotencyInProgress)
 	}
+}
+
+// AbandonExpiredAcornFoxPublish is deliberately namespaced to new AcornFox
+// commands. A process that dies before it can durably queue its Agent task
+// must not leave that idempotency key in_progress forever, nor may a retry
+// rebuild or enqueue the same command a second time. Legacy M1 publish rows
+// retain their existing semantics.
+func (s *Store) AbandonExpiredAcornFoxPublish(ctx context.Context, key, requestDigest string, now time.Time, lease time.Duration) error {
+	if err := s.requireDB(); err != nil {
+		return err
+	}
+	key, requestDigest = strings.TrimSpace(key), strings.TrimSpace(requestDigest)
+	if !strings.HasPrefix(key, "acornfox:") || !strings.HasPrefix(requestDigest, "sha256:") || lease <= 0 {
+		return domain.ValidationError("AcornFox publish recovery request is invalid")
+	}
+	if now.IsZero() {
+		now = s.now()
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	rollback := func(cause error) error { return rollbackTx(tx, cause) }
+	var storedDigest, status string
+	var updatedAt time.Time
+	var failure sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT request_digest,status,updated_at,failure_reason FROM m1_publish_requests WHERE idempotency_key=$1 FOR UPDATE`, key).Scan(&storedDigest, &status, &updatedAt, &failure); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return rollback(ErrNotFound)
+		}
+		return rollback(err)
+	}
+	if storedDigest != requestDigest {
+		return rollback(ErrIdempotencyConflict)
+	}
+	switch status {
+	case "completed":
+		return rollback(ErrOutcomeUnknown)
+	case "failed":
+		return rollback(publishFailureError(key, failure.String))
+	case "in_progress":
+		if updatedAt.After(now.UTC().Add(-lease)) {
+			return rollback(ErrIdempotencyInProgress)
+		}
+		result, err := tx.ExecContext(ctx, `UPDATE m1_publish_requests SET status='failed',failure_reason=$1,response=NULL,updated_at=$2 WHERE idempotency_key=$3 AND request_digest=$4 AND status='in_progress'`, acornFoxPublishAbandonedReason, now.UTC(), key, requestDigest)
+		if err != nil {
+			return rollback(err)
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return rollback(err)
+		}
+		if rows != 1 {
+			return rollback(ErrOutcomeUnknown)
+		}
+		// A create command has a deterministic build-plan idempotency key. If
+		// the process died after the provider returned but before build
+		// completion was persisted, do not leave that build running forever.
+		// Completed builds/releases are immutable evidence and are not changed.
+		if strings.HasPrefix(key, "acornfox:create:") {
+			if _, err := tx.ExecContext(ctx, `UPDATE builds SET state='failed',failure_reason=$1,version=version+1,updated_at=$2 WHERE state IN ('pending','running') AND plan_id IN (SELECT id FROM build_plans WHERE idempotency_key=$3)`, acornFoxPublishAbandonedReason, now.UTC(), key+":build"); err != nil {
+				return rollback(err)
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("%w: commit abandoned AcornFox publish: %v", ErrOutcomeUnknown, err)
+		}
+		return ErrAcornFoxPublishAbandoned
+	default:
+		return rollback(ErrOutcomeUnknown)
+	}
+}
+
+func publishFailureError(key, reason string) error {
+	if strings.HasPrefix(strings.TrimSpace(key), "acornfox:") && strings.TrimSpace(reason) == acornFoxPublishAbandonedReason {
+		return ErrAcornFoxPublishAbandoned
+	}
+	return fmt.Errorf("%w: %s", ErrPublishPreviouslyFailed, reason)
 }
 
 func (s *Store) CompletePublish(ctx context.Context, key, requestDigest string, response json.RawMessage, now time.Time) error {
@@ -144,8 +225,18 @@ func (s *Store) FailPublish(ctx context.Context, key, requestDigest, reason stri
 	if now.IsZero() {
 		now = s.now()
 	}
-	_, err := s.db.ExecContext(ctx, `UPDATE m1_publish_requests SET status='failed',failure_reason=$1,response=NULL,updated_at=$2 WHERE idempotency_key=$3 AND request_digest=$4 AND status='in_progress'`, reason, now.UTC(), key, requestDigest)
-	return err
+	result, err := s.db.ExecContext(ctx, `UPDATE m1_publish_requests SET status='failed',failure_reason=$1,response=NULL,updated_at=$2 WHERE idempotency_key=$3 AND request_digest=$4 AND status='in_progress'`, reason, now.UTC(), key, requestDigest)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows != 1 {
+		return ErrOutcomeUnknown
+	}
+	return nil
 }
 
 type DeploymentEndpoint struct {

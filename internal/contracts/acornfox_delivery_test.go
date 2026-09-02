@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -181,6 +183,64 @@ func TestCurrentDocumentedOpenAPIFailsTheFutureCleanInstallLeakageGuard(t *testi
 	for _, required := range []string{"/api/v1/applications/{applicationId}/operations", "/api/v1/operations/views/{applicationId}", "/api/v1/operations/{action}", "/api/v1/access/traffic-switches", "/api/v1/service-groups/{serviceGroupId}/releases"} {
 		if !containsPath(paths, required) {
 			t.Fatalf("documented OpenAPI inventory lost known route %q", required)
+		}
+	}
+}
+
+func TestAcornFoxStandaloneOpenAPIUsesExactCleanRouteInventory(t *testing.T) {
+	path := filepath.Join("..", "..", "api", "openapi", "acornfox.yaml")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read standalone AcornFox OpenAPI: %v", err)
+	}
+	paths := InventoryOpenAPIPaths(string(raw))
+	if err := ValidateAcornFoxCleanInstallRoutes(paths); err != nil {
+		t.Fatalf("standalone AcornFox OpenAPI leaked migration route: %v", err)
+	}
+	want := AcornFoxPublicRouteInventory()
+	sort.Strings(want)
+	if !reflect.DeepEqual(paths, want) {
+		t.Fatalf("standalone OpenAPI routes=%v want=%v", paths, want)
+	}
+	methods := InventoryOpenAPIRouteMethods(string(raw))
+	wantMethods := make(map[string][]string)
+	for _, route := range AcornFoxPublicRouteMethodInventory() {
+		wantMethods[route.Path] = route.Methods
+	}
+	if !reflect.DeepEqual(methods, wantMethods) {
+		t.Fatalf("standalone OpenAPI route methods=%v want=%v", methods, wantMethods)
+	}
+	for _, required := range []string{
+		"__Host-acornfox_session", "X-AcornFox-CSRF", "AuthLoginRequest:", "AuthPasswordRequest:",
+		"CreateApplicationRequest:", "CreateDeliveryRequest:", "DeliveryCommandResponse:", "Error:",
+		"requestBody:", "IdempotencyKey:", "AuthenticationFailed:", "ValidationFailed:",
+		"container_port: {type: integer, minimum: 0, maximum: 65535}",
+	} {
+		if !strings.Contains(string(raw), required) {
+			t.Fatalf("standalone OpenAPI misses typed contract %q", required)
+		}
+	}
+}
+
+func TestAcornFoxPublicArtifactsDoNotExposeOpenCardIdentifiers(t *testing.T) {
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("locate repository fixture")
+	}
+	repositoryRoot := filepath.Join(filepath.Dir(file), "..", "..")
+	for _, path := range []string{
+		filepath.Join(repositoryRoot, "cmd", "open-card-server", "main.go"),
+		filepath.Join(repositoryRoot, "api", "openapi", "acornfox.yaml"),
+		filepath.Join(repositoryRoot, "web", "src", "api", "acornfox-generated-schema.ts"),
+	} {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read AcornFox public artifact %s: %v", path, err)
+		}
+		for _, forbidden := range []string{"open-card.local", "Open Card"} {
+			if strings.Contains(string(raw), forbidden) {
+				t.Fatalf("AcornFox public artifact %s exposes %q", path, forbidden)
+			}
 		}
 	}
 }

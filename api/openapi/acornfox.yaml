@@ -1,0 +1,306 @@
+openapi: 3.0.3
+info:
+  title: AcornFox API
+  version: 1.0.0
+  description: Clean-install single-service delivery API. Runtime and response observations are facts, not health or public-reachability claims.
+paths:
+  /api/v1/acornfox/auth/login:
+    post:
+      operationId: loginAcornFoxAdministrator
+      security: []
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/AuthLoginRequest'}}}}
+      responses:
+        '200': {description: Administrator session created, headers: {Set-Cookie: {schema: {type: string}}}, content: {application/json: {schema: {$ref: '#/components/schemas/AuthSessionResponse'}}}}
+        '400': {$ref: '#/components/responses/InvalidRequest'}
+        '401': {$ref: '#/components/responses/AuthenticationFailed'}
+        '429': {$ref: '#/components/responses/AuthenticationFailed'}
+        '503': {$ref: '#/components/responses/AuthenticationUnavailable'}
+  /api/v1/acornfox/auth/logout:
+    post:
+      operationId: logoutAcornFoxAdministrator
+      security: [{AdministratorSession: []}]
+      parameters: [{$ref: '#/components/parameters/CSRFToken'}]
+      responses:
+        '204': {description: Administrator session and CSRF cookies cleared.}
+        '401': {$ref: '#/components/responses/AuthenticationFailed'}
+        '503': {$ref: '#/components/responses/AuthenticationUnavailable'}
+  /api/v1/acornfox/auth/session:
+    get:
+      operationId: getAcornFoxAdministratorSession
+      security: [{AdministratorSession: []}]
+      responses:
+        '200': {description: Current administrator session, content: {application/json: {schema: {$ref: '#/components/schemas/AuthSessionResponse'}}}}
+        '401': {$ref: '#/components/responses/AuthenticationFailed'}
+        '503': {$ref: '#/components/responses/AuthenticationUnavailable'}
+  /api/v1/acornfox/auth/password:
+    post:
+      operationId: rotateAcornFoxAdministratorPassword
+      security: [{AdministratorSession: []}]
+      parameters: [{$ref: '#/components/parameters/CSRFToken'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/AuthPasswordRequest'}}}}
+      responses:
+        '204': {description: Password changed; current session and CSRF cookies cleared.}
+        '400': {$ref: '#/components/responses/InvalidRequest'}
+        '401': {$ref: '#/components/responses/AuthenticationFailed'}
+        '503': {$ref: '#/components/responses/AuthenticationUnavailable'}
+  /api/v1/acornfox/apps:
+    get:
+      operationId: listAcornFoxApps
+      security: [{AdministratorSession: []}]
+      responses:
+        '200': {description: Application list, content: {application/json: {schema: {$ref: '#/components/schemas/ApplicationListResponse'}}}}
+        '401': {$ref: '#/components/responses/AuthenticationFailed'}
+        '503': {$ref: '#/components/responses/TemporarilyUnavailable'}
+    post:
+      operationId: createAcornFoxApp
+      security: [{AdministratorSession: []}]
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}, {$ref: '#/components/parameters/CSRFToken'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/CreateApplicationRequest'}}}}
+      responses:
+        '201': {description: Application and immutable public-Git source accepted, content: {application/json: {schema: {$ref: '#/components/schemas/CreateApplicationResponse'}}}}
+        '400': {$ref: '#/components/responses/InvalidRequest'}
+        '401': {$ref: '#/components/responses/AuthenticationFailed'}
+        '409': {$ref: '#/components/responses/IdempotencyConflict'}
+        '422': {$ref: '#/components/responses/ValidationFailed'}
+        '503': {$ref: '#/components/responses/TemporarilyUnavailable'}
+  /api/v1/acornfox/apps/{applicationId}:
+    parameters: [{$ref: '#/components/parameters/ApplicationId'}]
+    get:
+      operationId: getAcornFoxApp
+      security: [{AdministratorSession: []}]
+      responses:
+        '200': {description: Application, content: {application/json: {schema: {$ref: '#/components/schemas/Application'}}}}
+        '401': {$ref: '#/components/responses/AuthenticationFailed'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/TemporarilyUnavailable'}
+  /api/v1/acornfox/apps/{applicationId}/sources/{sourceRevisionId}:
+    parameters: [{$ref: '#/components/parameters/ApplicationId'}, {$ref: '#/components/parameters/SourceRevisionId'}]
+    get:
+      operationId: getAcornFoxSourceRevision
+      security: [{AdministratorSession: []}]
+      responses:
+        '200': {description: Redacted immutable input revision, content: {application/json: {schema: {$ref: '#/components/schemas/SourceRevision'}}}}
+        '401': {$ref: '#/components/responses/AuthenticationFailed'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/TemporarilyUnavailable'}
+  /api/v1/acornfox/apps/{applicationId}/deliveries:
+    parameters: [{$ref: '#/components/parameters/ApplicationId'}]
+    post:
+      operationId: createAcornFoxDelivery
+      security: [{AdministratorSession: []}]
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}, {$ref: '#/components/parameters/CSRFToken'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/CreateDeliveryRequest'}}}}
+      responses:
+        '202': {description: Delivery work accepted; later facts determine outcome, content: {application/json: {schema: {$ref: '#/components/schemas/DeliveryCommandResponse'}}}}
+        '400': {$ref: '#/components/responses/InvalidRequest'}
+        '401': {$ref: '#/components/responses/AuthenticationFailed'}
+        '409': {$ref: '#/components/responses/IdempotencyConflict'}
+        '422': {$ref: '#/components/responses/ValidationFailed'}
+        '503': {$ref: '#/components/responses/TemporarilyUnavailable'}
+  /api/v1/acornfox/apps/{applicationId}/deliveries/{deploymentId}:
+    parameters: [{$ref: '#/components/parameters/ApplicationId'}, {$ref: '#/components/parameters/DeploymentId'}]
+    get:
+      operationId: getAcornFoxDeliveryStatus
+      security: [{AdministratorSession: []}]
+      responses:
+        '200': {description: Desired runtime and response facts; null means no fact was persisted, content: {application/json: {schema: {$ref: '#/components/schemas/DeliveryStatusResponse'}}}}
+        '401': {$ref: '#/components/responses/AuthenticationFailed'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/TemporarilyUnavailable'}
+  /api/v1/acornfox/apps/{applicationId}/deliveries/{deploymentId}/restart:
+    parameters: [{$ref: '#/components/parameters/ApplicationId'}, {$ref: '#/components/parameters/DeploymentId'}]
+    post:
+      operationId: restartAcornFoxDelivery
+      security: [{AdministratorSession: []}]
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}, {$ref: '#/components/parameters/CSRFToken'}]
+      requestBody: {required: false, content: {application/json: {schema: {$ref: '#/components/schemas/EmptyRequest'}}}}
+      responses:
+        '202': {description: Restart work accepted, content: {application/json: {schema: {$ref: '#/components/schemas/DeliveryCommandResponse'}}}}
+        '400': {$ref: '#/components/responses/InvalidRequest'}
+        '401': {$ref: '#/components/responses/AuthenticationFailed'}
+        '409': {$ref: '#/components/responses/IdempotencyConflict'}
+        '422': {$ref: '#/components/responses/ValidationFailed'}
+        '503': {$ref: '#/components/responses/TemporarilyUnavailable'}
+  /api/v1/acornfox/apps/{applicationId}/deliveries/{deploymentId}/redeploy:
+    parameters: [{$ref: '#/components/parameters/ApplicationId'}, {$ref: '#/components/parameters/DeploymentId'}]
+    post:
+      operationId: redeployAcornFoxDelivery
+      security: [{AdministratorSession: []}]
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}, {$ref: '#/components/parameters/CSRFToken'}]
+      requestBody: {required: false, content: {application/json: {schema: {$ref: '#/components/schemas/EmptyRequest'}}}}
+      responses:
+        '202': {description: Recreate work accepted, content: {application/json: {schema: {$ref: '#/components/schemas/DeliveryCommandResponse'}}}}
+        '400': {$ref: '#/components/responses/InvalidRequest'}
+        '401': {$ref: '#/components/responses/AuthenticationFailed'}
+        '409': {$ref: '#/components/responses/IdempotencyConflict'}
+        '422': {$ref: '#/components/responses/ValidationFailed'}
+        '503': {$ref: '#/components/responses/TemporarilyUnavailable'}
+  /api/v1/acornfox/apps/{applicationId}/deliveries/{deploymentId}/probes:
+    parameters: [{$ref: '#/components/parameters/ApplicationId'}, {$ref: '#/components/parameters/DeploymentId'}]
+    post:
+      operationId: probeAcornFoxDeliveryOnce
+      security: [{AdministratorSession: []}]
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}, {$ref: '#/components/parameters/CSRFToken'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/ProbeDeliveryRequest'}}}}
+      responses:
+        '202': {description: One caller-requested loopback response probe accepted, content: {application/json: {schema: {$ref: '#/components/schemas/DeliveryCommandResponse'}}}}
+        '400': {$ref: '#/components/responses/InvalidRequest'}
+        '401': {$ref: '#/components/responses/AuthenticationFailed'}
+        '409': {$ref: '#/components/responses/IdempotencyConflict'}
+        '422': {$ref: '#/components/responses/ValidationFailed'}
+        '503': {$ref: '#/components/responses/TemporarilyUnavailable'}
+components:
+  securitySchemes:
+    AdministratorSession:
+      type: apiKey
+      in: cookie
+      name: __Host-acornfox_session
+      description: Secure HttpOnly SameSite=Strict administrator session cookie.
+  parameters:
+    ApplicationId: {name: applicationId, in: path, required: true, schema: {type: string, minLength: 1}}
+    SourceRevisionId: {name: sourceRevisionId, in: path, required: true, schema: {type: string, minLength: 1}}
+    DeploymentId: {name: deploymentId, in: path, required: true, schema: {type: string, minLength: 1}}
+    IdempotencyKey: {name: Idempotency-Key, in: header, required: true, schema: {type: string, minLength: 1}}
+    CSRFToken:
+      name: X-AcornFox-CSRF
+      in: header
+      required: true
+      schema: {type: string, minLength: 1}
+      description: Must equal the non-HttpOnly __Host-acornfox_csrf cookie and use the allowed Origin.
+  responses:
+    InvalidRequest: {description: Request JSON content type or body shape is invalid, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+    AuthenticationFailed: {description: Authentication origin CSRF or session validation failed, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+    AuthenticationUnavailable: {description: Authentication persistence is temporarily unavailable, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+    NotFound: {description: Resource or exact route was not found, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+    IdempotencyConflict: {description: Idempotency key conflicts with prior input or accepted work, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+    ValidationFailed: {description: Request is syntactically valid but violates an AcornFox boundary, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+    TemporarilyUnavailable: {description: Capability dependency or persisted readback is temporarily unavailable, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+  schemas:
+    Error:
+      type: object
+      required: [code, message]
+      additionalProperties: false
+      properties: {code: {type: string}, message: {type: string}}
+    AuthLoginRequest:
+      type: object
+      required: [password]
+      additionalProperties: false
+      properties: {password: {type: string, minLength: 1}}
+    AuthPasswordRequest:
+      type: object
+      required: [current_password, new_password]
+      additionalProperties: false
+      properties: {current_password: {type: string, minLength: 1}, new_password: {type: string, minLength: 1}}
+    AuthSessionResponse:
+      type: object
+      required: [authenticated, idle_expires_at, absolute_expires_at]
+      additionalProperties: false
+      properties: {authenticated: {type: boolean}, idle_expires_at: {type: string, format: date-time}, absolute_expires_at: {type: string, format: date-time}}
+    Application:
+      type: object
+      required: [id, name, created_at, updated_at]
+      additionalProperties: false
+      properties: {id: {type: string}, name: {type: string}, created_at: {type: string, format: date-time}, updated_at: {type: string, format: date-time}}
+    ApplicationListResponse:
+      type: object
+      required: [items]
+      additionalProperties: false
+      properties: {items: {type: array, items: {$ref: '#/components/schemas/Application'}}}
+    CreateApplicationRequest:
+      type: object
+      required: [name, source]
+      additionalProperties: false
+      properties:
+        name: {type: string, minLength: 1}
+        source:
+          type: object
+          required: [type, repository_url, ref]
+          additionalProperties: false
+          properties: {type: {type: string, enum: [public_git]}, repository_url: {type: string, format: uri}, ref: {type: string}}
+    CreateApplicationResponse:
+      type: object
+      required: [application, source_revision_id, operation_id]
+      additionalProperties: false
+      properties: {application: {$ref: '#/components/schemas/Application'}, source_revision_id: {type: string}, operation_id: {type: string}}
+    SourceRevision:
+      type: object
+      required: [id, application_id, kind, locator_sha256, content_digest, created_at, immutable]
+      additionalProperties: false
+      properties: {id: {type: string}, application_id: {type: string}, kind: {type: string}, locator_sha256: {type: string}, ref: {type: string}, commit: {type: string}, content_digest: {type: string}, created_at: {type: string, format: date-time}, immutable: {type: boolean}}
+    CreateDeliveryRequest:
+      type: object
+      required: [source_revision_id]
+      additionalProperties: false
+      properties: {source_revision_id: {type: string, minLength: 1}, container_port: {type: integer, minimum: 0, maximum: 65535}}
+    EmptyRequest: {type: object, additionalProperties: false, maxProperties: 0}
+    DeliveryCommandResponse:
+      type: object
+      required: [deployment_id, operation_id, task_id, status]
+      additionalProperties: false
+      properties: {deployment_id: {type: string}, operation_id: {type: string}, task_id: {type: string}, status: {type: string}}
+    ImageDigest:
+      type: object
+      required: [repository, digest]
+      additionalProperties: false
+      properties: {repository: {type: string}, digest: {type: string}}
+    RuntimeRequestedResources:
+      type: object
+      required: [cpu_millis, memory_bytes, pids, disk_reservation_bytes]
+      additionalProperties: false
+      properties: {cpu_millis: {type: integer, format: int64}, memory_bytes: {type: integer, format: int64}, pids: {type: integer, format: int64}, disk_reservation_bytes: {type: integer, format: int64}}
+    RuntimeReleaseFact:
+      type: object
+      required: [application_id, environment_id, release_id, service_name, image, resources, accepted_at, immutable]
+      additionalProperties: false
+      properties: {application_id: {type: string}, environment_id: {type: string}, release_id: {type: string}, service_name: {type: string}, image: {$ref: '#/components/schemas/ImageDigest'}, resources: {$ref: '#/components/schemas/RuntimeRequestedResources'}, container_port: {type: integer}, accepted_at: {type: string, format: date-time}, immutable: {type: boolean}}
+    RuntimeAppliedLimits:
+      type: object
+      required: [cpu_millis, memory_bytes, pids]
+      additionalProperties: false
+      properties: {cpu_millis: {type: integer, format: int64}, memory_bytes: {type: integer, format: int64}, pids: {type: integer, format: int64}}
+    RuntimeDiskFact:
+      type: object
+      required: [reservation_bytes, accounting_reconciled, per_container_enforced]
+      additionalProperties: false
+      properties: {reservation_bytes: {type: integer, format: int64}, accounting_reconciled: {type: boolean}, per_container_enforced: {type: boolean}}
+    RuntimeObservation:
+      type: object
+      required: [deployment_id, service_name, runtime_state, restart_count, requested_resources, applied_limits, disk, observed_at]
+      additionalProperties: false
+      properties: {deployment_id: {type: string}, service_name: {type: string}, container_id: {type: string}, runtime_state: {type: string}, restart_count: {type: integer, format: int64}, internal_address: {type: string}, requested_resources: {$ref: '#/components/schemas/RuntimeRequestedResources'}, applied_limits: {$ref: '#/components/schemas/RuntimeAppliedLimits'}, disk: {$ref: '#/components/schemas/RuntimeDiskFact'}, observed_at: {type: string, format: date-time}}
+    DeliveryStatusResponse:
+      type: object
+      required: [deployment, desired, runtime, response]
+      additionalProperties: false
+      properties:
+        deployment: {$ref: '#/components/schemas/DeploymentRuntimeState'}
+        desired:
+          type: object
+          nullable: true
+          allOf:
+            - {$ref: '#/components/schemas/RuntimeReleaseFact'}
+        runtime:
+          type: object
+          nullable: true
+          allOf:
+            - {$ref: '#/components/schemas/RuntimeObservation'}
+        response:
+          type: object
+          nullable: true
+          allOf:
+            - {$ref: '#/components/schemas/ProbeResponseFact'}
+    DeploymentRuntimeState:
+      type: object
+      required: [id, application_id, environment_id, release_id, stage, created_at, updated_at]
+      additionalProperties: false
+      properties: {id: {type: string}, application_id: {type: string}, environment_id: {type: string}, release_id: {type: string}, stage: {type: string, enum: [starting, runtime_observed, failed, unknown]}, created_at: {type: string, format: date-time}, updated_at: {type: string, format: date-time}}
+    ProbeDeliveryRequest:
+      type: object
+      required: [protocol]
+      additionalProperties: false
+      properties: {protocol: {type: string, enum: [tcp, http]}, path: {type: string}}
+    ProbeResponseFact:
+      type: object
+      required: [protocol, outcome, observed_at, fact_digest]
+      additionalProperties: false
+      properties: {protocol: {type: string, enum: [tcp, http]}, outcome: {type: string}, http_status: {type: integer, nullable: true}, latency_ms: {type: integer, format: int64}, error_code: {type: string}, observed_at: {type: string, format: date-time}, fact_digest: {type: string}}

@@ -39,6 +39,14 @@ func controlPlaneOperator(request *http.Request) bool {
 }
 
 func (s *Server) authenticateControlPlane(writer http.ResponseWriter, request *http.Request) (*http.Request, bool) {
+	return s.authenticateControlPlaneWithAuth(writer, request, legacyAuthRouteConfig)
+}
+
+func (s *Server) authenticateAcornFoxControlPlane(writer http.ResponseWriter, request *http.Request) (*http.Request, bool) {
+	return s.authenticateControlPlaneWithAuth(writer, request, acornFoxAuthRouteConfig)
+}
+
+func (s *Server) authenticateControlPlaneWithAuth(writer http.ResponseWriter, request *http.Request, config authRouteConfig) (*http.Request, bool) {
 	authNoStore(writer)
 	if s.auth == nil || s.auth.Service == nil {
 		authHTTPError(writer, http.StatusServiceUnavailable, "authentication unavailable")
@@ -47,9 +55,9 @@ func (s *Server) authenticateControlPlane(writer http.ResponseWriter, request *h
 	var session domain.AdminSession
 	var err error
 	if controlPlaneUnsafeMethod(request.Method) {
-		session, err = s.auth.Service.AuthorizeControlPlaneWrite(request.Context(), request.Header.Get("Origin"), authCookie(request, authSessionCookie), authCSRF(request))
+		session, err = s.auth.Service.AuthorizeControlPlaneWrite(request.Context(), request.Header.Get("Origin"), authCookie(request, config.sessionCookie), authCSRFFor(request, config))
 	} else {
-		_, session, err = s.auth.Service.Session(request.Context(), authCookie(request, authSessionCookie))
+		_, session, err = s.auth.Service.Session(request.Context(), authCookie(request, config.sessionCookie))
 	}
 	if err != nil {
 		if errors.Is(err, auth.ErrAuthenticationUnavailable) {
@@ -60,7 +68,7 @@ func (s *Server) authenticateControlPlane(writer http.ResponseWriter, request *h
 			authHTTPError(writer, http.StatusUnauthorized, "authentication failed")
 			return nil, false
 		}
-		clearAuthCookies(writer)
+		clearAuthCookies(writer, config)
 		authHTTPError(writer, http.StatusUnauthorized, "authentication failed")
 		return nil, false
 	}
@@ -77,3 +85,5 @@ func controlPlaneUnsafeMethod(method string) bool {
 }
 
 func isAuthRoute(path string) bool { return strings.HasPrefix(path, authAPIBase) }
+
+func isAcornFoxAuthRoute(path string) bool { return strings.HasPrefix(path, acornFoxAuthAPIBase) }

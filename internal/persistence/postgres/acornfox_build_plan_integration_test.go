@@ -88,6 +88,41 @@ func TestAcornFoxBuildPlanBindingRoundTripsOnTaskScopedPostgres(t *testing.T) {
 		t.Fatalf("changed durable network policy replay err=%v, want idempotency conflict", err)
 	}
 
+	// A clean AcornFox single-service release has no service-group fact. The
+	// migrated schema reserves the literal legacy value as the pre-M2 no-group
+	// representation; it must not require or create a service_groups row.
+	definition := domain.ApplicationDeliveryDefinition{ID: "def_afb_legacy", ApplicationID: "app_afb_build", SourceRevisionID: source, Version: 1, Facts: map[string]domain.FieldFact{}, CreatedAt: now, Immutable: true}
+	if _, err := store.CreateDeliveryDefinition(ctx, definition); err != nil {
+		t.Fatalf("create AcornFox definition: %v", err)
+	}
+	build := domain.Build{ID: "build_afb_legacy", PlanID: bound.ID, Status: domain.BuildPending, CreatedAt: now, UpdatedAt: now}
+	if _, err := store.CreateBuild(ctx, build); err != nil {
+		t.Fatalf("create AcornFox build: %v", err)
+	}
+	if _, err := store.StartBuild(ctx, build.ID, now); err != nil {
+		t.Fatalf("start AcornFox build: %v", err)
+	}
+	image, err := domain.ParseImageDigest("registry.example/acornfox", "sha256:"+strings.Repeat("e", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact := domain.Artifact{ID: "artifact_afb_legacy", BuildID: build.ID, Image: image, OCIStorageRef: "oci://acornfox/legacy", SizeBytes: 1, Evidence: []domain.EvidenceRef{{ID: "evidence_afb_legacy", Kind: "build"}}, CreatedAt: now}
+	release, err := domain.NewRelease("app_afb_build", "legacy", 1, "sha256:"+strings.Repeat("f", 64), map[string]domain.ImageDigest{"web": image}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release.ID = "rel_afb_legacy"
+	if _, err := store.CompleteBuild(ctx, artifact, &ReleaseCreation{Release: *release, DefinitionID: definition.ID}, now); err != nil {
+		t.Fatalf("complete AcornFox legacy release: %v", err)
+	}
+	if loaded, err := store.GetCompleteRelease(ctx, release.ID); err != nil || loaded.ServiceGroupID != "legacy" {
+		t.Fatalf("legacy no-group release=%+v err=%v", loaded, err)
+	}
+	var groups int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM service_groups WHERE id='legacy'`).Scan(&groups); err != nil || groups != 0 {
+		t.Fatalf("legacy sentinel unexpectedly needs service-group row count=%d err=%v", groups, err)
+	}
+
 	var legacyDefinition, legacyDockerfile, legacyMode, legacyPolicy, boundDefinition, boundDockerfile, boundMode, boundPolicy sql.NullString
 	if err := db.QueryRowContext(ctx, `SELECT acornfox_definition_digest,acornfox_dockerfile_digest,acornfox_network_mode,acornfox_worker_policy_digest FROM build_plans WHERE id=$1`, legacy.ID.String()).Scan(&legacyDefinition, &legacyDockerfile, &legacyMode, &legacyPolicy); err != nil || legacyDefinition.Valid || legacyDockerfile.Valid || legacyMode.Valid || legacyPolicy.Valid {
 		t.Fatalf("legacy persisted binding definition=%+v dockerfile=%+v mode=%+v policy=%+v err=%v", legacyDefinition, legacyDockerfile, legacyMode, legacyPolicy, err)

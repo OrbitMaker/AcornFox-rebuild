@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/open-card/open-card/internal/contracts"
+	"github.com/open-card/open-card/internal/domain"
 )
 
 const (
@@ -227,6 +228,26 @@ func (s *Store) ListAcornFoxProbeObservations(ctx context.Context, taskID string
 		items = append(items, item)
 	}
 	return items, rows.Err()
+}
+
+// GetLatestAcornFoxProbeObservation returns one immutable response fact for a
+// deployment. It does not infer health from absence, a port, or a runtime
+// state; callers must represent a missing fact as null.
+func (s *Store) GetLatestAcornFoxProbeObservation(ctx context.Context, applicationID, deploymentID domain.ID) (AcornFoxProbeObservation, error) {
+	if err := s.requireDB(); err != nil {
+		return AcornFoxProbeObservation{}, err
+	}
+	if err := domain.RequireID(applicationID, "application id"); err != nil {
+		return AcornFoxProbeObservation{}, err
+	}
+	if err := domain.RequireID(deploymentID, "deployment id"); err != nil {
+		return AcornFoxProbeObservation{}, err
+	}
+	item, err := scanAcornFoxProbeObservation(s.db.QueryRowContext(ctx, acornFoxProbeObservationSelect+` WHERE application_id=$1 AND deployment_id=$2 ORDER BY observed_at DESC,created_at DESC,agent_sequence DESC LIMIT 1`, applicationID.String(), deploymentID.String()))
+	if errors.Is(err, sql.ErrNoRows) {
+		return AcornFoxProbeObservation{}, ErrNotFound
+	}
+	return item, err
 }
 
 const acornFoxProbeObservationSelect = `

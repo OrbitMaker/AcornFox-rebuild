@@ -205,6 +205,45 @@ type AcornFoxLegacyRoute struct {
 	Class AcornFoxLegacyRouteClass `json:"class"`
 }
 
+// AcornFoxPublicRouteInventory is the small clean-install HTTP surface. It is
+// intentionally independent from the historical Open Card OpenAPI document;
+// callers use it to cross-check the standalone AcornFox document and router.
+var acornFoxPublicRoutes = [...]AcornFoxPublicRoute{
+	{Path: "/api/v1/acornfox/auth/login", Methods: []string{"post"}},
+	{Path: "/api/v1/acornfox/auth/logout", Methods: []string{"post"}},
+	{Path: "/api/v1/acornfox/auth/session", Methods: []string{"get"}},
+	{Path: "/api/v1/acornfox/auth/password", Methods: []string{"post"}},
+	{Path: "/api/v1/acornfox/apps", Methods: []string{"get", "post"}},
+	{Path: "/api/v1/acornfox/apps/{applicationId}", Methods: []string{"get"}},
+	{Path: "/api/v1/acornfox/apps/{applicationId}/sources/{sourceRevisionId}", Methods: []string{"get"}},
+	{Path: "/api/v1/acornfox/apps/{applicationId}/deliveries", Methods: []string{"post"}},
+	{Path: "/api/v1/acornfox/apps/{applicationId}/deliveries/{deploymentId}", Methods: []string{"get"}},
+	{Path: "/api/v1/acornfox/apps/{applicationId}/deliveries/{deploymentId}/restart", Methods: []string{"post"}},
+	{Path: "/api/v1/acornfox/apps/{applicationId}/deliveries/{deploymentId}/redeploy", Methods: []string{"post"}},
+	{Path: "/api/v1/acornfox/apps/{applicationId}/deliveries/{deploymentId}/probes", Methods: []string{"post"}},
+}
+
+type AcornFoxPublicRoute struct {
+	Path    string
+	Methods []string
+}
+
+func AcornFoxPublicRouteInventory() []string {
+	items := make([]string, len(acornFoxPublicRoutes))
+	for index, route := range acornFoxPublicRoutes {
+		items[index] = route.Path
+	}
+	return items
+}
+
+func AcornFoxPublicRouteMethodInventory() []AcornFoxPublicRoute {
+	items := make([]AcornFoxPublicRoute, len(acornFoxPublicRoutes))
+	for index, route := range acornFoxPublicRoutes {
+		items[index] = AcornFoxPublicRoute{Path: route.Path, Methods: append([]string(nil), route.Methods...)}
+	}
+	return items
+}
+
 // acornFoxMigrationOnlyRoutes is a hand-audited immutable snapshot of the
 // current OpenAPI, handleM2, and M2LifecycleHandler.Handle surfaces. The
 // OpenAPI does not publish a scale endpoint; scale remains an internal legacy
@@ -249,6 +288,32 @@ func InventoryOpenAPIPaths(raw string) []string {
 	}
 	sort.Strings(paths)
 	return paths
+}
+
+// InventoryOpenAPIRouteMethods extracts only top-level path operations from
+// the constrained repository OpenAPI shape. It intentionally ignores schema
+// content, so a generated client cannot disguise a method/path mismatch.
+func InventoryOpenAPIRouteMethods(raw string) map[string][]string {
+	items := make(map[string][]string)
+	current := ""
+	for _, line := range strings.Split(raw, "\n") {
+		if strings.HasPrefix(line, "  /") && strings.HasSuffix(strings.TrimSpace(line), ":") && !strings.HasPrefix(line, "    ") {
+			current = strings.TrimSuffix(strings.TrimSpace(line), ":")
+			items[current] = []string{}
+			continue
+		}
+		if current == "" || !strings.HasPrefix(line, "    ") || strings.HasPrefix(line, "      ") {
+			continue
+		}
+		method := strings.SplitN(strings.TrimSpace(line), ":", 2)[0]
+		if method == "get" || method == "post" || method == "put" || method == "patch" || method == "delete" {
+			items[current] = append(items[current], method)
+		}
+	}
+	for path := range items {
+		sort.Strings(items[path])
+	}
+	return items
 }
 
 // ValidateAcornFoxCleanInstallRoutes is the future clean-install leakage guard.

@@ -20,9 +20,11 @@ import (
 	aiprovider "github.com/open-card/open-card/internal/ai/provider"
 	airunner "github.com/open-card/open-card/internal/ai/runner"
 	aitools "github.com/open-card/open-card/internal/ai/tools"
+	"github.com/open-card/open-card/internal/application"
 	"github.com/open-card/open-card/internal/auth"
 	"github.com/open-card/open-card/internal/contracts"
 	"github.com/open-card/open-card/internal/controllers"
+	"github.com/open-card/open-card/internal/importers/dockerfile"
 	"github.com/open-card/open-card/internal/observability"
 	"github.com/open-card/open-card/internal/persistence/postgres"
 	"github.com/open-card/open-card/internal/providers/buildkit"
@@ -50,7 +52,12 @@ func main() {
 	if address == "" {
 		address = "127.0.0.1:8080"
 	}
-	server := NewServer()
+	compatibilityMode, compatibilityErr := acornFoxMigrationCompatibilityMode(os.Getenv("ACORNFOX_MIGRATION_COMPATIBILITY"))
+	if compatibilityErr != nil {
+		log.Fatal(compatibilityErr)
+	}
+	server := NewAcornFoxServer()
+	server.SetLegacyRoutesEnabled(compatibilityMode)
 	var controllerStore *postgres.Store
 	databaseURL := os.Getenv("OPEN_CARD_DATABASE_URL")
 	if err := validateFeatureHierarchy(databaseURL != "", os.Getenv("OPEN_CARD_M1_ENABLED") == "true", os.Getenv("OPEN_CARD_M2_ENABLED") == "true", os.Getenv("OPEN_CARD_M3_ENABLED") == "true", os.Getenv("OPEN_CARD_M4_ENABLED") == "true", os.Getenv("OPEN_CARD_M4_ROLLOUT_ENABLED") == "true", os.Getenv("OPEN_CARD_M5_ENABLED") == "true", os.Getenv("OPEN_CARD_M6_ENABLED") == "true"); err != nil {
@@ -68,7 +75,9 @@ func main() {
 				log.Printf("close postgres store: %v", err)
 			}
 		}()
-		server = NewServerWithRepository(store)
+		server = NewAcornFoxServerWithRepository(store)
+		server.SetLegacyRoutesEnabled(compatibilityMode)
+		server.SetAcornFoxDeploymentStore(store)
 		controllerStore = store
 		server.SetSystemStatusStore(store)
 		server.SetApplicationProjectionStore(store)
@@ -165,6 +174,12 @@ func main() {
 			releaseController := &controllers.ReleaseController{Store: store, Source: sourceProvider, Build: buildProvider, Capacity: capacityProvider, StaticRuntimeDigest: os.Getenv("OPEN_CARD_STATIC_RUNTIME_DIGEST")}
 			server.SetReleaseController(releaseController)
 			server.SetApplicationPublisher(store, releaseController)
+			acornFoxStore := acornFoxPostgresAdapter{store: store}
+			server.SetAcornFoxDeliveryCommand(acornFoxHTTPCommand{service: &application.AcornFoxDeliveryService{
+				Idempotency: acornFoxStore, Sources: acornFoxStore, Importer: dockerfile.New(), Builds: acornFoxStore,
+				Tasks: acornFoxStore, Runtime: acornFoxStore, Observer: acornFoxStore, Builder: buildProvider, Capacity: capacityProvider,
+				Config: application.AcornFoxDeliveryConfig{TargetRepository: "acornfox.local/apps", StorageKeyPrefix: "acornfox-builds"},
+			}})
 			if os.Getenv("OPEN_CARD_M2_ENABLED") == "true" {
 				registryTemp := buildWorkRoot + "/registry-config"
 				if err := os.MkdirAll(registryTemp, 0o700); err != nil {

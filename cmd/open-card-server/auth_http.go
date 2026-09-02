@@ -14,14 +14,30 @@ import (
 )
 
 const (
-	authAPIBase       = "/api/v1/auth/"
-	authSessionCookie = "__Host-open_card_session"
-	authCSRFCookie    = "__Host-open_card_csrf"
-	authCSRFHeader    = "X-Open-Card-CSRF"
-	authMaxJSONBody   = 16 << 10
+	// authAPIBase remains the explicit migration-only endpoint. New AcornFox
+	// installations expose the same administrator session contract only under
+	// their product namespace.
+	authAPIBase               = "/api/v1/auth/"
+	acornFoxAuthAPIBase       = "/api/v1/acornfox/auth/"
+	authSessionCookie         = "__Host-open_card_session"
+	authCSRFCookie            = "__Host-open_card_csrf"
+	authCSRFHeader            = "X-Open-Card-CSRF"
+	acornFoxAuthSessionCookie = "__Host-acornfox_session"
+	acornFoxAuthCSRFCookie    = "__Host-acornfox_csrf"
+	acornFoxAuthCSRFHeader    = "X-AcornFox-CSRF"
+	authMaxJSONBody           = 16 << 10
 )
 
 type AuthHTTPHandler struct{ Service *auth.Service }
+
+type authRouteConfig struct {
+	sessionCookie string
+	csrfCookie    string
+	csrfHeader    string
+}
+
+var legacyAuthRouteConfig = authRouteConfig{sessionCookie: authSessionCookie, csrfCookie: authCSRFCookie, csrfHeader: authCSRFHeader}
+var acornFoxAuthRouteConfig = authRouteConfig{sessionCookie: acornFoxAuthSessionCookie, csrfCookie: acornFoxAuthCSRFCookie, csrfHeader: acornFoxAuthCSRFHeader}
 
 type authLoginInput struct {
 	Password string `json:"password"`
@@ -33,7 +49,17 @@ type authPasswordInput struct {
 }
 
 func (h *AuthHTTPHandler) Handle(writer http.ResponseWriter, request *http.Request) bool {
-	if !strings.HasPrefix(request.URL.Path, authAPIBase) {
+	return h.handleAtBase(writer, request, authAPIBase, legacyAuthRouteConfig)
+}
+
+// HandleAcornFox serves the clean-install spelling without changing any
+// session, cookie, origin, or CSRF behavior of the established auth service.
+func (h *AuthHTTPHandler) HandleAcornFox(writer http.ResponseWriter, request *http.Request) bool {
+	return h.handleAtBase(writer, request, acornFoxAuthAPIBase, acornFoxAuthRouteConfig)
+}
+
+func (h *AuthHTTPHandler) handleAtBase(writer http.ResponseWriter, request *http.Request, base string, config authRouteConfig) bool {
+	if !strings.HasPrefix(request.URL.Path, base) {
 		return false
 	}
 	authNoStore(writer)
@@ -42,21 +68,21 @@ func (h *AuthHTTPHandler) Handle(writer http.ResponseWriter, request *http.Reque
 		return true
 	}
 	switch request.URL.Path {
-	case authAPIBase + "login":
-		h.login(writer, request)
-	case authAPIBase + "logout":
-		h.logout(writer, request)
-	case authAPIBase + "session":
-		h.session(writer, request)
-	case authAPIBase + "password":
-		h.password(writer, request)
+	case base + "login":
+		h.login(writer, request, config)
+	case base + "logout":
+		h.logout(writer, request, config)
+	case base + "session":
+		h.session(writer, request, config)
+	case base + "password":
+		h.password(writer, request, config)
 	default:
 		authHTTPError(writer, http.StatusNotFound, "authentication endpoint not found")
 	}
 	return true
 }
 
-func (h *AuthHTTPHandler) login(writer http.ResponseWriter, request *http.Request) {
+func (h *AuthHTTPHandler) login(writer http.ResponseWriter, request *http.Request, config authRouteConfig) {
 	if request.Method != http.MethodPost {
 		authMethod(writer, http.MethodPost)
 		return
@@ -70,17 +96,17 @@ func (h *AuthHTTPHandler) login(writer http.ResponseWriter, request *http.Reques
 		authServiceError(writer, err)
 		return
 	}
-	setAuthCookies(writer, result.SessionToken, result.CSRFTok, result.Session.AbsoluteExpiresAt)
+	setAuthCookies(writer, config, result.SessionToken, result.CSRFTok, result.Session.AbsoluteExpiresAt)
 	writeJSON(writer, http.StatusOK, map[string]any{"authenticated": true, "idle_expires_at": result.Session.IdleExpiresAt, "absolute_expires_at": result.Session.AbsoluteExpiresAt})
 }
 
-func (h *AuthHTTPHandler) logout(writer http.ResponseWriter, request *http.Request) {
+func (h *AuthHTTPHandler) logout(writer http.ResponseWriter, request *http.Request, config authRouteConfig) {
 	if request.Method != http.MethodPost {
 		authMethod(writer, http.MethodPost)
 		return
 	}
-	err := h.Service.Logout(request.Context(), request.Header.Get("Origin"), authCookie(request, authSessionCookie), authCSRF(request))
-	clearAuthCookies(writer)
+	err := h.Service.Logout(request.Context(), request.Header.Get("Origin"), authCookie(request, config.sessionCookie), authCSRFFor(request, config))
+	clearAuthCookies(writer, config)
 	if err != nil {
 		authServiceError(writer, err)
 		return
@@ -88,21 +114,21 @@ func (h *AuthHTTPHandler) logout(writer http.ResponseWriter, request *http.Reque
 	writer.WriteHeader(http.StatusNoContent)
 }
 
-func (h *AuthHTTPHandler) session(writer http.ResponseWriter, request *http.Request) {
+func (h *AuthHTTPHandler) session(writer http.ResponseWriter, request *http.Request, config authRouteConfig) {
 	if request.Method != http.MethodGet {
 		authMethod(writer, http.MethodGet)
 		return
 	}
-	info, _, err := h.Service.Session(request.Context(), authCookie(request, authSessionCookie))
+	info, _, err := h.Service.Session(request.Context(), authCookie(request, config.sessionCookie))
 	if err != nil {
-		clearAuthCookiesForInvalidSession(writer, err)
+		clearAuthCookiesForInvalidSession(writer, config, err)
 		authServiceError(writer, err)
 		return
 	}
 	writeJSON(writer, http.StatusOK, map[string]any{"authenticated": info.Authenticated, "idle_expires_at": info.IdleExpiresAt, "absolute_expires_at": info.AbsoluteAt})
 }
 
-func (h *AuthHTTPHandler) password(writer http.ResponseWriter, request *http.Request) {
+func (h *AuthHTTPHandler) password(writer http.ResponseWriter, request *http.Request, config authRouteConfig) {
 	if request.Method != http.MethodPost {
 		authMethod(writer, http.MethodPost)
 		return
@@ -111,13 +137,13 @@ func (h *AuthHTTPHandler) password(writer http.ResponseWriter, request *http.Req
 	if !decodeAuthJSON(writer, request, &input) {
 		return
 	}
-	err := h.Service.ChangePassword(request.Context(), request.Header.Get("Origin"), authCookie(request, authSessionCookie), authCSRF(request), input.CurrentPassword, input.NewPassword)
+	err := h.Service.ChangePassword(request.Context(), request.Header.Get("Origin"), authCookie(request, config.sessionCookie), authCSRFFor(request, config), input.CurrentPassword, input.NewPassword)
 	if err != nil {
-		clearAuthCookiesForInvalidSession(writer, err)
+		clearAuthCookiesForInvalidSession(writer, config, err)
 		authServiceError(writer, err)
 		return
 	}
-	clearAuthCookies(writer)
+	clearAuthCookies(writer, config)
 	writer.WriteHeader(http.StatusNoContent)
 }
 
@@ -149,8 +175,12 @@ func authCookie(request *http.Request, name string) string {
 }
 
 func authCSRF(request *http.Request) string {
-	cookie := authCookie(request, authCSRFCookie)
-	header := request.Header.Get(authCSRFHeader)
+	return authCSRFFor(request, legacyAuthRouteConfig)
+}
+
+func authCSRFFor(request *http.Request, config authRouteConfig) string {
+	cookie := authCookie(request, config.csrfCookie)
+	header := request.Header.Get(config.csrfHeader)
 	if cookie == "" || header == "" || subtle.ConstantTimeCompare([]byte(cookie), []byte(header)) != 1 {
 		return ""
 	}
@@ -180,20 +210,20 @@ func authRemoteIP(remoteAddr string) net.IP {
 	return net.ParseIP(host)
 }
 
-func setAuthCookies(writer http.ResponseWriter, session, csrf string, expires time.Time) {
-	http.SetCookie(writer, &http.Cookie{Name: authSessionCookie, Value: session, Path: "/", Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode, Expires: expires.UTC()})
-	http.SetCookie(writer, &http.Cookie{Name: authCSRFCookie, Value: csrf, Path: "/", Secure: true, HttpOnly: false, SameSite: http.SameSiteStrictMode, Expires: expires.UTC()})
+func setAuthCookies(writer http.ResponseWriter, config authRouteConfig, session, csrf string, expires time.Time) {
+	http.SetCookie(writer, &http.Cookie{Name: config.sessionCookie, Value: session, Path: "/", Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode, Expires: expires.UTC()})
+	http.SetCookie(writer, &http.Cookie{Name: config.csrfCookie, Value: csrf, Path: "/", Secure: true, HttpOnly: false, SameSite: http.SameSiteStrictMode, Expires: expires.UTC()})
 }
 
-func clearAuthCookies(writer http.ResponseWriter) {
+func clearAuthCookies(writer http.ResponseWriter, config authRouteConfig) {
 	expires := time.Unix(1, 0).UTC()
-	http.SetCookie(writer, &http.Cookie{Name: authSessionCookie, Value: "", Path: "/", Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode, Expires: expires, MaxAge: -1})
-	http.SetCookie(writer, &http.Cookie{Name: authCSRFCookie, Value: "", Path: "/", Secure: true, HttpOnly: false, SameSite: http.SameSiteStrictMode, Expires: expires, MaxAge: -1})
+	http.SetCookie(writer, &http.Cookie{Name: config.sessionCookie, Value: "", Path: "/", Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode, Expires: expires, MaxAge: -1})
+	http.SetCookie(writer, &http.Cookie{Name: config.csrfCookie, Value: "", Path: "/", Secure: true, HttpOnly: false, SameSite: http.SameSiteStrictMode, Expires: expires, MaxAge: -1})
 }
 
-func clearAuthCookiesForInvalidSession(writer http.ResponseWriter, err error) {
+func clearAuthCookiesForInvalidSession(writer http.ResponseWriter, config authRouteConfig, err error) {
 	if errors.Is(err, auth.ErrAuthenticationFailed) {
-		clearAuthCookies(writer)
+		clearAuthCookies(writer, config)
 	}
 }
 

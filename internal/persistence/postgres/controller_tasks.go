@@ -269,6 +269,63 @@ func (s *Store) EnqueueControllerTask(ctx context.Context, request EnqueueContro
 	if err := s.requireDB(); err != nil {
 		return application.Event{}, err
 	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return application.Event{}, fmt.Errorf("begin enqueue controller task: %w", err)
+	}
+	event, err := s.enqueueControllerTaskTx(ctx, tx, request)
+	if err != nil {
+		return application.Event{}, rollbackTx(tx, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return application.Event{}, fmt.Errorf("%w: commit controller task enqueue: %v", ErrOutcomeUnknown, err)
+	}
+	return event, nil
+}
+
+// EnqueueControllerTaskAndCompletePublish commits the durable Agent task and
+// its command response together. It closes the historical crash window where
+// a task was already visible but its idempotency row remained in_progress.
+func (s *Store) EnqueueControllerTaskAndCompletePublish(ctx context.Context, request EnqueueControllerTaskRequest, key, requestDigest string, response json.RawMessage, now time.Time) (application.Event, error) {
+	if err := s.requireDB(); err != nil {
+		return application.Event{}, err
+	}
+	key, requestDigest = strings.TrimSpace(key), strings.TrimSpace(requestDigest)
+	if key == "" || !strings.HasPrefix(requestDigest, "sha256:") || len(response) == 0 || !json.Valid(response) {
+		return application.Event{}, domain.ValidationError("publish completion is invalid")
+	}
+	if now.IsZero() {
+		now = s.now()
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return application.Event{}, fmt.Errorf("begin AcornFox delivery commit: %w", err)
+	}
+	event, err := s.enqueueControllerTaskTx(ctx, tx, request)
+	if err != nil {
+		return application.Event{}, rollbackTx(tx, err)
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE m1_publish_requests SET status='completed',response=$1::jsonb,failure_reason=NULL,updated_at=$2 WHERE idempotency_key=$3 AND request_digest=$4 AND status='in_progress'`, response, now.UTC(), key, requestDigest)
+	if err != nil {
+		return application.Event{}, rollbackTx(tx, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return application.Event{}, rollbackTx(tx, err)
+	}
+	if rows != 1 {
+		return application.Event{}, rollbackTx(tx, ErrOutcomeUnknown)
+	}
+	if err := tx.Commit(); err != nil {
+		return application.Event{}, fmt.Errorf("%w: commit AcornFox delivery task: %v", ErrOutcomeUnknown, err)
+	}
+	return event, nil
+}
+
+// enqueueControllerTaskTx is the common mutation used by ordinary controller
+// queueing and AcornFox's accepted-command commit. Callers own the transaction
+// so a task can never become visible without its idempotent command result.
+func (s *Store) enqueueControllerTaskTx(ctx context.Context, tx *sql.Tx, request EnqueueControllerTaskRequest) (application.Event, error) {
 	if err := request.Operation.Validate(); err != nil {
 		return application.Event{}, err
 	}
@@ -294,47 +351,40 @@ func (s *Store) EnqueueControllerTask(ctx context.Context, request EnqueueContro
 		now = s.now().UTC()
 	}
 
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return application.Event{}, fmt.Errorf("begin enqueue controller task: %w", err)
-	}
-	rollback := func(cause error) (application.Event, error) {
-		return application.Event{}, rollbackTx(tx, cause)
-	}
 	if request.Operation.Type != domain.OperationObserve {
 		if err := s.preemptReadOnlyControllerOperationTx(ctx, tx, request.Operation.EnvironmentID, now); err != nil {
-			return rollback(err)
+			return application.Event{}, err
 		}
 	}
 	var deploymentID any
 	if request.Deployment != nil && !request.ExistingDeploymentID.Empty() {
-		return rollback(domain.ValidationError("new and existing deployment are mutually exclusive"))
+		return application.Event{}, domain.ValidationError("new and existing deployment are mutually exclusive")
 	}
 	if request.Deployment != nil {
 		if err := request.Deployment.Validate(); err != nil {
-			return rollback(err)
+			return application.Event{}, err
 		}
 		if request.Deployment.Status != domain.DeploymentPending {
-			return rollback(domain.ValidationError("new deployment must be pending"))
+			return application.Event{}, domain.ValidationError("new deployment must be pending")
 		}
 		if request.Deployment.ApplicationID != request.Operation.ApplicationID || request.Deployment.EnvironmentID != request.Operation.EnvironmentID {
-			return rollback(domain.ValidationError("deployment and operation scope do not match"))
+			return application.Event{}, domain.ValidationError("deployment and operation scope do not match")
 		}
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO deployments
 				(id, environment_id, release_id, state, version, created_at, updated_at)
 			VALUES ($1, $2, $3, $4, 1, $5, $5)
 		`, request.Deployment.ID.String(), request.Deployment.EnvironmentID.String(), request.Deployment.ReleaseID.String(), string(request.Deployment.Status), now); err != nil {
-			return rollback(fmt.Errorf("insert controller deployment: %w", err))
+			return application.Event{}, fmt.Errorf("insert controller deployment: %w", err)
 		}
 		deploymentID = request.Deployment.ID.String()
 	} else if !request.ExistingDeploymentID.Empty() {
 		var applicationID, environmentID string
 		if err := tx.QueryRowContext(ctx, `SELECT e.application_id,d.environment_id FROM deployments d JOIN environments e ON e.id=d.environment_id WHERE d.id=$1`, request.ExistingDeploymentID.String()).Scan(&applicationID, &environmentID); err != nil {
-			return rollback(fmt.Errorf("load existing deployment: %w", err))
+			return application.Event{}, fmt.Errorf("load existing deployment: %w", err)
 		}
 		if applicationID != request.Operation.ApplicationID.String() || environmentID != request.Operation.EnvironmentID.String() {
-			return rollback(domain.ValidationError("existing deployment and operation scope do not match"))
+			return application.Event{}, domain.ValidationError("existing deployment and operation scope do not match")
 		}
 		deploymentID = request.ExistingDeploymentID.String()
 	}
@@ -346,7 +396,7 @@ func (s *Store) EnqueueControllerTask(ctx context.Context, request EnqueueContro
 		VALUES ($1, $2, $3, $4, $5, $6, $7, 1, $8, NULL, $9, $9)
 	`, request.Operation.ID.String(), request.Operation.ApplicationID.String(), request.Operation.EnvironmentID.String(), deploymentID,
 		string(request.Operation.Type), request.Operation.IdempotencyKey, string(request.Operation.Status), request.Operation.TargetRef, now); err != nil {
-		return rollback(mapControllerOperationInsertError(err))
+		return application.Event{}, mapControllerOperationInsertError(err)
 	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO task_leases
@@ -354,7 +404,7 @@ func (s *Store) EnqueueControllerTask(ctx context.Context, request EnqueueContro
 			 created_at, updated_at)
 		VALUES ($1, $2, 0, $3, 'ready', $4::jsonb, $5, $5)
 	`, request.TaskID.String(), request.Operation.ID.String(), maxAttempts, redactedPayload, now); err != nil {
-		return rollback(fmt.Errorf("insert controller task: %w", err))
+		return application.Event{}, fmt.Errorf("insert controller task: %w", err)
 	}
 	initialStatus := request.InitialPublishStatus
 	if initialStatus == "" {
@@ -362,10 +412,7 @@ func (s *Store) EnqueueControllerTask(ctx context.Context, request EnqueueContro
 	}
 	event, err := s.appendControllerEventTx(ctx, tx, request.Operation, "operation.queued", string(initialStatus), "operation queued", nil, now)
 	if err != nil {
-		return rollback(err)
-	}
-	if err := tx.Commit(); err != nil {
-		return application.Event{}, fmt.Errorf("%w: commit controller task enqueue: %v", ErrOutcomeUnknown, err)
+		return application.Event{}, err
 	}
 	return event, nil
 }
