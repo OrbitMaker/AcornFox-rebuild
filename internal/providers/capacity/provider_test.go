@@ -289,6 +289,151 @@ func TestActivatedRuntimeLeaseDoesNotExpireBeforeExplicitRelease(t *testing.T) {
 	}
 }
 
+func TestReconcileActiveRestoresAccountingWithoutPortAllocation(t *testing.T) {
+	var allocatorCalls int
+	provider := capacityProvider(t, fixedReader(hostCapacity()), func(config *Config) {
+		config.PortAllocator = PortAllocatorFunc(func(context.Context) (net.Listener, error) {
+			allocatorCalls++
+			return nil, errors.New("reconcile must not allocate a port")
+		})
+	})
+	lease := activeRuntimeLease("cap_restored", 1_200, 1_200, 1_200, 49152)
+	if err := provider.ReconcileActive(context.Background(), lease, contracts.OperationContext{IdempotencyKey: "restore-one"}); err != nil {
+		t.Fatal(err)
+	}
+	if allocatorCalls != 0 || provider.ActiveLeaseCount() != 1 {
+		t.Fatalf("reconcile allocated a port or failed to retain accounting: calls=%d active=%d", allocatorCalls, provider.ActiveLeaseCount())
+	}
+
+	snapshot, _, err := provider.Preflight(context.Background(), capacityRequest(contracts.CapacityRuntime, "restored-snapshot", 0, 0, 0, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.AvailableCPUMillis != 800 || snapshot.AvailableMemoryBytes != 800 || snapshot.AvailableDiskBytes != 800 {
+		t.Fatalf("restored lease was not reflected in capacity snapshot: %#v", snapshot)
+	}
+	_, err = provider.Reserve(context.Background(), capacityRequest(contracts.CapacityRuntime, "restored-overcommit", 801, 801, 801, 0))
+	providerErrorCode(t, err, contracts.ErrCapacity)
+
+	if err := provider.Release(context.Background(), lease, contracts.OperationContext{IdempotencyKey: "restore-release"}); err != nil {
+		t.Fatal(err)
+	}
+	if provider.ActiveLeaseCount() != 0 {
+		t.Fatalf("released restored lease remained active: %d", provider.ActiveLeaseCount())
+	}
+	if _, err := provider.Reserve(context.Background(), capacityRequest(contracts.CapacityRuntime, "restored-after-release", 2_000, 2_000, 2_000, 0)); err != nil {
+		t.Fatalf("release did not return restored capacity: %v", err)
+	}
+}
+
+func TestReconcileActiveIsLeaseIdempotentAndConflictsOnDifferentContent(t *testing.T) {
+	provider := capacityProvider(t, fixedReader(hostCapacity()), nil)
+	lease := activeRuntimeLease("cap_reconcile_idempotent", 500, 500, 500, 0)
+	if err := provider.ReconcileActive(context.Background(), lease, contracts.OperationContext{IdempotencyKey: "reconcile-first"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := provider.ReconcileActive(context.Background(), lease, contracts.OperationContext{IdempotencyKey: "reconcile-replay"}); err != nil {
+		t.Fatalf("same recovered lease was not idempotent: %v", err)
+	}
+	if provider.ActiveLeaseCount() != 1 {
+		t.Fatalf("same recovered lease was double counted: %d", provider.ActiveLeaseCount())
+	}
+
+	different := lease
+	different.Resources.CPUMillis++
+	providerErrorCode(t, provider.ReconcileActive(context.Background(), different, contracts.OperationContext{IdempotencyKey: "reconcile-different"}), contracts.ErrConflict)
+	providerErrorCode(t, provider.ReconcileActive(context.Background(), activeRuntimeLease("cap_different", 500, 500, 500, 0), contracts.OperationContext{IdempotencyKey: "reconcile-first"}), contracts.ErrConflict)
+}
+
+func TestReconcileActiveRetainsExistingOccupancyAndPreventsThirdLease(t *testing.T) {
+	provider := capacityProvider(t, fixedReader(hostCapacity()), nil)
+	first := activeRuntimeLease("cap_reconcile_first", 1_200, 1_200, 1_200, 0)
+	second := activeRuntimeLease("cap_reconcile_second", 800, 800, 800, 0)
+	if err := provider.ReconcileActive(context.Background(), first, contracts.OperationContext{IdempotencyKey: "reconcile-capacity-one"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := provider.ReconcileActive(context.Background(), second, contracts.OperationContext{IdempotencyKey: "reconcile-capacity-two"}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := provider.Reserve(context.Background(), capacityRequest(contracts.CapacityRuntime, "reconcile-capacity-third", 1, 1, 1, 0))
+	providerErrorCode(t, err, contracts.ErrCapacity)
+	if provider.ActiveLeaseCount() != 2 {
+		t.Fatalf("restored leases were not retained: %d", provider.ActiveLeaseCount())
+	}
+}
+
+func TestReconcileActiveAcceptsExistingOccupancyWhenHostAvailabilityIsLower(t *testing.T) {
+	provider := capacityProvider(t, fixedReader(HostCapacity{
+		TotalCPUMillis:       2_000,
+		AvailableCPUMillis:   500,
+		TotalMemoryBytes:     2_000,
+		AvailableMemoryBytes: 500,
+		TotalDiskBytes:       2_000,
+		AvailableDiskBytes:   500,
+	}), nil)
+	lease := activeRuntimeLease("cap_reconcile_low", 1_000, 1_000, 1_000, 0)
+	if err := provider.ReconcileActive(context.Background(), lease, contracts.OperationContext{IdempotencyKey: "reconcile-low-host"}); err != nil {
+		t.Fatalf("existing workload must remain accounted even after host availability drops: %v", err)
+	}
+	snapshot, _, err := provider.Preflight(context.Background(), capacityRequest(contracts.CapacityRuntime, "reconcile-low-host-snapshot", 0, 0, 0, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.AvailableCPUMillis != 0 || snapshot.AvailableMemoryBytes != 0 || snapshot.AvailableDiskBytes != 0 {
+		t.Fatalf("restored occupancy did not floor future availability: %#v", snapshot)
+	}
+}
+
+func TestReconcileActiveRejectsInvalidLeaseAndOperation(t *testing.T) {
+	provider := capacityProvider(t, fixedReader(hostCapacity()), nil)
+	valid := activeRuntimeLease("cap_reconcile_valid", 100, 100, 100, 0)
+	tests := []struct {
+		name      string
+		lease     contracts.CapacityLease
+		operation contracts.OperationContext
+	}{
+		{name: "missing lease id", lease: contracts.CapacityLease{Scope: contracts.CapacityRuntime, Resources: valid.Resources}, operation: contracts.OperationContext{IdempotencyKey: "invalid-id"}},
+		{name: "build scope", lease: func() contracts.CapacityLease { item := valid; item.Scope = contracts.CapacityBuild; return item }(), operation: contracts.OperationContext{IdempotencyKey: "invalid-scope"}},
+		{name: "zero accounting resource", lease: func() contracts.CapacityLease { item := valid; item.Resources.DiskBytes = 0; return item }(), operation: contracts.OperationContext{IdempotencyKey: "invalid-resource"}},
+		{name: "negative resource", lease: func() contracts.CapacityLease { item := valid; item.Resources.MemoryBytes = -1; return item }(), operation: contracts.OperationContext{IdempotencyKey: "negative-resource"}},
+		{name: "invalid host port", lease: func() contracts.CapacityLease { item := valid; item.HostPort = 65536; return item }(), operation: contracts.OperationContext{IdempotencyKey: "invalid-port"}},
+		{name: "missing operation", lease: valid, operation: contracts.OperationContext{}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			providerErrorCode(t, provider.ReconcileActive(context.Background(), test.lease, test.operation), contracts.ErrInvalidArgument)
+		})
+	}
+	if provider.ActiveLeaseCount() != 0 {
+		t.Fatalf("invalid reconcile created an active lease: %d", provider.ActiveLeaseCount())
+	}
+}
+
+func TestReconcileActiveIsRaceSafe(t *testing.T) {
+	provider := capacityProvider(t, fixedReader(hostCapacity()), nil)
+	lease := activeRuntimeLease("cap_reconcile_race", 500, 500, 500, 0)
+	var wait sync.WaitGroup
+	var failures []error
+	var mu sync.Mutex
+	for index := 0; index < 32; index++ {
+		wait.Add(1)
+		go func(index int) {
+			defer wait.Done()
+			err := provider.ReconcileActive(context.Background(), lease, contracts.OperationContext{IdempotencyKey: "reconcile-race-" + itoa(index)})
+			if err == nil {
+				return
+			}
+			mu.Lock()
+			failures = append(failures, err)
+			mu.Unlock()
+		}(index)
+	}
+	wait.Wait()
+	if len(failures) != 0 || provider.ActiveLeaseCount() != 1 {
+		t.Fatalf("concurrent reconcile was not safe: failures=%v active=%d", failures, provider.ActiveLeaseCount())
+	}
+}
+
 func TestOperationKeyConflictAndPreflightIdempotency(t *testing.T) {
 	provider := capacityProvider(t, fixedReader(hostCapacity()), nil)
 	first := capacityRequest(contracts.CapacityRuntime, "same-preflight", 100, 100, 100, 0)
@@ -351,4 +496,14 @@ func TestSystemReaderReadsLinuxCPUAndMemoryAndStatfs(t *testing.T) {
 
 func itoa(value int) string {
 	return strconv.Itoa(value)
+}
+
+func activeRuntimeLease(id string, cpu, memory, disk int64, hostPort int) contracts.CapacityLease {
+	return contracts.CapacityLease{
+		ID:        id,
+		Scope:     contracts.CapacityRuntime,
+		Resources: contracts.ResourceLimits{CPUMillis: cpu, MemoryBytes: memory, DiskBytes: disk},
+		HostPort:  hostPort,
+		ExpiresAt: time.Unix(1, 0).UTC(),
+	}
 }

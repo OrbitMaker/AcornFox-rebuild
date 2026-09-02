@@ -18,6 +18,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -158,10 +159,12 @@ type Provider struct {
 	config   Config
 	metadata contracts.ProviderMetadata
 
-	mu        sync.Mutex
-	networkMu sync.Mutex
-	deploys   map[string]*deployRecord
-	states    map[domain.ID]*runtimeState
+	mu             sync.Mutex
+	networkMu      sync.Mutex
+	guardMu        sync.Mutex
+	lifecycleLocks map[domain.ID]*sync.Mutex
+	deploys        map[string]*deployRecord
+	states         map[domain.ID]*runtimeState
 }
 
 type deployRecord struct {
@@ -172,15 +175,34 @@ type deployRecord struct {
 }
 
 type runtimeState struct {
-	deployment domain.Deployment
-	service    string
-	container  string
-	port       int
-	destroyed  bool
-	actions    map[string]struct{}
-	capacity   *contracts.CapacityLease
-	resources  contracts.ResourceLimits
+	deployment      domain.Deployment
+	service         string
+	image           domain.ImageDigest
+	container       string
+	containerID     string
+	port            int
+	containerPort   int
+	destroyed       bool
+	phase           string
+	fingerprint     string
+	createdAt       time.Time
+	updatedAt       time.Time
+	leaseGeneration int
+	recovery        runtimeRecovery
+	actions         map[string]runtimeAction
+	capacity        *contracts.CapacityLease
+	resources       contracts.ResourceLimits
 }
+
+type runtimeRecovery string
+
+const (
+	runtimeRecoveryActive            runtimeRecovery = "active"
+	runtimeRecoveryPendingAbsent     runtimeRecovery = "pending_confirmed_absent"
+	runtimeRecoveryPendingRunning    runtimeRecovery = "pending_present_running"
+	runtimeRecoveryPendingNotRunning runtimeRecovery = "pending_present_not_running"
+	runtimeRecoveryDestroyingAbsent  runtimeRecovery = "destroying_absent"
+)
 
 var _ contracts.RuntimeDriver = (*Provider)(nil)
 
@@ -202,8 +224,9 @@ func New(config Config) (*Provider, error) {
 			),
 			SensitiveInputs: []string{"oci archive", "runtime logs"},
 		},
-		deploys: make(map[string]*deployRecord),
-		states:  make(map[domain.ID]*runtimeState),
+		deploys:        make(map[string]*deployRecord),
+		states:         make(map[domain.ID]*runtimeState),
+		lifecycleLocks: make(map[domain.ID]*sync.Mutex),
 	}, nil
 }
 
@@ -211,7 +234,25 @@ func NewProvider(config Config) (*Provider, error) { return New(config) }
 
 func (p *Provider) Metadata(context.Context) contracts.ProviderMetadata { return p.metadata }
 
+func (p *Provider) lockDeployment(id domain.ID) func() {
+	p.guardMu.Lock()
+	lock := p.lifecycleLocks[id]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		p.lifecycleLocks[id] = lock
+	}
+	p.guardMu.Unlock()
+	lock.Lock()
+	return lock.Unlock
+}
+
 func (p *Provider) Deploy(ctx context.Context, request contracts.DeployRequest) (domain.Deployment, error) {
+	unlock := p.lockDeployment(request.DeploymentID)
+	defer unlock()
+	return p.deployOperation(ctx, request)
+}
+
+func (p *Provider) deployOperation(ctx context.Context, request contracts.DeployRequest) (domain.Deployment, error) {
 	if err := p.check(ctx, request.Operation, contracts.CapabilityRuntimeDeploy, "deploy"); err != nil {
 		return domain.Deployment{}, err
 	}
@@ -232,6 +273,15 @@ func (p *Provider) Deploy(ctx context.Context, request contracts.DeployRequest) 
 		p.mu.Unlock()
 		select {
 		case <-previous.done:
+			if previous.err == nil {
+				p.mu.Lock()
+				state := p.states[previous.deployment.ID]
+				destroyed := state != nil && state.destroyed
+				p.mu.Unlock()
+				if destroyed {
+					return domain.Deployment{}, p.failure(request.Operation, contracts.CapabilityRuntimeDeploy, "deploy", contracts.ErrConflict, "destroyed runtime rejects replay of its prior deploy operation", contracts.RetryNever, false, nil)
+				}
+			}
 			return previous.deployment, previous.err
 		case <-ctx.Done():
 			return domain.Deployment{}, p.contextError(request.Operation, contracts.CapabilityRuntimeDeploy, "deploy", ctx.Err())
@@ -248,8 +298,87 @@ func (p *Provider) Deploy(ctx context.Context, request contracts.DeployRequest) 
 		p.states[deployment.ID] = state
 	}
 	close(record.done)
+	if err != nil {
+		delete(p.deploys, key)
+	}
 	p.mu.Unlock()
 	return deployment, err
+}
+
+// Recreate is the standalone-only linear replacement operation. It never
+// keeps an older container: a replay either returns its durable success or
+// resumes from the persisted destroyed state with the same immutable spec.
+func (p *Provider) Recreate(ctx context.Context, request contracts.DeployRequest) (domain.Deployment, error) {
+	unlock := p.lockDeployment(request.DeploymentID)
+	defer unlock()
+	if err := p.check(ctx, request.Operation, contracts.CapabilityRuntimeDeploy, "recreate"); err != nil {
+		return domain.Deployment{}, err
+	}
+	if request.DeploymentID.Empty() || p.validateSpec(request.Spec, request.Operation) != nil {
+		return domain.Deployment{}, p.failure(request.Operation, contracts.CapabilityRuntimeDeploy, "recreate", contracts.ErrInvalidArgument, "runtime deployment and immutable spec are invalid", contracts.RetryNever, false, nil)
+	}
+	actionHash := actionIdentity("recreate", request.Operation.IdempotencyKey)
+	if state, err := p.ensureState(ctx, request.DeploymentID, request.Operation, contracts.CapabilityRuntimeDeploy, "recreate"); err == nil {
+		p.mu.Lock()
+		if action, ok := state.actions[actionHash]; ok && action.action == "recreate" && action.fingerprint == state.fingerprint {
+			if action.status == "succeeded" {
+				deployment := state.deployment
+				p.mu.Unlock()
+				return deployment, nil
+			}
+			if state.phase == "active" && state.containerID != "" && state.containerID != action.previousContainerID {
+				action.status, action.at = "succeeded", p.config.Clock().UTC()
+				state.actions[actionHash], state.updatedAt = action, action.at
+				persistErr := p.persistState(state)
+				deployment := state.deployment
+				p.mu.Unlock()
+				if persistErr != nil {
+					return domain.Deployment{}, p.failure(request.Operation, contracts.CapabilityRuntimeDeploy, "persist_state", contracts.ErrUnavailable, "recreated runtime state could not be persisted", contracts.RetryBackoff, true, persistErr)
+				}
+				return deployment, nil
+			}
+		} else {
+			now := p.config.Clock().UTC()
+			state.actions[actionHash] = runtimeAction{identityHash: actionHash, action: "recreate", fingerprint: state.fingerprint, status: "started", previousContainerID: state.containerID, at: now}
+			state.updatedAt = now
+			if persistErr := p.persistState(state); persistErr != nil {
+				p.mu.Unlock()
+				return domain.Deployment{}, p.failure(request.Operation, contracts.CapabilityRuntimeDeploy, "persist_state", contracts.ErrUnavailable, "pending recreate state could not be persisted", contracts.RetryBackoff, true, persistErr)
+			}
+		}
+		destroyed := state.destroyed
+		p.mu.Unlock()
+		if !destroyed {
+			destroy := contracts.DestroyRequest{DeploymentID: request.DeploymentID, Operation: request.Operation}
+			destroy.Operation.IdempotencyKey += ":recreate-destroy"
+			if err := p.destroyOperation(ctx, destroy); err != nil {
+				return domain.Deployment{}, err
+			}
+		}
+	} else if !isProviderCode(err, contracts.ErrNotFound) {
+		return domain.Deployment{}, err
+	}
+	deploy := request
+	deploy.Operation.IdempotencyKey += ":recreate-deploy"
+	deployment, err := p.deployOperation(ctx, deploy)
+	if err != nil {
+		return domain.Deployment{}, err
+	}
+	p.mu.Lock()
+	state := p.states[deployment.ID]
+	if state == nil {
+		p.mu.Unlock()
+		return domain.Deployment{}, p.failure(request.Operation, contracts.CapabilityRuntimeDeploy, "recreate", contracts.ErrUnavailable, "recreated runtime state is unavailable", contracts.RetryAfterReconnect, true, nil)
+	}
+	now := p.config.Clock().UTC()
+	state.actions[actionHash] = runtimeAction{identityHash: actionHash, action: "recreate", fingerprint: state.fingerprint, status: "succeeded", at: now}
+	state.updatedAt = now
+	persistErr := p.persistState(state)
+	p.mu.Unlock()
+	if persistErr != nil {
+		return domain.Deployment{}, p.failure(request.Operation, contracts.CapabilityRuntimeDeploy, "persist_state", contracts.ErrUnavailable, "recreated runtime state could not be persisted", contracts.RetryBackoff, true, persistErr)
+	}
+	return deployment, nil
 }
 
 func (p *Provider) deploy(ctx context.Context, request contracts.DeployRequest, fingerprint string) (deployment domain.Deployment, state *runtimeState, err error) {
@@ -262,23 +391,99 @@ func (p *Provider) deploy(ctx context.Context, request contracts.DeployRequest, 
 	if err := deployment.Transition(domain.DeploymentPreparing, p.config.Clock()); err != nil {
 		return domain.Deployment{}, nil, p.failure(request.Operation, contracts.CapabilityRuntimeDeploy, "deploy", contracts.ErrValidation, "deployment transition is invalid", contracts.RetryNever, false, err)
 	}
+	var priorActions []durableRuntimeAction
+	leaseGeneration := 0
+	if snapshot, found, readErr := p.readDurableState(request.DeploymentID); readErr != nil {
+		return domain.Deployment{}, nil, p.failure(request.Operation, contracts.CapabilityRuntimeDeploy, "deploy", contracts.ErrUnavailable, "durable runtime state could not be read", contracts.RetryAfterReconnect, true, readErr)
+	} else if found {
+		if snapshot.Fingerprint != fingerprint {
+			return domain.Deployment{}, nil, p.failure(request.Operation, contracts.CapabilityRuntimeDeploy, "deploy", contracts.ErrConflict, "durable runtime state does not match the immutable deployment", contracts.RetryNever, false, nil)
+		}
+		if snapshot.Phase == "active" {
+			state, stateErr := p.stateFromDurable(ctx, snapshot, request.Operation, contracts.CapabilityRuntimeDeploy, "deploy")
+			if stateErr != nil {
+				return domain.Deployment{}, nil, stateErr
+			}
+			return state.deployment, state, nil
+		}
+		if snapshot.Phase == "pending" {
+			state, stateErr := p.stateFromDurable(ctx, snapshot, request.Operation, contracts.CapabilityRuntimeDeploy, "deploy")
+			if stateErr != nil {
+				return domain.Deployment{}, nil, stateErr
+			}
+			if state.recovery == runtimeRecoveryPendingAbsent {
+				leaseGeneration = state.leaseGeneration
+			} else if state.recovery == runtimeRecoveryPendingNotRunning {
+				return domain.Deployment{}, nil, p.failure(request.Operation, contracts.CapabilityRuntimeDeploy, "deploy", contracts.ErrConflict, "pending runtime is present but not running", contracts.RetryNever, false, nil)
+			} else {
+				return state.deployment, state, nil
+			}
+			// A pending ledger with no provable live container is not adopted. The
+			// new attempt overwrites it only after it obtains a fresh lease.
+		}
+		if snapshot.Phase == "destroyed" {
+			priorActions = append(priorActions, snapshot.Actions...)
+			for _, action := range snapshot.Actions {
+				if action.IdentityHash == actionIdentity("deploy", request.Operation.IdempotencyKey) && action.Action == "deploy" {
+					return domain.Deployment{}, nil, p.failure(request.Operation, contracts.CapabilityRuntimeDeploy, "deploy", contracts.ErrConflict, "destroyed runtime rejects replay of its prior deploy operation", contracts.RetryNever, false, nil)
+				}
+			}
+		}
+	}
 	container := p.config.TaskPrefix + "-runtime-" + hash(string(deployment.ID))[:20]
-	if recovered, ok, recoverErr := p.recover(ctx, container, deployment, request); recoverErr != nil {
+	if _, ok, recoverErr := p.recover(ctx, container, deployment, request); recoverErr != nil {
 		return domain.Deployment{}, nil, recoverErr
 	} else if ok {
-		return recovered.deployment, recovered, nil
+		return domain.Deployment{}, nil, p.failure(request.Operation, contracts.CapabilityRuntimeDeploy, "deploy", contracts.ErrConflict, "active runtime without a durable ledger cannot be adopted", contracts.RetryNever, false, nil)
+	}
+	now := p.config.Clock().UTC()
+	pending := &runtimeState{deployment: deployment, service: request.Spec.ServiceName, image: request.Spec.Image, container: container, containerPort: request.Spec.Port, phase: "pending", fingerprint: fingerprint, createdAt: now, updatedAt: now, leaseGeneration: leaseGeneration, actions: make(map[string]runtimeAction), resources: request.Spec.Resources}
+	if err := p.persistState(pending); err != nil {
+		return domain.Deployment{}, nil, p.failure(request.Operation, contracts.CapabilityRuntimeDeploy, "persist_state", contracts.ErrUnavailable, "pending runtime generation could not be persisted", contracts.RetryBackoff, true, err)
 	}
 	capacityOperation := request.Operation
-	capacityOperation.IdempotencyKey += ":runtime-capacity"
-	capacity, err := p.config.Capacity.Reserve(ctx, contracts.CapacityRequest{Scope: contracts.CapacityRuntime, Resources: request.Spec.Resources, HostPorts: 1, Operation: capacityOperation})
+	capacityOperation.IdempotencyKey += ":runtime-capacity-reserve:" + strconv.Itoa(leaseGeneration)
+	hostPorts := 0
+	if request.Spec.Port != 0 {
+		hostPorts = 1
+	}
+	capacity, err := p.config.Capacity.Reserve(ctx, contracts.CapacityRequest{Scope: contracts.CapacityRuntime, Resources: request.Spec.Resources, HostPorts: hostPorts, Operation: capacityOperation})
 	if err != nil {
 		return domain.Deployment{}, nil, err
+	}
+	pending.capacity = &capacity
+	pending.port = capacity.HostPort
+	pending.updatedAt = p.config.Clock().UTC()
+	if err := p.persistState(pending); err != nil {
+		persistErr := err
+		releaseOperation := request.Operation
+		releaseOperation.IdempotencyKey += ":runtime-capacity-release:" + strconv.Itoa(leaseGeneration)
+		if releaseErr := p.config.Capacity.Release(context.Background(), capacity, releaseOperation); releaseErr != nil {
+			return domain.Deployment{}, nil, fmt.Errorf("persist pending lease: %w; release lease: %v", persistErr, releaseErr)
+		}
+		pending.capacity = nil
+		pending.leaseGeneration++
+		pending.updatedAt = p.config.Clock().UTC()
+		if cleanupErr := p.persistState(pending); cleanupErr != nil {
+			return domain.Deployment{}, nil, fmt.Errorf("persist pending lease: %w; persist released lease cleanup: %v", persistErr, cleanupErr)
+		}
+		return domain.Deployment{}, nil, p.failure(request.Operation, contracts.CapabilityRuntimeDeploy, "persist_state", contracts.ErrUnavailable, "pending runtime lease could not be persisted", contracts.RetryBackoff, true, persistErr)
 	}
 	defer func() {
 		if err != nil {
 			releaseOperation := request.Operation
-			releaseOperation.IdempotencyKey += ":runtime-capacity-release"
-			_ = p.config.Capacity.Release(context.Background(), capacity, releaseOperation)
+			releaseOperation.IdempotencyKey += ":runtime-capacity-release:" + strconv.Itoa(leaseGeneration)
+			releaseErr := p.config.Capacity.Release(context.Background(), capacity, releaseOperation)
+			if releaseErr == nil {
+				pending.capacity = nil
+				pending.leaseGeneration++
+				pending.updatedAt = p.config.Clock().UTC()
+				if persistErr := p.persistState(pending); persistErr != nil {
+					err = fmt.Errorf("%w; persist cleanup: %v", err, persistErr)
+				}
+			} else {
+				err = fmt.Errorf("%w; release cleanup: %v", err, releaseErr)
+			}
 		}
 	}()
 	archive, stored, err := p.config.ImageStore.OpenOCI(ctx, request.Spec.Image, request.Operation)
@@ -313,67 +518,47 @@ func (p *Provider) deploy(ctx context.Context, request contracts.DeployRequest, 
 	}
 	args := p.runArgs(container, deployment, request.Spec, port)
 	activateOperation := request.Operation
-	activateOperation.IdempotencyKey += ":runtime-capacity-activate"
+	activateOperation.IdempotencyKey += ":runtime-capacity-activate:" + strconv.Itoa(leaseGeneration)
 	if err = p.config.Capacity.Activate(ctx, capacity, activateOperation); err != nil {
 		return domain.Deployment{}, nil, err
+	}
+	pending.port = port
+	pending.capacity = &capacity
+	pending.updatedAt = p.config.Clock().UTC()
+	if err := p.persistState(pending); err != nil {
+		return domain.Deployment{}, nil, p.failure(request.Operation, contracts.CapabilityRuntimeDeploy, "persist_state", contracts.ErrUnavailable, "pending runtime state could not be persisted", contracts.RetryBackoff, true, err)
 	}
 	if err := p.run(ctx, args); err != nil {
 		return domain.Deployment{}, nil, p.commandError(request.Operation, contracts.CapabilityRuntimeDeploy, "deploy", err)
 	}
+	facts, inspectErr := p.inspectFacts(ctx, container)
+	observedPort, matches := facts.matchesRunning(p.config, deployment, request.Spec)
+	if inspectErr != nil || !matches || observedPort != port {
+		_ = p.run(context.Background(), []string{"rm", "--force", container})
+		return domain.Deployment{}, nil, p.failure(request.Operation, contracts.CapabilityRuntimeDeploy, "inspect", contracts.ErrConflict, "Docker runtime facts do not match the constrained deployment", contracts.RetryNever, false, inspectErr)
+	}
 	if err := deployment.Transition(domain.DeploymentRuntimeReady, p.config.Clock()); err != nil {
 		return domain.Deployment{}, nil, p.failure(request.Operation, contracts.CapabilityRuntimeDeploy, "deploy", contracts.ErrValidation, "deployment transition is invalid", contracts.RetryNever, false, err)
 	}
-	return deployment, &runtimeState{deployment: deployment, service: request.Spec.ServiceName, container: container, port: port, actions: make(map[string]struct{}), capacity: &capacity, resources: request.Spec.Resources}, nil
+	state = &runtimeState{deployment: deployment, service: request.Spec.ServiceName, image: request.Spec.Image, container: container, containerID: facts.ID, port: port, containerPort: request.Spec.Port, phase: "active", fingerprint: fingerprint, createdAt: now, updatedAt: p.config.Clock().UTC(), leaseGeneration: leaseGeneration, actions: make(map[string]runtimeAction), capacity: &capacity, resources: request.Spec.Resources}
+	for _, action := range priorActions {
+		state.actions[action.IdentityHash] = runtimeAction{identityHash: action.IdentityHash, action: action.Action, fingerprint: action.Fingerprint, status: action.Status, previousContainerID: action.PreviousContainerID, previousStartedAt: action.PreviousStartedAt, releaseAttempt: action.ReleaseAttempt, at: action.At}
+	}
+	deployAction := actionIdentity("deploy", request.Operation.IdempotencyKey)
+	state.actions[deployAction] = runtimeAction{identityHash: deployAction, action: "deploy", fingerprint: fingerprint, status: "succeeded", at: now}
+	if err := p.persistState(state); err != nil {
+		_ = p.run(context.Background(), []string{"rm", "--force", container})
+		return domain.Deployment{}, nil, p.failure(request.Operation, contracts.CapabilityRuntimeDeploy, "persist_state", contracts.ErrUnavailable, "durable runtime state could not be persisted", contracts.RetryBackoff, true, err)
+	}
+	return deployment, state, nil
 }
 
 func (p *Provider) recover(ctx context.Context, container string, deployment domain.Deployment, request contracts.DeployRequest) (*runtimeState, bool, error) {
-	output, err := p.output(ctx, []string{"container", "inspect", "--format", "{{json .}}", container})
+	facts, err := p.inspectFacts(ctx, container)
 	if err != nil {
 		return nil, false, nil
 	}
-	var value struct {
-		Image  string `json:"Image"`
-		Config struct {
-			Labels  map[string]string `json:"Labels"`
-			Volumes map[string]any    `json:"Volumes"`
-		} `json:"Config"`
-		State struct {
-			Running bool `json:"Running"`
-		} `json:"State"`
-		HostConfig struct {
-			NetworkMode  string   `json:"NetworkMode"`
-			Privileged   bool     `json:"Privileged"`
-			Binds        []string `json:"Binds"`
-			CapAdd       []string `json:"CapAdd"`
-			Memory       int64    `json:"Memory"`
-			MemorySwap   int64    `json:"MemorySwap"`
-			CpuPeriod    int64    `json:"CpuPeriod"`
-			CpuQuota     int64    `json:"CpuQuota"`
-			PidsLimit    *int64   `json:"PidsLimit"`
-			SecurityOpt  []string `json:"SecurityOpt"`
-			PortBindings map[string][]struct {
-				HostIP   string `json:"HostIp"`
-				HostPort string `json:"HostPort"`
-			} `json:"PortBindings"`
-		} `json:"HostConfig"`
-	}
-	if err := json.Unmarshal([]byte(output), &value); err != nil {
-		return nil, true, p.failure(request.Operation, contracts.CapabilityRuntimeDeploy, "deploy", contracts.ErrConflict, "existing task container has invalid inspection data", contracts.RetryNever, false, nil)
-	}
-	labels := value.Config.Labels
-	valid := labels["open-card.managed"] == "true" && labels["open-card.task-prefix"] == p.config.TaskPrefix && labels["open-card.deployment-id"] == deployment.ID.String() && labels["open-card.service"] == request.Spec.ServiceName
-	valid = valid && value.Image == request.Spec.Image.Digest && value.State.Running && value.HostConfig.NetworkMode == p.config.Network && !value.HostConfig.Privileged && len(value.HostConfig.Binds) == 0 && len(value.HostConfig.CapAdd) == 0 && len(value.Config.Volumes) == 0
-	valid = valid && value.HostConfig.Memory == request.Spec.Resources.MemoryBytes && value.HostConfig.MemorySwap == request.Spec.Resources.MemoryBytes && value.HostConfig.CpuPeriod == 100000 && value.HostConfig.CpuQuota == request.Spec.Resources.CPUMillis*100 && contains(value.HostConfig.SecurityOpt, "no-new-privileges=true")
-	valid = valid && value.HostConfig.PidsLimit != nil && *value.HostConfig.PidsLimit == request.Spec.Resources.PIDs
-	port := 0
-	if request.Spec.Port != 0 {
-		bindings := value.HostConfig.PortBindings[fmt.Sprintf("%d/tcp", request.Spec.Port)]
-		if len(bindings) != 1 || bindings[0].HostIP != "127.0.0.1" {
-			valid = false
-		} else if _, err := fmt.Sscan(bindings[0].HostPort, &port); err != nil || port < 1 || port > 65535 {
-			valid = false
-		}
-	}
+	port, valid := facts.matchesRunning(p.config, deployment, request.Spec)
 	if !valid {
 		return nil, true, p.failure(request.Operation, contracts.CapabilityRuntimeDeploy, "deploy", contracts.ErrConflict, "existing task container does not match the immutable constrained deployment", contracts.RetryNever, false, nil)
 	}
@@ -383,16 +568,8 @@ func (p *Provider) recover(ctx context.Context, container string, deployment dom
 	if err := deployment.Transition(domain.DeploymentRuntimeReady, p.config.Clock()); err != nil {
 		return nil, true, err
 	}
-	return &runtimeState{deployment: deployment, service: request.Spec.ServiceName, container: container, port: port, actions: make(map[string]struct{}), resources: request.Spec.Resources}, true, nil
-}
-
-func contains(values []string, expected string) bool {
-	for _, value := range values {
-		if value == expected {
-			return true
-		}
-	}
-	return false
+	now := p.config.Clock().UTC()
+	return &runtimeState{deployment: deployment, service: request.Spec.ServiceName, image: request.Spec.Image, container: container, containerID: facts.ID, port: port, containerPort: request.Spec.Port, phase: "active", fingerprint: p.fingerprint(deployment.ID, request.Spec), createdAt: now, updatedAt: now, actions: make(map[string]runtimeAction), resources: request.Spec.Resources}, true, nil
 }
 
 func (p *Provider) Observe(ctx context.Context, request contracts.ObserveRequest) (contracts.RuntimeObservation, error) {
@@ -404,17 +581,21 @@ func (p *Provider) Observe(ctx context.Context, request contracts.ObserveRequest
 		return contracts.RuntimeObservation{}, err
 	}
 	if state.destroyed {
-		return p.observation(state, "stopped", false, 0, 0, 0, request.Operation), nil
+		return p.observation(state, "stopped", false, 0, 0, 0, contracts.ResourceLimits{}, false, "", request.Operation), nil
 	}
-	output, err := p.output(ctx, []string{"inspect", "--format", "{{json .State}}|{{.RestartCount}}", state.container})
+	facts, err := p.inspectFacts(ctx, state.container)
 	if err != nil {
 		return contracts.RuntimeObservation{}, p.commandError(request.Operation, contracts.CapabilityRuntimeObserve, "observe", err)
 	}
-	status, healthy, restarts, err := parseState(output)
-	if err != nil {
-		return contracts.RuntimeObservation{}, p.failure(request.Operation, contracts.CapabilityRuntimeObserve, "observe", contracts.ErrValidation, "Docker returned an invalid runtime observation", contracts.RetryNever, false, nil)
+	port, valid := facts.matchesConfiguration(p.config, state.deployment, contracts.RuntimeSpec{ApplicationID: state.deployment.ApplicationID, EnvironmentID: state.deployment.EnvironmentID, ReleaseID: state.deployment.ReleaseID, ServiceName: state.service, Image: state.image, Resources: state.resources, Port: state.containerPort})
+	if !valid || port != state.port {
+		return contracts.RuntimeObservation{}, p.failure(request.Operation, contracts.CapabilityRuntimeObserve, "observe", contracts.ErrConflict, "Docker runtime readback does not match the constrained deployment", contracts.RetryNever, false, nil)
 	}
-	return p.observation(state, status, healthy, restarts, 0, 0, request.Operation), nil
+	status := facts.State.Status
+	if status == "" && facts.State.Running {
+		status = "running"
+	}
+	return p.observation(state, status, facts.State.Running, facts.RestartCount, 0, 0, state.resources, true, facts.ID, request.Operation), nil
 }
 
 func (p *Provider) Logs(ctx context.Context, request contracts.LogsRequest) (<-chan string, error) {
@@ -451,7 +632,12 @@ func (p *Provider) Logs(ctx context.Context, request contracts.LogsRequest) (<-c
 }
 
 func (p *Provider) Restart(ctx context.Context, request contracts.RestartRequest) error {
+	unlock := p.lockDeployment(request.DeploymentID)
+	defer unlock()
 	if err := p.check(ctx, request.Operation, contracts.CapabilityRuntimeRestart, "restart"); err != nil {
+		return err
+	}
+	if _, err := p.ensureState(ctx, request.DeploymentID, request.Operation, contracts.CapabilityRuntimeRestart, "restart"); err != nil {
 		return err
 	}
 	p.mu.Lock()
@@ -463,13 +649,40 @@ func (p *Provider) Restart(ctx context.Context, request contracts.RestartRequest
 	if request.ServiceName != "" && request.ServiceName != state.service {
 		return p.failure(request.Operation, contracts.CapabilityRuntimeRestart, "restart", contracts.ErrValidation, "runtime service does not match deployment", contracts.RetryNever, false, nil)
 	}
-	if _, done := state.actions[request.Operation.IdempotencyKey]; done {
+	actionHash := actionIdentity("restart", request.Operation.IdempotencyKey)
+	if action, done := state.actions[actionHash]; done && action.status == "succeeded" && action.action == "restart" && action.fingerprint == state.fingerprint {
 		return nil
+	}
+	facts, inspectErr := p.inspectFacts(ctx, state.container)
+	_, matches := facts.matchesConfiguration(p.config, state.deployment, contracts.RuntimeSpec{ApplicationID: state.deployment.ApplicationID, EnvironmentID: state.deployment.EnvironmentID, ReleaseID: state.deployment.ReleaseID, ServiceName: state.service, Image: state.image, Resources: state.resources, Port: state.containerPort})
+	if inspectErr != nil || !matches {
+		return p.failure(request.Operation, contracts.CapabilityRuntimeRestart, "restart", contracts.ErrConflict, "runtime facts do not match before restart", contracts.RetryNever, false, inspectErr)
+	}
+	if action, started := state.actions[actionHash]; started && action.action == "restart" && action.fingerprint == state.fingerprint && action.status == "started" && action.previousStartedAt != "" && facts.State.StartedAt != "" && facts.State.StartedAt != action.previousStartedAt {
+		action.status, action.at = "succeeded", p.config.Clock().UTC()
+		state.actions[actionHash], state.updatedAt = action, action.at
+		if err := p.persistState(state); err != nil {
+			return p.failure(request.Operation, contracts.CapabilityRuntimeRestart, "persist_state", contracts.ErrUnavailable, "recovered restart state could not be persisted", contracts.RetryBackoff, true, err)
+		}
+		return nil
+	}
+	if _, started := state.actions[actionHash]; !started {
+		now := p.config.Clock().UTC()
+		state.actions[actionHash] = runtimeAction{identityHash: actionHash, action: "restart", fingerprint: state.fingerprint, status: "started", previousContainerID: facts.ID, previousStartedAt: facts.State.StartedAt, at: now}
+		state.updatedAt = now
+		if err := p.persistState(state); err != nil {
+			return p.failure(request.Operation, contracts.CapabilityRuntimeRestart, "persist_state", contracts.ErrUnavailable, "pending restart state could not be persisted", contracts.RetryBackoff, true, err)
+		}
 	}
 	if err := p.run(ctx, []string{"restart", state.container}); err != nil {
 		return p.commandError(request.Operation, contracts.CapabilityRuntimeRestart, "restart", err)
 	}
-	state.actions[request.Operation.IdempotencyKey] = struct{}{}
+	now := p.config.Clock().UTC()
+	state.actions[actionHash] = runtimeAction{identityHash: actionHash, action: "restart", fingerprint: state.fingerprint, status: "succeeded", at: now}
+	state.updatedAt = now
+	if err := p.persistState(state); err != nil {
+		return p.failure(request.Operation, contracts.CapabilityRuntimeRestart, "persist_state", contracts.ErrUnavailable, "restarted runtime state could not be persisted", contracts.RetryBackoff, true, err)
+	}
 	return nil
 }
 
@@ -482,7 +695,16 @@ func (p *Provider) Rollback(ctx context.Context, request contracts.RollbackReque
 }
 
 func (p *Provider) Destroy(ctx context.Context, request contracts.DestroyRequest) error {
+	unlock := p.lockDeployment(request.DeploymentID)
+	defer unlock()
+	return p.destroyOperation(ctx, request)
+}
+
+func (p *Provider) destroyOperation(ctx context.Context, request contracts.DestroyRequest) error {
 	if err := p.check(ctx, request.Operation, contracts.CapabilityRuntimeDestroy, "destroy"); err != nil {
+		return err
+	}
+	if _, err := p.ensureState(ctx, request.DeploymentID, request.Operation, contracts.CapabilityRuntimeDestroy, "destroy"); err != nil {
 		return err
 	}
 	p.mu.Lock()
@@ -491,22 +713,48 @@ func (p *Provider) Destroy(ctx context.Context, request contracts.DestroyRequest
 	if err != nil {
 		return err
 	}
-	if state.destroyed || hasAction(state, request.Operation.IdempotencyKey) {
+	actionHash := actionIdentity("destroy", request.Operation.IdempotencyKey)
+	if action, ok := state.actions[actionHash]; ok && action.action == "destroy" && action.fingerprint == state.fingerprint && action.status == "succeeded" && state.destroyed && state.capacity == nil {
 		return nil
 	}
-	if err := p.run(ctx, []string{"rm", "--force", state.container}); err != nil {
-		return p.commandError(request.Operation, contracts.CapabilityRuntimeDestroy, "destroy", err)
-	}
-	state.destroyed = true
-	state.actions[request.Operation.IdempotencyKey] = struct{}{}
-	if state.port != 0 {
+	if !state.destroyed {
+		now := p.config.Clock().UTC()
+		state.actions[actionHash] = runtimeAction{identityHash: actionHash, action: "destroy", fingerprint: state.fingerprint, status: "started", previousContainerID: state.containerID, at: now}
+		state.phase, state.updatedAt = "destroying", now
+		if err := p.persistState(state); err != nil {
+			return p.failure(request.Operation, contracts.CapabilityRuntimeDestroy, "persist_state", contracts.ErrUnavailable, "pending destroy state could not be persisted", contracts.RetryBackoff, true, err)
+		}
+		if err := p.run(ctx, []string{"rm", "--force", state.container}); err != nil {
+			return p.commandError(request.Operation, contracts.CapabilityRuntimeDestroy, "destroy", err)
+		}
+		state.destroyed = true
+		state.phase, state.updatedAt = "destroyed", p.config.Clock().UTC()
 		state.port = 0
+		if err := p.persistState(state); err != nil {
+			return p.failure(request.Operation, contracts.CapabilityRuntimeDestroy, "persist_state", contracts.ErrUnavailable, "removed runtime state could not be persisted", contracts.RetryBackoff, true, err)
+		}
 	}
 	if state.capacity != nil {
-		if err := p.config.Capacity.Release(ctx, *state.capacity, request.Operation); err != nil {
+		action := state.actions[actionHash]
+		action.releaseAttempt++
+		state.actions[actionHash] = action
+		state.updatedAt = p.config.Clock().UTC()
+		if err := p.persistState(state); err != nil {
+			return p.failure(request.Operation, contracts.CapabilityRuntimeDestroy, "persist_state", contracts.ErrUnavailable, "pending capacity release state could not be persisted", contracts.RetryBackoff, true, err)
+		}
+		releaseOperation := request.Operation
+		releaseOperation.IdempotencyKey += ":destroy-release:" + strconv.Itoa(action.releaseAttempt)
+		if err := p.config.Capacity.Release(ctx, *state.capacity, releaseOperation); err != nil {
 			return err
 		}
 		state.capacity = nil
+	}
+	action := state.actions[actionHash]
+	action.status, action.at = "succeeded", p.config.Clock().UTC()
+	state.actions[actionHash] = action
+	state.updatedAt = action.at
+	if err := p.persistState(state); err != nil {
+		return p.failure(request.Operation, contracts.CapabilityRuntimeDestroy, "persist_state", contracts.ErrUnavailable, "destroyed runtime state could not be persisted", contracts.RetryBackoff, true, err)
 	}
 	return nil
 }
@@ -583,7 +831,12 @@ func (p *Provider) runArgs(container string, deployment domain.Deployment, spec 
 		"--label", "open-card.managed=true",
 		"--label", "open-card.task-prefix=" + p.config.TaskPrefix,
 		"--label", "open-card.deployment-id=" + string(deployment.ID),
+		"--label", "open-card.application-id=" + string(deployment.ApplicationID),
+		"--label", "open-card.environment-id=" + string(deployment.EnvironmentID),
+		"--label", "open-card.release-id=" + string(deployment.ReleaseID),
 		"--label", "open-card.service=" + spec.ServiceName,
+		"--label", "open-card.image-repository=" + spec.Image.Repository,
+		"--label", "open-card.image-digest=" + spec.Image.Digest,
 	}
 	if port != 0 {
 		args = append(args, "--publish", fmt.Sprintf("127.0.0.1:%d:%d/tcp", port, spec.Port))
@@ -623,13 +876,44 @@ func (p *Provider) copyArchive(source io.Reader) (string, error) {
 }
 
 func (p *Provider) state(id domain.ID, operation contracts.OperationContext, capability contracts.Capability, action string) (runtimeState, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	state, err := p.stateLocked(id, operation, capability, action)
+	state, err := p.ensureState(context.Background(), id, operation, capability, action)
 	if err != nil {
 		return runtimeState{}, err
 	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	return *state, nil
+}
+
+func (p *Provider) ensureState(ctx context.Context, id domain.ID, operation contracts.OperationContext, capability contracts.Capability, action string) (*runtimeState, error) {
+	if id.Empty() {
+		return nil, p.failure(operation, capability, action, contracts.ErrInvalidArgument, "deployment id is required", contracts.RetryNever, false, nil)
+	}
+	p.mu.Lock()
+	if state := p.states[id]; state != nil {
+		p.mu.Unlock()
+		return state, nil
+	}
+	p.mu.Unlock()
+	snapshot, found, err := p.readDurableState(id)
+	if err != nil {
+		return nil, p.failure(operation, capability, action, contracts.ErrUnavailable, "durable runtime state could not be read", contracts.RetryAfterReconnect, true, err)
+	}
+	if !found {
+		return nil, p.failure(operation, capability, action, contracts.ErrNotFound, "managed deployment was not found", contracts.RetryUserAction, false, nil)
+	}
+	loaded, err := p.stateFromDurable(ctx, snapshot, operation, capability, action)
+	if err != nil {
+		return nil, err
+	}
+	p.mu.Lock()
+	if existing := p.states[id]; existing != nil {
+		p.mu.Unlock()
+		return existing, nil
+	}
+	p.states[id] = loaded
+	p.mu.Unlock()
+	return loaded, nil
 }
 
 func (p *Provider) stateLocked(id domain.ID, operation contracts.OperationContext, capability contracts.Capability, action string) (*runtimeState, error) {
@@ -643,8 +927,8 @@ func (p *Provider) stateLocked(id domain.ID, operation contracts.OperationContex
 	return state, nil
 }
 
-func (p *Provider) observation(state runtimeState, status string, healthy bool, restarts uint64, cpu, memory int64, operation contracts.OperationContext) contracts.RuntimeObservation {
-	return contracts.RuntimeObservation{DeploymentID: state.deployment.ID, ServiceName: state.service, Status: status, Healthy: healthy, RestartCount: restarts, CPUUsageMillis: cpu, MemoryBytes: memory, HostPort: state.port, Limits: state.resources, ObservedAt: p.config.Clock().UTC(), Evidence: p.evidence(operation, "runtime.observe")}
+func (p *Provider) observation(state runtimeState, status string, healthy bool, restarts uint64, cpu, memory int64, observed contracts.ResourceLimits, cgroupVerified bool, containerID string, operation contracts.OperationContext) contracts.RuntimeObservation {
+	return contracts.RuntimeObservation{DeploymentID: state.deployment.ID, ServiceName: state.service, ContainerID: containerID, Status: status, Healthy: healthy, RestartCount: restarts, CPUUsageMillis: cpu, MemoryBytes: memory, HostPort: state.port, Limits: observed, CgroupVerified: cgroupVerified, ObservedAt: p.config.Clock().UTC(), Evidence: p.evidence(operation, "runtime.observe")}
 }
 
 func (p *Provider) output(ctx context.Context, args []string) (string, error) {
@@ -712,6 +996,11 @@ func (p *Provider) failure(operation contracts.OperationContext, capability cont
 	return &contracts.ProviderError{Provider: p.metadata.Name, Code: code, Message: message, Retry: retry, Retryable: retryable, Capability: capability, Operation: action, Cause: cause, Details: map[string]string{"evidence_ref": string(evidenceID(p.metadata.Name, action, operation.IdempotencyKey)), "log_ref": "runtime://" + p.metadata.Name + "/" + action + "/" + hash(operation.IdempotencyKey)[:16]}}
 }
 
+func isProviderCode(err error, code contracts.ErrorCode) bool {
+	var providerErr *contracts.ProviderError
+	return errors.As(err, &providerErr) && providerErr.Code == code
+}
+
 func (p *Provider) evidence(operation contracts.OperationContext, kind string) contracts.Evidence {
 	digest := "sha256:" + hash(p.metadata.Name, kind, operation.IdempotencyKey)
 	return contracts.Evidence{Refs: []domain.EvidenceRef{{ID: evidenceID(p.metadata.Name, kind, operation.IdempotencyKey), Kind: kind, Digest: digest, Locator: "runtime://" + p.metadata.Name + "/" + kind + "/" + hash(operation.IdempotencyKey)[:16]}}, Summary: "redacted standalone runtime observation", Digest: digest, Redacted: true}
@@ -725,7 +1014,14 @@ func imageRef(image domain.ImageDigest) string { return image.Digest }
 func sameImage(left, right domain.ImageDigest) bool {
 	return left.Repository == right.Repository && left.Digest == right.Digest
 }
-func hasAction(state *runtimeState, key string) bool { _, ok := state.actions[key]; return ok }
+func hasAction(state *runtimeState, key string) bool {
+	action, ok := state.actions[key]
+	return ok && action.status == "succeeded"
+}
+
+func actionIdentity(action, providerOperationKey string) string {
+	return hash(action + "\x00" + providerOperationKey)
+}
 func validImageID(value string) bool {
 	if !strings.HasPrefix(value, "sha256:") || len(strings.TrimPrefix(value, "sha256:")) != 64 {
 		return false
@@ -755,6 +1051,52 @@ func parseState(output string) (string, bool, uint64, error) {
 	}
 	healthy := state.Running && (state.Health == nil || state.Health.Status == "healthy")
 	return state.Status, healthy, restarts, nil
+}
+
+func parseRuntimeReadback(output string, state runtimeState) (string, bool, uint64, contracts.ResourceLimits, string, error) {
+	parts := strings.SplitN(strings.TrimSpace(output), "|", 9)
+	if len(parts) != 9 {
+		return "", false, 0, contracts.ResourceLimits{}, "", errors.New("invalid runtime inspect result")
+	}
+	status, healthy, restarts, err := parseState(parts[0] + "|" + parts[1])
+	if err != nil {
+		return "", false, 0, contracts.ResourceLimits{}, "", err
+	}
+	memory, memoryErr := strconv.ParseInt(strings.TrimSpace(parts[2]), 10, 64)
+	memorySwap, memorySwapErr := strconv.ParseInt(strings.TrimSpace(parts[3]), 10, 64)
+	cpuPeriod, cpuPeriodErr := strconv.ParseInt(strings.TrimSpace(parts[4]), 10, 64)
+	cpuQuota, cpuQuotaErr := strconv.ParseInt(strings.TrimSpace(parts[5]), 10, 64)
+	pids, pidsErr := strconv.ParseInt(strings.TrimSpace(parts[6]), 10, 64)
+	containerID := strings.TrimSpace(parts[7])
+	if memoryErr != nil || memorySwapErr != nil || cpuPeriodErr != nil || cpuQuotaErr != nil || pidsErr != nil || !validContainerID(containerID) || memory != state.resources.MemoryBytes || memorySwap != state.resources.MemoryBytes || cpuPeriod != 100000 || cpuQuota != state.resources.CPUMillis*100 || pids != state.resources.PIDs {
+		return "", false, 0, contracts.ResourceLimits{}, "", errors.New("runtime limits do not match")
+	}
+	var bindings map[string][]struct {
+		HostIP   string `json:"HostIp"`
+		HostPort string `json:"HostPort"`
+	}
+	if err := json.Unmarshal([]byte(parts[8]), &bindings); err != nil {
+		return "", false, 0, contracts.ResourceLimits{}, "", err
+	}
+	if state.port == 0 {
+		if len(bindings) != 0 {
+			return "", false, 0, contracts.ResourceLimits{}, "", errors.New("unexpected host port")
+		}
+	} else {
+		binding := bindings[fmt.Sprintf("%d/tcp", state.containerPort)]
+		if len(bindings) != 1 || len(binding) != 1 || binding[0].HostIP != "127.0.0.1" || binding[0].HostPort != strconv.Itoa(state.port) {
+			return "", false, 0, contracts.ResourceLimits{}, "", errors.New("loopback host port is absent")
+		}
+	}
+	return status, healthy, restarts, state.resources, containerID, nil
+}
+
+func validContainerID(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
 }
 
 func hash(parts ...string) string {

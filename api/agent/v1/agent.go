@@ -5,6 +5,7 @@
 package v1
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -67,6 +68,10 @@ const (
 	AgentCapabilityRuntimeRestartGroup        = "runtime.restart_group"
 	AgentCapabilityRuntimeRestart             = "runtime.restart"
 	AgentCapabilityRuntimeRollback            = "runtime.rollback"
+	// AgentCapabilityAcornFoxRuntime is the narrow single-service lifecycle
+	// surface. It is intentionally one capability because all five accepted
+	// actions share the same immutable runtime fact boundary.
+	AgentCapabilityAcornFoxRuntime = "acornfox.runtime.v1"
 )
 
 func (t TaskKind) RequiredCapability() string {
@@ -84,6 +89,14 @@ func (t TaskKind) RequiredCapability() string {
 // restart/rollback/redeploy merely because it supports a single-container
 // task with the same wire kind.
 func RequiredCapabilityForTaskRequest(task TaskRequest) string {
+	if marker, present := acornFoxPayloadMarker(task.Parameters); present {
+		switch marker {
+		case "deploy", "redeploy", "observe", "restart", "destroy":
+			return AgentCapabilityAcornFoxRuntime
+		default:
+			return "acornfox.unknown_payload"
+		}
+	}
 	var marker struct {
 		PayloadType string `json:"m4_payload_type"`
 	}
@@ -113,6 +126,25 @@ func RequiredCapabilityForTaskRequest(task TaskRequest) string {
 	default:
 		return task.Kind.RequiredCapability()
 	}
+}
+
+// acornFoxPayloadMarker recognizes only a top-level marker. A nested field
+// must not change task routing. Once a top-level marker is seen, the executor
+// performs the stricter complete-wrapper decode before any lifecycle effect.
+func acornFoxPayloadMarker(data json.RawMessage) (string, bool) {
+	var object map[string]json.RawMessage
+	if json.NewDecoder(bytes.NewReader(data)).Decode(&object) != nil {
+		return "", false
+	}
+	raw, present := object["acornfox_payload_type"]
+	if !present {
+		return "", false
+	}
+	var marker string
+	if json.Unmarshal(raw, &marker) != nil || strings.TrimSpace(marker) == "" {
+		return "", true
+	}
+	return marker, true
 }
 
 func IsAggregateRuntimeCapability(capability string) bool {
@@ -561,7 +593,7 @@ func validTaskResultStatus(status string) bool {
 
 func validObservationStatus(status string) bool {
 	switch status {
-	case "healthy", "unhealthy", "unknown", "pending", "preparing", "deploying", "runtime_ready", "degraded", "serving", "failed", "rolling_back", "rolled_back", "stopped":
+	case "created", "running", "restarting", "paused", "exited", "dead", "removing", "healthy", "unhealthy", "unknown", "pending", "preparing", "deploying", "runtime_ready", "degraded", "serving", "failed", "rolling_back", "rolled_back", "stopped":
 		return true
 	default:
 		return false

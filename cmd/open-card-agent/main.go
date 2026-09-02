@@ -12,7 +12,9 @@ import (
 
 	v1 "github.com/open-card/open-card/api/agent/v1"
 	"github.com/open-card/open-card/internal/agenttransport"
+	"github.com/open-card/open-card/internal/application"
 	"github.com/open-card/open-card/internal/contracts"
+	"github.com/open-card/open-card/internal/domain"
 	"github.com/open-card/open-card/internal/providers/capacity"
 	imageprovider "github.com/open-card/open-card/internal/providers/image"
 	"github.com/open-card/open-card/internal/providers/standalone"
@@ -78,6 +80,7 @@ func runOutboundAgent(controlPlaneURL, instanceID, nodeID, version string) {
 	var runtime contracts.RuntimeDriver
 	var groupRuntime contracts.ServiceGroupRuntimeDriver
 	var volumeRuntime contracts.VolumeProvider
+	var acornFoxRuntime contracts.AcornFoxRuntimeDriver
 	capabilities := []string{"docker.read.facts"}
 	if os.Getenv("OPEN_CARD_RUNTIME_ENABLED") == "true" {
 		if os.Getenv("OPEN_CARD_WORKER_NETWORK_ISOLATED") != "true" {
@@ -107,7 +110,7 @@ func runOutboundAgent(controlPlaneURL, instanceID, nodeID, version string) {
 		if capacityErr != nil {
 			log.Fatal(capacityErr)
 		}
-		runtime, storeErr = standalone.New(standalone.Config{
+		standaloneRuntime, storeErr := standalone.New(standalone.Config{
 			TaskPrefix:            os.Getenv("OPEN_CARD_RUNTIME_TASK_PREFIX"),
 			Network:               os.Getenv("OPEN_CARD_RUNTIME_NETWORK"),
 			WorkRoot:              os.Getenv("OPEN_CARD_RUNTIME_WORK_ROOT"),
@@ -118,7 +121,12 @@ func runOutboundAgent(controlPlaneURL, instanceID, nodeID, version string) {
 		if storeErr != nil {
 			log.Fatal(storeErr)
 		}
-		capabilities = append(capabilities, "runtime.deploy.digest", "runtime.observe", "runtime.logs", "runtime.restart", "runtime.destroy")
+		var runtimeCapabilities []string
+		runtime, acornFoxRuntime, runtimeCapabilities, storeErr = composeAcornFoxRuntime(context.Background(), standaloneRuntime)
+		if storeErr != nil {
+			log.Fatal(storeErr)
+		}
+		capabilities = append(capabilities, runtimeCapabilities...)
 		if os.Getenv("OPEN_CARD_M2_ENABLED") == "true" {
 			var metricsReader standalonegroup.RuntimeMetricsReader
 			if os.Getenv("OPEN_CARD_M4_ENABLED") == "true" {
@@ -143,7 +151,7 @@ func runOutboundAgent(controlPlaneURL, instanceID, nodeID, version string) {
 			capabilities = append(capabilities, v1.AgentCapabilityRuntimeDeployGroup, v1.AgentCapabilityRuntimeObserveGroup, v1.AgentCapabilityRuntimeLogsGroup, v1.AgentCapabilityRuntimeRollbackGroup, v1.AgentCapabilityRuntimeDestroyGroup, v1.AgentCapabilityRuntimeRestartGroupService, v1.AgentCapabilityRuntimeRestartGroup)
 		}
 	}
-	handler := NewOutboundHandlerWithProviders(instanceID, nodeID, facts, runtime, groupRuntime, volumeRuntime)
+	handler := NewOutboundHandlerWithProvidersAndAcornFoxRuntime(instanceID, nodeID, facts, runtime, groupRuntime, volumeRuntime, acornFoxRuntime)
 	certificateID := ""
 	if len(tlsConfig.Certificates) == 1 && len(tlsConfig.Certificates[0].Certificate) > 0 {
 		certificate, parseErr := x509.ParseCertificate(tlsConfig.Certificates[0].Certificate[0])
@@ -162,4 +170,27 @@ func runOutboundAgent(controlPlaneURL, instanceID, nodeID, version string) {
 	if err := client.Run(context.Background()); err != nil && !errors.Is(err, context.Canceled) {
 		log.Fatal(err)
 	}
+}
+
+type acornFoxRuntimeProvider interface {
+	contracts.RuntimeDriver
+	Recreate(context.Context, contracts.DeployRequest) (domain.Deployment, error)
+	Reconcile(context.Context) error
+}
+
+// composeAcornFoxRuntime keeps the startup invariant testable: reconciliation
+// happens before any runtime capability is returned to the caller. The legacy
+// driver is deliberately returned too so existing clients remain compatible.
+func composeAcornFoxRuntime(ctx context.Context, provider acornFoxRuntimeProvider) (contracts.RuntimeDriver, contracts.AcornFoxRuntimeDriver, []string, error) {
+	if provider == nil {
+		return nil, nil, nil, errors.New("standalone runtime is unavailable")
+	}
+	if err := provider.Reconcile(ctx); err != nil {
+		return nil, nil, nil, err
+	}
+	acornFoxRuntime, err := application.NewAcornFoxRuntimeService(provider)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return provider, acornFoxRuntime, []string{"runtime.deploy.digest", "runtime.observe", "runtime.logs", "runtime.restart", "runtime.destroy", v1.AgentCapabilityAcornFoxRuntime}, nil
 }

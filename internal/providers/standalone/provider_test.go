@@ -16,6 +16,7 @@ import (
 )
 
 const testDigest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+const testContainerID = "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
 
 type fakeRunner struct {
 	mu    sync.Mutex
@@ -82,11 +83,14 @@ func (s fakeImageStore) OpenOCI(_ context.Context, _ domain.ImageDigest, _ contr
 }
 
 type fixedPorts struct {
-	mu        sync.Mutex
-	port      int
-	allocated int
-	released  int
-	fail      bool
+	mu               sync.Mutex
+	port             int
+	allocated        int
+	released         int
+	reconciled       int
+	releaseFailures  int
+	fail             bool
+	hostPortRequests []int
 }
 
 func (p *fixedPorts) Allocate(context.Context) (int, error) {
@@ -109,6 +113,9 @@ func (p *fixedPorts) Preflight(_ context.Context, request contracts.CapacityRequ
 	return contracts.CapacitySnapshot{Scope: request.Scope, AvailableCPUMillis: 8000, AvailableMemoryBytes: 8 << 30, AvailableDiskBytes: 40 << 30}, contracts.Evidence{Redacted: true}, nil
 }
 func (p *fixedPorts) Reserve(ctx context.Context, request contracts.CapacityRequest) (contracts.CapacityLease, error) {
+	p.mu.Lock()
+	p.hostPortRequests = append(p.hostPortRequests, request.HostPorts)
+	p.mu.Unlock()
 	if p.fail {
 		return contracts.CapacityLease{}, &contracts.ProviderError{Provider: "fake-runtime-capacity", Code: contracts.ErrCapacity, Message: "capacity unavailable", Retry: contracts.RetryBackoff, Retryable: true}
 	}
@@ -139,9 +146,13 @@ func testRequest(key string) contracts.DeployRequest {
 }
 
 func testProvider(t *testing.T, runner *fakeRunner, ports *fixedPorts) *Provider {
+	return testProviderAt(t, t.TempDir(), runner, ports)
+}
+
+func testProviderAt(t *testing.T, workRoot string, runner *fakeRunner, ports *fixedPorts) *Provider {
 	t.Helper()
 	provider, err := New(Config{
-		TaskPrefix: "opencard-m1", WorkRoot: t.TempDir(), Runner: runner, Capacity: capacityAdapter{ports},
+		TaskPrefix: "opencard-m1", WorkRoot: workRoot, Runner: runner, Capacity: capacityAdapter{ports},
 		ImageStore: fakeImageStore{archive: []byte("persistent OCI archive"), result: contracts.StoreOCIResult{Image: testImage(), StorageRef: "oci://artifact/immutable", SizeBytes: 22}},
 		Clock:      func() time.Time { return time.Unix(100, 0).UTC() },
 	})
@@ -166,16 +177,47 @@ func (a capacityAdapter) Activate(context.Context, contracts.CapacityLease, cont
 	return nil
 }
 func (a capacityAdapter) Release(_ context.Context, l contracts.CapacityLease, _ contracts.OperationContext) error {
+	a.ports.mu.Lock()
+	if a.ports.releaseFailures > 0 {
+		a.ports.releaseFailures--
+		a.ports.mu.Unlock()
+		return errors.New("temporary capacity release failure")
+	}
+	a.ports.mu.Unlock()
 	a.ports.Release(l.HostPort)
+	return nil
+}
+func (a capacityAdapter) ReconcileActive(context.Context, contracts.CapacityLease, contracts.OperationContext) error {
+	a.ports.mu.Lock()
+	a.ports.reconciled++
+	a.ports.mu.Unlock()
 	return nil
 }
 
 func dockerHappyRunner(t *testing.T) *fakeRunner {
 	t.Helper()
+	created := false
+	var runArgs []string
 	return &fakeRunner{run: func(args []string, stdout io.Writer) error {
 		switch strings.Join(args[:min(2, len(args))], " ") {
 		case "container inspect":
-			return errors.New("container does not exist")
+			if !created {
+				return errors.New("container does not exist")
+			}
+			payload := ownedContainerInspect(testRequest("runtime-inspect"), testDigest)
+			published := ""
+			for index := 0; index+1 < len(runArgs); index++ {
+				if runArgs[index] == "--publish" {
+					published = runArgs[index+1]
+				}
+			}
+			if published == "" {
+				payload = strings.Replace(payload, `"PortBindings":{"8080/tcp":[{"HostIp":"127.0.0.1","HostPort":"39130"}]}`, `"PortBindings":{}`, 1)
+			} else {
+				parts := strings.Split(published, ":")
+				payload = strings.Replace(payload, `"HostPort":"39130"`, `"HostPort":"`+parts[1]+`"`, 1)
+			}
+			_, _ = io.WriteString(stdout, payload)
 		case "load --input":
 			contents, err := os.ReadFile(args[2])
 			if err != nil || string(contents) != "persistent OCI archive" {
@@ -186,9 +228,16 @@ func dockerHappyRunner(t *testing.T) *fakeRunner {
 		case "network inspect":
 			return errors.New("network does not exist")
 		case "inspect --format":
-			_, _ = io.WriteString(stdout, `{"Status":"running","Running":true,"Health":{"Status":"healthy"}}|3`)
+			_, _ = io.WriteString(stdout, `{"Status":"running","Running":true,"Health":{"Status":"healthy"}}|3|134217728|134217728|100000|50000|64|`+testContainerID+`|{"8080/tcp":[{"HostIp":"127.0.0.1","HostPort":"39124"}]}`)
 		case "logs --timestamps":
 			_, _ = io.WriteString(stdout, "2026-08-24T00:00:00Z hello\n2026-08-24T00:00:01Z ready\n")
+		}
+		if len(args) > 0 && args[0] == "run" {
+			runArgs = append([]string(nil), args...)
+			created = true
+		}
+		if len(args) > 0 && args[0] == "rm" {
+			created = false
 		}
 		return nil
 	}}
@@ -289,6 +338,8 @@ func TestLifecycleObservesLogsRestartsAndDestroysWithoutDocker(t *testing.T) {
 		t.Fatalf("destroy observation: %#v %v", stopped, err)
 	}
 	assertCode(t, provider.Scale(context.Background(), contracts.ScaleRequest{DeploymentID: deployment.ID, Replicas: 2, Operation: contracts.OperationContext{IdempotencyKey: "scale"}}), contracts.ErrUnsupportedCapability)
+	_, err = provider.Rollback(context.Background(), contracts.RollbackRequest{DeploymentID: deployment.ID, ReleaseID: "rel_other", Operation: contracts.OperationContext{IdempotencyKey: "rollback"}})
+	assertCode(t, err, contracts.ErrUnsupportedCapability)
 }
 
 func TestDeployRejectsEscapesAndDigestVerificationFailuresBeforeRun(t *testing.T) {
@@ -373,6 +424,60 @@ func TestRuntimeCapacityFailureHasNoMutatingDockerSideEffects(t *testing.T) {
 	}
 }
 
+func TestDeployWithoutContainerPortDoesNotReserveHostPort(t *testing.T) {
+	runner := dockerHappyRunner(t)
+	ports := &fixedPorts{port: 39131}
+	provider := testProvider(t, runner, ports)
+	request := testRequest("no-container-port")
+	request.Spec.Port = 0
+	if _, err := provider.Deploy(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	ports.mu.Lock()
+	defer ports.mu.Unlock()
+	if len(ports.hostPortRequests) != 1 || ports.hostPortRequests[0] != 0 || ports.allocated != 0 {
+		t.Fatalf("portless deployment reserved a host port: requests=%v allocated=%d", ports.hostPortRequests, ports.allocated)
+	}
+	for _, arg := range runner.callsFor("run")[0] {
+		if arg == "--publish" {
+			t.Fatalf("portless deployment exposed a Docker port: %#v", runner.callsFor("run")[0])
+		}
+	}
+}
+
+func TestFailedDeployCanRetryWithSameDeterministicOperation(t *testing.T) {
+	runner := dockerHappyRunner(t)
+	happy := runner.run
+	runAttempts := 0
+	runner.run = func(args []string, stdout io.Writer) error {
+		if len(args) > 0 && args[0] == "run" {
+			runAttempts++
+			if runAttempts == 1 {
+				return errors.New("temporary Docker failure")
+			}
+		}
+		return happy(args, stdout)
+	}
+	ports := &fixedPorts{port: 39132}
+	provider := testProvider(t, runner, ports)
+	request := testRequest("retry-after-failure")
+	if _, err := provider.Deploy(context.Background(), request); err == nil {
+		t.Fatal("first Docker failure became a deployment success")
+	}
+	if _, err := provider.Deploy(context.Background(), request); err != nil {
+		t.Fatalf("same deterministic deploy did not retry honestly: %v", err)
+	}
+	if runAttempts != 2 {
+		t.Fatalf("retry did not issue a fresh Docker run: attempts=%d", runAttempts)
+	}
+	ports.mu.Lock()
+	reservations := len(ports.hostPortRequests)
+	ports.mu.Unlock()
+	if reservations != 2 {
+		t.Fatalf("same-key retry reused a released capacity attempt: reservations=%d", reservations)
+	}
+}
+
 func TestConcurrentSameDeployUsesOneDockerRun(t *testing.T) {
 	runner := dockerHappyRunner(t)
 	provider := testProvider(t, runner, &fixedPorts{port: 39127})
@@ -409,6 +514,110 @@ func TestConcurrentSameDeployUsesOneDockerRun(t *testing.T) {
 	if len(runner.callsFor("run")) != 1 {
 		t.Fatalf("concurrent deploy created multiple containers: %#v", runner.callsFor("run"))
 	}
+}
+
+func TestProviderRestartRejectsPreLedgerContainerAndExactDrift(t *testing.T) {
+	request := testRequest("recover-deploy")
+	runner := &fakeRunner{run: func(args []string, stdout io.Writer) error {
+		switch strings.Join(args[:min(2, len(args))], " ") {
+		case "container inspect":
+			_, _ = io.WriteString(stdout, ownedContainerInspect(request, testDigest))
+		}
+		return nil
+	}}
+	provider := testProvider(t, runner, &fixedPorts{port: 39130})
+	assertCode(t, deployError(provider, request), contracts.ErrConflict)
+	if len(runner.callsFor("run")) != 0 || len(runner.callsFor("load")) != 0 {
+		t.Fatalf("pre-ledger container reached Docker mutation: calls=%#v", runner.callsFor())
+	}
+
+	for _, testCase := range []struct {
+		name   string
+		mutate func(string) string
+	}{
+		{"digest", func(value string) string {
+			return strings.Replace(value, testDigest, "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 1)
+		}},
+		{"label", func(value string) string {
+			return strings.Replace(value, `"open-card.service":"web"`, `"open-card.service":"other"`, 1)
+		}},
+		{"cpu", func(value string) string { return strings.Replace(value, `"CpuQuota":50000`, `"CpuQuota":60000`, 1) }},
+		{"memory", func(value string) string {
+			return strings.Replace(value, `"Memory":134217728`, `"Memory":134217729`, 1)
+		}},
+		{"pid", func(value string) string { return strings.Replace(value, `"PidsLimit":64`, `"PidsLimit":65`, 1) }},
+		{"cap-drop", func(value string) string {
+			return strings.Replace(value, `"CapDrop":["ALL"]`, `"CapDrop":["ALL","NET_RAW"]`, 1)
+		}},
+		{"restart-policy", func(value string) string {
+			return strings.Replace(value, `"RestartPolicy":{"Name":"no"}`, `"RestartPolicy":{"Name":"always"}`, 1)
+		}},
+		{"loopback-port", func(value string) string {
+			return strings.Replace(value, `"HostIp":"127.0.0.1"`, `"HostIp":"0.0.0.0"`, 1)
+		}},
+		{"extra-port", func(value string) string {
+			return strings.Replace(value, `"PortBindings":{"8080/tcp":[{"HostIp":"127.0.0.1","HostPort":"39130"}]}`, `"PortBindings":{"8080/tcp":[{"HostIp":"127.0.0.1","HostPort":"39130"}],"9090/tcp":[{"HostIp":"127.0.0.1","HostPort":"39131"}]}`, 1)
+		}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			mismatch := &fakeRunner{run: func(args []string, stdout io.Writer) error {
+				if len(args) > 1 && args[0] == "container" && args[1] == "inspect" {
+					_, _ = io.WriteString(stdout, testCase.mutate(ownedContainerInspect(request, testDigest)))
+				}
+				return nil
+			}}
+			provider := testProvider(t, mismatch, &fixedPorts{port: 39130})
+			assertCode(t, deployError(provider, request), contracts.ErrConflict)
+			for _, mutation := range [][]string{{"load"}, {"network", "create"}, {"run"}} {
+				if calls := mismatch.callsFor(mutation...); len(calls) != 0 {
+					t.Fatalf("mismatched owned container reached Docker mutation %v: %#v", mutation, calls)
+				}
+			}
+		})
+	}
+	portless := testRequest("recover-portless")
+	portless.Spec.Port = 0
+	extraBinding := &fakeRunner{run: func(args []string, stdout io.Writer) error {
+		if len(args) > 1 && args[0] == "container" && args[1] == "inspect" {
+			_, _ = io.WriteString(stdout, ownedContainerInspect(portless, testDigest))
+		}
+		return nil
+	}}
+	provider = testProvider(t, extraBinding, &fixedPorts{port: 39130})
+	assertCode(t, deployError(provider, portless), contracts.ErrConflict)
+	for _, mutation := range [][]string{{"load"}, {"network", "create"}, {"run"}} {
+		if calls := extraBinding.callsFor(mutation...); len(calls) != 0 {
+			t.Fatalf("portless durable state reached Docker mutation %v: %#v", mutation, calls)
+		}
+	}
+}
+
+func TestObserveRejectsIndependentLimitReadbackMismatch(t *testing.T) {
+	runner := dockerHappyRunner(t)
+	happy := runner.run
+	containerInspects := 0
+	runner.run = func(args []string, stdout io.Writer) error {
+		if len(args) > 1 && args[0] == "container" && args[1] == "inspect" {
+			containerInspects++
+			if containerInspects <= 2 {
+				return happy(args, stdout)
+			}
+			_, _ = io.WriteString(stdout, strings.Replace(strings.Replace(ownedContainerInspect(testRequest("readback-mismatch"), testDigest), `"HostPort":"39130"`, `"HostPort":"39124"`, 1), `"Memory":134217728`, `"Memory":1`, 1))
+			return nil
+		}
+		return happy(args, stdout)
+	}
+	provider := testProvider(t, runner, &fixedPorts{port: 39124})
+	deployment, err := provider.Deploy(context.Background(), testRequest("readback-mismatch"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = provider.Observe(context.Background(), contracts.ObserveRequest{DeploymentID: deployment.ID, Operation: contracts.OperationContext{IdempotencyKey: "readback-mismatch-observe"}})
+	assertCode(t, err, contracts.ErrConflict)
+}
+
+func ownedContainerInspect(request contracts.DeployRequest, image string) string {
+	return `{"Id":"` + testContainerID + `","RestartCount":3,"Image":"` + image + `","Config":{"Labels":{"open-card.managed":"true","open-card.task-prefix":"opencard-m1","open-card.deployment-id":"` + request.DeploymentID.String() + `","open-card.application-id":"` + request.Spec.ApplicationID.String() + `","open-card.environment-id":"` + request.Spec.EnvironmentID.String() + `","open-card.release-id":"` + request.Spec.ReleaseID.String() + `","open-card.service":"` + request.Spec.ServiceName + `","open-card.image-repository":"` + request.Spec.Image.Repository + `","open-card.image-digest":"` + request.Spec.Image.Digest + `"},"Volumes":null},"State":{"Running":true},"HostConfig":{"NetworkMode":"opencard-m1-network","Privileged":false,"Binds":null,"CapAdd":null,"CapDrop":["ALL"],"Memory":134217728,"MemorySwap":134217728,"CpuPeriod":100000,"CpuQuota":50000,"PidsLimit":64,"SecurityOpt":["no-new-privileges=true"],"RestartPolicy":{"Name":"no"},"PortBindings":{"8080/tcp":[{"HostIp":"127.0.0.1","HostPort":"39130"}]}}}`
 }
 
 func assertContainsPairs(t *testing.T, args []string, pairs ...string) {

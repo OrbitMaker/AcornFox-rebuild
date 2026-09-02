@@ -53,6 +53,28 @@ func TestAGENT_CT_002_TaskAllowlistAndIdempotencyFields(t *testing.T) {
 	}
 }
 
+func TestRequiredCapabilityForTaskRequestPrefersStrictAcornFoxMarker(t *testing.T) {
+	base := TaskRequest{Kind: TaskDeploy}
+	for _, payloadType := range []string{"deploy", "redeploy", "observe", "restart", "destroy"} {
+		base.Parameters = json.RawMessage(`{"acornfox_payload_type":"` + payloadType + `","request":{}}`)
+		if got := RequiredCapabilityForTaskRequest(base); got != AgentCapabilityAcornFoxRuntime {
+			t.Fatalf("payload %q capability = %q, want %q", payloadType, got, AgentCapabilityAcornFoxRuntime)
+		}
+	}
+	base.Parameters = json.RawMessage(`{"acornfox_payload_type":"shell","request":{}}`)
+	if got := RequiredCapabilityForTaskRequest(base); got != "acornfox.unknown_payload" {
+		t.Fatalf("unknown AcornFox marker capability = %q", got)
+	}
+	base.Parameters = json.RawMessage(`{"nested":{"acornfox_payload_type":"deploy"}}`)
+	if got := RequiredCapabilityForTaskRequest(base); got != "" {
+		t.Fatalf("nested AcornFox marker changed routing: %q", got)
+	}
+	base.Parameters = json.RawMessage(`{"acornfox_payload_type":"deploy","request":{}} {"ignored":true}`)
+	if got := RequiredCapabilityForTaskRequest(base); got != AgentCapabilityAcornFoxRuntime {
+		t.Fatalf("top-level marker did not fail closed before trailing JSON: %q", got)
+	}
+}
+
 func TestAGENT_CT_003_TaskRequestRejectsInvalidIdentityKindJSONAndDeadline(t *testing.T) {
 	base := TaskRequest{
 		TaskID:         "task-1",

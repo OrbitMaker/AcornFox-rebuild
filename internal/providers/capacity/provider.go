@@ -89,8 +89,10 @@ func (systemPortAllocator) Listen(ctx context.Context) (net.Listener, error) {
 type FixedPortAllocator struct{ Port int }
 
 func (a FixedPortAllocator) Listen(ctx context.Context) (net.Listener, error) {
-	if a.Port < 1 || a.Port > 65535 { return nil, errors.New("fixed capacity port is invalid") }
-	return (&net.ListenConfig{}).Listen(ctx,"tcp4",fmt.Sprintf("127.0.0.1:%d",a.Port))
+	if a.Port < 1 || a.Port > 65535 {
+		return nil, errors.New("fixed capacity port is invalid")
+	}
+	return (&net.ListenConfig{}).Listen(ctx, "tcp4", fmt.Sprintf("127.0.0.1:%d", a.Port))
 }
 
 // Config contains the provider-owned capacity boundary.  BuildReserve and
@@ -393,6 +395,50 @@ func (p *Provider) Activate(ctx context.Context, lease contracts.CapacityLease, 
 	return nil
 }
 
+// ReconcileActive restores an already-running standalone runtime lease after
+// this provider process restarts. The standalone provider must first prove the
+// runtime and any published port still exist; this method only restores local
+// accounting and deliberately neither binds nor probes a port.
+//
+// A restored lease is activated from the outset, so it does not carry an
+// expiry timer. The running workload, rather than the pre-activation lease
+// timeout, owns its lifetime until Release is called.
+func (p *Provider) ReconcileActive(ctx context.Context, lease contracts.CapacityLease, operation contracts.OperationContext) error {
+	const action = "reconcile_active"
+	if err := p.validateOperation(ctx, operation, contracts.CapabilityCapacityReserve, action); err != nil {
+		return err
+	}
+	if err := p.validateActiveLease(lease); err != nil {
+		return p.argumentError(operation, contracts.CapabilityCapacityReserve, action, err.Error())
+	}
+	fingerprint := activeLeaseFingerprint(lease)
+	opKey := operationKey(action, operation.IdempotencyKey)
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if previous, ok := p.operations[opKey]; ok {
+		if previous.fingerprint != fingerprint {
+			return p.conflict(operation, contracts.CapabilityCapacityReserve, action)
+		}
+		return previous.err
+	}
+	if record, ok := p.leases[lease.ID]; ok {
+		if record.released || !record.activated || activeLeaseFingerprint(record.lease) != fingerprint {
+			return p.conflict(operation, contracts.CapabilityCapacityReserve, action)
+		}
+		p.operations[opKey] = operationRecord{fingerprint: fingerprint}
+		return nil
+	}
+
+	// Reconciliation is intentionally independent of the current host snapshot.
+	// A live container remains an actual reservation even if host availability
+	// has fallen since it was first started; subsequent snapshots floor the
+	// remaining availability at zero.
+	p.leases[lease.ID] = &leaseRecord{lease: lease, activated: true}
+	p.operations[opKey] = operationRecord{fingerprint: fingerprint}
+	return nil
+}
+
 // Release is idempotent.  An already-expired lease is considered released
 // because the expiry path has already closed its listener and returned its
 // accounting capacity.
@@ -581,6 +627,25 @@ func (p *Provider) validateRequest(ctx context.Context, request contracts.Capaci
 	return nil
 }
 
+func (p *Provider) validateActiveLease(lease contracts.CapacityLease) error {
+	if strings.TrimSpace(lease.ID) == "" {
+		return errors.New("capacity lease id is required")
+	}
+	if lease.Scope != contracts.CapacityRuntime {
+		return errors.New("only runtime capacity leases can be reconciled")
+	}
+	if err := validateResources(lease.Resources); err != nil {
+		return errors.New("capacity resources must not be negative")
+	}
+	if lease.Resources.CPUMillis <= 0 || lease.Resources.MemoryBytes <= 0 || lease.Resources.DiskBytes <= 0 {
+		return errors.New("active runtime capacity resources must be positive")
+	}
+	if lease.HostPort < 0 || lease.HostPort > 65535 {
+		return errors.New("capacity host port is invalid")
+	}
+	return nil
+}
+
 func (p *Provider) validateOperation(ctx context.Context, operation contracts.OperationContext, capability contracts.Capability, action string) error {
 	if err := contextError(ctx, operation, p.config.Clock); err != nil {
 		return err
@@ -673,6 +738,13 @@ func leaseOperationFingerprint(lease contracts.CapacityLease) string {
 	// The ID is the stable opaque handle.  Callers may deserialize a lease and
 	// omit its evidence without making a valid idempotent operation conflict.
 	return hashParts(lease.ID)
+}
+
+func activeLeaseFingerprint(lease contracts.CapacityLease) string {
+	// Evidence is intentionally excluded because callers may deserialize the
+	// durable lease from a compact record. Its identity, scope, accounting
+	// values, and assigned host port are the restored facts.
+	return hashParts(lease.ID, lease.Scope, lease.Resources, lease.HostPort)
 }
 
 func operationKey(action, idempotencyKey string) string { return action + "\x00" + idempotencyKey }
