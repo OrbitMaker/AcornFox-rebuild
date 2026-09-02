@@ -30,7 +30,7 @@ func (s *Store) GetAcornFoxRuntimeRequest(ctx context.Context, applicationID, de
 		  FROM task_leases t
 		  JOIN operations o ON o.id=t.operation_id
 		  JOIN deployments d ON d.id=o.deployment_id
-		 WHERE d.id=$1 AND d.application_id=$2
+		 WHERE d.id=$1 AND o.application_id=$2
 		 ORDER BY t.created_at,t.task_id`, deploymentID.String(), applicationID.String())
 	if err != nil {
 		return contracts.AcornFoxRuntimeDeployRequest{}, fmt.Errorf("query AcornFox runtime task: %w", err)

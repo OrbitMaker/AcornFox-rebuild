@@ -147,6 +147,29 @@ paths:
         '404': {$ref: '#/components/responses/NotFound'}
         '422': {$ref: '#/components/responses/InvalidLogQuery'}
         '503': {$ref: '#/components/responses/LogsUnavailable'}
+  /api/v1/acornfox/apps/{applicationId}/deliveries/{deploymentId}/public-access:
+    parameters: [{$ref: '#/components/parameters/ApplicationId'}, {$ref: '#/components/parameters/DeploymentId'}]
+    get:
+      operationId: getAcornFoxDeliveryPublicAccess
+      security: [{AdministratorSession: []}]
+      responses:
+        '200': {description: Local public-access intent only. This state does not claim DNS TLS or Internet reachability., content: {application/json: {schema: {$ref: '#/components/schemas/PublicAccessResponse'}}}}
+        '401': {$ref: '#/components/responses/AuthenticationFailed'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/PublicAccessUnavailable'}
+    put:
+      operationId: setAcornFoxDeliveryPublicAccess
+      security: [{AdministratorSession: []}]
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}, {$ref: '#/components/parameters/CSRFToken'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/PublicAccessRequest'}}}}
+      responses:
+        '200': {description: Local route intent updated. An enabled result remains pending external validation., content: {application/json: {schema: {$ref: '#/components/schemas/PublicAccessResponse'}}}}
+        '400': {$ref: '#/components/responses/InvalidRequest'}
+        '401': {$ref: '#/components/responses/AuthenticationFailed'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/PublicAccessConflict'}
+        '422': {$ref: '#/components/responses/ValidationFailed'}
+        '503': {$ref: '#/components/responses/PublicAccessUnavailable'}
   /api/v1/acornfox/apps/{applicationId}/deliveries/{deploymentId}/probes:
     parameters: [{$ref: '#/components/parameters/ApplicationId'}, {$ref: '#/components/parameters/DeploymentId'}]
     post:
@@ -192,6 +215,8 @@ components:
     TemporarilyUnavailable: {description: Capability dependency or persisted readback is temporarily unavailable, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
     InvalidLogQuery: {description: Log source limit or opaque cursor is invalid, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
     LogsUnavailable: {description: Collected log storage or its integrity reconciliation is temporarily unavailable, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+    PublicAccessConflict: {description: A local endpoint route ownership or idempotency conflict prevented the requested public-access intent, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+    PublicAccessUnavailable: {description: The optional local public-access capability is unavailable or has no configured authorized root and route provider, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
   schemas:
     Error:
       type: object
@@ -340,3 +365,18 @@ components:
         items: {type: array, items: {$ref: '#/components/schemas/DeliveryLogItem'}}
         next_cursor: {type: string, nullable: true}
         retention_limited: {type: boolean, description: "True when source-specific older log indexes were retired; active items, if present, remain readable."}
+    PublicAccessRequest:
+      type: object
+      required: [enabled]
+      additionalProperties: false
+      properties: {enabled: {type: boolean}}
+    PublicAccessResponse:
+      type: object
+      required: [desired_public, url, endpoint, components, status]
+      additionalProperties: false
+      properties:
+        desired_public: {type: boolean}
+        url: {type: string, format: uri, description: "Derived HTTPS URL only; not a DNS TLS or Internet readiness claim."}
+        endpoint: {type: object, required: [deployment_id], additionalProperties: false, properties: {deployment_id: {type: string}}}
+        components: {type: object, required: [internal_endpoint, local_route, dns, tls, external], additionalProperties: false, properties: {internal_endpoint: {type: string, enum: [accepted, not_observed]}, local_route: {type: string, enum: [desired, reconcile_required, configured, disabled]}, dns: {type: string, enum: [not_validated]}, tls: {type: string, enum: [not_validated]}, external: {type: string, enum: [not_validated]}}}
+        status: {type: string, enum: [PUBLIC_DISABLED, PENDING_EXTERNAL_VALIDATION]}

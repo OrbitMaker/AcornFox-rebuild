@@ -253,13 +253,13 @@ func TestPlatformBackupSnapshotCapturesFixedReadOnlyFactsAndRollsBack(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if facts.DatabaseSnapshotSHA256 != sha256TextFrom("00000003-0000001B-1") || facts.Audit.Table.RowsSHA256 != sha256TextFrom("{\"sequence\":1}\n") || facts.Audit.ChainHead == nil || *facts.Audit.ChainHead != chain || len(facts.Routes.Tables) != 15 {
+	if facts.DatabaseSnapshotSHA256 != sha256TextFrom("00000003-0000001B-1") || facts.Audit.Table.RowsSHA256 != sha256TextFrom("{\"sequence\":1}\n") || facts.Audit.ChainHead == nil || *facts.Audit.ChainHead != chain || len(facts.Routes.Tables) != len(platformBackupRouteTables) {
 		t.Fatalf("facts=%+v", facts)
 	}
 	if _, err := facts.ReleaseDatabase(); err != nil {
 		t.Fatalf("release database: %v", err)
 	}
-	if len(tx.queries) != 15+1+1+3+1+1+1+1 {
+	if len(tx.queries) != len(platformBackupRouteTables)+1+1+3+1+1+1+1 {
 		t.Fatalf("query count=%d queries=%q", len(tx.queries), tx.queries)
 	}
 	if err := snapshot.Commit(); !errors.Is(err, ErrPostgresOutcomeUnknown) || tx.committed {
@@ -267,6 +267,52 @@ func TestPlatformBackupSnapshotCapturesFixedReadOnlyFactsAndRollsBack(t *testing
 	}
 	if err := snapshot.Rollback(); err != nil || !tx.rolledBack {
 		t.Fatalf("rollback=%v", err)
+	}
+}
+
+func TestPlatformBackupSnapshotCapturesPublicAccessAndDNSRecoveryFacts(t *testing.T) {
+	database, _, tx, _ := compositeFixture(t, nil, nil, nil)
+	baseRows := tx.rows
+	const publicCommand = `{"application_id":"app-a","deployment_id":"deployment-a","idempotency_key":"public-enable","phase":"applying"}`
+	const dnsExecution = `{"plan_id":"plan-a","change_index":0,"phase":"reconcile_required"}`
+	const dnsScope = `{"installation_id":"install-a","provider":"aliyun-dns","zone_id":"zone-a","plan_id":"plan-a","change_index":0,"request_fingerprint":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`
+	tx.rows = func(query string) postgresRows {
+		switch {
+		case strings.Contains(query, "public.acornfox_public_access_commands"):
+			if !strings.Contains(query, "ORDER BY application_id, deployment_id, idempotency_key") {
+				return &captureRows{err: errors.New("public-access route facts use an unstable order")}
+			}
+			return &captureRows{values: [][]any{{publicCommand}}}
+		case strings.Contains(query, "public.dns_change_execution_steps"):
+			if !strings.Contains(query, "ORDER BY plan_id, change_index") {
+				return &captureRows{err: errors.New("DNS execution route facts use an unstable order")}
+			}
+			return &captureRows{values: [][]any{{dnsExecution}}}
+		case strings.Contains(query, "public.dns_change_execution_scopes"):
+			if !strings.Contains(query, "ORDER BY installation_id, provider, zone_id") {
+				return &captureRows{err: errors.New("DNS execution scope facts use an unstable order")}
+			}
+			return &captureRows{values: [][]any{{dnsScope}}}
+		case strings.Contains(query, "public.dns_change_owned_records"):
+			if !strings.Contains(query, "ORDER BY installation_id, owner_key") {
+				return &captureRows{err: errors.New("DNS ownership route facts use an unstable order")}
+			}
+			return baseRows(query)
+		default:
+			return baseRows(query)
+		}
+	}
+	snapshot, err := database.BeginPlatformBackupSnapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = snapshot.Rollback() }()
+	facts, err := snapshot.CaptureFacts(context.Background(), PlatformBackupKeyReferenceV1{Provider: "local-backup-key", KeyID: "backup-encryption", KeyVersion: "key-v1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(facts.Routes.Tables) != len(platformBackupRouteTables) || !facts.Routes.Tables[0].valid("acornfox_public_access_commands", []string{"application_id", "deployment_id", "idempotency_key"}) || facts.Routes.Tables[0].RowCount != 1 || facts.Routes.Tables[0].RowsSHA256 != sha256TextFrom(publicCommand+"\n") || !facts.Routes.Tables[1].valid("dns_change_execution_steps", []string{"plan_id", "change_index"}) || facts.Routes.Tables[1].RowCount != 1 || facts.Routes.Tables[1].RowsSHA256 != sha256TextFrom(dnsExecution+"\n") || !facts.Routes.Tables[2].valid("dns_change_execution_scopes", []string{"installation_id", "provider", "zone_id"}) || facts.Routes.Tables[2].RowCount != 1 || facts.Routes.Tables[2].RowsSHA256 != sha256TextFrom(dnsScope+"\n") || facts.Routes.Tables[3].Name != "dns_change_owned_records" || !equalStrings(facts.Routes.Tables[3].OrderBy, []string{"installation_id", "owner_key"}) {
+		t.Fatalf("route facts = %#v", facts.Routes.Tables)
 	}
 }
 

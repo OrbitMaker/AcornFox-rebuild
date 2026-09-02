@@ -285,6 +285,39 @@ func main() {
 						}()
 					}
 				}
+				// Public access is deliberately optional and shares the one configured
+				// local RouteProvider with M3. A second Caddy adapter/cache would be a
+				// second route projection and could overwrite routes on restart.
+				// DNS/TLS remain absent from this composition.
+				if authorizedRoot := strings.TrimSpace(os.Getenv("ACORNFOX_PUBLIC_ROOT")); authorizedRoot != "" {
+					if m3RouteProvider == nil {
+						log.Print("AcornFox public access is unavailable: an authorized root requires the configured M3 RouteProvider")
+					} else {
+						router := acornFoxPublicAccessRouteAdapter{Routes: m3RouteProvider}
+						server.SetAcornFoxPublicAccess(&AcornFoxPublicAccessHTTPHandler{Service: &application.AcornFoxPublicAccessService{
+							Store:  store,
+							Router: router,
+							Config: application.AcornFoxPublicAccessConfig{AuthorizedRoot: authorizedRoot},
+						}})
+						go func() {
+							if err := reconcileAcornFoxPublicAccess(lifecycleContext, store, authorizedRoot, router, 10); err != nil {
+								log.Printf("AcornFox public-access recovery deferred: %v", err)
+							}
+							ticker := time.NewTicker(30 * time.Second)
+							defer ticker.Stop()
+							for {
+								select {
+								case <-lifecycleContext.Done():
+									return
+								case <-ticker.C:
+									if err := reconcileAcornFoxPublicAccess(lifecycleContext, store, authorizedRoot, router, 10); err != nil {
+										log.Printf("AcornFox public-access recovery deferred: %v", err)
+									}
+								}
+							}
+						}()
+					}
+				}
 				if os.Getenv("OPEN_CARD_M4_ENABLED") == "true" {
 					rolloutEnabled := os.Getenv("OPEN_CARD_M4_ROLLOUT_ENABLED") == "true"
 					if err := validateM4RolloutComposition(rolloutEnabled, m3RouteProvider != nil, store != nil); err != nil {

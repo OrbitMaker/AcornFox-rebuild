@@ -16,13 +16,14 @@ func BuildDryRun(idempotencyKey string, desired []DesiredRecord, observed []Reco
 	if idempotencyKey == "" {
 		return Plan{}, errors.New("DNS change idempotency key is required")
 	}
-	domainNames := map[int64]string{}
+	domainNames := map[string]string{}
 	registerDomain := func(record Record) error {
 		name := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(record.Domain), "."))
-		if previous, exists := domainNames[record.DomainID]; exists && previous != name {
-			return fmt.Errorf("DNS domain id %d maps to multiple names", record.DomainID)
+		zoneKey := strings.Join([]string{record.InstallationID, record.Provider, record.ZoneID}, ":")
+		if previous, exists := domainNames[zoneKey]; exists && previous != name {
+			return fmt.Errorf("DNS zone id %s maps to multiple names", record.ZoneID)
 		}
-		domainNames[record.DomainID] = name
+		domainNames[zoneKey] = name
 		return nil
 	}
 	desiredIdentity := map[string]string{}
@@ -39,15 +40,16 @@ func BuildDryRun(idempotencyKey string, desired []DesiredRecord, observed []Reco
 		}
 		desiredIdentity[identity] = record.OwnerKey
 	}
-	observedIDs := map[int64]struct{}{}
+	observedIDs := map[string]struct{}{}
 	for _, record := range observed {
 		if err := record.Validate(true); err != nil {
 			return Plan{}, err
 		}
-		if _, exists := observedIDs[record.RecordID]; exists {
-			return Plan{}, fmt.Errorf("DNS observed record id %d is duplicated", record.RecordID)
+		identity := providerRecordKey(record)
+		if _, exists := observedIDs[identity]; exists {
+			return Plan{}, fmt.Errorf("DNS observed record identity %s is duplicated", identity)
 		}
-		observedIDs[record.RecordID] = struct{}{}
+		observedIDs[identity] = struct{}{}
 		if err := registerDomain(record); err != nil {
 			return Plan{}, err
 		}
@@ -64,9 +66,9 @@ func BuildDryRun(idempotencyKey string, desired []DesiredRecord, observed []Reco
 	if err != nil {
 		return Plan{}, err
 	}
-	observedByID, observedByKey, ownedByKey, desiredByKey := map[int64]Record{}, map[string][]Record{}, map[string]OwnedRecord{}, map[string]DesiredRecord{}
+	observedByID, observedByKey, ownedByKey, desiredByKey := map[string]Record{}, map[string][]Record{}, map[string]OwnedRecord{}, map[string]DesiredRecord{}
 	for _, record := range observed {
-		observedByID[record.RecordID] = record
+		observedByID[providerRecordKey(record)] = record
 		observedByKey[recordKey(record)] = append(observedByKey[recordKey(record)], record)
 	}
 	for _, record := range owned {
@@ -92,10 +94,10 @@ func BuildDryRun(idempotencyKey string, desired []DesiredRecord, observed []Reco
 			changes = append(changes, Change{Kind: ChangeCreate, OwnerKey: target.OwnerKey, After: pointerDesired(target), Rollback: &Rollback{Kind: ChangeDelete, Deferred: true}})
 			continue
 		}
-		if target.DomainID != ownedRecord.Record.DomainID || !strings.EqualFold(target.Host, ownedRecord.Record.Host) || target.Type != ownedRecord.Record.Type {
+		if target.InstallationID != ownedRecord.Record.InstallationID || target.Provider != ownedRecord.Record.Provider || target.ZoneID != ownedRecord.Record.ZoneID || !strings.EqualFold(target.Name, ownedRecord.Record.Name) || target.Type != ownedRecord.Record.Type {
 			return Plan{}, fmt.Errorf("DNS ownership identity changed for %s", target.OwnerKey)
 		}
-		current, found := observedByID[ownedRecord.Record.RecordID]
+		current, found := observedByID[providerRecordKey(ownedRecord.Record)]
 		if !found || !recordEqual(current, ownedRecord.Record) {
 			return Plan{}, fmt.Errorf("DNS ownership drift for %s", target.OwnerKey)
 		}
@@ -109,7 +111,7 @@ func BuildDryRun(idempotencyKey string, desired []DesiredRecord, observed []Reco
 		if _, exists := desiredByKey[ownerKey]; exists {
 			continue
 		}
-		current, found := observedByID[ownedRecord.Record.RecordID]
+		current, found := observedByID[providerRecordKey(ownedRecord.Record)]
 		if !found || !recordEqual(current, ownedRecord.Record) {
 			return Plan{}, fmt.Errorf("DNS ownership drift for %s", ownerKey)
 		}

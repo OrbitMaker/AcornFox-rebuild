@@ -215,6 +215,25 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/acornfox/apps/{applicationId}/deliveries/{deploymentId}/public-access": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                applicationId: components["parameters"]["ApplicationId"];
+                deploymentId: components["parameters"]["DeploymentId"];
+            };
+            cookie?: never;
+        };
+        get: operations["getAcornFoxDeliveryPublicAccess"];
+        put: operations["setAcornFoxDeliveryPublicAccess"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/acornfox/apps/{applicationId}/deliveries/{deploymentId}/probes": {
         parameters: {
             query?: never;
@@ -414,6 +433,34 @@ export interface components {
             /** @description True when source-specific older log indexes were retired; active items, if present, remain readable. */
             retention_limited: boolean;
         };
+        PublicAccessRequest: {
+            enabled: boolean;
+        };
+        PublicAccessResponse: {
+            desired_public: boolean;
+            /**
+             * Format: uri
+             * @description Derived HTTPS URL only; not a DNS TLS or Internet readiness claim.
+             */
+            url: string;
+            endpoint: {
+                deployment_id: string;
+            };
+            components: {
+                /** @enum {string} */
+                internal_endpoint: "accepted" | "not_observed";
+                /** @enum {string} */
+                local_route: "desired" | "reconcile_required" | "configured" | "disabled";
+                /** @enum {string} */
+                dns: "not_validated";
+                /** @enum {string} */
+                tls: "not_validated";
+                /** @enum {string} */
+                external: "not_validated";
+            };
+            /** @enum {string} */
+            status: "PUBLIC_DISABLED" | "PENDING_EXTERNAL_VALIDATION";
+        };
     };
     responses: {
         /** @description Request JSON content type or body shape is invalid */
@@ -490,6 +537,24 @@ export interface components {
         };
         /** @description Collected log storage or its integrity reconciliation is temporarily unavailable */
         LogsUnavailable: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description A local endpoint route ownership or idempotency conflict prevented the requested public-access intent */
+        PublicAccessConflict: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description The optional local public-access capability is unavailable or has no configured authorized root and route provider */
+        PublicAccessUnavailable: {
             headers: {
                 [name: string]: unknown;
             };
@@ -887,6 +952,69 @@ export interface operations {
             404: components["responses"]["NotFound"];
             422: components["responses"]["InvalidLogQuery"];
             503: components["responses"]["LogsUnavailable"];
+        };
+    };
+    getAcornFoxDeliveryPublicAccess: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                applicationId: components["parameters"]["ApplicationId"];
+                deploymentId: components["parameters"]["DeploymentId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Local public-access intent only. This state does not claim DNS TLS or Internet reachability. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PublicAccessResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationFailed"];
+            404: components["responses"]["NotFound"];
+            503: components["responses"]["PublicAccessUnavailable"];
+        };
+    };
+    setAcornFoxDeliveryPublicAccess: {
+        parameters: {
+            query?: never;
+            header: {
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+                /** @description Must equal the non-HttpOnly __Host-acornfox_csrf cookie and use the allowed Origin. */
+                "X-AcornFox-CSRF": components["parameters"]["CSRFToken"];
+            };
+            path: {
+                applicationId: components["parameters"]["ApplicationId"];
+                deploymentId: components["parameters"]["DeploymentId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PublicAccessRequest"];
+            };
+        };
+        responses: {
+            /** @description Local route intent updated. An enabled result remains pending external validation. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PublicAccessResponse"];
+                };
+            };
+            400: components["responses"]["InvalidRequest"];
+            401: components["responses"]["AuthenticationFailed"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["PublicAccessConflict"];
+            422: components["responses"]["ValidationFailed"];
+            503: components["responses"]["PublicAccessUnavailable"];
         };
     };
     probeAcornFoxDeliveryOnce: {

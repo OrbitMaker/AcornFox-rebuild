@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -29,8 +30,9 @@ type Adapter struct {
 	Clock    func() time.Time
 }
 
-func (a Adapter) ListRecords(ctx context.Context, domainID int64, domain string) ([]dnschange.Record, error) {
-	if a.Client == nil || domainID <= 0 || strings.TrimSpace(domain) == "" {
+func (a Adapter) ListRecords(ctx context.Context, installationID, zoneID, domain string) ([]dnschange.Record, error) {
+	domainID, err := strconv.ParseInt(strings.TrimSpace(zoneID), 10, 64)
+	if a.Client == nil || err != nil || domainID <= 0 || strings.TrimSpace(installationID) == "" || strings.TrimSpace(domain) == "" {
 		return nil, errors.New("DNSPod read adapter is not configured")
 	}
 	payload, err := json.Marshal(map[string]any{"Domain": strings.ToLower(strings.TrimSpace(domain)), "DomainId": domainID, "Offset": 0, "Limit": 3000})
@@ -95,7 +97,7 @@ func (a Adapter) ListRecords(ctx context.Context, domainID int64, domain string)
 		if itemDomainID != domainID {
 			return nil, errors.New("DNSPod fixture record domain id mismatched")
 		}
-		record := dnschange.Record{Provider: dnschange.ProviderDNSPod, DomainID: itemDomainID, Domain: strings.ToLower(strings.TrimSpace(domain)), RecordID: item.RecordID, Host: strings.ToLower(strings.TrimSpace(item.Name)), Type: strings.ToUpper(strings.TrimSpace(item.Type)), Value: strings.TrimSpace(item.Value), TTL: item.TTL, RequestID: decoded.Response.RequestID, CreatedAt: now}
+		record := dnschange.Record{InstallationID: installationID, Provider: dnschange.ProviderDNSPod, ZoneID: zoneID, Domain: strings.ToLower(strings.TrimSpace(domain)), RecordID: strconv.FormatInt(item.RecordID, 10), Name: strings.ToLower(strings.TrimSpace(item.Name)), Type: strings.ToUpper(strings.TrimSpace(item.Type)), Value: strings.TrimSpace(item.Value), TTL: item.TTL, RequestID: decoded.Response.RequestID, CreatedAt: now}
 		if err := record.Validate(true); err != nil {
 			return nil, errors.New("DNSPod fixture record is invalid")
 		}

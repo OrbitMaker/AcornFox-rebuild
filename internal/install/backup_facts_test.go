@@ -64,7 +64,7 @@ func TestPlatformBackupRuntimeFactBoundaries(t *testing.T) {
 			}
 		})
 	}
-	if !validLoopbackURL("http://127.0.0.1:5000", "http") || !validResolverList("1.1.1.1:53,8.8.8.8:53") || !validResolverList("1.1.1.1:53,[2606:4700:4700::1111]:53") || validResolverList("[::ffff:1.1.1.1]:53,8.8.8.8:53") || validResolverList("8.8.8.8:53,1.1.1.1:53") || validResolverList("198.51.100.1:53,8.8.8.8:53") || !runtimeValueValid("OPEN_CARD_BUILDKIT_ADDRESS", "unix:///run/open-card-buildkit/buildkitd.sock", true) {
+	if !validLoopbackURL("http://127.0.0.1:5000", "http") || !validResolverList("1.1.1.1:53,8.8.8.8:53") || !validResolverList("1.1.1.1:53,[2606:4700:4700::1111]:53") || validResolverList("[::ffff:1.1.1.1]:53,8.8.8.8:53") || validResolverList("8.8.8.8:53,1.1.1.1:53") || validResolverList("198.51.100.1:53,8.8.8.8:53") || !runtimeValueValid("OPEN_CARD_BUILDKIT_ADDRESS", "unix:///run/open-card-buildkit/buildkitd.sock", true) || !runtimeValueValid("ACORNFOX_PUBLIC_ROOT", "example.test", true) || runtimeValueValid("ACORNFOX_PUBLIC_ROOT", "apps.example.test", true) || runtimeValueValid("ACORNFOX_PUBLIC_ROOT", "*.example.test", true) {
 		t.Fatal("documented runtime grammar")
 	}
 }
@@ -91,6 +91,40 @@ func TestPlatformBackupFactTableAndAuditInvariants(t *testing.T) {
 				t.Fatal("invalid audit accepted")
 			}
 		})
+	}
+}
+
+func TestPlatformBackupRouteReceiptSchemaIsCompleteAndOrdered(t *testing.T) {
+	expected := []struct {
+		name  string
+		order []string
+	}{
+		{"acornfox_public_access_commands", []string{"application_id", "deployment_id", "idempotency_key"}},
+		{"dns_change_execution_steps", []string{"plan_id", "change_index"}},
+		{"dns_change_execution_scopes", []string{"installation_id", "provider", "zone_id"}},
+		{"dns_change_owned_records", []string{"installation_id", "owner_key"}},
+		{"dns_change_plans", []string{"id"}},
+		{"dns_change_reconcile_state", []string{"scope"}},
+		{"m3_application_domains", []string{"id"}},
+		{"m3_certificate_references", []string{"id"}},
+		{"m3_desired_routes", []string{"id"}},
+		{"m3_domain_convergence_requests", []string{"id"}},
+		{"m3_platform_domains", []string{"id"}},
+		{"m3_port_leases", []string{"id"}},
+		{"m3_route_pointers", []string{"route_id"}},
+		{"m3_traffic_switches", []string{"id"}},
+		{"m4_rollout_coordinations", []string{"operation_id"}},
+		{"m4_rollout_phase_events", []string{"operation_id", "sequence"}},
+		{"m4_rollout_route_set_entries", []string{"rollout_operation_id", "route_id"}},
+		{"m4_rollout_route_sets", []string{"rollout_operation_id"}},
+	}
+	if len(platformBackupRouteTables) != 18 || len(platformBackupRouteTables) != len(expected) {
+		t.Fatalf("route receipt table count=%d", len(platformBackupRouteTables))
+	}
+	for i, item := range expected {
+		if platformBackupRouteTables[i].name != item.name || !equalStrings(platformBackupRouteTables[i].order, item.order) {
+			t.Fatalf("route receipt[%d]=%+v, want %s/%v", i, platformBackupRouteTables[i], item.name, item.order)
+		}
 	}
 }
 

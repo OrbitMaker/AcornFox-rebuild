@@ -483,6 +483,79 @@ func TestPlatformBackupV3SnapshotMismatchAbortsBuildAndVerify(t *testing.T) {
 	}
 }
 
+func TestPlatformBackupV3VerifierRejectsOmittedOrReorderedPublicRouteFacts(t *testing.T) {
+	for name, mutate := range map[string]func(*PlatformBackupRoutesV1){
+		"omitted-public-command-ledger": func(routes *PlatformBackupRoutesV1) {
+			routes.Tables = append([]TableDigest(nil), routes.Tables[1:]...)
+		},
+		"reordered-dns-execution-ledger": func(routes *PlatformBackupRoutesV1) {
+			routes.Tables[0], routes.Tables[1] = routes.Tables[1], routes.Tables[0]
+		},
+		"omitted-occupied-dns-execution-scope": func(routes *PlatformBackupRoutesV1) {
+			routes.Tables = append(routes.Tables[:2:2], routes.Tables[3:]...)
+		},
+		"reordered-occupied-dns-execution-scope": func(routes *PlatformBackupRoutesV1) {
+			routes.Tables[1], routes.Tables[2] = routes.Tables[2], routes.Tables[1]
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			entries := platformTestEntries(t, platformBackupBytes(t, platformBackupInput(t)))
+			manifest := platformRewriteRouteFactForVerifier(t, entries, mutate)
+			if manifest.Validate() != nil {
+				t.Fatal("the package manifest must still bind the altered typed fact")
+			}
+			sink := &platformBackupSink{}
+			if _, err := VerifyPlatformBackupV3Package(bytes.NewReader(platformTestArchive(t, entries)), sink); !errors.Is(err, ErrPlatformBackupPackage) || sink.aborted != 1 || sink.committed != 0 {
+				t.Fatalf("restore-gate verifier err=%v sink=%+v", err, sink)
+			}
+		})
+	}
+}
+
+// platformRewriteRouteFactForVerifier keeps the archive manifest's artifact
+// digest valid so this test reaches typed fact verification, which is the
+// required pre-restore integrity gate for the full PostgreSQL snapshot.
+func platformRewriteRouteFactForVerifier(t *testing.T, entries []platformTestEntry, mutate func(*PlatformBackupRoutesV1)) PlatformBackupV3 {
+	t.Helper()
+	var manifest PlatformBackupV3
+	var routeIndex, manifestIndex = -1, -1
+	for i := range entries {
+		switch entries[i].name {
+		case PlatformBackupV3Manifest:
+			parsed, err := ParsePlatformBackupV3(entries[i].data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			manifest, manifestIndex = parsed, i
+		case "facts/routes.json":
+			routeIndex = i
+		}
+	}
+	if routeIndex < 0 || manifestIndex < 0 {
+		t.Fatal("required route fact or manifest missing")
+	}
+	routes, err := ParsePlatformBackupRoutesV1(entries[routeIndex].data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutate(&routes)
+	entries[routeIndex].data, err = json.Marshal(routes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range manifest.Artifacts {
+		if manifest.Artifacts[i].Path == "facts/routes.json" {
+			manifest.Artifacts[i].SHA256 = sha256Bytes(entries[routeIndex].data)
+			manifest.Artifacts[i].Size = int64(len(entries[routeIndex].data))
+		}
+	}
+	entries[manifestIndex].data, err = MarshalPlatformBackupV3(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return manifest
+}
+
 type platformTestEntry struct {
 	name string
 	data []byte

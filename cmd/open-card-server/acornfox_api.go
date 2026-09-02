@@ -105,6 +105,10 @@ func (s *Server) handleAcornFoxAPI(w http.ResponseWriter, r *http.Request) bool 
 			s.handleAcornFoxDeliveryLogs(w, r, domain.ID(parts[0]), domain.ID(parts[2]))
 			return true
 		}
+		if parts[3] == "public-access" {
+			s.handleAcornFoxDeliveryPublicAccess(w, r, domain.ID(parts[0]), domain.ID(parts[2]))
+			return true
+		}
 		s.handleAcornFoxDeliveryAction(w, r, domain.ID(parts[0]), domain.ID(parts[2]), parts[3])
 		return true
 	}
@@ -135,9 +139,21 @@ func acornFoxRouteAllow(path string) (string, bool) {
 			return "POST", true
 		case "logs":
 			return "GET", true
+		case "public-access":
+			return "GET, PUT", true
 		}
 	}
 	return "", false
+}
+
+func (s *Server) handleAcornFoxDeliveryPublicAccess(w http.ResponseWriter, r *http.Request, applicationID, deploymentID domain.ID) {
+	if s.acornFoxPublicAccess == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "public_access_unavailable", "public access is unavailable")
+		return
+	}
+	// Exact app/deployment ownership is verified by the public-access store.
+	// The handler neither probes runtime nor invokes DNS/Caddy directly.
+	s.acornFoxPublicAccess.Handle(w, r, applicationID, deploymentID)
 }
 
 func (s *Server) handleAcornFoxDeliveryLogs(w http.ResponseWriter, r *http.Request, applicationID, deploymentID domain.ID) {

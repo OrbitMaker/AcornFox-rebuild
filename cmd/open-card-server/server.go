@@ -114,6 +114,7 @@ type Server struct {
 	acornFoxDeployments        acornFoxDeploymentStore
 	acornFoxDeliveryCommand    acornFoxDeliveryCommand
 	acornFoxLogs               *AcornFoxLogsHTTPHandler
+	acornFoxPublicAccess       *AcornFoxPublicAccessHTTPHandler
 	broker                     *eventBroker
 	agentGateway               *agenttransport.Gateway
 	repositoryHealth           interface {
@@ -193,9 +194,12 @@ func (s *Server) SetAcornFoxDeploymentStore(store acornFoxDeploymentStore) {
 	s.acornFoxDeployments = store
 }
 func (s *Server) SetAcornFoxLogs(handler *AcornFoxLogsHTTPHandler) { s.acornFoxLogs = handler }
-func (s *Server) SetLegacyRoutesEnabled(enabled bool)              { s.legacyRoutesEnabled = enabled }
-func (s *Server) Handler() http.Handler                            { return http.HandlerFunc(s.serveHTTP) }
-func (s *Server) AgentGateway() *agenttransport.Gateway            { return s.agentGateway }
+func (s *Server) SetAcornFoxPublicAccess(handler *AcornFoxPublicAccessHTTPHandler) {
+	s.acornFoxPublicAccess = handler
+}
+func (s *Server) SetLegacyRoutesEnabled(enabled bool)   { s.legacyRoutesEnabled = enabled }
+func (s *Server) Handler() http.Handler                 { return http.HandlerFunc(s.serveHTTP) }
+func (s *Server) AgentGateway() *agenttransport.Gateway { return s.agentGateway }
 func (s *Server) HTTPServer(addr string) *http.Server {
 	return &http.Server{Addr: addr, Handler: s.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 0, IdleTimeout: 60 * time.Second}
 }

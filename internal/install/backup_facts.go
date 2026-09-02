@@ -39,7 +39,7 @@ type PlatformBackupRuntimeConfigV1 struct {
 }
 
 var platformBackupServerRuntimeKeys = []string{
-	"OPEN_CARD_AGENT_DISPATCH_INSTANCE_ID", "OPEN_CARD_AGENT_DISPATCH_NODE_ID", "OPEN_CARD_AGENT_GATEWAY_ADDR", "OPEN_CARD_AGENT_IDENTITIES_JSON", "OPEN_CARD_AUTH_ORIGIN", "OPEN_CARD_BUILDKIT_ADDRESS", "OPEN_CARD_BUILDKIT_COMMAND", "OPEN_CARD_BUILDKIT_WORKER", "OPEN_CARD_BUILD_WORK_ROOT", "OPEN_CARD_CADDY_ADMIN_URL", "OPEN_CARD_CADDY_LISTEN", "OPEN_CARD_LOG_MAX_FILE_BYTES", "OPEN_CARD_LOG_MAX_TOTAL_BYTES", "OPEN_CARD_LOG_ROOT", "OPEN_CARD_M1_ENABLED", "OPEN_CARD_M2_ENABLED", "OPEN_CARD_M2_REGISTRY_BASE_URL", "OPEN_CARD_M3_COMPOSITION", "OPEN_CARD_M3_ENABLED", "OPEN_CARD_M4_ENABLED", "OPEN_CARD_M4_LOG_COLLECTION_INTERVAL", "OPEN_CARD_M4_ROLLOUT_ENABLED", "OPEN_CARD_M4_ROLLOUT_INTERVAL", "OPEN_CARD_M5_ENABLED", "OPEN_CARD_M5_STORAGE_CAPACITY_BYTES", "OPEN_CARD_M5_STORAGE_HARD_RESERVE_BYTES", "OPEN_CARD_M6_ENABLED", "OPEN_CARD_M6_WORKSPACE_ROOT", "OPEN_CARD_OCI_STORE_ROOT", "OPEN_CARD_RUNTIME_TASK_PREFIX", "OPEN_CARD_SERVER_ADDR", "OPEN_CARD_SOURCE_GIT_RESOLVERS", "OPEN_CARD_SOURCE_UPLOAD_ROOT", "OPEN_CARD_SOURCE_WORKSPACE_ROOT", "OPEN_CARD_STATIC_RUNTIME_DIGEST", "OPEN_CARD_STATIC_SERVER_BINARY",
+	"ACORNFOX_PUBLIC_ROOT", "OPEN_CARD_AGENT_DISPATCH_INSTANCE_ID", "OPEN_CARD_AGENT_DISPATCH_NODE_ID", "OPEN_CARD_AGENT_GATEWAY_ADDR", "OPEN_CARD_AGENT_IDENTITIES_JSON", "OPEN_CARD_AUTH_ORIGIN", "OPEN_CARD_BUILDKIT_ADDRESS", "OPEN_CARD_BUILDKIT_COMMAND", "OPEN_CARD_BUILDKIT_WORKER", "OPEN_CARD_BUILD_WORK_ROOT", "OPEN_CARD_CADDY_ADMIN_URL", "OPEN_CARD_CADDY_LISTEN", "OPEN_CARD_LOG_MAX_FILE_BYTES", "OPEN_CARD_LOG_MAX_TOTAL_BYTES", "OPEN_CARD_LOG_ROOT", "OPEN_CARD_M1_ENABLED", "OPEN_CARD_M2_ENABLED", "OPEN_CARD_M2_REGISTRY_BASE_URL", "OPEN_CARD_M3_COMPOSITION", "OPEN_CARD_M3_ENABLED", "OPEN_CARD_M4_ENABLED", "OPEN_CARD_M4_LOG_COLLECTION_INTERVAL", "OPEN_CARD_M4_ROLLOUT_ENABLED", "OPEN_CARD_M4_ROLLOUT_INTERVAL", "OPEN_CARD_M5_ENABLED", "OPEN_CARD_M5_STORAGE_CAPACITY_BYTES", "OPEN_CARD_M5_STORAGE_HARD_RESERVE_BYTES", "OPEN_CARD_M6_ENABLED", "OPEN_CARD_M6_WORKSPACE_ROOT", "OPEN_CARD_OCI_STORE_ROOT", "OPEN_CARD_RUNTIME_TASK_PREFIX", "OPEN_CARD_SERVER_ADDR", "OPEN_CARD_SOURCE_GIT_RESOLVERS", "OPEN_CARD_SOURCE_UPLOAD_ROOT", "OPEN_CARD_SOURCE_WORKSPACE_ROOT", "OPEN_CARD_STATIC_RUNTIME_DIGEST", "OPEN_CARD_STATIC_SERVER_BINARY",
 }
 var platformBackupAgentRuntimeKeys = []string{
 	"OPEN_CARD_AGENT_VERSION", "OPEN_CARD_CONTROL_PLANE_SERVER_NAME", "OPEN_CARD_CONTROL_PLANE_URL", "OPEN_CARD_INSTANCE_ID", "OPEN_CARD_M2_ENABLED", "OPEN_CARD_M4_ENABLED", "OPEN_CARD_NODE_ID", "OPEN_CARD_OCI_STORE_ROOT", "OPEN_CARD_RUNTIME_ENABLED", "OPEN_CARD_RUNTIME_GROUP_NETWORK", "OPEN_CARD_RUNTIME_NETWORK", "OPEN_CARD_RUNTIME_RESERVE_MEMORY_BYTES", "OPEN_CARD_RUNTIME_TASK_PREFIX", "OPEN_CARD_RUNTIME_WORK_ROOT", "OPEN_CARD_WORKER_NETWORK_ISOLATED",
@@ -93,7 +93,28 @@ var platformBackupRouteTables = []struct {
 	name  string
 	order []string
 }{
-	{"dns_change_owned_records", []string{"owner_key"}}, {"dns_change_plans", []string{"id"}}, {"dns_change_reconcile_state", []string{"scope"}}, {"m3_application_domains", []string{"id"}}, {"m3_certificate_references", []string{"id"}}, {"m3_desired_routes", []string{"id"}}, {"m3_domain_convergence_requests", []string{"id"}}, {"m3_platform_domains", []string{"id"}}, {"m3_port_leases", []string{"id"}}, {"m3_route_pointers", []string{"route_id"}}, {"m3_traffic_switches", []string{"id"}}, {"m4_rollout_coordinations", []string{"operation_id"}}, {"m4_rollout_phase_events", []string{"operation_id", "sequence"}}, {"m4_rollout_route_set_entries", []string{"rollout_operation_id", "route_id"}}, {"m4_rollout_route_sets", []string{"rollout_operation_id"}},
+	// The PostgreSQL dump remains the recovery source. These table digests are
+	// mandatory post-restore integrity receipts: they prove the recovered dump
+	// retained route/public-access/DNS command facts without pretending the
+	// backup protocol copies tables one by one.
+	{"acornfox_public_access_commands", []string{"application_id", "deployment_id", "idempotency_key"}},
+	{"dns_change_execution_steps", []string{"plan_id", "change_index"}},
+	{"dns_change_execution_scopes", []string{"installation_id", "provider", "zone_id"}},
+	{"dns_change_owned_records", []string{"installation_id", "owner_key"}},
+	{"dns_change_plans", []string{"id"}},
+	{"dns_change_reconcile_state", []string{"scope"}},
+	{"m3_application_domains", []string{"id"}},
+	{"m3_certificate_references", []string{"id"}},
+	{"m3_desired_routes", []string{"id"}},
+	{"m3_domain_convergence_requests", []string{"id"}},
+	{"m3_platform_domains", []string{"id"}},
+	{"m3_port_leases", []string{"id"}},
+	{"m3_route_pointers", []string{"route_id"}},
+	{"m3_traffic_switches", []string{"id"}},
+	{"m4_rollout_coordinations", []string{"operation_id"}},
+	{"m4_rollout_phase_events", []string{"operation_id", "sequence"}},
+	{"m4_rollout_route_set_entries", []string{"rollout_operation_id", "route_id"}},
+	{"m4_rollout_route_sets", []string{"rollout_operation_id"}},
 }
 
 func (v PlatformBackupRoutesV1) Validate() error {
@@ -499,6 +520,8 @@ func runtimeValueValid(key, value string, server bool) bool {
 		return validResolverList(value)
 	case "OPEN_CARD_CONTROL_PLANE_SERVER_NAME":
 		return normalizedConsoleHostname(value)
+	case "ACORNFOX_PUBLIC_ROOT":
+		return normalizedConsoleHostname(value) && !strings.HasPrefix(value, "apps.") && !strings.HasPrefix(value, "*.")
 	case "OPEN_CARD_BUILDKIT_WORKER":
 		return validID(value)
 	case "OPEN_CARD_BUILDKIT_COMMAND", "OPEN_CARD_STATIC_SERVER_BINARY":
