@@ -35,6 +35,37 @@ type acornFoxCommandFixture struct {
 	err   error
 }
 
+type acornFoxDirectReadFixture struct {
+	source     domain.SourceRevision
+	deployment domain.Deployment
+}
+
+func (f acornFoxDirectReadFixture) GetAcornFoxSourceRevision(_ context.Context, applicationID, sourceID domain.ID) (domain.SourceRevision, error) {
+	if applicationID != f.source.ApplicationID || sourceID != f.source.ID {
+		return domain.SourceRevision{}, postgres.ErrNotFound
+	}
+	return f.source, nil
+}
+
+func (f acornFoxDirectReadFixture) GetAcornFoxDeployment(_ context.Context, applicationID, deploymentID domain.ID) (domain.Deployment, error) {
+	if applicationID != f.deployment.ApplicationID || deploymentID != f.deployment.ID {
+		return domain.Deployment{}, postgres.ErrNotFound
+	}
+	return f.deployment, nil
+}
+
+func (acornFoxDirectReadFixture) GetAcornFoxRuntimeRequest(context.Context, domain.ID, domain.ID) (contracts.AcornFoxRuntimeDeployRequest, error) {
+	return contracts.AcornFoxRuntimeDeployRequest{}, postgres.ErrNotFound
+}
+
+func (acornFoxDirectReadFixture) GetAcornFoxRuntimeObservation(context.Context, domain.ID, domain.ID) (contracts.AcornFoxRuntimeObservation, error) {
+	return contracts.AcornFoxRuntimeObservation{}, postgres.ErrNotFound
+}
+
+func (acornFoxDirectReadFixture) GetLatestAcornFoxProbeObservation(context.Context, domain.ID, domain.ID) (postgres.AcornFoxProbeObservation, error) {
+	return postgres.AcornFoxProbeObservation{}, postgres.ErrNotFound
+}
+
 func TestAcornFoxAuthLoginAuthenticatesCleanAPIOnly(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
 	store := &authHTTPStore{}
@@ -308,6 +339,55 @@ func TestAcornFoxPublicErrorsUseStableStatusAndEnvelope(t *testing.T) {
 		})
 	}
 }
+
+func TestAcornFoxDirectReadsOnlyExposeEligibleResources(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	fixture := acornFoxDirectReadFixture{
+		source: domain.SourceRevision{
+			ID:            "src_public",
+			ApplicationID: "app_1",
+			Kind:          domain.SourceGitHTTPS,
+			Locator:       "https://github.com/acme/example.git",
+			Ref:           "main",
+			Commit:        strings.Repeat("a", 40),
+			ContentDigest: "sha256:" + strings.Repeat("b", 64),
+			WorkspaceRef:  "/private/workspace/src_public",
+			CreatedAt:     now,
+			Immutable:     true,
+		},
+		deployment: domain.Deployment{ID: "dep_runtime", ApplicationID: "app_1", EnvironmentID: "env_1", ReleaseID: "rel_1", Status: domain.DeploymentDeploying, CreatedAt: now, UpdatedAt: now},
+	}
+	server := NewAcornFoxServer()
+	server.SetAcornFoxDeploymentStore(fixture)
+	_, session, _ := attachTestAcornFoxAdministratorTokens(t, server, &now)
+
+	for _, test := range []struct {
+		name, path string
+		want       int
+	}{
+		{name: "eligible source", path: acornFoxAPIBase + "/app_1/sources/src_public", want: http.StatusOK},
+		{name: "eligible deployment", path: acornFoxAPIBase + "/app_1/deliveries/dep_runtime", want: http.StatusOK},
+		{name: "private or unproven source", path: acornFoxAPIBase + "/app_1/sources/src_private", want: http.StatusNotFound},
+		{name: "legacy or nonstrict deployment", path: acornFoxAPIBase + "/app_1/deliveries/dep_legacy", want: http.StatusNotFound},
+		{name: "cross app source", path: acornFoxAPIBase + "/app_other/sources/src_public", want: http.StatusNotFound},
+		{name: "cross app deployment", path: acornFoxAPIBase + "/app_other/deliveries/dep_runtime", want: http.StatusNotFound},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodGet, test.path, nil)
+			request.AddCookie(session)
+			response := httptest.NewRecorder()
+			server.Handler().ServeHTTP(response, request)
+			if response.Code != test.want {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			if test.want == http.StatusOK && (strings.Contains(response.Body.String(), fixture.source.Locator) || strings.Contains(response.Body.String(), fixture.source.WorkspaceRef) || strings.Contains(response.Body.String(), "task_")) {
+				t.Fatalf("direct response leaked internal topology: %s", response.Body.String())
+			}
+		})
+	}
+}
+
+var _ acornFoxDeploymentStore = acornFoxDirectReadFixture{}
 
 func TestAcornFoxMigrationModePreservesHistoricalRoutesOnlyWhenExplicit(t *testing.T) {
 	server := NewServer()

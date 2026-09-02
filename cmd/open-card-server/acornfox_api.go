@@ -18,8 +18,8 @@ const acornFoxAPIBase = "/api/v1/acornfox/apps"
 // Commands are supplied separately so status can never manufacture lifecycle
 // facts from a client request.
 type acornFoxDeploymentStore interface {
-	GetSourceRevision(context.Context, domain.ID) (domain.SourceRevision, error)
-	GetDeployment(context.Context, domain.ID) (domain.Deployment, error)
+	GetAcornFoxSourceRevision(context.Context, domain.ID, domain.ID) (domain.SourceRevision, error)
+	GetAcornFoxDeployment(context.Context, domain.ID, domain.ID) (domain.Deployment, error)
 	GetAcornFoxRuntimeRequest(context.Context, domain.ID, domain.ID) (contracts.AcornFoxRuntimeDeployRequest, error)
 	GetAcornFoxRuntimeObservation(context.Context, domain.ID, domain.ID) (contracts.AcornFoxRuntimeObservation, error)
 	GetLatestAcornFoxProbeObservation(context.Context, domain.ID, domain.ID) (postgres.AcornFoxProbeObservation, error)
@@ -260,8 +260,8 @@ func (s *Server) handleAcornFoxSource(w http.ResponseWriter, r *http.Request, ap
 		writeJSONError(w, http.StatusServiceUnavailable, "capability_unavailable", "source readback is unavailable")
 		return
 	}
-	source, err := s.acornFoxDeployments.GetSourceRevision(r.Context(), sourceID)
-	if err != nil || source.ApplicationID != applicationID {
+	source, err := s.acornFoxDeployments.GetAcornFoxSourceRevision(r.Context(), applicationID, sourceID)
+	if err != nil {
 		writeAcornFoxError(w, errOrNotFound(err))
 		return
 	}
@@ -297,8 +297,8 @@ func (s *Server) handleAcornFoxDeliveryStatus(w http.ResponseWriter, r *http.Req
 		writeJSONError(w, http.StatusServiceUnavailable, "capability_unavailable", "delivery readback is unavailable")
 		return
 	}
-	deployment, err := s.acornFoxDeployments.GetDeployment(r.Context(), deploymentID)
-	if err != nil || deployment.ApplicationID != applicationID {
+	deployment, err := s.acornFoxDeployments.GetAcornFoxDeployment(r.Context(), applicationID, deploymentID)
+	if err != nil {
 		writeAcornFoxError(w, errOrNotFound(err))
 		return
 	}

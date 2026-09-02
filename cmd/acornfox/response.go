@@ -324,7 +324,7 @@ func validateCreateApp(v *apiCreateApp) bool {
 	return validateApplication(&v.Application) && nonempty(v.SourceRevisionID, v.OperationID)
 }
 func validateSource(v *apiSource) bool {
-	return v.Immutable != nil && nonempty(v.ID, v.ApplicationID, v.Kind, v.LocatorSHA256, v.ContentDigest) && validTime(v.CreatedAt)
+	return v.Immutable != nil && v.Kind == "git_https" && nonempty(v.ID, v.ApplicationID, v.LocatorSHA256, v.ContentDigest) && validTime(v.CreatedAt)
 }
 func validateSources(v *apiSources) bool {
 	for i := range v.Items {

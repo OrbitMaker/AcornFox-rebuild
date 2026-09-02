@@ -322,7 +322,8 @@ export interface components {
         SourceRevision: {
             id: string;
             application_id: string;
-            kind: string;
+            /** @enum {string} */
+            kind: "git_https";
             locator_sha256: string;
             ref?: string;
             commit?: string;

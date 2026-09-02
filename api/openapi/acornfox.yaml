@@ -294,7 +294,7 @@ components:
       type: object
       required: [id, application_id, kind, locator_sha256, content_digest, created_at, immutable]
       additionalProperties: false
-      properties: {id: {type: string}, application_id: {type: string}, kind: {type: string}, locator_sha256: {type: string}, ref: {type: string}, commit: {type: string}, content_digest: {type: string}, created_at: {type: string, format: date-time}, immutable: {type: boolean}}
+      properties: {id: {type: string}, application_id: {type: string}, kind: {type: string, enum: [git_https]}, locator_sha256: {type: string}, ref: {type: string}, commit: {type: string}, content_digest: {type: string}, created_at: {type: string, format: date-time}, immutable: {type: boolean}}
     SourceRevisionList:
       type: object
       required: [items, next_cursor]

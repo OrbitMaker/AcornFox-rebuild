@@ -9,9 +9,15 @@ import {
   type PublicAccess,
   type SourceRevision,
   type Deployment,
-  type DeliveryLogs,
+  type LogsPage,
 } from "./client";
-import { ActionScope, LatestRequest, refetchAfterAccepted } from "./state";
+import {
+  ActionScope,
+  LatestRequest,
+  appendServerPage,
+  keepsVisibleFacts,
+  refetchAfterAccepted,
+} from "./state";
 
 type Region<T> = {
   state: "loading" | "ready" | "empty" | "unavailable" | "failed";
@@ -254,6 +260,8 @@ export function Sources({
   const [detail, setDetail] = useState<Region<SourceRevision>>({
     state: "empty",
   });
+  const [nextCursor, setNextCursor] = useState<string>();
+  const [more, setMore] = useState<Region<never> | undefined>();
   const listRequest = useRef(new LatestRequest());
   const detailRequest = useRef(new LatestRequest());
   const chosenId = useRef<string | undefined>(selectedId);
@@ -279,22 +287,31 @@ export function Sources({
   };
   const refresh = async (
     autoSelect: boolean,
-  ): Promise<Deployment[] | undefined> => {
+    explicit = false,
+  ): Promise<SourceRevision[] | undefined> => {
     const current = listRequest.current.begin();
-    setRegion({ state: "loading" });
+    const preserve = keepsVisibleFacts(region.state, explicit);
+    if (preserve) setMore({ state: "loading" });
+    else setRegion({ state: "loading" });
     try {
-      const values = await api.sources(applicationId);
+      const page = await api.sources(applicationId);
+      const values = page.items;
       if (!current()) return undefined;
       setRegion(
         values.length
           ? { state: "ready", value: values }
           : { state: "empty", value: values },
       );
+      setNextCursor(page.nextCursor);
+      if (preserve) setMore(undefined);
       if (autoSelect && chosenId.current === undefined) void select(values[0]);
+      return values;
     } catch (error) {
-      if (!current()) return;
-      setRegion(failure(error));
+      if (!current()) return undefined;
+      if (preserve) setMore(failure(error));
+      else setRegion(failure(error));
       if (autoSelect) void select(undefined);
+      return undefined;
     }
   };
   useEffect(() => {
@@ -305,11 +322,37 @@ export function Sources({
       detailRequest.current.invalidate();
     };
   }, [applicationId]);
+  const loadMore = async () => {
+    if (!nextCursor || region.state !== "ready") return;
+    const current = listRequest.current.begin();
+    setMore({ state: "loading" });
+    try {
+      const page = await api.sources(applicationId, nextCursor);
+      if (!current()) return;
+      const items = [
+        ...(region.value ?? []),
+        ...page.items.filter(
+          (item) => !region.value?.some((existing) => existing.id === item.id),
+        ),
+      ];
+      setRegion({ state: "ready", value: items });
+      setNextCursor(page.nextCursor);
+      setMore(undefined);
+    } catch (error) {
+      if (current()) setMore(failure(error));
+    }
+  };
   return (
     <section className="af-section" aria-labelledby="sources-title">
       <header>
         <h2 id="sources-title">源码版本</h2>
-        <button className="af-text-button" onClick={() => void refresh(false)}>
+        <button
+          className="af-text-button"
+          onClick={() => {
+            setMore(undefined);
+            void refresh(false, true);
+          }}
+        >
           刷新
         </button>
       </header>
@@ -340,6 +383,16 @@ export function Sources({
           </div>
         </dl>
       )}
+      {nextCursor && (
+        <button
+          className="af-text-button"
+          onClick={() => void loadMore()}
+          disabled={more?.state === "loading"}
+        >
+          {more?.state === "loading" ? "正在加载…" : "加载更多"}
+        </button>
+      )}
+      {more && <RegionNote region={more} empty="" />}
     </section>
   );
 }
@@ -363,20 +416,30 @@ export function Deployments({
   const [port, setPort] = useState("");
   const [message, setMessage] = useState<string>();
   const [busy, setBusy] = useState(false);
+  const [nextCursor, setNextCursor] = useState<string>();
+  const [more, setMore] = useState<Region<never> | undefined>();
   const request = useRef(new LatestRequest());
   const actionScope = useRef(new ActionScope());
   const chosenId = useRef<string | undefined>(selected?.id);
-  const refresh = async (autoSelect: boolean) => {
+  const refresh = async (
+    autoSelect: boolean,
+    explicit = false,
+  ): Promise<Deployment[] | undefined> => {
     const current = request.current.begin();
-    setRegion({ state: "loading" });
+    const preserve = keepsVisibleFacts(region.state, explicit);
+    if (preserve) setMore({ state: "loading" });
+    else setRegion({ state: "loading" });
     try {
-      const values = await api.deployments(applicationId);
-      if (!current()) return;
+      const page = await api.deployments(applicationId);
+      const values = page.items;
+      if (!current()) return undefined;
       setRegion(
         values.length
           ? { state: "ready", value: values }
           : { state: "empty", value: values },
       );
+      setNextCursor(page.nextCursor);
+      if (preserve) setMore(undefined);
       if (autoSelect && chosenId.current === undefined) {
         const next = values[0];
         chosenId.current = next?.id;
@@ -385,7 +448,8 @@ export function Deployments({
       return values;
     } catch (error) {
       if (!current()) return undefined;
-      setRegion(failure(error));
+      if (preserve) setMore(failure(error));
+      else setRegion(failure(error));
       if (autoSelect) onSelect(undefined);
       return undefined;
     }
@@ -395,12 +459,34 @@ export function Deployments({
     setBusy(false);
     setMessage(undefined);
     setPort("");
+    setNextCursor(undefined);
+    setMore(undefined);
     void refresh(true);
     return () => {
       request.current.invalidate();
       actionScope.current.invalidate();
     };
   }, [applicationId]);
+  const loadMore = async () => {
+    if (!nextCursor || region.state !== "ready") return;
+    const current = request.current.begin();
+    setMore({ state: "loading" });
+    try {
+      const page = await api.deployments(applicationId, nextCursor);
+      if (!current()) return;
+      const items = [
+        ...(region.value ?? []),
+        ...page.items.filter(
+          (item) => !region.value?.some((existing) => existing.id === item.id),
+        ),
+      ];
+      setRegion({ state: "ready", value: items });
+      setNextCursor(page.nextCursor);
+      setMore(undefined);
+    } catch (error) {
+      if (current()) setMore(failure(error));
+    }
+  };
   async function deploy(event: FormEvent) {
     event.preventDefault();
     if (!source || busy) return;
@@ -416,7 +502,7 @@ export function Deployments({
         port ? Number(port) : undefined,
       );
       if (!ticket.current()) return;
-      const values = await refetchAfterAccepted(() => refresh(false));
+      const values = await refetchAfterAccepted(() => refresh(false, true));
       if (!ticket.current()) return;
       const created = values?.find(
         (item) => item.id === accepted.deployment_id,
@@ -438,7 +524,13 @@ export function Deployments({
     <section className="af-section" aria-labelledby="deployments-title">
       <header>
         <h2 id="deployments-title">部署</h2>
-        <button className="af-text-button" onClick={() => void refresh(false)}>
+        <button
+          className="af-text-button"
+          onClick={() => {
+            setMore(undefined);
+            void refresh(false, true);
+          }}
+        >
           刷新
         </button>
       </header>
@@ -477,6 +569,16 @@ export function Deployments({
           </span>
         </button>
       ))}
+      {nextCursor && (
+        <button
+          className="af-text-button"
+          onClick={() => void loadMore()}
+          disabled={more?.state === "loading"}
+        >
+          {more?.state === "loading" ? "正在加载…" : "加载更多"}
+        </button>
+      )}
+      {more && <RegionNote region={more} empty="" />}
     </section>
   );
 }
@@ -491,13 +593,16 @@ export function Logs({
   deploymentId: string;
 }) {
   const [source, setSource] = useState<"build" | "runtime">("build");
-  const [region, setRegion] = useState<Region<DeliveryLogs>>({
+  const [region, setRegion] = useState<Region<LogsPage>>({
     state: "loading",
   });
+  const [nextCursor, setNextCursor] = useState<string>();
+  const [more, setMore] = useState<Region<never> | undefined>();
   const request = useRef(new LatestRequest());
-  const refresh = async () => {
+  const refresh = async (replace: boolean) => {
     const current = request.current.begin();
-    setRegion({ state: "loading" });
+    if (replace) setRegion({ state: "loading" });
+    else setMore({ state: "loading" });
     try {
       const result = await api.logs(applicationId, deploymentId, source);
       if (!current()) return;
@@ -506,15 +611,40 @@ export function Logs({
           ? { state: "ready", value: result }
           : { state: "empty", value: result },
       );
+      setNextCursor(result.nextCursor);
+      if (!replace) setMore(undefined);
     } catch (error) {
       if (!current()) return;
-      setRegion(failure(error));
+      if (replace) setRegion(failure(error));
+      else setMore(failure(error));
     }
   };
   useEffect(() => {
-    void refresh();
+    setNextCursor(undefined);
+    setMore(undefined);
+    void refresh(true);
     return () => request.current.invalidate();
   }, [applicationId, deploymentId, source]);
+  const loadMore = async () => {
+    if (!nextCursor || region.state !== "ready") return;
+    const current = request.current.begin();
+    setMore({ state: "loading" });
+    try {
+      const page = await api.logs(
+        applicationId,
+        deploymentId,
+        source,
+        nextCursor,
+      );
+      if (!current()) return;
+      const items = appendServerPage(region.value?.items ?? [], page.items);
+      setRegion({ state: "ready", value: { ...page, items } });
+      setNextCursor(page.nextCursor);
+      setMore(undefined);
+    } catch (error) {
+      if (current()) setMore(failure(error));
+    }
+  };
   return (
     <section className="af-section" aria-labelledby="logs-title">
       <header>
@@ -532,7 +662,13 @@ export function Logs({
           >
             运行
           </button>
-          <button className="af-text-button" onClick={() => void refresh()}>
+          <button
+            className="af-text-button"
+            onClick={() => {
+              setMore(undefined);
+              void refresh(false);
+            }}
+          >
             刷新
           </button>
         </span>
@@ -553,6 +689,16 @@ export function Logs({
           </pre>
         </>
       )}
+      {nextCursor && (
+        <button
+          className="af-text-button"
+          onClick={() => void loadMore()}
+          disabled={more?.state === "loading"}
+        >
+          {more?.state === "loading" ? "正在加载…" : "加载更早"}
+        </button>
+      )}
+      {more && <RegionNote region={more} empty="" />}
     </section>
   );
 }

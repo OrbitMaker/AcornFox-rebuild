@@ -50,7 +50,7 @@ describe("AcornFox API client", () => {
       return json({
         id: "s",
         application_id: "a",
-        kind: "public_git",
+        kind: "git_https",
         locator_sha256: "x",
         content_digest: "y",
         created_at: "2026-01-01T00:00:00Z",
@@ -302,7 +302,7 @@ describe("AcornFox API client", () => {
         return json({
           id: "s",
           application_id: "a",
-          kind: "public_git",
+          kind: "git_https",
           locator_sha256: "x",
           content_digest: "y",
           created_at: "not-a-date",
@@ -447,5 +447,83 @@ describe("AcornFox API client", () => {
     await expect(wrongCommand.deploy("a", "s")).rejects.toMatchObject({
       code: "invalid_response",
     });
+  });
+
+  it("preserves opaque discovery and log page envelopes across 51 records", async () => {
+    const sourceItem = (id: string) => ({
+      id,
+      application_id: "a",
+      kind: "git_https",
+      locator_sha256: "x",
+      content_digest: "y",
+      created_at: "2026-01-01T00:00:00Z",
+      immutable: true,
+    });
+    const paged = createAcornFoxClient(async (input) => {
+      const url = String(input);
+      if (url.includes("/sources"))
+        return json(
+          url.includes("cursor=opaque-next")
+            ? { items: [sourceItem("s-51")], next_cursor: null }
+            : {
+                items: Array.from({ length: 50 }, (_, index) =>
+                  sourceItem(`s-${index + 1}`),
+                ),
+                next_cursor: "opaque-next",
+              },
+        );
+      return json(
+        url.includes("cursor=opaque-log")
+          ? {
+              source: "build",
+              availability: "available",
+              items: [],
+              next_cursor: null,
+              retention_limited: false,
+            }
+          : {
+              source: "build",
+              availability: "available",
+              items: [],
+              next_cursor: "opaque-log",
+              retention_limited: false,
+            },
+      );
+    });
+    const first = await paged.sources("a");
+    const second = await paged.sources("a", first.nextCursor);
+    expect([...first.items, ...second.items]).toHaveLength(51);
+    const logs = await paged.logs("a", "d", "build");
+    expect(logs.nextCursor).toBe("opaque-log");
+    await paged.logs("a", "d", "build", logs.nextCursor);
+  });
+
+  it("rejects public access URLs without HTTPS host-only authority", async () => {
+    for (const value of [
+      "http://example.test",
+      "data:text/plain,no",
+      "ftp://example.test",
+      "https://user@example.test",
+      "https://",
+    ]) {
+      const api = createAcornFoxClient(async () =>
+        json({
+          desired_public: false,
+          url: value,
+          endpoint: { deployment_id: "d" },
+          components: {
+            internal_endpoint: "accepted",
+            local_route: "disabled",
+            dns: "not_validated",
+            tls: "not_validated",
+            external: "not_validated",
+          },
+          status: "PUBLIC_DISABLED",
+        }),
+      );
+      await expect(api.publicAccess("a", "d")).rejects.toMatchObject({
+        code: "invalid_response",
+      });
+    }
   });
 });

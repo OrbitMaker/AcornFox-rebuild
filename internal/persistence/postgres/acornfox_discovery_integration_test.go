@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -58,6 +59,29 @@ func TestAcornFoxDiscoveryPersistsOnlyPublicGitAndStrictRuntimeDeployments(t *te
 	deliveries, err := store.ListAcornFoxDeployments(ctx, domain.ID(fixture.applicationID), nil, 50)
 	if err != nil || len(deliveries.Items) != 1 || deliveries.Items[0].ID != strictDeployment {
 		t.Fatalf("deliveries=%+v err=%v", deliveries, err)
+	}
+	directSource, err := store.GetAcornFoxSourceRevision(ctx, domain.ID(fixture.applicationID), "source_discovery_git")
+	if err != nil || directSource.ID != "source_discovery_git" {
+		t.Fatalf("eligible direct source=%+v err=%v", directSource, err)
+	}
+	if _, err := store.GetAcornFoxSourceRevision(ctx, domain.ID(fixture.applicationID), "source_discovery_unproven"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unproven direct source err=%v", err)
+	}
+	directDeployment, err := store.GetAcornFoxDeployment(ctx, domain.ID(fixture.applicationID), strictDeployment)
+	if err != nil || directDeployment.ID != strictDeployment {
+		t.Fatalf("eligible direct deployment=%+v err=%v", directDeployment, err)
+	}
+	if _, err := store.GetAcornFoxDeployment(ctx, domain.ID(fixture.applicationID), domain.ID(fixture.deploymentID)); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("legacy direct deployment err=%v", err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO applications(id,name,created_at,updated_at) VALUES('app_entry_other','other',$1,$1)`, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.GetAcornFoxSourceRevision(ctx, "app_entry_other", "source_discovery_git"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("cross-app direct source err=%v", err)
+	}
+	if _, err := store.GetAcornFoxDeployment(ctx, "app_entry_other", strictDeployment); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("cross-app direct deployment err=%v", err)
 	}
 	if _, err := store.ListAcornFoxDeployments(ctx, "app_other", nil, 50); err != ErrNotFound {
 		t.Fatalf("cross app err=%v", err)

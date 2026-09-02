@@ -9,6 +9,9 @@ export type DeliveryLogs = AcornFoxSchemas["DeliveryLogsResponse"];
 export type PublicAccess = AcornFoxSchemas["PublicAccessResponse"];
 export type Session = AcornFoxSchemas["AuthSessionResponse"];
 export type Command = AcornFoxSchemas["DeliveryCommandResponse"];
+export type Page<T> = { items: T[]; nextCursor?: string };
+export type LogsPage = Page<DeliveryLogs["items"][number]> &
+  Pick<DeliveryLogs, "source" | "availability" | "retention_limited">;
 
 const base = "/api/v1/acornfox";
 type Fetcher = (
@@ -61,9 +64,15 @@ export interface AcornFoxClient {
     sourceRevisionId: string;
     operationId: string;
   }>;
-  sources(applicationId: string): Promise<SourceRevision[]>;
+  sources(
+    applicationId: string,
+    cursor?: string,
+  ): Promise<Page<SourceRevision>>;
   source(applicationId: string, sourceId: string): Promise<SourceRevision>;
-  deployments(applicationId: string): Promise<Deployment[]>;
+  deployments(
+    applicationId: string,
+    cursor?: string,
+  ): Promise<Page<Deployment>>;
   deploy(
     applicationId: string,
     sourceId: string,
@@ -74,7 +83,8 @@ export interface AcornFoxClient {
     applicationId: string,
     deploymentId: string,
     source: "build" | "runtime",
-  ): Promise<DeliveryLogs>;
+    cursor?: string,
+  ): Promise<LogsPage>;
   restart(applicationId: string, deploymentId: string): Promise<Command>;
   redeploy(applicationId: string, deploymentId: string): Promise<Command>;
   publicAccess(
@@ -150,11 +160,16 @@ function dateTime(value: unknown): string {
 function integer(value: unknown): number {
   return Number.isInteger(value) ? numberValue(value) : invalid();
 }
-function uri(value: unknown): string {
+function httpsUri(value: unknown): string {
   const result = text(value);
   try {
-    new URL(result);
-    return result;
+    const parsed = new URL(result);
+    return parsed.protocol === "https:" &&
+      parsed.host.length > 0 &&
+      parsed.username === "" &&
+      parsed.password === ""
+      ? result
+      : invalid();
   } catch {
     return invalid();
   }
@@ -200,7 +215,7 @@ function source(value: unknown): SourceRevision {
   return {
     id: text(row.id),
     application_id: text(row.application_id),
-    kind: text(row.kind),
+    kind: enumValue(row.kind, ["git_https"]),
     locator_sha256: text(row.locator_sha256),
     ref: maybeText(row.ref),
     commit: maybeText(row.commit),
@@ -490,7 +505,7 @@ function publicAccess(value: unknown): PublicAccess {
   ]);
   return {
     desired_public: flag(row.desired_public),
-    url: uri(row.url),
+    url: httpsUri(row.url),
     endpoint: { deployment_id: text(endpoint.deployment_id) },
     components: {
       internal_endpoint: enumValue(details.internal_endpoint, [
@@ -513,12 +528,18 @@ function publicAccess(value: unknown): PublicAccess {
     ]),
   };
 }
-function discoveryList<T>(value: unknown, parse: (item: unknown) => T): T[] {
+function discoveryPage<T>(
+  value: unknown,
+  parse: (item: unknown) => T,
+): Page<T> {
   const root = exact(value, ["items", "next_cursor"]);
   if (!Array.isArray(root.items)) return invalid();
   if (root.next_cursor !== null && typeof root.next_cursor !== "string")
     return invalid();
-  return root.items.map(parse);
+  return {
+    items: root.items.map(parse),
+    ...(root.next_cursor === null ? {} : { nextCursor: root.next_cursor }),
+  };
 }
 
 function csrfCookie(): string | undefined {
@@ -697,15 +718,17 @@ export function createAcornFoxClient(
         write,
       );
     },
-    sources: (id) =>
-      request(`/apps/${pathPart(id)}/sources?limit=50`, (value) =>
-        discoveryList(value, source),
+    sources: (id, cursor) =>
+      request(
+        `/apps/${pathPart(id)}/sources?limit=50${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`,
+        (value) => discoveryPage(value, source),
       ),
     source: (id, sourceId) =>
       request(`/apps/${pathPart(id)}/sources/${pathPart(sourceId)}`, source),
-    deployments: (id) =>
-      request(`/apps/${pathPart(id)}/deliveries?limit=50`, (value) =>
-        discoveryList(value, deployment),
+    deployments: (id, cursor) =>
+      request(
+        `/apps/${pathPart(id)}/deliveries?limit=50${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`,
+        (value) => discoveryPage(value, deployment),
       ),
     deploy: (id, sourceId, port) => {
       if (
@@ -731,10 +754,21 @@ export function createAcornFoxClient(
         `/apps/${pathPart(id)}/deliveries/${pathPart(deploymentId)}`,
         deliveryStatus,
       ),
-    logs: (id, deploymentId, logSource) =>
+    logs: (id, deploymentId, logSource, cursor) =>
       request(
-        `/apps/${pathPart(id)}/deliveries/${pathPart(deploymentId)}/logs?source=${logSource}&limit=50`,
-        logs,
+        `/apps/${pathPart(id)}/deliveries/${pathPart(deploymentId)}/logs?source=${logSource}&limit=50${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`,
+        (value) => {
+          const page = logs(value);
+          return {
+            items: page.items,
+            ...(page.next_cursor === null
+              ? {}
+              : { nextCursor: page.next_cursor }),
+            source: page.source,
+            availability: page.availability,
+            retention_limited: page.retention_limited,
+          };
+        },
       ),
     restart: (id, deploymentId) =>
       request(

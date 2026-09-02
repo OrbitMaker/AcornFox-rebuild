@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -50,6 +51,11 @@ func (c *cli) performCall(state sessionState, method, path string, body any, csr
 	if err != nil {
 		return nil, err
 	}
+	expectedStatus, known := expectedSuccessStatus(method, path, shape)
+	if !known || (response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices && response.StatusCode != expectedStatus) {
+		response.Body.Close()
+		return nil, apiError{status: response.StatusCode, Code: "invalid_response", Message: "server response used an unexpected success status", contract: true}
+	}
 	if response.StatusCode == http.StatusUnauthorized {
 		if err := removeState(c.env); err != nil {
 			response.Body.Close()
@@ -72,6 +78,108 @@ func (c *cli) performCall(state sessionState, method, path string, body any, csr
 		return nil, err
 	}
 	return value, nil
+}
+
+func expectedSuccessStatus(method, rawPath string, shape responseShape) (int, bool) {
+	if strings.Contains(rawPath, "#") || strings.HasSuffix(rawPath, "?") {
+		return 0, false
+	}
+	parsed, err := url.ParseRequestURI(rawPath)
+	if err != nil || parsed.Path == "" || strings.HasSuffix(parsed.EscapedPath(), "/") {
+		return 0, false
+	}
+	segments := strings.Split(strings.TrimPrefix(parsed.EscapedPath(), "/"), "/")
+	for _, segment := range segments {
+		decoded, decodeErr := url.PathUnescape(segment)
+		if segment == "" || decodeErr != nil || decoded == "" || strings.Contains(decoded, "/") {
+			return 0, false
+		}
+	}
+	noQuery := parsed.RawQuery == ""
+	hasApp := len(segments) >= 2 && segments[0] == "apps" && segments[1] != ""
+	switch method {
+	case http.MethodPost:
+		switch {
+		case len(segments) == 2 && segments[0] == "auth" && segments[1] == "login" && noQuery && shape == shapeSession:
+			return http.StatusOK, true
+		case len(segments) == 2 && segments[0] == "auth" && (segments[1] == "logout" || segments[1] == "password") && noQuery && shape == shapeSession:
+			return http.StatusNoContent, true
+		case len(segments) == 1 && segments[0] == "apps" && noQuery && shape == shapeCreateApp:
+			return http.StatusCreated, true
+		case hasApp && len(segments) == 3 && segments[2] == "deliveries" && noQuery && shape == shapeCommand:
+			return http.StatusAccepted, true
+		case hasApp && len(segments) == 5 && segments[2] == "deliveries" && (segments[4] == "restart" || segments[4] == "redeploy") && noQuery && shape == shapeCommand:
+			return http.StatusAccepted, true
+		}
+	case http.MethodPut:
+		if hasApp && len(segments) == 5 && segments[2] == "deliveries" && segments[4] == "public-access" && noQuery && shape == shapePublicAccess {
+			return http.StatusOK, true
+		}
+	case http.MethodGet:
+		switch {
+		case len(segments) == 2 && segments[0] == "auth" && segments[1] == "session" && noQuery && shape == shapeSession:
+			return http.StatusOK, true
+		case len(segments) == 1 && segments[0] == "apps" && noQuery && shape == shapeApps:
+			return http.StatusOK, true
+		case hasApp && len(segments) == 2 && noQuery && shape == shapeApplication:
+			return http.StatusOK, true
+		case hasApp && len(segments) == 3 && segments[2] == "sources" && validListQuery(parsed.RawQuery) && shape == shapeSourceList:
+			return http.StatusOK, true
+		case hasApp && len(segments) == 4 && segments[2] == "sources" && noQuery && shape == shapeSource:
+			return http.StatusOK, true
+		case hasApp && len(segments) == 3 && segments[2] == "deliveries" && validListQuery(parsed.RawQuery) && shape == shapeDeploymentList:
+			return http.StatusOK, true
+		case hasApp && len(segments) == 4 && segments[2] == "deliveries" && noQuery && shape == shapeStatus:
+			return http.StatusOK, true
+		case hasApp && len(segments) == 5 && segments[2] == "deliveries" && segments[4] == "logs" && validLogsQuery(parsed.RawQuery) && shape == shapeLogs:
+			return http.StatusOK, true
+		case hasApp && len(segments) == 5 && segments[2] == "deliveries" && segments[4] == "public-access" && noQuery && shape == shapePublicAccess:
+			return http.StatusOK, true
+		}
+	}
+	return 0, false
+}
+
+func validListQuery(raw string) bool { return validQuery(raw, false) }
+func validLogsQuery(raw string) bool { return raw != "" && validQuery(raw, true) }
+func validQuery(raw string, logs bool) bool {
+	if raw == "" {
+		return !logs
+	}
+	for _, part := range strings.Split(raw, "&") {
+		if part == "" {
+			return false
+		}
+	}
+	values, err := url.ParseQuery(raw)
+	if err != nil {
+		return false
+	}
+	allowed := map[string]bool{"limit": true, "cursor": true}
+	if logs {
+		allowed["source"] = true
+	}
+	for key, entries := range values {
+		if !allowed[key] || len(entries) != 1 {
+			return false
+		}
+	}
+	if logs {
+		source, ok := values["source"]
+		if !ok || len(source) != 1 || (source[0] != "build" && source[0] != "runtime") {
+			return false
+		}
+	}
+	if limit, ok := values["limit"]; ok {
+		value, err := strconv.Atoi(limit[0])
+		if err != nil || value < 1 || value > 100 {
+			return false
+		}
+	}
+	if cursor, ok := values["cursor"]; ok && cursor[0] == "" {
+		return false
+	}
+	return true
 }
 
 func (c *cli) request(ctx context.Context, state sessionState, method, path string, body any, csrf bool, key string, timeout time.Duration) (*http.Response, error) {
@@ -181,23 +289,15 @@ func cookie(response *http.Response, name string) string {
 	}
 	return ""
 }
-func responseExpiry(value map[string]json.RawMessage, requireAuthenticated bool) (time.Time, error) {
-	var absolute, idle string
-	var authenticated bool
-	if json.Unmarshal(value["absolute_expires_at"], &absolute) != nil || json.Unmarshal(value["idle_expires_at"], &idle) != nil || json.Unmarshal(value["authenticated"], &authenticated) != nil {
+func responseExpiry(value apiSession, requireAuthenticated bool) (time.Time, error) {
+	if value.Authenticated == nil {
 		return time.Time{}, errors.New("missing expiry")
 	}
-	if requireAuthenticated && !authenticated {
+	if requireAuthenticated && !*value.Authenticated {
 		return time.Time{}, errors.New("not authenticated")
 	}
-	abs, err := time.Parse(time.RFC3339, absolute)
-	if err != nil {
-		return time.Time{}, err
-	}
-	idleAt, err := time.Parse(time.RFC3339, idle)
-	if err != nil {
-		return time.Time{}, err
-	}
+	abs := value.AbsoluteExpiresAt
+	idleAt := value.IdleExpiresAt
 	if !abs.After(time.Now().UTC()) || !idleAt.After(time.Now().UTC()) {
 		return time.Time{}, errors.New("expiry is not future")
 	}

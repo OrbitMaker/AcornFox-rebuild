@@ -225,6 +225,51 @@ func isAcornFoxPublicHTTPSGit(item domain.SourceRevision) bool {
 	return err == nil && parsed.Scheme == "https" && parsed.Host != "" && parsed.User == nil && !strings.ContainsRune(item.Locator, 0)
 }
 
+// GetAcornFoxSourceRevision returns a source only when it meets the same
+// public-Git provenance rule as discovery. A known internal source is not a
+// clean API resource merely because its opaque ID was guessed or retained.
+func (s *Store) GetAcornFoxSourceRevision(ctx context.Context, applicationID, sourceID domain.ID) (domain.SourceRevision, error) {
+	if err := s.requireDB(); err != nil {
+		return domain.SourceRevision{}, err
+	}
+	if err := domain.RequireID(sourceID, "AcornFox source revision id"); err != nil {
+		return domain.SourceRevision{}, err
+	}
+	if err := s.ensureAcornFoxDiscoveryApplication(ctx, applicationID); err != nil {
+		return domain.SourceRevision{}, err
+	}
+	item, err := s.getAcornFoxDiscoverySource(ctx, applicationID, sourceID)
+	if err != nil {
+		return domain.SourceRevision{}, err
+	}
+	if item.Validate() != nil || !isAcornFoxPublicHTTPSGit(item) {
+		return domain.SourceRevision{}, ErrNotFound
+	}
+	proven, err := s.provenAcornFoxPublicSourceIDs(ctx, applicationID, []domain.SourceRevision{item})
+	if err != nil {
+		return domain.SourceRevision{}, err
+	}
+	if !proven[item.ID] {
+		return domain.SourceRevision{}, ErrNotFound
+	}
+	return item, nil
+}
+
+func (s *Store) getAcornFoxDiscoverySource(ctx context.Context, applicationID, sourceID domain.ID) (domain.SourceRevision, error) {
+	item, err := scanAcornFoxDiscoverySource(s.db.QueryRowContext(ctx, `
+		SELECT id,application_id,source_kind,locator,COALESCE(source_ref,''),COALESCE(git_commit,''),content_digest,workspace_ref,created_at,immutable
+		  FROM source_revisions
+		 WHERE id=$1 AND application_id=$2 AND source_kind='git_https' AND immutable=true
+	`, sourceID.String(), applicationID.String()))
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.SourceRevision{}, ErrNotFound
+	}
+	if err != nil {
+		return domain.SourceRevision{}, fmt.Errorf("get AcornFox source revision: %w", err)
+	}
+	return item, nil
+}
+
 // ListAcornFoxDeployments returns only deployments whose persisted task has
 // the strict AcornFox runtime marker and matching immutable runtime identity.
 func (s *Store) ListAcornFoxDeployments(ctx context.Context, applicationID domain.ID, after *AcornFoxDiscoveryCursor, limit int) (AcornFoxDeploymentPage, error) {
@@ -295,6 +340,36 @@ func (s *Store) ListAcornFoxDeployments(ctx context.Context, applicationID domai
 		return AcornFoxDeploymentPage{}, errors.New("AcornFox discovery deployment scan exhausted")
 	}
 	return page, nil
+}
+
+// GetAcornFoxDeployment returns a deployment only when it has the same strict
+// persisted runtime-task proof required by delivery discovery.
+func (s *Store) GetAcornFoxDeployment(ctx context.Context, applicationID, deploymentID domain.ID) (domain.Deployment, error) {
+	if err := s.requireDB(); err != nil {
+		return domain.Deployment{}, err
+	}
+	if err := domain.RequireID(deploymentID, "AcornFox deployment id"); err != nil {
+		return domain.Deployment{}, err
+	}
+	if err := s.ensureAcornFoxDiscoveryApplication(ctx, applicationID); err != nil {
+		return domain.Deployment{}, err
+	}
+	deployment, _, err := loadM1DeploymentQuery(s.db.QueryRowContext(ctx, `
+		SELECT d.id,e.application_id,d.environment_id,d.release_id,d.state,COALESCE(d.failure_reason,''),d.version,d.created_at,d.updated_at
+		  FROM deployments d JOIN environments e ON e.id=d.environment_id
+		 WHERE d.id=$1 AND e.application_id=$2
+	`, deploymentID.String(), applicationID.String()))
+	if err != nil {
+		return domain.Deployment{}, err
+	}
+	strict, err := s.strictAcornFoxDeploymentIDs(ctx, []domain.Deployment{deployment})
+	if err != nil {
+		return domain.Deployment{}, err
+	}
+	if !strict[deployment.ID] {
+		return domain.Deployment{}, ErrNotFound
+	}
+	return deployment, nil
 }
 
 const (

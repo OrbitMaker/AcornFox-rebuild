@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -93,10 +92,11 @@ func (c *cli) login(args []string) error {
 	if err != nil {
 		return err
 	}
-	encoded, _ := json.Marshal(value)
-	var raw map[string]json.RawMessage
-	_ = json.Unmarshal(encoded, &raw)
-	state.ExpiresAt, err = responseExpiry(raw, true)
+	session, ok := value.(apiSession)
+	if !ok {
+		return invalidResponse("login response does not match the AcornFox API contract")
+	}
+	state.ExpiresAt, err = responseExpiry(session, true)
 	if err != nil {
 		return invalidResponse("login response expiry is invalid")
 	}

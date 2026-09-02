@@ -1,10 +1,47 @@
-import { ActionScope, LatestRequest, refetchAfterAccepted } from "./state";
+import {
+  ActionScope,
+  LatestRequest,
+  appendServerPage,
+  keepsVisibleFacts,
+  refetchAfterAccepted,
+} from "./state";
 
 describe("accepted command refresh", () => {
   it("performs one explicit read and never schedules another read", async () => {
     const refresh = vi.fn(async () => undefined);
     await refetchAfterAccepted(refresh);
     expect(refresh).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("explicit refresh transition", () => {
+  it("keeps populated or empty facts visible until a successful replacement", () => {
+    expect(keepsVisibleFacts("ready", true)).toBe(true);
+    expect(keepsVisibleFacts("empty", true)).toBe(true);
+    expect(keepsVisibleFacts("ready", false)).toBe(false);
+    expect(keepsVisibleFacts("failed", true)).toBe(false);
+  });
+});
+
+describe("server log pages", () => {
+  it("keeps distinct records with the same timestamp and content in server order", () => {
+    const first = [
+      {
+        stream: "stdout",
+        recorded_at: "2026-01-01T00:00:00Z",
+        content: "same",
+        truncation: "complete",
+      },
+    ];
+    const second = [
+      {
+        stream: "stderr",
+        recorded_at: "2026-01-01T00:00:00Z",
+        content: "same",
+        truncation: "source_limited",
+      },
+    ];
+    expect(appendServerPage(first, second)).toEqual([...first, ...second]);
   });
 });
 

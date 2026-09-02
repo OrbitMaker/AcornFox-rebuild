@@ -43,3 +43,18 @@ export class ActionScope {
     this.#pending = false;
   }
 }
+
+/** Log pages are already ordered and non-overlapping at the server boundary. */
+export function appendServerPage<T>(
+  current: readonly T[],
+  page: readonly T[],
+): T[] {
+  return [...current, ...page];
+}
+
+export function keepsVisibleFacts(
+  state: "loading" | "ready" | "empty" | "unavailable" | "failed",
+  manual: boolean,
+): boolean {
+  return manual && (state === "ready" || state === "empty");
+}

@@ -290,6 +290,146 @@ func TestRequestProofMatrix(t *testing.T) {
 	}
 }
 
+func TestExpectedSuccessStatusCoversEveryCLICommandRouteClass(t *testing.T) {
+	for _, tc := range []struct {
+		method, path string
+		shape        responseShape
+		want         int
+	}{
+		{http.MethodPost, "/auth/login", shapeSession, http.StatusOK}, {http.MethodGet, "/auth/session", shapeSession, http.StatusOK}, {http.MethodPost, "/auth/logout", shapeSession, http.StatusNoContent}, {http.MethodPost, "/auth/password", shapeSession, http.StatusNoContent},
+		{http.MethodGet, "/apps", shapeApps, http.StatusOK}, {http.MethodPost, "/apps", shapeCreateApp, http.StatusCreated}, {http.MethodGet, "/apps/app", shapeApplication, http.StatusOK},
+		{http.MethodGet, "/apps/app/sources", shapeSourceList, http.StatusOK}, {http.MethodGet, "/apps/app/sources/source", shapeSource, http.StatusOK}, {http.MethodGet, "/apps/app/deliveries", shapeDeploymentList, http.StatusOK},
+		{http.MethodPost, "/apps/app/deliveries", shapeCommand, http.StatusAccepted}, {http.MethodGet, "/apps/app/deliveries/deployment", shapeStatus, http.StatusOK}, {http.MethodGet, "/apps/app/deliveries/deployment/logs?source=runtime", shapeLogs, http.StatusOK},
+		{http.MethodPost, "/apps/app/deliveries/deployment/restart", shapeCommand, http.StatusAccepted}, {http.MethodPost, "/apps/app/deliveries/deployment/redeploy", shapeCommand, http.StatusAccepted}, {http.MethodGet, "/apps/app/deliveries/deployment/public-access", shapePublicAccess, http.StatusOK}, {http.MethodPut, "/apps/app/deliveries/deployment/public-access", shapePublicAccess, http.StatusOK},
+	} {
+		got, known := expectedSuccessStatus(tc.method, tc.path, tc.shape)
+		if !known || got != tc.want {
+			t.Fatalf("%s %s shape=%d: got=%d known=%t want=%d", tc.method, tc.path, tc.shape, got, known, tc.want)
+		}
+	}
+	if _, known := expectedSuccessStatus(http.MethodDelete, "/apps/app", shapeApplication); known {
+		t.Fatal("unsupported command route must fail closed")
+	}
+	for _, tc := range []struct {
+		method, path string
+		shape        responseShape
+	}{
+		{http.MethodGet, "/unknown", shapeApps}, {http.MethodGet, "/apps/app/", shapeApplication}, {http.MethodGet, "/apps?limit=1", shapeApps}, {http.MethodGet, "/apps/app/sources/source?cursor=opaque", shapeSource},
+		{http.MethodPost, "/apps/app/deliveries/deployment/probes", shapeCommand}, {http.MethodPost, "/apps/app/deliveries/deployment/restart/extra", shapeCommand}, {http.MethodPost, "/anything", shapeCommand}, {http.MethodPut, "/apps/app/deliveries/deployment/public-access?x=1", shapePublicAccess},
+	} {
+		if _, known := expectedSuccessStatus(tc.method, tc.path, tc.shape); known {
+			t.Fatalf("unexpected known route: %s %s", tc.method, tc.path)
+		}
+	}
+	for _, tc := range []struct {
+		path  string
+		shape responseShape
+	}{{"/apps/app/sources?limit=1", shapeSourceList}, {"/apps/app/deliveries?cursor=opaque", shapeDeploymentList}, {"/apps/app/deliveries/deployment/logs?source=runtime", shapeLogs}} {
+		if _, known := expectedSuccessStatus(http.MethodGet, tc.path, tc.shape); !known {
+			t.Fatalf("canonical query route rejected: %s", tc.path)
+		}
+	}
+	for _, path := range []string{
+		"/apps/app%2Fother/sources", "/apps/app/sources?limit=0", "/apps/app/sources?limit=101", "/apps/app/sources?limit=bad", "/apps/app/sources?limit=1&limit=2", "/apps/app/sources?limit=1&", "/apps/app/sources?cursor=", "/apps/app/sources?unknown=1", "/apps/app/sources?cursor=%ZZ",
+		"/apps/app/deliveries?limit=1&cursor=opaque&extra=1", "/apps/app/deliveries?cursor=one&cursor=two",
+		"/apps/app/deliveries/deployment/logs", "/apps/app/deliveries/deployment/logs?source=other", "/apps/app/deliveries/deployment/logs?source=build&source=runtime", "/apps/app/deliveries/deployment/logs?source=runtime&limit=", "/apps/app/deliveries/deployment/logs?source=runtime&cursor=", "/apps/app/deliveries/deployment/logs?source=runtime&unknown=1",
+		"/apps/app/sources?", "/apps/app/deliveries/deployment/logs?source=runtime#fragment",
+	} {
+		shape := shapeSourceList
+		if strings.Contains(path, "deliveries?") {
+			shape = shapeDeploymentList
+		}
+		if strings.Contains(path, "/logs") {
+			shape = shapeLogs
+		}
+		if _, known := expectedSuccessStatus(http.MethodGet, path, shape); known {
+			t.Fatalf("invalid query accepted: %s", path)
+		}
+	}
+	for _, tc := range []struct {
+		path  string
+		shape responseShape
+	}{
+		{"/apps/app/sources?limit=100&cursor=opaque%2Fcursor", shapeSourceList}, {"/apps/app/deliveries?cursor=opaque%20value", shapeDeploymentList}, {"/apps/app/deliveries/deployment/logs?source=build&limit=1&cursor=opaque%2Fcursor", shapeLogs},
+	} {
+		if _, known := expectedSuccessStatus(http.MethodGet, tc.path, tc.shape); !known {
+			t.Fatalf("valid opaque query rejected: %s", tc.path)
+		}
+	}
+}
+
+func TestUnexpectedSuccessStatusesAreContractFailuresWithoutStateMutation(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		method, path string
+		shape        responseShape
+		status       int
+	}{
+		{"session 201", http.MethodGet, "/auth/session", shapeSession, http.StatusCreated}, {"deploy 200", http.MethodPost, "/apps/app/deliveries", shapeCommand, http.StatusOK}, {"logout 200", http.MethodPost, "/auth/logout", shapeSession, http.StatusOK}, {"password 200", http.MethodPost, "/auth/password", shapeSession, http.StatusOK}, {"read 204", http.MethodGet, "/apps", shapeApps, http.StatusNoContent},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			env := func(key string) string {
+				if key == "XDG_STATE_HOME" {
+					return root
+				}
+				return ""
+			}
+			state := sessionState{Origin: "https://console.example.test", Session: "session", CSRF: "csrf", ExpiresAt: time.Now().Add(time.Hour)}
+			if err := saveState(env, state); err != nil {
+				t.Fatal(err)
+			}
+			var out bytes.Buffer
+			c := &cli{out: &out, err: io.Discard, env: env, client: &http.Client{Transport: roundTripper(func(*http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: tc.status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{}`))}, nil
+			})}, json: true}
+			err := c.callWithState(state, tc.method, tc.path, nil, tc.method != http.MethodGet, "key", time.Second, tc.shape)
+			var responseErr apiError
+			if !errors.As(err, &responseErr) || responseErr.class() != "contract" || responseErr.Code != "invalid_response" || out.Len() != 0 {
+				t.Fatalf("err=%v out=%q", err, out.String())
+			}
+			if _, err := loadState(env); err != nil {
+				t.Fatalf("mismatched success mutated state: %v", err)
+			}
+		})
+	}
+}
+
+func TestMismatchedLogoutAndPasswordDoNotEmitOrRemoveState(t *testing.T) {
+	for _, password := range []bool{false, true} {
+		t.Run(map[bool]string{false: "logout", true: "password"}[password], func(t *testing.T) {
+			root := t.TempDir()
+			env := func(key string) string {
+				if key == "XDG_STATE_HOME" {
+					return root
+				}
+				return ""
+			}
+			state := sessionState{Origin: "https://console.example.test", Session: "session", CSRF: "csrf", ExpiresAt: time.Now().Add(time.Hour)}
+			if err := saveState(env, state); err != nil {
+				t.Fatal(err)
+			}
+			var out bytes.Buffer
+			c := &cli{in: strings.NewReader("old\nnew\nnew\n"), out: &out, err: io.Discard, env: env, json: true, client: &http.Client{Transport: roundTripper(func(*http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{}`))}, nil
+			})}}
+			var err error
+			if password {
+				err = c.password([]string{"--password-stdin"})
+			} else {
+				err = c.logout(nil)
+			}
+			var responseErr apiError
+			if !errors.As(err, &responseErr) || responseErr.class() != "contract" || out.Len() != 0 {
+				t.Fatalf("err=%v out=%q", err, out.String())
+			}
+			if _, err := loadState(env); err != nil {
+				t.Fatalf("state removed: %v", err)
+			}
+		})
+	}
+}
+
 func TestAPIErrorClassMatrix(t *testing.T) {
 	for _, tc := range []struct {
 		status  int
@@ -364,6 +504,7 @@ func TestCallResponseContractAndSessionRemoval(t *testing.T) {
 			if r.Header.Get("Idempotency-Key") == "" || r.Header.Get("Origin") != server.URL || r.Header.Get("X-AcornFox-CSRF") != "csrf" {
 				t.Errorf("write proof headers=%v", r.Header)
 			}
+			w.WriteHeader(http.StatusCreated)
 			_, _ = io.WriteString(w, `{"application":{"id":"app","name":"demo","created_at":"2030-01-01T00:00:00Z","updated_at":"2030-01-01T00:00:00Z"},"source_revision_id":"source","operation_id":"operation"}`)
 		case apiBase + "/auth/logout":
 			if r.Header.Get("Idempotency-Key") != "" || r.Header.Get("Origin") != server.URL || r.Header.Get("X-AcornFox-CSRF") != "csrf" {
@@ -486,7 +627,7 @@ func TestProbeOptionalFieldsPreserveOpenAPIOmissionAndNullNormalization(t *testi
 }
 
 func TestOptionalNonNullableFieldsRejectExplicitNull(t *testing.T) {
-	source := `{"id":"source","application_id":"app","kind":"public_git","locator_sha256":"sha256:locator","content_digest":"sha256:content","created_at":"2030-01-01T00:00:00Z","immutable":true}`
+	source := `{"id":"source","application_id":"app","kind":"git_https","locator_sha256":"sha256:locator","content_digest":"sha256:content","created_at":"2030-01-01T00:00:00Z","immutable":true}`
 	for _, invalid := range []string{
 		strings.Replace(source, `"immutable":true`, `"immutable":true,"ref":null`, 1),
 		strings.Replace(source, `"immutable":true`, `"immutable":true,"commit":null`, 1),
@@ -664,11 +805,13 @@ func TestAllCommandFamiliesUseTheirDeclaredRouteAndProof(t *testing.T) {
 			t.Errorf("%s read had write proof headers=%v", r.URL.Path, r.Header)
 		}
 		var response string
+		status := http.StatusOK
 		switch r.URL.Path {
 		case apiBase + "/apps":
 			if r.Method == http.MethodGet {
 				response = `{"items":[]}`
 			} else {
+				status = http.StatusCreated
 				response = `{"application":{"id":"app","name":"demo","created_at":"2030-01-01T00:00:00Z","updated_at":"2030-01-01T00:00:00Z"},"source_revision_id":"source","operation_id":"operation"}`
 			}
 		case apiBase + "/apps/app":
@@ -676,11 +819,12 @@ func TestAllCommandFamiliesUseTheirDeclaredRouteAndProof(t *testing.T) {
 		case apiBase + "/apps/app/sources":
 			response = `{"items":[],"next_cursor":null}`
 		case apiBase + "/apps/app/sources/source":
-			response = `{"id":"source","application_id":"app","kind":"public_git","locator_sha256":"digest","content_digest":"content","created_at":"2030-01-01T00:00:00Z","immutable":true}`
+			response = `{"id":"source","application_id":"app","kind":"git_https","locator_sha256":"digest","content_digest":"content","created_at":"2030-01-01T00:00:00Z","immutable":true}`
 		case apiBase + "/apps/app/deliveries":
 			if r.Method == http.MethodGet {
 				response = `{"items":[],"next_cursor":null}`
 			} else {
+				status = http.StatusAccepted
 				response = `{"deployment_id":"deployment","operation_id":"operation","task_id":"task","status":"accepted"}`
 			}
 		case apiBase + "/apps/app/deliveries/deployment":
@@ -691,6 +835,7 @@ func TestAllCommandFamiliesUseTheirDeclaredRouteAndProof(t *testing.T) {
 			}
 			response = `{"source":"runtime","availability":"available","items":[],"next_cursor":null,"retention_limited":false}`
 		case apiBase + "/apps/app/deliveries/deployment/restart", apiBase + "/apps/app/deliveries/deployment/redeploy":
+			status = http.StatusAccepted
 			response = `{"deployment_id":"deployment","operation_id":"operation","task_id":"task","status":"accepted"}`
 		case apiBase + "/apps/app/deliveries/deployment/public-access":
 			response = `{"desired_public":true,"url":"https://app.example.test","endpoint":{"deployment_id":"deployment"},"components":{"internal_endpoint":"accepted","local_route":"configured","dns":"not_validated","tls":"not_validated","external":"not_validated"},"status":"PENDING_EXTERNAL_VALIDATION"}`
@@ -698,6 +843,9 @@ func TestAllCommandFamiliesUseTheirDeclaredRouteAndProof(t *testing.T) {
 			t.Errorf("unexpected route %s", r.URL.Path)
 			w.WriteHeader(http.StatusNotFound)
 			response = `{"code":"not_found","message":"not found"}`
+		}
+		if status != http.StatusOK {
+			w.WriteHeader(status)
 		}
 		_, _ = io.WriteString(w, response)
 	}))
