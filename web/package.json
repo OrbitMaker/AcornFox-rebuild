@@ -12,8 +12,9 @@
     "check:acornfox-api": "node scripts/generate-acornfox-api.mjs --check",
     "lint": "eslint . --ignore-pattern dist-stub",
     "preview": "vite preview --host 127.0.0.1 --port 4175",
-    "test": "vitest run --exclude scripts/live-build-contract.test.mjs",
+    "test": "vitest run --exclude scripts/live-build-contract.test.mjs --exclude scripts/acornfox-artifact.test.mjs",
     "test:build-contract": "node --test scripts/live-build-contract.test.mjs",
+    "test:acornfox-artifact": "node --test scripts/acornfox-artifact.test.mjs",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
