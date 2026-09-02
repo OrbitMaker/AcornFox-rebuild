@@ -73,6 +73,18 @@ paths:
         '401': {$ref: '#/components/responses/AuthenticationFailed'}
         '404': {$ref: '#/components/responses/NotFound'}
         '503': {$ref: '#/components/responses/TemporarilyUnavailable'}
+  /api/v1/acornfox/apps/{applicationId}/sources:
+    parameters: [{$ref: '#/components/parameters/ApplicationId'}]
+    get:
+      operationId: listAcornFoxSourceRevisions
+      security: [{AdministratorSession: []}]
+      parameters: [{$ref: '#/components/parameters/DiscoveryLimit'}, {$ref: '#/components/parameters/DiscoveryCursor'}]
+      responses:
+        '200': {description: Immutable public HTTPS Git source revisions only, content: {application/json: {schema: {$ref: '#/components/schemas/SourceRevisionList'}}}}
+        '401': {$ref: '#/components/responses/AuthenticationFailed'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/InvalidDiscoveryQuery'}
+        '503': {$ref: '#/components/responses/DiscoveryUnavailable'}
   /api/v1/acornfox/apps/{applicationId}/sources/{sourceRevisionId}:
     parameters: [{$ref: '#/components/parameters/ApplicationId'}, {$ref: '#/components/parameters/SourceRevisionId'}]
     get:
@@ -85,6 +97,16 @@ paths:
         '503': {$ref: '#/components/responses/TemporarilyUnavailable'}
   /api/v1/acornfox/apps/{applicationId}/deliveries:
     parameters: [{$ref: '#/components/parameters/ApplicationId'}]
+    get:
+      operationId: listAcornFoxDeliveries
+      security: [{AdministratorSession: []}]
+      parameters: [{$ref: '#/components/parameters/DiscoveryLimit'}, {$ref: '#/components/parameters/DiscoveryCursor'}]
+      responses:
+        '200': {description: Strict AcornFox runtime-task-backed deployments only, content: {application/json: {schema: {$ref: '#/components/schemas/DeploymentRuntimeStateList'}}}}
+        '401': {$ref: '#/components/responses/AuthenticationFailed'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/InvalidDiscoveryQuery'}
+        '503': {$ref: '#/components/responses/DiscoveryUnavailable'}
     post:
       operationId: createAcornFoxDelivery
       security: [{AdministratorSession: []}]
@@ -199,6 +221,8 @@ components:
     LogSource: {name: source, in: query, required: true, schema: {type: string, enum: [build, runtime]}}
     LogLimit: {name: limit, in: query, required: false, schema: {type: integer, minimum: 1, maximum: 100, default: 50}}
     LogCursor: {name: cursor, in: query, required: false, schema: {type: string, minLength: 1}, description: Opaque base64url cursor bound to this application deployment and source.}
+    DiscoveryLimit: {name: limit, in: query, required: false, schema: {type: integer, minimum: 1, maximum: 100, default: 50}}
+    DiscoveryCursor: {name: cursor, in: query, required: false, schema: {type: string, minLength: 1}, description: Opaque versioned cursor bound to the application and list resource.}
     CSRFToken:
       name: X-AcornFox-CSRF
       in: header
@@ -214,6 +238,8 @@ components:
     ValidationFailed: {description: Request is syntactically valid but violates an AcornFox boundary, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
     TemporarilyUnavailable: {description: Capability dependency or persisted readback is temporarily unavailable, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
     InvalidLogQuery: {description: Log source limit or opaque cursor is invalid, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+    InvalidDiscoveryQuery: {description: Discovery list limit or opaque cursor is invalid, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+    DiscoveryUnavailable: {description: Discovery evidence is unavailable, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
     LogsUnavailable: {description: Collected log storage or its integrity reconciliation is temporarily unavailable, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
     PublicAccessConflict: {description: A local endpoint route ownership or idempotency conflict prevented the requested public-access intent, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
     PublicAccessUnavailable: {description: The optional local public-access capability is unavailable or has no configured authorized root and route provider, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
@@ -269,6 +295,11 @@ components:
       required: [id, application_id, kind, locator_sha256, content_digest, created_at, immutable]
       additionalProperties: false
       properties: {id: {type: string}, application_id: {type: string}, kind: {type: string}, locator_sha256: {type: string}, ref: {type: string}, commit: {type: string}, content_digest: {type: string}, created_at: {type: string, format: date-time}, immutable: {type: boolean}}
+    SourceRevisionList:
+      type: object
+      required: [items, next_cursor]
+      additionalProperties: false
+      properties: {items: {type: array, items: {$ref: '#/components/schemas/SourceRevision'}}, next_cursor: {type: string, nullable: true}}
     CreateDeliveryRequest:
       type: object
       required: [source_revision_id]
@@ -336,6 +367,11 @@ components:
       required: [id, application_id, environment_id, release_id, stage, created_at, updated_at]
       additionalProperties: false
       properties: {id: {type: string}, application_id: {type: string}, environment_id: {type: string}, release_id: {type: string}, stage: {type: string, enum: [starting, runtime_observed, failed, unknown]}, created_at: {type: string, format: date-time}, updated_at: {type: string, format: date-time}}
+    DeploymentRuntimeStateList:
+      type: object
+      required: [items, next_cursor]
+      additionalProperties: false
+      properties: {items: {type: array, items: {$ref: '#/components/schemas/DeploymentRuntimeState'}}, next_cursor: {type: string, nullable: true}}
     ProbeDeliveryRequest:
       type: object
       required: [protocol]

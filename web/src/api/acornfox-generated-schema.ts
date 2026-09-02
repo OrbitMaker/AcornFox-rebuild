@@ -102,6 +102,24 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/acornfox/apps/{applicationId}/sources": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                applicationId: components["parameters"]["ApplicationId"];
+            };
+            cookie?: never;
+        };
+        get: operations["listAcornFoxSourceRevisions"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/acornfox/apps/{applicationId}/sources/{sourceRevisionId}": {
         parameters: {
             query?: never;
@@ -130,7 +148,7 @@ export interface paths {
             };
             cookie?: never;
         };
-        get?: never;
+        get: operations["listAcornFoxDeliveries"];
         put?: never;
         post: operations["createAcornFoxDelivery"];
         delete?: never;
@@ -313,6 +331,10 @@ export interface components {
             created_at: string;
             immutable: boolean;
         };
+        SourceRevisionList: {
+            items: components["schemas"]["SourceRevision"][];
+            next_cursor: string | null;
+        };
         CreateDeliveryRequest: {
             source_revision_id: string;
             container_port?: number;
@@ -395,6 +417,10 @@ export interface components {
             created_at: string;
             /** Format: date-time */
             updated_at: string;
+        };
+        DeploymentRuntimeStateList: {
+            items: components["schemas"]["DeploymentRuntimeState"][];
+            next_cursor: string | null;
         };
         ProbeDeliveryRequest: {
             /** @enum {string} */
@@ -535,6 +561,24 @@ export interface components {
                 "application/json": components["schemas"]["Error"];
             };
         };
+        /** @description Discovery list limit or opaque cursor is invalid */
+        InvalidDiscoveryQuery: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description Discovery evidence is unavailable */
+        DiscoveryUnavailable: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
         /** @description Collected log storage or its integrity reconciliation is temporarily unavailable */
         LogsUnavailable: {
             headers: {
@@ -572,6 +616,9 @@ export interface components {
         LogLimit: number;
         /** @description Opaque base64url cursor bound to this application deployment and source. */
         LogCursor: string;
+        DiscoveryLimit: number;
+        /** @description Opaque versioned cursor bound to the application and list resource. */
+        DiscoveryCursor: string;
         /** @description Must equal the non-HttpOnly __Host-acornfox_csrf cookie and use the allowed Origin. */
         CSRFToken: string;
     };
@@ -763,6 +810,36 @@ export interface operations {
             503: components["responses"]["TemporarilyUnavailable"];
         };
     };
+    listAcornFoxSourceRevisions: {
+        parameters: {
+            query?: {
+                limit?: components["parameters"]["DiscoveryLimit"];
+                /** @description Opaque versioned cursor bound to the application and list resource. */
+                cursor?: components["parameters"]["DiscoveryCursor"];
+            };
+            header?: never;
+            path: {
+                applicationId: components["parameters"]["ApplicationId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Immutable public HTTPS Git source revisions only */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SourceRevisionList"];
+                };
+            };
+            401: components["responses"]["AuthenticationFailed"];
+            404: components["responses"]["NotFound"];
+            422: components["responses"]["InvalidDiscoveryQuery"];
+            503: components["responses"]["DiscoveryUnavailable"];
+        };
+    };
     getAcornFoxSourceRevision: {
         parameters: {
             query?: never;
@@ -787,6 +864,36 @@ export interface operations {
             401: components["responses"]["AuthenticationFailed"];
             404: components["responses"]["NotFound"];
             503: components["responses"]["TemporarilyUnavailable"];
+        };
+    };
+    listAcornFoxDeliveries: {
+        parameters: {
+            query?: {
+                limit?: components["parameters"]["DiscoveryLimit"];
+                /** @description Opaque versioned cursor bound to the application and list resource. */
+                cursor?: components["parameters"]["DiscoveryCursor"];
+            };
+            header?: never;
+            path: {
+                applicationId: components["parameters"]["ApplicationId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Strict AcornFox runtime-task-backed deployments only */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeploymentRuntimeStateList"];
+                };
+            };
+            401: components["responses"]["AuthenticationFailed"];
+            404: components["responses"]["NotFound"];
+            422: components["responses"]["InvalidDiscoveryQuery"];
+            503: components["responses"]["DiscoveryUnavailable"];
         };
     };
     createAcornFoxDelivery: {

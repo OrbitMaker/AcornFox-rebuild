@@ -112,6 +112,7 @@ type Server struct {
 	publishInputStore          publishInputStore
 	applicationPublisher       applicationPublisher
 	acornFoxDeployments        acornFoxDeploymentStore
+	acornFoxDiscovery          *AcornFoxDiscoveryHTTPHandler
 	acornFoxDeliveryCommand    acornFoxDeliveryCommand
 	acornFoxLogs               *AcornFoxLogsHTTPHandler
 	acornFoxPublicAccess       *AcornFoxPublicAccessHTTPHandler
@@ -192,6 +193,9 @@ func (s *Server) SetApplicationPublisher(store publishInputStore, publisher appl
 }
 func (s *Server) SetAcornFoxDeploymentStore(store acornFoxDeploymentStore) {
 	s.acornFoxDeployments = store
+}
+func (s *Server) SetAcornFoxDiscovery(handler *AcornFoxDiscoveryHTTPHandler) {
+	s.acornFoxDiscovery = handler
 }
 func (s *Server) SetAcornFoxLogs(handler *AcornFoxLogsHTTPHandler) { s.acornFoxLogs = handler }
 func (s *Server) SetAcornFoxPublicAccess(handler *AcornFoxPublicAccessHTTPHandler) {

@@ -92,8 +92,16 @@ func (s *Server) handleAcornFoxAPI(w http.ResponseWriter, r *http.Request) bool 
 		s.handleAcornFoxSource(w, r, domain.ID(parts[0]), domain.ID(parts[2]))
 		return true
 	}
+	if len(parts) == 2 && parts[1] == "sources" {
+		s.handleAcornFoxSources(w, r, domain.ID(parts[0]))
+		return true
+	}
 	if len(parts) == 2 && parts[1] == "deliveries" {
-		s.handleAcornFoxDeliveryCreate(w, r, domain.ID(parts[0]))
+		if r.Method == http.MethodGet {
+			s.handleAcornFoxDeliveries(w, r, domain.ID(parts[0]))
+		} else {
+			s.handleAcornFoxDeliveryCreate(w, r, domain.ID(parts[0]))
+		}
 		return true
 	}
 	if len(parts) == 3 && parts[1] == "deliveries" {
@@ -127,8 +135,11 @@ func acornFoxRouteAllow(path string) (string, bool) {
 	if len(parts) == 3 && parts[0] != "" && parts[1] == "sources" && parts[2] != "" {
 		return "GET", true
 	}
+	if len(parts) == 2 && parts[0] != "" && parts[1] == "sources" {
+		return "GET", true
+	}
 	if len(parts) == 2 && parts[0] != "" && parts[1] == "deliveries" {
-		return "POST", true
+		return "GET, POST", true
 	}
 	if len(parts) == 3 && parts[0] != "" && parts[1] == "deliveries" && parts[2] != "" {
 		return "GET", true
@@ -144,6 +155,22 @@ func acornFoxRouteAllow(path string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+func (s *Server) handleAcornFoxSources(w http.ResponseWriter, r *http.Request, applicationID domain.ID) {
+	if s.acornFoxDiscovery == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "discovery_unavailable", "source discovery is unavailable")
+		return
+	}
+	s.acornFoxDiscovery.HandleSources(w, r, applicationID)
+}
+
+func (s *Server) handleAcornFoxDeliveries(w http.ResponseWriter, r *http.Request, applicationID domain.ID) {
+	if s.acornFoxDiscovery == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "discovery_unavailable", "delivery discovery is unavailable")
+		return
+	}
+	s.acornFoxDiscovery.HandleDeliveries(w, r, applicationID)
 }
 
 func (s *Server) handleAcornFoxDeliveryPublicAccess(w http.ResponseWriter, r *http.Request, applicationID, deploymentID domain.ID) {

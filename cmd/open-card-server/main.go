@@ -175,6 +175,14 @@ func main() {
 			if err != nil {
 				log.Fatal(err)
 			}
+			discoveryCursorKey, err := secretprovider.DeriveExistingContextKey(os.Getenv("OPEN_CARD_SECRET_MASTER_KEY"), "acornfox-discovery-cursor-v1")
+			if err != nil {
+				log.Fatal("AcornFox discovery cursor signing key is unavailable")
+			}
+			discoveryHandler := newAcornFoxDiscoveryHTTPHandler(store, discoveryCursorKey)
+			server.SetAcornFoxDiscovery(discoveryHandler)
+			defer discoveryHandler.Close()
+			defer secretprovider.ZeroContextKey(&discoveryCursorKey)
 			workspaceCapacityBytes, workspaceCapacityEntries, workspaceOperationalReserveBytes, workspaceOperationalReserveEntries, capacityErr := sourceWorkspaceCapacityConfig(os.Getenv)
 			if capacityErr != nil {
 				log.Fatal("invalid source workspace capacity configuration")
