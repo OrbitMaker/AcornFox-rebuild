@@ -3,6 +3,7 @@ package install
 import (
 	"bytes"
 	"encoding/json"
+	"os"
 	"reflect"
 	"sort"
 	"strings"
@@ -29,7 +30,7 @@ func substrateReceiptFixture() InactiveSubstrateReceiptV1 {
 		addRelease(required.Path, required.Mode, digest, int64(len(required.Path)))
 	}
 	addRelease("web/dist/assets/app-12345678.js", 0o644, sha256Hex([]byte("asset")), int64(len("asset")))
-	candidate.FileCount = len(AcornFoxV1RequiredFiles()) + 2
+	candidate.FileCount = len(AcornFoxV1RequiredFiles()) + 1
 	for path, fixed := range acornFoxFixedSubstrateEntries(candidate) {
 		if fixed.Kind == SubstrateEntryDirectory {
 			entries = append(entries, fixed)
@@ -181,5 +182,50 @@ func TestAcornFoxV1SubstrateInventoryRejectsMissingExtraAndBadMappings(t *testin
 		if err := receipt.Validate(); err == nil {
 			t.Fatalf("invalid closed inventory accepted: %#v", receipt)
 		}
+	}
+}
+
+func TestAcornFoxV1SubstrateInventoryUsesActualStageReceiptFileCount(t *testing.T) {
+	taskRoot := t.TempDir()
+	if err := os.Chmod(taskRoot, acornFoxStageDirMode); err != nil {
+		t.Fatal(err)
+	}
+	stager, err := NewTaskAcornFoxStager(taskRoot, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stager.Close()
+	handle, staged, err := stager.Stage(newAcornFoxFixture(t, "1.2.3-test.1", nil).input(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer handle.Close()
+	if staged.FileCount != len(AcornFoxV1RequiredFiles())+1 {
+		t.Fatalf("stage receipt FileCount=%d want manifest.Files=%d", staged.FileCount, len(AcornFoxV1RequiredFiles())+1)
+	}
+	receipt := substrateReceiptFixture()
+	receipt.CandidateReceipt = staged
+	receipt.ReleaseTreeSHA256 = staged.TreeSHA256
+	manifest := substrateEntryAt(receipt.Entries, "opt/acornfox/releases/"+staged.ReleaseID+"/manifest.json")
+	if manifest == nil {
+		t.Fatal("fixture lacks release manifest")
+	}
+	manifest.SHA256 = staged.ManifestSHA256
+	receipt.InstalledTreeSHA256, err = ComputeAcornFoxSubstrateTreeSHA256(receipt.Entries)
+	if err != nil || receipt.Validate() != nil {
+		t.Fatalf("actual stage derived inventory err=%v validate=%v", err, receipt.Validate())
+	}
+	missing := receipt
+	missing.Entries = append([]SubstrateEntry(nil), receipt.Entries[1:]...)
+	missing.InstalledTreeSHA256, _ = ComputeAcornFoxSubstrateTreeSHA256(missing.Entries)
+	if err := missing.Validate(); err == nil {
+		t.Fatal("actual receipt accepted missing entry")
+	}
+	extra := receipt
+	extra.Entries = append(extra.Entries, SubstrateEntry{Path: "var/log/acornfox/extra", Kind: SubstrateEntryDirectory, Mode: 0o750, Role: OwnerRoleServer})
+	sort.Slice(extra.Entries, func(i, j int) bool { return extra.Entries[i].Path < extra.Entries[j].Path })
+	extra.InstalledTreeSHA256, _ = ComputeAcornFoxSubstrateTreeSHA256(extra.Entries)
+	if err := extra.Validate(); err == nil {
+		t.Fatal("actual receipt accepted extra entry")
 	}
 }

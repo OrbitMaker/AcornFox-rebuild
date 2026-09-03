@@ -255,7 +255,9 @@ func validateAcornFoxV1SubstrateInventory(candidate AcornFoxStageReceiptV1, entr
 			return fmt.Errorf("AcornFox substrate misses release member: %s", required.Path)
 		}
 	}
-	if releaseMembers != candidate.FileCount {
+	// AcornFoxStageReceiptV1.FileCount is the pinned manifest.Files count;
+	// manifest.json is the one additional release-tree member.
+	if releaseMembers != candidate.FileCount+1 {
 		return errors.New("AcornFox substrate release member count is invalid")
 	}
 	for path, want := range acornFoxFixedSubstrateEntries(candidate) {
