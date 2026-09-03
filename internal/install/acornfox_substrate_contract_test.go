@@ -13,7 +13,7 @@ import (
 func substrateDigest(value string) string { return strings.Repeat(value, 64) }
 
 func substrateEntry(path string, kind SubstrateEntryKind, mode uint32, role OwnerRole) SubstrateEntry {
-	return SubstrateEntry{Path: path, Kind: kind, Mode: mode, Role: role, Size: 1, SHA256: substrateDigest("a")}
+	return SubstrateEntry{Path: path, Kind: kind, Mode: mode, Role: role, Group: GroupRole(role), Size: 1, SHA256: substrateDigest("a")}
 }
 
 func substrateReceiptFixture() InactiveSubstrateReceiptV1 {
@@ -22,7 +22,7 @@ func substrateReceiptFixture() InactiveSubstrateReceiptV1 {
 	releasePrefix := "opt/acornfox/releases/" + candidate.ReleaseID + "/"
 	entries := []SubstrateEntry{}
 	addRelease := func(path string, mode uint32, digest string, size int64) {
-		entries = append(entries, SubstrateEntry{Path: releasePrefix + path, Kind: SubstrateEntryFile, Mode: mode, Role: OwnerRoleRoot, Size: size, SHA256: digest})
+		entries = append(entries, SubstrateEntry{Path: releasePrefix + path, Kind: SubstrateEntryFile, Mode: mode, Role: OwnerRoleRoot, Group: GroupRoleRoot, Size: size, SHA256: digest})
 	}
 	addRelease("manifest.json", 0o644, manifestDigest, int64(len("manifest")))
 	for _, required := range AcornFoxV1RequiredFiles() {
@@ -160,12 +160,20 @@ func TestAcornFoxV1SubstrateInventoryRejectsMissingExtraAndBadMappings(t *testin
 			receipt.Entries = append([]SubstrateEntry(nil), receipt.Entries[1:]...)
 		},
 		func(receipt *InactiveSubstrateReceiptV1) {
-			receipt.Entries = append(receipt.Entries, SubstrateEntry{Path: "var/lib/acornfox/extra", Kind: SubstrateEntryDirectory, Mode: 0o750, Role: OwnerRoleServer})
+			receipt.Entries = append(receipt.Entries, SubstrateEntry{Path: "var/lib/acornfox/extra", Kind: SubstrateEntryDirectory, Mode: 0o750, Role: OwnerRoleServer, Group: GroupRoleServer})
 			sort.Slice(receipt.Entries, func(i, j int) bool { return receipt.Entries[i].Path < receipt.Entries[j].Path })
 		},
 		func(receipt *InactiveSubstrateReceiptV1) {
 			entry := substrateEntryAt(receipt.Entries, AcornFoxUpgradeHelperPath)
 			entry.Role = OwnerRoleServer
+		},
+		func(receipt *InactiveSubstrateReceiptV1) {
+			entry := substrateEntryAt(receipt.Entries, AcornFoxUpgradeHelperPath)
+			entry.Group = GroupRoleServer
+		},
+		func(receipt *InactiveSubstrateReceiptV1) {
+			entry := substrateEntryAt(receipt.Entries, AcornFoxUpgradeHelperPath)
+			entry.Group = ""
 		},
 		func(receipt *InactiveSubstrateReceiptV1) {
 			entry := substrateEntryAt(receipt.Entries, AcornFoxUpgradeHelperPath)
@@ -222,10 +230,32 @@ func TestAcornFoxV1SubstrateInventoryUsesActualStageReceiptFileCount(t *testing.
 		t.Fatal("actual receipt accepted missing entry")
 	}
 	extra := receipt
-	extra.Entries = append(extra.Entries, SubstrateEntry{Path: "var/log/acornfox/extra", Kind: SubstrateEntryDirectory, Mode: 0o750, Role: OwnerRoleServer})
+	extra.Entries = append(extra.Entries, SubstrateEntry{Path: "var/log/acornfox/extra", Kind: SubstrateEntryDirectory, Mode: 0o750, Role: OwnerRoleServer, Group: GroupRoleServer})
 	sort.Slice(extra.Entries, func(i, j int) bool { return extra.Entries[i].Path < extra.Entries[j].Path })
 	extra.InstalledTreeSHA256, _ = ComputeAcornFoxSubstrateTreeSHA256(extra.Entries)
 	if err := extra.Validate(); err == nil {
 		t.Fatal("actual receipt accepted extra entry")
+	}
+}
+
+func TestAcornFoxV1SubstrateDirectoriesCoverSystemdWritablePathsWithoutRun(t *testing.T) {
+	fixed := acornFoxFixedSubstrateEntries(substrateReceiptFixture().CandidateReceipt)
+	for _, unit := range acornFoxSystemdFiles {
+		_, sections := readAcornFoxUnit(t, unit)
+		for _, value := range sections["Service"]["ReadWritePaths"] {
+			for _, absolute := range strings.Fields(value) {
+				if strings.HasPrefix(absolute, "/run/") {
+					continue // RuntimeDirectory creates volatile runtime state.
+				}
+				path := strings.TrimPrefix(absolute, "/")
+				entry, ok := fixed[path]
+				if !ok || entry.Kind != SubstrateEntryDirectory {
+					t.Fatalf("%s writable path %q is absent from closed directory table", unit, absolute)
+				}
+			}
+		}
+	}
+	if _, exists := fixed["run/acornfox-buildkit"]; exists {
+		t.Fatal("closed substrate incorrectly persists RuntimeDirectory")
 	}
 }

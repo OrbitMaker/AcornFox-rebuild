@@ -24,6 +24,7 @@ func AcornFoxHealthcheckHelperPath(receipt AcornFoxStageReceiptV1) string {
 // OwnerRole is a fixed role label, never a uid/gid. Receipts deliberately do
 // not carry host identity data.
 type OwnerRole string
+type GroupRole string
 
 const (
 	OwnerRoleRoot     OwnerRole = "root"
@@ -32,6 +33,15 @@ const (
 	OwnerRoleBuildKit OwnerRole = "buildkit"
 	OwnerRoleCaddy    OwnerRole = "caddy"
 	OwnerRoleEdge     OwnerRole = "edge"
+)
+
+const (
+	GroupRoleRoot     GroupRole = "root"
+	GroupRoleServer   GroupRole = "server"
+	GroupRoleAgent    GroupRole = "agent"
+	GroupRoleBuildKit GroupRole = "buildkit"
+	GroupRoleCaddy    GroupRole = "caddy"
+	GroupRoleEdge     GroupRole = "edge"
 )
 
 type SubstrateEntryKind string
@@ -48,6 +58,7 @@ type SubstrateEntry struct {
 	Kind   SubstrateEntryKind `json:"kind"`
 	Mode   uint32             `json:"mode"`
 	Role   OwnerRole          `json:"role"`
+	Group  GroupRole          `json:"group"`
 	Size   int64              `json:"size"`
 	SHA256 string             `json:"sha256"`
 }
@@ -179,7 +190,7 @@ func validateAcornFoxSubstrateEntry(entry SubstrateEntry) error {
 	if entry.Kind != SubstrateEntryFile && entry.Kind != SubstrateEntryDirectory {
 		return errors.New("kind is invalid")
 	}
-	if entry.Mode > 0o777 || entry.Mode&0o022 != 0 || !validAcornFoxOwnerRole(entry.Role) || entry.Size < 0 {
+	if entry.Mode > 0o777 || entry.Mode&0o022 != 0 || !validAcornFoxOwnerRole(entry.Role) || !validAcornFoxGroupRole(entry.Group) || entry.Size < 0 {
 		return errors.New("metadata is invalid")
 	}
 	if entry.Kind == SubstrateEntryDirectory {
@@ -192,6 +203,15 @@ func validateAcornFoxSubstrateEntry(entry SubstrateEntry) error {
 		return errors.New("file metadata is invalid")
 	}
 	return nil
+}
+
+func validAcornFoxGroupRole(role GroupRole) bool {
+	switch role {
+	case GroupRoleRoot, GroupRoleServer, GroupRoleAgent, GroupRoleBuildKit, GroupRoleCaddy, GroupRoleEdge:
+		return true
+	default:
+		return false
+	}
 }
 
 func validAcornFoxOwnerRole(role OwnerRole) bool {
@@ -262,7 +282,7 @@ func validateAcornFoxV1SubstrateInventory(candidate AcornFoxStageReceiptV1, entr
 	}
 	for path, want := range acornFoxFixedSubstrateEntries(candidate) {
 		got, ok := byPath[path]
-		if !ok || got.Kind != want.Kind || got.Mode != want.Mode || got.Role != want.Role || (got.Kind == SubstrateEntryDirectory && (got.Size != want.Size || got.SHA256 != want.SHA256)) {
+		if !ok || got.Kind != want.Kind || got.Mode != want.Mode || got.Role != want.Role || got.Group != want.Group || (got.Kind == SubstrateEntryDirectory && (got.Size != want.Size || got.SHA256 != want.SHA256)) {
 			return fmt.Errorf("AcornFox substrate fixed entry is invalid: %s", path)
 		}
 		if source := acornFoxInstalledSource(candidate, path); source != "" {
@@ -276,7 +296,7 @@ func validateAcornFoxV1SubstrateInventory(candidate AcornFoxStageReceiptV1, entr
 }
 
 func validateAcornFoxReleaseMember(candidate AcornFoxStageReceiptV1, relative string, entry SubstrateEntry) error {
-	if entry.Kind != SubstrateEntryFile || entry.Role != OwnerRoleRoot {
+	if entry.Kind != SubstrateEntryFile || entry.Role != OwnerRoleRoot || entry.Group != GroupRoleRoot {
 		return errors.New("AcornFox release member metadata is invalid")
 	}
 	if relative == "manifest.json" {
@@ -305,36 +325,40 @@ func acornFoxFixedSubstrateEntry(candidate AcornFoxStageReceiptV1, path string) 
 }
 
 func acornFoxFixedSubstrateEntries(candidate AcornFoxStageReceiptV1) map[string]SubstrateEntry {
-	directory := func(path string, mode uint32, role OwnerRole) SubstrateEntry {
-		return SubstrateEntry{Path: path, Kind: SubstrateEntryDirectory, Mode: mode, Role: role}
+	directory := func(path string, mode uint32, role OwnerRole, group GroupRole) SubstrateEntry {
+		return SubstrateEntry{Path: path, Kind: SubstrateEntryDirectory, Mode: mode, Role: role, Group: group}
 	}
-	file := func(path string, mode uint32, role OwnerRole) SubstrateEntry {
-		return SubstrateEntry{Path: path, Kind: SubstrateEntryFile, Mode: mode, Role: role}
+	file := func(path string, mode uint32, role OwnerRole, group GroupRole) SubstrateEntry {
+		return SubstrateEntry{Path: path, Kind: SubstrateEntryFile, Mode: mode, Role: role, Group: group}
 	}
 	entries := map[string]SubstrateEntry{}
-	for _, path := range []string{"opt", "opt/acornfox", "opt/acornfox/releases", "opt/acornfox/releases/" + candidate.ReleaseID, "opt/acornfox/upgrade-tools", "etc", "etc/systemd", "etc/systemd/system", "etc/acornfox", "var", "var/lib", "var/lib/acornfox", "var/log", "var/log/acornfox"} {
-		entries[path] = directory(path, 0o755, OwnerRoleRoot)
+	for _, path := range []string{"opt", "opt/acornfox", "opt/acornfox/releases", "opt/acornfox/releases/" + candidate.ReleaseID, "opt/acornfox/upgrade-tools", "etc", "etc/acornfox", "etc/systemd", "etc/systemd/system", "var", "var/lib", "var/lib/acornfox", "var/lib/acornfox/install", "var/lib/acornfox/install/releases", "var/log", "var/log/acornfox"} {
+		entries[path] = directory(path, 0o755, OwnerRoleRoot, GroupRoleRoot)
 	}
-	for _, service := range []struct {
-		name string
-		role OwnerRole
-	}{{"server", OwnerRoleServer}, {"agent", OwnerRoleAgent}, {"buildkit", OwnerRoleBuildKit}, {"caddy", OwnerRoleCaddy}, {"edge", OwnerRoleEdge}} {
-		for _, base := range []string{"var/lib/acornfox/", "var/log/acornfox/"} {
-			path := base + service.name
-			entries[path] = directory(path, 0o750, service.role)
-		}
+	for _, path := range []string{"var/lib/acornfox/uploads", "var/lib/acornfox/workspaces", "var/lib/acornfox/build-work", "var/lib/acornfox/oci", "var/log/acornfox/server"} {
+		entries[path] = directory(path, 0o750, OwnerRoleServer, GroupRoleServer)
 	}
-	entries[AcornFoxUpgradeHelperPath] = file(AcornFoxUpgradeHelperPath, 0o755, OwnerRoleRoot)
+	for _, path := range []string{"var/lib/acornfox/secrets", "var/lib/acornfox/secret-materials", "var/lib/acornfox/health-secret-materials"} {
+		entries[path] = directory(path, 0o700, OwnerRoleServer, GroupRoleServer)
+	}
+	entries["var/lib/acornfox/agent"], entries["var/log/acornfox/agent"] = directory("var/lib/acornfox/agent", 0o750, OwnerRoleAgent, GroupRoleAgent), directory("var/log/acornfox/agent", 0o750, OwnerRoleAgent, GroupRoleAgent)
+	entries["var/lib/acornfox/buildkit"] = directory("var/lib/acornfox/buildkit", 0o700, OwnerRoleBuildKit, GroupRoleBuildKit)
+	entries["var/lib/acornfox/caddy"], entries["var/log/acornfox/caddy"] = directory("var/lib/acornfox/caddy", 0o750, OwnerRoleCaddy, GroupRoleCaddy), directory("var/log/acornfox/caddy", 0o750, OwnerRoleCaddy, GroupRoleCaddy)
+	for _, path := range []string{"var/lib/acornfox/edge", "var/lib/acornfox/edge/home", "var/lib/acornfox/edge/data", "var/lib/acornfox/edge/config", "var/log/acornfox/edge"} {
+		entries[path] = directory(path, 0o750, OwnerRoleEdge, GroupRoleEdge)
+	}
+	entries["var/lib/acornfox/healthcheck"] = directory("var/lib/acornfox/healthcheck", 0o700, OwnerRoleRoot, GroupRoleRoot)
+	entries[AcornFoxUpgradeHelperPath] = file(AcornFoxUpgradeHelperPath, 0o755, OwnerRoleRoot, GroupRoleRoot)
 	for _, unit := range acornFoxV1Units {
 		path := "etc/systemd/system/" + strings.TrimPrefix(unit, "systemd/")
-		entries[path] = file(path, 0o644, OwnerRoleRoot)
+		entries[path] = file(path, 0o644, OwnerRoleRoot, GroupRoleRoot)
 	}
 	for destination := range map[string]string{"etc/acornfox/Caddyfile": "caddy/acornfox.Caddyfile.example", "etc/acornfox/acornfox-edge.Caddyfile": "caddy/acornfox-edge.Caddyfile.example", "etc/acornfox/acornfox-edge.env": "caddy/acornfox-edge.env.example", "etc/acornfox/buildkitd.toml": "config/acornfox-buildkitd.toml"} {
-		mode := uint32(0o644)
+		mode, group := uint32(0o644), GroupRoleRoot
 		if strings.HasSuffix(destination, ".env") {
-			mode = 0o640
+			mode, group = 0o640, GroupRoleEdge
 		}
-		entries[destination] = file(destination, mode, OwnerRoleRoot)
+		entries[destination] = file(destination, mode, OwnerRoleRoot, group)
 	}
 	return entries
 }
