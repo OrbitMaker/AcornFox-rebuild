@@ -2,6 +2,7 @@ package install
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -10,11 +11,17 @@ import (
 	"syscall"
 )
 
+var (
+	ErrAcornFoxSubstrateRecoveryRequired = errors.New("AcornFox substrate recovery is required")
+	ErrAcornFoxSubstrateConflict         = errors.New("AcornFox substrate conflicts with task state")
+)
+
 const (
 	acornFoxSubstrateDir     = "substrate"
 	acornFoxSubstrateRootfs  = "substrate/rootfs"
 	acornFoxSubstrateIntent  = "substrate/intent.json"
 	acornFoxSubstrateReceipt = "substrate/receipt.json"
+	acornFoxSubstrateLock    = "substrate/publish.lock"
 )
 
 // TaskAcornFoxSubstratePublisher is deliberately task-root-only. It has no
@@ -118,6 +125,17 @@ func (p *TaskAcornFoxSubstratePublisher) Publish(ctx context.Context, stage *Sta
 	return AcornFoxSubstratePublishResult{Receipt: receipt, Outcome: AcornFoxReconcileCompleted}, nil
 }
 
+// Resume reacquires the only matching sealed task stage after a process exit.
+// It never accepts a caller-supplied stage path.
+func (p *TaskAcornFoxSubstratePublisher) Resume(ctx context.Context, expectedBindingSHA256 string) (AcornFoxSubstratePublishResult, error) {
+	stage, err := p.reopenStage(expectedBindingSHA256)
+	if err != nil {
+		return AcornFoxSubstratePublishResult{}, err
+	}
+	defer stage.Close()
+	return p.Publish(ctx, stage, expectedBindingSHA256)
+}
+
 func (p *TaskAcornFoxSubstratePublisher) Reopen(expectedBindingSHA256 string) (*PublishedAcornFoxSubstrateV1, error) {
 	if p == nil || !digestPattern.MatchString(expectedBindingSHA256) {
 		return nil, errors.New("AcornFox substrate reopen input is invalid")
@@ -128,8 +146,23 @@ func (p *TaskAcornFoxSubstratePublisher) Reopen(expectedBindingSHA256 string) (*
 	}
 	raw, err := root.ReadFile(acornFoxSubstrateReceipt)
 	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			root.Close()
+			return nil, err
+		}
+		intentRaw, intentErr := root.ReadFile(acornFoxSubstrateIntent)
 		root.Close()
-		return nil, err
+		if errors.Is(intentErr, os.ErrNotExist) {
+			return nil, ErrAcornFoxSubstrateRecoveryRequired
+		}
+		intent, parseErr := ParseAcornFoxInactiveSubstrateIntentV1(intentRaw)
+		if parseErr != nil || intent.CandidateReceipt.BindingSHA256 != expectedBindingSHA256 {
+			return nil, ErrAcornFoxSubstrateConflict
+		}
+		if _, scanErr := p.reopenStage(expectedBindingSHA256); scanErr != nil {
+			return nil, ErrAcornFoxSubstrateRecoveryRequired
+		}
+		return nil, ErrAcornFoxSubstrateRecoveryRequired
 	}
 	receipt, err := ParseInactiveSubstrateReceiptV1(raw)
 	if err != nil || receipt.CandidateReceipt.BindingSHA256 != expectedBindingSHA256 {
@@ -142,6 +175,65 @@ func (p *TaskAcornFoxSubstratePublisher) Reopen(expectedBindingSHA256 string) (*
 		return nil, err
 	}
 	return handle, nil
+}
+
+func (p *TaskAcornFoxSubstratePublisher) reopenStage(expectedBindingSHA256 string) (*StagedAcornFoxCandidateV1, error) {
+	if p == nil || !digestPattern.MatchString(expectedBindingSHA256) {
+		return nil, errors.New("AcornFox substrate stage reopen input is invalid")
+	}
+	parent, err := os.OpenRoot(p.rootPath)
+	if err != nil {
+		return nil, err
+	}
+	directory, err := parent.OpenFile(".", os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		parent.Close()
+		return nil, err
+	}
+	entries, err := directory.ReadDir(-1)
+	directory.Close()
+	if err != nil {
+		parent.Close()
+		return nil, err
+	}
+	var matches []struct {
+		name    string
+		root    *os.Root
+		receipt AcornFoxStageReceiptV1
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), ".acornfox-stage-") {
+			continue
+		}
+		stageRoot, openErr := parent.OpenRoot(entry.Name())
+		if openErr != nil {
+			continue
+		}
+		raw, readErr := stageRoot.ReadFile(".acornfox-stage-complete.json")
+		var receipt AcornFoxStageReceiptV1
+		if readErr != nil || json.Unmarshal(raw, &receipt) != nil || receipt.BindingSHA256 != expectedBindingSHA256 || !acornFoxStageCompletionMatches(stageRoot, receipt, p.uid, p.gid) {
+			stageRoot.Close()
+			continue
+		}
+		matches = append(matches, struct {
+			name    string
+			root    *os.Root
+			receipt AcornFoxStageReceiptV1
+		}{entry.Name(), stageRoot, receipt})
+	}
+	if len(matches) != 1 {
+		for _, match := range matches {
+			match.root.Close()
+		}
+		parent.Close()
+		if len(matches) > 1 {
+			return nil, ErrAcornFoxSubstrateConflict
+		}
+		return nil, ErrAcornFoxSubstrateRecoveryRequired
+	}
+	match := matches[0]
+	state := &acornFoxStageState{phase: acornFoxStageLive, root: match.root, parent: parent, stageName: match.name, receipt: match.receipt, uid: p.uid, gid: p.gid, seal: &acornFoxStageSeal{}}
+	return &StagedAcornFoxCandidateV1{state: state}, nil
 }
 
 func (h *PublishedAcornFoxSubstrateV1) Verify() error {

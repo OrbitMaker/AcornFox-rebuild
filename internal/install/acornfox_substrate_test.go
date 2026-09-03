@@ -120,3 +120,66 @@ func TestPublishedAcornFoxSubstrateVerifyAndDiscardAreTaskOnly(t *testing.T) {
 		t.Fatalf("discard retained task substrate: %v", err)
 	}
 }
+
+func TestTaskAcornFoxSubstratePublisherResumeFindsOnlyMatchingFreshStage(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, acornFoxStageDirMode); err != nil {
+		t.Fatal(err)
+	}
+	stager, err := NewTaskAcornFoxStager(root, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stager.Close()
+	stage, staged, err := stager.Stage(newAcornFoxFixture(t, "1.2.3-test.1", nil).input(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	publisher, err := NewTaskAcornFoxSubstratePublisher(root, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := stage.claimForPublish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate, ok := lease.receipt()
+	if !ok {
+		t.Fatal("lease receipt unavailable")
+	}
+	source, err := lease.openSourceRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := acornFoxSubstrateManifest(source, candidate)
+	source.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err = lease.openSourceRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err := acornFoxSubstrateEntries(source, candidate, manifest)
+	source.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := ComputeAcornFoxSubstrateTreeSHA256(entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskRoot, err := os.OpenRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := acornFoxSubstrateWriteIntent(taskRoot, AcornFoxInactiveSubstrateIntentV1{SchemaVersion: InactiveSubstrateReceiptV1Schema, LayoutVersion: AcornFoxSubstrateLayoutV1, CandidateReceipt: candidate, ExpectedEntryEnvelopeSHA256: digest}, os.Getuid(), os.Getgid()); err != nil {
+		t.Fatal(err)
+	}
+	taskRoot.Close()
+	lease.releaseFailure()
+	result, err := publisher.Resume(context.Background(), staged.BindingSHA256)
+	if err != nil || result.Outcome != AcornFoxReconcileCompleted {
+		t.Fatalf("resume=%#v err=%v", result, err)
+	}
+}
