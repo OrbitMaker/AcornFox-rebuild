@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -133,7 +134,13 @@ func TestTaskAcornFoxStagerRejectsTaskRootReplacement(t *testing.T) {
 }
 
 func TestTaskAcornFoxStagerRejectsProductionRootsAndCloseDiscardsStage(t *testing.T) {
-	for _, root := range []string{string(filepath.Separator), AcornFoxV1InstallPrefix, AcornFoxV1ConfigDir, AcornFoxV1DataDir, AcornFoxV1LogDir, AcornFoxV1DataDir + "/task"} {
+	for _, root := range []string{
+		string(filepath.Separator), AcornFoxV1InstallPrefix, AcornFoxV1ConfigDir, AcornFoxV1DataDir, AcornFoxV1LogDir, AcornFoxV1DataDir + "/task",
+		"/opt/open-card", "/opt/open-card/task", "/etc/open-card", "/etc/open-card/task", "/var/lib/open-card", "/var/lib/open-card/task", "/var/log/open-card", "/var/log/open-card/task", "/etc/systemd/system", "/etc/systemd/system/open-card.service",
+	} {
+		if !forbiddenAcornFoxStageRoot(root) {
+			t.Fatalf("production root policy allowed: %s", root)
+		}
 		if _, err := NewTaskAcornFoxStager(root, os.Getuid(), os.Getgid()); err == nil {
 			t.Fatalf("production root accepted: %s", root)
 		}
@@ -173,19 +180,24 @@ func TestTaskAcornFoxStagerFaultsDiscardEveryOrdinaryFailure(t *testing.T) {
 		acornFoxStageFaultStageMkdir,
 		acornFoxStageFaultStageOpen,
 		acornFoxStageFaultStageMetadata,
-		acornFoxStageFaultStageSync,
+		acornFoxStageFaultStageParentEntrySync,
 		acornFoxStageFaultParentMkdir,
-		acornFoxStageFaultParentSync,
+		acornFoxStageFaultParentEntrySync,
 		acornFoxStageFaultParentMetadata,
+		acornFoxStageFaultParentDirectorySync,
+		acornFoxStageFaultStageDirectorySync,
 		acornFoxStageFaultMemberWrite,
 		acornFoxStageFaultMemberSync,
+		acornFoxStageFaultMemberDirectorySync,
 		acornFoxStageFaultMemberClose,
 		acornFoxStageFaultReceiptCreate,
 		acornFoxStageFaultReceiptWrite,
 		acornFoxStageFaultReceiptSync,
+		acornFoxStageFaultReceiptRootSync,
 		acornFoxStageFaultReceiptReread,
 		acornFoxStageFaultReceiptClose,
 		acornFoxStageFaultFinalRootSync,
+		acornFoxStageFaultFinalStageSync,
 	} {
 		t.Run(acornFoxStageFaultName(step), func(t *testing.T) {
 			root := t.TempDir()
@@ -314,7 +326,7 @@ func TestStagedAcornFoxCandidateRequiresMintedSealedReceipt(t *testing.T) {
 }
 
 func TestStagedAcornFoxCandidateCloseFailuresAreUnknown(t *testing.T) {
-	for _, step := range []acornFoxStageFaultStep{acornFoxStageFaultHandleClose, acornFoxStageFaultHandleRemove, acornFoxStageFaultHandleSync} {
+	for _, step := range []acornFoxStageFaultStep{acornFoxStageFaultHandleClose, acornFoxStageFaultHandleRemove, acornFoxStageFaultHandleSync, acornFoxStageFaultHandleParentClose} {
 		t.Run(acornFoxStageFaultName(step), func(t *testing.T) {
 			root := t.TempDir()
 			if err := os.Chmod(root, acornFoxStageDirMode); err != nil {
@@ -338,6 +350,10 @@ func TestStagedAcornFoxCandidateCloseFailuresAreUnknown(t *testing.T) {
 			if err := handle.Close(); !errors.Is(err, ErrAcornFoxStageCleanupUnknown) {
 				t.Fatalf("step=%s close=%v", acornFoxStageFaultName(step), err)
 			}
+			handle.fault = nil
+			if err := handle.Close(); err != nil {
+				t.Fatalf("step=%s retry close=%v", acornFoxStageFaultName(step), err)
+			}
 		})
 	}
 }
@@ -358,8 +374,230 @@ func TestWriteAcornFoxStageCompletionNeverReplacesReceipt(t *testing.T) {
 	if err := writeAcornFoxStageCompletion(root, changed, os.Getuid(), os.Getgid(), nil); !errors.Is(err, os.ErrExist) {
 		t.Fatalf("receipt replacement err=%v", err)
 	}
-	if !acornFoxStageCompletionMatches(root, receipt) {
+	if !acornFoxStageCompletionMatches(root, receipt, os.Getuid(), os.Getgid()) {
 		t.Fatal("original completion receipt was replaced")
+	}
+}
+
+func TestTaskAcornFoxStagerHandlesOwnIndependentParents(t *testing.T) {
+	taskRoot := t.TempDir()
+	if err := os.Chmod(taskRoot, acornFoxStageDirMode); err != nil {
+		t.Fatal(err)
+	}
+	stager, err := NewTaskAcornFoxStager(taskRoot, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := newAcornFoxFixture(t, "1.2.3-test.1", nil)
+	stageA, _, err := stager.Stage(fixture.input(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stageB, _, err := stager.Stage(fixture.input(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stageA.parent == stager.root || stageB.parent == stager.root || stageA.parent == stageB.parent {
+		t.Fatal("handles borrowed or shared the stager parent descriptor")
+	}
+	if err := stageA.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !stageB.valid() {
+		t.Fatal("closing stage A invalidated stage B")
+	}
+	if err := stager.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := stageB.Close(); err != nil {
+		t.Fatal(err)
+	}
+	assertAcornFoxStageRootEmpty(t, taskRoot)
+}
+
+func TestTaskAcornFoxStagerHandlesCloseInReverseOrder(t *testing.T) {
+	taskRoot := t.TempDir()
+	if err := os.Chmod(taskRoot, acornFoxStageDirMode); err != nil {
+		t.Fatal(err)
+	}
+	stager, err := NewTaskAcornFoxStager(taskRoot, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stager.Close()
+	fixture := newAcornFoxFixture(t, "1.2.3-test.1", nil)
+	stageA, _, err := stager.Stage(fixture.input(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stageB, _, err := stager.Stage(fixture.input(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stageB.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !stageA.valid() {
+		t.Fatal("closing stage B invalidated stage A")
+	}
+	if err := stageA.Close(); err != nil {
+		t.Fatal(err)
+	}
+	assertAcornFoxStageRootEmpty(t, taskRoot)
+}
+
+func TestStagedAcornFoxCandidateCloseCanRetryAfterInjectedFailure(t *testing.T) {
+	for _, failedStep := range []acornFoxStageFaultStep{acornFoxStageFaultHandleClose, acornFoxStageFaultHandleRemove, acornFoxStageFaultHandleSync, acornFoxStageFaultHandleParentClose} {
+		t.Run(acornFoxStageFaultName(failedStep), func(t *testing.T) {
+			taskRoot := t.TempDir()
+			if err := os.Chmod(taskRoot, acornFoxStageDirMode); err != nil {
+				t.Fatal(err)
+			}
+			stager, err := NewTaskAcornFoxStager(taskRoot, os.Getuid(), os.Getgid())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer stager.Close()
+			handle, _, err := stager.Stage(newAcornFoxFixture(t, "1.2.3-test.1", nil).input(nil))
+			if err != nil {
+				t.Fatal(err)
+			}
+			handle.fault = func(step acornFoxStageFaultStep) error {
+				if step == failedStep {
+					return errAcornFoxStageInjected
+				}
+				return nil
+			}
+			if err := handle.Close(); !errors.Is(err, ErrAcornFoxStageCleanupUnknown) || handle.parent == nil || (failedStep == acornFoxStageFaultHandleClose && handle.root == nil) {
+				t.Fatalf("first close err=%v handle=%#v", err, handle)
+			}
+			handle.fault = nil
+			if err := handle.Close(); err != nil {
+				t.Fatalf("retry close=%v", err)
+			}
+			assertAcornFoxStageRootEmpty(t, taskRoot)
+		})
+	}
+}
+
+func TestAcornFoxStageCompletionRejectsCanonicalAndMetadataTampering(t *testing.T) {
+	for _, variant := range []struct {
+		name   string
+		mutate func(*testing.T, *StagedAcornFoxCandidateV1)
+	}{
+		{"whitespace", func(t *testing.T, handle *StagedAcornFoxCandidateV1) {
+			overwriteAcornFoxStageCompletion(t, handle.root, append([]byte(" "), mustMarshalAcornFoxReceipt(t, handle.receipt)...))
+		}},
+		{"unknown_field", func(t *testing.T, handle *StagedAcornFoxCandidateV1) {
+			raw := mustMarshalAcornFoxReceipt(t, handle.receipt)
+			overwriteAcornFoxStageCompletion(t, handle.root, append(append([]byte(nil), raw[:len(raw)-1]...), []byte(`,"unknown":true}`)...))
+		}},
+		{"duplicate_field", func(t *testing.T, handle *StagedAcornFoxCandidateV1) {
+			raw := bytes.Replace(mustMarshalAcornFoxReceipt(t, handle.receipt), []byte(`"schema_version":1,`), []byte(`"schema_version":1,"schema_version":1,`), 1)
+			overwriteAcornFoxStageCompletion(t, handle.root, raw)
+		}},
+		{"field_order", func(t *testing.T, handle *StagedAcornFoxCandidateV1) {
+			var object map[string]any
+			if err := json.Unmarshal(mustMarshalAcornFoxReceipt(t, handle.receipt), &object); err != nil {
+				t.Fatal(err)
+			}
+			raw, err := json.Marshal(object)
+			if err != nil {
+				t.Fatal(err)
+			}
+			overwriteAcornFoxStageCompletion(t, handle.root, raw)
+		}},
+		{"mode", func(t *testing.T, handle *StagedAcornFoxCandidateV1) {
+			file, err := handle.root.OpenFile(".acornfox-stage-complete.json", os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer file.Close()
+			if err := file.Chmod(0o644); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(variant.name, func(t *testing.T) {
+			taskRoot := t.TempDir()
+			if err := os.Chmod(taskRoot, acornFoxStageDirMode); err != nil {
+				t.Fatal(err)
+			}
+			stager, err := NewTaskAcornFoxStager(taskRoot, os.Getuid(), os.Getgid())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer stager.Close()
+			handle, receipt, err := stager.Stage(newAcornFoxFixture(t, "1.2.3-test.1", nil).input(nil))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if acornFoxStageCompletionMatches(handle.root, receipt, os.Getuid()+1, os.Getgid()) {
+				t.Fatal("valid receipt accepted mismatched expected owner")
+			}
+			variant.mutate(t, &handle)
+			if handle.valid() {
+				t.Fatalf("tampered receipt %s remained valid", variant.name)
+			}
+			if err := handle.Close(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestTaskAcornFoxStagerFaultStepsReachDistinctDurabilityBoundaries(t *testing.T) {
+	taskRoot := t.TempDir()
+	if err := os.Chmod(taskRoot, acornFoxStageDirMode); err != nil {
+		t.Fatal(err)
+	}
+	stager, err := NewTaskAcornFoxStager(taskRoot, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stager.Close()
+	hits := make(map[acornFoxStageFaultStep]int)
+	stager.fault = func(step acornFoxStageFaultStep) error { hits[step]++; return nil }
+	handle, _, err := stager.Stage(newAcornFoxFixture(t, "1.2.3-test.1", nil).input(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer handle.Close()
+	for _, step := range []acornFoxStageFaultStep{
+		acornFoxStageFaultStageParentEntrySync, acornFoxStageFaultStageDirectorySync, acornFoxStageFaultFinalStageSync,
+		acornFoxStageFaultParentEntrySync, acornFoxStageFaultParentDirectorySync, acornFoxStageFaultMemberDirectorySync,
+		acornFoxStageFaultReceiptRootSync, acornFoxStageFaultFinalRootSync,
+	} {
+		if hits[step] == 0 {
+			t.Fatalf("durability boundary %s was not reached", acornFoxStageFaultName(step))
+		}
+	}
+	if hits[acornFoxStageFaultParentEntrySync] < 2 || hits[acornFoxStageFaultParentDirectorySync] < 2 {
+		t.Fatalf("nested parent durability operations not independently reached: %#v", hits)
+	}
+}
+
+func mustMarshalAcornFoxReceipt(t *testing.T, receipt AcornFoxStageReceiptV1) []byte {
+	t.Helper()
+	raw, err := json.Marshal(receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+func overwriteAcornFoxStageCompletion(t *testing.T, root *os.Root, raw []byte) {
+	t.Helper()
+	file, err := root.OpenFile(".acornfox-stage-complete.json", os.O_WRONLY|os.O_TRUNC|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if written, err := file.Write(raw); err != nil || written != len(raw) {
+		_ = file.Close()
+		t.Fatalf("write completion written=%d err=%v", written, err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 

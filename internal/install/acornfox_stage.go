@@ -1,6 +1,7 @@
 package install
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -30,22 +31,28 @@ const (
 	acornFoxStageFaultStageMkdir
 	acornFoxStageFaultStageOpen
 	acornFoxStageFaultStageMetadata
-	acornFoxStageFaultStageSync
+	acornFoxStageFaultStageParentEntrySync
 	acornFoxStageFaultParentMkdir
-	acornFoxStageFaultParentSync
+	acornFoxStageFaultParentEntrySync
 	acornFoxStageFaultParentMetadata
+	acornFoxStageFaultParentDirectorySync
+	acornFoxStageFaultStageDirectorySync
 	acornFoxStageFaultMemberWrite
 	acornFoxStageFaultMemberSync
+	acornFoxStageFaultMemberDirectorySync
 	acornFoxStageFaultMemberClose
 	acornFoxStageFaultReceiptCreate
 	acornFoxStageFaultReceiptWrite
 	acornFoxStageFaultReceiptSync
+	acornFoxStageFaultReceiptRootSync
 	acornFoxStageFaultReceiptReread
 	acornFoxStageFaultReceiptClose
 	acornFoxStageFaultFinalRootSync
+	acornFoxStageFaultFinalStageSync
 	acornFoxStageFaultHandleClose
 	acornFoxStageFaultHandleRemove
 	acornFoxStageFaultHandleSync
+	acornFoxStageFaultHandleParentClose
 	acornFoxStageFaultCleanupSpoolClose
 	acornFoxStageFaultCleanupSpoolRemove
 	acornFoxStageFaultCleanupStageClose
@@ -101,6 +108,8 @@ type StagedAcornFoxCandidateV1 struct {
 	parent    *os.Root
 	stageName string
 	receipt   AcornFoxStageReceiptV1
+	uid       int
+	gid       int
 	fault     acornFoxStageFault
 	seal      *acornFoxStageSeal
 }
@@ -111,31 +120,34 @@ type StagedAcornFoxCandidateV1 struct {
 type acornFoxStageSeal struct{}
 
 func (s StagedAcornFoxCandidateV1) valid() bool {
-	return s.root != nil && s.parent != nil && s.stageName != "" && s.seal != nil && s.receipt.SchemaVersion == 1 && s.receipt.Product == AcornFoxV1Product && digestPattern.MatchString(s.receipt.ManifestSHA256) && digestPattern.MatchString(s.receipt.ArchiveSHA256) && digestPattern.MatchString(s.receipt.TreeSHA256) && s.receipt.FileCount > 0 && acornFoxStageCompletionMatches(s.root, s.receipt)
+	return s.root != nil && s.parent != nil && s.stageName != "" && s.seal != nil && s.receipt.SchemaVersion == 1 && s.receipt.Product == AcornFoxV1Product && digestPattern.MatchString(s.receipt.ManifestSHA256) && digestPattern.MatchString(s.receipt.ArchiveSHA256) && digestPattern.MatchString(s.receipt.TreeSHA256) && s.receipt.FileCount > 0 && acornFoxStageCompletionMatches(s.root, s.receipt, s.uid, s.gid)
 }
 
 func (s *StagedAcornFoxCandidateV1) Close() error {
-	if s == nil || s.root == nil {
+	if s == nil || (s.root == nil && s.parent == nil) {
 		return nil
 	}
-	root := s.root
-	parent := s.parent
-	name := s.stageName
-	s.root = nil
-	s.parent = nil
-	closeErr := acornFoxStageRun(s.fault, acornFoxStageFaultHandleClose, root.Close)
-	if parent == nil || name == "" {
-		if closeErr != nil {
+	if s.root != nil {
+		if err := acornFoxStageRun(s.fault, acornFoxStageFaultHandleClose, s.root.Close); err != nil {
 			return ErrAcornFoxStageCleanupUnknown
 		}
+		s.root = nil
+	}
+	if s.parent == nil || s.stageName == "" {
 		return nil
 	}
-	removeErr := acornFoxStageRun(s.fault, acornFoxStageFaultHandleRemove, func() error { return parent.RemoveAll(name) })
-	syncErr := acornFoxStageRun(s.fault, acornFoxStageFaultHandleSync, func() error { return syncAcornFoxRoot(parent) })
-	parentErr := parent.Close()
-	if closeErr != nil || removeErr != nil || syncErr != nil || parentErr != nil {
+	if err := acornFoxStageRun(s.fault, acornFoxStageFaultHandleRemove, func() error { return s.parent.RemoveAll(s.stageName) }); err != nil {
 		return ErrAcornFoxStageCleanupUnknown
 	}
+	if err := acornFoxStageRun(s.fault, acornFoxStageFaultHandleSync, func() error { return syncAcornFoxRoot(s.parent) }); err != nil {
+		return ErrAcornFoxStageCleanupUnknown
+	}
+	if err := acornFoxStageRun(s.fault, acornFoxStageFaultHandleParentClose, s.parent.Close); err != nil {
+		return ErrAcornFoxStageCleanupUnknown
+	}
+	s.parent = nil
+	s.stageName = ""
+	s.seal = nil
 	return nil
 }
 
@@ -188,6 +200,32 @@ func (s *TaskAcornFoxStager) verifyLiveRoot() error {
 		return errors.New("AcornFox task root identity changed")
 	}
 	return nil
+}
+
+// openHandleParent pins a fresh descriptor to the verified task root. Handles
+// must not borrow s.root: callers may close the stager before discarding a
+// previously minted handle, and independently minted handles close in either
+// order.
+func (s *TaskAcornFoxStager) openHandleParent() (*os.Root, error) {
+	if err := s.verifyLiveRoot(); err != nil {
+		return nil, err
+	}
+	parent, err := os.OpenRoot(s.rootPath)
+	if err != nil {
+		return nil, err
+	}
+	directory, err := parent.OpenFile(".", os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		_ = parent.Close()
+		return nil, err
+	}
+	info, statErr := directory.Stat()
+	closeErr := directory.Close()
+	if statErr != nil || closeErr != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm()&0o022 != 0 || !os.SameFile(info, s.rootInfo) || verifyOwner(info, s.uid, s.gid) != nil {
+		_ = parent.Close()
+		return nil, errors.New("AcornFox task root identity changed")
+	}
+	return parent, nil
 }
 
 func (s *TaskAcornFoxStager) Stage(input VerifyAcornFoxCandidateArtifactsV1Input) (handle StagedAcornFoxCandidateV1, receipt AcornFoxStageReceiptV1, err error) {
@@ -289,7 +327,7 @@ func (s *TaskAcornFoxStager) Stage(input VerifyAcornFoxCandidateArtifactsV1Input
 	if err = verifyAcornFoxArchive(spool, input.ArchiveSize, verified.archiveSHA256, input.Manifest, manifest, sink); err != nil {
 		return handle, receipt, err
 	}
-	if err = acornFoxStageRun(s.fault, acornFoxStageFaultStageSync, func() error { return syncAcornFoxRoot(stage) }); err != nil {
+	if err = acornFoxStageRun(s.fault, acornFoxStageFaultFinalStageSync, func() error { return syncAcornFoxRoot(stage) }); err != nil {
 		return handle, receipt, err
 	}
 	receipt, err = readAcornFoxStageReceipt(stage, manifest, verified, s.uid, s.gid)
@@ -313,8 +351,12 @@ func (s *TaskAcornFoxStager) Stage(input VerifyAcornFoxCandidateArtifactsV1Input
 	if err = s.verifyLiveRoot(); err != nil {
 		return handle, receipt, errors.New("AcornFox task stage publication is unknown")
 	}
+	parent, err := s.openHandleParent()
+	if err != nil {
+		return handle, receipt, errors.New("AcornFox task stage publication is unknown")
+	}
 	stagePublished = true
-	handle = StagedAcornFoxCandidateV1{root: stage, parent: s.root, stageName: stageName, receipt: receipt, fault: s.fault, seal: &acornFoxStageSeal{}}
+	handle = StagedAcornFoxCandidateV1{root: stage, parent: parent, stageName: stageName, receipt: receipt, uid: s.uid, gid: s.gid, fault: s.fault, seal: &acornFoxStageSeal{}}
 	return handle, receipt, nil
 }
 
@@ -322,7 +364,10 @@ func forbiddenAcornFoxStageRoot(path string) bool {
 	if path == string(filepath.Separator) {
 		return true
 	}
-	for _, root := range []string{AcornFoxV1InstallPrefix, AcornFoxV1ConfigDir, AcornFoxV1DataDir, AcornFoxV1LogDir} {
+	for _, root := range []string{
+		AcornFoxV1InstallPrefix, AcornFoxV1ConfigDir, AcornFoxV1DataDir, AcornFoxV1LogDir,
+		"/opt/open-card", "/etc/open-card", "/var/lib/open-card", "/var/log/open-card", "/etc/systemd/system",
+	} {
 		if path == root || strings.HasPrefix(path, root+string(filepath.Separator)) {
 			return true
 		}
@@ -360,7 +405,7 @@ func (s *TaskAcornFoxStager) createStage(name string) (stage *os.Root, err error
 	created = true
 	// A newly-created entry is durable in its parent before it is opened and
 	// populated. This makes every later failure removable as an exact entry.
-	if err = acornFoxStageRun(s.fault, acornFoxStageFaultStageSync, func() error { return syncAcornFoxRoot(s.root) }); err != nil {
+	if err = acornFoxStageRun(s.fault, acornFoxStageFaultStageParentEntrySync, func() error { return syncAcornFoxRoot(s.root) }); err != nil {
 		return nil, err
 	}
 	if err = s.faultAt(acornFoxStageFaultStageOpen); err != nil {
@@ -395,7 +440,7 @@ func (s *TaskAcornFoxStager) createStage(name string) (stage *os.Root, err error
 	if statErr != nil || !info.IsDir() || info.Mode().Perm() != acornFoxStageDirMode || verifyOwner(info, s.uid, s.gid) != nil {
 		return nil, errors.New("AcornFox stage directory is unsafe")
 	}
-	if err = acornFoxStageRun(s.fault, acornFoxStageFaultStageSync, directory.Sync); err != nil {
+	if err = acornFoxStageRun(s.fault, acornFoxStageFaultStageDirectorySync, directory.Sync); err != nil {
 		return nil, err
 	}
 	if err = directory.Close(); err != nil {
@@ -425,7 +470,7 @@ func (m *acornFoxStageMember) Sync() error {
 	if err := acornFoxStageRun(m.fault, acornFoxStageFaultMemberSync, m.file.Sync); err != nil {
 		return err
 	}
-	return syncAcornFoxDirectory(m.root, m.parent)
+	return acornFoxStageRun(m.fault, acornFoxStageFaultMemberDirectorySync, func() error { return syncAcornFoxDirectory(m.root, m.parent) })
 }
 func (m *acornFoxStageMember) Close() error {
 	return acornFoxStageRun(m.fault, acornFoxStageFaultMemberClose, m.file.Close)
@@ -501,7 +546,7 @@ func ensureAcornFoxStageParents(root *os.Root, directory string, uid, gid int, f
 		}
 		// A mkdir changes its parent entry. Sync that parent before opening the
 		// child, then sync the child after metadata is checked below.
-		if err := acornFoxStageRun(fault, acornFoxStageFaultParentSync, func() error { return syncAcornFoxDirectory(root, parent) }); err != nil {
+		if err := acornFoxStageRun(fault, acornFoxStageFaultParentEntrySync, func() error { return syncAcornFoxDirectory(root, parent) }); err != nil {
 			return err
 		}
 		dir, err := root.OpenFile(current, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
@@ -517,7 +562,7 @@ func ensureAcornFoxStageParents(root *os.Root, directory string, uid, gid int, f
 			return err
 		}
 		info, err := dir.Stat()
-		if err != nil || !info.IsDir() || info.Mode().Perm() != acornFoxStageDirMode || verifyOwner(info, uid, gid) != nil || acornFoxStageRun(fault, acornFoxStageFaultParentSync, dir.Sync) != nil {
+		if err != nil || !info.IsDir() || info.Mode().Perm() != acornFoxStageDirMode || verifyOwner(info, uid, gid) != nil || acornFoxStageRun(fault, acornFoxStageFaultParentDirectorySync, dir.Sync) != nil {
 			_ = dir.Close()
 			return errors.New("AcornFox stage parent is unsafe")
 		}
@@ -628,25 +673,24 @@ func writeAcornFoxStageCompletion(root *os.Root, receipt AcornFoxStageReceiptV1,
 		return err
 	}
 	closed = true
-	if err := syncAcornFoxRoot(root); err != nil {
+	if err := acornFoxStageRun(fault, acornFoxStageFaultReceiptRootSync, func() error { return syncAcornFoxRoot(root) }); err != nil {
 		return err
 	}
 	if err := acornFoxStageRun(fault, acornFoxStageFaultReceiptReread, func() error { return nil }); err != nil {
 		return err
 	}
-	read, err := root.ReadFile(".acornfox-stage-complete.json")
-	if err != nil {
-		return err
-	}
-	var reread AcornFoxStageReceiptV1
-	if err := json.Unmarshal(read, &reread); err != nil || reread != receipt {
+	if !acornFoxStageCompletionMatches(root, receipt, uid, gid) {
 		return errors.New("AcornFox stage completion receipt is invalid")
 	}
 	return nil
 }
 
-func acornFoxStageCompletionMatches(root *os.Root, receipt AcornFoxStageReceiptV1) bool {
+func acornFoxStageCompletionMatches(root *os.Root, receipt AcornFoxStageReceiptV1, uid, gid int) bool {
 	if root == nil {
+		return false
+	}
+	want, err := json.Marshal(receipt)
+	if err != nil {
 		return false
 	}
 	file, err := root.OpenFile(".acornfox-stage-complete.json", os.O_RDONLY|syscall.O_NOFOLLOW, 0)
@@ -655,15 +699,14 @@ func acornFoxStageCompletionMatches(root *os.Root, receipt AcornFoxStageReceiptV
 	}
 	defer file.Close()
 	info, err := file.Stat()
-	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != acornFoxSpoolFileMode {
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != acornFoxSpoolFileMode || info.Size() != int64(len(want)) || verifyOwner(info, uid, gid) != nil {
 		return false
 	}
-	read, err := io.ReadAll(file)
-	if err != nil {
+	read, err := io.ReadAll(io.LimitReader(file, int64(len(want))+1))
+	if err != nil || len(read) != len(want) {
 		return false
 	}
-	var sealed AcornFoxStageReceiptV1
-	return json.Unmarshal(read, &sealed) == nil && sealed == receipt
+	return bytes.Equal(read, want)
 }
 
 func sha256AcornFoxOpenFile(file *os.File) (string, error) {
