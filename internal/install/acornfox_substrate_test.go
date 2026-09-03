@@ -49,15 +49,22 @@ func TestTaskAcornFoxSubstratePublisherSerializesConcurrentSameBinding(t *testin
 	wait.Wait()
 	close(outcomes)
 	close(failures)
+	cleanupUnknown := 0
 	for err := range failures {
-		if err != nil {
+		if err != nil && !errors.Is(err, ErrAcornFoxStageCleanupUnknown) {
 			t.Fatal(err)
+		}
+		if errors.Is(err, ErrAcornFoxStageCleanupUnknown) {
+			cleanupUnknown++
 		}
 	}
 	for result := range outcomes {
-		if result.Outcome != AcornFoxReconcileCompleted {
+		if result.Outcome != AcornFoxReconcileCompleted && result.Outcome != AcornFoxReconcileCleanupUnknown {
 			t.Fatalf("outcome=%s", result.Outcome)
 		}
+	}
+	if cleanupUnknown != 1 {
+		t.Fatalf("cleanup unknown=%d", cleanupUnknown)
 	}
 }
 

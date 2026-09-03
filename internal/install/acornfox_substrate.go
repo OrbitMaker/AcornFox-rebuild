@@ -164,6 +164,9 @@ func (p *TaskAcornFoxSubstratePublisher) publishLocked(ctx context.Context, stag
 	if inspection.Outcome == AcornFoxReconcileCompleted {
 		return AcornFoxSubstratePublishResult{Receipt: inspection.Receipt, Outcome: AcornFoxReconcileCompleted}, nil
 	}
+	if inspection.Outcome == AcornFoxReconcileCleanupUnknown {
+		return AcornFoxSubstratePublishResult{Receipt: inspection.Receipt, Outcome: inspection.Outcome}, ErrAcornFoxStageCleanupUnknown
+	}
 	if inspection.Outcome != permitted {
 		return AcornFoxSubstratePublishResult{}, acornFoxSubstrateOutcomeError(inspection.Outcome)
 	}
@@ -237,7 +240,7 @@ func (p *TaskAcornFoxSubstratePublisher) publishLocked(ctx context.Context, stag
 		return AcornFoxSubstratePublishResult{}, err
 	}
 	if err := lease.consume(); err != nil {
-		return AcornFoxSubstratePublishResult{}, err
+		return AcornFoxSubstratePublishResult{Receipt: receipt, Outcome: AcornFoxReconcileCleanupUnknown}, ErrAcornFoxStageCleanupUnknown
 	}
 	committed = true
 	return AcornFoxSubstratePublishResult{Receipt: receipt, Outcome: AcornFoxReconcileCompleted}, nil
@@ -305,6 +308,9 @@ func (p *TaskAcornFoxSubstratePublisher) inspectLocked(expectedBindingSHA256 str
 			return AcornFoxSubstrateInspection{Outcome: AcornFoxReconcileCommitUnknown}, nil
 		}
 		handle.root = nil
+		if disposition := p.stageDisposition(expectedBindingSHA256); disposition != AcornFoxReconcileRecoveryRequired {
+			return AcornFoxSubstrateInspection{Outcome: AcornFoxReconcileCleanupUnknown, Receipt: receipt}, nil
+		}
 		return AcornFoxSubstrateInspection{Outcome: AcornFoxReconcileCompleted, Receipt: receipt}, nil
 	}
 	if !errors.Is(receiptErr, os.ErrNotExist) {
@@ -321,10 +327,7 @@ func (p *TaskAcornFoxSubstratePublisher) inspectLocked(expectedBindingSHA256 str
 	if parseErr != nil || intent.CandidateReceipt.BindingSHA256 != expectedBindingSHA256 {
 		return AcornFoxSubstrateInspection{Outcome: AcornFoxReconcileConflict}, nil
 	}
-	if p.hasReopenableStage(expectedBindingSHA256) {
-		return AcornFoxSubstrateInspection{Outcome: AcornFoxReconcileResume}, nil
-	}
-	return AcornFoxSubstrateInspection{Outcome: AcornFoxReconcileRecoveryRequired}, nil
+	return AcornFoxSubstrateInspection{Outcome: p.stageDisposition(expectedBindingSHA256)}, nil
 }
 
 func (p *TaskAcornFoxSubstratePublisher) Reopen(expectedBindingSHA256 string) (*PublishedAcornFoxSubstrateV1, error) {
@@ -388,21 +391,29 @@ func (p *TaskAcornFoxSubstratePublisher) reopenLocked(expectedBindingSHA256 stri
 }
 
 func (p *TaskAcornFoxSubstratePublisher) hasReopenableStage(expectedBindingSHA256 string) bool {
+	return p.stageDisposition(expectedBindingSHA256) == AcornFoxReconcileResume
+}
+
+// stageDisposition makes the resumability decision from one complete scan:
+// no candidate is recoverable, exactly one matching candidate is resumable,
+// while a mismatching or ambiguous stage set is conflict evidence.
+func (p *TaskAcornFoxSubstratePublisher) stageDisposition(expectedBindingSHA256 string) AcornFoxReconciliationOutcome {
 	parent, err := p.openRoot()
 	if err != nil {
-		return false
+		return AcornFoxReconcileRecoveryRequired
 	}
 	defer parent.Close()
 	directory, err := parent.OpenFile(".", os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
-		return false
+		return AcornFoxReconcileRecoveryRequired
 	}
 	entries, readErr := directory.ReadDir(-1)
 	closeErr := directory.Close()
 	if readErr != nil || closeErr != nil {
-		return false
+		return AcornFoxReconcileRecoveryRequired
 	}
 	matches := 0
+	mismatch := false
 	for _, entry := range entries {
 		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), ".acornfox-stage-") {
 			continue
@@ -413,13 +424,21 @@ func (p *TaskAcornFoxSubstratePublisher) hasReopenableStage(expectedBindingSHA25
 		}
 		raw, readErr := stageRoot.ReadFile(".acornfox-stage-complete.json")
 		var receipt AcornFoxStageReceiptV1
-		valid := readErr == nil && json.Unmarshal(raw, &receipt) == nil && receipt.BindingSHA256 == expectedBindingSHA256 && acornFoxStageCompletionMatches(stageRoot, receipt, p.uid, p.gid)
+		valid := readErr == nil && json.Unmarshal(raw, &receipt) == nil && acornFoxStageCompletionMatches(stageRoot, receipt, p.uid, p.gid)
 		_ = stageRoot.Close()
-		if valid {
+		if valid && receipt.BindingSHA256 == expectedBindingSHA256 {
 			matches++
+		} else {
+			mismatch = true
 		}
 	}
-	return matches == 1
+	if mismatch || matches > 1 {
+		return AcornFoxReconcileConflict
+	}
+	if matches == 1 {
+		return AcornFoxReconcileResume
+	}
+	return AcornFoxReconcileRecoveryRequired
 }
 
 func (p *TaskAcornFoxSubstratePublisher) reopenStage(expectedBindingSHA256 string) (*StagedAcornFoxCandidateV1, error) {
