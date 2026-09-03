@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -57,6 +58,59 @@ func TestTaskAcornFoxSubstratePublisherSerializesConcurrentSameBinding(t *testin
 		if result.Outcome != AcornFoxReconcileCompleted {
 			t.Fatalf("outcome=%s", result.Outcome)
 		}
+	}
+}
+
+func TestTaskAcornFoxSubstratePublisherSerializesConcurrentDifferentBindings(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, acornFoxStageDirMode); err != nil {
+		t.Fatal(err)
+	}
+	stager, err := NewTaskAcornFoxStager(root, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stager.Close()
+	first, firstReceipt, err := stager.Stage(newAcornFoxFixture(t, "1.2.3-test.1", nil).input(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, secondReceipt, err := stager.Stage(newAcornFoxFixture(t, "1.2.4-test.1", nil).input(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	publisher, err := NewTaskAcornFoxSubstratePublisher(root, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	results := make(chan error, 2)
+	var wait sync.WaitGroup
+	for _, candidate := range []struct {
+		stage   *StagedAcornFoxCandidateV1
+		binding string
+	}{{&first, firstReceipt.BindingSHA256}, {&second, secondReceipt.BindingSHA256}} {
+		wait.Add(1)
+		go func(stage *StagedAcornFoxCandidateV1, binding string) {
+			defer wait.Done()
+			_, err := publisher.Publish(context.Background(), stage, binding)
+			results <- err
+		}(candidate.stage, candidate.binding)
+	}
+	wait.Wait()
+	close(results)
+	completed, conflicts := 0, 0
+	for err := range results {
+		if err == nil {
+			completed++
+		} else if errors.Is(err, ErrAcornFoxSubstrateConflict) {
+			conflicts++
+		} else {
+			t.Fatalf("unexpected concurrent publish error: %v", err)
+		}
+	}
+	if completed != 1 || conflicts != 1 {
+		t.Fatalf("completed=%d conflicts=%d", completed, conflicts)
 	}
 }
 
@@ -178,6 +232,9 @@ func TestPublishedAcornFoxSubstrateVerifyAndDiscardAreTaskOnly(t *testing.T) {
 	}
 	if _, err := os.Stat(root + "/substrate"); !os.IsNotExist(err) {
 		t.Fatalf("discard retained task substrate: %v", err)
+	}
+	if info, err := os.Stat(root + "/" + acornFoxSubstrateLock); err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
+		t.Fatalf("discard removed or changed task lock: info=%v err=%v", info, err)
 	}
 }
 
@@ -354,8 +411,170 @@ func TestTaskAcornFoxSubstratePublisherResumeRejectsTamperedSourceBeforeRootfs(t
 	}
 }
 
+func TestTaskAcornFoxSubstratePublisherResumesCompletePartialFilesAndCleansOwnedTemps(t *testing.T) {
+	for _, failAt := range []int{1, 2} {
+		t.Run(fmt.Sprintf("file_%d", failAt), func(t *testing.T) {
+			root := t.TempDir()
+			if err := os.Chmod(root, acornFoxStageDirMode); err != nil {
+				t.Fatal(err)
+			}
+			stager, err := NewTaskAcornFoxStager(root, os.Getuid(), os.Getgid())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer stager.Close()
+			stage, receipt, err := stager.Stage(newAcornFoxFixture(t, "1.2.3-test.1", nil).input(nil))
+			if err != nil {
+				t.Fatal(err)
+			}
+			publisher, err := NewTaskAcornFoxSubstratePublisher(root, os.Getuid(), os.Getgid())
+			if err != nil {
+				t.Fatal(err)
+			}
+			seen := 0
+			publisher.fault = func(step acornFoxSubstrateFaultStep) error {
+				if step == acornFoxSubstrateFaultFileReadback {
+					seen++
+					if seen == failAt {
+						return errAcornFoxStageInjected
+					}
+				}
+				return nil
+			}
+			if _, err := publisher.Publish(context.Background(), &stage, receipt.BindingSHA256); err == nil {
+				t.Fatal("partial publish unexpectedly completed")
+			}
+			fresh, err := NewTaskAcornFoxSubstratePublisher(root, os.Getuid(), os.Getgid())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if inspection, err := fresh.Inspect(receipt.BindingSHA256); err != nil || inspection.Outcome != AcornFoxReconcileResume {
+				t.Fatalf("inspection=%#v err=%v", inspection, err)
+			}
+			if result, err := fresh.Resume(context.Background(), receipt.BindingSHA256); err != nil || result.Outcome != AcornFoxReconcileCompleted {
+				t.Fatalf("resume=%#v err=%v", result, err)
+			}
+			reopened, err := fresh.Reopen(receipt.BindingSHA256)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reopened.Close()
+			if err := reopened.Verify(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestPublishedAcornFoxSubstrateRejectsExtraRootfsEntriesWithoutDiscarding(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, acornFoxStageDirMode); err != nil {
+		t.Fatal(err)
+	}
+	stager, err := NewTaskAcornFoxStager(root, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stager.Close()
+	stage, receipt, err := stager.Stage(newAcornFoxFixture(t, "1.2.3-test.1", nil).input(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	publisher, err := NewTaskAcornFoxSubstratePublisher(root, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := publisher.Publish(context.Background(), &stage, receipt.BindingSHA256); err != nil {
+		t.Fatal(err)
+	}
+	published, err := publisher.Reopen(receipt.BindingSHA256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer published.Close()
+	if err := os.WriteFile(root+"/substrate/rootfs/foreign", []byte("foreign"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(root+"/substrate/rootfs/foreign-dir", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := published.Verify(); err == nil {
+		t.Fatal("extra rootfs file verified")
+	}
+	if err := published.Discard(); err == nil {
+		t.Fatal("discard removed conflicting substrate")
+	}
+	if _, err := os.Stat(root + "/substrate/rootfs/foreign"); err != nil {
+		t.Fatalf("discard mutated conflicting substrate: %v", err)
+	}
+}
+
+func TestTaskAcornFoxSubstratePublisherRejectsExistingFinalWithoutMutation(t *testing.T) {
+	for _, payload := range [][]byte{nil, []byte("truncated")} {
+		t.Run(fmt.Sprintf("bytes_%d", len(payload)), func(t *testing.T) {
+			root := t.TempDir()
+			if err := os.Chmod(root, acornFoxStageDirMode); err != nil {
+				t.Fatal(err)
+			}
+			stager, err := NewTaskAcornFoxStager(root, os.Getuid(), os.Getgid())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer stager.Close()
+			stage, receipt, err := stager.Stage(newAcornFoxFixture(t, "1.2.3-test.1", nil).input(nil))
+			if err != nil {
+				t.Fatal(err)
+			}
+			publisher, err := NewTaskAcornFoxSubstratePublisher(root, os.Getuid(), os.Getgid())
+			if err != nil {
+				t.Fatal(err)
+			}
+			final := root + "/substrate/rootfs/opt/acornfox/releases/" + receipt.ReleaseID + "/manifest.json"
+			planted := false
+			publisher.fault = func(step acornFoxSubstrateFaultStep) error {
+				if step == acornFoxSubstrateFaultFileOpen && !planted {
+					planted = true
+					return os.WriteFile(final, payload, 0o600)
+				}
+				return nil
+			}
+			if _, err := publisher.Publish(context.Background(), &stage, receipt.BindingSHA256); !errors.Is(err, ErrAcornFoxSubstrateConflict) {
+				t.Fatalf("publish error=%v", err)
+			}
+			got, err := os.ReadFile(final)
+			if err != nil || string(got) != string(payload) {
+				t.Fatalf("existing final mutated: bytes=%q err=%v", got, err)
+			}
+			info, err := os.Stat(final)
+			if err != nil || info.Mode().Perm() != 0o600 || info.Size() != int64(len(payload)) {
+				t.Fatalf("existing final metadata mutated: info=%v err=%v", info, err)
+			}
+		})
+	}
+}
+
+func TestTaskAcornFoxSubstratePublisherPinsTaskRootIdentity(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, acornFoxStageDirMode); err != nil {
+		t.Fatal(err)
+	}
+	publisher, err := NewTaskAcornFoxSubstratePublisher(root, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(root); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(root, acornFoxStageDirMode); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := publisher.Inspect(strings.Repeat("a", 64)); err == nil {
+		t.Fatal("replacement task root was accepted")
+	}
+}
+
 func TestTaskAcornFoxSubstratePublisherFaultsLeaveFreshRecoveryRequired(t *testing.T) {
-	for _, step := range []acornFoxSubstrateFaultStep{acornFoxSubstrateFaultIntentCreate, acornFoxSubstrateFaultIntentWrite, acornFoxSubstrateFaultIntentSync, acornFoxSubstrateFaultIntentReadback, acornFoxSubstrateFaultDirectoryCreate, acornFoxSubstrateFaultDirectorySync, acornFoxSubstrateFaultFileOpen, acornFoxSubstrateFaultFileWrite, acornFoxSubstrateFaultFileSync, acornFoxSubstrateFaultFileReadback, acornFoxSubstrateFaultReceiptCreate, acornFoxSubstrateFaultReceiptWrite, acornFoxSubstrateFaultReceiptSync, acornFoxSubstrateFaultReceiptReadback, acornFoxSubstrateFaultConsume} {
+	for _, step := range []acornFoxSubstrateFaultStep{acornFoxSubstrateFaultIntentCreate, acornFoxSubstrateFaultIntentWrite, acornFoxSubstrateFaultIntentSync, acornFoxSubstrateFaultIntentReadback, acornFoxSubstrateFaultDirectoryCreate, acornFoxSubstrateFaultDirectorySync, acornFoxSubstrateFaultFileOpen, acornFoxSubstrateFaultFileWrite, acornFoxSubstrateFaultFileSync, acornFoxSubstrateFaultFileReadback, acornFoxSubstrateFaultReceiptCreate, acornFoxSubstrateFaultReceiptWrite, acornFoxSubstrateFaultReceiptSync, acornFoxSubstrateFaultReceiptReadback, acornFoxSubstrateFaultConsume, acornFoxSubstrateFaultDirectoryMetadata, acornFoxSubstrateFaultDirectoryStat, acornFoxSubstrateFaultDirectoryParentSync, acornFoxSubstrateFaultTempCreate, acornFoxSubstrateFaultTempWrite, acornFoxSubstrateFaultTempShortWrite, acornFoxSubstrateFaultTempMetadata, acornFoxSubstrateFaultTempStat, acornFoxSubstrateFaultTempSync, acornFoxSubstrateFaultTempClose, acornFoxSubstrateFaultTempLink, acornFoxSubstrateFaultTempParentSync, acornFoxSubstrateFaultTempRemove, acornFoxSubstrateFaultTempRemoveParentSync, acornFoxSubstrateFaultFinalReadback} {
 		t.Run(fmt.Sprintf("step_%d", step), func(t *testing.T) {
 			root := t.TempDir()
 			if err := os.Chmod(root, acornFoxStageDirMode); err != nil {
@@ -388,15 +607,11 @@ func TestTaskAcornFoxSubstratePublisherFaultsLeaveFreshRecoveryRequired(t *testi
 				t.Fatal(err)
 			}
 			reopened, reopenErr := fresh.Reopen(receipt.BindingSHA256)
-			if step == acornFoxSubstrateFaultConsume || step == acornFoxSubstrateFaultReceiptSync || step == acornFoxSubstrateFaultReceiptReadback {
+			if step == acornFoxSubstrateFaultConsume || step == acornFoxSubstrateFaultReceiptReadback {
 				if reopenErr != nil {
 					t.Fatalf("terminal reopen=%v", reopenErr)
 				}
 				reopened.Close()
-			} else if step == acornFoxSubstrateFaultIntentWrite || step == acornFoxSubstrateFaultReceiptWrite {
-				if !errors.Is(reopenErr, ErrAcornFoxSubstrateConflict) {
-					t.Fatalf("conflict reopen=%v", reopenErr)
-				}
 			} else {
 				if !errors.Is(reopenErr, ErrAcornFoxSubstrateRecoveryRequired) {
 					t.Fatalf("reopen=%v", reopenErr)

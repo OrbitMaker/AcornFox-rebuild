@@ -4,16 +4,18 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"syscall"
 )
 
 type acornFoxSubstrateTaskLock struct{ file *os.File }
+
+const acornFoxSubstrateTempPrefix = ".acornfox-substrate.tmp-"
 
 func (p *TaskAcornFoxSubstratePublisher) lock() (*acornFoxSubstrateTaskLock, error) {
 	root, err := p.openRoot()
@@ -91,55 +93,77 @@ func sha256SubstrateOpenFile(file *os.File) string {
 	return hex.EncodeToString(hash.Sum(nil))
 }
 
+// acornFoxSubstrateEnsureDirectory changes metadata only for a directory this
+// call created. Existing directories are read-only evidence, never repair
+// targets.
+func acornFoxSubstrateEnsureDirectory(root *os.Root, path string, mode os.FileMode, uid, gid int, fault func(acornFoxSubstrateFaultStep) error) error {
+	created := false
+	err := root.Mkdir(path, mode)
+	if err == nil {
+		created = true
+	} else if !errors.Is(err, os.ErrExist) {
+		return err
+	}
+	dir, err := root.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	if created {
+		if err = fault(acornFoxSubstrateFaultDirectoryMetadata); err == nil {
+			err = dir.Chmod(mode)
+		}
+		if err == nil {
+			err = dir.Chown(uid, gid)
+		}
+	}
+	info, statErr := dir.Stat()
+	if err == nil {
+		err = fault(acornFoxSubstrateFaultDirectoryStat)
+	}
+	if err == nil && (statErr != nil || !info.IsDir() || info.Mode().Perm() != mode || verifyOwner(info, uid, gid) != nil) {
+		err = errors.New("AcornFox substrate directory is unsafe")
+	}
+	if err == nil && created {
+		if err = fault(acornFoxSubstrateFaultDirectorySync); err == nil {
+			err = dir.Sync()
+		}
+	}
+	if err != nil {
+		return err
+	}
+	if created {
+		if err = fault(acornFoxSubstrateFaultDirectoryParentSync); err != nil {
+			return err
+		}
+		parent := parentDirectory(path)
+		if parent == "" {
+			parent = "."
+		}
+		return syncAcornFoxDirectory(root, parent)
+	}
+	return nil
+}
+
 func acornFoxSubstrateWriteIntent(root *os.Root, intent AcornFoxInactiveSubstrateIntentV1, uid, gid int, fault func(acornFoxSubstrateFaultStep) error) error {
-	if err := root.Mkdir(acornFoxSubstrateDir, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+	if err := acornFoxSubstrateEnsureDirectory(root, acornFoxSubstrateDir, 0o700, uid, gid, fault); err != nil {
 		return err
 	}
 	raw, err := MarshalAcornFoxInactiveSubstrateIntentV1(intent)
 	if err != nil {
 		return err
 	}
-	file, err := root.OpenFile(acornFoxSubstrateIntent, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
-	if errors.Is(err, os.ErrExist) {
-		existing, readErr := root.ReadFile(acornFoxSubstrateIntent)
-		if readErr == nil && string(existing) == string(raw) {
-			return nil
+	return acornFoxSubstrateAtomicFile(root, acornFoxSubstrateIntent, raw, 0o600, uid, gid, fault, acornFoxSubstrateFaultIntentWrite, acornFoxSubstrateFaultIntentSync, acornFoxSubstrateFaultIntentReadback, func(got []byte) error {
+		parsed, err := ParseAcornFoxInactiveSubstrateIntentV1(got)
+		if err != nil || parsed.CandidateReceipt.BindingSHA256 != intent.CandidateReceipt.BindingSHA256 || parsed.ExpectedEntryEnvelopeSHA256 != intent.ExpectedEntryEnvelopeSHA256 || string(got) != string(raw) {
+			return errors.New("AcornFox substrate intent is invalid")
 		}
-		return errors.New("AcornFox substrate intent conflicts")
-	}
-	if err != nil {
-		return err
-	}
-	if err = fault(acornFoxSubstrateFaultIntentWrite); err == nil {
-		_, err = file.Write(raw)
-	}
-	if err == nil {
-		err = file.Chmod(0o600)
-	}
-	if err == nil {
-		err = fault(acornFoxSubstrateFaultIntentSync)
-	}
-	if err == nil {
-		err = file.Chown(uid, gid)
-	}
-	if err == nil {
-		err = file.Sync()
-	}
-	closeErr := file.Close()
-	if err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		return err
-	}
-	if err = fault(acornFoxSubstrateFaultIntentReadback); err != nil {
-		return err
-	}
-	return syncAcornFoxRoot(root)
+		return nil
+	})
 }
 
 func acornFoxSubstrateCreateDirs(root *os.Root, entries []SubstrateEntry, uid, gid int, fault func(acornFoxSubstrateFaultStep) error) error {
-	if err := root.Mkdir(acornFoxSubstrateRootfs, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+	if err := acornFoxSubstrateEnsureDirectory(root, acornFoxSubstrateRootfs, 0o700, uid, gid, fault); err != nil {
 		return err
 	}
 	dirs := make([]SubstrateEntry, 0)
@@ -150,36 +174,18 @@ func acornFoxSubstrateCreateDirs(root *os.Root, entries []SubstrateEntry, uid, g
 	}
 	sort.Slice(dirs, func(i, j int) bool { return dirs[i].Path < dirs[j].Path })
 	for _, entry := range dirs {
-		path := acornFoxSubstrateTarget(entry.Path)
-		if err := root.Mkdir(path, os.FileMode(entry.Mode)); err != nil && !errors.Is(err, os.ErrExist) {
-			return err
-		}
-		file, err := root.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
-		if err != nil {
-			return err
-		}
-		if err = file.Chmod(os.FileMode(entry.Mode)); err == nil {
-			err = file.Chown(uid, gid)
-		}
-		if err == nil {
-			err = fault(acornFoxSubstrateFaultDirectorySync)
-		}
-		if err == nil {
-			err = file.Sync()
-		}
-		closeErr := file.Close()
-		if err == nil {
-			err = closeErr
-		}
-		if err != nil {
+		if err := acornFoxSubstrateEnsureDirectory(root, acornFoxSubstrateTarget(entry.Path), os.FileMode(entry.Mode), uid, gid, fault); err != nil {
 			return err
 		}
 	}
-	return syncAcornFoxRoot(root)
+	return nil
 }
 
 func acornFoxSubstrateCopyFiles(ctx context.Context, target, source *os.Root, entries []SubstrateEntry, candidate AcornFoxStageReceiptV1, uid, gid int, fault func(acornFoxSubstrateFaultStep) error) error {
 	prefix := "opt/acornfox/releases/" + candidate.ReleaseID + "/"
+	if err := acornFoxSubstrateRemoveOwnedTemps(target, entries, uid, gid, fault); err != nil {
+		return err
+	}
 	for index := range entries {
 		entry := &entries[index]
 		if entry.Kind != SubstrateEntryFile {
@@ -202,8 +208,9 @@ func acornFoxSubstrateCopyFiles(ctx context.Context, target, source *os.Root, en
 		if err != nil {
 			return err
 		}
-		info, err := input.Stat()
-		if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != os.FileMode(entry.Mode) || sha256SubstrateOpenFile(input) != entry.SHA256 {
+		info, statErr := input.Stat()
+		actual := sha256SubstrateOpenFile(input)
+		if statErr != nil || !info.Mode().IsRegular() || info.Mode().Perm() != os.FileMode(entry.Mode) || actual != entry.SHA256 {
 			input.Close()
 			return errors.New("AcornFox substrate source entry is invalid")
 		}
@@ -212,47 +219,16 @@ func acornFoxSubstrateCopyFiles(ctx context.Context, target, source *os.Root, en
 			input.Close()
 			return err
 		}
-		output, err := target.OpenFile(acornFoxSubstrateTarget(entry.Path), os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, os.FileMode(entry.Mode))
+		err = acornFoxSubstrateAtomicCopy(target, acornFoxSubstrateTarget(entry.Path), input, *entry, uid, gid, fault)
+		closeErr := input.Close()
+		if err == nil {
+			err = closeErr
+		}
 		if err != nil {
-			input.Close()
 			return err
-		}
-		copyErr := fault(acornFoxSubstrateFaultFileWrite)
-		if copyErr == nil {
-			_, copyErr = io.CopyBuffer(output, input, make([]byte, 32*1024))
-		}
-		if copyErr == nil {
-			copyErr = fault(acornFoxSubstrateFaultFileSync)
-		}
-		if copyErr == nil {
-			copyErr = output.Chmod(os.FileMode(entry.Mode))
-		}
-		if copyErr == nil {
-			copyErr = output.Chown(uid, gid)
-		}
-		if copyErr == nil {
-			copyErr = output.Sync()
-		}
-		outClose := output.Close()
-		inClose := input.Close()
-		if copyErr == nil {
-			copyErr = outClose
-		}
-		if copyErr == nil {
-			copyErr = inClose
-		}
-		if copyErr != nil {
-			return copyErr
-		}
-		if err := fault(acornFoxSubstrateFaultFileReadback); err != nil {
-			return err
-		}
-		read, err := target.ReadFile(acornFoxSubstrateTarget(entry.Path))
-		if err != nil || sha256Hex(read) != entry.SHA256 {
-			return errors.New("AcornFox substrate copy digest is invalid")
 		}
 	}
-	return syncAcornFoxRoot(target)
+	return nil
 }
 
 func acornFoxSubstrateWriteReceipt(root *os.Root, receipt InactiveSubstrateReceiptV1, uid, gid int, fault func(acornFoxSubstrateFaultStep) error) error {
@@ -260,45 +236,299 @@ func acornFoxSubstrateWriteReceipt(root *os.Root, receipt InactiveSubstrateRecei
 	if err != nil {
 		return err
 	}
-	file, err := root.OpenFile(acornFoxSubstrateReceipt, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
+	return acornFoxSubstrateAtomicFile(root, acornFoxSubstrateReceipt, raw, 0o600, uid, gid, fault, acornFoxSubstrateFaultReceiptWrite, acornFoxSubstrateFaultReceiptSync, acornFoxSubstrateFaultReceiptReadback, func(got []byte) error {
+		parsed, err := ParseInactiveSubstrateReceiptV1(got)
+		if err != nil || parsed.CandidateReceipt.BindingSHA256 != receipt.CandidateReceipt.BindingSHA256 || string(got) != string(raw) {
+			return errors.New("AcornFox substrate receipt is invalid")
+		}
+		return nil
+	})
+}
+
+func acornFoxSubstrateAtomicCopy(root *os.Root, final string, input *os.File, entry SubstrateEntry, uid, gid int, fault func(acornFoxSubstrateFaultStep) error) error {
+	return acornFoxSubstrateAtomic(root, final, os.FileMode(entry.Mode), uid, gid, fault, acornFoxSubstrateFaultFileSync, func(output *os.File) error {
+		if err := fault(acornFoxSubstrateFaultFileWrite); err != nil {
+			return err
+		}
+		if err := fault(acornFoxSubstrateFaultTempShortWrite); err != nil {
+			return err
+		}
+		return acornFoxSubstrateCopyFully(output, input)
+	}, func(file *os.File, info os.FileInfo) error {
+		if !info.Mode().IsRegular() || info.Mode().Perm() != os.FileMode(entry.Mode) || verifyOwner(info, uid, gid) != nil || info.Size() != entry.Size || sha256SubstrateOpenFile(file) != entry.SHA256 {
+			return errors.New("AcornFox substrate temporary file is invalid")
+		}
+		return nil
+	}, func(file *os.File) error {
+		if err := fault(acornFoxSubstrateFaultFileReadback); err != nil {
+			return err
+		}
+		return acornFoxSubstrateVerifyFileHandle(file, entry.Size, entry.SHA256, os.FileMode(entry.Mode), uid, gid)
+	})
+}
+
+func acornFoxSubstrateAtomicFile(root *os.Root, final string, raw []byte, mode os.FileMode, uid, gid int, fault func(acornFoxSubstrateFaultStep) error, writeStep, syncStep, readbackStep acornFoxSubstrateFaultStep, parse func([]byte) error) error {
+	return acornFoxSubstrateAtomic(root, final, mode, uid, gid, fault, syncStep, func(output *os.File) error {
+		if err := fault(writeStep); err != nil {
+			return err
+		}
+		if err := fault(acornFoxSubstrateFaultTempShortWrite); err != nil {
+			return err
+		}
+		return acornFoxSubstrateWriteFully(output, raw)
+	}, func(file *os.File, info os.FileInfo) error {
+		if !info.Mode().IsRegular() || info.Mode().Perm() != mode || verifyOwner(info, uid, gid) != nil || info.Size() != int64(len(raw)) || sha256SubstrateOpenFile(file) != sha256Hex(raw) {
+			return errors.New("AcornFox substrate temporary control file is invalid")
+		}
+		return nil
+	}, func(file *os.File) error {
+		if err := acornFoxSubstrateVerifyFileHandle(file, int64(len(raw)), sha256Hex(raw), mode, uid, gid); err != nil {
+			return err
+		}
+		if err := fault(readbackStep); err != nil {
+			return err
+		}
+		got, err := readAcornFoxSubstrateFile(file)
+		if err != nil {
+			return err
+		}
+		return parse(got)
+	})
+}
+
+// acornFoxSubstrateAtomic commits a fully checked, same-directory temporary
+// inode using Link. Link has no replacement behavior; an existing final is
+// only read and verified as replay evidence.
+func acornFoxSubstrateAtomic(root *os.Root, final string, mode os.FileMode, uid, gid int, fault func(acornFoxSubstrateFaultStep) error, legacySync acornFoxSubstrateFaultStep, write func(*os.File) error, validateTemp func(*os.File, os.FileInfo) error, verifyFinal func(*os.File) error) error {
+	parent := parentDirectory(final)
+	if parent == "" {
+		return errors.New("AcornFox substrate final parent is invalid")
+	}
+	temp, err := durableTempName(parent, acornFoxSubstrateTempPrefix)
 	if err != nil {
 		return err
 	}
-	if err = fault(acornFoxSubstrateFaultReceiptWrite); err == nil {
-		_, err = file.Write(raw)
+	if err := fault(acornFoxSubstrateFaultTempCreate); err != nil {
+		return err
+	}
+	file, err := root.OpenFile(temp, os.O_RDWR|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return err
+	}
+	closed := false
+	closeTemp := func() error {
+		if closed {
+			return nil
+		}
+		closed = true
+		return file.Close()
+	}
+	if err = fault(acornFoxSubstrateFaultTempWrite); err == nil {
+		err = write(file)
 	}
 	if err == nil {
-		err = file.Chmod(0o600)
+		err = fault(acornFoxSubstrateFaultTempMetadata)
 	}
 	if err == nil {
-		err = fault(acornFoxSubstrateFaultReceiptSync)
+		err = file.Chmod(mode)
 	}
 	if err == nil {
 		err = file.Chown(uid, gid)
 	}
+	var info os.FileInfo
+	if err == nil {
+		err = fault(acornFoxSubstrateFaultTempStat)
+	}
+	if err == nil {
+		info, err = file.Stat()
+	}
+	if err == nil {
+		err = validateTemp(file, info)
+	}
+	if err == nil {
+		err = fault(legacySync)
+	}
+	if err == nil {
+		err = fault(acornFoxSubstrateFaultTempSync)
+	}
 	if err == nil {
 		err = file.Sync()
 	}
-	closeErr := file.Close()
 	if err == nil {
+		err = fault(acornFoxSubstrateFaultTempClose)
+	}
+	if closeErr := closeTemp(); err == nil {
 		err = closeErr
 	}
 	if err != nil {
 		return err
 	}
-	if err = fault(acornFoxSubstrateFaultReceiptReadback); err != nil {
+	if err = fault(acornFoxSubstrateFaultTempLink); err != nil {
 		return err
 	}
-	if err = syncAcornFoxRoot(root); err != nil {
+	linkErr := root.Link(temp, final)
+	if linkErr != nil && !errors.Is(linkErr, os.ErrExist) {
+		return linkErr
+	}
+	if err = fault(acornFoxSubstrateFaultFinalReadback); err != nil {
 		return err
 	}
-	read, err := root.ReadFile(acornFoxSubstrateReceipt)
+	if err = acornFoxSubstrateVerifyFinal(root, final, verifyFinal); err != nil {
+		if errors.Is(linkErr, os.ErrExist) {
+			return ErrAcornFoxSubstrateConflict
+		}
+		return err
+	}
+	if err = fault(acornFoxSubstrateFaultTempParentSync); err != nil {
+		return err
+	}
+	if err = syncAcornFoxDirectory(root, parent); err != nil {
+		return err
+	}
+	if err = fault(acornFoxSubstrateFaultTempRemove); err != nil {
+		return err
+	}
+	if err = root.Remove(temp); err != nil {
+		return err
+	}
+	if err = fault(acornFoxSubstrateFaultTempRemoveParentSync); err != nil {
+		return err
+	}
+	return syncAcornFoxDirectory(root, parent)
+}
+
+func acornFoxSubstrateVerifyFinal(root *os.Root, path string, verify func(*os.File) error) error {
+	file, err := root.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return err
 	}
-	var reread InactiveSubstrateReceiptV1
-	if err := json.Unmarshal(read, &reread); err != nil || reread.Validate() != nil || string(read) != string(raw) {
-		return errors.New("AcornFox substrate receipt reread is invalid")
+	verifyErr := verify(file)
+	closeErr := file.Close()
+	if verifyErr != nil {
+		return verifyErr
+	}
+	return closeErr
+}
+
+func acornFoxSubstrateVerifyFileHandle(file *os.File, size int64, digest string, mode os.FileMode, uid, gid int) error {
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != mode || verifyOwner(info, uid, gid) != nil || info.Size() != size || sha256SubstrateOpenFile(file) != digest {
+		return errors.New("AcornFox substrate file evidence is invalid")
+	}
+	return nil
+}
+
+func readAcornFoxSubstrateFile(file *os.File) ([]byte, error) {
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	return io.ReadAll(file)
+}
+
+func acornFoxSubstrateReadControl(root *os.Root, path string, uid, gid int) ([]byte, error) {
+	file, err := root.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+	info, statErr := file.Stat()
+	raw, readErr := readAcornFoxSubstrateFile(file)
+	closeErr := file.Close()
+	if statErr != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 || verifyOwner(info, uid, gid) != nil {
+		return nil, errors.New("AcornFox substrate control metadata is invalid")
+	}
+	if readErr != nil {
+		return nil, readErr
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	return raw, nil
+}
+
+func acornFoxSubstrateWriteFully(file *os.File, raw []byte) error {
+	for len(raw) > 0 {
+		written, err := file.Write(raw)
+		if written < 0 || written > len(raw) {
+			return errors.New("AcornFox substrate write count is invalid")
+		}
+		if written == 0 && err == nil {
+			return io.ErrShortWrite
+		}
+		raw = raw[written:]
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func acornFoxSubstrateCopyFully(output, input *os.File) error {
+	buffer := make([]byte, 32*1024)
+	for {
+		read, readErr := input.Read(buffer)
+		if read > 0 {
+			if err := acornFoxSubstrateWriteFully(output, buffer[:read]); err != nil {
+				return err
+			}
+		}
+		if errors.Is(readErr, io.EOF) {
+			return nil
+		}
+		if readErr != nil {
+			return readErr
+		}
+	}
+}
+
+// Only a regular temporary file owned by this task may be removed. Foreign
+// files, symlinks, and final paths remain evidence and are never cleaned.
+func acornFoxSubstrateRemoveOwnedTemps(root *os.Root, entries []SubstrateEntry, uid, gid int, fault func(acornFoxSubstrateFaultStep) error) error {
+	directories := map[string]struct{}{acornFoxSubstrateDir: {}, acornFoxSubstrateRootfs: {}}
+	for _, entry := range entries {
+		if entry.Kind == SubstrateEntryDirectory {
+			directories[acornFoxSubstrateTarget(entry.Path)] = struct{}{}
+		}
+	}
+	ordered := make([]string, 0, len(directories))
+	for directory := range directories {
+		ordered = append(ordered, directory)
+	}
+	sort.Strings(ordered)
+	for _, directory := range ordered {
+		dir, err := root.OpenFile(directory, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+		if err != nil {
+			return err
+		}
+		children, readErr := dir.ReadDir(-1)
+		closeErr := dir.Close()
+		if readErr != nil {
+			return readErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		for _, child := range children {
+			if !strings.HasPrefix(child.Name(), acornFoxSubstrateTempPrefix) {
+				continue
+			}
+			path := filepath.ToSlash(filepath.Join(directory, child.Name()))
+			info, err := root.Lstat(path)
+			if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || verifyOwner(info, uid, gid) != nil {
+				return ErrAcornFoxSubstrateConflict
+			}
+			if err := fault(acornFoxSubstrateFaultTempRemove); err != nil {
+				return err
+			}
+			if err := root.Remove(path); err != nil {
+				return err
+			}
+			if err := fault(acornFoxSubstrateFaultTempRemoveParentSync); err != nil {
+				return err
+			}
+			if err := syncAcornFoxDirectory(root, directory); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }

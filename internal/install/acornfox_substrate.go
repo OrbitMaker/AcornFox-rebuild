@@ -56,6 +56,21 @@ const (
 	acornFoxSubstrateFaultConsume
 	acornFoxSubstrateFaultDiscardRemove
 	acornFoxSubstrateFaultDiscardSync
+	acornFoxSubstrateFaultDirectoryMetadata
+	acornFoxSubstrateFaultDirectoryStat
+	acornFoxSubstrateFaultDirectoryParentSync
+	acornFoxSubstrateFaultTempCreate
+	acornFoxSubstrateFaultTempWrite
+	acornFoxSubstrateFaultTempShortWrite
+	acornFoxSubstrateFaultTempMetadata
+	acornFoxSubstrateFaultTempStat
+	acornFoxSubstrateFaultTempSync
+	acornFoxSubstrateFaultTempClose
+	acornFoxSubstrateFaultTempLink
+	acornFoxSubstrateFaultTempParentSync
+	acornFoxSubstrateFaultTempRemove
+	acornFoxSubstrateFaultTempRemoveParentSync
+	acornFoxSubstrateFaultFinalReadback
 )
 
 type acornFoxSubstrateFault func(acornFoxSubstrateFaultStep) error
@@ -111,7 +126,12 @@ func (p *TaskAcornFoxSubstratePublisher) openRoot() (*os.Root, error) {
 	return os.OpenRoot(p.rootPath)
 }
 
+// Publish creates an inactive substrate only from an absent task-root state.
 func (p *TaskAcornFoxSubstratePublisher) Publish(ctx context.Context, stage *StagedAcornFoxCandidateV1, expectedBindingSHA256 string) (AcornFoxSubstratePublishResult, error) {
+	return p.publish(ctx, stage, expectedBindingSHA256, AcornFoxReconcileAbsent)
+}
+
+func (p *TaskAcornFoxSubstratePublisher) publish(ctx context.Context, stage *StagedAcornFoxCandidateV1, expectedBindingSHA256 string, permitted AcornFoxReconciliationOutcome) (AcornFoxSubstratePublishResult, error) {
 	if p == nil || stage == nil || !digestPattern.MatchString(expectedBindingSHA256) {
 		return AcornFoxSubstratePublishResult{}, errors.New("AcornFox substrate publish input is invalid")
 	}
@@ -120,9 +140,15 @@ func (p *TaskAcornFoxSubstratePublisher) Publish(ctx context.Context, stage *Sta
 		return AcornFoxSubstratePublishResult{}, err
 	}
 	defer lock.Close()
-	if existing, err := p.Reopen(expectedBindingSHA256); err == nil {
-		defer existing.Close()
-		return AcornFoxSubstratePublishResult{Receipt: existing.receipt, Outcome: AcornFoxReconcileCompleted}, nil
+	inspection, err := p.inspectLocked(expectedBindingSHA256)
+	if err != nil {
+		return AcornFoxSubstratePublishResult{}, err
+	}
+	if inspection.Outcome == AcornFoxReconcileCompleted {
+		return AcornFoxSubstratePublishResult{Receipt: inspection.Receipt, Outcome: AcornFoxReconcileCompleted}, nil
+	}
+	if inspection.Outcome != permitted {
+		return AcornFoxSubstratePublishResult{}, acornFoxSubstrateOutcomeError(inspection.Outcome)
 	}
 	lease, err := stage.claimForPublish()
 	if err != nil {
@@ -173,9 +199,6 @@ func (p *TaskAcornFoxSubstratePublisher) Publish(ctx context.Context, stage *Sta
 	if err := acornFoxSubstrateCreateDirs(root, entries, p.uid, p.gid, p.faultAt); err != nil {
 		return AcornFoxSubstratePublishResult{}, err
 	}
-	if err := p.faultAt(acornFoxSubstrateFaultFileWrite); err != nil {
-		return AcornFoxSubstratePublishResult{}, err
-	}
 	if err := acornFoxSubstrateCopyFiles(ctx, root, source, entries, candidate, p.uid, p.gid, p.faultAt); err != nil {
 		return AcornFoxSubstratePublishResult{}, err
 	}
@@ -211,7 +234,14 @@ func (p *TaskAcornFoxSubstratePublisher) Resume(ctx context.Context, expectedBin
 		return AcornFoxSubstratePublishResult{}, err
 	}
 	defer stage.Close()
-	return p.Publish(ctx, stage, expectedBindingSHA256)
+	return p.publish(ctx, stage, expectedBindingSHA256, AcornFoxReconcileResume)
+}
+
+func acornFoxSubstrateOutcomeError(outcome AcornFoxReconciliationOutcome) error {
+	if outcome == AcornFoxReconcileConflict {
+		return ErrAcornFoxSubstrateConflict
+	}
+	return ErrAcornFoxSubstrateRecoveryRequired
 }
 
 // Inspect classifies only pinned task-root durable state. It does not mint a
@@ -262,8 +292,7 @@ func (p *TaskAcornFoxSubstratePublisher) inspectLocked(expectedBindingSHA256 str
 	if parseErr != nil || intent.CandidateReceipt.BindingSHA256 != expectedBindingSHA256 {
 		return AcornFoxSubstrateInspection{Outcome: AcornFoxReconcileConflict}, nil
 	}
-	if stage, scanErr := p.reopenStage(expectedBindingSHA256); scanErr == nil {
-		stage.Close()
+	if p.hasReopenableStage(expectedBindingSHA256) {
 		return AcornFoxSubstrateInspection{Outcome: AcornFoxReconcileResume}, nil
 	}
 	return AcornFoxSubstrateInspection{Outcome: AcornFoxReconcileRecoveryRequired}, nil
@@ -292,7 +321,7 @@ func (p *TaskAcornFoxSubstratePublisher) Reopen(expectedBindingSHA256 string) (*
 		if parseErr != nil || intent.CandidateReceipt.BindingSHA256 != expectedBindingSHA256 {
 			return nil, ErrAcornFoxSubstrateConflict
 		}
-		if _, scanErr := p.reopenStage(expectedBindingSHA256); scanErr != nil {
+		if !p.hasReopenableStage(expectedBindingSHA256) {
 			return nil, ErrAcornFoxSubstrateRecoveryRequired
 		}
 		return nil, ErrAcornFoxSubstrateRecoveryRequired
@@ -302,12 +331,54 @@ func (p *TaskAcornFoxSubstratePublisher) Reopen(expectedBindingSHA256 string) (*
 		root.Close()
 		return nil, ErrAcornFoxSubstrateConflict
 	}
+	// A failed post-link cleanup can leave only our private temp inode beside a
+	// durable receipt. It is neither a final entry nor foreign state; remove it
+	// only after the receipt has authenticated its exact directory inventory.
+	if err := acornFoxSubstrateRemoveOwnedTemps(root, receipt.Entries, p.uid, p.gid, p.faultAt); err != nil {
+		root.Close()
+		return nil, err
+	}
 	handle := &PublishedAcornFoxSubstrateV1{root: root, receipt: receipt, uid: p.uid, gid: p.gid, publisher: p}
 	if err := handle.Verify(); err != nil {
 		root.Close()
 		return nil, err
 	}
 	return handle, nil
+}
+
+func (p *TaskAcornFoxSubstratePublisher) hasReopenableStage(expectedBindingSHA256 string) bool {
+	parent, err := p.openRoot()
+	if err != nil {
+		return false
+	}
+	defer parent.Close()
+	directory, err := parent.OpenFile(".", os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return false
+	}
+	entries, readErr := directory.ReadDir(-1)
+	closeErr := directory.Close()
+	if readErr != nil || closeErr != nil {
+		return false
+	}
+	matches := 0
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), ".acornfox-stage-") {
+			continue
+		}
+		stageRoot, openErr := parent.OpenRoot(entry.Name())
+		if openErr != nil {
+			continue
+		}
+		raw, readErr := stageRoot.ReadFile(".acornfox-stage-complete.json")
+		var receipt AcornFoxStageReceiptV1
+		valid := readErr == nil && json.Unmarshal(raw, &receipt) == nil && receipt.BindingSHA256 == expectedBindingSHA256 && acornFoxStageCompletionMatches(stageRoot, receipt, p.uid, p.gid)
+		_ = stageRoot.Close()
+		if valid {
+			matches++
+		}
+	}
+	return matches == 1
 }
 
 func (p *TaskAcornFoxSubstratePublisher) reopenStage(expectedBindingSHA256 string) (*StagedAcornFoxCandidateV1, error) {
@@ -376,15 +447,36 @@ func (h *PublishedAcornFoxSubstrateV1) Verify() error {
 	if err := h.receipt.Validate(); err != nil {
 		return err
 	}
-	for _, entry := range h.receipt.Entries {
+	if err := h.verifyControlFiles(); err != nil {
+		return err
+	}
+	actual, err := h.walkRootfs()
+	if err != nil {
+		return err
+	}
+	if len(actual) != len(h.receipt.Entries) {
+		return errors.New("AcornFox substrate rootfs set is not exact")
+	}
+	observed := append([]SubstrateEntry(nil), h.receipt.Entries...)
+	for index := range observed {
+		entry := &observed[index]
+		if _, ok := actual[entry.Path]; !ok {
+			return errors.New("AcornFox substrate rootfs misses receipt entry")
+		}
 		path := acornFoxSubstrateTarget(entry.Path)
 		file, err := h.root.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 		if err != nil {
 			return err
 		}
 		info, statErr := file.Stat()
-		if statErr == nil && (!info.Mode().IsRegular() && entry.Kind == SubstrateEntryFile || !info.IsDir() && entry.Kind == SubstrateEntryDirectory || info.Mode().Perm() != os.FileMode(entry.Mode) || verifyOwner(info, h.uid, h.gid) != nil || (entry.Kind == SubstrateEntryFile && (info.Size() != entry.Size || sha256SubstrateOpenFile(file) != entry.SHA256))) {
+		if statErr == nil && ((!info.Mode().IsRegular() && entry.Kind == SubstrateEntryFile) || (!info.IsDir() && entry.Kind == SubstrateEntryDirectory) || info.Mode().Perm() != os.FileMode(entry.Mode) || verifyOwner(info, h.uid, h.gid) != nil) {
 			statErr = errors.New("AcornFox substrate disk entry is invalid")
+		}
+		if statErr == nil && entry.Kind == SubstrateEntryFile {
+			entry.Size, entry.SHA256 = info.Size(), sha256SubstrateOpenFile(file)
+			if entry.Size != h.receipt.Entries[index].Size || entry.SHA256 != h.receipt.Entries[index].SHA256 {
+				statErr = errors.New("AcornFox substrate file digest is invalid")
+			}
 		}
 		closeErr := file.Close()
 		if statErr == nil {
@@ -394,7 +486,99 @@ func (h *PublishedAcornFoxSubstrateV1) Verify() error {
 			return statErr
 		}
 	}
+	installed, err := ComputeAcornFoxSubstrateTreeSHA256(observed)
+	if err != nil || installed != h.receipt.InstalledTreeSHA256 {
+		return errors.New("AcornFox substrate installed tree digest is invalid")
+	}
+	release, err := ComputeAcornFoxReleaseTreeSHA256(h.receipt.CandidateReceipt, observed)
+	if err != nil || release != h.receipt.ReleaseTreeSHA256 {
+		return errors.New("AcornFox substrate release tree digest is invalid")
+	}
 	return nil
+}
+
+func (h *PublishedAcornFoxSubstrateV1) verifyControlFiles() error {
+	for _, path := range []string{acornFoxSubstrateDir, acornFoxSubstrateRootfs} {
+		file, err := h.root.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+		if err != nil {
+			return err
+		}
+		info, statErr := file.Stat()
+		closeErr := file.Close()
+		if statErr != nil || closeErr != nil || !info.IsDir() || info.Mode().Perm() != 0o700 || verifyOwner(info, h.uid, h.gid) != nil {
+			return errors.New("AcornFox substrate control directory is invalid")
+		}
+	}
+	dir, err := h.root.OpenFile(acornFoxSubstrateDir, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return err
+	}
+	children, readErr := dir.ReadDir(-1)
+	closeErr := dir.Close()
+	if readErr != nil || closeErr != nil || len(children) != 3 {
+		return errors.New("AcornFox substrate control set is not exact")
+	}
+	want := map[string]bool{"intent.json": true, "receipt.json": true, "rootfs": true}
+	for _, child := range children {
+		if !want[child.Name()] {
+			return errors.New("AcornFox substrate control set has an extra entry")
+		}
+	}
+	intentRaw, err := acornFoxSubstrateReadControl(h.root, acornFoxSubstrateIntent, h.uid, h.gid)
+	if err != nil {
+		return err
+	}
+	intent, err := ParseAcornFoxInactiveSubstrateIntentV1(intentRaw)
+	if err != nil || intent.CandidateReceipt.BindingSHA256 != h.receipt.CandidateReceipt.BindingSHA256 || intent.ExpectedEntryEnvelopeSHA256 != h.receipt.InstalledTreeSHA256 {
+		return errors.New("AcornFox substrate intent binding is invalid")
+	}
+	raw, err := acornFoxSubstrateReadControl(h.root, acornFoxSubstrateReceipt, h.uid, h.gid)
+	if err != nil {
+		return err
+	}
+	canonical, err := MarshalInactiveSubstrateReceiptV1(h.receipt)
+	if err != nil || string(raw) != string(canonical) {
+		return errors.New("AcornFox substrate receipt canonical evidence is invalid")
+	}
+	return nil
+}
+
+func (h *PublishedAcornFoxSubstrateV1) walkRootfs() (map[string]os.FileInfo, error) {
+	actual := map[string]os.FileInfo{}
+	var walk func(string) error
+	walk = func(directory string) error {
+		dir, err := h.root.OpenFile(directory, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+		if err != nil {
+			return err
+		}
+		children, readErr := dir.ReadDir(-1)
+		closeErr := dir.Close()
+		if readErr != nil {
+			return readErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		for _, child := range children {
+			path := filepath.ToSlash(filepath.Join(directory, child.Name()))
+			info, err := h.root.Lstat(path)
+			if err != nil || info.Mode()&os.ModeSymlink != 0 || (!info.IsDir() && !info.Mode().IsRegular()) {
+				return errors.New("AcornFox substrate rootfs contains an unsafe entry")
+			}
+			relative := strings.TrimPrefix(path, acornFoxSubstrateRootfs+"/")
+			actual[relative] = info
+			if info.IsDir() {
+				if err := walk(path); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	if err := walk(acornFoxSubstrateRootfs); err != nil {
+		return nil, err
+	}
+	return actual, nil
 }
 func (h *PublishedAcornFoxSubstrateV1) Close() error {
 	if h == nil || h.root == nil {
@@ -416,7 +600,14 @@ func (h *PublishedAcornFoxSubstrateV1) Discard() error {
 		return err
 	}
 	defer lock.Close()
-	if err := h.Verify(); err != nil {
+	// The lock remains outside substrate. Reopen from the pinned publisher after
+	// acquiring it so a stale handle cannot delete replacement task state.
+	fresh, err := h.publisher.Reopen(h.receipt.CandidateReceipt.BindingSHA256)
+	if err != nil {
+		return err
+	}
+	defer fresh.Close()
+	if err := fresh.Verify(); err != nil {
 		return err
 	}
 	if h.fault != nil {
@@ -424,7 +615,7 @@ func (h *PublishedAcornFoxSubstrateV1) Discard() error {
 			return ErrAcornFoxStageCleanupUnknown
 		}
 	}
-	if err := h.root.RemoveAll(acornFoxSubstrateDir); err != nil {
+	if err := fresh.root.RemoveAll(acornFoxSubstrateDir); err != nil {
 		return ErrAcornFoxStageCleanupUnknown
 	}
 	if h.fault != nil {
@@ -432,7 +623,7 @@ func (h *PublishedAcornFoxSubstrateV1) Discard() error {
 			return ErrAcornFoxStageCleanupUnknown
 		}
 	}
-	if err := syncAcornFoxRoot(h.root); err != nil {
+	if err := syncAcornFoxRoot(fresh.root); err != nil {
 		return ErrAcornFoxStageCleanupUnknown
 	}
 	return nil
