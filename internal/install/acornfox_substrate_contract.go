@@ -14,22 +14,24 @@ const (
 )
 
 const (
-	AcornFoxUpgradeHelperPath     = "helpers/upgrade"
-	AcornFoxHealthcheckHelperPath = "helpers/healthcheck"
+	AcornFoxUpgradeHelperPath = "opt/acornfox/upgrade-tools/acornfox-upgrade"
 )
+
+func AcornFoxHealthcheckHelperPath(receipt AcornFoxStageReceiptV1) string {
+	return "opt/acornfox/releases/" + receipt.ReleaseID + "/bin/acornfox-healthcheck"
+}
 
 // OwnerRole is a fixed role label, never a uid/gid. Receipts deliberately do
 // not carry host identity data.
 type OwnerRole string
 
 const (
-	OwnerRoleRoot        OwnerRole = "root"
-	OwnerRoleServer      OwnerRole = "server"
-	OwnerRoleAgent       OwnerRole = "agent"
-	OwnerRoleBuildKit    OwnerRole = "buildkit"
-	OwnerRoleCaddy       OwnerRole = "caddy"
-	OwnerRoleEdge        OwnerRole = "edge"
-	OwnerRoleHealthcheck OwnerRole = "healthcheck"
+	OwnerRoleRoot     OwnerRole = "root"
+	OwnerRoleServer   OwnerRole = "server"
+	OwnerRoleAgent    OwnerRole = "agent"
+	OwnerRoleBuildKit OwnerRole = "buildkit"
+	OwnerRoleCaddy    OwnerRole = "caddy"
+	OwnerRoleEdge     OwnerRole = "edge"
 )
 
 type SubstrateEntryKind string
@@ -86,15 +88,15 @@ func (r InactiveSubstrateReceiptV1) Validate() error {
 	if r.ReleaseTreeSHA256 != r.CandidateReceipt.TreeSHA256 {
 		return errors.New("AcornFox inactive substrate release tree is not candidate-bound")
 	}
-	if err := validateAcornFoxSubstrateEntries(r.Entries); err != nil {
+	if err := validateAcornFoxV1SubstrateInventory(r.CandidateReceipt, r.Entries); err != nil {
 		return err
 	}
 	computed, err := ComputeAcornFoxSubstrateTreeSHA256(r.Entries)
 	if err != nil || r.InstalledTreeSHA256 != computed {
 		return errors.New("AcornFox inactive substrate installed tree digest is invalid")
 	}
-	upgrade, health := substrateEntryAt(r.Entries, AcornFoxUpgradeHelperPath), substrateEntryAt(r.Entries, AcornFoxHealthcheckHelperPath)
-	if upgrade == nil || health == nil || upgrade.Kind != SubstrateEntryFile || health.Kind != SubstrateEntryFile || upgrade.Role != OwnerRoleRoot || health.Role != OwnerRoleHealthcheck || upgrade.SHA256 != r.UpgradeHelperSHA256 || health.SHA256 != r.HealthHelperSHA256 {
+	upgrade, health := substrateEntryAt(r.Entries, AcornFoxUpgradeHelperPath), substrateEntryAt(r.Entries, AcornFoxHealthcheckHelperPath(r.CandidateReceipt))
+	if upgrade == nil || health == nil || upgrade.SHA256 != r.UpgradeHelperSHA256 || health.SHA256 != r.HealthHelperSHA256 {
 		return errors.New("AcornFox inactive substrate helper entries are invalid")
 	}
 	return nil
@@ -194,7 +196,7 @@ func validateAcornFoxSubstrateEntry(entry SubstrateEntry) error {
 
 func validAcornFoxOwnerRole(role OwnerRole) bool {
 	switch role {
-	case OwnerRoleRoot, OwnerRoleServer, OwnerRoleAgent, OwnerRoleBuildKit, OwnerRoleCaddy, OwnerRoleEdge, OwnerRoleHealthcheck:
+	case OwnerRoleRoot, OwnerRoleServer, OwnerRoleAgent, OwnerRoleBuildKit, OwnerRoleCaddy, OwnerRoleEdge:
 		return true
 	default:
 		return false
@@ -212,6 +214,137 @@ func substrateEntryAt(entries []SubstrateEntry, path string) *SubstrateEntry {
 		}
 	}
 	return nil
+}
+
+// validateAcornFoxV1SubstrateInventory validates the complete inactive V1
+// layout. The publisher must separately verify each release member's digest
+// against the pinned manifest before constructing this receipt; this contract
+// binds that verified tree through CandidateReceipt.TreeSHA256, exact member
+// count, and the closed installed-path/mapping inventory below.
+func validateAcornFoxV1SubstrateInventory(candidate AcornFoxStageReceiptV1, entries []SubstrateEntry) error {
+	if err := validateAcornFoxSubstrateEntries(entries); err != nil {
+		return err
+	}
+	byPath := make(map[string]SubstrateEntry, len(entries))
+	for _, entry := range entries {
+		byPath[entry.Path] = entry
+	}
+	releasePrefix := "opt/acornfox/releases/" + candidate.ReleaseID + "/"
+	releaseMembers := 0
+	seenRequired := map[string]bool{}
+	for path, entry := range byPath {
+		if strings.HasPrefix(path, releasePrefix) {
+			relative := strings.TrimPrefix(path, releasePrefix)
+			if err := validateAcornFoxReleaseMember(candidate, relative, entry); err != nil {
+				return err
+			}
+			releaseMembers++
+			for _, required := range AcornFoxV1RequiredFiles() {
+				if relative == required.Path {
+					seenRequired[relative] = true
+				}
+			}
+			continue
+		}
+		if _, ok := acornFoxFixedSubstrateEntry(candidate, path); !ok {
+			return fmt.Errorf("AcornFox substrate path is not allowed: %s", path)
+		}
+	}
+	for _, required := range AcornFoxV1RequiredFiles() {
+		if !seenRequired[required.Path] {
+			return fmt.Errorf("AcornFox substrate misses release member: %s", required.Path)
+		}
+	}
+	if releaseMembers != candidate.FileCount {
+		return errors.New("AcornFox substrate release member count is invalid")
+	}
+	for path, want := range acornFoxFixedSubstrateEntries(candidate) {
+		got, ok := byPath[path]
+		if !ok || got.Kind != want.Kind || got.Mode != want.Mode || got.Role != want.Role || (got.Kind == SubstrateEntryDirectory && (got.Size != want.Size || got.SHA256 != want.SHA256)) {
+			return fmt.Errorf("AcornFox substrate fixed entry is invalid: %s", path)
+		}
+		if source := acornFoxInstalledSource(candidate, path); source != "" {
+			member, ok := byPath[releasePrefix+source]
+			if !ok || got.SHA256 != member.SHA256 || got.Size != member.Size {
+				return fmt.Errorf("AcornFox substrate installed mapping is invalid: %s", path)
+			}
+		}
+	}
+	return nil
+}
+
+func validateAcornFoxReleaseMember(candidate AcornFoxStageReceiptV1, relative string, entry SubstrateEntry) error {
+	if entry.Kind != SubstrateEntryFile || entry.Role != OwnerRoleRoot {
+		return errors.New("AcornFox release member metadata is invalid")
+	}
+	if relative == "manifest.json" {
+		if entry.Mode != 0o644 || entry.SHA256 != candidate.ManifestSHA256 {
+			return errors.New("AcornFox release manifest is invalid")
+		}
+		return nil
+	}
+	for _, required := range AcornFoxV1RequiredFiles() {
+		if relative == required.Path {
+			if entry.Mode != required.Mode {
+				return errors.New("AcornFox release member mode is invalid")
+			}
+			return nil
+		}
+	}
+	if strings.HasPrefix(relative, "web/dist/assets/") && validAcornFoxV1WebAsset(relative) && entry.Mode == 0o644 {
+		return nil
+	}
+	return fmt.Errorf("AcornFox release member is not allowed: %s", relative)
+}
+
+func acornFoxFixedSubstrateEntry(candidate AcornFoxStageReceiptV1, path string) (SubstrateEntry, bool) {
+	entry, ok := acornFoxFixedSubstrateEntries(candidate)[path]
+	return entry, ok
+}
+
+func acornFoxFixedSubstrateEntries(candidate AcornFoxStageReceiptV1) map[string]SubstrateEntry {
+	directory := func(path string, mode uint32, role OwnerRole) SubstrateEntry {
+		return SubstrateEntry{Path: path, Kind: SubstrateEntryDirectory, Mode: mode, Role: role}
+	}
+	file := func(path string, mode uint32, role OwnerRole) SubstrateEntry {
+		return SubstrateEntry{Path: path, Kind: SubstrateEntryFile, Mode: mode, Role: role}
+	}
+	entries := map[string]SubstrateEntry{}
+	for _, path := range []string{"opt", "opt/acornfox", "opt/acornfox/releases", "opt/acornfox/releases/" + candidate.ReleaseID, "opt/acornfox/upgrade-tools", "etc", "etc/systemd", "etc/systemd/system", "etc/acornfox", "var", "var/lib", "var/lib/acornfox", "var/log", "var/log/acornfox"} {
+		entries[path] = directory(path, 0o755, OwnerRoleRoot)
+	}
+	for _, service := range []struct {
+		name string
+		role OwnerRole
+	}{{"server", OwnerRoleServer}, {"agent", OwnerRoleAgent}, {"buildkit", OwnerRoleBuildKit}, {"caddy", OwnerRoleCaddy}, {"edge", OwnerRoleEdge}} {
+		for _, base := range []string{"var/lib/acornfox/", "var/log/acornfox/"} {
+			path := base + service.name
+			entries[path] = directory(path, 0o750, service.role)
+		}
+	}
+	entries[AcornFoxUpgradeHelperPath] = file(AcornFoxUpgradeHelperPath, 0o755, OwnerRoleRoot)
+	for _, unit := range acornFoxV1Units {
+		path := "etc/systemd/system/" + strings.TrimPrefix(unit, "systemd/")
+		entries[path] = file(path, 0o644, OwnerRoleRoot)
+	}
+	for destination := range map[string]string{"etc/acornfox/Caddyfile": "caddy/acornfox.Caddyfile.example", "etc/acornfox/acornfox-edge.Caddyfile": "caddy/acornfox-edge.Caddyfile.example", "etc/acornfox/acornfox-edge.env": "caddy/acornfox-edge.env.example", "etc/acornfox/buildkitd.toml": "config/acornfox-buildkitd.toml"} {
+		mode := uint32(0o644)
+		if strings.HasSuffix(destination, ".env") {
+			mode = 0o640
+		}
+		entries[destination] = file(destination, mode, OwnerRoleRoot)
+	}
+	return entries
+}
+
+func acornFoxInstalledSource(candidate AcornFoxStageReceiptV1, path string) string {
+	if path == AcornFoxUpgradeHelperPath {
+		return "bin/acornfox-upgrade"
+	}
+	if strings.HasPrefix(path, "etc/systemd/system/") {
+		return "systemd/" + strings.TrimPrefix(path, "etc/systemd/system/")
+	}
+	return map[string]string{"etc/acornfox/Caddyfile": "caddy/acornfox.Caddyfile.example", "etc/acornfox/acornfox-edge.Caddyfile": "caddy/acornfox-edge.Caddyfile.example", "etc/acornfox/acornfox-edge.env": "caddy/acornfox-edge.env.example", "etc/acornfox/buildkitd.toml": "config/acornfox-buildkitd.toml"}[path]
 }
 
 type AcornFoxInactiveSubstrateIntentV1 struct {

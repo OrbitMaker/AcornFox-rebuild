@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -15,11 +16,40 @@ func substrateEntry(path string, kind SubstrateEntryKind, mode uint32, role Owne
 }
 
 func substrateReceiptFixture() InactiveSubstrateReceiptV1 {
+	manifestDigest := sha256Hex([]byte("manifest"))
+	candidate := AcornFoxStageReceiptV1{SchemaVersion: 1, Product: AcornFoxV1Product, Version: "1.2.3-test.1", ReleaseID: "release-1.2.3-test.1", ManifestSHA256: manifestDigest, ArchiveSHA256: substrateDigest("c"), BindingSHA256: substrateDigest("d"), BundleManifestSHA256: substrateDigest("e"), SourceCommit: strings.Repeat("a", 40), Architecture: AcornFoxV1Architecture, MigrationVersion: AcornFoxV1MigrationVersion, TreeSHA256: substrateDigest("f")}
+	releasePrefix := "opt/acornfox/releases/" + candidate.ReleaseID + "/"
+	entries := []SubstrateEntry{}
+	addRelease := func(path string, mode uint32, digest string, size int64) {
+		entries = append(entries, SubstrateEntry{Path: releasePrefix + path, Kind: SubstrateEntryFile, Mode: mode, Role: OwnerRoleRoot, Size: size, SHA256: digest})
+	}
+	addRelease("manifest.json", 0o644, manifestDigest, int64(len("manifest")))
+	for _, required := range AcornFoxV1RequiredFiles() {
+		digest := sha256Hex([]byte(required.Path))
+		addRelease(required.Path, required.Mode, digest, int64(len(required.Path)))
+	}
+	addRelease("web/dist/assets/app-12345678.js", 0o644, sha256Hex([]byte("asset")), int64(len("asset")))
+	candidate.FileCount = len(AcornFoxV1RequiredFiles()) + 2
+	for path, fixed := range acornFoxFixedSubstrateEntries(candidate) {
+		if fixed.Kind == SubstrateEntryDirectory {
+			entries = append(entries, fixed)
+			continue
+		}
+		source := acornFoxInstalledSource(candidate, path)
+		for _, release := range entries {
+			if release.Path == releasePrefix+source {
+				fixed.Size, fixed.SHA256 = release.Size, release.SHA256
+				entries = append(entries, fixed)
+				break
+			}
+		}
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Path < entries[j].Path })
+	upgrade := substrateEntryAt(entries, AcornFoxUpgradeHelperPath)
+	health := substrateEntryAt(entries, AcornFoxHealthcheckHelperPath(candidate))
 	receipt := InactiveSubstrateReceiptV1{
 		SchemaVersion: InactiveSubstrateReceiptV1Schema, State: "inactive_complete", LayoutVersion: AcornFoxSubstrateLayoutV1,
-		CandidateReceipt:  AcornFoxStageReceiptV1{SchemaVersion: 1, Product: AcornFoxV1Product, Version: "1.2.3-test.1", ReleaseID: "release-1.2.3-test.1", ManifestSHA256: substrateDigest("b"), ArchiveSHA256: substrateDigest("c"), BindingSHA256: substrateDigest("d"), BundleManifestSHA256: substrateDigest("e"), SourceCommit: strings.Repeat("a", 40), Architecture: AcornFoxV1Architecture, MigrationVersion: AcornFoxV1MigrationVersion, FileCount: 1, TreeSHA256: substrateDigest("f")},
-		ReleaseTreeSHA256: substrateDigest("f"), UpgradeHelperSHA256: substrateDigest("1"), HealthHelperSHA256: substrateDigest("2"),
-		Entries: []SubstrateEntry{{Path: AcornFoxHealthcheckHelperPath, Kind: SubstrateEntryFile, Mode: 0o700, Role: OwnerRoleHealthcheck, Size: 1, SHA256: substrateDigest("2")}, {Path: AcornFoxUpgradeHelperPath, Kind: SubstrateEntryFile, Mode: 0o700, Role: OwnerRoleRoot, Size: 1, SHA256: substrateDigest("1")}},
+		CandidateReceipt: candidate, ReleaseTreeSHA256: candidate.TreeSHA256, UpgradeHelperSHA256: upgrade.SHA256, HealthHelperSHA256: health.SHA256, Entries: entries,
 	}
 	receipt.InstalledTreeSHA256, _ = ComputeAcornFoxSubstrateTreeSHA256(receipt.Entries)
 	return receipt
@@ -119,6 +149,37 @@ func TestInactiveSubstrateReceiptRejectsUnrelatedTreeAndHelperHashes(t *testing.
 		mutate(&receipt)
 		if err := receipt.Validate(); err == nil {
 			t.Fatalf("unrelated placeholder digest accepted: %#v", receipt)
+		}
+	}
+}
+
+func TestAcornFoxV1SubstrateInventoryRejectsMissingExtraAndBadMappings(t *testing.T) {
+	for _, mutate := range []func(*InactiveSubstrateReceiptV1){
+		func(receipt *InactiveSubstrateReceiptV1) {
+			receipt.Entries = append([]SubstrateEntry(nil), receipt.Entries[1:]...)
+		},
+		func(receipt *InactiveSubstrateReceiptV1) {
+			receipt.Entries = append(receipt.Entries, SubstrateEntry{Path: "var/lib/acornfox/extra", Kind: SubstrateEntryDirectory, Mode: 0o750, Role: OwnerRoleServer})
+			sort.Slice(receipt.Entries, func(i, j int) bool { return receipt.Entries[i].Path < receipt.Entries[j].Path })
+		},
+		func(receipt *InactiveSubstrateReceiptV1) {
+			entry := substrateEntryAt(receipt.Entries, AcornFoxUpgradeHelperPath)
+			entry.Role = OwnerRoleServer
+		},
+		func(receipt *InactiveSubstrateReceiptV1) {
+			entry := substrateEntryAt(receipt.Entries, AcornFoxUpgradeHelperPath)
+			entry.Mode = 0o700
+		},
+		func(receipt *InactiveSubstrateReceiptV1) {
+			entry := substrateEntryAt(receipt.Entries, AcornFoxUpgradeHelperPath)
+			entry.SHA256 = substrateDigest("9")
+		},
+	} {
+		receipt := substrateReceiptFixture()
+		mutate(&receipt)
+		receipt.InstalledTreeSHA256, _ = ComputeAcornFoxSubstrateTreeSHA256(receipt.Entries)
+		if err := receipt.Validate(); err == nil {
+			t.Fatalf("invalid closed inventory accepted: %#v", receipt)
 		}
 	}
 }

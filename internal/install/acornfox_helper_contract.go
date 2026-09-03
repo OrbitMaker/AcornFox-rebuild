@@ -26,26 +26,49 @@ func (i AcornFoxBuildIdentityV1) Validate() error {
 }
 
 type AcornFoxHelperContractResultV1 struct {
-	SchemaVersion          int                     `json:"schema_version"`
-	OK                     bool                    `json:"ok"`
-	Code                   string                  `json:"code"`
-	Identity               AcornFoxBuildIdentityV1 `json:"identity"`
-	BindingSHA256          string                  `json:"binding_sha256"`
-	ExecutableSHA256       string                  `json:"executable_sha256"`
-	SubstrateReceiptSHA256 string                  `json:"substrate_receipt_sha256"`
+	SchemaVersion          int                      `json:"schema_version"`
+	OK                     bool                     `json:"ok"`
+	Code                   string                   `json:"code"`
+	Identity               *AcornFoxBuildIdentityV1 `json:"identity,omitempty"`
+	BindingSHA256          string                   `json:"binding_sha256,omitempty"`
+	ExecutableSHA256       string                   `json:"executable_sha256,omitempty"`
+	SubstrateReceiptSHA256 string                   `json:"substrate_receipt_sha256,omitempty"`
 }
 
+const (
+	AcornFoxHelperCodeOK                    = "ok"
+	AcornFoxHelperCodeInvalidArguments      = "invalid_arguments"
+	AcornFoxHelperCodeIdentityMismatch      = "identity_mismatch"
+	AcornFoxHelperCodeReceiptUnavailable    = "receipt_unavailable"
+	AcornFoxHelperCodeReceiptInvalid        = "receipt_invalid"
+	AcornFoxHelperCodeBindingMismatch       = "binding_mismatch"
+	AcornFoxHelperCodeExecutableUnavailable = "executable_unavailable"
+	AcornFoxHelperCodeExecutableMismatch    = "executable_mismatch"
+	AcornFoxHelperCodeInternalError         = "internal_error"
+)
+
 func (r AcornFoxHelperContractResultV1) Validate() error {
-	if r.SchemaVersion != AcornFoxHelperContractV1Schema || r.Identity.Validate() != nil || !digestPattern.MatchString(r.BindingSHA256) || !digestPattern.MatchString(r.ExecutableSHA256) || !digestPattern.MatchString(r.SubstrateReceiptSHA256) || r.Code == "" {
+	if r.SchemaVersion != AcornFoxHelperContractV1Schema || !validAcornFoxHelperCode(r.Code) {
 		return errors.New("AcornFox helper contract result is invalid")
 	}
-	if r.OK && r.Code != "ok" {
+	hasEvidence := r.Identity != nil || r.BindingSHA256 != "" || r.ExecutableSHA256 != "" || r.SubstrateReceiptSHA256 != ""
+	validEvidence := r.Identity != nil && r.Identity.Validate() == nil && digestPattern.MatchString(r.BindingSHA256) && digestPattern.MatchString(r.ExecutableSHA256) && digestPattern.MatchString(r.SubstrateReceiptSHA256)
+	if r.OK && (r.Code != AcornFoxHelperCodeOK || !validEvidence) {
 		return errors.New("AcornFox successful helper result code is invalid")
 	}
-	if !r.OK && r.Code == "ok" {
+	if !r.OK && (r.Code == AcornFoxHelperCodeOK || (hasEvidence && !validEvidence)) {
 		return errors.New("AcornFox failed helper result code is invalid")
 	}
 	return nil
+}
+
+func validAcornFoxHelperCode(code string) bool {
+	switch code {
+	case AcornFoxHelperCodeOK, AcornFoxHelperCodeInvalidArguments, AcornFoxHelperCodeIdentityMismatch, AcornFoxHelperCodeReceiptUnavailable, AcornFoxHelperCodeReceiptInvalid, AcornFoxHelperCodeBindingMismatch, AcornFoxHelperCodeExecutableUnavailable, AcornFoxHelperCodeExecutableMismatch, AcornFoxHelperCodeInternalError:
+		return true
+	default:
+		return false
+	}
 }
 
 func ParseAcornFoxHelperContractResultV1(raw []byte) (AcornFoxHelperContractResultV1, error) {
