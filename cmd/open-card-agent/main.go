@@ -6,11 +6,11 @@ import (
 	"errors"
 	"log"
 	"net/http"
-	"os"
 	"strconv"
 	"time"
 
 	v1 "github.com/open-card/open-card/api/agent/v1"
+	"github.com/open-card/open-card/internal/acornfoxenv"
 	"github.com/open-card/open-card/internal/agenttransport"
 	"github.com/open-card/open-card/internal/application"
 	"github.com/open-card/open-card/internal/contracts"
@@ -24,31 +24,40 @@ import (
 )
 
 func main() {
-	address := os.Getenv("OPEN_CARD_AGENT_ADDR")
+	environment, err := acornfoxenv.ResolveCurrent()
+	if err != nil {
+		log.Fatal(err)
+	}
+	run(environment)
+}
+
+func run(environment acornfoxenv.Environment) {
+	getenv := environment.Get
+	address := getenv("OPEN_CARD_AGENT_ADDR")
 	if address == "" {
 		address = "127.0.0.1:8091"
 	}
-	instanceID := os.Getenv("OPEN_CARD_INSTANCE_ID")
+	instanceID := getenv("OPEN_CARD_INSTANCE_ID")
 	if instanceID == "" {
 		instanceID = "local"
 	}
-	nodeID := os.Getenv("OPEN_CARD_NODE_ID")
+	nodeID := getenv("OPEN_CARD_NODE_ID")
 	if nodeID == "" {
 		nodeID = "local-node"
 	}
-	version := os.Getenv("OPEN_CARD_AGENT_VERSION")
+	version := getenv("OPEN_CARD_AGENT_VERSION")
 	if version == "" {
 		version = "dev"
 	}
-	if controlPlaneURL := os.Getenv("OPEN_CARD_CONTROL_PLANE_URL"); controlPlaneURL != "" {
-		runOutboundAgent(controlPlaneURL, instanceID, nodeID, version)
+	if controlPlaneURL := getenv("OPEN_CARD_CONTROL_PLANE_URL"); controlPlaneURL != "" {
+		runOutboundAgent(controlPlaneURL, instanceID, nodeID, version, environment)
 		return
 	}
 	agent := NewAgent(instanceID, nodeID, version)
 	tlsConfig, err := loadMTLSConfig(
-		os.Getenv("OPEN_CARD_AGENT_TLS_CA"),
-		os.Getenv("OPEN_CARD_AGENT_TLS_CERT"),
-		os.Getenv("OPEN_CARD_AGENT_TLS_KEY"),
+		getenv("OPEN_CARD_AGENT_TLS_CA"),
+		getenv("OPEN_CARD_AGENT_TLS_CERT"),
+		getenv("OPEN_CARD_AGENT_TLS_KEY"),
 	)
 	if err != nil {
 		log.Fatal(err)
@@ -60,17 +69,18 @@ func main() {
 	}
 }
 
-func runOutboundAgent(controlPlaneURL, instanceID, nodeID, version string) {
+func runOutboundAgent(controlPlaneURL, instanceID, nodeID, version string, environment acornfoxenv.Environment) {
+	getenv := environment.Get
 	tlsConfig, err := loadOutboundMTLSConfig(
-		os.Getenv("OPEN_CARD_AGENT_TLS_CA"),
-		os.Getenv("OPEN_CARD_AGENT_TLS_CERT"),
-		os.Getenv("OPEN_CARD_AGENT_TLS_KEY"),
-		os.Getenv("OPEN_CARD_CONTROL_PLANE_SERVER_NAME"),
+		getenv("OPEN_CARD_AGENT_TLS_CA"),
+		getenv("OPEN_CARD_AGENT_TLS_CERT"),
+		getenv("OPEN_CARD_AGENT_TLS_KEY"),
+		getenv("OPEN_CARD_CONTROL_PLANE_SERVER_NAME"),
 	)
 	if err != nil {
 		log.Fatal(err)
 	}
-	socketPath := os.Getenv("OPEN_CARD_DOCKER_SOCKET")
+	socketPath := getenv("OPEN_CARD_DOCKER_SOCKET")
 	if socketPath == "" {
 		socketPath = "/var/run/docker.sock"
 	}
@@ -84,24 +94,24 @@ func runOutboundAgent(controlPlaneURL, instanceID, nodeID, version string) {
 	var acornFoxRuntime contracts.AcornFoxRuntimeDriver
 	var acornFoxProber acornFoxRuntimeProber
 	capabilities := []string{"docker.read.facts"}
-	if os.Getenv("OPEN_CARD_RUNTIME_ENABLED") == "true" {
-		if os.Getenv("OPEN_CARD_WORKER_NETWORK_ISOLATED") != "true" {
+	if getenv("OPEN_CARD_RUNTIME_ENABLED") == "true" {
+		if getenv("OPEN_CARD_WORKER_NETWORK_ISOLATED") != "true" {
 			log.Fatal("runtime deployment requires an externally isolated worker network")
 		}
-		store, storeErr := imageprovider.New(imageprovider.Config{Root: os.Getenv("OPEN_CARD_OCI_STORE_ROOT")})
+		store, storeErr := imageprovider.New(imageprovider.Config{Root: getenv("OPEN_CARD_OCI_STORE_ROOT")})
 		if storeErr != nil {
 			log.Fatal(storeErr)
 		}
 		reserveMemory := int64(256 << 20)
-		if value := os.Getenv("OPEN_CARD_RUNTIME_RESERVE_MEMORY_BYTES"); value != "" {
+		if value := getenv("OPEN_CARD_RUNTIME_RESERVE_MEMORY_BYTES"); value != "" {
 			parsed, parseErr := strconv.ParseInt(value, 10, 64)
 			if parseErr != nil || parsed < 0 {
 				log.Fatal("invalid runtime memory reserve")
 			}
 			reserveMemory = parsed
 		}
-		capacityConfig := capacity.Config{DiskPath: os.Getenv("OPEN_CARD_RUNTIME_WORK_ROOT"), RuntimeReserve: contracts.ResourceLimits{CPUMillis: 250, MemoryBytes: reserveMemory, DiskBytes: 512 << 20}}
-		if value := os.Getenv("OPEN_CARD_RUNTIME_FIXED_HOST_PORT"); value != "" {
+		capacityConfig := capacity.Config{DiskPath: getenv("OPEN_CARD_RUNTIME_WORK_ROOT"), RuntimeReserve: contracts.ResourceLimits{CPUMillis: 250, MemoryBytes: reserveMemory, DiskBytes: 512 << 20}}
+		if value := getenv("OPEN_CARD_RUNTIME_FIXED_HOST_PORT"); value != "" {
 			parsed, parseErr := strconv.Atoi(value)
 			if parseErr != nil || parsed < 1 || parsed > 65535 {
 				log.Fatal("invalid fixed runtime host port")
@@ -113,9 +123,9 @@ func runOutboundAgent(controlPlaneURL, instanceID, nodeID, version string) {
 			log.Fatal(capacityErr)
 		}
 		standaloneRuntime, storeErr := standalone.New(standalone.Config{
-			TaskPrefix:            os.Getenv("OPEN_CARD_RUNTIME_TASK_PREFIX"),
-			Network:               os.Getenv("OPEN_CARD_RUNTIME_NETWORK"),
-			WorkRoot:              os.Getenv("OPEN_CARD_RUNTIME_WORK_ROOT"),
+			TaskPrefix:            getenv("OPEN_CARD_RUNTIME_TASK_PREFIX"),
+			Network:               getenv("OPEN_CARD_RUNTIME_NETWORK"),
+			WorkRoot:              getenv("OPEN_CARD_RUNTIME_WORK_ROOT"),
 			ImageStore:            store,
 			Capacity:              capacityProvider,
 			WorkerNetworkIsolated: true,
@@ -131,22 +141,22 @@ func runOutboundAgent(controlPlaneURL, instanceID, nodeID, version string) {
 			log.Fatal(storeErr)
 		}
 		capabilities = append(capabilities, runtimeCapabilities...)
-		if os.Getenv("OPEN_CARD_M2_ENABLED") == "true" {
+		if getenv("OPEN_CARD_M2_ENABLED") == "true" {
 			var metricsReader standalonegroup.RuntimeMetricsReader
-			if os.Getenv("OPEN_CARD_M4_ENABLED") == "true" {
+			if getenv("OPEN_CARD_M4_ENABLED") == "true" {
 				reader, readerErr := NewUnixDockerRuntimeMetricsReader(socketPath)
 				if readerErr != nil {
 					log.Fatal(readerErr)
 				}
 				metricsReader = m4GroupRuntimeMetricsAdapter{reader: reader}
 			}
-			volumes, volumeErr := volumeprovider.New(volumeprovider.Config{TaskPrefix: os.Getenv("OPEN_CARD_RUNTIME_TASK_PREFIX")})
+			volumes, volumeErr := volumeprovider.New(volumeprovider.Config{TaskPrefix: getenv("OPEN_CARD_RUNTIME_TASK_PREFIX")})
 			if volumeErr != nil {
 				log.Fatal(volumeErr)
 			}
 			volumeRuntime = volumes
 			groupRuntime, storeErr = standalonegroup.New(standalonegroup.Config{
-				TaskPrefix: os.Getenv("OPEN_CARD_RUNTIME_TASK_PREFIX"), Network: os.Getenv("OPEN_CARD_RUNTIME_GROUP_NETWORK"), WorkRoot: os.Getenv("OPEN_CARD_RUNTIME_WORK_ROOT"),
+				TaskPrefix: getenv("OPEN_CARD_RUNTIME_TASK_PREFIX"), Network: getenv("OPEN_CARD_RUNTIME_GROUP_NETWORK"), WorkRoot: getenv("OPEN_CARD_RUNTIME_WORK_ROOT"),
 				ImageStore: store, Capacity: capacityProvider, Volumes: volumes, MetricsReader: metricsReader, WorkerNetworkIsolated: true,
 			})
 			if storeErr != nil {

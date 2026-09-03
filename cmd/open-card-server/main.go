@@ -6,7 +6,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
-	"os"
+	stdio "os"
 	"os/signal"
 	"strconv"
 	"strings"
@@ -14,6 +14,7 @@ import (
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/open-card/open-card/internal/acornfoxenv"
 	aicontext "github.com/open-card/open-card/internal/ai/context"
 	ailedger "github.com/open-card/open-card/internal/ai/ledger"
 	"github.com/open-card/open-card/internal/ai/orchestrator"
@@ -38,7 +39,20 @@ import (
 	"github.com/open-card/open-card/internal/rules"
 )
 
+type closedRuntimeOS struct {
+	Args      []string
+	Interrupt stdio.Signal
+	Getenv    func(string) string
+	MkdirAll  func(string, stdio.FileMode) error
+	Exit      func(int)
+}
+
 func main() {
+	environment, environmentErr := acornfoxenv.ResolveCurrent()
+	if environmentErr != nil {
+		log.Fatal(environmentErr)
+	}
+	os := closedRuntimeOS{Args: stdio.Args, Interrupt: stdio.Interrupt, Getenv: environment.Get, MkdirAll: stdio.MkdirAll, Exit: stdio.Exit}
 	lifecycleContext, lifecycleCancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer lifecycleCancel()
 	if len(os.Args) > 1 {
@@ -92,8 +106,8 @@ func main() {
 		} else {
 			log.Print("administrator HTTP authentication is not activated; OPEN_CARD_AUTH_ORIGIN is unset")
 		}
-		server.SetG3Access(newG3AccessHTTPHandler(store))
-		server.SetG3SourceUpload(&G3SourceUploadHTTPHandler{Store: store})
+		server.SetG3Access(newG3AccessHTTPHandler(store, os.Getenv))
+		server.SetG3SourceUpload(newG3SourceUploadHTTPHandler(store, os.Getenv))
 		server.AgentGateway().SetEventSink(&controllers.DurableAgentSink{Store: store})
 		var acornFoxProjector controllers.AgentEvidenceProjector
 		applicationWorker := &controllers.Worker{
@@ -118,7 +132,7 @@ func main() {
 					log.Fatal(err)
 				}
 			}
-			server.SetG3SourceUpload(newG3SourceUploadHTTPHandler(store))
+			server.SetG3SourceUpload(newG3SourceUploadHTTPHandler(store, os.Getenv))
 			logRoot := os.Getenv("OPEN_CARD_LOG_ROOT")
 			if logRoot == "" {
 				logRoot = buildWorkRoot + "/m4-logs"

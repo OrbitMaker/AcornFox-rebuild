@@ -6,7 +6,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 
@@ -350,15 +349,15 @@ func g3PostgresIdempotency(request controllers.G3Idempotency) postgres.G3Idempot
 
 var _ controllers.G3AccessStore = (*g3PostgresAdapter)(nil)
 
-func newG3AccessHTTPHandler(store *postgres.Store) *G3AccessHTTPHandler {
+func newG3AccessHTTPHandler(store *postgres.Store, getenv func(string) string) *G3AccessHTTPHandler {
 	config := controllers.G3AccessConfig{
-		ExpectedPublicIP:   strings.TrimSpace(os.Getenv("OPEN_CARD_G3_EXPECTED_PUBLIC_IP")),
-		ConsoleLabel:       strings.TrimSpace(os.Getenv("OPEN_CARD_G3_CONSOLE_LABEL")),
-		IngressLabel:       strings.TrimSpace(os.Getenv("OPEN_CARD_G3_INGRESS_LABEL")),
-		AppsLabel:          strings.TrimSpace(os.Getenv("OPEN_CARD_G3_APPS_LABEL")),
-		WildcardProbeLabel: strings.TrimSpace(os.Getenv("OPEN_CARD_G3_WILDCARD_PROBE_LABEL")),
+		ExpectedPublicIP:   strings.TrimSpace(getenv("OPEN_CARD_G3_EXPECTED_PUBLIC_IP")),
+		ConsoleLabel:       strings.TrimSpace(getenv("OPEN_CARD_G3_CONSOLE_LABEL")),
+		IngressLabel:       strings.TrimSpace(getenv("OPEN_CARD_G3_INGRESS_LABEL")),
+		AppsLabel:          strings.TrimSpace(getenv("OPEN_CARD_G3_APPS_LABEL")),
+		WildcardProbeLabel: strings.TrimSpace(getenv("OPEN_CARD_G3_WILDCARD_PROBE_LABEL")),
 	}
-	endpoints := g3ResolverEndpoints(os.Getenv("OPEN_CARD_G3_PUBLIC_DNS_RESOLVERS"))
+	endpoints := g3ResolverEndpoints(getenv("OPEN_CARD_G3_PUBLIC_DNS_RESOLVERS"))
 	if len(endpoints) > 0 {
 		if verifier, err := publicdns.New(publicdns.Config{ResolverEndpoints: endpoints}); err == nil {
 			config.PublicDNSVerifier = verifier

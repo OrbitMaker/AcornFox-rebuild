@@ -9,7 +9,6 @@ import (
 	"mime"
 	"mime/multipart"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -295,13 +294,13 @@ func writeSourceUploadError(writer http.ResponseWriter, err error) {
 	}
 }
 
-func newG3SourceUploadHTTPHandler(store *postgres.Store) *G3SourceUploadHTTPHandler {
+func newG3SourceUploadHTTPHandler(store *postgres.Store, getenv func(string) string) *G3SourceUploadHTTPHandler {
 	handler := &G3SourceUploadHTTPHandler{Store: store}
-	root := strings.TrimSpace(os.Getenv("OPEN_CARD_SOURCE_UPLOAD_ROOT"))
+	root := strings.TrimSpace(getenv("OPEN_CARD_SOURCE_UPLOAD_ROOT"))
 	if root == "" {
 		return handler
 	}
-	limits, ttl, err := sourceUploadConfigFromEnvironment()
+	limits, ttl, err := sourceUploadConfigFromEnvironment(getenv)
 	if err != nil {
 		log.Printf("G3 source upload storage is unavailable: %v", err)
 		return handler
@@ -315,7 +314,7 @@ func newG3SourceUploadHTTPHandler(store *postgres.Store) *G3SourceUploadHTTPHand
 	return handler
 }
 
-func sourceUploadConfigFromEnvironment() (sourceupload.Limits, time.Duration, error) {
+func sourceUploadConfigFromEnvironment(getenv func(string) string) (sourceupload.Limits, time.Duration, error) {
 	limits := sourceupload.DefaultLimits()
 	values := []struct {
 		name string
@@ -328,7 +327,7 @@ func sourceUploadConfigFromEnvironment() (sourceupload.Limits, time.Duration, er
 		{"OPEN_CARD_SOURCE_UPLOAD_MAX_MANIFEST_BYTES", func(value int64) { limits.MaxManifest = value }},
 	}
 	for _, item := range values {
-		if raw := strings.TrimSpace(os.Getenv(item.name)); raw != "" {
+		if raw := strings.TrimSpace(getenv(item.name)); raw != "" {
 			value, err := strconv.ParseInt(raw, 10, 64)
 			if err != nil || value <= 0 {
 				return sourceupload.Limits{}, 0, errors.New("source upload limits are invalid")
@@ -340,7 +339,7 @@ func sourceUploadConfigFromEnvironment() (sourceupload.Limits, time.Duration, er
 		return sourceupload.Limits{}, 0, err
 	}
 	ttl := 24 * time.Hour
-	if raw := strings.TrimSpace(os.Getenv("OPEN_CARD_SOURCE_UPLOAD_TTL")); raw != "" {
+	if raw := strings.TrimSpace(getenv("OPEN_CARD_SOURCE_UPLOAD_TTL")); raw != "" {
 		value, err := time.ParseDuration(raw)
 		if err != nil || value <= 0 {
 			return sourceupload.Limits{}, 0, errors.New("source upload TTL is invalid")
