@@ -6,6 +6,7 @@ package acornfoxenv
 import (
 	"errors"
 	"os"
+	"strings"
 )
 
 type Key uint16
@@ -136,46 +137,102 @@ func (e Environment) ProductLabel() string {
 }
 func (e Environment) Clean() bool { return e.clean }
 func ResolveCurrent(process Process, identity string) (Environment, error) {
-	return Resolve(process, identity, os.LookupEnv)
+	return ResolveEnviron(process, identity, os.Environ())
 }
+
+// ResolveEnviron exists so the complete process environment can be captured
+// once before policy decisions are made. It is intentionally narrow: callers
+// may inject an enumerated environment for deterministic boundary tests.
+func ResolveEnviron(process Process, identity string, environ []string) (Environment, error) {
+	raw := make(map[string]string, len(environ))
+	for _, entry := range environ {
+		name, value, found := strings.Cut(entry, "=")
+		if !found || name == "" {
+			continue
+		}
+		raw[name] = value
+	}
+	return resolveSnapshot(process, identity, raw)
+}
+
 func Resolve(process Process, identity string, lookup Lookup) (Environment, error) {
-	if lookup == nil || (process != ProcessServer && process != ProcessAgent) {
+	if lookup == nil {
+		return Environment{}, cleanError()
+	}
+	raw := make(map[string]string, len(specs)*2)
+	seen := make(map[string]struct{}, len(specs)*2)
+	for _, spec := range specs {
+		for _, name := range []string{spec.legacy, spec.canonical} {
+			if name == "" {
+				continue
+			}
+			if _, alreadyRead := seen[name]; alreadyRead {
+				continue
+			}
+			seen[name] = struct{}{}
+			if value, exists := lookup(name); exists {
+				raw[name] = value
+			}
+		}
+	}
+	return resolveSnapshot(process, identity, raw)
+}
+
+func resolveSnapshot(process Process, identity string, raw map[string]string) (Environment, error) {
+	if process != ProcessServer && process != ProcessAgent {
 		return Environment{}, cleanError()
 	}
 	clean := identity == "acornfox"
 	if !clean && identity != "legacy" {
 		return Environment{}, cleanError()
 	}
+	mode, modeExists := raw[mustSpec(RuntimeMode).canonical]
 	if clean {
-		mode, ok := lookup(mustSpec(RuntimeMode).canonical)
-		if !ok || mode != "clean" {
+		if !modeExists || mode != "clean" {
 			return Environment{}, cleanError()
 		}
-		if value, exists := lookup(mustSpec(MigrationCompatibility).canonical); exists && value != "" {
+		if value, exists := raw[mustSpec(MigrationCompatibility).canonical]; exists && value != "" {
 			return Environment{}, cleanError()
+		}
+		for name := range raw {
+			if !knownName(name) && (strings.HasPrefix(name, "OPEN_CARD_") || strings.HasPrefix(name, "ACORNFOX_")) {
+				return Environment{}, cleanError()
+			}
 		}
 		for _, spec := range specs {
 			if spec.legacy != "" {
-				if _, exists := lookup(spec.legacy); exists {
+				if _, exists := raw[spec.legacy]; exists {
 					return Environment{}, cleanError()
 				}
 			}
 		}
+	} else if modeExists {
+		return Environment{}, cleanError()
 	}
 	values := make(map[Key]string, len(specs))
 	for key, spec := range specs {
 		if key == RuntimeMode {
+			values[key] = mode
 			continue
 		}
 		name := spec.legacy
 		if clean || name == "" {
 			name = spec.canonical
 		}
-		if value, ok := lookup(name); ok {
+		if value, ok := raw[name]; ok {
 			values[key] = value
 		}
 	}
 	return Environment{clean: clean, values: values}, nil
+}
+
+func knownName(name string) bool {
+	for _, spec := range specs {
+		if name == spec.legacy || name == spec.canonical {
+			return true
+		}
+	}
+	return false
 }
 func mustSpec(key Key) keySpec {
 	spec, ok := specs[key]
