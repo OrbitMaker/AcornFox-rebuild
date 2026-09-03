@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 )
 
 const (
@@ -29,8 +30,9 @@ type AcornFoxSubstratePublishResult struct {
 }
 
 type PublishedAcornFoxSubstrateV1 struct {
-	root    *os.Root
-	receipt InactiveSubstrateReceiptV1
+	root     *os.Root
+	receipt  InactiveSubstrateReceiptV1
+	uid, gid int
 }
 
 func NewTaskAcornFoxSubstratePublisher(taskRoot string, uid, gid int) (*TaskAcornFoxSubstratePublisher, error) {
@@ -98,6 +100,10 @@ func (p *TaskAcornFoxSubstratePublisher) Publish(ctx context.Context, stage *Sta
 	if err := acornFoxSubstrateCopyFiles(ctx, root, source, entries, candidate, p.uid, p.gid); err != nil {
 		return AcornFoxSubstratePublishResult{}, err
 	}
+	installed, err = ComputeAcornFoxSubstrateTreeSHA256(entries)
+	if err != nil {
+		return AcornFoxSubstratePublishResult{}, err
+	}
 	receipt := InactiveSubstrateReceiptV1{SchemaVersion: InactiveSubstrateReceiptV1Schema, State: "inactive_complete", LayoutVersion: AcornFoxSubstrateLayoutV1, CandidateReceipt: candidate, ReleaseTreeSHA256: candidate.TreeSHA256, InstalledTreeSHA256: installed, UpgradeHelperSHA256: substrateEntryAt(entries, AcornFoxUpgradeHelperPath).SHA256, HealthHelperSHA256: substrateEntryAt(entries, AcornFoxHealthcheckHelperPath(candidate)).SHA256, Entries: entries}
 	if err := receipt.Validate(); err != nil {
 		return AcornFoxSubstratePublishResult{}, err
@@ -130,14 +136,40 @@ func (p *TaskAcornFoxSubstratePublisher) Reopen(expectedBindingSHA256 string) (*
 		root.Close()
 		return nil, errors.New("AcornFox substrate receipt is invalid")
 	}
-	return &PublishedAcornFoxSubstrateV1{root: root, receipt: receipt}, nil
+	handle := &PublishedAcornFoxSubstrateV1{root: root, receipt: receipt, uid: p.uid, gid: p.gid}
+	if err := handle.Verify(); err != nil {
+		root.Close()
+		return nil, err
+	}
+	return handle, nil
 }
 
 func (h *PublishedAcornFoxSubstrateV1) Verify() error {
 	if h == nil || h.root == nil {
 		return errors.New("AcornFox substrate handle is invalid")
 	}
-	return h.receipt.Validate()
+	if err := h.receipt.Validate(); err != nil {
+		return err
+	}
+	for _, entry := range h.receipt.Entries {
+		path := acornFoxSubstrateTarget(entry.Path)
+		file, err := h.root.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+		if err != nil {
+			return err
+		}
+		info, statErr := file.Stat()
+		if statErr == nil && (!info.Mode().IsRegular() && entry.Kind == SubstrateEntryFile || !info.IsDir() && entry.Kind == SubstrateEntryDirectory || info.Mode().Perm() != os.FileMode(entry.Mode) || verifyOwner(info, h.uid, h.gid) != nil || (entry.Kind == SubstrateEntryFile && (info.Size() != entry.Size || sha256SubstrateOpenFile(file) != entry.SHA256))) {
+			statErr = errors.New("AcornFox substrate disk entry is invalid")
+		}
+		closeErr := file.Close()
+		if statErr == nil {
+			statErr = closeErr
+		}
+		if statErr != nil {
+			return statErr
+		}
+	}
+	return nil
 }
 func (h *PublishedAcornFoxSubstrateV1) Close() error {
 	if h == nil || h.root == nil {
@@ -148,7 +180,19 @@ func (h *PublishedAcornFoxSubstrateV1) Close() error {
 	return root.Close()
 }
 func (h *PublishedAcornFoxSubstrateV1) Discard() error {
-	return errors.New("AcornFox published substrate discard requires a closed recovery leaf")
+	if h == nil || h.root == nil {
+		return errors.New("AcornFox substrate handle is invalid")
+	}
+	if err := h.Verify(); err != nil {
+		return err
+	}
+	if err := h.root.RemoveAll(acornFoxSubstrateDir); err != nil {
+		return ErrAcornFoxStageCleanupUnknown
+	}
+	if err := syncAcornFoxRoot(h.root); err != nil {
+		return ErrAcornFoxStageCleanupUnknown
+	}
+	return nil
 }
 
 func acornFoxSubstrateTarget(path string) string {

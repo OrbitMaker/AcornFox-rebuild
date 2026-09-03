@@ -87,3 +87,36 @@ func TestTaskAcornFoxSubstratePublisherRejectsConflictingBindingWithoutOverwrite
 		t.Fatal("conflicting publish changed terminal receipt")
 	}
 }
+
+func TestPublishedAcornFoxSubstrateVerifyAndDiscardAreTaskOnly(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, acornFoxStageDirMode); err != nil {
+		t.Fatal(err)
+	}
+	stager, err := NewTaskAcornFoxStager(root, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stager.Close()
+	stage, receipt, err := stager.Stage(newAcornFoxFixture(t, "1.2.3-test.1", nil).input(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	publisher, err := NewTaskAcornFoxSubstratePublisher(root, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := publisher.Publish(context.Background(), &stage, receipt.BindingSHA256); err != nil {
+		t.Fatal(err)
+	}
+	published, err := publisher.Reopen(receipt.BindingSHA256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := published.Discard(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(root + "/substrate"); !os.IsNotExist(err) {
+		t.Fatalf("discard retained task substrate: %v", err)
+	}
+}

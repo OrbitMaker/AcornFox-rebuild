@@ -2,6 +2,8 @@ package install
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -10,6 +12,17 @@ import (
 	"strings"
 	"syscall"
 )
+
+func sha256SubstrateOpenFile(file *os.File) string {
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return ""
+	}
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(hash.Sum(nil))
+}
 
 func acornFoxSubstrateWriteIntent(root *os.Root, intent AcornFoxInactiveSubstrateIntentV1, uid, gid int) error {
 	if err := root.Mkdir(acornFoxSubstrateDir, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
@@ -88,7 +101,8 @@ func acornFoxSubstrateCreateDirs(root *os.Root, entries []SubstrateEntry, uid, g
 
 func acornFoxSubstrateCopyFiles(ctx context.Context, target, source *os.Root, entries []SubstrateEntry, candidate AcornFoxStageReceiptV1, uid, gid int) error {
 	prefix := "opt/acornfox/releases/" + candidate.ReleaseID + "/"
-	for _, entry := range entries {
+	for index := range entries {
+		entry := &entries[index]
 		if entry.Kind != SubstrateEntryFile {
 			continue
 		}
@@ -104,6 +118,16 @@ func acornFoxSubstrateCopyFiles(ctx context.Context, target, source *os.Root, en
 		}
 		input, err := source.OpenFile(sourcePath, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 		if err != nil {
+			return err
+		}
+		info, err := input.Stat()
+		if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != os.FileMode(entry.Mode) || sha256SubstrateOpenFile(input) != entry.SHA256 {
+			input.Close()
+			return errors.New("AcornFox substrate source entry is invalid")
+		}
+		entry.Size = info.Size()
+		if _, err := input.Seek(0, io.SeekStart); err != nil {
+			input.Close()
 			return err
 		}
 		output, err := target.OpenFile(acornFoxSubstrateTarget(entry.Path), os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, os.FileMode(entry.Mode))
