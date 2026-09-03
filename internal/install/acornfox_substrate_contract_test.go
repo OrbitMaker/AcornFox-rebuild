@@ -31,6 +31,23 @@ func substrateReceiptFixture() InactiveSubstrateReceiptV1 {
 	}
 	addRelease("web/dist/assets/app-12345678.js", 0o644, sha256Hex([]byte("asset")), int64(len("asset")))
 	candidate.FileCount = len(AcornFoxV1RequiredFiles()) + 1
+	releaseDirs := map[string]struct{}{}
+	for _, file := range append([]SubstrateEntry(nil), entries...) {
+		for parent := parentDirectory(file.Path); strings.HasPrefix(parent, "opt/acornfox/releases/"+candidate.ReleaseID); parent = parentDirectory(parent) {
+			releaseDirs[parent] = struct{}{}
+			if parent == "opt/acornfox/releases/"+candidate.ReleaseID {
+				break
+			}
+		}
+	}
+	for path := range releaseDirs {
+		if path == "opt/acornfox/releases/"+candidate.ReleaseID {
+			continue // fixed table contributes the release root exactly once.
+		}
+		entries = append(entries, SubstrateEntry{Path: path, Kind: SubstrateEntryDirectory, Mode: 0o755, Role: OwnerRoleRoot, Group: GroupRoleRoot})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Path < entries[j].Path })
+	candidate.TreeSHA256, _ = ComputeAcornFoxReleaseTreeSHA256(candidate, entries)
 	for path, fixed := range acornFoxFixedSubstrateEntries(candidate) {
 		if fixed.Kind == SubstrateEntryDirectory {
 			entries = append(entries, fixed)
@@ -203,7 +220,8 @@ func TestAcornFoxV1SubstrateInventoryUsesActualStageReceiptFileCount(t *testing.
 		t.Fatal(err)
 	}
 	defer stager.Close()
-	handle, staged, err := stager.Stage(newAcornFoxFixture(t, "1.2.3-test.1", nil).input(nil))
+	fixture := newAcornFoxFixture(t, "1.2.3-test.1", nil)
+	handle, staged, err := stager.Stage(fixture.input(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -214,6 +232,30 @@ func TestAcornFoxV1SubstrateInventoryUsesActualStageReceiptFileCount(t *testing.
 	receipt := substrateReceiptFixture()
 	receipt.CandidateReceipt = staged
 	receipt.ReleaseTreeSHA256 = staged.TreeSHA256
+	var manifestData Manifest
+	if err := json.Unmarshal(fixture.manifestRaw, &manifestData); err != nil {
+		t.Fatal(err)
+	}
+	for _, member := range manifestData.Files {
+		entry := substrateEntryAt(receipt.Entries, "opt/acornfox/releases/"+staged.ReleaseID+"/"+member.Path)
+		if entry == nil {
+			t.Fatalf("fixture lacks actual release member %s", member.Path)
+		}
+		entry.Mode, entry.SHA256 = member.Mode, member.SHA256
+	}
+	for path, fixed := range acornFoxFixedSubstrateEntries(staged) {
+		if fixed.Kind != SubstrateEntryFile {
+			continue
+		}
+		source := acornFoxInstalledSource(staged, path)
+		installed, release := substrateEntryAt(receipt.Entries, path), substrateEntryAt(receipt.Entries, "opt/acornfox/releases/"+staged.ReleaseID+"/"+source)
+		if installed == nil || release == nil {
+			t.Fatalf("fixture lacks installed mapping %s", path)
+		}
+		installed.SHA256, installed.Size = release.SHA256, release.Size
+	}
+	receipt.UpgradeHelperSHA256 = substrateEntryAt(receipt.Entries, AcornFoxUpgradeHelperPath).SHA256
+	receipt.HealthHelperSHA256 = substrateEntryAt(receipt.Entries, AcornFoxHealthcheckHelperPath(staged)).SHA256
 	manifest := substrateEntryAt(receipt.Entries, "opt/acornfox/releases/"+staged.ReleaseID+"/manifest.json")
 	if manifest == nil {
 		t.Fatal("fixture lacks release manifest")
@@ -235,6 +277,14 @@ func TestAcornFoxV1SubstrateInventoryUsesActualStageReceiptFileCount(t *testing.
 	extra.InstalledTreeSHA256, _ = ComputeAcornFoxSubstrateTreeSHA256(extra.Entries)
 	if err := extra.Validate(); err == nil {
 		t.Fatal("actual receipt accepted extra entry")
+	}
+	drift := receipt
+	drift.Entries = append([]SubstrateEntry(nil), receipt.Entries...)
+	entry := substrateEntryAt(drift.Entries, "opt/acornfox/releases/"+staged.ReleaseID+"/bin/acornfox-server")
+	entry.SHA256 = substrateDigest("9")
+	drift.InstalledTreeSHA256, _ = ComputeAcornFoxSubstrateTreeSHA256(drift.Entries)
+	if err := drift.Validate(); err == nil {
+		t.Fatal("actual receipt accepted a single release digest drift")
 	}
 }
 

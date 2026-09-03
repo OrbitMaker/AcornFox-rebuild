@@ -1,9 +1,12 @@
 package install
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -102,6 +105,10 @@ func (r InactiveSubstrateReceiptV1) Validate() error {
 	if err := validateAcornFoxV1SubstrateInventory(r.CandidateReceipt, r.Entries); err != nil {
 		return err
 	}
+	computedRelease, err := ComputeAcornFoxReleaseTreeSHA256(r.CandidateReceipt, r.Entries)
+	if err != nil || computedRelease != r.ReleaseTreeSHA256 {
+		return errors.New("AcornFox inactive substrate release tree digest is invalid")
+	}
 	computed, err := ComputeAcornFoxSubstrateTreeSHA256(r.Entries)
 	if err != nil || r.InstalledTreeSHA256 != computed {
 		return errors.New("AcornFox inactive substrate installed tree digest is invalid")
@@ -111,6 +118,41 @@ func (r InactiveSubstrateReceiptV1) Validate() error {
 		return errors.New("AcornFox inactive substrate helper entries are invalid")
 	}
 	return nil
+}
+
+// ComputeAcornFoxReleaseTreeSHA256 is intentionally congruent with the stage
+// receipt tree: manifest.json is first, then manifest.Files paths sorted by
+// relative release path. The publisher verifies source bytes against the pinned
+// manifest before emitting entries; this contract recomputes their tree shape.
+func ComputeAcornFoxReleaseTreeSHA256(candidate AcornFoxStageReceiptV1, entries []SubstrateEntry) (string, error) {
+	prefix := "opt/acornfox/releases/" + candidate.ReleaseID + "/"
+	files := make([]SubstrateEntry, 0, candidate.FileCount)
+	var manifest *SubstrateEntry
+	for index := range entries {
+		entry := &entries[index]
+		if !strings.HasPrefix(entry.Path, prefix) || entry.Kind != SubstrateEntryFile {
+			continue
+		}
+		relative := strings.TrimPrefix(entry.Path, prefix)
+		if relative == "manifest.json" {
+			manifest = entry
+			continue
+		}
+		files = append(files, *entry)
+	}
+	if manifest == nil || manifest.Mode != 0o644 || manifest.SHA256 != candidate.ManifestSHA256 || len(files) != candidate.FileCount {
+		return "", errors.New("AcornFox release tree members are invalid")
+	}
+	sort.Slice(files, func(i, j int) bool {
+		return strings.TrimPrefix(files[i].Path, prefix) < strings.TrimPrefix(files[j].Path, prefix)
+	})
+	hash := sha256.New()
+	_, _ = fmt.Fprintf(hash, "manifest.json\x00%04o\x00%s\n", 0o644, candidate.ManifestSHA256)
+	for _, entry := range files {
+		relative := strings.TrimPrefix(entry.Path, prefix)
+		_, _ = fmt.Fprintf(hash, "%s\x00%04o\x00%s\n", relative, entry.Mode, entry.SHA256)
+	}
+	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 func (e AcornFoxSubstrateTreeEnvelopeV1) Validate() error {
@@ -251,14 +293,24 @@ func validateAcornFoxV1SubstrateInventory(candidate AcornFoxStageReceiptV1, entr
 	}
 	releasePrefix := "opt/acornfox/releases/" + candidate.ReleaseID + "/"
 	releaseMembers := 0
+	releaseDirectories := map[string]struct{}{"opt/acornfox/releases/" + candidate.ReleaseID: {}}
 	seenRequired := map[string]bool{}
 	for path, entry := range byPath {
 		if strings.HasPrefix(path, releasePrefix) {
+			if entry.Kind == SubstrateEntryDirectory {
+				continue
+			}
 			relative := strings.TrimPrefix(path, releasePrefix)
 			if err := validateAcornFoxReleaseMember(candidate, relative, entry); err != nil {
 				return err
 			}
 			releaseMembers++
+			for parent := parentDirectory(path); strings.HasPrefix(parent, "opt/acornfox/releases/"+candidate.ReleaseID); parent = parentDirectory(parent) {
+				releaseDirectories[parent] = struct{}{}
+				if parent == "opt/acornfox/releases/"+candidate.ReleaseID {
+					break
+				}
+			}
 			for _, required := range AcornFoxV1RequiredFiles() {
 				if relative == required.Path {
 					seenRequired[relative] = true
@@ -268,6 +320,12 @@ func validateAcornFoxV1SubstrateInventory(candidate AcornFoxStageReceiptV1, entr
 		}
 		if _, ok := acornFoxFixedSubstrateEntry(candidate, path); !ok {
 			return fmt.Errorf("AcornFox substrate path is not allowed: %s", path)
+		}
+	}
+	for path := range releaseDirectories {
+		entry, ok := byPath[path]
+		if !ok || entry.Kind != SubstrateEntryDirectory || entry.Mode != 0o755 || entry.Role != OwnerRoleRoot || entry.Group != GroupRoleRoot || entry.Size != 0 || entry.SHA256 != "" {
+			return fmt.Errorf("AcornFox release directory is invalid: %s", path)
 		}
 	}
 	for _, required := range AcornFoxV1RequiredFiles() {
@@ -293,6 +351,13 @@ func validateAcornFoxV1SubstrateInventory(candidate AcornFoxStageReceiptV1, entr
 		}
 	}
 	return nil
+}
+
+func parentDirectory(path string) string {
+	if index := strings.LastIndex(path, "/"); index > 0 {
+		return path[:index]
+	}
+	return ""
 }
 
 func validateAcornFoxReleaseMember(candidate AcornFoxStageReceiptV1, relative string, entry SubstrateEntry) error {
@@ -332,7 +397,7 @@ func acornFoxFixedSubstrateEntries(candidate AcornFoxStageReceiptV1) map[string]
 		return SubstrateEntry{Path: path, Kind: SubstrateEntryFile, Mode: mode, Role: role, Group: group}
 	}
 	entries := map[string]SubstrateEntry{}
-	for _, path := range []string{"opt", "opt/acornfox", "opt/acornfox/releases", "opt/acornfox/releases/" + candidate.ReleaseID, "opt/acornfox/upgrade-tools", "etc", "etc/acornfox", "etc/systemd", "etc/systemd/system", "var", "var/lib", "var/lib/acornfox", "var/lib/acornfox/install", "var/lib/acornfox/install/releases", "var/log", "var/log/acornfox"} {
+	for _, path := range []string{"opt", "opt/acornfox", "opt/acornfox/releases", "opt/acornfox/releases/" + candidate.ReleaseID, "opt/acornfox/upgrade-tools", "etc", "etc/acornfox", "etc/systemd", "etc/systemd/system", "etc/systemd/system/acornfox-edge.service.d", "var", "var/lib", "var/lib/acornfox", "var/lib/acornfox/install", "var/lib/acornfox/install/releases", "var/log", "var/log/acornfox"} {
 		entries[path] = directory(path, 0o755, OwnerRoleRoot, GroupRoleRoot)
 	}
 	for _, path := range []string{"var/lib/acornfox/uploads", "var/lib/acornfox/workspaces", "var/lib/acornfox/build-work", "var/lib/acornfox/oci", "var/log/acornfox/server"} {
@@ -345,8 +410,11 @@ func acornFoxFixedSubstrateEntries(candidate AcornFoxStageReceiptV1) map[string]
 	entries["var/lib/acornfox/agent"], entries["var/log/acornfox/agent"] = directory("var/lib/acornfox/agent", 0o750, OwnerRoleAgent, GroupRoleAgent), directory("var/log/acornfox/agent", 0o750, OwnerRoleAgent, GroupRoleAgent)
 	entries["var/lib/acornfox/buildkit"] = directory("var/lib/acornfox/buildkit", 0o700, OwnerRoleBuildKit, GroupRoleBuildKit)
 	entries["var/lib/acornfox/caddy"], entries["var/log/acornfox/caddy"] = directory("var/lib/acornfox/caddy", 0o750, OwnerRoleCaddy, GroupRoleCaddy), directory("var/log/acornfox/caddy", 0o750, OwnerRoleCaddy, GroupRoleCaddy)
-	for _, path := range []string{"var/lib/acornfox/edge", "var/lib/acornfox/edge/home", "var/lib/acornfox/edge/data", "var/lib/acornfox/edge/config", "var/log/acornfox/edge"} {
+	for _, path := range []string{"var/lib/acornfox/edge", "var/log/acornfox/edge"} {
 		entries[path] = directory(path, 0o750, OwnerRoleEdge, GroupRoleEdge)
+	}
+	for _, path := range []string{"var/lib/acornfox/edge/home", "var/lib/acornfox/edge/data", "var/lib/acornfox/edge/config"} {
+		entries[path] = directory(path, 0o700, OwnerRoleEdge, GroupRoleEdge)
 	}
 	entries["var/lib/acornfox/healthcheck"] = directory("var/lib/acornfox/healthcheck", 0o700, OwnerRoleRoot, GroupRoleRoot)
 	entries[AcornFoxUpgradeHelperPath] = file(AcornFoxUpgradeHelperPath, 0o755, OwnerRoleRoot, GroupRoleRoot)
