@@ -1,12 +1,14 @@
 [Unit]
 Description=Prepare interrupted AcornFox upgrade recovery
-# Static 02C contract only; 03/04 activation must verify helper digest and AcornFox roots.
+# Static 02C contract only; 03/04 must implement contract-check and bind the helper digest before enabling this unit.
 Wants=network-online.target
 After=local-fs.target network-online.target
 Before=acornfox-upgrade-safe.target
 
 [Service]
 Type=oneshot
+# WATCH: this pre-start guard fails the recovery unit closed until the helper contract exists.
+ExecStartPre=/opt/acornfox/upgrade-tools/acornfox-upgrade contract-check --product acornfox --layout-schema 1
 ExecStart=/opt/acornfox/upgrade-tools/acornfox-upgrade recover-prepare --pending
 TimeoutStartSec=15min
 NoNewPrivileges=yes

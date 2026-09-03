@@ -147,6 +147,7 @@ func TestAcornFoxSystemdNamesPathsAndEnvironmentContract(t *testing.T) {
 	requireAcornFoxDirective(t, server, "Service", "Group", "acornfox")
 	requireAcornFoxDirective(t, server, "Service", "WorkingDirectory", "/opt/acornfox/current")
 	requireAcornFoxDirective(t, server, "Service", "Environment", "ACORNFOX_RUNTIME_MODE=clean")
+	requireAcornFoxDirective(t, server, "Service", "Environment", "ACORNFOX_SERVER_ADDR=127.0.0.1:18481")
 	requireAcornFoxDirective(t, server, "Service", "EnvironmentFile", "-/etc/acornfox/server.env")
 	requireAcornFoxDirective(t, server, "Service", "EnvironmentFile", "/opt/acornfox/active/database.env")
 	requireAcornFoxDirective(t, server, "Service", "ExecStart", "/opt/acornfox/current/bin/acornfox-server")
@@ -270,16 +271,68 @@ func TestAcornFoxWritablePathOwnershipMatrix(t *testing.T) {
 	for _, unit := range []string{"acornfox-upgrade-recover.service", "acornfox-upgrade-finalize.service"} {
 		raw, sections := readAcornFoxUnit(t, unit)
 		requireAcornFoxDirectiveContains(t, sections, "Service", "ReadWritePaths", "/opt/acornfox /var/lib/acornfox /run/lock /etc/acornfox /etc/systemd/system")
-		if !strings.Contains(raw, "03/04 activation must verify helper digest and AcornFox roots") {
+		if !strings.Contains(raw, "03/04 must implement contract-check and bind the helper digest before enabling this unit") {
 			t.Fatalf("%s lacks the future-activation boundary", unit)
 		}
 	}
 	for _, unit := range []string{"acornfox-healthcheck.service", "acornfox-healthcheck.timer", "acornfox-upgrade-safe.target"} {
 		raw, _ := readAcornFoxUnit(t, unit)
-		if !strings.Contains(raw, "03/04 activation must verify helper digest and AcornFox roots") {
+		if !strings.Contains(raw, "03/04 must implement") || !strings.Contains(raw, "helper digest") {
 			t.Fatalf("%s lacks the future-activation boundary", unit)
 		}
 	}
+}
+
+func TestAcornFoxListenerParityAndCollisionBoundary(t *testing.T) {
+	_, server := readAcornFoxUnit(t, "acornfox-server.service")
+	requireAcornFoxDirective(t, server, "Service", "Environment", "ACORNFOX_SERVER_ADDR=127.0.0.1:18481")
+	internal, err := os.ReadFile(filepath.Join(acornFoxDeployRoot(t), "caddy", "acornfox.Caddyfile.example"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(internal), "http://127.0.0.1:8080 {") || !strings.Contains(string(internal), "reverse_proxy 127.0.0.1:18481") {
+		t.Fatalf("internal Caddy listener/upstream parity is invalid: %s", internal)
+	}
+	edge, err := os.ReadFile(filepath.Join(acornFoxDeployRoot(t), "caddy", "acornfox-edge.Caddyfile.example"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, listener := range []string{"127.0.0.1:18481", "127.0.0.1:8080", "127.0.0.1:18482"} {
+		if strings.Count(string(internal)+string(edge), listener) == 0 {
+			t.Fatalf("listener %s is absent from the static topology", listener)
+		}
+	}
+	if strings.Contains(string(internal), "http://127.0.0.1:18481 {") || strings.Contains(string(internal), "reverse_proxy 127.0.0.1:8080") || strings.Contains(string(edge), "http://127.0.0.1:18481 {") || strings.Contains(string(edge), "http://127.0.0.1:8080 {") {
+		t.Fatal("server, internal Caddy, and edge listener addresses must remain distinct")
+	}
+}
+
+func TestAcornFoxDeferredHelperGuardsFailClosed(t *testing.T) {
+	guarded := map[string]string{
+		"acornfox-upgrade-recover.service":  "/opt/acornfox/upgrade-tools/acornfox-upgrade contract-check --product acornfox --layout-schema 1",
+		"acornfox-upgrade-finalize.service": "/opt/acornfox/upgrade-tools/acornfox-upgrade contract-check --product acornfox --layout-schema 1",
+		"acornfox-healthcheck.service":      "/opt/acornfox/current/bin/acornfox-healthcheck contract-check --product acornfox --layout-schema 1",
+	}
+	for unit, guard := range guarded {
+		raw, sections := readAcornFoxUnit(t, unit)
+		requireAcornFoxDirective(t, sections, "Service", "ExecStartPre", guard)
+		if !strings.Contains(raw, "WATCH:") || !strings.Contains(raw, "bind the helper digest") {
+			t.Fatalf("%s lacks the deferred helper-digest watch", unit)
+		}
+		for key := range sections["Unit"] {
+			if strings.HasPrefix(key, "Condition") && !(unit == "acornfox-upgrade-finalize.service" && key == "ConditionPathExists" && sections["Unit"][key][0] == "/var/lib/acornfox/upgrade-in-progress") {
+				t.Fatalf("%s uses %s as a helper guard instead of a failing ExecStartPre", unit, key)
+			}
+		}
+	}
+	_, safeTarget := readAcornFoxUnit(t, "acornfox-upgrade-safe.target")
+	requireAcornFoxDirective(t, safeTarget, "Unit", "Requires", "acornfox-upgrade-recover.service")
+	for _, management := range []string{"acornfox-buildkit.service", "acornfox-caddy.service", "acornfox-server.service", "acornfox-agent.service", "acornfox-edge.service"} {
+		_, sections := readAcornFoxUnit(t, management)
+		requireAcornFoxDirectiveContains(t, sections, "Unit", "Requires", "acornfox-upgrade-safe.target")
+	}
+	_, timer := readAcornFoxUnit(t, "acornfox-healthcheck.timer")
+	requireAcornFoxDirective(t, timer, "Timer", "Unit", "acornfox-healthcheck.service")
 }
 
 func TestAcornFoxBootGraphIsAcyclic(t *testing.T) {

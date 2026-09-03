@@ -1,6 +1,6 @@
 [Unit]
 Description=AcornFox host health check
-# Static 02C contract only; 03/04 activation must verify helper digest and AcornFox roots.
+# Static 02C contract only; 03/04 must implement contract-check and bind the helper digest before enabling this unit.
 Wants=network-online.target
 After=network-online.target acornfox-upgrade-safe.target acornfox-server.service acornfox-agent.service acornfox-edge.service acornfox-caddy.service acornfox-buildkit.service
 
@@ -10,6 +10,8 @@ User=root
 Group=root
 Environment=ACORNFOX_RUNTIME_MODE=clean
 EnvironmentFile=-/etc/acornfox/healthcheck.env
+# WATCH: this pre-start guard fails health checking closed until the helper contract exists.
+ExecStartPre=/opt/acornfox/current/bin/acornfox-healthcheck contract-check --product acornfox --layout-schema 1
 ExecStart=/opt/acornfox/current/bin/acornfox-healthcheck
 TimeoutStartSec=50s
 NoNewPrivileges=yes
