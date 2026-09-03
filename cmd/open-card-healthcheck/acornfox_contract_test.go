@@ -30,3 +30,17 @@ func TestAcornFoxContractCheckRejectsBeforeHealthDependencies(t *testing.T) {
 		}
 	}
 }
+
+func TestAcornFoxContractCheckRejectsMissingBuildLayout(t *testing.T) {
+	oldIdentity, oldVersion, oldCommit, oldLayout := processIdentity, buildVersion, buildSourceCommit, buildLayoutSchema
+	t.Cleanup(func() {
+		processIdentity, buildVersion, buildSourceCommit, buildLayoutSchema = oldIdentity, oldVersion, oldCommit, oldLayout
+	})
+	processIdentity, buildVersion, buildSourceCommit, buildLayoutSchema = "acornfox", "1.2.3-test.1", "0123456789abcdef0123456789abcdef01234567", ""
+	var output bytes.Buffer
+	_ = runWithDependencies(context.Background(), []string{"contract-check", "--product", "acornfox", "--layout-schema", "1"}, &output, &bytes.Buffer{}, dependencies{})
+	result, err := install.ParseAcornFoxHelperContractResultV1(bytes.TrimSpace(output.Bytes()))
+	if err != nil || result.Code != install.AcornFoxHelperCodeIdentityMismatch {
+		t.Fatalf("result=%#v err=%v", result, err)
+	}
+}

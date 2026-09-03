@@ -34,3 +34,20 @@ func TestAcornFoxContractCheckRejectsBeforeUpgradeDependencies(t *testing.T) {
 		}
 	}
 }
+
+func TestAcornFoxContractCheckRequiresExactLayoutBuildValue(t *testing.T) {
+	oldIdentity, oldVersion, oldCommit, oldLayout := processIdentity, buildVersion, buildSourceCommit, buildLayoutSchema
+	t.Cleanup(func() {
+		processIdentity, buildVersion, buildSourceCommit, buildLayoutSchema = oldIdentity, oldVersion, oldCommit, oldLayout
+	})
+	processIdentity, buildVersion, buildSourceCommit = "acornfox", "1.2.3-test.1", "0123456789abcdef0123456789abcdef01234567"
+	for _, layout := range []string{"", "0", "01", "2"} {
+		buildLayoutSchema = layout
+		var output bytes.Buffer
+		_ = runWithDependencies(context.Background(), []string{"contract-check", "--product", "acornfox", "--layout-schema", "1"}, &output, &bytes.Buffer{}, upgradeDependencies{})
+		result, err := install.ParseAcornFoxHelperContractResultV1(bytes.TrimSpace(output.Bytes()))
+		if err != nil || result.Code != install.AcornFoxHelperCodeIdentityMismatch {
+			t.Fatalf("layout=%q result=%#v err=%v", layout, result, err)
+		}
+	}
+}

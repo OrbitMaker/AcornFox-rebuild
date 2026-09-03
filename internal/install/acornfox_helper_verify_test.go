@@ -18,7 +18,7 @@ func (i helperReceiptInfo) Size() int64        { return 1 }
 func (i helperReceiptInfo) Mode() os.FileMode  { return i.mode }
 func (i helperReceiptInfo) ModTime() time.Time { return time.Time{} }
 func (i helperReceiptInfo) IsDir() bool        { return false }
-func (i helperReceiptInfo) Sys() any           { return &syscall.Stat_t{Uid: i.uid} }
+func (i helperReceiptInfo) Sys() any           { return &syscall.Stat_t{Uid: i.uid, Gid: 0, Nlink: 1} }
 
 func TestAcornFoxHelperVerifierReturnsOnlyCompleteEvidence(t *testing.T) {
 	receipt := substrateReceiptFixture()
