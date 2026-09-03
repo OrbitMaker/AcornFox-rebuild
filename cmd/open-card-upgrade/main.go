@@ -35,6 +35,14 @@ const (
 
 const productionUpgradeExecutable = "/opt/open-card/upgrade-tools/open-card-upgrade"
 const productionUpgradeRecoveryUnit = install.ProductionUpgradeRecoveryUnitPath
+const helperRole = "upgrade"
+
+var (
+	processIdentity   = "legacy"
+	buildVersion      string
+	buildSourceCommit string
+	buildLayoutSchema string
+)
 
 var productionBootUnitFiles = []struct {
 	path string
@@ -279,6 +287,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 }
 
 func runWithDependencies(ctx context.Context, args []string, stdout, stderr io.Writer, deps upgradeDependencies) (code int) {
+	if processIdentity == "acornfox" {
+		return runAcornFoxContractCheck(args, stdout, helperRole)
+	}
+	if processIdentity != "legacy" {
+		return writeAcornFoxContractFailure(stdout, install.AcornFoxHelperCodeIdentityMismatch)
+	}
 	var bufferedStdout, bufferedStderr bytes.Buffer
 	defer func() {
 		if code == exitOK {
@@ -288,6 +302,36 @@ func runWithDependencies(ctx context.Context, args []string, stdout, stderr io.W
 		_, _ = stderr.Write(bufferedStderr.Bytes())
 	}()
 	return runWithDependenciesCore(ctx, args, &bufferedStdout, &bufferedStderr, deps)
+}
+
+func runAcornFoxContractCheck(args []string, stdout io.Writer, role string) int {
+	if len(args) != 5 || args[0] != "contract-check" || args[1] != "--product" || args[2] != "acornfox" || args[3] != "--layout-schema" || args[4] != "1" {
+		return writeAcornFoxContractFailure(stdout, install.AcornFoxHelperCodeInvalidArguments)
+	}
+	identity := install.AcornFoxBuildIdentityV1{SchemaVersion: install.AcornFoxHelperContractV1Schema, Product: install.AcornFoxV1Product, LayoutVersion: install.AcornFoxSubstrateLayoutV1, Role: role, Version: buildVersion, ReleaseID: "release-" + buildVersion, SourceCommit: buildSourceCommit}
+	if buildLayoutSchema != "1" || identity.Validate() != nil {
+		return writeAcornFoxContractFailure(stdout, install.AcornFoxHelperCodeIdentityMismatch)
+	}
+	return writeAcornFoxContractResult(stdout, install.VerifyProductionAcornFoxHelperContract(identity))
+}
+
+func writeAcornFoxContractFailure(stdout io.Writer, code string) int {
+	return writeAcornFoxContractResult(stdout, install.AcornFoxHelperContractResultV1{SchemaVersion: install.AcornFoxHelperContractV1Schema, Code: code})
+}
+
+func writeAcornFoxContractResult(stdout io.Writer, result install.AcornFoxHelperContractResultV1) int {
+	raw, err := install.MarshalAcornFoxHelperContractResultV1(result)
+	if err != nil || stdout == nil {
+		return exitInternal
+	}
+	_, err = stdout.Write(append(raw, '\n'))
+	if err != nil {
+		return exitInternal
+	}
+	if result.OK {
+		return exitOK
+	}
+	return exitInternal
 }
 
 func runWithDependenciesCore(ctx context.Context, args []string, stdout, stderr io.Writer, deps upgradeDependencies) (code int) {
