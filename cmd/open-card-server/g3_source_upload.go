@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/open-card/open-card/internal/acornfoxenv"
 	"github.com/open-card/open-card/internal/domain"
 	"github.com/open-card/open-card/internal/persistence/postgres"
 	"github.com/open-card/open-card/internal/providers/sourceupload"
@@ -294,40 +295,40 @@ func writeSourceUploadError(writer http.ResponseWriter, err error) {
 	}
 }
 
-func newG3SourceUploadHTTPHandler(store *postgres.Store, getenv func(string) string) *G3SourceUploadHTTPHandler {
+func newG3SourceUploadHTTPHandler(store *postgres.Store, getenv func(acornfoxenv.Key) string) *G3SourceUploadHTTPHandler {
 	handler := &G3SourceUploadHTTPHandler{Store: store}
-	root := strings.TrimSpace(getenv("OPEN_CARD_SOURCE_UPLOAD_ROOT"))
+	root := strings.TrimSpace(getenv(acornfoxenv.SourceUploadRoot))
 	if root == "" {
 		return handler
 	}
 	limits, ttl, err := sourceUploadConfigFromEnvironment(getenv)
 	if err != nil {
-		log.Printf("G3 source upload storage is unavailable: %v", err)
+		log.Printf("source upload storage is unavailable: %v", err)
 		return handler
 	}
 	manager, err := sourceupload.New(sourceupload.Config{Root: root, Limits: limits, TTL: ttl})
 	if err != nil {
-		log.Printf("G3 source upload storage is unavailable: %v", err)
+		log.Printf("source upload storage is unavailable: %v", err)
 		return handler
 	}
 	handler.Manager = manager
 	return handler
 }
 
-func sourceUploadConfigFromEnvironment(getenv func(string) string) (sourceupload.Limits, time.Duration, error) {
+func sourceUploadConfigFromEnvironment(getenv func(acornfoxenv.Key) string) (sourceupload.Limits, time.Duration, error) {
 	limits := sourceupload.DefaultLimits()
 	values := []struct {
-		name string
-		set  func(int64)
+		key acornfoxenv.Key
+		set func(int64)
 	}{
-		{"OPEN_CARD_SOURCE_UPLOAD_MAX_TOTAL_BYTES", func(value int64) { limits.MaxTotalBytes = value }},
-		{"OPEN_CARD_SOURCE_UPLOAD_MAX_FILE_BYTES", func(value int64) { limits.MaxFileBytes = value }},
-		{"OPEN_CARD_SOURCE_UPLOAD_MAX_FILES", func(value int64) { limits.MaxFiles = int(value) }},
-		{"OPEN_CARD_SOURCE_UPLOAD_MAX_PATH_BYTES", func(value int64) { limits.MaxPathBytes = int(value) }},
-		{"OPEN_CARD_SOURCE_UPLOAD_MAX_MANIFEST_BYTES", func(value int64) { limits.MaxManifest = value }},
+		{acornfoxenv.SourceUploadMaxTotalBytes, func(value int64) { limits.MaxTotalBytes = value }},
+		{acornfoxenv.SourceUploadMaxFileBytes, func(value int64) { limits.MaxFileBytes = value }},
+		{acornfoxenv.SourceUploadMaxFiles, func(value int64) { limits.MaxFiles = int(value) }},
+		{acornfoxenv.SourceUploadMaxPathBytes, func(value int64) { limits.MaxPathBytes = int(value) }},
+		{acornfoxenv.SourceUploadMaxManifestBytes, func(value int64) { limits.MaxManifest = value }},
 	}
 	for _, item := range values {
-		if raw := strings.TrimSpace(getenv(item.name)); raw != "" {
+		if raw := strings.TrimSpace(getenv(item.key)); raw != "" {
 			value, err := strconv.ParseInt(raw, 10, 64)
 			if err != nil || value <= 0 {
 				return sourceupload.Limits{}, 0, errors.New("source upload limits are invalid")
@@ -339,7 +340,7 @@ func sourceUploadConfigFromEnvironment(getenv func(string) string) (sourceupload
 		return sourceupload.Limits{}, 0, err
 	}
 	ttl := 24 * time.Hour
-	if raw := strings.TrimSpace(getenv("OPEN_CARD_SOURCE_UPLOAD_TTL")); raw != "" {
+	if raw := strings.TrimSpace(getenv(acornfoxenv.SourceUploadTTL)); raw != "" {
 		value, err := time.ParseDuration(raw)
 		if err != nil || value <= 0 {
 			return sourceupload.Limits{}, 0, errors.New("source upload TTL is invalid")

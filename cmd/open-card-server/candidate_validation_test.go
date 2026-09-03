@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/open-card/open-card/internal/acornfoxenv"
 	"github.com/open-card/open-card/internal/application"
 )
 
@@ -20,8 +21,8 @@ func (candidateUnavailableRepository) PingContext(context.Context) error {
 	return errors.New("postgresql://candidate:never-log-this@db.example/open_card")
 }
 
-func candidateValidationEnvironment(values map[string]string) func(string) string {
-	return func(key string) string { return values[key] }
+func candidateValidationEnvironment(values map[string]string) func(acornfoxenv.Key) string {
+	return func(key acornfoxenv.Key) string { return values[acornfoxenv.Environment{}.Name(key)] }
 }
 
 func TestCandidateValidationConfigIsExactAndSuppressesRuntimeWorkers(t *testing.T) {
@@ -120,6 +121,31 @@ func TestCandidateValidationInheritedListenerRejectsNonSocket(t *testing.T) {
 	}
 	if _, err := file.Stat(); err == nil {
 		t.Fatal("non-socket inherited descriptor file was not closed")
+	}
+}
+
+func TestCandidateValidationListenerUsesModeSpecificDescriptorLabel(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		label string
+	}{
+		{name: "legacy", label: "open-card-candidate-listener"},
+		{name: "clean", label: "acornfox-candidate-listener"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var got string
+			file, err := os.CreateTemp(t.TempDir(), "candidate-listener-label")
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = candidateValidationListener(candidateValidationConfig{address: "127.0.0.1:18481", inheritedListenerFD: true, listenerLabel: test.label}, candidateListenerDependencies{
+				openInheritedFile: func(_ uintptr, label string) *os.File { got = label; return file },
+				listenerFromFile:  net.FileListener,
+			})
+			if got != test.label {
+				t.Fatalf("descriptor label=%q want=%q", got, test.label)
+			}
+		})
 	}
 }
 

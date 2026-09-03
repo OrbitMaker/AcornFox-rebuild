@@ -39,42 +39,36 @@ import (
 	"github.com/open-card/open-card/internal/rules"
 )
 
-type closedRuntimeOS struct {
-	Args      []string
-	Interrupt stdio.Signal
-	Getenv    func(string) string
-	MkdirAll  func(string, stdio.FileMode) error
-	Exit      func(int)
-}
+var processIdentity = "legacy"
 
 func main() {
-	environment, environmentErr := acornfoxenv.ResolveCurrent()
+	environment, environmentErr := acornfoxenv.ResolveCurrent(acornfoxenv.ProcessServer, processIdentity)
 	if environmentErr != nil {
 		log.Fatal(environmentErr)
 	}
-	os := closedRuntimeOS{Args: stdio.Args, Interrupt: stdio.Interrupt, Getenv: environment.Get, MkdirAll: stdio.MkdirAll, Exit: stdio.Exit}
-	lifecycleContext, lifecycleCancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	lifecycleContext, lifecycleCancel := signal.NotifyContext(context.Background(), stdio.Interrupt, syscall.SIGTERM)
 	defer lifecycleCancel()
-	if len(os.Args) > 1 {
-		if err := runCandidateValidation(lifecycleContext, os.Args[1:], os.Getenv); err != nil {
-			log.Printf("open-card candidate validation: %v", err)
-			os.Exit(1)
+	if len(stdio.Args) > 1 {
+		if err := runCandidateValidation(lifecycleContext, stdio.Args[1:], environment); err != nil {
+			log.Printf("%s candidate validation: %v", environment.ProductLabel(), err)
+			stdio.Exit(1)
 		}
 		return
 	}
-	address := os.Getenv("OPEN_CARD_SERVER_ADDR")
+	getenv := environment.Get
+	address := getenv(acornfoxenv.ServerAddr)
 	if address == "" {
 		address = "127.0.0.1:8080"
 	}
-	compatibilityMode, compatibilityErr := acornFoxMigrationCompatibilityMode(os.Getenv("ACORNFOX_MIGRATION_COMPATIBILITY"))
+	compatibilityMode, compatibilityErr := acornFoxMigrationCompatibilityMode(getenv(acornfoxenv.MigrationCompatibility))
 	if compatibilityErr != nil {
 		log.Fatal(compatibilityErr)
 	}
 	server := NewAcornFoxServer()
 	server.SetLegacyRoutesEnabled(compatibilityMode)
 	var controllerStore *postgres.Store
-	databaseURL := os.Getenv("OPEN_CARD_DATABASE_URL")
-	if err := validateFeatureHierarchy(databaseURL != "", os.Getenv("OPEN_CARD_M1_ENABLED") == "true", os.Getenv("OPEN_CARD_M2_ENABLED") == "true", os.Getenv("OPEN_CARD_M3_ENABLED") == "true", os.Getenv("OPEN_CARD_M4_ENABLED") == "true", os.Getenv("OPEN_CARD_M4_ROLLOUT_ENABLED") == "true", os.Getenv("OPEN_CARD_M5_ENABLED") == "true", os.Getenv("OPEN_CARD_M6_ENABLED") == "true"); err != nil {
+	databaseURL := getenv(acornfoxenv.DatabaseURL)
+	if err := validateFeatureHierarchy(databaseURL != "", getenv(acornfoxenv.M1Enabled) == "true", getenv(acornfoxenv.M2Enabled) == "true", getenv(acornfoxenv.M3Enabled) == "true", getenv(acornfoxenv.M4Enabled) == "true", getenv(acornfoxenv.M4RolloutEnabled) == "true", getenv(acornfoxenv.M5Enabled) == "true", getenv(acornfoxenv.M6Enabled) == "true"); err != nil {
 		log.Fatal(err)
 	}
 	if databaseURL != "" {
@@ -95,8 +89,8 @@ func main() {
 		controllerStore = store
 		server.SetSystemStatusStore(store)
 		server.SetApplicationProjectionStore(store)
-		server.SetSystemStatusNode(os.Getenv("OPEN_CARD_AGENT_DISPATCH_INSTANCE_ID"), os.Getenv("OPEN_CARD_AGENT_DISPATCH_NODE_ID"))
-		origin := strings.TrimSpace(os.Getenv("OPEN_CARD_AUTH_ORIGIN"))
+		server.SetSystemStatusNode(getenv(acornfoxenv.AgentDispatchInstanceID), getenv(acornfoxenv.AgentDispatchNodeID))
+		origin := strings.TrimSpace(getenv(acornfoxenv.AuthOrigin))
 		if origin != "" {
 			authService, authErr := auth.NewService(auth.Config{Store: store, Origin: origin})
 			if authErr != nil {
@@ -104,10 +98,10 @@ func main() {
 			}
 			server.SetAuth(&AuthHTTPHandler{Service: authService})
 		} else {
-			log.Print("administrator HTTP authentication is not activated; OPEN_CARD_AUTH_ORIGIN is unset")
+			log.Printf("administrator HTTP authentication is not activated; %s is unset", environment.Name(acornfoxenv.AuthOrigin))
 		}
-		server.SetG3Access(newG3AccessHTTPHandler(store, os.Getenv))
-		server.SetG3SourceUpload(newG3SourceUploadHTTPHandler(store, os.Getenv))
+		server.SetG3Access(newG3AccessHTTPHandler(store, getenv))
+		server.SetG3SourceUpload(newG3SourceUploadHTTPHandler(store, getenv))
 		server.AgentGateway().SetEventSink(&controllers.DurableAgentSink{Store: store})
 		var acornFoxProjector controllers.AgentEvidenceProjector
 		applicationWorker := &controllers.Worker{
@@ -120,24 +114,24 @@ func main() {
 				server.SetReady(false)
 			}
 		}()
-		if os.Getenv("OPEN_CARD_M1_ENABLED") == "true" {
-			uploadRoot := os.Getenv("OPEN_CARD_SOURCE_UPLOAD_ROOT")
-			workspaceRoot := os.Getenv("OPEN_CARD_SOURCE_WORKSPACE_ROOT")
-			buildWorkRoot := os.Getenv("OPEN_CARD_BUILD_WORK_ROOT")
+		if getenv(acornfoxenv.M1Enabled) == "true" {
+			uploadRoot := getenv(acornfoxenv.SourceUploadRoot)
+			workspaceRoot := getenv(acornfoxenv.SourceWorkspaceRoot)
+			buildWorkRoot := getenv(acornfoxenv.BuildWorkRoot)
 			for _, path := range []string{uploadRoot, workspaceRoot, buildWorkRoot} {
 				if path == "" {
 					log.Fatal("M1 source and build roots must be explicitly configured")
 				}
-				if err := os.MkdirAll(path, 0o700); err != nil {
+				if err := stdio.MkdirAll(path, 0o700); err != nil {
 					log.Fatal(err)
 				}
 			}
-			server.SetG3SourceUpload(newG3SourceUploadHTTPHandler(store, os.Getenv))
-			logRoot := os.Getenv("OPEN_CARD_LOG_ROOT")
+			server.SetG3SourceUpload(newG3SourceUploadHTTPHandler(store, getenv))
+			logRoot := getenv(acornfoxenv.LogRoot)
 			if logRoot == "" {
 				logRoot = buildWorkRoot + "/m4-logs"
 			}
-			logConfig, configErr := m4LogStoreConfig(logRoot, os.Getenv("OPEN_CARD_LOG_MAX_FILE_BYTES"), os.Getenv("OPEN_CARD_LOG_MAX_TOTAL_BYTES"))
+			logConfig, configErr := m4LogStoreConfig(logRoot, getenv, environment)
 			if configErr != nil {
 				log.Fatal(configErr)
 			}
@@ -169,12 +163,12 @@ func main() {
 					cancel()
 				}
 			}()
-			imageStore, err := imageprovider.New(imageprovider.Config{Root: os.Getenv("OPEN_CARD_OCI_STORE_ROOT")})
+			imageStore, err := imageprovider.New(imageprovider.Config{Root: getenv(acornfoxenv.OCIStoreRoot)})
 			if err != nil {
 				log.Fatal(err)
 			}
 			capacityConfig := capacity.Config{DiskPath: buildWorkRoot, BuildReserve: contracts.ResourceLimits{CPUMillis: 250, MemoryBytes: 256 << 20, DiskBytes: 512 << 20}, RuntimeReserve: contracts.ResourceLimits{CPUMillis: 250, MemoryBytes: 256 << 20, DiskBytes: 512 << 20}}
-			if value := os.Getenv("OPEN_CARD_CAPACITY_FIXED_HOST_PORT"); value != "" {
+			if value := getenv(acornfoxenv.CapacityFixedHostPort); value != "" {
 				parsed, parseErr := strconv.Atoi(value)
 				if parseErr != nil || parsed < 1 || parsed > 65535 {
 					log.Fatal("invalid fixed capacity host port")
@@ -185,11 +179,11 @@ func main() {
 			if err != nil {
 				log.Fatal(err)
 			}
-			secretProvider, err := secretprovider.New(secretprovider.Config{Root: os.Getenv("OPEN_CARD_SECRET_ROOT"), MaterialRoot: os.Getenv("OPEN_CARD_SECRET_MATERIAL_ROOT"), MasterKeyPath: os.Getenv("OPEN_CARD_SECRET_MASTER_KEY"), MaterialTTL: 2 * time.Minute})
+			secretProvider, err := secretprovider.New(secretprovider.Config{Root: getenv(acornfoxenv.SecretRoot), MaterialRoot: getenv(acornfoxenv.SecretMaterialRoot), MasterKeyPath: getenv(acornfoxenv.SecretMasterKey), MaterialTTL: 2 * time.Minute})
 			if err != nil {
 				log.Fatal(err)
 			}
-			discoveryCursorKey, err := secretprovider.DeriveExistingContextKey(os.Getenv("OPEN_CARD_SECRET_MASTER_KEY"), "acornfox-discovery-cursor-v1")
+			discoveryCursorKey, err := secretprovider.DeriveExistingContextKey(getenv(acornfoxenv.SecretMasterKey), "acornfox-discovery-cursor-v1")
 			if err != nil {
 				log.Fatal("AcornFox discovery cursor signing key is unavailable")
 			}
@@ -197,20 +191,20 @@ func main() {
 			server.SetAcornFoxDiscovery(discoveryHandler)
 			defer discoveryHandler.Close()
 			defer secretprovider.ZeroContextKey(&discoveryCursorKey)
-			workspaceCapacityBytes, workspaceCapacityEntries, workspaceOperationalReserveBytes, workspaceOperationalReserveEntries, capacityErr := sourceWorkspaceCapacityConfig(os.Getenv)
+			workspaceCapacityBytes, workspaceCapacityEntries, workspaceOperationalReserveBytes, workspaceOperationalReserveEntries, capacityErr := sourceWorkspaceCapacityConfig(getenv)
 			if capacityErr != nil {
 				log.Fatal("invalid source workspace capacity configuration")
 			}
-			sourceProvider, err := source.New(source.Config{UploadRoot: uploadRoot, WorkspaceRoot: workspaceRoot, WorkspaceCapacityBytes: workspaceCapacityBytes, WorkspaceCapacityEntries: workspaceCapacityEntries, WorkspaceOperationalReserveBytes: workspaceOperationalReserveBytes, WorkspaceOperationalReserveEntries: workspaceOperationalReserveEntries, GitResolverEndpoints: sourceGitResolverEndpoints(os.Getenv("OPEN_CARD_SOURCE_GIT_RESOLVERS"))})
+			sourceProvider, err := source.New(source.Config{UploadRoot: uploadRoot, WorkspaceRoot: workspaceRoot, WorkspaceCapacityBytes: workspaceCapacityBytes, WorkspaceCapacityEntries: workspaceCapacityEntries, WorkspaceOperationalReserveBytes: workspaceOperationalReserveBytes, WorkspaceOperationalReserveEntries: workspaceOperationalReserveEntries, GitResolverEndpoints: sourceGitResolverEndpoints(getenv(acornfoxenv.SourceGitResolvers))})
 			if err != nil {
 				log.Fatal(err)
 			}
 			server.controller.SetSourcePreparer(sourceProvider)
-			buildProvider, err := buildkit.New(buildkit.Config{Command: os.Getenv("OPEN_CARD_BUILDKIT_COMMAND"), Builder: os.Getenv("OPEN_CARD_BUILDKIT_WORKER"), Address: os.Getenv("OPEN_CARD_BUILDKIT_ADDRESS"), WorkspaceRoot: workspaceRoot, WorkRoot: buildWorkRoot, StaticServerBinary: os.Getenv("OPEN_CARD_STATIC_SERVER_BINARY"), ImageStore: imageStore, Capacity: capacityProvider, SecretResolver: secretProvider, LogSink: buildLogSink, RequireLogSink: true})
+			buildProvider, err := buildkit.New(buildkit.Config{Command: getenv(acornfoxenv.BuildkitCommand), Builder: getenv(acornfoxenv.BuildkitWorker), Address: getenv(acornfoxenv.BuildkitAddress), WorkspaceRoot: workspaceRoot, WorkRoot: buildWorkRoot, StaticServerBinary: getenv(acornfoxenv.StaticServerBinary), ImageStore: imageStore, Capacity: capacityProvider, SecretResolver: secretProvider, LogSink: buildLogSink, RequireLogSink: true})
 			if err != nil {
 				log.Fatal(err)
 			}
-			releaseController := &controllers.ReleaseController{Store: store, Source: sourceProvider, Build: buildProvider, Capacity: capacityProvider, StaticRuntimeDigest: os.Getenv("OPEN_CARD_STATIC_RUNTIME_DIGEST")}
+			releaseController := &controllers.ReleaseController{Store: store, Source: sourceProvider, Build: buildProvider, Capacity: capacityProvider, StaticRuntimeDigest: getenv(acornfoxenv.StaticRuntimeDigest)}
 			server.SetReleaseController(releaseController)
 			server.SetApplicationPublisher(store, releaseController)
 			acornFoxStore := acornFoxPostgresAdapter{store: store}
@@ -219,19 +213,19 @@ func main() {
 				Tasks: acornFoxStore, Runtime: acornFoxStore, Observer: acornFoxStore, Builder: buildProvider, Capacity: capacityProvider,
 				Config: application.AcornFoxDeliveryConfig{TargetRepository: "acornfox.local/apps", StorageKeyPrefix: "acornfox-builds"},
 			}})
-			if os.Getenv("OPEN_CARD_M2_ENABLED") == "true" {
+			if getenv(acornfoxenv.M2Enabled) == "true" {
 				registryTemp := buildWorkRoot + "/registry-config"
-				if err := os.MkdirAll(registryTemp, 0o700); err != nil {
+				if err := stdio.MkdirAll(registryTemp, 0o700); err != nil {
 					log.Fatal(err)
 				}
-				registryProvider, err := registryprovider.New(registryprovider.Config{BaseURL: os.Getenv("OPEN_CARD_M2_REGISTRY_BASE_URL"), SecretResolver: secretProvider, ImageStore: imageStore, TempRoot: registryTemp})
+				registryProvider, err := registryprovider.New(registryprovider.Config{BaseURL: getenv(acornfoxenv.M2RegistryBaseURL), SecretResolver: secretProvider, ImageStore: imageStore, TempRoot: registryTemp})
 				if err != nil {
 					log.Fatal(err)
 				}
-				m2Controller := &controllers.M2ReleaseController{Store: store, Source: sourceProvider, Build: buildProvider, Registry: registryProvider, Capacity: capacityProvider, StaticRuntimeDigest: os.Getenv("OPEN_CARD_STATIC_RUNTIME_DIGEST")}
-				server.SetM2(m2Controller, store, registryProvider, uploadRoot, os.Getenv("OPEN_CARD_RUNTIME_TASK_PREFIX"), os.Getenv("OPEN_CARD_AGENT_DISPATCH_INSTANCE_ID"), os.Getenv("OPEN_CARD_AGENT_DISPATCH_NODE_ID"))
+				m2Controller := &controllers.M2ReleaseController{Store: store, Source: sourceProvider, Build: buildProvider, Registry: registryProvider, Capacity: capacityProvider, StaticRuntimeDigest: getenv(acornfoxenv.StaticRuntimeDigest)}
+				server.SetM2(m2Controller, store, registryProvider, uploadRoot, getenv(acornfoxenv.RuntimeTaskPrefix), getenv(acornfoxenv.AgentDispatchInstanceID), getenv(acornfoxenv.AgentDispatchNodeID))
 				volumeCommand := &m2AgentVolumeCommand{store: store, capabilities: server.m2AgentCapabilities}
-				lifecycle, lifecycleErr := NewM2LifecycleHandler(store, volumeCommand, nil, os.Getenv("OPEN_CARD_RUNTIME_TASK_PREFIX"))
+				lifecycle, lifecycleErr := NewM2LifecycleHandler(store, volumeCommand, nil, getenv(acornfoxenv.RuntimeTaskPrefix))
 				if lifecycleErr != nil {
 					log.Fatal(lifecycleErr)
 				}
@@ -239,9 +233,9 @@ func main() {
 				var m3RouteProvider contracts.RouteProvider
 				routeSetFence := newRouteSetMutationFence()
 				routeMutationWorkers := newRouteMutationWorkerGroup()
-				if os.Getenv("OPEN_CARD_M3_ENABLED") == "true" {
-					production, productionErr := newM3ProductionConvergence(store, caddyprovider.Config{AdminURL: os.Getenv("OPEN_CARD_CADDY_ADMIN_URL"), Listen: os.Getenv("OPEN_CARD_CADDY_LISTEN"), Issuer: "internal"}, "control-plane-domain-convergence")
-					composition, compositionErr := resolveM3Composition(os.Getenv("OPEN_CARD_M3_COMPOSITION"), os.Getenv("OPEN_CARD_RUNTIME_TASK_PREFIX"), productionErr == nil, authorizeM3FixtureHost)
+				if getenv(acornfoxenv.M3Enabled) == "true" {
+					production, productionErr := newM3ProductionConvergence(store, caddyprovider.Config{AdminURL: getenv(acornfoxenv.CaddyAdminURL), Listen: getenv(acornfoxenv.CaddyListen), Issuer: "internal"}, "control-plane-domain-convergence")
+					composition, compositionErr := resolveM3Composition(getenv(acornfoxenv.M3Composition), getenv(acornfoxenv.RuntimeTaskPrefix), productionErr == nil, authorizeM3FixtureHost)
 					if compositionErr != nil {
 						server.SetReady(false)
 						log.Fatal(compositionErr)
@@ -279,11 +273,11 @@ func main() {
 							releaseLeader()
 						}()
 					} else {
-						caddyProvider, caddyErr := caddyprovider.New(caddyprovider.Config{AdminURL: os.Getenv("OPEN_CARD_CADDY_ADMIN_URL"), Listen: os.Getenv("OPEN_CARD_CADDY_LISTEN"), Issuer: "internal"})
+						caddyProvider, caddyErr := caddyprovider.New(caddyprovider.Config{AdminURL: getenv(acornfoxenv.CaddyAdminURL), Listen: getenv(acornfoxenv.CaddyListen), Issuer: "internal"})
 						if caddyErr != nil {
 							log.Fatal(caddyErr)
 						}
-						accessController, fixtureErr := newM3FixtureAccessController(caddyProvider, store, secretProvider, buildWorkRoot+"/m3-dns-state.json", os.Getenv("OPEN_CARD_M3_DNS_FAIL") == "true", os.Getenv("OPEN_CARD_M3_CERT_FAIL") == "true")
+						accessController, fixtureErr := newM3FixtureAccessController(caddyProvider, store, secretProvider, buildWorkRoot+"/m3-dns-state.json", getenv(acornfoxenv.M3DNSFail) == "true", getenv(acornfoxenv.M3CertFail) == "true")
 						if fixtureErr != nil {
 							log.Fatal(fixtureErr)
 						}
@@ -311,7 +305,7 @@ func main() {
 				// local RouteProvider with M3. A second Caddy adapter/cache would be a
 				// second route projection and could overwrite routes on restart.
 				// DNS/TLS remain absent from this composition.
-				if authorizedRoot := strings.TrimSpace(os.Getenv("ACORNFOX_PUBLIC_ROOT")); authorizedRoot != "" {
+				if authorizedRoot := strings.TrimSpace(getenv(acornfoxenv.PublicRoot)); authorizedRoot != "" {
 					if m3RouteProvider == nil {
 						log.Print("AcornFox public access is unavailable: an authorized root requires the configured M3 RouteProvider")
 					} else {
@@ -340,8 +334,8 @@ func main() {
 						}()
 					}
 				}
-				if os.Getenv("OPEN_CARD_M4_ENABLED") == "true" {
-					rolloutEnabled := os.Getenv("OPEN_CARD_M4_ROLLOUT_ENABLED") == "true"
+				if getenv(acornfoxenv.M4Enabled) == "true" {
+					rolloutEnabled := getenv(acornfoxenv.M4RolloutEnabled) == "true"
 					if err := validateM4RolloutComposition(rolloutEnabled, m3RouteProvider != nil, store != nil); err != nil {
 						log.Fatal(err)
 					}
@@ -351,7 +345,7 @@ func main() {
 					server.AgentGateway().SetEventSink(&controllers.DurableAgentSink{Store: store, Projector: agentEvidenceProjectorChain{acornFoxProjector, adapter}, RedactEnvelope: newAcornFoxAgentLogEnvelopeRedactor(store, redactionRoots...)})
 					operations := &controllers.M4OperationsController{Store: adapter, Runtime: &m4AgentRuntimeExecutor{store: store}}
 					server.SetM4Operations(&M4OperationsHTTPHandler{Operations: operations, Views: adapter})
-					allowM4LoopbackFixture := os.Getenv("OPEN_CARD_M4_ALLOW_LOOPBACK_WEBHOOK_FIXTURE") == "true" && os.Getenv("OPEN_CARD_RUNTIME_TASK_PREFIX") == "opencard-mvp-fa8f8eab"
+					allowM4LoopbackFixture := getenv(acornfoxenv.M4AllowLoopbackWebhookFixture) == "true" && getenv(acornfoxenv.RuntimeTaskPrefix) == "opencard-mvp-fa8f8eab"
 					notifications := &controllers.M4NotificationController{
 						Ledger:   &m4PostgresNotificationLedger{store: store, lease: 30 * time.Second},
 						Resolver: &m4WebhookProviderResolver{Secrets: secretProvider, AllowLoopbackFixture: allowM4LoopbackFixture},
@@ -363,7 +357,7 @@ func main() {
 					server.SetM4Webhooks(&M4WebhookHTTPHandler{Store: adapter, Notifications: notifications, Environments: adapter})
 					lifecycleWorker := &M4NotificationOutboxWorker{Store: store, Dispatcher: lifecycleDispatcher}
 					if rolloutEnabled {
-						rolloutInterval, intervalErr := m4RolloutInterval(os.Getenv("OPEN_CARD_M4_ROLLOUT_INTERVAL"))
+						rolloutInterval, intervalErr := m4RolloutInterval(getenv(acornfoxenv.M4RolloutInterval))
 						if intervalErr != nil {
 							log.Fatal(intervalErr)
 						}
@@ -375,7 +369,7 @@ func main() {
 						log.Print("M4 rollout coordinator is disabled; rollout mutations remain unavailable")
 					}
 					observationScheduler := &M4ObservationScheduler{Store: store, Interval: 5 * time.Second}
-					logCollectionInterval, logCollectionErr := m4LogCollectionInterval(os.Getenv("OPEN_CARD_M4_LOG_COLLECTION_INTERVAL"))
+					logCollectionInterval, logCollectionErr := m4LogCollectionInterval(getenv(acornfoxenv.M4LogCollectionInterval), environment)
 					if logCollectionErr != nil {
 						log.Fatal(logCollectionErr)
 					}
@@ -425,20 +419,20 @@ func main() {
 						}
 					}()
 				}
-				if os.Getenv("OPEN_CARD_M5_ENABLED") == "true" {
+				if getenv(acornfoxenv.M5Enabled) == "true" {
 					usageMeter := meterlocal.New(store.DB())
 					usageWorker := &M5UsageWorker{DB: store.DB(), Meter: usageMeter, Interval: time.Minute}
-					if value := os.Getenv("OPEN_CARD_M5_STORAGE_CAPACITY_BYTES"); value != "" {
+					if value := getenv(acornfoxenv.M5StorageCapacityBytes); value != "" {
 						parsed, parseErr := strconv.ParseInt(value, 10, 64)
 						if parseErr != nil || parsed <= 0 {
-							log.Fatal("OPEN_CARD_M5_STORAGE_CAPACITY_BYTES must be a positive integer")
+							log.Fatalf("%s must be a positive integer", environment.Name(acornfoxenv.M5StorageCapacityBytes))
 						}
 						usageWorker.StorageCapacity = parsed
 					}
-					if value := os.Getenv("OPEN_CARD_M5_STORAGE_HARD_RESERVE_BYTES"); value != "" {
+					if value := getenv(acornfoxenv.M5StorageHardReserveBytes); value != "" {
 						parsed, parseErr := strconv.ParseInt(value, 10, 64)
 						if parseErr != nil || parsed <= 0 {
-							log.Fatal("OPEN_CARD_M5_STORAGE_HARD_RESERVE_BYTES must be a positive integer")
+							log.Fatalf("%s must be a positive integer", environment.Name(acornfoxenv.M5StorageHardReserveBytes))
 						}
 						usageWorker.StorageHardReserve = parsed
 					}
@@ -465,18 +459,18 @@ func main() {
 						}
 					}()
 				}
-				if os.Getenv("OPEN_CARD_M6_ENABLED") == "true" {
+				if getenv(acornfoxenv.M6Enabled) == "true" {
 					m6Context, m6Cancel := context.WithTimeout(context.Background(), 30*time.Second)
 					if err := validateM6Schema(m6Context, store.DB()); err != nil {
 						m6Cancel()
 						log.Fatal(err)
 					}
 					m6Cancel()
-					workspaceRoot := os.Getenv("OPEN_CARD_M6_WORKSPACE_ROOT")
+					workspaceRoot := getenv(acornfoxenv.M6WorkspaceRoot)
 					if workspaceRoot == "" {
 						workspaceRoot = buildWorkRoot + "/m6-workspace"
 					}
-					if err := os.MkdirAll(workspaceRoot+"/drafts", 0o700); err != nil {
+					if err := stdio.MkdirAll(workspaceRoot+"/drafts", 0o700); err != nil {
 						log.Fatal(err)
 					}
 					contextBuilder := aicontext.New(aicontext.Config{MaxBytes: 64 << 10, MaxFileBytes: 16 << 10, MaxLogBytes: 24 << 10, MaxLogLines: 256, TemplateVersion: "context-v1"})
@@ -509,16 +503,16 @@ func main() {
 			}
 		}
 	} else {
-		log.Print("OPEN_CARD_DATABASE_URL is unset; using the non-persistent development repository")
+		log.Printf("%s is unset; using the non-persistent development repository", environment.Name(acornfoxenv.DatabaseURL))
 	}
-	if gatewayAddress := os.Getenv("OPEN_CARD_AGENT_GATEWAY_ADDR"); gatewayAddress != "" {
+	if gatewayAddress := getenv(acornfoxenv.AgentGatewayAddr); gatewayAddress != "" {
 		var identities []struct {
 			CertificateID string `json:"certificate_id"`
 			InstanceID    string `json:"instance_id"`
 			NodeID        string `json:"node_id"`
 		}
-		if err := json.Unmarshal([]byte(os.Getenv("OPEN_CARD_AGENT_IDENTITIES_JSON")), &identities); err != nil || len(identities) == 0 {
-			log.Fatal("OPEN_CARD_AGENT_IDENTITIES_JSON must contain at least one certificate/instance/node binding")
+		if err := json.Unmarshal([]byte(getenv(acornfoxenv.AgentIdentitiesJSON)), &identities); err != nil || len(identities) == 0 {
+			log.Fatalf("%s must contain at least one certificate/instance/node binding", environment.Name(acornfoxenv.AgentIdentitiesJSON))
 		}
 		for _, identity := range identities {
 			if err := server.AgentGateway().RegisterIdentity(identity.CertificateID, identity.InstanceID, identity.NodeID); err != nil {
@@ -526,23 +520,23 @@ func main() {
 			}
 		}
 		gatewayTLS, err := loadAgentGatewayMTLSConfig(
-			os.Getenv("OPEN_CARD_SERVER_AGENT_TLS_CA"),
-			os.Getenv("OPEN_CARD_SERVER_AGENT_TLS_CERT"),
-			os.Getenv("OPEN_CARD_SERVER_AGENT_TLS_KEY"),
+			getenv(acornfoxenv.ServerAgentTLSCA),
+			getenv(acornfoxenv.ServerAgentTLSCert),
+			getenv(acornfoxenv.ServerAgentTLSKey),
 		)
 		if err != nil {
 			log.Fatal(err)
 		}
 		gatewayServer := &http.Server{Addr: gatewayAddress, Handler: server.AgentGateway(), TLSConfig: gatewayTLS, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second}
 		go func() {
-			log.Printf("open-card Agent gateway listening with mTLS on %s", gatewayAddress)
+			log.Printf("%s Agent gateway listening with mTLS on %s", environment.ProductLabel(), gatewayAddress)
 			if err := gatewayServer.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				log.Printf("Agent gateway stopped: %v", err)
 				server.SetReady(false)
 			}
 		}()
-		dispatchInstance := os.Getenv("OPEN_CARD_AGENT_DISPATCH_INSTANCE_ID")
-		dispatchNode := os.Getenv("OPEN_CARD_AGENT_DISPATCH_NODE_ID")
+		dispatchInstance := getenv(acornfoxenv.AgentDispatchInstanceID)
+		dispatchNode := getenv(acornfoxenv.AgentDispatchNodeID)
 		if controllerStore != nil && dispatchInstance != "" && dispatchNode != "" {
 			dispatcher := &controllers.AgentDispatcher{Store: controllerStore, Queue: server.AgentGateway(), InstanceID: dispatchInstance, NodeID: dispatchNode}
 			go func() {
@@ -574,7 +568,7 @@ func main() {
 		}
 	}
 	httpServer := server.HTTPServer(address)
-	log.Printf("open-card server listening on %s", address)
+	log.Printf("%s server listening on %s", environment.ProductLabel(), address)
 	serveResult := make(chan error, 1)
 	go func() { serveResult <- httpServer.ListenAndServe() }()
 	var serveErr error
@@ -610,15 +604,15 @@ func sourceGitResolverEndpoints(raw string) []string {
 	return result
 }
 
-func sourceWorkspaceCapacityConfig(getenv func(string) string) (int64, int64, int64, int64, error) {
+func sourceWorkspaceCapacityConfig(getenv func(acornfoxenv.Key) string) (int64, int64, int64, int64, error) {
 	if getenv == nil {
 		return 0, 0, 0, 0, errors.New("source workspace environment is unavailable")
 	}
-	names := []string{
-		"OPEN_CARD_SOURCE_WORKSPACE_CAPACITY_BYTES",
-		"OPEN_CARD_SOURCE_WORKSPACE_CAPACITY_ENTRIES",
-		"OPEN_CARD_SOURCE_WORKSPACE_OPERATIONAL_RESERVE_BYTES",
-		"OPEN_CARD_SOURCE_WORKSPACE_OPERATIONAL_RESERVE_ENTRIES",
+	names := []acornfoxenv.Key{
+		acornfoxenv.SourceWorkspaceCapacityBytes,
+		acornfoxenv.SourceWorkspaceCapacityEntries,
+		acornfoxenv.SourceWorkspaceOperationalReserveBytes,
+		acornfoxenv.SourceWorkspaceOperationalReserveEntries,
 	}
 	values := [4]int64{}
 	for index, name := range names {

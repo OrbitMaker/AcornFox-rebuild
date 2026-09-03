@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/open-card/open-card/internal/acornfoxenv"
 	"github.com/open-card/open-card/internal/controllers"
 	"github.com/open-card/open-card/internal/domain"
 	"github.com/open-card/open-card/internal/persistence/postgres"
@@ -349,20 +350,20 @@ func g3PostgresIdempotency(request controllers.G3Idempotency) postgres.G3Idempot
 
 var _ controllers.G3AccessStore = (*g3PostgresAdapter)(nil)
 
-func newG3AccessHTTPHandler(store *postgres.Store, getenv func(string) string) *G3AccessHTTPHandler {
+func newG3AccessHTTPHandler(store *postgres.Store, getenv func(acornfoxenv.Key) string) *G3AccessHTTPHandler {
 	config := controllers.G3AccessConfig{
-		ExpectedPublicIP:   strings.TrimSpace(getenv("OPEN_CARD_G3_EXPECTED_PUBLIC_IP")),
-		ConsoleLabel:       strings.TrimSpace(getenv("OPEN_CARD_G3_CONSOLE_LABEL")),
-		IngressLabel:       strings.TrimSpace(getenv("OPEN_CARD_G3_INGRESS_LABEL")),
-		AppsLabel:          strings.TrimSpace(getenv("OPEN_CARD_G3_APPS_LABEL")),
-		WildcardProbeLabel: strings.TrimSpace(getenv("OPEN_CARD_G3_WILDCARD_PROBE_LABEL")),
+		ExpectedPublicIP:   strings.TrimSpace(getenv(acornfoxenv.G3ExpectedPublicIP)),
+		ConsoleLabel:       strings.TrimSpace(getenv(acornfoxenv.G3ConsoleLabel)),
+		IngressLabel:       strings.TrimSpace(getenv(acornfoxenv.G3IngressLabel)),
+		AppsLabel:          strings.TrimSpace(getenv(acornfoxenv.G3AppsLabel)),
+		WildcardProbeLabel: strings.TrimSpace(getenv(acornfoxenv.G3WildcardProbeLabel)),
 	}
-	endpoints := g3ResolverEndpoints(getenv("OPEN_CARD_G3_PUBLIC_DNS_RESOLVERS"))
+	endpoints := g3ResolverEndpoints(getenv(acornfoxenv.G3PublicDNSResolvers))
 	if len(endpoints) > 0 {
 		if verifier, err := publicdns.New(publicdns.Config{ResolverEndpoints: endpoints}); err == nil {
 			config.PublicDNSVerifier = verifier
 		} else {
-			log.Printf("G3 public DNS verifier is unavailable: %v", err)
+			log.Printf("public DNS verifier is unavailable: %v", err)
 		}
 	}
 	return &G3AccessHTTPHandler{Controller: &controllers.G3AccessController{Store: &g3PostgresAdapter{store: store}, Config: config}}

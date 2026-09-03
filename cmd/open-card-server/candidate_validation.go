@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/open-card/open-card/internal/acornfoxenv"
 	"github.com/open-card/open-card/internal/persistence/postgres"
 )
 
@@ -20,6 +21,7 @@ type candidateValidationConfig struct {
 	address             string
 	databaseURL         string
 	inheritedListenerFD bool
+	listenerLabel       string
 }
 
 type candidateListenerDependencies struct {
@@ -28,10 +30,15 @@ type candidateListenerDependencies struct {
 	listen            func(string, string) (net.Listener, error)
 }
 
-func runCandidateValidation(ctx context.Context, args []string, getenv func(string) string) error {
-	config, err := parseCandidateValidationConfig(args, getenv)
+func runCandidateValidation(ctx context.Context, args []string, environment acornfoxenv.Environment) error {
+	config, err := parseCandidateValidationConfig(args, environment.Get)
 	if err != nil {
 		return err
+	}
+	if environment.Clean() {
+		config.listenerLabel = "acornfox-candidate-listener"
+	} else {
+		config.listenerLabel = "open-card-candidate-listener"
 	}
 	connectContext, cancel := context.WithTimeout(ctx, 10*time.Second)
 	store, err := postgres.OpenStore(connectContext, config.databaseURL)
@@ -51,38 +58,38 @@ func runCandidateValidation(ctx context.Context, args []string, getenv func(stri
 	return serveCandidateValidationOnListener(ctx, listener, NewServerWithRepository(store))
 }
 
-func parseCandidateValidationConfig(args []string, getenv func(string) string) (candidateValidationConfig, error) {
+func parseCandidateValidationConfig(args []string, getenv func(acornfoxenv.Key) string) (candidateValidationConfig, error) {
 	if len(args) != 1 || args[0] != candidateValidationArgument {
 		return candidateValidationConfig{}, errors.New("unsupported server arguments")
 	}
 	if getenv == nil {
 		return candidateValidationConfig{}, errors.New("candidate validation configuration is unavailable")
 	}
-	address := strings.TrimSpace(getenv("OPEN_CARD_SERVER_ADDR"))
+	address := strings.TrimSpace(getenv(acornfoxenv.ServerAddr))
 	if err := validateCandidateValidationAddress(address); err != nil {
 		return candidateValidationConfig{}, err
 	}
-	databaseURL := strings.TrimSpace(getenv("OPEN_CARD_DATABASE_URL"))
+	databaseURL := strings.TrimSpace(getenv(acornfoxenv.DatabaseURL))
 	if databaseURL == "" {
 		return candidateValidationConfig{}, errors.New("candidate validation database is required")
 	}
-	if strings.TrimSpace(getenv("OPEN_CARD_AGENT_GATEWAY_ADDR")) != "" || strings.TrimSpace(getenv("OPEN_CARD_AUTH_ORIGIN")) != "" {
+	if strings.TrimSpace(getenv(acornfoxenv.AgentGatewayAddr)) != "" || strings.TrimSpace(getenv(acornfoxenv.AuthOrigin)) != "" {
 		return candidateValidationConfig{}, errors.New("candidate validation forbids Agent gateway and authentication origin")
 	}
-	for _, key := range []string{
-		"OPEN_CARD_M1_ENABLED",
-		"OPEN_CARD_M2_ENABLED",
-		"OPEN_CARD_M3_ENABLED",
-		"OPEN_CARD_M4_ENABLED",
-		"OPEN_CARD_M4_ROLLOUT_ENABLED",
-		"OPEN_CARD_M5_ENABLED",
-		"OPEN_CARD_M6_ENABLED",
+	for _, key := range []acornfoxenv.Key{
+		acornfoxenv.M1Enabled,
+		acornfoxenv.M2Enabled,
+		acornfoxenv.M3Enabled,
+		acornfoxenv.M4Enabled,
+		acornfoxenv.M4RolloutEnabled,
+		acornfoxenv.M5Enabled,
+		acornfoxenv.M6Enabled,
 	} {
 		if value := strings.TrimSpace(getenv(key)); value != "" && value != "false" {
 			return candidateValidationConfig{}, errors.New("candidate validation requires runtime workers to be disabled")
 		}
 	}
-	listenerFD := getenv("OPEN_CARD_CANDIDATE_LISTEN_FD")
+	listenerFD := getenv(acornfoxenv.CandidateListenFD)
 	if listenerFD != "" && listenerFD != "3" {
 		return candidateValidationConfig{}, errors.New("candidate validation accepts only inherited listener FD 3")
 	}
@@ -122,7 +129,11 @@ func candidateValidationListener(config candidateValidationConfig, dependencies 
 	if dependencies.openInheritedFile == nil || dependencies.listenerFromFile == nil {
 		return nil, errors.New("candidate validation listener is unavailable")
 	}
-	file := dependencies.openInheritedFile(3, "open-card-candidate-listener")
+	label := config.listenerLabel
+	if label == "" {
+		label = "open-card-candidate-listener"
+	}
+	file := dependencies.openInheritedFile(3, label)
 	if file == nil {
 		return nil, errors.New("candidate validation inherited listener is unavailable")
 	}
