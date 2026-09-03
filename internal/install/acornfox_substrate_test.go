@@ -175,6 +175,47 @@ func TestPublishedAcornFoxSubstrateVerifyAndDiscardAreTaskOnly(t *testing.T) {
 	}
 }
 
+func TestPublishedAcornFoxSubstrateDiscardFaultsAreUnknown(t *testing.T) {
+	for _, step := range []acornFoxSubstrateFaultStep{acornFoxSubstrateFaultDiscardRemove, acornFoxSubstrateFaultDiscardSync} {
+		t.Run(fmt.Sprintf("step_%d", step), func(t *testing.T) {
+			root := t.TempDir()
+			if err := os.Chmod(root, acornFoxStageDirMode); err != nil {
+				t.Fatal(err)
+			}
+			stager, err := NewTaskAcornFoxStager(root, os.Getuid(), os.Getgid())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer stager.Close()
+			stage, receipt, err := stager.Stage(newAcornFoxFixture(t, "1.2.3-test.1", nil).input(nil))
+			if err != nil {
+				t.Fatal(err)
+			}
+			publisher, err := NewTaskAcornFoxSubstratePublisher(root, os.Getuid(), os.Getgid())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := publisher.Publish(context.Background(), &stage, receipt.BindingSHA256); err != nil {
+				t.Fatal(err)
+			}
+			published, err := publisher.Reopen(receipt.BindingSHA256)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer published.Close()
+			published.fault = func(candidate acornFoxSubstrateFaultStep) error {
+				if candidate == step {
+					return errAcornFoxStageInjected
+				}
+				return nil
+			}
+			if err := published.Discard(); !errors.Is(err, ErrAcornFoxStageCleanupUnknown) {
+				t.Fatalf("discard=%v", err)
+			}
+		})
+	}
+}
+
 func TestTaskAcornFoxSubstratePublisherResumeFindsOnlyMatchingFreshStage(t *testing.T) {
 	root := t.TempDir()
 	if err := os.Chmod(root, acornFoxStageDirMode); err != nil {
@@ -227,7 +268,7 @@ func TestTaskAcornFoxSubstratePublisherResumeFindsOnlyMatchingFreshStage(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := acornFoxSubstrateWriteIntent(taskRoot, AcornFoxInactiveSubstrateIntentV1{SchemaVersion: InactiveSubstrateReceiptV1Schema, LayoutVersion: AcornFoxSubstrateLayoutV1, CandidateReceipt: candidate, ExpectedEntryEnvelopeSHA256: digest}, os.Getuid(), os.Getgid()); err != nil {
+	if err := acornFoxSubstrateWriteIntent(taskRoot, AcornFoxInactiveSubstrateIntentV1{SchemaVersion: InactiveSubstrateReceiptV1Schema, LayoutVersion: AcornFoxSubstrateLayoutV1, CandidateReceipt: candidate, ExpectedEntryEnvelopeSHA256: digest}, os.Getuid(), os.Getgid(), func(acornFoxSubstrateFaultStep) error { return nil }); err != nil {
 		t.Fatal(err)
 	}
 	taskRoot.Close()
@@ -284,7 +325,7 @@ func TestTaskAcornFoxSubstratePublisherResumeRejectsTamperedSourceBeforeRootfs(t
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := acornFoxSubstrateWriteIntent(task, AcornFoxInactiveSubstrateIntentV1{SchemaVersion: InactiveSubstrateReceiptV1Schema, LayoutVersion: AcornFoxSubstrateLayoutV1, CandidateReceipt: candidate, ExpectedEntryEnvelopeSHA256: digest}, os.Getuid(), os.Getgid()); err != nil {
+	if err := acornFoxSubstrateWriteIntent(task, AcornFoxInactiveSubstrateIntentV1{SchemaVersion: InactiveSubstrateReceiptV1Schema, LayoutVersion: AcornFoxSubstrateLayoutV1, CandidateReceipt: candidate, ExpectedEntryEnvelopeSHA256: digest}, os.Getuid(), os.Getgid(), func(acornFoxSubstrateFaultStep) error { return nil }); err != nil {
 		t.Fatal(err)
 	}
 	task.Close()
@@ -308,7 +349,7 @@ func TestTaskAcornFoxSubstratePublisherResumeRejectsTamperedSourceBeforeRootfs(t
 }
 
 func TestTaskAcornFoxSubstratePublisherFaultsLeaveFreshRecoveryRequired(t *testing.T) {
-	for _, step := range []acornFoxSubstrateFaultStep{acornFoxSubstrateFaultIntentCreate, acornFoxSubstrateFaultDirectoryCreate, acornFoxSubstrateFaultFileWrite, acornFoxSubstrateFaultReceiptCreate, acornFoxSubstrateFaultConsume} {
+	for _, step := range []acornFoxSubstrateFaultStep{acornFoxSubstrateFaultIntentCreate, acornFoxSubstrateFaultIntentWrite, acornFoxSubstrateFaultIntentSync, acornFoxSubstrateFaultIntentReadback, acornFoxSubstrateFaultDirectoryCreate, acornFoxSubstrateFaultDirectorySync, acornFoxSubstrateFaultFileOpen, acornFoxSubstrateFaultFileWrite, acornFoxSubstrateFaultFileSync, acornFoxSubstrateFaultFileReadback, acornFoxSubstrateFaultReceiptCreate, acornFoxSubstrateFaultReceiptWrite, acornFoxSubstrateFaultReceiptSync, acornFoxSubstrateFaultReceiptReadback, acornFoxSubstrateFaultConsume} {
 		t.Run(fmt.Sprintf("step_%d", step), func(t *testing.T) {
 			root := t.TempDir()
 			if err := os.Chmod(root, acornFoxStageDirMode); err != nil {
@@ -341,11 +382,15 @@ func TestTaskAcornFoxSubstratePublisherFaultsLeaveFreshRecoveryRequired(t *testi
 				t.Fatal(err)
 			}
 			reopened, reopenErr := fresh.Reopen(receipt.BindingSHA256)
-			if step == acornFoxSubstrateFaultConsume {
+			if step == acornFoxSubstrateFaultConsume || step == acornFoxSubstrateFaultReceiptSync || step == acornFoxSubstrateFaultReceiptReadback {
 				if reopenErr != nil {
 					t.Fatalf("terminal reopen=%v", reopenErr)
 				}
 				reopened.Close()
+			} else if step == acornFoxSubstrateFaultIntentWrite || step == acornFoxSubstrateFaultReceiptWrite {
+				if !errors.Is(reopenErr, ErrAcornFoxSubstrateConflict) {
+					t.Fatalf("conflict reopen=%v", reopenErr)
+				}
 			} else {
 				if !errors.Is(reopenErr, ErrAcornFoxSubstrateRecoveryRequired) {
 					t.Fatalf("reopen=%v", reopenErr)

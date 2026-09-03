@@ -79,7 +79,7 @@ func sha256SubstrateOpenFile(file *os.File) string {
 	return hex.EncodeToString(hash.Sum(nil))
 }
 
-func acornFoxSubstrateWriteIntent(root *os.Root, intent AcornFoxInactiveSubstrateIntentV1, uid, gid int) error {
+func acornFoxSubstrateWriteIntent(root *os.Root, intent AcornFoxInactiveSubstrateIntentV1, uid, gid int, fault func(acornFoxSubstrateFaultStep) error) error {
 	if err := root.Mkdir(acornFoxSubstrateDir, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
 		return err
 	}
@@ -98,8 +98,14 @@ func acornFoxSubstrateWriteIntent(root *os.Root, intent AcornFoxInactiveSubstrat
 	if err != nil {
 		return err
 	}
-	if _, err = file.Write(raw); err == nil {
+	if err = fault(acornFoxSubstrateFaultIntentWrite); err == nil {
+		_, err = file.Write(raw)
+	}
+	if err == nil {
 		err = file.Chmod(0o600)
+	}
+	if err == nil {
+		err = fault(acornFoxSubstrateFaultIntentSync)
 	}
 	if err == nil {
 		err = file.Chown(uid, gid)
@@ -114,10 +120,13 @@ func acornFoxSubstrateWriteIntent(root *os.Root, intent AcornFoxInactiveSubstrat
 	if err != nil {
 		return err
 	}
+	if err = fault(acornFoxSubstrateFaultIntentReadback); err != nil {
+		return err
+	}
 	return syncAcornFoxRoot(root)
 }
 
-func acornFoxSubstrateCreateDirs(root *os.Root, entries []SubstrateEntry, uid, gid int) error {
+func acornFoxSubstrateCreateDirs(root *os.Root, entries []SubstrateEntry, uid, gid int, fault func(acornFoxSubstrateFaultStep) error) error {
 	if err := root.Mkdir(acornFoxSubstrateRootfs, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
 		return err
 	}
@@ -141,6 +150,9 @@ func acornFoxSubstrateCreateDirs(root *os.Root, entries []SubstrateEntry, uid, g
 			err = file.Chown(uid, gid)
 		}
 		if err == nil {
+			err = fault(acornFoxSubstrateFaultDirectorySync)
+		}
+		if err == nil {
 			err = file.Sync()
 		}
 		closeErr := file.Close()
@@ -154,7 +166,7 @@ func acornFoxSubstrateCreateDirs(root *os.Root, entries []SubstrateEntry, uid, g
 	return syncAcornFoxRoot(root)
 }
 
-func acornFoxSubstrateCopyFiles(ctx context.Context, target, source *os.Root, entries []SubstrateEntry, candidate AcornFoxStageReceiptV1, uid, gid int) error {
+func acornFoxSubstrateCopyFiles(ctx context.Context, target, source *os.Root, entries []SubstrateEntry, candidate AcornFoxStageReceiptV1, uid, gid int, fault func(acornFoxSubstrateFaultStep) error) error {
 	prefix := "opt/acornfox/releases/" + candidate.ReleaseID + "/"
 	for index := range entries {
 		entry := &entries[index]
@@ -170,6 +182,9 @@ func acornFoxSubstrateCopyFiles(ctx context.Context, target, source *os.Root, en
 		}
 		if sourcePath == "" {
 			return errors.New("AcornFox substrate source mapping is invalid")
+		}
+		if err := fault(acornFoxSubstrateFaultFileOpen); err != nil {
+			return err
 		}
 		input, err := source.OpenFile(sourcePath, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 		if err != nil {
@@ -190,7 +205,13 @@ func acornFoxSubstrateCopyFiles(ctx context.Context, target, source *os.Root, en
 			input.Close()
 			return err
 		}
-		_, copyErr := io.CopyBuffer(output, input, make([]byte, 32*1024))
+		copyErr := fault(acornFoxSubstrateFaultFileWrite)
+		if copyErr == nil {
+			_, copyErr = io.CopyBuffer(output, input, make([]byte, 32*1024))
+		}
+		if copyErr == nil {
+			copyErr = fault(acornFoxSubstrateFaultFileSync)
+		}
 		if copyErr == nil {
 			copyErr = output.Chmod(os.FileMode(entry.Mode))
 		}
@@ -211,6 +232,9 @@ func acornFoxSubstrateCopyFiles(ctx context.Context, target, source *os.Root, en
 		if copyErr != nil {
 			return copyErr
 		}
+		if err := fault(acornFoxSubstrateFaultFileReadback); err != nil {
+			return err
+		}
 		read, err := target.ReadFile(acornFoxSubstrateTarget(entry.Path))
 		if err != nil || sha256Hex(read) != entry.SHA256 {
 			return errors.New("AcornFox substrate copy digest is invalid")
@@ -219,7 +243,7 @@ func acornFoxSubstrateCopyFiles(ctx context.Context, target, source *os.Root, en
 	return syncAcornFoxRoot(target)
 }
 
-func acornFoxSubstrateWriteReceipt(root *os.Root, receipt InactiveSubstrateReceiptV1, uid, gid int) error {
+func acornFoxSubstrateWriteReceipt(root *os.Root, receipt InactiveSubstrateReceiptV1, uid, gid int, fault func(acornFoxSubstrateFaultStep) error) error {
 	raw, err := MarshalInactiveSubstrateReceiptV1(receipt)
 	if err != nil {
 		return err
@@ -228,8 +252,14 @@ func acornFoxSubstrateWriteReceipt(root *os.Root, receipt InactiveSubstrateRecei
 	if err != nil {
 		return err
 	}
-	if _, err = file.Write(raw); err == nil {
+	if err = fault(acornFoxSubstrateFaultReceiptWrite); err == nil {
+		_, err = file.Write(raw)
+	}
+	if err == nil {
 		err = file.Chmod(0o600)
+	}
+	if err == nil {
+		err = fault(acornFoxSubstrateFaultReceiptSync)
 	}
 	if err == nil {
 		err = file.Chown(uid, gid)
@@ -242,6 +272,9 @@ func acornFoxSubstrateWriteReceipt(root *os.Root, receipt InactiveSubstrateRecei
 		err = closeErr
 	}
 	if err != nil {
+		return err
+	}
+	if err = fault(acornFoxSubstrateFaultReceiptReadback); err != nil {
 		return err
 	}
 	if err = syncAcornFoxRoot(root); err != nil {

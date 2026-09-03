@@ -74,6 +74,7 @@ type PublishedAcornFoxSubstrateV1 struct {
 	root     *os.Root
 	receipt  InactiveSubstrateReceiptV1
 	uid, gid int
+	fault    acornFoxSubstrateFault
 }
 
 func NewTaskAcornFoxSubstratePublisher(taskRoot string, uid, gid int) (*TaskAcornFoxSubstratePublisher, error) {
@@ -140,19 +141,19 @@ func (p *TaskAcornFoxSubstratePublisher) Publish(ctx context.Context, stage *Sta
 	if err := p.faultAt(acornFoxSubstrateFaultIntentCreate); err != nil {
 		return AcornFoxSubstratePublishResult{}, err
 	}
-	if err := acornFoxSubstrateWriteIntent(root, intent, p.uid, p.gid); err != nil {
+	if err := acornFoxSubstrateWriteIntent(root, intent, p.uid, p.gid, p.faultAt); err != nil {
 		return AcornFoxSubstratePublishResult{}, err
 	}
 	if err := p.faultAt(acornFoxSubstrateFaultDirectoryCreate); err != nil {
 		return AcornFoxSubstratePublishResult{}, err
 	}
-	if err := acornFoxSubstrateCreateDirs(root, entries, p.uid, p.gid); err != nil {
+	if err := acornFoxSubstrateCreateDirs(root, entries, p.uid, p.gid, p.faultAt); err != nil {
 		return AcornFoxSubstratePublishResult{}, err
 	}
 	if err := p.faultAt(acornFoxSubstrateFaultFileWrite); err != nil {
 		return AcornFoxSubstratePublishResult{}, err
 	}
-	if err := acornFoxSubstrateCopyFiles(ctx, root, source, entries, candidate, p.uid, p.gid); err != nil {
+	if err := acornFoxSubstrateCopyFiles(ctx, root, source, entries, candidate, p.uid, p.gid, p.faultAt); err != nil {
 		return AcornFoxSubstratePublishResult{}, err
 	}
 	installed, err = ComputeAcornFoxSubstrateTreeSHA256(entries)
@@ -166,7 +167,7 @@ func (p *TaskAcornFoxSubstratePublisher) Publish(ctx context.Context, stage *Sta
 	if err := p.faultAt(acornFoxSubstrateFaultReceiptCreate); err != nil {
 		return AcornFoxSubstratePublishResult{}, err
 	}
-	if err := acornFoxSubstrateWriteReceipt(root, receipt, p.uid, p.gid); err != nil {
+	if err := acornFoxSubstrateWriteReceipt(root, receipt, p.uid, p.gid, p.faultAt); err != nil {
 		return AcornFoxSubstratePublishResult{}, err
 	}
 	if err := p.faultAt(acornFoxSubstrateFaultConsume); err != nil {
@@ -221,7 +222,7 @@ func (p *TaskAcornFoxSubstratePublisher) Reopen(expectedBindingSHA256 string) (*
 	receipt, err := ParseInactiveSubstrateReceiptV1(raw)
 	if err != nil || receipt.CandidateReceipt.BindingSHA256 != expectedBindingSHA256 {
 		root.Close()
-		return nil, errors.New("AcornFox substrate receipt is invalid")
+		return nil, ErrAcornFoxSubstrateConflict
 	}
 	handle := &PublishedAcornFoxSubstrateV1{root: root, receipt: receipt, uid: p.uid, gid: p.gid}
 	if err := handle.Verify(); err != nil {
@@ -332,8 +333,18 @@ func (h *PublishedAcornFoxSubstrateV1) Discard() error {
 	if err := h.Verify(); err != nil {
 		return err
 	}
+	if h.fault != nil {
+		if err := h.fault(acornFoxSubstrateFaultDiscardRemove); err != nil {
+			return ErrAcornFoxStageCleanupUnknown
+		}
+	}
 	if err := h.root.RemoveAll(acornFoxSubstrateDir); err != nil {
 		return ErrAcornFoxStageCleanupUnknown
+	}
+	if h.fault != nil {
+		if err := h.fault(acornFoxSubstrateFaultDiscardSync); err != nil {
+			return ErrAcornFoxStageCleanupUnknown
+		}
 	}
 	if err := syncAcornFoxRoot(h.root); err != nil {
 		return ErrAcornFoxStageCleanupUnknown
