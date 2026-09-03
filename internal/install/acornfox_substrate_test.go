@@ -79,6 +79,9 @@ func TestTaskAcornFoxSubstratePublisherPublishesAndReopensInactiveRootfs(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
+	if inspection, err := publisher.Inspect(staged.BindingSHA256); err != nil || inspection.Outcome != AcornFoxReconcileAbsent {
+		t.Fatalf("empty inspect=%#v err=%v", inspection, err)
+	}
 	result, err := publisher.Publish(context.Background(), &stage, staged.BindingSHA256)
 	if err != nil || result.Outcome != AcornFoxReconcileCompleted || result.Receipt.Validate() != nil {
 		t.Fatalf("result=%#v err=%v", result, err)
@@ -90,6 +93,9 @@ func TestTaskAcornFoxSubstratePublisherPublishesAndReopensInactiveRootfs(t *test
 	defer reopened.Close()
 	if err := reopened.Verify(); err != nil {
 		t.Fatal(err)
+	}
+	if inspection, err := publisher.Inspect(staged.BindingSHA256); err != nil || inspection.Outcome != AcornFoxReconcileCompleted {
+		t.Fatalf("completed inspect=%#v err=%v", inspection, err)
 	}
 	if replay, err := publisher.Publish(context.Background(), &stage, staged.BindingSHA256); err != nil || replay.Outcome != AcornFoxReconcileCompleted {
 		t.Fatalf("replay=%#v err=%v", replay, err)
