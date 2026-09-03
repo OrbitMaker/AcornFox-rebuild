@@ -44,7 +44,7 @@ func TestTaskAcornFoxStagerStagesOneConsumedStream(t *testing.T) {
 	if err != nil || bytes.Contains(rawReceipt, []byte(taskRoot)) || bytes.Contains(rawReceipt, []byte("postgresql://")) {
 		t.Fatalf("receipt leaked private data: %q %v", rawReceipt, err)
 	}
-	info, err := handle.root.Lstat("bin/acornfox-server")
+	info, err := handle.state.root.Lstat("bin/acornfox-server")
 	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o755 || verifyOwner(info, os.Getuid(), os.Getgid()) != nil {
 		t.Fatalf("staged server=%#v err=%v", info, err)
 	}
@@ -298,7 +298,7 @@ func TestStagedAcornFoxCandidateRequiresMintedSealedReceipt(t *testing.T) {
 	forged := AcornFoxStageReceiptV1{
 		SchemaVersion: 1, Product: AcornFoxV1Product, ManifestSHA256: strings.Repeat("a", 64), ArchiveSHA256: strings.Repeat("b", 64), TreeSHA256: strings.Repeat("c", 64), FileCount: 1,
 	}
-	if (StagedAcornFoxCandidateV1{root: root, parent: root, stageName: "forged", receipt: forged}).valid() {
+	if (StagedAcornFoxCandidateV1{state: &acornFoxStageState{phase: acornFoxStageLive, root: root, parent: root, stageName: "forged", receipt: forged, uid: os.Getuid(), gid: os.Getgid()}}).valid() {
 		t.Fatal("unsealed forged receipt formed a valid handle")
 	}
 
@@ -315,7 +315,7 @@ func TestStagedAcornFoxCandidateRequiresMintedSealedReceipt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := handle.root.Remove(".acornfox-stage-complete.json"); err != nil {
+	if err := handle.state.root.Remove(".acornfox-stage-complete.json"); err != nil {
 		t.Fatal(err)
 	}
 	if handle.valid() {
@@ -352,7 +352,7 @@ func TestStagedAcornFoxCandidateCloseFailuresAreUnknown(t *testing.T) {
 				t.Fatalf("step=%s close=%v", acornFoxStageFaultName(step), err)
 			}
 			handle.state.fault = nil
-			if err := handle.Close(); err != nil {
+			if err := handle.retryCleanup(); err != nil {
 				t.Fatalf("step=%s retry close=%v", acornFoxStageFaultName(step), err)
 			}
 		})
@@ -366,12 +366,13 @@ func TestWriteAcornFoxStageCompletionNeverReplacesReceipt(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer root.Close()
-	receipt := AcornFoxStageReceiptV1{SchemaVersion: 1, Product: AcornFoxV1Product, Version: "1.2.3-test.1"}
+	receipt := substrateReceiptFixture().CandidateReceipt
 	if err := writeAcornFoxStageCompletion(root, receipt, os.Getuid(), os.Getgid(), nil); err != nil {
 		t.Fatal(err)
 	}
 	changed := receipt
 	changed.Version = "1.2.3-test.2"
+	changed.ReleaseID = "release-1.2.3-test.2"
 	if err := writeAcornFoxStageCompletion(root, changed, os.Getuid(), os.Getgid(), nil); !errors.Is(err, os.ErrExist) {
 		t.Fatalf("receipt replacement err=%v", err)
 	}
@@ -398,7 +399,7 @@ func TestTaskAcornFoxStagerHandlesOwnIndependentParents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stageA.parent == stager.root || stageB.parent == stager.root || stageA.parent == stageB.parent {
+	if stageA.state.parent == stager.root || stageB.state.parent == stager.root || stageA.state.parent == stageB.state.parent {
 		t.Fatal("handles borrowed or shared the stager parent descriptor")
 	}
 	if err := stageA.Close(); err != nil {
@@ -469,11 +470,11 @@ func TestStagedAcornFoxCandidateCloseCanRetryAfterInjectedFailure(t *testing.T) 
 				}
 				return nil
 			}
-			if err := handle.Close(); !errors.Is(err, ErrAcornFoxStageCleanupUnknown) || handle.parent == nil || (failedStep == acornFoxStageFaultHandleClose && handle.root == nil) {
+			if err := handle.Close(); !errors.Is(err, ErrAcornFoxStageCleanupUnknown) || handle.state.parent == nil || (failedStep == acornFoxStageFaultHandleClose && handle.state.root == nil) {
 				t.Fatalf("first close err=%v handle=%#v", err, handle)
 			}
 			handle.state.fault = nil
-			if err := handle.Close(); err != nil {
+			if err := handle.retryCleanup(); err != nil {
 				t.Fatalf("retry close=%v", err)
 			}
 			assertAcornFoxStageRootEmpty(t, taskRoot)
@@ -487,29 +488,29 @@ func TestAcornFoxStageCompletionRejectsCanonicalAndMetadataTampering(t *testing.
 		mutate func(*testing.T, *StagedAcornFoxCandidateV1)
 	}{
 		{"whitespace", func(t *testing.T, handle *StagedAcornFoxCandidateV1) {
-			overwriteAcornFoxStageCompletion(t, handle.root, append([]byte(" "), mustMarshalAcornFoxReceipt(t, handle.receipt)...))
+			overwriteAcornFoxStageCompletion(t, handle.state.root, append([]byte(" "), mustMarshalAcornFoxReceipt(t, handle.state.receipt)...))
 		}},
 		{"unknown_field", func(t *testing.T, handle *StagedAcornFoxCandidateV1) {
-			raw := mustMarshalAcornFoxReceipt(t, handle.receipt)
-			overwriteAcornFoxStageCompletion(t, handle.root, append(append([]byte(nil), raw[:len(raw)-1]...), []byte(`,"unknown":true}`)...))
+			raw := mustMarshalAcornFoxReceipt(t, handle.state.receipt)
+			overwriteAcornFoxStageCompletion(t, handle.state.root, append(append([]byte(nil), raw[:len(raw)-1]...), []byte(`,"unknown":true}`)...))
 		}},
 		{"duplicate_field", func(t *testing.T, handle *StagedAcornFoxCandidateV1) {
-			raw := bytes.Replace(mustMarshalAcornFoxReceipt(t, handle.receipt), []byte(`"schema_version":1,`), []byte(`"schema_version":1,"schema_version":1,`), 1)
-			overwriteAcornFoxStageCompletion(t, handle.root, raw)
+			raw := bytes.Replace(mustMarshalAcornFoxReceipt(t, handle.state.receipt), []byte(`"schema_version":1,`), []byte(`"schema_version":1,"schema_version":1,`), 1)
+			overwriteAcornFoxStageCompletion(t, handle.state.root, raw)
 		}},
 		{"field_order", func(t *testing.T, handle *StagedAcornFoxCandidateV1) {
 			var object map[string]any
-			if err := json.Unmarshal(mustMarshalAcornFoxReceipt(t, handle.receipt), &object); err != nil {
+			if err := json.Unmarshal(mustMarshalAcornFoxReceipt(t, handle.state.receipt), &object); err != nil {
 				t.Fatal(err)
 			}
 			raw, err := json.Marshal(object)
 			if err != nil {
 				t.Fatal(err)
 			}
-			overwriteAcornFoxStageCompletion(t, handle.root, raw)
+			overwriteAcornFoxStageCompletion(t, handle.state.root, raw)
 		}},
 		{"mode", func(t *testing.T, handle *StagedAcornFoxCandidateV1) {
-			file, err := handle.root.OpenFile(".acornfox-stage-complete.json", os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+			file, err := handle.state.root.OpenFile(".acornfox-stage-complete.json", os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -533,12 +534,15 @@ func TestAcornFoxStageCompletionRejectsCanonicalAndMetadataTampering(t *testing.
 			if err != nil {
 				t.Fatal(err)
 			}
-			if acornFoxStageCompletionMatches(handle.root, receipt, os.Getuid()+1, os.Getgid()) {
+			if acornFoxStageCompletionMatches(handle.state.root, receipt, os.Getuid()+1, os.Getgid()) {
 				t.Fatal("valid receipt accepted mismatched expected owner")
 			}
 			variant.mutate(t, &handle)
 			if handle.valid() {
 				t.Fatalf("tampered receipt %s remained valid", variant.name)
+			}
+			if _, err := handle.claimForPublish(); err == nil {
+				t.Fatalf("tampered receipt %s was claimable", variant.name)
 			}
 			if err := handle.Close(); err != nil {
 				t.Fatal(err)
@@ -619,11 +623,11 @@ func TestStagedAcornFoxCandidateSharedClaimLeaseAndCopies(t *testing.T) {
 func TestStagedAcornFoxCandidateClaimConsumeAndUnknownFreeze(t *testing.T) {
 	for _, finish := range []struct {
 		name  string
-		apply func(*acornFoxStagePublishLease)
+		apply func(*acornFoxStagePublishLease) error
 		want  acornFoxStagePhase
 	}{
-		{"consume", func(lease *acornFoxStagePublishLease) { lease.consume() }, acornFoxStageConsumed},
-		{"unknown", func(lease *acornFoxStagePublishLease) { lease.freezeUnknown() }, acornFoxStageUnknown},
+		{"consume", func(lease *acornFoxStagePublishLease) error { return lease.consume() }, acornFoxStageConsumed},
+		{"unknown", func(lease *acornFoxStagePublishLease) error { lease.freezeUnknown(); return nil }, acornFoxStageUnknown},
 	} {
 		t.Run(finish.name, func(t *testing.T) {
 			root := t.TempDir()
@@ -643,7 +647,9 @@ func TestStagedAcornFoxCandidateClaimConsumeAndUnknownFreeze(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			finish.apply(lease)
+			if err := finish.apply(lease); err != nil {
+				t.Fatal(err)
+			}
 			handle.state.mu.Lock()
 			phase := handle.state.phase
 			handle.state.mu.Unlock()
@@ -652,6 +658,9 @@ func TestStagedAcornFoxCandidateClaimConsumeAndUnknownFreeze(t *testing.T) {
 			}
 			if _, err := handle.claimForPublish(); err == nil {
 				t.Fatal("terminal lease phase allowed a second claim")
+			}
+			if finish.name == "consume" {
+				assertAcornFoxStageRootEmpty(t, root)
 			}
 		})
 	}

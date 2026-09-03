@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -103,19 +104,18 @@ type AcornFoxStageReceiptV1 struct {
 	TreeSHA256               string `json:"tree_sha256"`
 }
 
+func (r AcornFoxStageReceiptV1) Validate() error {
+	if r.SchemaVersion != 1 || r.Product != AcornFoxV1Product || ParseVersion(r.Version) != nil || r.ReleaseID != "release-"+r.Version || !digestPattern.MatchString(r.ManifestSHA256) || !digestPattern.MatchString(r.ArchiveSHA256) || !digestPattern.MatchString(r.BindingSHA256) || !digestPattern.MatchString(r.BundleManifestSHA256) || !digestPattern.MatchString(r.TreeSHA256) || (r.PredecessorBindingSHA256 != "" && !digestPattern.MatchString(r.PredecessorBindingSHA256)) || !regexp.MustCompile(`^[a-f0-9]{40}$`).MatchString(r.SourceCommit) || r.Architecture != AcornFoxV1Architecture || r.MigrationVersion != AcornFoxV1MigrationVersion || r.FileCount < 1 {
+		return errors.New("AcornFox stage receipt is invalid")
+	}
+	return nil
+}
+
 // StagedAcornFoxCandidateV1 is intentionally opaque. A later closed leaf may
 // consume its pinned directory descriptor, but this leaf exposes no stage path
 // and no production applier.
 type StagedAcornFoxCandidateV1 struct {
-	root      *os.Root
-	parent    *os.Root
-	stageName string
-	receipt   AcornFoxStageReceiptV1
-	uid       int
-	gid       int
-	fault     acornFoxStageFault
-	seal      *acornFoxStageSeal
-	state     *acornFoxStageState
+	state *acornFoxStageState
 }
 
 type acornFoxStagePhase uint8
@@ -159,7 +159,7 @@ func (s StagedAcornFoxCandidateV1) valid() bool {
 	s.state.mu.Lock()
 	defer s.state.mu.Unlock()
 	state := s.state
-	return state.phase == acornFoxStageLive && state.root != nil && state.parent != nil && state.stageName != "" && state.seal != nil && state.receipt.SchemaVersion == 1 && state.receipt.Product == AcornFoxV1Product && digestPattern.MatchString(state.receipt.ManifestSHA256) && digestPattern.MatchString(state.receipt.ArchiveSHA256) && digestPattern.MatchString(state.receipt.TreeSHA256) && state.receipt.FileCount > 0 && acornFoxStageCompletionMatches(state.root, state.receipt, state.uid, state.gid)
+	return state.phase == acornFoxStageLive && acornFoxStageStateComplete(state)
 }
 
 func (s *StagedAcornFoxCandidateV1) Close() error {
@@ -178,30 +178,57 @@ func (s *StagedAcornFoxCandidateV1) Close() error {
 	if state.phase == acornFoxStageUnknown {
 		return ErrAcornFoxStageCleanupUnknown
 	}
+	if err := acornFoxStageCleanup(state); err != nil {
+		state.phase = acornFoxStageUnknown
+		return ErrAcornFoxStageCleanupUnknown
+	}
+	state.phase = acornFoxStageClosed
+	return nil
+}
+
+// retryCleanup reconciles a frozen close outcome. It can only advance unknown
+// to closed; it never restores live authority or permits a publish claim.
+func (s StagedAcornFoxCandidateV1) retryCleanup() error {
+	if s.state == nil {
+		return errors.New("AcornFox stage is invalid")
+	}
+	s.state.mu.Lock()
+	defer s.state.mu.Unlock()
+	if s.state.phase != acornFoxStageUnknown {
+		return errors.New("AcornFox stage cleanup is not frozen")
+	}
+	if err := acornFoxStageCleanup(s.state); err != nil {
+		return ErrAcornFoxStageCleanupUnknown
+	}
+	s.state.phase = acornFoxStageClosed
+	return nil
+}
+
+func acornFoxStageCleanup(state *acornFoxStageState) error {
 	if state.root != nil {
 		if err := acornFoxStageRun(state.fault, acornFoxStageFaultHandleClose, state.root.Close); err != nil {
-			return ErrAcornFoxStageCleanupUnknown
+			return err
 		}
 		state.root = nil
 	}
 	if state.parent == nil || state.stageName == "" {
-		state.phase = acornFoxStageClosed
 		return nil
 	}
 	if err := acornFoxStageRun(state.fault, acornFoxStageFaultHandleRemove, func() error { return state.parent.RemoveAll(state.stageName) }); err != nil {
-		return ErrAcornFoxStageCleanupUnknown
+		return err
 	}
 	if err := acornFoxStageRun(state.fault, acornFoxStageFaultHandleSync, func() error { return syncAcornFoxRoot(state.parent) }); err != nil {
-		return ErrAcornFoxStageCleanupUnknown
+		return err
 	}
 	if err := acornFoxStageRun(state.fault, acornFoxStageFaultHandleParentClose, state.parent.Close); err != nil {
-		return ErrAcornFoxStageCleanupUnknown
+		return err
 	}
-	state.parent = nil
-	state.stageName = ""
-	state.seal = nil
-	state.phase = acornFoxStageClosed
+	state.parent, state.stageName, state.seal = nil, "", nil
 	return nil
+}
+
+func acornFoxStageStateComplete(state *acornFoxStageState) bool {
+	return state.root != nil && state.parent != nil && state.stageName != "" && state.seal != nil && state.receipt.Validate() == nil && acornFoxStageCompletionMatches(state.root, state.receipt, state.uid, state.gid)
 }
 
 func (s StagedAcornFoxCandidateV1) claimForPublish() (*acornFoxStagePublishLease, error) {
@@ -213,7 +240,7 @@ func (s StagedAcornFoxCandidateV1) claimForPublish() (*acornFoxStagePublishLease
 	if s.state.phase == acornFoxStageClaimed {
 		return nil, ErrAcornFoxStageClaimed
 	}
-	if s.state.phase != acornFoxStageLive {
+	if s.state.phase != acornFoxStageLive || !acornFoxStageStateComplete(s.state) {
 		return nil, errors.New("AcornFox stage is not live")
 	}
 	s.state.phase = acornFoxStageClaimed
@@ -226,20 +253,51 @@ func (l *acornFoxStagePublishLease) releaseFailure() {
 	}
 	l.state.mu.Lock()
 	defer l.state.mu.Unlock()
-	if l.state.phase == acornFoxStageClaimed {
+	if l.state.phase == acornFoxStageClaimed && acornFoxStageStateComplete(l.state) {
 		l.state.phase = acornFoxStageLive
+	} else if l.state.phase == acornFoxStageClaimed {
+		l.state.phase = acornFoxStageUnknown
 	}
 }
 
-func (l *acornFoxStagePublishLease) consume() {
+func (l *acornFoxStagePublishLease) consume() error {
 	if l == nil || l.state == nil {
-		return
+		return errors.New("AcornFox stage lease is invalid")
 	}
 	l.state.mu.Lock()
 	defer l.state.mu.Unlock()
 	if l.state.phase == acornFoxStageClaimed {
+		if err := acornFoxStageCleanup(l.state); err != nil {
+			l.state.phase = acornFoxStageUnknown
+			return ErrAcornFoxStageCleanupUnknown
+		}
 		l.state.phase = acornFoxStageConsumed
 	}
+	return nil
+}
+
+func (l *acornFoxStagePublishLease) receipt() (AcornFoxStageReceiptV1, bool) {
+	if l == nil || l.state == nil {
+		return AcornFoxStageReceiptV1{}, false
+	}
+	l.state.mu.Lock()
+	defer l.state.mu.Unlock()
+	return l.state.receipt, l.state.phase == acornFoxStageClaimed && acornFoxStageStateComplete(l.state)
+}
+
+// openSourceRoot returns a distinct descriptor only while the lease is held.
+// A future closed publisher can read the candidate through this capability; it
+// cannot obtain task-root paths or bypass the shared phase gate.
+func (l *acornFoxStagePublishLease) openSourceRoot() (*os.Root, error) {
+	if l == nil || l.state == nil {
+		return nil, errors.New("AcornFox stage lease is invalid")
+	}
+	l.state.mu.Lock()
+	defer l.state.mu.Unlock()
+	if l.state.phase != acornFoxStageClaimed || !acornFoxStageStateComplete(l.state) {
+		return nil, errors.New("AcornFox stage lease is not readable")
+	}
+	return l.state.root.OpenRoot(".")
 }
 
 func (l *acornFoxStagePublishLease) freezeUnknown() {
@@ -459,10 +517,7 @@ func (s *TaskAcornFoxStager) Stage(input VerifyAcornFoxCandidateArtifactsV1Input
 	}
 	stagePublished = true
 	state := &acornFoxStageState{phase: acornFoxStageLive, root: stage, parent: parent, stageName: stageName, receipt: receipt, uid: s.uid, gid: s.gid, fault: s.fault, seal: &acornFoxStageSeal{}}
-	// The direct fields preserve package-private inspection in this staging
-	// leaf; lifecycle authority belongs exclusively to state so shallow copies
-	// cannot double-close or double-claim the same capability.
-	handle = StagedAcornFoxCandidateV1{root: stage, parent: parent, stageName: stageName, receipt: receipt, uid: s.uid, gid: s.gid, fault: s.fault, seal: state.seal, state: state}
+	handle = StagedAcornFoxCandidateV1{state: state}
 	return handle, receipt, nil
 }
 
@@ -743,6 +798,9 @@ func readAcornFoxStageReceipt(root *os.Root, manifest Manifest, verified Verifie
 }
 
 func writeAcornFoxStageCompletion(root *os.Root, receipt AcornFoxStageReceiptV1, uid, gid int, fault acornFoxStageFault) error {
+	if err := receipt.Validate(); err != nil {
+		return err
+	}
 	raw, err := json.Marshal(receipt)
 	if err != nil {
 		return err
@@ -792,7 +850,7 @@ func writeAcornFoxStageCompletion(root *os.Root, receipt AcornFoxStageReceiptV1,
 }
 
 func acornFoxStageCompletionMatches(root *os.Root, receipt AcornFoxStageReceiptV1, uid, gid int) bool {
-	if root == nil {
+	if root == nil || receipt.Validate() != nil {
 		return false
 	}
 	want, err := json.Marshal(receipt)

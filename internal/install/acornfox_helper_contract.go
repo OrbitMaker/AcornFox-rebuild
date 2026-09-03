@@ -3,84 +3,62 @@ package install
 import (
 	"encoding/json"
 	"errors"
+	"regexp"
 )
 
 const AcornFoxHelperContractV1Schema = 1
 
-// HelperContractEvidenceV1 binds an inactive helper result to external
-// digests. It intentionally never embeds the binding, manifest, archive, or
-// receipt binary whose SHA-256 is referenced, avoiding circular digests.
-type HelperContractEvidenceV1 struct {
-	SchemaVersion          int    `json:"schema_version"`
-	Helper                 string `json:"helper"`
-	CandidateReceiptSHA256 string `json:"candidate_receipt_sha256"`
-	InputTreeSHA256        string `json:"input_tree_sha256"`
-	OutputSHA256           string `json:"output_sha256"`
+type AcornFoxBuildIdentityV1 struct {
+	SchemaVersion int    `json:"schema_version"`
+	Product       string `json:"product"`
+	LayoutVersion int    `json:"layout_version"`
+	Role          string `json:"role"`
+	Version       string `json:"version"`
+	ReleaseID     string `json:"release_id"`
+	SourceCommit  string `json:"source_commit"`
 }
 
-type HelperContractOutputV1 struct {
-	SchemaVersion int              `json:"schema_version"`
-	Helper        string           `json:"helper"`
-	State         string           `json:"state"`
-	TreeSHA256    string           `json:"tree_sha256"`
-	Entries       []SubstrateEntry `json:"entries"`
-}
-
-func (e HelperContractEvidenceV1) Validate() error {
-	if e.SchemaVersion != AcornFoxHelperContractV1Schema || !validAcornFoxHelperName(e.Helper) {
-		return errors.New("AcornFox helper evidence identity is invalid")
-	}
-	for _, digest := range []string{e.CandidateReceiptSHA256, e.InputTreeSHA256, e.OutputSHA256} {
-		if !digestPattern.MatchString(digest) {
-			return errors.New("AcornFox helper evidence digest is invalid")
-		}
+func (i AcornFoxBuildIdentityV1) Validate() error {
+	if i.SchemaVersion != AcornFoxHelperContractV1Schema || i.Product != AcornFoxV1Product || i.LayoutVersion != AcornFoxSubstrateLayoutV1 || (i.Role != "upgrade" && i.Role != "healthcheck") || ParseVersion(i.Version) != nil || i.ReleaseID != "release-"+i.Version || !regexp.MustCompile(`^[a-f0-9]{40}$`).MatchString(i.SourceCommit) {
+		return errors.New("AcornFox build identity is invalid")
 	}
 	return nil
 }
 
-func (o HelperContractOutputV1) Validate() error {
-	if o.SchemaVersion != AcornFoxHelperContractV1Schema || !validAcornFoxHelperName(o.Helper) || o.State != "inactive_complete" || !digestPattern.MatchString(o.TreeSHA256) {
-		return errors.New("AcornFox helper output identity is invalid")
-	}
-	return validateAcornFoxSubstrateEntries(o.Entries)
+type AcornFoxHelperContractResultV1 struct {
+	SchemaVersion          int                     `json:"schema_version"`
+	OK                     bool                    `json:"ok"`
+	Code                   string                  `json:"code"`
+	Identity               AcornFoxBuildIdentityV1 `json:"identity"`
+	BindingSHA256          string                  `json:"binding_sha256"`
+	ExecutableSHA256       string                  `json:"executable_sha256"`
+	SubstrateReceiptSHA256 string                  `json:"substrate_receipt_sha256"`
 }
 
-func ParseHelperContractEvidenceV1(raw []byte) (HelperContractEvidenceV1, error) {
-	var evidence HelperContractEvidenceV1
-	if err := strictCanonicalJSON(raw, &evidence, "AcornFox helper evidence"); err != nil {
-		return HelperContractEvidenceV1{}, err
+func (r AcornFoxHelperContractResultV1) Validate() error {
+	if r.SchemaVersion != AcornFoxHelperContractV1Schema || r.Identity.Validate() != nil || !digestPattern.MatchString(r.BindingSHA256) || !digestPattern.MatchString(r.ExecutableSHA256) || !digestPattern.MatchString(r.SubstrateReceiptSHA256) || r.Code == "" {
+		return errors.New("AcornFox helper contract result is invalid")
 	}
-	if err := evidence.Validate(); err != nil {
-		return HelperContractEvidenceV1{}, err
+	if r.OK && r.Code != "ok" {
+		return errors.New("AcornFox successful helper result code is invalid")
 	}
-	return evidence, nil
+	if !r.OK && r.Code == "ok" {
+		return errors.New("AcornFox failed helper result code is invalid")
+	}
+	return nil
 }
 
-func ParseHelperContractOutputV1(raw []byte) (HelperContractOutputV1, error) {
-	var output HelperContractOutputV1
-	if err := strictCanonicalJSON(raw, &output, "AcornFox helper output"); err != nil {
-		return HelperContractOutputV1{}, err
+func ParseAcornFoxHelperContractResultV1(raw []byte) (AcornFoxHelperContractResultV1, error) {
+	var result AcornFoxHelperContractResultV1
+	if err := strictCanonicalJSON(raw, &result, "AcornFox helper contract result"); err != nil {
+		return AcornFoxHelperContractResultV1{}, err
 	}
-	if err := output.Validate(); err != nil {
-		return HelperContractOutputV1{}, err
-	}
-	return output, nil
+	return result, result.Validate()
 }
 
-func MarshalHelperContractEvidenceV1(evidence HelperContractEvidenceV1) ([]byte, error) {
-	if err := evidence.Validate(); err != nil {
+func MarshalAcornFoxHelperContractResultV1(result AcornFoxHelperContractResultV1) ([]byte, error) {
+	if err := result.Validate(); err != nil {
 		return nil, err
 	}
-	return json.Marshal(evidence)
-}
-
-func MarshalHelperContractOutputV1(output HelperContractOutputV1) ([]byte, error) {
-	if err := output.Validate(); err != nil {
-		return nil, err
-	}
-	return json.Marshal(output)
-}
-
-func validAcornFoxHelperName(name string) bool {
-	return name == "upgrade" || name == "healthcheck"
+	return json.Marshal(result)
 }

@@ -15,12 +15,14 @@ func substrateEntry(path string, kind SubstrateEntryKind, mode uint32, role Owne
 }
 
 func substrateReceiptFixture() InactiveSubstrateReceiptV1 {
-	return InactiveSubstrateReceiptV1{
+	receipt := InactiveSubstrateReceiptV1{
 		SchemaVersion: InactiveSubstrateReceiptV1Schema, State: "inactive_complete", LayoutVersion: AcornFoxSubstrateLayoutV1,
-		CandidateReceipt:  AcornFoxStageReceiptV1{SchemaVersion: 1, Product: AcornFoxV1Product, ManifestSHA256: substrateDigest("b"), ArchiveSHA256: substrateDigest("c"), TreeSHA256: substrateDigest("d"), FileCount: 1},
-		ReleaseTreeSHA256: substrateDigest("e"), InstalledTreeSHA256: substrateDigest("f"), UpgradeHelperSHA256: substrateDigest("1"), HealthHelperSHA256: substrateDigest("2"),
-		Entries: []SubstrateEntry{substrateEntry("helpers/healthcheck", SubstrateEntryFile, 0o700, OwnerRoleHealthcheck), substrateEntry("helpers/upgrade", SubstrateEntryFile, 0o700, OwnerRoleRoot)},
+		CandidateReceipt:  AcornFoxStageReceiptV1{SchemaVersion: 1, Product: AcornFoxV1Product, Version: "1.2.3-test.1", ReleaseID: "release-1.2.3-test.1", ManifestSHA256: substrateDigest("b"), ArchiveSHA256: substrateDigest("c"), BindingSHA256: substrateDigest("d"), BundleManifestSHA256: substrateDigest("e"), SourceCommit: strings.Repeat("a", 40), Architecture: AcornFoxV1Architecture, MigrationVersion: AcornFoxV1MigrationVersion, FileCount: 1, TreeSHA256: substrateDigest("f")},
+		ReleaseTreeSHA256: substrateDigest("f"), UpgradeHelperSHA256: substrateDigest("1"), HealthHelperSHA256: substrateDigest("2"),
+		Entries: []SubstrateEntry{{Path: AcornFoxHealthcheckHelperPath, Kind: SubstrateEntryFile, Mode: 0o700, Role: OwnerRoleHealthcheck, Size: 1, SHA256: substrateDigest("2")}, {Path: AcornFoxUpgradeHelperPath, Kind: SubstrateEntryFile, Mode: 0o700, Role: OwnerRoleRoot, Size: 1, SHA256: substrateDigest("1")}},
 	}
+	receipt.InstalledTreeSHA256, _ = ComputeAcornFoxSubstrateTreeSHA256(receipt.Entries)
+	return receipt
 }
 
 func TestInactiveSubstrateReceiptV1CanonicalAndSecretFree(t *testing.T) {
@@ -83,5 +85,40 @@ func TestAcornFoxSubstrateTreeEnvelopeRejectsOrderPathModeAndDigest(t *testing.T
 	}
 	if _, err := ParseAcornFoxSubstrateTreeEnvelopeV1(alias); err == nil {
 		t.Fatal("field-order alias accepted")
+	}
+}
+
+func TestInactiveSubstrateIntentAndReconciliationOutcomesAreFixed(t *testing.T) {
+	receipt := substrateReceiptFixture()
+	intent := AcornFoxInactiveSubstrateIntentV1{SchemaVersion: InactiveSubstrateReceiptV1Schema, LayoutVersion: AcornFoxSubstrateLayoutV1, CandidateReceipt: receipt.CandidateReceipt, ExpectedEntryEnvelopeSHA256: receipt.InstalledTreeSHA256}
+	raw, err := MarshalAcornFoxInactiveSubstrateIntentV1(intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed, err := ParseAcornFoxInactiveSubstrateIntentV1(raw); err != nil || !reflect.DeepEqual(parsed, intent) {
+		t.Fatalf("parsed=%#v err=%v", parsed, err)
+	}
+	for _, outcome := range []AcornFoxReconciliationOutcome{AcornFoxReconcileAbsent, AcornFoxReconcileResume, AcornFoxReconcileCompleted, AcornFoxReconcileRecoveryRequired, AcornFoxReconcileConflict, AcornFoxReconcileCommitUnknown, AcornFoxReconcileCleanupUnknown} {
+		if err := outcome.Validate(); err != nil {
+			t.Fatalf("outcome %q: %v", outcome, err)
+		}
+	}
+	if err := AcornFoxReconciliationOutcome("mutable_journal").Validate(); err == nil {
+		t.Fatal("unknown reconciliation outcome accepted")
+	}
+}
+
+func TestInactiveSubstrateReceiptRejectsUnrelatedTreeAndHelperHashes(t *testing.T) {
+	for _, mutate := range []func(*InactiveSubstrateReceiptV1){
+		func(receipt *InactiveSubstrateReceiptV1) { receipt.InstalledTreeSHA256 = substrateDigest("9") },
+		func(receipt *InactiveSubstrateReceiptV1) { receipt.ReleaseTreeSHA256 = substrateDigest("8") },
+		func(receipt *InactiveSubstrateReceiptV1) { receipt.UpgradeHelperSHA256 = substrateDigest("7") },
+		func(receipt *InactiveSubstrateReceiptV1) { receipt.HealthHelperSHA256 = substrateDigest("6") },
+	} {
+		receipt := substrateReceiptFixture()
+		mutate(&receipt)
+		if err := receipt.Validate(); err == nil {
+			t.Fatalf("unrelated placeholder digest accepted: %#v", receipt)
+		}
 	}
 }

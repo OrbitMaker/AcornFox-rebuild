@@ -13,6 +13,11 @@ const (
 	AcornFoxSubstrateTreeV1Schema    = 1
 )
 
+const (
+	AcornFoxUpgradeHelperPath     = "helpers/upgrade"
+	AcornFoxHealthcheckHelperPath = "helpers/healthcheck"
+)
+
 // OwnerRole is a fixed role label, never a uid/gid. Receipts deliberately do
 // not carry host identity data.
 type OwnerRole string
@@ -70,7 +75,7 @@ func (r InactiveSubstrateReceiptV1) Validate() error {
 	if r.SchemaVersion != InactiveSubstrateReceiptV1Schema || r.State != "inactive_complete" || r.LayoutVersion != AcornFoxSubstrateLayoutV1 {
 		return errors.New("AcornFox inactive substrate receipt identity is invalid")
 	}
-	if !validAcornFoxStageReceipt(r.CandidateReceipt) {
+	if r.CandidateReceipt.Validate() != nil {
 		return errors.New("AcornFox inactive substrate candidate receipt is invalid")
 	}
 	for _, digest := range []string{r.ReleaseTreeSHA256, r.InstalledTreeSHA256, r.UpgradeHelperSHA256, r.HealthHelperSHA256} {
@@ -78,7 +83,21 @@ func (r InactiveSubstrateReceiptV1) Validate() error {
 			return errors.New("AcornFox inactive substrate digest is invalid")
 		}
 	}
-	return validateAcornFoxSubstrateEntries(r.Entries)
+	if r.ReleaseTreeSHA256 != r.CandidateReceipt.TreeSHA256 {
+		return errors.New("AcornFox inactive substrate release tree is not candidate-bound")
+	}
+	if err := validateAcornFoxSubstrateEntries(r.Entries); err != nil {
+		return err
+	}
+	computed, err := ComputeAcornFoxSubstrateTreeSHA256(r.Entries)
+	if err != nil || r.InstalledTreeSHA256 != computed {
+		return errors.New("AcornFox inactive substrate installed tree digest is invalid")
+	}
+	upgrade, health := substrateEntryAt(r.Entries, AcornFoxUpgradeHelperPath), substrateEntryAt(r.Entries, AcornFoxHealthcheckHelperPath)
+	if upgrade == nil || health == nil || upgrade.Kind != SubstrateEntryFile || health.Kind != SubstrateEntryFile || upgrade.Role != OwnerRoleRoot || health.Role != OwnerRoleHealthcheck || upgrade.SHA256 != r.UpgradeHelperSHA256 || health.SHA256 != r.HealthHelperSHA256 {
+		return errors.New("AcornFox inactive substrate helper entries are invalid")
+	}
+	return nil
 }
 
 func (e AcornFoxSubstrateTreeEnvelopeV1) Validate() error {
@@ -104,6 +123,18 @@ func MarshalAcornFoxSubstrateTreeEnvelopeV1(envelope AcornFoxSubstrateTreeEnvelo
 		return nil, err
 	}
 	return json.Marshal(envelope)
+}
+
+// ComputeAcornFoxSubstrateTreeSHA256 is the single tree digest definition for
+// inactive substrate contracts. The envelope bytes are canonical and entries
+// are already required to be strictly sorted; no caller-controlled hash shape
+// exists here.
+func ComputeAcornFoxSubstrateTreeSHA256(entries []SubstrateEntry) (string, error) {
+	raw, err := MarshalAcornFoxSubstrateTreeEnvelopeV1(AcornFoxSubstrateTreeEnvelopeV1{SchemaVersion: AcornFoxSubstrateTreeV1Schema, Entries: entries})
+	if err != nil {
+		return "", err
+	}
+	return sha256Hex(raw), nil
 }
 
 func MarshalInactiveSubstrateReceiptV1(receipt InactiveSubstrateReceiptV1) ([]byte, error) {
@@ -146,11 +177,17 @@ func validateAcornFoxSubstrateEntry(entry SubstrateEntry) error {
 	if entry.Kind != SubstrateEntryFile && entry.Kind != SubstrateEntryDirectory {
 		return errors.New("kind is invalid")
 	}
-	if entry.Mode > 0o777 || entry.Mode&0o022 != 0 || !validAcornFoxOwnerRole(entry.Role) || entry.Size < 0 || !digestPattern.MatchString(entry.SHA256) {
+	if entry.Mode > 0o777 || entry.Mode&0o022 != 0 || !validAcornFoxOwnerRole(entry.Role) || entry.Size < 0 {
 		return errors.New("metadata is invalid")
 	}
-	if entry.Kind == SubstrateEntryDirectory && (entry.Size != 0 || entry.Mode != 0o700) {
-		return errors.New("directory metadata is invalid")
+	if entry.Kind == SubstrateEntryDirectory {
+		if entry.Size != 0 || entry.SHA256 != "" || (entry.Mode != 0o700 && entry.Mode != 0o750 && entry.Mode != 0o755) {
+			return errors.New("directory metadata is invalid")
+		}
+		return nil
+	}
+	if !digestPattern.MatchString(entry.SHA256) || !validAcornFoxSubstrateFileMode(entry.Mode) {
+		return errors.New("file metadata is invalid")
 	}
 	return nil
 }
@@ -164,6 +201,65 @@ func validAcornFoxOwnerRole(role OwnerRole) bool {
 	}
 }
 
-func validAcornFoxStageReceipt(receipt AcornFoxStageReceiptV1) bool {
-	return receipt.SchemaVersion == 1 && receipt.Product == AcornFoxV1Product && digestPattern.MatchString(receipt.ManifestSHA256) && digestPattern.MatchString(receipt.ArchiveSHA256) && digestPattern.MatchString(receipt.TreeSHA256) && receipt.FileCount > 0
+func validAcornFoxSubstrateFileMode(mode uint32) bool {
+	return mode == 0o600 || mode == 0o640 || mode == 0o644 || mode == 0o700 || mode == 0o750 || mode == 0o755
+}
+
+func substrateEntryAt(entries []SubstrateEntry, path string) *SubstrateEntry {
+	for index := range entries {
+		if entries[index].Path == path {
+			return &entries[index]
+		}
+	}
+	return nil
+}
+
+type AcornFoxInactiveSubstrateIntentV1 struct {
+	SchemaVersion               int                    `json:"schema_version"`
+	LayoutVersion               int                    `json:"layout_version"`
+	CandidateReceipt            AcornFoxStageReceiptV1 `json:"candidate_receipt"`
+	ExpectedEntryEnvelopeSHA256 string                 `json:"expected_entry_envelope_sha256"`
+}
+
+func (i AcornFoxInactiveSubstrateIntentV1) Validate() error {
+	if i.SchemaVersion != InactiveSubstrateReceiptV1Schema || i.LayoutVersion != AcornFoxSubstrateLayoutV1 || i.CandidateReceipt.Validate() != nil || !digestPattern.MatchString(i.ExpectedEntryEnvelopeSHA256) {
+		return errors.New("AcornFox inactive substrate intent is invalid")
+	}
+	return nil
+}
+
+func ParseAcornFoxInactiveSubstrateIntentV1(raw []byte) (AcornFoxInactiveSubstrateIntentV1, error) {
+	var intent AcornFoxInactiveSubstrateIntentV1
+	if err := strictCanonicalJSON(raw, &intent, "AcornFox inactive substrate intent"); err != nil {
+		return AcornFoxInactiveSubstrateIntentV1{}, err
+	}
+	return intent, intent.Validate()
+}
+
+func MarshalAcornFoxInactiveSubstrateIntentV1(intent AcornFoxInactiveSubstrateIntentV1) ([]byte, error) {
+	if err := intent.Validate(); err != nil {
+		return nil, err
+	}
+	return json.Marshal(intent)
+}
+
+type AcornFoxReconciliationOutcome string
+
+const (
+	AcornFoxReconcileAbsent           AcornFoxReconciliationOutcome = "absent"
+	AcornFoxReconcileResume           AcornFoxReconciliationOutcome = "resume"
+	AcornFoxReconcileCompleted        AcornFoxReconciliationOutcome = "completed"
+	AcornFoxReconcileRecoveryRequired AcornFoxReconciliationOutcome = "recovery_required"
+	AcornFoxReconcileConflict         AcornFoxReconciliationOutcome = "conflict"
+	AcornFoxReconcileCommitUnknown    AcornFoxReconciliationOutcome = "commit_unknown"
+	AcornFoxReconcileCleanupUnknown   AcornFoxReconciliationOutcome = "cleanup_unknown"
+)
+
+func (o AcornFoxReconciliationOutcome) Validate() error {
+	switch o {
+	case AcornFoxReconcileAbsent, AcornFoxReconcileResume, AcornFoxReconcileCompleted, AcornFoxReconcileRecoveryRequired, AcornFoxReconcileConflict, AcornFoxReconcileCommitUnknown, AcornFoxReconcileCleanupUnknown:
+		return nil
+	default:
+		return errors.New("AcornFox reconciliation outcome is invalid")
+	}
 }

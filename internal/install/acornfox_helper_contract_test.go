@@ -2,33 +2,25 @@ package install
 
 import (
 	"bytes"
-	"reflect"
+	"strings"
 	"testing"
 )
 
 func TestAcornFoxHelperContractsAreStrictAndExternalDigestBound(t *testing.T) {
-	evidence := HelperContractEvidenceV1{SchemaVersion: AcornFoxHelperContractV1Schema, Helper: "upgrade", CandidateReceiptSHA256: substrateDigest("a"), InputTreeSHA256: substrateDigest("b"), OutputSHA256: substrateDigest("c")}
-	raw, err := MarshalHelperContractEvidenceV1(evidence)
+	result := AcornFoxHelperContractResultV1{SchemaVersion: AcornFoxHelperContractV1Schema, OK: true, Code: "ok", Identity: AcornFoxBuildIdentityV1{SchemaVersion: AcornFoxHelperContractV1Schema, Product: AcornFoxV1Product, LayoutVersion: AcornFoxSubstrateLayoutV1, Role: "upgrade", Version: "1.2.3-test.1", ReleaseID: "release-1.2.3-test.1", SourceCommit: strings.Repeat("a", 40)}, BindingSHA256: substrateDigest("a"), ExecutableSHA256: substrateDigest("b"), SubstrateReceiptSHA256: substrateDigest("c")}
+	raw, err := MarshalAcornFoxHelperContractResultV1(result)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if parsed, err := ParseHelperContractEvidenceV1(raw); err != nil || parsed != evidence {
+	if parsed, err := ParseAcornFoxHelperContractResultV1(raw); err != nil || parsed != result {
 		t.Fatalf("parsed=%#v err=%v", parsed, err)
 	}
-	if bytes.Contains(raw, []byte("archive")) || bytes.Contains(raw, []byte("manifest")) || bytes.Contains(raw, []byte("binding")) {
-		t.Fatalf("evidence embeds circular binary topology: %s", raw)
+	if bytes.Contains(raw, []byte("archive")) || bytes.Contains(raw, []byte("manifest")) || bytes.Contains(raw, []byte("receipt_content")) {
+		t.Fatalf("result embeds circular binary topology: %s", raw)
 	}
-	output := HelperContractOutputV1{SchemaVersion: AcornFoxHelperContractV1Schema, Helper: "healthcheck", State: "inactive_complete", TreeSHA256: substrateDigest("d"), Entries: []SubstrateEntry{substrateEntry("helpers/healthcheck", SubstrateEntryFile, 0o700, OwnerRoleHealthcheck)}}
-	outputRaw, err := MarshalHelperContractOutputV1(output)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if parsed, err := ParseHelperContractOutputV1(outputRaw); err != nil || !reflect.DeepEqual(parsed, output) {
-		t.Fatalf("parsed=%#v err=%v", parsed, err)
-	}
-	for _, invalid := range [][]byte{append(outputRaw, '\n'), append(append([]byte(nil), outputRaw[:len(outputRaw)-1]...), []byte(`,"unknown":true}`)...)} {
-		if _, err := ParseHelperContractOutputV1(invalid); err == nil {
-			t.Fatalf("noncanonical output accepted: %s", invalid)
+	for _, invalid := range [][]byte{append(raw, '\n'), append(append([]byte(nil), raw[:len(raw)-1]...), []byte(`,"unknown":true}`)...)} {
+		if _, err := ParseAcornFoxHelperContractResultV1(invalid); err == nil {
+			t.Fatalf("noncanonical result accepted: %s", invalid)
 		}
 	}
 }

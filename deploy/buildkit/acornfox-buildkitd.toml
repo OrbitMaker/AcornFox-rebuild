@@ -2,12 +2,12 @@
 # config/acornfox-buildkitd.toml and is intentionally offline with no remote
 # endpoints or host-specific credentials.
 root = "/var/lib/acornfox/buildkit/buildkitd"
-max-parallelism = 1
 
 [worker.oci]
   enabled = true
   rootless = true
   snapshotter = "native"
+  max-parallelism = 1
 
 [worker.containerd]
   enabled = false
