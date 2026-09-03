@@ -235,3 +235,72 @@ func TestTaskAcornFoxSubstratePublisherResumeFindsOnlyMatchingFreshStage(t *test
 		t.Fatalf("resume=%#v err=%v", result, err)
 	}
 }
+
+func TestTaskAcornFoxSubstratePublisherResumeRejectsTamperedSourceBeforeRootfs(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, acornFoxStageDirMode); err != nil {
+		t.Fatal(err)
+	}
+	stager, err := NewTaskAcornFoxStager(root, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stager.Close()
+	stage, staged, err := stager.Stage(newAcornFoxFixture(t, "1.2.3-test.1", nil).input(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	publisher, err := NewTaskAcornFoxSubstratePublisher(root, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := stage.claimForPublish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate, _ := lease.receipt()
+	source, err := lease.openSourceRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := acornFoxSubstrateManifest(source, candidate)
+	source.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err = lease.openSourceRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err := acornFoxSubstrateEntries(source, candidate, manifest)
+	source.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, _ := ComputeAcornFoxSubstrateTreeSHA256(entries)
+	task, err := os.OpenRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := acornFoxSubstrateWriteIntent(task, AcornFoxInactiveSubstrateIntentV1{SchemaVersion: InactiveSubstrateReceiptV1Schema, LayoutVersion: AcornFoxSubstrateLayoutV1, CandidateReceipt: candidate, ExpectedEntryEnvelopeSHA256: digest}, os.Getuid(), os.Getgid()); err != nil {
+		t.Fatal(err)
+	}
+	task.Close()
+	file, err := stage.state.root.OpenFile("bin/acornfox-server", os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteAt([]byte("x"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	lease.releaseFailure()
+	if _, err := publisher.Resume(context.Background(), staged.BindingSHA256); err == nil {
+		t.Fatal("tampered source resumed into rootfs")
+	}
+	if _, err := os.Stat(root + "/substrate/rootfs"); !os.IsNotExist(err) {
+		t.Fatalf("tampered resume created rootfs: %v", err)
+	}
+}

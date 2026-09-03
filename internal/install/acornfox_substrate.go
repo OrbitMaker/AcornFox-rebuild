@@ -314,9 +314,17 @@ func acornFoxSubstrateEntries(source *os.Root, candidate AcornFoxStageReceiptV1,
 	add := func(path string, mode uint32, digest string, size int64) {
 		entries = append(entries, SubstrateEntry{Path: path, Kind: SubstrateEntryFile, Mode: mode, Role: OwnerRoleRoot, Group: GroupRoleRoot, Size: size, SHA256: digest})
 	}
-	add(prefix+"manifest.json", 0o644, candidate.ManifestSHA256, 0)
+	if size, err := acornFoxSubstrateSourceEvidence(source, "manifest.json", 0o644, candidate.ManifestSHA256); err != nil {
+		return nil, err
+	} else {
+		add(prefix+"manifest.json", 0o644, candidate.ManifestSHA256, size)
+	}
 	for _, file := range manifest.Files {
-		add(prefix+file.Path, file.Mode, file.SHA256, 0)
+		size, err := acornFoxSubstrateSourceEvidence(source, file.Path, file.Mode, file.SHA256)
+		if err != nil {
+			return nil, err
+		}
+		add(prefix+file.Path, file.Mode, file.SHA256, size)
 	}
 	for path, entry := range acornFoxFixedSubstrateEntries(candidate) {
 		entries = append(entries, entry)
@@ -324,7 +332,7 @@ func acornFoxSubstrateEntries(source *os.Root, candidate AcornFoxStageReceiptV1,
 			sourcePath := acornFoxInstalledSource(candidate, path)
 			sourceEntry := substrateEntryAt(entries, prefix+sourcePath)
 			if sourceEntry != nil {
-				entries[len(entries)-1].SHA256 = sourceEntry.SHA256
+				entries[len(entries)-1].SHA256, entries[len(entries)-1].Size = sourceEntry.SHA256, sourceEntry.Size
 			}
 		}
 	}
@@ -352,4 +360,18 @@ func acornFoxSubstrateEntries(source *os.Root, candidate AcornFoxStageReceiptV1,
 		return nil, err
 	}
 	return entries, nil
+}
+
+func acornFoxSubstrateSourceEvidence(root *os.Root, path string, mode uint32, digest string) (int64, error) {
+	file, err := root.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return 0, err
+	}
+	info, statErr := file.Stat()
+	actual := sha256SubstrateOpenFile(file)
+	closeErr := file.Close()
+	if statErr != nil || closeErr != nil || !info.Mode().IsRegular() || info.Mode().Perm() != os.FileMode(mode) || actual != digest {
+		return 0, errors.New("AcornFox substrate source evidence is invalid")
+	}
+	return info.Size(), nil
 }
