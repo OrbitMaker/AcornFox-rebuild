@@ -494,6 +494,19 @@ func (m Manifest) Validate() error {
 	if m.Product != ManifestProduct {
 		return fmt.Errorf("manifest product %q is not %q", m.Product, ManifestProduct)
 	}
+	if err := validateManifestIdentityStructure(m); err != nil {
+		return err
+	}
+	if err := validateLegacyManifestLineage(m); err != nil {
+		return err
+	}
+	return validateManifestContentStructure(m)
+}
+
+// validateManifestIdentityStructure contains the product-neutral manifest
+// fields shared by retained bundles and future closed-product validators.
+// Callers remain responsible for choosing their product and lineage policy.
+func validateManifestIdentityStructure(m Manifest) error {
 	if err := ParseVersion(m.Version); err != nil {
 		return err
 	}
@@ -511,6 +524,12 @@ func (m Manifest) Validate() error {
 	if m.SourceCommit != "" && !regexp.MustCompile(`^[a-f0-9]{40}$`).MatchString(m.SourceCommit) {
 		return errors.New("manifest source_commit is invalid")
 	}
+	return nil
+}
+
+// validateLegacyManifestLineage intentionally preserves the frozen Open Card
+// RC lineage semantics. Do not share this policy with a new product.
+func validateLegacyManifestLineage(m Manifest) error {
 	if m.Version == "0.8.0-rc.0" && m.MigrationVersion == "0023" {
 		if m.SourceCommit != RC0SourceCommit || m.NMinusOne != nil {
 			return errors.New("rc0 manifest lineage is invalid")
@@ -556,6 +575,12 @@ func (m Manifest) Validate() error {
 	} else if m.SourceCommit != "" {
 		return errors.New("only rc0/0023, rc1/0024, rc2/0024 and rc3/0024 manifests may carry source_commit")
 	}
+	return nil
+}
+
+// validateManifestContentStructure contains only product-neutral protocol,
+// filesystem and declared-file structural checks.
+func validateManifestContentStructure(m Manifest) error {
 	if _, err := NormalizeProtocolVersion(m.Protocol); err != nil {
 		return errors.New("manifest protocol is invalid")
 	}
