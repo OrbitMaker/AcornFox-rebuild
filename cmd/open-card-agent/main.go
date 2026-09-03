@@ -35,9 +35,9 @@ func main() {
 
 func run(environment acornfoxenv.Environment) {
 	getenv := environment.Get
-	address := getenv(acornfoxenv.AgentAddr)
-	if address == "" {
-		address = "127.0.0.1:8091"
+	address, addressErr := resolveAgentListenerAddress(environment)
+	if addressErr != nil {
+		log.Fatal(addressErr)
 	}
 	instanceID := getenv(acornfoxenv.InstanceID)
 	if instanceID == "" {
@@ -69,6 +69,20 @@ func run(environment acornfoxenv.Environment) {
 	if err := server.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
+}
+
+func resolveAgentListenerAddress(environment acornfoxenv.Environment) (string, error) {
+	address := environment.Get(acornfoxenv.AgentAddr)
+	if !environment.Clean() {
+		if address == "" {
+			return "127.0.0.1:8091", nil
+		}
+		return address, nil
+	}
+	if address == "" || address == "127.0.0.1:8091" {
+		return "127.0.0.1:8091", nil
+	}
+	return "", errors.New("AcornFox clean runtime listener is invalid")
 }
 
 func runOutboundAgent(controlPlaneURL, instanceID, nodeID, version string, environment acornfoxenv.Environment) {

@@ -56,9 +56,13 @@ func main() {
 		return
 	}
 	getenv := environment.Get
-	address := getenv(acornfoxenv.ServerAddr)
-	if address == "" {
-		address = "127.0.0.1:8080"
+	address, addressErr := resolveServerListenerAddress(environment)
+	if addressErr != nil {
+		log.Fatal(addressErr)
+	}
+	gatewayAddress, gatewayAddressErr := resolveAgentGatewayListenerAddress(environment)
+	if gatewayAddressErr != nil {
+		log.Fatal(gatewayAddressErr)
 	}
 	compatibilityMode, compatibilityErr := acornFoxMigrationCompatibilityMode(getenv(acornfoxenv.MigrationCompatibility))
 	if compatibilityErr != nil {
@@ -505,7 +509,7 @@ func main() {
 	} else {
 		log.Printf("%s is unset; using the non-persistent development repository", environment.Name(acornfoxenv.DatabaseURL))
 	}
-	if gatewayAddress := getenv(acornfoxenv.AgentGatewayAddr); gatewayAddress != "" {
+	if gatewayAddress != "" {
 		var identities []struct {
 			CertificateID string `json:"certificate_id"`
 			InstanceID    string `json:"instance_id"`
@@ -588,6 +592,28 @@ func main() {
 		log.Fatal(serveErr)
 	}
 	_ = server.Shutdown(context.Background())
+}
+
+func resolveServerListenerAddress(environment acornfoxenv.Environment) (string, error) {
+	address := environment.Get(acornfoxenv.ServerAddr)
+	if !environment.Clean() {
+		if address == "" {
+			return "127.0.0.1:8080", nil
+		}
+		return address, nil
+	}
+	if address == "" || address == "127.0.0.1:18481" {
+		return "127.0.0.1:18481", nil
+	}
+	return "", errors.New("AcornFox clean runtime listener is invalid")
+}
+
+func resolveAgentGatewayListenerAddress(environment acornfoxenv.Environment) (string, error) {
+	address := environment.Get(acornfoxenv.AgentGatewayAddr)
+	if !environment.Clean() || address == "" || address == "127.0.0.1:8092" {
+		return address, nil
+	}
+	return "", errors.New("AcornFox clean runtime listener is invalid")
 }
 
 // sourceGitResolverEndpoints has no default: an empty value leaves public Git
