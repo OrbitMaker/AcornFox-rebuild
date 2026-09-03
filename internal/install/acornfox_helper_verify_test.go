@@ -17,7 +17,7 @@ func (i helperReceiptInfo) Name() string       { return "receipt" }
 func (i helperReceiptInfo) Size() int64        { return 1 }
 func (i helperReceiptInfo) Mode() os.FileMode  { return i.mode }
 func (i helperReceiptInfo) ModTime() time.Time { return time.Time{} }
-func (i helperReceiptInfo) IsDir() bool        { return false }
+func (i helperReceiptInfo) IsDir() bool        { return i.mode.IsDir() }
 func (i helperReceiptInfo) Sys() any           { return &syscall.Stat_t{Uid: i.uid, Gid: 0, Nlink: 1} }
 
 func TestAcornFoxHelperVerifierReturnsOnlyCompleteEvidence(t *testing.T) {
@@ -92,5 +92,20 @@ func TestAcornFoxHelperVerifierReturnsOnlyCompleteEvidence(t *testing.T) {
 	mismatchIdentity.SourceCommit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	if got := verifyAcornFoxHelperContract(mismatchIdentity, deps); got.Code != AcornFoxHelperCodeBindingMismatch || got.Identity != nil {
 		t.Fatalf("binding mismatch=%#v", got)
+	}
+}
+
+func TestAcornFoxHelperReceiptParentMetadataRejectsUnsafeDirectories(t *testing.T) {
+	for _, info := range []os.FileInfo{
+		helperReceiptInfo{mode: os.ModeDir | 0o755, uid: 0},
+		helperReceiptInfo{mode: os.ModeDir | 0o700, uid: 0},
+		helperReceiptInfo{mode: os.ModeDir | os.ModeSymlink | 0o755, uid: 0},
+		helperReceiptInfo{mode: os.ModeDir | 0o755, uid: 1},
+	} {
+		got := safeAcornFoxHelperReceiptParentInfo(info)
+		want := info.Mode().Perm() == 0o755 && info.Mode()&os.ModeSymlink == 0 && info.Sys().(*syscall.Stat_t).Uid == 0
+		if got != want {
+			t.Fatalf("info=%#v got=%t want=%t", info, got, want)
+		}
 	}
 }

@@ -27,7 +27,18 @@ func VerifyProductionAcornFoxHelperContract(identity AcornFoxBuildIdentityV1) Ac
 	if identity.Validate() != nil {
 		return fail(AcornFoxHelperCodeIdentityMismatch)
 	}
-	root, err := os.OpenRoot("/var/lib/acornfox/install/releases")
+	const receiptParent = "/var/lib/acornfox/install/releases"
+	if ensureNoSymlinkBetween("/var/lib", receiptParent) != nil {
+		return fail(AcornFoxHelperCodeReceiptInvalid)
+	}
+	parentInfo, err := os.Lstat(receiptParent)
+	if err != nil {
+		return fail(AcornFoxHelperCodeReceiptUnavailable)
+	}
+	if !safeAcornFoxHelperReceiptParentInfo(parentInfo) {
+		return fail(AcornFoxHelperCodeReceiptInvalid)
+	}
+	root, err := os.OpenRoot(receiptParent)
 	if err != nil {
 		return fail(AcornFoxHelperCodeReceiptUnavailable)
 	}
@@ -38,7 +49,7 @@ func VerifyProductionAcornFoxHelperContract(identity AcornFoxBuildIdentityV1) Ac
 	}
 	directoryInfo, statErr := directory.Stat()
 	closeErr := directory.Close()
-	if statErr != nil || closeErr != nil || directoryInfo == nil || !directoryInfo.IsDir() || !safeAcornFoxHelperOwner(directoryInfo) {
+	if statErr != nil || closeErr != nil || directoryInfo == nil || !os.SameFile(parentInfo, directoryInfo) || !safeAcornFoxHelperReceiptParentInfo(directoryInfo) {
 		return fail(AcornFoxHelperCodeReceiptInvalid)
 	}
 	file, err := root.OpenFile(identity.ReleaseID+".json", os.O_RDONLY|syscall.O_NOFOLLOW, 0)
@@ -136,6 +147,10 @@ func safeAcornFoxHelperReceiptInfo(info os.FileInfo) bool {
 func safeAcornFoxHelperOwner(info os.FileInfo) bool {
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	return ok && stat.Uid == 0 && stat.Gid == 0 && info.Mode().Perm()&0o022 == 0
+}
+
+func safeAcornFoxHelperReceiptParentInfo(info os.FileInfo) bool {
+	return info != nil && info.Mode()&os.ModeSymlink == 0 && info.IsDir() && info.Mode().Perm() == 0o755 && safeAcornFoxHelperOwner(info)
 }
 func safeAcornFoxHelperExecutableInfo(info os.FileInfo) bool {
 	return info != nil && info.Mode().IsRegular() && info.Mode().Perm()&0o111 != 0 && info.Size() >= 1 && info.Size() <= acornFoxHelperExecutableMaxBytes && safeAcornFoxHelperOwner(info)
