@@ -13,6 +13,61 @@ import (
 	"syscall"
 )
 
+type acornFoxSubstrateTaskLock struct{ file *os.File }
+
+func (p *TaskAcornFoxSubstratePublisher) lock() (*acornFoxSubstrateTaskLock, error) {
+	root, err := os.OpenRoot(p.rootPath)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	if err := root.Mkdir(acornFoxSubstrateDir, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+		return nil, err
+	}
+	file, err := root.OpenFile(acornFoxSubstrateLock, os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW, 0o600)
+	if errors.Is(err, os.ErrNotExist) {
+		if mkdirErr := root.Mkdir(acornFoxSubstrateDir, 0o700); mkdirErr != nil && !errors.Is(mkdirErr, os.ErrExist) {
+			return nil, mkdirErr
+		}
+		file, err = root.OpenFile(acornFoxSubstrateLock, os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW, 0o600)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err = file.Chmod(0o600); err == nil {
+		err = file.Chown(p.uid, p.gid)
+	}
+	if err == nil {
+		info, statErr := file.Stat()
+		if statErr != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 || verifyOwner(info, p.uid, p.gid) != nil {
+			err = errors.New("AcornFox substrate lock is unsafe")
+		}
+	}
+	if err != nil {
+		file.Close()
+		return nil, err
+	}
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX); err != nil {
+		file.Close()
+		return nil, err
+	}
+	return &acornFoxSubstrateTaskLock{file: file}, nil
+}
+
+func (l *acornFoxSubstrateTaskLock) Close() error {
+	if l == nil || l.file == nil {
+		return nil
+	}
+	file := l.file
+	l.file = nil
+	unlockErr := syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+	closeErr := file.Close()
+	if unlockErr != nil {
+		return unlockErr
+	}
+	return closeErr
+}
+
 func sha256SubstrateOpenFile(file *os.File) string {
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return ""

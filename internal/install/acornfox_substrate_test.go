@@ -3,8 +3,60 @@ package install
 import (
 	"context"
 	"os"
+	"sync"
 	"testing"
 )
+
+func TestTaskAcornFoxSubstratePublisherSerializesConcurrentSameBinding(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, acornFoxStageDirMode); err != nil {
+		t.Fatal(err)
+	}
+	stager, err := NewTaskAcornFoxStager(root, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stager.Close()
+	fixture := newAcornFoxFixture(t, "1.2.3-test.1", nil)
+	first, receipt, err := stager.Stage(fixture.input(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, _, err := stager.Stage(fixture.input(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	publisher, err := NewTaskAcornFoxSubstratePublisher(root, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wait sync.WaitGroup
+	outcomes := make(chan AcornFoxSubstratePublishResult, 2)
+	failures := make(chan error, 2)
+	for _, stage := range []*StagedAcornFoxCandidateV1{&first, &second} {
+		wait.Add(1)
+		go func(stage *StagedAcornFoxCandidateV1) {
+			defer wait.Done()
+			result, err := publisher.Publish(context.Background(), stage, receipt.BindingSHA256)
+			outcomes <- result
+			failures <- err
+		}(stage)
+	}
+	wait.Wait()
+	close(outcomes)
+	close(failures)
+	for err := range failures {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	for result := range outcomes {
+		if result.Outcome != AcornFoxReconcileCompleted {
+			t.Fatalf("outcome=%s", result.Outcome)
+		}
+	}
+}
 
 func TestTaskAcornFoxSubstratePublisherPublishesAndReopensInactiveRootfs(t *testing.T) {
 	root := t.TempDir()

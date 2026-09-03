@@ -57,6 +57,11 @@ func (p *TaskAcornFoxSubstratePublisher) Publish(ctx context.Context, stage *Sta
 	if p == nil || stage == nil || !digestPattern.MatchString(expectedBindingSHA256) {
 		return AcornFoxSubstratePublishResult{}, errors.New("AcornFox substrate publish input is invalid")
 	}
+	lock, err := p.lock()
+	if err != nil {
+		return AcornFoxSubstratePublishResult{}, err
+	}
+	defer lock.Close()
 	if existing, err := p.Reopen(expectedBindingSHA256); err == nil {
 		defer existing.Close()
 		return AcornFoxSubstratePublishResult{Receipt: existing.receipt, Outcome: AcornFoxReconcileCompleted}, nil
