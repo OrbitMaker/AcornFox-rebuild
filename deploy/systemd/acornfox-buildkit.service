@@ -1,0 +1,47 @@
+[Unit]
+Description=AcornFox rootless BuildKit worker
+Requires=acornfox-upgrade-safe.target
+After=local-fs.target acornfox-upgrade-safe.target
+
+[Service]
+Type=simple
+User=acornfox-buildkit
+Group=acornfox-buildkit
+RuntimeDirectory=acornfox-buildkit
+RuntimeDirectoryMode=0750
+WorkingDirectory=/var/lib/acornfox
+Environment=ACORNFOX_RUNTIME_MODE=clean
+EnvironmentFile=-/etc/acornfox/buildkit.env
+# Rootless BuildKit needs a user namespace and mount setup; these are the
+# intentionally retained exceptions to the otherwise unprivileged hardening.
+NoNewPrivileges=no
+Delegate=yes
+ExecStart=/opt/acornfox/current/bin/rootlesskit --state-dir=/var/lib/acornfox/rootlesskit --net=none --disable-host-loopback --copy-up=/etc /opt/acornfox/current/bin/buildkitd --config /etc/acornfox/buildkitd.toml --root /var/lib/acornfox/buildkitd --addr unix:///run/acornfox-buildkit/buildkitd.sock --group acornfox-buildkit
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+PrivateTmp=yes
+PrivateDevices=yes
+DevicePolicy=closed
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectClock=yes
+LockPersonality=yes
+RestrictSUIDSGID=yes
+ProtectProc=invisible
+RestrictRealtime=yes
+RemoveIPC=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+SystemCallArchitectures=native
+# @mount is required by rootlesskit's deliberately retained namespace setup.
+SystemCallFilter=@system-service @mount
+ReadWritePaths=/var/lib/acornfox /run/acornfox-buildkit
+MemoryMax=512M
+CPUQuota=50%
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

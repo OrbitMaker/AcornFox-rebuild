@@ -1,0 +1,47 @@
+[Unit]
+Description=AcornFox control-plane server
+Wants=network-online.target
+Requires=acornfox-buildkit.service acornfox-upgrade-safe.target
+After=network-online.target acornfox-buildkit.service acornfox-upgrade-safe.target
+
+[Service]
+Type=simple
+User=acornfox
+Group=acornfox
+SupplementaryGroups=acornfox-buildkit
+WorkingDirectory=/opt/acornfox/current
+Environment=ACORNFOX_RUNTIME_MODE=clean
+EnvironmentFile=-/etc/acornfox/server.env
+EnvironmentFile=/opt/acornfox/active/database.env
+ExecStart=/opt/acornfox/current/bin/acornfox-server
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+PrivateDevices=yes
+DevicePolicy=closed
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+ProtectProc=invisible
+RestrictRealtime=yes
+RemoveIPC=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+ReadWritePaths=/var/lib/acornfox /var/log/acornfox
+BindReadOnlyPaths=/run/acornfox-buildkit
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

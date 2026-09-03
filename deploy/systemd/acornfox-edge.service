@@ -1,0 +1,52 @@
+[Unit]
+Description=AcornFox loopback edge Caddy
+Wants=network-online.target
+Requires=acornfox-upgrade-safe.target
+After=network-online.target acornfox-upgrade-safe.target acornfox-server.service
+
+[Service]
+Type=notify
+User=acornfox-edge
+Group=acornfox-edge
+WorkingDirectory=/var/lib/acornfox
+Environment=ACORNFOX_RUNTIME_MODE=clean
+EnvironmentFile=/etc/acornfox/acornfox-edge.env
+ExecStartPre=/opt/acornfox/current/bin/caddy validate --config /etc/acornfox/acornfox-edge.Caddyfile --adapter caddyfile
+ExecStartPre=/opt/acornfox/current/bin/caddy adapt --config /etc/acornfox/acornfox-edge.Caddyfile --adapter caddyfile --validate
+ExecStart=/opt/acornfox/current/bin/caddy run --environ --config /etc/acornfox/acornfox-edge.Caddyfile --adapter caddyfile
+ExecReload=/opt/acornfox/current/bin/caddy reload --config /etc/acornfox/acornfox-edge.Caddyfile --adapter caddyfile
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=45s
+LimitNOFILE=1048576
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+DevicePolicy=closed
+ProtectSystem=strict
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectClock=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+ProtectProc=invisible
+RestrictRealtime=yes
+RemoveIPC=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+IPAddressDeny=any
+IPAddressAllow=127.0.0.0/8
+IPAddressAllow=::1/128
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+ReadWritePaths=/var/lib/acornfox /var/log/acornfox
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

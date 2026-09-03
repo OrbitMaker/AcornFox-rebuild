@@ -1,0 +1,34 @@
+[Unit]
+Description=Finalize interrupted AcornFox upgrade recovery
+After=acornfox-upgrade-safe.target
+ConditionPathExists=/var/lib/acornfox/upgrade-in-progress
+
+[Service]
+Type=oneshot
+ExecStart=/opt/acornfox/upgrade-tools/acornfox-upgrade recover-finalize --pending
+TimeoutStartSec=15min
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+LockPersonality=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+ProtectProc=invisible
+RestrictRealtime=yes
+RemoveIPC=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+ReadWritePaths=/opt/acornfox /var/lib/acornfox /run/lock /etc/acornfox /etc/systemd/system
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

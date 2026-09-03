@@ -1,0 +1,38 @@
+[Unit]
+Description=AcornFox host health check
+Wants=network-online.target
+After=network-online.target acornfox-upgrade-safe.target acornfox-server.service acornfox-agent.service acornfox-edge.service acornfox-caddy.service acornfox-buildkit.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+Environment=ACORNFOX_RUNTIME_MODE=clean
+EnvironmentFile=-/etc/acornfox/healthcheck.env
+ExecStart=/opt/acornfox/current/bin/acornfox-healthcheck
+TimeoutStartSec=50s
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+DevicePolicy=closed
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictSUIDSGID=yes
+ProtectProc=invisible
+RestrictRealtime=yes
+RemoveIPC=yes
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+ReadWritePaths=/var/lib/acornfox/healthcheck
+UMask=0077
