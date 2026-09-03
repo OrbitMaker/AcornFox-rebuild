@@ -40,7 +40,7 @@ AmbientCapabilities=
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
-ReadWritePaths=/var/lib/acornfox/uploads /var/lib/acornfox/workspaces /var/lib/acornfox/build-work /var/lib/acornfox/oci /var/lib/acornfox/secrets /var/lib/acornfox/secret-materials /var/lib/acornfox/health-secret-materials /var/log/acornfox/server
+ReadWritePaths=/var/lib/acornfox/uploads /var/lib/acornfox/workspaces /var/lib/acornfox/build-work /var/lib/acornfox/oci /var/lib/acornfox/secrets /var/lib/acornfox/secret-materials /var/log/acornfox/server
 BindReadOnlyPaths=/run/acornfox-buildkit
 UMask=0077
 

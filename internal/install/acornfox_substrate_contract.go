@@ -338,9 +338,10 @@ func acornFoxFixedSubstrateEntries(candidate AcornFoxStageReceiptV1) map[string]
 	for _, path := range []string{"var/lib/acornfox/uploads", "var/lib/acornfox/workspaces", "var/lib/acornfox/build-work", "var/lib/acornfox/oci", "var/log/acornfox/server"} {
 		entries[path] = directory(path, 0o750, OwnerRoleServer, GroupRoleServer)
 	}
-	for _, path := range []string{"var/lib/acornfox/secrets", "var/lib/acornfox/secret-materials", "var/lib/acornfox/health-secret-materials"} {
+	for _, path := range []string{"var/lib/acornfox/secrets", "var/lib/acornfox/secret-materials"} {
 		entries[path] = directory(path, 0o700, OwnerRoleServer, GroupRoleServer)
 	}
+	entries["var/lib/acornfox/health-secret-materials"] = directory("var/lib/acornfox/health-secret-materials", 0o700, OwnerRoleRoot, GroupRoleRoot)
 	entries["var/lib/acornfox/agent"], entries["var/log/acornfox/agent"] = directory("var/lib/acornfox/agent", 0o750, OwnerRoleAgent, GroupRoleAgent), directory("var/log/acornfox/agent", 0o750, OwnerRoleAgent, GroupRoleAgent)
 	entries["var/lib/acornfox/buildkit"] = directory("var/lib/acornfox/buildkit", 0o700, OwnerRoleBuildKit, GroupRoleBuildKit)
 	entries["var/lib/acornfox/caddy"], entries["var/log/acornfox/caddy"] = directory("var/lib/acornfox/caddy", 0o750, OwnerRoleCaddy, GroupRoleCaddy), directory("var/log/acornfox/caddy", 0o750, OwnerRoleCaddy, GroupRoleCaddy)

@@ -274,7 +274,7 @@ func TestAcornFoxWritablePathOwnershipMatrix(t *testing.T) {
 	want := map[string][]string{
 		"acornfox-server.service": {
 			"/var/lib/acornfox/uploads", "/var/lib/acornfox/workspaces", "/var/lib/acornfox/build-work", "/var/lib/acornfox/oci",
-			"/var/lib/acornfox/secrets", "/var/lib/acornfox/secret-materials", "/var/lib/acornfox/health-secret-materials", "/var/log/acornfox/server",
+			"/var/lib/acornfox/secrets", "/var/lib/acornfox/secret-materials", "/var/log/acornfox/server",
 		},
 		"acornfox-agent.service":       {"/var/lib/acornfox/agent", "/var/log/acornfox/agent"},
 		"acornfox-buildkit.service":    {"/var/lib/acornfox/buildkit", "/run/acornfox-buildkit"},
@@ -303,6 +303,16 @@ func TestAcornFoxWritablePathOwnershipMatrix(t *testing.T) {
 		if !strings.Contains(raw, "03/04 must implement contract-check and bind the helper digest before enabling this unit") {
 			t.Fatalf("%s lacks the future-activation boundary", unit)
 		}
+	}
+	_, server := readAcornFoxUnit(t, "acornfox-server.service")
+	for _, value := range server["Service"]["ReadWritePaths"] {
+		if strings.Contains(value, "/var/lib/acornfox/health-secret-materials") {
+			t.Fatal("server retained health-secret-materials write access")
+		}
+	}
+	entry, ok := acornFoxFixedSubstrateEntries(substrateReceiptFixture().CandidateReceipt)["var/lib/acornfox/health-secret-materials"]
+	if !ok || entry.Kind != SubstrateEntryDirectory || entry.Mode != 0o700 || entry.Role != OwnerRoleRoot || entry.Group != GroupRoleRoot {
+		t.Fatalf("health secret substrate ownership=%#v", entry)
 	}
 	for _, unit := range []string{"acornfox-healthcheck.service", "acornfox-healthcheck.timer", "acornfox-upgrade-safe.target"} {
 		raw, _ := readAcornFoxUnit(t, unit)
