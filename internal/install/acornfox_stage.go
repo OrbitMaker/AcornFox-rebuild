@@ -3,6 +3,7 @@ package install
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +13,8 @@ import (
 	"strings"
 	"syscall"
 )
+
+var ErrAcornFoxStageCleanupUnknown = errors.New("AcornFox stage cleanup outcome is unknown")
 
 const (
 	acornFoxStageDirMode  = 0o700
@@ -32,22 +35,30 @@ type TaskAcornFoxStager struct {
 // AcornFoxStageReceiptV1 identifies staged bytes without carrying a path,
 // archive body, credential, DSN, or other host-local secret.
 type AcornFoxStageReceiptV1 struct {
-	SchemaVersion  int    `json:"schema_version"`
-	Product        string `json:"product"`
-	Version        string `json:"version"`
-	ReleaseID      string `json:"release_id"`
-	ManifestSHA256 string `json:"manifest_sha256"`
-	ArchiveSHA256  string `json:"archive_sha256"`
-	FileCount      int    `json:"file_count"`
-	TreeSHA256     string `json:"tree_sha256"`
+	SchemaVersion            int    `json:"schema_version"`
+	Product                  string `json:"product"`
+	Version                  string `json:"version"`
+	ReleaseID                string `json:"release_id"`
+	ManifestSHA256           string `json:"manifest_sha256"`
+	ArchiveSHA256            string `json:"archive_sha256"`
+	BindingSHA256            string `json:"binding_sha256"`
+	BundleManifestSHA256     string `json:"bundle_manifest_sha256"`
+	SourceCommit             string `json:"source_commit"`
+	Architecture             string `json:"architecture"`
+	MigrationVersion         string `json:"migration_version"`
+	PredecessorBindingSHA256 string `json:"predecessor_binding_sha256,omitempty"`
+	FileCount                int    `json:"file_count"`
+	TreeSHA256               string `json:"tree_sha256"`
 }
 
 // StagedAcornFoxCandidateV1 is intentionally opaque. A later closed leaf may
 // consume its pinned directory descriptor, but this leaf exposes no stage path
 // and no production applier.
 type StagedAcornFoxCandidateV1 struct {
-	root    *os.Root
-	receipt AcornFoxStageReceiptV1
+	root      *os.Root
+	parent    *os.Root
+	stageName string
+	receipt   AcornFoxStageReceiptV1
 }
 
 func (s StagedAcornFoxCandidateV1) valid() bool {
@@ -59,12 +70,25 @@ func (s *StagedAcornFoxCandidateV1) Close() error {
 		return nil
 	}
 	root := s.root
+	parent := s.parent
+	name := s.stageName
 	s.root = nil
-	return root.Close()
+	s.parent = nil
+	closeErr := root.Close()
+	if parent == nil || name == "" {
+		return closeErr
+	}
+	removeErr := parent.RemoveAll(name)
+	syncErr := syncAcornFoxRoot(parent)
+	parentErr := parent.Close()
+	if closeErr != nil || removeErr != nil || syncErr != nil || parentErr != nil {
+		return ErrAcornFoxStageCleanupUnknown
+	}
+	return nil
 }
 
 func NewTaskAcornFoxStager(taskRoot string, uid, gid int) (*TaskAcornFoxStager, error) {
-	if uid < 0 || gid < 0 || !safeAbsoluteDurableRoot(taskRoot) || taskRoot == string(filepath.Separator) {
+	if uid < 0 || gid < 0 || !safeAbsoluteDurableRoot(taskRoot) || forbiddenAcornFoxStageRoot(taskRoot) {
 		return nil, errors.New("AcornFox task root is unsafe")
 	}
 	info, err := os.Lstat(taskRoot)
@@ -99,6 +123,9 @@ func (s *TaskAcornFoxStager) verifyLiveRoot() error {
 }
 
 func (s *TaskAcornFoxStager) Stage(input VerifyAcornFoxCandidateArtifactsV1Input) (StagedAcornFoxCandidateV1, AcornFoxStageReceiptV1, error) {
+	if input.Archive == nil {
+		return StagedAcornFoxCandidateV1{}, AcornFoxStageReceiptV1{}, errors.New("AcornFox archive is required")
+	}
 	if err := s.verifyLiveRoot(); err != nil {
 		return StagedAcornFoxCandidateV1{}, AcornFoxStageReceiptV1{}, err
 	}
@@ -176,6 +203,9 @@ func (s *TaskAcornFoxStager) Stage(input VerifyAcornFoxCandidateArtifactsV1Input
 	if err != nil {
 		return StagedAcornFoxCandidateV1{}, AcornFoxStageReceiptV1{}, err
 	}
+	if err := writeAcornFoxStageCompletion(stage, receipt, s.uid, s.gid); err != nil {
+		return StagedAcornFoxCandidateV1{}, AcornFoxStageReceiptV1{}, err
+	}
 	if err := s.root.Remove(spoolName); err != nil {
 		return StagedAcornFoxCandidateV1{}, AcornFoxStageReceiptV1{}, err
 	}
@@ -188,7 +218,19 @@ func (s *TaskAcornFoxStager) Stage(input VerifyAcornFoxCandidateArtifactsV1Input
 		return StagedAcornFoxCandidateV1{}, AcornFoxStageReceiptV1{}, errors.New("AcornFox task stage publication is unknown")
 	}
 	stagePublished = true
-	return StagedAcornFoxCandidateV1{root: stage, receipt: receipt}, receipt, nil
+	return StagedAcornFoxCandidateV1{root: stage, parent: s.root, stageName: stageName, receipt: receipt}, receipt, nil
+}
+
+func forbiddenAcornFoxStageRoot(path string) bool {
+	if path == string(filepath.Separator) {
+		return true
+	}
+	for _, root := range []string{AcornFoxV1InstallPrefix, AcornFoxV1ConfigDir, AcornFoxV1DataDir, AcornFoxV1LogDir} {
+		if path == root || strings.HasPrefix(path, root+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *TaskAcornFoxStager) createStage(name string) (*os.Root, error) {
@@ -366,7 +408,60 @@ func readAcornFoxStageReceipt(root *os.Root, manifest Manifest, verified Verifie
 		}
 		_, _ = fmt.Fprintf(hash, "%s\x00%04o\x00%s\n", expected.Path, expected.Mode, digest)
 	}
-	return AcornFoxStageReceiptV1{SchemaVersion: 1, Product: AcornFoxV1Product, Version: manifest.Version, ReleaseID: manifest.ReleaseID, ManifestSHA256: verified.manifestSHA256, ArchiveSHA256: verified.archiveSHA256, FileCount: len(files), TreeSHA256: hex.EncodeToString(hash.Sum(nil))}, nil
+	binding := verified.binding.binding
+	receipt := AcornFoxStageReceiptV1{SchemaVersion: 1, Product: AcornFoxV1Product, Version: binding.Version, ReleaseID: binding.ReleaseID, ManifestSHA256: verified.manifestSHA256, ArchiveSHA256: verified.archiveSHA256, BindingSHA256: verified.binding.digest, BundleManifestSHA256: binding.BundleManifestSHA256, SourceCommit: binding.SourceCommit, Architecture: binding.Architecture, MigrationVersion: binding.MigrationVersion, FileCount: len(files), TreeSHA256: hex.EncodeToString(hash.Sum(nil))}
+	if binding.NMinusOne != nil {
+		receipt.PredecessorBindingSHA256 = binding.NMinusOne.BindingSHA256
+	}
+	return receipt, nil
+}
+
+func writeAcornFoxStageCompletion(root *os.Root, receipt AcornFoxStageReceiptV1, uid, gid int) error {
+	raw, err := json.Marshal(receipt)
+	if err != nil {
+		return err
+	}
+	file, err := root.OpenFile(".acornfox-stage-complete.json", os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, acornFoxSpoolFileMode)
+	if err != nil {
+		return err
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			_ = file.Close()
+		}
+	}()
+	if written, err := file.Write(raw); err != nil || written != len(raw) {
+		if err != nil {
+			return err
+		}
+		return io.ErrShortWrite
+	}
+	if err := file.Chmod(acornFoxSpoolFileMode); err != nil {
+		return err
+	}
+	if err := file.Chown(uid, gid); err != nil {
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	closed = true
+	if err := syncAcornFoxRoot(root); err != nil {
+		return err
+	}
+	read, err := root.ReadFile(".acornfox-stage-complete.json")
+	if err != nil {
+		return err
+	}
+	var reread AcornFoxStageReceiptV1
+	if err := json.Unmarshal(read, &reread); err != nil || reread != receipt {
+		return errors.New("AcornFox stage completion receipt is invalid")
+	}
+	return nil
 }
 
 func sha256AcornFoxOpenFile(file *os.File) (string, error) {

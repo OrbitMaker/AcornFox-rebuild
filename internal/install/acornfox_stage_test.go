@@ -127,3 +127,34 @@ func TestTaskAcornFoxStagerRejectsTaskRootReplacement(t *testing.T) {
 		t.Fatal("replaced task root accepted")
 	}
 }
+
+func TestTaskAcornFoxStagerRejectsProductionRootsAndCloseDiscardsStage(t *testing.T) {
+	for _, root := range []string{string(filepath.Separator), AcornFoxV1InstallPrefix, AcornFoxV1ConfigDir, AcornFoxV1DataDir, AcornFoxV1LogDir, AcornFoxV1DataDir + "/task"} {
+		if _, err := NewTaskAcornFoxStager(root, os.Getuid(), os.Getgid()); err == nil {
+			t.Fatalf("production root accepted: %s", root)
+		}
+	}
+	taskRoot := t.TempDir()
+	if err := os.Chmod(taskRoot, acornFoxStageDirMode); err != nil {
+		t.Fatal(err)
+	}
+	stager, err := NewTaskAcornFoxStager(taskRoot, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := newAcornFoxFixture(t, "1.2.3-test.1", nil)
+	handle, _, err := stager.Stage(fixture.input(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := handle.Close(); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(taskRoot)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("discard entries=%#v err=%v", entries, err)
+	}
+	if err := stager.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
