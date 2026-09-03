@@ -32,6 +32,9 @@ type TaskAcornFoxSubstratePublisher struct {
 	root     *os.Root
 	uid, gid int
 	fault    acornFoxSubstrateFault
+	// afterRootPathCheck is a package-private race seam. It must never affect
+	// authority: the returned root is always derived from p.root.
+	afterRootPathCheck func()
 }
 
 // acornFoxSubstrateFaultStep is a package-private durability seam. Production
@@ -123,7 +126,21 @@ func (p *TaskAcornFoxSubstratePublisher) openRoot() (*os.Root, error) {
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o022 != 0 || !os.SameFile(info, p.rootInfo) || verifyOwner(info, p.uid, p.gid) != nil {
 		return nil, errors.New("AcornFox task substrate root identity changed")
 	}
-	return os.OpenRoot(p.rootPath)
+	if p.afterRootPathCheck != nil {
+		p.afterRootPathCheck()
+	}
+	return p.root.OpenRoot(".")
+}
+
+// Close releases the constructor-held task-root descriptor. It is idempotent;
+// every later operation fails rather than reopening rootPath by name.
+func (p *TaskAcornFoxSubstratePublisher) Close() error {
+	if p == nil || p.root == nil {
+		return nil
+	}
+	root := p.root
+	p.root = nil
+	return root.Close()
 }
 
 // Publish creates an inactive substrate only from an absent task-root state.
@@ -299,6 +316,18 @@ func (p *TaskAcornFoxSubstratePublisher) inspectLocked(expectedBindingSHA256 str
 }
 
 func (p *TaskAcornFoxSubstratePublisher) Reopen(expectedBindingSHA256 string) (*PublishedAcornFoxSubstrateV1, error) {
+	if p == nil || !digestPattern.MatchString(expectedBindingSHA256) {
+		return nil, errors.New("AcornFox substrate reopen input is invalid")
+	}
+	lock, err := p.lock()
+	if err != nil {
+		return nil, err
+	}
+	defer lock.Close()
+	return p.reopenLocked(expectedBindingSHA256)
+}
+
+func (p *TaskAcornFoxSubstratePublisher) reopenLocked(expectedBindingSHA256 string) (*PublishedAcornFoxSubstrateV1, error) {
 	if p == nil || !digestPattern.MatchString(expectedBindingSHA256) {
 		return nil, errors.New("AcornFox substrate reopen input is invalid")
 	}
@@ -602,7 +631,7 @@ func (h *PublishedAcornFoxSubstrateV1) Discard() error {
 	defer lock.Close()
 	// The lock remains outside substrate. Reopen from the pinned publisher after
 	// acquiring it so a stale handle cannot delete replacement task state.
-	fresh, err := h.publisher.Reopen(h.receipt.CandidateReceipt.BindingSHA256)
+	fresh, err := h.publisher.reopenLocked(h.receipt.CandidateReceipt.BindingSHA256)
 	if err != nil {
 		return err
 	}

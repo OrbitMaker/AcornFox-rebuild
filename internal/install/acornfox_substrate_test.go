@@ -573,6 +573,58 @@ func TestTaskAcornFoxSubstratePublisherPinsTaskRootIdentity(t *testing.T) {
 	}
 }
 
+func TestTaskAcornFoxSubstratePublisherNeverReacquiresReplacementPath(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, acornFoxStageDirMode); err != nil {
+		t.Fatal(err)
+	}
+	publisher, err := NewTaskAcornFoxSubstratePublisher(root, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer publisher.Close()
+	publisher.afterRootPathCheck = func() {
+		publisher.afterRootPathCheck = nil
+		if err := os.Rename(root, root+"-original"); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(root, acornFoxStageDirMode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	owned, err := publisher.openRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owned.Close()
+	if err := owned.Mkdir("original-only", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(root + "/original-only"); !os.IsNotExist(err) {
+		t.Fatalf("replacement pathname received authority: %v", err)
+	}
+}
+
+func TestTaskAcornFoxSubstratePublisherCloseIsIdempotentAndFinal(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, acornFoxStageDirMode); err != nil {
+		t.Fatal(err)
+	}
+	publisher, err := NewTaskAcornFoxSubstratePublisher(root, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := publisher.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := publisher.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := publisher.Inspect(strings.Repeat("a", 64)); err == nil {
+		t.Fatal("closed publisher reopened task root")
+	}
+}
+
 func TestTaskAcornFoxSubstratePublisherFaultsLeaveFreshRecoveryRequired(t *testing.T) {
 	for _, step := range []acornFoxSubstrateFaultStep{acornFoxSubstrateFaultIntentCreate, acornFoxSubstrateFaultIntentWrite, acornFoxSubstrateFaultIntentSync, acornFoxSubstrateFaultIntentReadback, acornFoxSubstrateFaultDirectoryCreate, acornFoxSubstrateFaultDirectorySync, acornFoxSubstrateFaultFileOpen, acornFoxSubstrateFaultFileWrite, acornFoxSubstrateFaultFileSync, acornFoxSubstrateFaultFileReadback, acornFoxSubstrateFaultReceiptCreate, acornFoxSubstrateFaultReceiptWrite, acornFoxSubstrateFaultReceiptSync, acornFoxSubstrateFaultReceiptReadback, acornFoxSubstrateFaultConsume, acornFoxSubstrateFaultDirectoryMetadata, acornFoxSubstrateFaultDirectoryStat, acornFoxSubstrateFaultDirectoryParentSync, acornFoxSubstrateFaultTempCreate, acornFoxSubstrateFaultTempWrite, acornFoxSubstrateFaultTempShortWrite, acornFoxSubstrateFaultTempMetadata, acornFoxSubstrateFaultTempStat, acornFoxSubstrateFaultTempSync, acornFoxSubstrateFaultTempClose, acornFoxSubstrateFaultTempLink, acornFoxSubstrateFaultTempParentSync, acornFoxSubstrateFaultTempRemove, acornFoxSubstrateFaultTempRemoveParentSync, acornFoxSubstrateFaultFinalReadback} {
 		t.Run(fmt.Sprintf("step_%d", step), func(t *testing.T) {
