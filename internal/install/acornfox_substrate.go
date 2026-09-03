@@ -145,18 +145,18 @@ func (p *TaskAcornFoxSubstratePublisher) Close() error {
 
 // Publish creates an inactive substrate only from an absent task-root state.
 func (p *TaskAcornFoxSubstratePublisher) Publish(ctx context.Context, stage *StagedAcornFoxCandidateV1, expectedBindingSHA256 string) (AcornFoxSubstratePublishResult, error) {
-	return p.publish(ctx, stage, expectedBindingSHA256, AcornFoxReconcileAbsent)
-}
-
-func (p *TaskAcornFoxSubstratePublisher) publish(ctx context.Context, stage *StagedAcornFoxCandidateV1, expectedBindingSHA256 string, permitted AcornFoxReconciliationOutcome) (AcornFoxSubstratePublishResult, error) {
-	if p == nil || stage == nil || !digestPattern.MatchString(expectedBindingSHA256) {
-		return AcornFoxSubstratePublishResult{}, errors.New("AcornFox substrate publish input is invalid")
-	}
 	lock, err := p.lock()
 	if err != nil {
 		return AcornFoxSubstratePublishResult{}, err
 	}
 	defer lock.Close()
+	return p.publishLocked(ctx, stage, expectedBindingSHA256, AcornFoxReconcileAbsent)
+}
+
+func (p *TaskAcornFoxSubstratePublisher) publishLocked(ctx context.Context, stage *StagedAcornFoxCandidateV1, expectedBindingSHA256 string, permitted AcornFoxReconciliationOutcome) (AcornFoxSubstratePublishResult, error) {
+	if p == nil || stage == nil || !digestPattern.MatchString(expectedBindingSHA256) {
+		return AcornFoxSubstratePublishResult{}, errors.New("AcornFox substrate publish input is invalid")
+	}
 	inspection, err := p.inspectLocked(expectedBindingSHA256)
 	if err != nil {
 		return AcornFoxSubstratePublishResult{}, err
@@ -246,12 +246,24 @@ func (p *TaskAcornFoxSubstratePublisher) publish(ctx context.Context, stage *Sta
 // Resume reacquires the only matching sealed task stage after a process exit.
 // It never accepts a caller-supplied stage path.
 func (p *TaskAcornFoxSubstratePublisher) Resume(ctx context.Context, expectedBindingSHA256 string) (AcornFoxSubstratePublishResult, error) {
+	lock, err := p.lock()
+	if err != nil {
+		return AcornFoxSubstratePublishResult{}, err
+	}
+	defer lock.Close()
+	inspection, err := p.inspectLocked(expectedBindingSHA256)
+	if err != nil {
+		return AcornFoxSubstratePublishResult{}, err
+	}
+	if inspection.Outcome != AcornFoxReconcileResume {
+		return AcornFoxSubstratePublishResult{}, acornFoxSubstrateOutcomeError(inspection.Outcome)
+	}
 	stage, err := p.reopenStage(expectedBindingSHA256)
 	if err != nil {
 		return AcornFoxSubstratePublishResult{}, err
 	}
 	defer stage.Close()
-	return p.publish(ctx, stage, expectedBindingSHA256, AcornFoxReconcileResume)
+	return p.publishLocked(ctx, stage, expectedBindingSHA256, AcornFoxReconcileResume)
 }
 
 func acornFoxSubstrateOutcomeError(outcome AcornFoxReconciliationOutcome) error {
