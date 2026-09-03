@@ -271,7 +271,7 @@ func VerifyAcornFoxCandidateArtifactsV1(input VerifyAcornFoxCandidateArtifactsV1
 	if err := verifyAcornFoxPredecessor(input.PredecessorBinding, binding.binding, manifest.NMinusOne); err != nil {
 		return VerifiedAcornFoxCandidateV1{}, err
 	}
-	if err := verifyAcornFoxArchive(input.Archive, input.ArchiveSize, binding.binding.ArchiveSHA256, input.Manifest, manifest); err != nil {
+	if err := verifyAcornFoxArchive(input.Archive, input.ArchiveSize, binding.binding.ArchiveSHA256, input.Manifest, manifest, nil); err != nil {
 		return VerifiedAcornFoxCandidateV1{}, err
 	}
 	return VerifiedAcornFoxCandidateV1{binding: binding, manifestSHA256: binding.binding.ManifestSHA256, archiveSHA256: binding.binding.ArchiveSHA256}, nil

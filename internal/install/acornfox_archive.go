@@ -23,6 +23,18 @@ type acornFoxExactArchiveReader struct {
 	hash      hash.Hash
 }
 
+// acornFoxArchiveSink is package-private so only a verified installation leaf
+// can receive members from the canonical USTAR walker.
+type acornFoxArchiveSink interface {
+	OpenMember(string, uint32) (acornFoxArchiveMember, error)
+}
+
+type acornFoxArchiveMember interface {
+	io.Writer
+	Sync() error
+	Close() error
+}
+
 func newAcornFoxExactArchiveReader(reader io.Reader, size int64) (*acornFoxExactArchiveReader, error) {
 	if reader == nil || size < 1 || size > acornFoxArchiveMaxBytes {
 		return nil, errors.New("AcornFox archive size is invalid")
@@ -75,7 +87,7 @@ func (r *acornFoxExactArchiveReader) finish(expectedSHA256 string) error {
 	return nil
 }
 
-func verifyAcornFoxArchive(reader io.Reader, size int64, expectedSHA256 string, rawManifest []byte, manifest Manifest) error {
+func verifyAcornFoxArchive(reader io.Reader, size int64, expectedSHA256 string, rawManifest []byte, manifest Manifest, sink acornFoxArchiveSink) error {
 	stream, err := newAcornFoxExactArchiveReader(reader, size)
 	if err != nil {
 		return err
@@ -85,7 +97,7 @@ func verifyAcornFoxArchive(reader io.Reader, size int64, expectedSHA256 string, 
 		return fmt.Errorf("open AcornFox archive: %w", err)
 	}
 	gzipReader.Multistream(false)
-	if err := verifyAcornFoxArchiveTree(gzipReader, rawManifest, manifest); err != nil {
+	if err := verifyAcornFoxArchiveTree(gzipReader, rawManifest, manifest, sink); err != nil {
 		_ = gzipReader.Close()
 		return err
 	}
@@ -99,7 +111,7 @@ func verifyAcornFoxArchive(reader io.Reader, size int64, expectedSHA256 string, 
 	return stream.finish(expectedSHA256)
 }
 
-func verifyAcornFoxArchiveTree(reader *gzip.Reader, rawManifest []byte, manifest Manifest) error {
+func verifyAcornFoxArchiveTree(reader *gzip.Reader, rawManifest []byte, manifest Manifest, sink acornFoxArchiveSink) error {
 	// RELEASE-12 must emit USTAR members. A legacy PAX writer cannot be reused:
 	// PAX metadata is rejected before any member is treated as installable.
 	expected := make(map[string]FileDigest, len(manifest.Files))
@@ -134,7 +146,7 @@ func verifyAcornFoxArchiveTree(reader *gzip.Reader, rawManifest []byte, manifest
 		}
 		seen[header.Name] = struct{}{}
 		if header.Name == "release/manifest.json" {
-			if header.Mode != 0o644 || header.Size != int64(len(rawManifest)) || !equalAcornFoxArchiveMember(tarReader, rawManifest) {
+			if header.Mode != 0o644 || header.Size != int64(len(rawManifest)) || verifyAcornFoxArchiveMember(tarReader, header.Size, rawManifest, "", sink, header.Name, uint32(header.Mode)) != nil {
 				return errors.New("AcornFox archive manifest member is invalid")
 			}
 			continue
@@ -143,7 +155,7 @@ func verifyAcornFoxArchiveTree(reader *gzip.Reader, rawManifest []byte, manifest
 		if !ok || header.Mode != int64(file.Mode) {
 			return fmt.Errorf("AcornFox archive member %q is unlisted or has wrong mode", header.Name)
 		}
-		if digest, err := hashAcornFoxArchiveMember(tarReader, header.Size); err != nil || digest != file.SHA256 {
+		if err := verifyAcornFoxArchiveMember(tarReader, header.Size, nil, file.SHA256, sink, header.Name, uint32(header.Mode)); err != nil {
 			return fmt.Errorf("AcornFox archive member %q content is invalid", header.Name)
 		}
 	}
@@ -158,25 +170,62 @@ func verifyAcornFoxArchiveTree(reader *gzip.Reader, rawManifest []byte, manifest
 	return nil
 }
 
-func equalAcornFoxArchiveMember(reader io.Reader, want []byte) bool {
+func verifyAcornFoxArchiveMember(reader io.Reader, size int64, want []byte, expectedSHA256 string, sink acornFoxArchiveSink, name string, mode uint32) error {
 	buffer := make([]byte, acornFoxArchiveStreamBuffer)
-	for offset := 0; offset < len(want); {
-		chunk := len(want) - offset
-		if chunk > len(buffer) {
-			chunk = len(buffer)
+	var member acornFoxArchiveMember
+	if sink != nil {
+		var err error
+		member, err = sink.OpenMember(name, mode)
+		if err != nil {
+			return err
 		}
-		if _, err := io.ReadFull(reader, buffer[:chunk]); err != nil || !bytes.Equal(buffer[:chunk], want[offset:offset+chunk]) {
-			return false
+	}
+	closed := false
+	defer func() {
+		if member != nil && !closed {
+			_ = member.Close()
+		}
+	}()
+	hash := sha256.New()
+	for offset, remaining := int64(0), size; remaining > 0; {
+		chunk := int64(len(buffer))
+		if chunk > remaining {
+			chunk = remaining
+		}
+		if _, err := io.ReadFull(reader, buffer[:chunk]); err != nil {
+			return errors.New("AcornFox archive member is truncated")
+		}
+		if want != nil && !bytes.Equal(buffer[:chunk], want[offset:offset+chunk]) {
+			return errors.New("AcornFox archive member content differs")
+		}
+		if _, err := hash.Write(buffer[:chunk]); err != nil {
+			return err
+		}
+		if member != nil {
+			if written, err := member.Write(buffer[:chunk]); err != nil || written != int(chunk) {
+				if err != nil {
+					return err
+				}
+				return io.ErrShortWrite
+			}
 		}
 		offset += chunk
+		remaining -= chunk
 	}
-	return true
-}
-
-func hashAcornFoxArchiveMember(reader io.Reader, size int64) (string, error) {
-	hash := sha256.New()
-	if copied, err := io.CopyN(hash, reader, size); err != nil || copied != size {
-		return "", errors.New("AcornFox archive member is truncated")
+	if want != nil && size != int64(len(want)) {
+		return errors.New("AcornFox archive manifest size mismatch")
 	}
-	return hex.EncodeToString(hash.Sum(nil)), nil
+	if expectedSHA256 != "" && hex.EncodeToString(hash.Sum(nil)) != expectedSHA256 {
+		return errors.New("AcornFox archive member checksum mismatch")
+	}
+	if member != nil {
+		if err := member.Sync(); err != nil {
+			return err
+		}
+		if err := member.Close(); err != nil {
+			return err
+		}
+		closed = true
+	}
+	return nil
 }
