@@ -3,6 +3,7 @@ package install
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"reflect"
 	"sort"
@@ -207,6 +208,72 @@ func TestAcornFoxV1SubstrateInventoryRejectsMissingExtraAndBadMappings(t *testin
 		if err := receipt.Validate(); err == nil {
 			t.Fatalf("invalid closed inventory accepted: %#v", receipt)
 		}
+	}
+}
+
+func TestAcornFoxV1SubstrateInventoryRequiresExactReleaseDirectories(t *testing.T) {
+	for _, mutate := range []func(*InactiveSubstrateReceiptV1){
+		func(receipt *InactiveSubstrateReceiptV1) {
+			path := "opt/acornfox/releases/" + receipt.CandidateReceipt.ReleaseID + "/bin"
+			entries := receipt.Entries[:0]
+			for _, entry := range receipt.Entries {
+				if entry.Path != path {
+					entries = append(entries, entry)
+				}
+			}
+			receipt.Entries = entries
+		},
+		func(receipt *InactiveSubstrateReceiptV1) {
+			path := "opt/acornfox/releases/" + receipt.CandidateReceipt.ReleaseID + "/unused"
+			receipt.Entries = append(receipt.Entries, SubstrateEntry{Path: path, Kind: SubstrateEntryDirectory, Mode: 0o755, Role: OwnerRoleRoot, Group: GroupRoleRoot})
+			sort.Slice(receipt.Entries, func(i, j int) bool { return receipt.Entries[i].Path < receipt.Entries[j].Path })
+		},
+		func(receipt *InactiveSubstrateReceiptV1) {
+			entry := substrateEntryAt(receipt.Entries, "opt/acornfox/releases/"+receipt.CandidateReceipt.ReleaseID+"/bin")
+			entry.Mode = 0o750
+		},
+	} {
+		receipt := substrateReceiptFixture()
+		mutate(&receipt)
+		receipt.InstalledTreeSHA256, _ = ComputeAcornFoxSubstrateTreeSHA256(receipt.Entries)
+		if err := receipt.Validate(); err == nil {
+			t.Fatal("invalid release directory set accepted")
+		}
+	}
+}
+
+func TestAcornFoxSubstrateEntryBoundIsDerivedAndFinite(t *testing.T) {
+	entries := make([]SubstrateEntry, 0, acornFoxSubstrateMaxEntries)
+	for index := 0; index < acornFoxSubstrateMaxEntries; index++ {
+		entries = append(entries, SubstrateEntry{Path: fmt.Sprintf("bounded/%05d", index), Kind: SubstrateEntryDirectory, Mode: 0o755, Role: OwnerRoleRoot, Group: GroupRoleRoot})
+	}
+	if err := validateAcornFoxSubstrateEntries(entries); err != nil {
+		t.Fatalf("derived maximum rejected: %v", err)
+	}
+	entries = append(entries, SubstrateEntry{Path: "bounded/overflow", Kind: SubstrateEntryDirectory, Mode: 0o755, Role: OwnerRoleRoot, Group: GroupRoleRoot})
+	if err := validateAcornFoxSubstrateEntries(entries); err == nil {
+		t.Fatal("derived maximum plus one accepted")
+	}
+}
+
+func TestAcornFoxV1SubstrateInventoryAcceptsArchiveBoundDynamicAssets(t *testing.T) {
+	receipt := substrateReceiptFixture()
+	prefix := "opt/acornfox/releases/" + receipt.CandidateReceipt.ReleaseID + "/web/dist/assets/"
+	for index := receipt.CandidateReceipt.FileCount; index < acornFoxArchiveMaxMembers-1; index++ {
+		entries := append(receipt.Entries, SubstrateEntry{Path: fmt.Sprintf("%sextra-%08d.js", prefix, index), Kind: SubstrateEntryFile, Mode: 0o644, Role: OwnerRoleRoot, Group: GroupRoleRoot, Size: 1, SHA256: sha256Hex([]byte(fmt.Sprintf("asset-%d", index)))})
+		receipt.Entries = entries
+		receipt.CandidateReceipt.FileCount++
+	}
+	sort.Slice(receipt.Entries, func(i, j int) bool { return receipt.Entries[i].Path < receipt.Entries[j].Path })
+	receipt.CandidateReceipt.TreeSHA256, _ = ComputeAcornFoxReleaseTreeSHA256(receipt.CandidateReceipt, receipt.Entries)
+	receipt.ReleaseTreeSHA256 = receipt.CandidateReceipt.TreeSHA256
+	receipt.InstalledTreeSHA256, _ = ComputeAcornFoxSubstrateTreeSHA256(receipt.Entries)
+	if err := receipt.Validate(); err != nil {
+		t.Fatalf("archive-bound dynamic assets rejected: %v", err)
+	}
+	receipt.CandidateReceipt.FileCount++
+	if err := receipt.Validate(); err == nil {
+		t.Fatal("archive-bound dynamic assets plus one accepted")
 	}
 }
 

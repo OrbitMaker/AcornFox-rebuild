@@ -14,6 +14,13 @@ const (
 	InactiveSubstrateReceiptV1Schema = 1
 	AcornFoxSubstrateLayoutV1        = 1
 	AcornFoxSubstrateTreeV1Schema    = 1
+	// USTAR names are at most 255 bytes; a one-byte component plus separator
+	// gives at most 127 parent directories per release member. The archive
+	// member bound includes manifest.json, and the fixed table is audited below.
+	acornFoxUstarPathMaxBytes             = 255
+	acornFoxSubstrateMaxReleaseParentDirs = (acornFoxArchiveMaxMembers - 1) * ((acornFoxUstarPathMaxBytes - 1) / 2)
+	acornFoxSubstrateFixedEntryMax        = 64
+	acornFoxSubstrateMaxEntries           = acornFoxArchiveMaxMembers + acornFoxSubstrateMaxReleaseParentDirs + acornFoxSubstrateFixedEntryMax
 )
 
 const (
@@ -211,7 +218,7 @@ func ParseInactiveSubstrateReceiptV1(raw []byte) (InactiveSubstrateReceiptV1, er
 }
 
 func validateAcornFoxSubstrateEntries(entries []SubstrateEntry) error {
-	if len(entries) == 0 || len(entries) > 256 {
+	if len(entries) == 0 || len(entries) > acornFoxSubstrateMaxEntries {
 		return errors.New("AcornFox substrate entry count is invalid")
 	}
 	for index, entry := range entries {
@@ -284,6 +291,9 @@ func substrateEntryAt(entries []SubstrateEntry, path string) *SubstrateEntry {
 // binds that verified tree through CandidateReceipt.TreeSHA256, exact member
 // count, and the closed installed-path/mapping inventory below.
 func validateAcornFoxV1SubstrateInventory(candidate AcornFoxStageReceiptV1, entries []SubstrateEntry) error {
+	if candidate.FileCount+1 > acornFoxArchiveMaxMembers {
+		return errors.New("AcornFox substrate candidate file count exceeds archive bound")
+	}
 	if err := validateAcornFoxSubstrateEntries(entries); err != nil {
 		return err
 	}
@@ -294,10 +304,12 @@ func validateAcornFoxV1SubstrateInventory(candidate AcornFoxStageReceiptV1, entr
 	releasePrefix := "opt/acornfox/releases/" + candidate.ReleaseID + "/"
 	releaseMembers := 0
 	releaseDirectories := map[string]struct{}{"opt/acornfox/releases/" + candidate.ReleaseID: {}}
+	actualReleaseDirectories := map[string]struct{}{}
 	seenRequired := map[string]bool{}
 	for path, entry := range byPath {
 		if strings.HasPrefix(path, releasePrefix) {
 			if entry.Kind == SubstrateEntryDirectory {
+				actualReleaseDirectories[path] = struct{}{}
 				continue
 			}
 			relative := strings.TrimPrefix(path, releasePrefix)
@@ -326,6 +338,18 @@ func validateAcornFoxV1SubstrateInventory(candidate AcornFoxStageReceiptV1, entr
 		entry, ok := byPath[path]
 		if !ok || entry.Kind != SubstrateEntryDirectory || entry.Mode != 0o755 || entry.Role != OwnerRoleRoot || entry.Group != GroupRoleRoot || entry.Size != 0 || entry.SHA256 != "" {
 			return fmt.Errorf("AcornFox release directory is invalid: %s", path)
+		}
+	}
+	releaseRoot := strings.TrimSuffix(releasePrefix, "/")
+	if entry, ok := byPath[releaseRoot]; ok && entry.Kind == SubstrateEntryDirectory {
+		actualReleaseDirectories[releaseRoot] = struct{}{}
+	}
+	if len(actualReleaseDirectories) != len(releaseDirectories) {
+		return errors.New("AcornFox release directory set is not exact")
+	}
+	for path := range actualReleaseDirectories {
+		if _, ok := releaseDirectories[path]; !ok {
+			return fmt.Errorf("AcornFox release directory is extra: %s", path)
 		}
 	}
 	for _, required := range AcornFoxV1RequiredFiles() {
@@ -428,6 +452,9 @@ func acornFoxFixedSubstrateEntries(candidate AcornFoxStageReceiptV1) map[string]
 			mode, group = 0o640, GroupRoleEdge
 		}
 		entries[destination] = file(destination, mode, OwnerRoleRoot, group)
+	}
+	if len(entries) > acornFoxSubstrateFixedEntryMax {
+		panic("AcornFox substrate fixed entry bound is stale")
 	}
 	return entries
 }
