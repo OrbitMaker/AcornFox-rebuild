@@ -29,6 +29,40 @@ const (
 type TaskAcornFoxSubstratePublisher struct {
 	rootPath string
 	uid, gid int
+	fault    acornFoxSubstrateFault
+}
+
+// acornFoxSubstrateFaultStep is a package-private durability seam. Production
+// publishers leave fault nil and use real os.Root/file operations.
+type acornFoxSubstrateFaultStep uint8
+
+const (
+	acornFoxSubstrateFaultIntentCreate acornFoxSubstrateFaultStep = iota + 1
+	acornFoxSubstrateFaultIntentWrite
+	acornFoxSubstrateFaultIntentSync
+	acornFoxSubstrateFaultIntentReadback
+	acornFoxSubstrateFaultDirectoryCreate
+	acornFoxSubstrateFaultDirectorySync
+	acornFoxSubstrateFaultFileOpen
+	acornFoxSubstrateFaultFileWrite
+	acornFoxSubstrateFaultFileSync
+	acornFoxSubstrateFaultFileReadback
+	acornFoxSubstrateFaultReceiptCreate
+	acornFoxSubstrateFaultReceiptWrite
+	acornFoxSubstrateFaultReceiptSync
+	acornFoxSubstrateFaultReceiptReadback
+	acornFoxSubstrateFaultConsume
+	acornFoxSubstrateFaultDiscardRemove
+	acornFoxSubstrateFaultDiscardSync
+)
+
+type acornFoxSubstrateFault func(acornFoxSubstrateFaultStep) error
+
+func (p *TaskAcornFoxSubstratePublisher) faultAt(step acornFoxSubstrateFaultStep) error {
+	if p != nil && p.fault != nil {
+		return p.fault(step)
+	}
+	return nil
 }
 
 type AcornFoxSubstratePublishResult struct {
@@ -103,10 +137,19 @@ func (p *TaskAcornFoxSubstratePublisher) Publish(ctx context.Context, stage *Sta
 		return AcornFoxSubstratePublishResult{}, err
 	}
 	defer root.Close()
+	if err := p.faultAt(acornFoxSubstrateFaultIntentCreate); err != nil {
+		return AcornFoxSubstratePublishResult{}, err
+	}
 	if err := acornFoxSubstrateWriteIntent(root, intent, p.uid, p.gid); err != nil {
 		return AcornFoxSubstratePublishResult{}, err
 	}
+	if err := p.faultAt(acornFoxSubstrateFaultDirectoryCreate); err != nil {
+		return AcornFoxSubstratePublishResult{}, err
+	}
 	if err := acornFoxSubstrateCreateDirs(root, entries, p.uid, p.gid); err != nil {
+		return AcornFoxSubstratePublishResult{}, err
+	}
+	if err := p.faultAt(acornFoxSubstrateFaultFileWrite); err != nil {
 		return AcornFoxSubstratePublishResult{}, err
 	}
 	if err := acornFoxSubstrateCopyFiles(ctx, root, source, entries, candidate, p.uid, p.gid); err != nil {
@@ -120,7 +163,13 @@ func (p *TaskAcornFoxSubstratePublisher) Publish(ctx context.Context, stage *Sta
 	if err := receipt.Validate(); err != nil {
 		return AcornFoxSubstratePublishResult{}, err
 	}
+	if err := p.faultAt(acornFoxSubstrateFaultReceiptCreate); err != nil {
+		return AcornFoxSubstratePublishResult{}, err
+	}
 	if err := acornFoxSubstrateWriteReceipt(root, receipt, p.uid, p.gid); err != nil {
+		return AcornFoxSubstratePublishResult{}, err
+	}
+	if err := p.faultAt(acornFoxSubstrateFaultConsume); err != nil {
 		return AcornFoxSubstratePublishResult{}, err
 	}
 	if err := lease.consume(); err != nil {

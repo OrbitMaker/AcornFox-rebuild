@@ -2,6 +2,8 @@ package install
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"sync"
 	"testing"
@@ -302,5 +304,56 @@ func TestTaskAcornFoxSubstratePublisherResumeRejectsTamperedSourceBeforeRootfs(t
 	}
 	if _, err := os.Stat(root + "/substrate/rootfs"); !os.IsNotExist(err) {
 		t.Fatalf("tampered resume created rootfs: %v", err)
+	}
+}
+
+func TestTaskAcornFoxSubstratePublisherFaultsLeaveFreshRecoveryRequired(t *testing.T) {
+	for _, step := range []acornFoxSubstrateFaultStep{acornFoxSubstrateFaultIntentCreate, acornFoxSubstrateFaultDirectoryCreate, acornFoxSubstrateFaultFileWrite, acornFoxSubstrateFaultReceiptCreate, acornFoxSubstrateFaultConsume} {
+		t.Run(fmt.Sprintf("step_%d", step), func(t *testing.T) {
+			root := t.TempDir()
+			if err := os.Chmod(root, acornFoxStageDirMode); err != nil {
+				t.Fatal(err)
+			}
+			stager, err := NewTaskAcornFoxStager(root, os.Getuid(), os.Getgid())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer stager.Close()
+			stage, receipt, err := stager.Stage(newAcornFoxFixture(t, "1.2.3-test.1", nil).input(nil))
+			if err != nil {
+				t.Fatal(err)
+			}
+			publisher, err := NewTaskAcornFoxSubstratePublisher(root, os.Getuid(), os.Getgid())
+			if err != nil {
+				t.Fatal(err)
+			}
+			publisher.fault = func(candidate acornFoxSubstrateFaultStep) error {
+				if candidate == step {
+					return errAcornFoxStageInjected
+				}
+				return nil
+			}
+			if _, err := publisher.Publish(context.Background(), &stage, receipt.BindingSHA256); err == nil {
+				t.Fatal("faulted publish succeeded")
+			}
+			fresh, err := NewTaskAcornFoxSubstratePublisher(root, os.Getuid(), os.Getgid())
+			if err != nil {
+				t.Fatal(err)
+			}
+			reopened, reopenErr := fresh.Reopen(receipt.BindingSHA256)
+			if step == acornFoxSubstrateFaultConsume {
+				if reopenErr != nil {
+					t.Fatalf("terminal reopen=%v", reopenErr)
+				}
+				reopened.Close()
+			} else {
+				if !errors.Is(reopenErr, ErrAcornFoxSubstrateRecoveryRequired) {
+					t.Fatalf("reopen=%v", reopenErr)
+				}
+				if _, err := os.Stat(root + "/substrate/receipt.json"); !os.IsNotExist(err) {
+					t.Fatalf("fault created terminal receipt: %v", err)
+				}
+			}
+		})
 	}
 }
