@@ -173,8 +173,19 @@ func TestAcornFoxSystemdNamesPathsAndEnvironmentContract(t *testing.T) {
 	requireAcornFoxDirectiveContains(t, buildkit, "Service", "ExecStart", "/opt/acornfox/current/bin/buildkitd")
 	requireAcornFoxDirectiveContains(t, buildkit, "Service", "ExecStart", "--addr unix:///run/acornfox-buildkit/buildkitd.sock")
 
+	_, agent := readAcornFoxUnit(t, "acornfox-agent.service")
+	requireAcornFoxDirectiveContains(t, agent, "Unit", "Requires", "docker.service")
+	requireAcornFoxDirectiveContains(t, agent, "Unit", "After", "docker.service")
+	requireAcornFoxDirective(t, agent, "Service", "SupplementaryGroups", "docker acornfox")
+	requireAcornFoxDirective(t, agent, "Service", "Environment", "ACORNFOX_DOCKER_SOCKET=/var/run/docker.sock")
+	requireAcornFoxDirective(t, agent, "Service", "BindPaths", "/var/run/docker.sock")
+	if values := agent["Service"]["BindReadOnlyPaths"]; len(values) != 0 {
+		t.Fatalf("agent retained an unsupported BuildKit bind: %#v", values)
+	}
+
 	_, edge := readAcornFoxUnit(t, "acornfox-edge.service")
 	requireAcornFoxDirective(t, edge, "Service", "EnvironmentFile", "/etc/acornfox/acornfox-edge.env")
+	requireAcornFoxDirective(t, edge, "Service", "WorkingDirectory", "/var/lib/acornfox/edge")
 	for key, values := range edge["Service"] {
 		if strings.HasPrefix(key, "Exec") {
 			for _, value := range values {
@@ -226,29 +237,150 @@ func TestAcornFoxSystemdBootDagAndHardening(t *testing.T) {
 	requireAcornFoxDirective(t, buildkit, "Service", "Delegate", "yes")
 	requireAcornFoxDirective(t, buildkit, "Service", "RestrictAddressFamilies", "AF_UNIX AF_NETLINK")
 	requireAcornFoxDirective(t, buildkit, "Service", "SystemCallFilter", "@system-service @mount")
-	requireAcornFoxDirective(t, buildkit, "Service", "ReadWritePaths", "/var/lib/acornfox /run/acornfox-buildkit")
+	requireAcornFoxDirective(t, buildkit, "Service", "ReadWritePaths", "/var/lib/acornfox/buildkit /run/acornfox-buildkit")
 }
 
-func TestAcornFoxInitialEdgeIsLoopbackOnly(t *testing.T) {
+func TestAcornFoxWritablePathOwnershipMatrix(t *testing.T) {
+	want := map[string][]string{
+		"acornfox-server.service": {
+			"/var/lib/acornfox/uploads", "/var/lib/acornfox/workspaces", "/var/lib/acornfox/build-work", "/var/lib/acornfox/oci",
+			"/var/lib/acornfox/secrets", "/var/lib/acornfox/secret-materials", "/var/lib/acornfox/health-secret-materials", "/var/log/acornfox/server",
+		},
+		"acornfox-agent.service":       {"/var/lib/acornfox/agent", "/var/log/acornfox/agent"},
+		"acornfox-buildkit.service":    {"/var/lib/acornfox/buildkit", "/run/acornfox-buildkit"},
+		"acornfox-caddy.service":       {"/var/lib/acornfox/caddy", "/var/log/acornfox/caddy"},
+		"acornfox-edge.service":        {"/var/lib/acornfox/edge", "/var/log/acornfox/edge"},
+		"acornfox-healthcheck.service": {"/var/lib/acornfox/healthcheck", "/var/lib/acornfox/health-secret-materials"},
+	}
+	for unit, paths := range want {
+		_, sections := readAcornFoxUnit(t, unit)
+		got := strings.Fields(strings.Join(sections["Service"]["ReadWritePaths"], " "))
+		sort.Strings(got)
+		sortedWant := append([]string(nil), paths...)
+		sort.Strings(sortedWant)
+		if !reflect.DeepEqual(got, sortedWant) {
+			t.Fatalf("%s writable paths = %#v, want %#v", unit, got, sortedWant)
+		}
+		for _, path := range got {
+			if path == "/var/lib/acornfox" || path == "/var/log/acornfox" {
+				t.Fatalf("%s retained a cross-service root writable path %q", unit, path)
+			}
+		}
+	}
+	for _, unit := range []string{"acornfox-upgrade-recover.service", "acornfox-upgrade-finalize.service"} {
+		raw, sections := readAcornFoxUnit(t, unit)
+		requireAcornFoxDirectiveContains(t, sections, "Service", "ReadWritePaths", "/opt/acornfox /var/lib/acornfox /run/lock /etc/acornfox /etc/systemd/system")
+		if !strings.Contains(raw, "03/04 activation must verify helper digest and AcornFox roots") {
+			t.Fatalf("%s lacks the future-activation boundary", unit)
+		}
+	}
+	for _, unit := range []string{"acornfox-healthcheck.service", "acornfox-healthcheck.timer", "acornfox-upgrade-safe.target"} {
+		raw, _ := readAcornFoxUnit(t, unit)
+		if !strings.Contains(raw, "03/04 activation must verify helper digest and AcornFox roots") {
+			t.Fatalf("%s lacks the future-activation boundary", unit)
+		}
+	}
+}
+
+func TestAcornFoxBootGraphIsAcyclic(t *testing.T) {
+	nodes := map[string]bool{}
+	for _, unit := range []string{"acornfox-upgrade-recover.service", "acornfox-upgrade-safe.target", "acornfox-upgrade-finalize.service", "acornfox-buildkit.service", "acornfox-caddy.service", "acornfox-server.service", "acornfox-agent.service", "acornfox-edge.service", "acornfox-healthcheck.service"} {
+		nodes[unit] = true
+	}
+	edges := map[string][]string{}
+	for unit := range nodes {
+		_, sections := readAcornFoxUnit(t, unit)
+		for _, target := range strings.Fields(strings.Join(sections["Unit"]["Before"], " ")) {
+			if nodes[target] {
+				edges[unit] = append(edges[unit], target)
+			}
+		}
+		for _, dependency := range strings.Fields(strings.Join(sections["Unit"]["After"], " ")) {
+			if nodes[dependency] {
+				edges[dependency] = append(edges[dependency], unit)
+			}
+		}
+	}
+	state := map[string]uint8{}
+	var visit func(string)
+	visit = func(unit string) {
+		switch state[unit] {
+		case 1:
+			t.Fatalf("boot ordering cycle reaches %s through %#v", unit, edges)
+		case 2:
+			return
+		}
+		state[unit] = 1
+		for _, target := range edges[unit] {
+			visit(target)
+		}
+		state[unit] = 2
+	}
+	for unit := range nodes {
+		visit(unit)
+	}
+}
+
+func TestAcornFoxCaddyPackageSourcesAreLoopbackOnly(t *testing.T) {
 	caddyRoot := filepath.Join(acornFoxDeployRoot(t), "caddy")
-	config, err := os.ReadFile(filepath.Join(caddyRoot, "acornfox-edge.Caddyfile.example"))
+	wantPackageFiles := map[string]uint32{
+		"caddy/acornfox.Caddyfile.example":      0o644,
+		"caddy/acornfox-edge.Caddyfile.example": 0o644,
+		"caddy/acornfox-edge.env.example":       0o640,
+	}
+	gotPackageFiles := map[string]uint32{}
+	for _, file := range AcornFoxV1RequiredFiles() {
+		if strings.HasPrefix(file.Path, "caddy/") {
+			gotPackageFiles[file.Path] = file.Mode
+		}
+	}
+	if !reflect.DeepEqual(gotPackageFiles, wantPackageFiles) {
+		t.Fatalf("Caddy package files = %#v, want %#v", gotPackageFiles, wantPackageFiles)
+	}
+	for source, future := range map[string]string{
+		"acornfox.Caddyfile.example":      "/etc/acornfox/Caddyfile",
+		"acornfox-edge.Caddyfile.example": "/etc/acornfox/acornfox-edge.Caddyfile",
+	} {
+		config, err := os.ReadFile(filepath.Join(caddyRoot, source))
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := string(config)
+		for _, forbidden := range []string{"Open Card", "open-card", "open_card", "opencard", "OPEN_CARD_", "0.0.0.0", "[::]", "{$", "{env.", "https://", "on_demand", "acme"} {
+			if strings.Contains(strings.ToLower(text), strings.ToLower(forbidden)) {
+				t.Fatalf("%s for future %s contains forbidden value %q", source, future, forbidden)
+			}
+		}
+		if !strings.Contains(text, "admin 127.0.0.1:2019") || !strings.Contains(text, "auto_https off") {
+			t.Fatalf("%s is not an explicitly local Caddy source", source)
+		}
+	}
+	internal, err := os.ReadFile(filepath.Join(caddyRoot, "acornfox.Caddyfile.example"))
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !strings.Contains(string(internal), "http://127.0.0.1:8080") || !strings.Contains(string(internal), "reverse_proxy 127.0.0.1:18481") {
+		t.Fatalf("internal Caddy source is not the fixed local proxy: %s", internal)
+	}
+	_, caddyUnit := readAcornFoxUnit(t, "acornfox-caddy.service")
+	requireAcornFoxDirective(t, caddyUnit, "Service", "ExecStart", "/opt/acornfox/current/bin/caddy run --environ --config /etc/acornfox/Caddyfile --adapter caddyfile")
+	edge, err := os.ReadFile(filepath.Join(caddyRoot, "acornfox-edge.Caddyfile.example"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(edge), "\nhttp://127.0.0.1:18482 {") {
+		t.Fatalf("edge Caddy source is not the fixed local listener: %s", edge)
+	}
+	for _, forbidden := range []string{":80 ", ":80\n", ":80{", ":443 ", ":443\n", ":443{"} {
+		if strings.Contains(string(edge), forbidden) {
+			t.Fatalf("edge Caddy source contains a public listener %q", forbidden)
+		}
 	}
 	env, err := os.ReadFile(filepath.Join(caddyRoot, "acornfox-edge.env.example"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	text := string(config)
-	for _, forbidden := range []string{"Open Card", "open-card", "open_card", "opencard", "OPEN_CARD_", ":80", ":443"} {
-		if strings.Contains(text, forbidden) {
-			t.Fatalf("edge Caddy example contains forbidden value %q", forbidden)
-		}
-	}
-	if !strings.Contains(text, "admin 127.0.0.1:2019") || !strings.Contains(text, "{$ACORNFOX_EDGE_BIND:127.0.0.1:18482}") || !strings.Contains(text, "auto_https off") {
-		t.Fatalf("edge Caddy example is not a fixed loopback-only bootstrap: %s", text)
-	}
-	if strings.TrimSpace(string(env)) != "# This local-only listener is required until a separately approved edge route exists.\nACORNFOX_EDGE_BIND=127.0.0.1:18482" {
+	if strings.Contains(strings.ToUpper(string(env)), "BIND") || strings.Contains(string(env), "18482") || strings.TrimSpace(string(env)) != "# Edge process state only; listener selection is fixed in the Caddyfile.\nHOME=/var/lib/acornfox/edge/home\nXDG_DATA_HOME=/var/lib/acornfox/edge/data\nXDG_CONFIG_HOME=/var/lib/acornfox/edge/config\nACORNFOX_EDGE_LOG_DIR=/var/log/acornfox/edge" {
 		t.Fatalf("edge environment example = %q", env)
 	}
 }

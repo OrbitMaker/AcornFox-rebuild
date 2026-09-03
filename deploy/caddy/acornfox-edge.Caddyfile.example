@@ -5,7 +5,7 @@
 
 # This initial edge is deliberately local-only. It neither publishes a route
 # nor creates a certificate or DNS request.
-{$ACORNFOX_EDGE_BIND:127.0.0.1:18482} {
+http://127.0.0.1:18482 {
 	@edge_health path /healthz
 	respond @edge_health 200
 	respond 404

@@ -1,5 +1,6 @@
 [Unit]
 Description=Run AcornFox host health check every minute
+# Static 02C contract only; 03/04 activation must verify helper digest and AcornFox roots.
 
 [Timer]
 OnBootSec=30s

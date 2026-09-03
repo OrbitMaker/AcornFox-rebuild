@@ -1,5 +1,6 @@
 [Unit]
 Description=AcornFox host health check
+# Static 02C contract only; 03/04 activation must verify helper digest and AcornFox roots.
 Wants=network-online.target
 After=network-online.target acornfox-upgrade-safe.target acornfox-server.service acornfox-agent.service acornfox-edge.service acornfox-caddy.service acornfox-buildkit.service
 
@@ -34,5 +35,5 @@ AmbientCapabilities=
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
-ReadWritePaths=/var/lib/acornfox/healthcheck
+ReadWritePaths=/var/lib/acornfox/healthcheck /var/lib/acornfox/health-secret-materials
 UMask=0077

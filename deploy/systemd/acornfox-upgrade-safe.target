@@ -1,5 +1,6 @@
 [Unit]
 Description=AcornFox upgrade-safe boot barrier
+# Static 02C contract only; 03/04 activation must verify helper digest and AcornFox roots.
 Requires=acornfox-upgrade-recover.service
 Wants=acornfox-upgrade-finalize.service
 After=acornfox-upgrade-recover.service

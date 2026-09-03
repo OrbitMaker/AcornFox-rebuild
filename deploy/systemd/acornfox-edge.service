@@ -8,7 +8,7 @@ After=network-online.target acornfox-upgrade-safe.target acornfox-server.service
 Type=notify
 User=acornfox-edge
 Group=acornfox-edge
-WorkingDirectory=/var/lib/acornfox
+WorkingDirectory=/var/lib/acornfox/edge
 Environment=ACORNFOX_RUNTIME_MODE=clean
 EnvironmentFile=/etc/acornfox/acornfox-edge.env
 ExecStartPre=/opt/acornfox/current/bin/caddy validate --config /etc/acornfox/acornfox-edge.Caddyfile --adapter caddyfile
@@ -45,7 +45,7 @@ IPAddressAllow=::1/128
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
-ReadWritePaths=/var/lib/acornfox /var/log/acornfox
+ReadWritePaths=/var/lib/acornfox/edge /var/log/acornfox/edge
 UMask=0077
 
 [Install]

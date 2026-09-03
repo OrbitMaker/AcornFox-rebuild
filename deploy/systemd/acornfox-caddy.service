@@ -8,10 +8,8 @@ After=network-online.target acornfox-upgrade-safe.target
 Type=simple
 User=acornfox-caddy
 Group=acornfox-caddy
-WorkingDirectory=/var/lib/acornfox
+WorkingDirectory=/var/lib/acornfox/caddy
 Environment=ACORNFOX_RUNTIME_MODE=clean
-Environment=ACORNFOX_CADDY_LISTEN=127.0.0.1:8080
-EnvironmentFile=-/etc/acornfox/caddy.env
 ExecStartPre=/usr/bin/test -r /etc/acornfox/Caddyfile
 ExecStartPre=/usr/bin/grep -Eq ^[[:space:]]*http://(127\\.0\\.0\\.1|localhost|\\[::1\\]):[0-9]+ /etc/acornfox/Caddyfile
 ExecStart=/opt/acornfox/current/bin/caddy run --environ --config /etc/acornfox/Caddyfile --adapter caddyfile
@@ -45,7 +43,7 @@ IPAddressAllow=::1/128
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
-ReadWritePaths=/var/lib/acornfox /var/log/acornfox
+ReadWritePaths=/var/lib/acornfox/caddy /var/log/acornfox/caddy
 UMask=0077
 
 [Install]

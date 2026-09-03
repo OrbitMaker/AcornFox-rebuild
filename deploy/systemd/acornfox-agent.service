@@ -1,16 +1,17 @@
 [Unit]
 Description=AcornFox node agent
 Wants=network-online.target
-Requires=acornfox-upgrade-safe.target
-After=network-online.target acornfox-upgrade-safe.target acornfox-buildkit.service
+Requires=docker.service acornfox-upgrade-safe.target
+After=network-online.target docker.service acornfox-upgrade-safe.target
 
 [Service]
 Type=simple
 User=acornfox-agent
 Group=acornfox-agent
-SupplementaryGroups=acornfox acornfox-buildkit
+SupplementaryGroups=docker acornfox
 WorkingDirectory=/opt/acornfox/current
 Environment=ACORNFOX_RUNTIME_MODE=clean
+Environment=ACORNFOX_DOCKER_SOCKET=/var/run/docker.sock
 EnvironmentFile=-/etc/acornfox/agent.env
 ExecStart=/opt/acornfox/current/bin/acornfox-agent
 Restart=on-failure
@@ -38,9 +39,9 @@ AmbientCapabilities=
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
-ReadWritePaths=/var/lib/acornfox /var/log/acornfox
+ReadWritePaths=/var/lib/acornfox/agent /var/log/acornfox/agent
 ReadOnlyPaths=/var/lib/acornfox/oci
-BindReadOnlyPaths=/run/acornfox-buildkit
+BindPaths=/var/run/docker.sock
 UMask=0077
 
 [Install]

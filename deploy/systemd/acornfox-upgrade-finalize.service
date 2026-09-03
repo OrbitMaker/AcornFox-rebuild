@@ -1,5 +1,6 @@
 [Unit]
 Description=Finalize interrupted AcornFox upgrade recovery
+# Static 02C contract only; 03/04 activation must verify helper digest and AcornFox roots.
 After=acornfox-upgrade-safe.target
 ConditionPathExists=/var/lib/acornfox/upgrade-in-progress
 

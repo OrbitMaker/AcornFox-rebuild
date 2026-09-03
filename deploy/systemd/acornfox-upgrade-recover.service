@@ -1,5 +1,6 @@
 [Unit]
 Description=Prepare interrupted AcornFox upgrade recovery
+# Static 02C contract only; 03/04 activation must verify helper digest and AcornFox roots.
 Wants=network-online.target
 After=local-fs.target network-online.target
 Before=acornfox-upgrade-safe.target

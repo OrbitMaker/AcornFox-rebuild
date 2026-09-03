@@ -1,0 +1,10 @@
+{
+	admin 127.0.0.1:2019
+	auto_https off
+}
+
+# This internal proxy is a package source for the future local config path.
+# It does not publish a DNS name, certificate, or public listener.
+http://127.0.0.1:8080 {
+	reverse_proxy 127.0.0.1:18481
+}
