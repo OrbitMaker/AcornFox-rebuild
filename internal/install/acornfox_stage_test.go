@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 )
@@ -341,7 +342,7 @@ func TestStagedAcornFoxCandidateCloseFailuresAreUnknown(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			handle.fault = func(candidate acornFoxStageFaultStep) error {
+			handle.state.fault = func(candidate acornFoxStageFaultStep) error {
 				if candidate == step {
 					return errAcornFoxStageInjected
 				}
@@ -350,7 +351,7 @@ func TestStagedAcornFoxCandidateCloseFailuresAreUnknown(t *testing.T) {
 			if err := handle.Close(); !errors.Is(err, ErrAcornFoxStageCleanupUnknown) {
 				t.Fatalf("step=%s close=%v", acornFoxStageFaultName(step), err)
 			}
-			handle.fault = nil
+			handle.state.fault = nil
 			if err := handle.Close(); err != nil {
 				t.Fatalf("step=%s retry close=%v", acornFoxStageFaultName(step), err)
 			}
@@ -462,7 +463,7 @@ func TestStagedAcornFoxCandidateCloseCanRetryAfterInjectedFailure(t *testing.T) 
 			if err != nil {
 				t.Fatal(err)
 			}
-			handle.fault = func(step acornFoxStageFaultStep) error {
+			handle.state.fault = func(step acornFoxStageFaultStep) error {
 				if step == failedStep {
 					return errAcornFoxStageInjected
 				}
@@ -471,7 +472,7 @@ func TestStagedAcornFoxCandidateCloseCanRetryAfterInjectedFailure(t *testing.T) 
 			if err := handle.Close(); !errors.Is(err, ErrAcornFoxStageCleanupUnknown) || handle.parent == nil || (failedStep == acornFoxStageFaultHandleClose && handle.root == nil) {
 				t.Fatalf("first close err=%v handle=%#v", err, handle)
 			}
-			handle.fault = nil
+			handle.state.fault = nil
 			if err := handle.Close(); err != nil {
 				t.Fatalf("retry close=%v", err)
 			}
@@ -575,6 +576,119 @@ func TestTaskAcornFoxStagerFaultStepsReachDistinctDurabilityBoundaries(t *testin
 	if hits[acornFoxStageFaultParentEntrySync] < 2 || hits[acornFoxStageFaultParentDirectorySync] < 2 {
 		t.Fatalf("nested parent durability operations not independently reached: %#v", hits)
 	}
+}
+
+func TestStagedAcornFoxCandidateSharedClaimLeaseAndCopies(t *testing.T) {
+	taskRoot := t.TempDir()
+	if err := os.Chmod(taskRoot, acornFoxStageDirMode); err != nil {
+		t.Fatal(err)
+	}
+	stager, err := NewTaskAcornFoxStager(taskRoot, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stager.Close()
+	handle, _, err := stager.Stage(newAcornFoxFixture(t, "1.2.3-test.1", nil).input(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	copyHandle := handle
+	lease, err := handle.claimForPublish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := copyHandle.claimForPublish(); !errors.Is(err, ErrAcornFoxStageClaimed) {
+		t.Fatalf("double claim err=%v", err)
+	}
+	if err := copyHandle.Close(); !errors.Is(err, ErrAcornFoxStageClaimed) {
+		t.Fatalf("close while claimed err=%v", err)
+	}
+	lease.releaseFailure()
+	if !copyHandle.valid() {
+		t.Fatal("failed claim did not restore live stage")
+	}
+	if err := copyHandle.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := handle.Close(); err != nil {
+		t.Fatal(err)
+	}
+	assertAcornFoxStageRootEmpty(t, taskRoot)
+}
+
+func TestStagedAcornFoxCandidateClaimConsumeAndUnknownFreeze(t *testing.T) {
+	for _, finish := range []struct {
+		name  string
+		apply func(*acornFoxStagePublishLease)
+		want  acornFoxStagePhase
+	}{
+		{"consume", func(lease *acornFoxStagePublishLease) { lease.consume() }, acornFoxStageConsumed},
+		{"unknown", func(lease *acornFoxStagePublishLease) { lease.freezeUnknown() }, acornFoxStageUnknown},
+	} {
+		t.Run(finish.name, func(t *testing.T) {
+			root := t.TempDir()
+			if err := os.Chmod(root, acornFoxStageDirMode); err != nil {
+				t.Fatal(err)
+			}
+			stager, err := NewTaskAcornFoxStager(root, os.Getuid(), os.Getgid())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer stager.Close()
+			handle, _, err := stager.Stage(newAcornFoxFixture(t, "1.2.3-test.1", nil).input(nil))
+			if err != nil {
+				t.Fatal(err)
+			}
+			lease, err := handle.claimForPublish()
+			if err != nil {
+				t.Fatal(err)
+			}
+			finish.apply(lease)
+			handle.state.mu.Lock()
+			phase := handle.state.phase
+			handle.state.mu.Unlock()
+			if phase != finish.want || handle.valid() {
+				t.Fatalf("phase=%d valid=%t", phase, handle.valid())
+			}
+			if _, err := handle.claimForPublish(); err == nil {
+				t.Fatal("terminal lease phase allowed a second claim")
+			}
+		})
+	}
+}
+
+func TestStagedAcornFoxCandidateConcurrentCloseCopies(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, acornFoxStageDirMode); err != nil {
+		t.Fatal(err)
+	}
+	stager, err := NewTaskAcornFoxStager(root, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stager.Close()
+	handle, _, err := stager.Stage(newAcornFoxFixture(t, "1.2.3-test.1", nil).input(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	copyHandle := handle
+	var group sync.WaitGroup
+	errs := make(chan error, 2)
+	for _, candidate := range []*StagedAcornFoxCandidateV1{&handle, &copyHandle} {
+		group.Add(1)
+		go func(candidate *StagedAcornFoxCandidateV1) {
+			defer group.Done()
+			errs <- candidate.Close()
+		}(candidate)
+	}
+	group.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	assertAcornFoxStageRootEmpty(t, root)
 }
 
 func mustMarshalAcornFoxReceipt(t *testing.T, receipt AcornFoxStageReceiptV1) []byte {

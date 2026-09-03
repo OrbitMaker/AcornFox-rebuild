@@ -107,6 +107,35 @@ func TestAcornFoxSystemdInventoryMatchesPackageContract(t *testing.T) {
 	}
 }
 
+func TestAcornFoxBuildKitCandidateConfigIsFixedAndOffline(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join(acornFoxDeployRoot(t), "buildkit", "acornfox-buildkitd.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := string(raw)
+	for _, required := range []string{
+		"root = \"/var/lib/acornfox/buildkit/buildkitd\"", "max-parallelism = 1", "[worker.oci]", "enabled = true", "rootless = true", "snapshotter = \"native\"", "[worker.containerd]", "enabled = false",
+	} {
+		if !strings.Contains(config, required) {
+			t.Fatalf("candidate BuildKit config missing %q", required)
+		}
+	}
+	for _, forbidden := range []string{"registry", "mirror", "entitlement", "network."} {
+		if strings.Contains(strings.ToLower(config), forbidden) {
+			t.Fatalf("candidate BuildKit config retained forbidden %q", forbidden)
+		}
+	}
+	found := false
+	for _, file := range AcornFoxV1RequiredFiles() {
+		if file.Path == "config/acornfox-buildkitd.toml" && file.Mode == 0o644 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("candidate BuildKit config is not bound to package inventory")
+	}
+}
+
 func TestAcornFoxSystemdNamesPathsAndEnvironmentContract(t *testing.T) {
 	for _, name := range acornFoxSystemdFiles {
 		raw, sections := readAcornFoxUnit(t, name)

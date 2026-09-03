@@ -92,6 +92,7 @@ func AcornFoxV1RequiredFiles() []AcornFoxV1PackageFile {
 		files = append(files, AcornFoxV1PackageFile{"migrations/control-plane/" + name, 0o640})
 	}
 	return append(files,
+		AcornFoxV1PackageFile{"config/acornfox-buildkitd.toml", 0o644},
 		AcornFoxV1PackageFile{"caddy/acornfox.Caddyfile.example", 0o644},
 		AcornFoxV1PackageFile{"caddy/acornfox-edge.env.example", 0o640},
 		AcornFoxV1PackageFile{"caddy/acornfox-edge.Caddyfile.example", 0o644},
