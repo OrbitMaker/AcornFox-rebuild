@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/open-card/open-card/internal/contracts"
+	"github.com/open-card/open-card/internal/domain"
 )
 
 // This integration path intentionally observes only repository task-root
@@ -50,6 +51,29 @@ func TestAcornFox04CRepositoryPreparationLeavesExternalSentinelUntouched(t *test
 func TestAcornFox04CRepositoryOnlyLeavesProviderFactsAndDataSentinelUntouched(t *testing.T) {
 	runtime := contracts.NewFakeRuntimeDriver(true)
 	volume := contracts.NewFakeVolumeProvider(true)
+	image, err := domain.ParseImageDigest("example/acornfox", "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deployment, err := runtime.Deploy(context.Background(), contracts.DeployRequest{DeploymentID: domain.ID("dep_04c_seed"), Spec: contracts.RuntimeSpec{ApplicationID: domain.ID("app_04c"), EnvironmentID: domain.ID("env_04c"), ReleaseID: domain.ID("release_04c"), ServiceName: "web", Image: image, Port: 8080}, Operation: contracts.OperationContext{IdempotencyKey: "runtime-seed"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	observe := func() contracts.RuntimeObservation {
+		got, err := runtime.Observe(context.Background(), contracts.ObserveRequest{DeploymentID: deployment.ID, Operation: contracts.OperationContext{IdempotencyKey: "runtime-observe"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	beforeObservation := observe()
+	volumeSpec := contracts.VolumeSpec{Name: "retained-data", MountPath: "/var/lib/app", SizeBytes: 1024}
+	if _, _, err = volume.Create(context.Background(), contracts.VolumeRequest{Volume: volumeSpec, Operation: contracts.OperationContext{IdempotencyKey: "volume-create"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err = volume.Attach(context.Background(), contracts.VolumeRequest{Volume: volumeSpec, Operation: contracts.OperationContext{IdempotencyKey: "volume-attach"}}); err != nil {
+		t.Fatal(err)
+	}
 	ledger := struct {
 		Runtime contracts.ProviderMetadata `json:"runtime"`
 		Volume  contracts.ProviderMetadata `json:"volume"`
@@ -100,5 +124,10 @@ func TestAcornFox04CRepositoryOnlyLeavesProviderFactsAndDataSentinelUntouched(t 
 	afterRaw, readErr := os.ReadFile(sentinel)
 	if err != nil || readErr != nil || !os.SameFile(beforeInfo, afterInfo) || string(beforeRaw) != string(afterRaw) {
 		t.Fatalf("application-data sentinel changed: %v %v", err, readErr)
+	}
+	beforeObservationRaw, marshalErr := json.Marshal(beforeObservation)
+	afterObservationRaw, afterMarshalErr := json.Marshal(observe())
+	if marshalErr != nil || afterMarshalErr != nil || string(beforeObservationRaw) != string(afterObservationRaw) {
+		t.Fatalf("runtime observation changed: %v %v", marshalErr, afterMarshalErr)
 	}
 }

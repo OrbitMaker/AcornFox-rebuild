@@ -96,10 +96,14 @@ func prepareAcornFoxRepository(ctx context.Context, store *TaskAcornFoxRepoStore
 			err = ErrAcornFoxRepoRecoveryUnknown
 		}
 	}()
-	if err = acornFoxRepoRecoverPointerTemps(root, l.store, l.journal.TransactionID, a, mark); err != nil {
-		return ErrAcornFoxRepoBootstrapConflict
-	}
+	wasRecovery := l.journal.NeedsRecovery
 	if l.journal.NeedsRecovery {
+		if !acornFoxRepoPrefix(root, l.store, l.journal, lease.receipt, l.substrate, a, raw) {
+			return ErrAcornFoxRepoBootstrapConflict
+		}
+		if err = acornFoxRepoRecoverPointerTemps(root, l.store, l.journal.TransactionID, a, mark); err != nil {
+			return ErrAcornFoxRepoBootstrapConflict
+		}
 		if !acornFoxRepoPrefix(root, l.store, l.journal, lease.receipt, l.substrate, a, raw) {
 			return ErrAcornFoxRepoBootstrapConflict
 		}
@@ -109,7 +113,7 @@ func prepareAcornFoxRepository(ctx context.Context, store *TaskAcornFoxRepoStore
 		}
 		l.journal = next
 	}
-	if !acornFoxRepoPrefix(root, l.store, l.journal, lease.receipt, l.substrate, a, raw) {
+	if !wasRecovery && !acornFoxRepoPrefix(root, l.store, l.journal, lease.receipt, l.substrate, a, raw) {
 		return ErrAcornFoxRepoBootstrapConflict
 	}
 	if l.journal.Phase == AcornFoxRepoStaticVerified {
@@ -364,57 +368,149 @@ func acornFoxRepoRecovered(o AcornFoxRepoJournalV1, d string) AcornFoxRepoJourna
 	n.History = append(n.History, AcornFoxRepoHistoryV1{n.Revision, AcornFoxRepoHistoryRecovered, o.Phase, o.Phase, acornFoxRepoEvidence("acornfox-repo-bootstrap-recovered-v1\x00", o.BindingSHA256, string(o.Phase), d)})
 	return n
 }
+
+type acornFoxRepoPrefixState int
+
+const (
+	acornFoxRepoPrefixStatic acornFoxRepoPrefixState = iota
+	acornFoxRepoPrefixActivations
+	acornFoxRepoPrefixActivationDir
+	acornFoxRepoPrefixActivationJSON
+	acornFoxRepoPrefixReleaseTemp
+	acornFoxRepoPrefixRelease
+	acornFoxRepoPrefixActiveTemp
+	acornFoxRepoPrefixActive
+	acornFoxRepoPrefixCurrentTemp
+	acornFoxRepoPrefixCurrent
+)
+
 func acornFoxRepoPrefix(root *os.Root, s *TaskAcornFoxRepoStore, j AcornFoxRepoJournalV1, r AcornFoxLiveReceiptV1, sub *PublishedAcornFoxSubstrateV1, a AcornFoxRepoActivationV1, raw []byte) bool {
 	entries, e := acornFoxLiveExpectedEntries(sub)
 	if e != nil || !acornFoxRepoVerifyPinnedLive(root, s, entries, r) {
 		return false
 	}
-	stage := AcornFoxRepoStaticVerified
-	if acornFoxLiveExactFile(root, s, acornFoxRepoActivationPath(a.ActivationID), raw, durableFileMode, false) && acornFoxRepoPointer(root, s, acornFoxRepoReleasePath(a.ActivationID), "../../releases/"+a.ReleaseID, false) {
-		stage = AcornFoxRepoActivationWritten
-	}
-	if acornFoxRepoPointer(root, s, acornFoxRepoActivePath(), "activations/"+a.ActivationID, false) {
-		if stage != AcornFoxRepoActivationWritten {
-			return false
-		}
-		stage = AcornFoxRepoActivePublished
-	}
-	if acornFoxRepoPointer(root, s, acornFoxRepoCurrentPath(), "active/release", false) {
-		if stage != AcornFoxRepoActivePublished {
-			return false
-		}
-		stage = AcornFoxRepoCurrentPublished
-	}
-	if !acornFoxRepoExactInventory(root, s, entries, r, a, raw, stage) {
+	state, ok := acornFoxRepoClassifyPrefix(root, s, a, raw)
+	if !ok || !acornFoxRepoExactInventory(root, s, entries, a, raw, state) {
 		return false
 	}
-	minimum := acornFoxRepoRank(j.Phase)
-	if j.Phase == AcornFoxRepoPreparedFinal {
-		minimum = acornFoxRepoRank(AcornFoxRepoCurrentPublished)
-	}
-	return acornFoxRepoRank(stage) >= minimum && (j.Phase == AcornFoxRepoPreparedFinal || acornFoxRepoRank(stage) <= acornFoxRepoRank(j.Phase)+1)
+	min, max := acornFoxRepoPrefixBounds(j.Phase, j.NeedsRecovery)
+	return state >= min && state <= max
 }
-func acornFoxRepoExactInventory(root *os.Root, s *TaskAcornFoxRepoStore, entries []SubstrateEntry, r AcornFoxLiveReceiptV1, a AcornFoxRepoActivationV1, raw []byte, phase AcornFoxRepoPhase) bool {
+func acornFoxRepoPrefixBounds(phase AcornFoxRepoPhase, recovery bool) (acornFoxRepoPrefixState, acornFoxRepoPrefixState) {
+	if recovery {
+		switch phase {
+		case AcornFoxRepoStaticVerified:
+			return acornFoxRepoPrefixStatic, acornFoxRepoPrefixRelease
+		case AcornFoxRepoActivationWritten:
+			return acornFoxRepoPrefixRelease, acornFoxRepoPrefixActive
+		case AcornFoxRepoActivePublished:
+			return acornFoxRepoPrefixActive, acornFoxRepoPrefixCurrent
+		default:
+			return acornFoxRepoPrefixCurrent, acornFoxRepoPrefixCurrent
+		}
+	}
+	switch phase {
+	case AcornFoxRepoStaticVerified:
+		return acornFoxRepoPrefixStatic, acornFoxRepoPrefixStatic
+	case AcornFoxRepoActivationWritten:
+		return acornFoxRepoPrefixRelease, acornFoxRepoPrefixRelease
+	case AcornFoxRepoActivePublished:
+		return acornFoxRepoPrefixActive, acornFoxRepoPrefixActive
+	default:
+		return acornFoxRepoPrefixCurrent, acornFoxRepoPrefixCurrent
+	}
+}
+func acornFoxRepoClassifyPrefix(root *os.Root, s *TaskAcornFoxRepoStore, a AcornFoxRepoActivationV1, raw []byte) (acornFoxRepoPrefixState, bool) {
+	exists := func(path string) bool { _, err := root.Lstat(path); return err == nil }
+	parent, dir, jsonPath, release := acornFoxLiveDir+"/opt/acornfox/activations", acornFoxRepoActivationDir(a.ActivationID), acornFoxRepoActivationPath(a.ActivationID), acornFoxRepoReleasePath(a.ActivationID)
+	if !exists(parent) {
+		return acornFoxRepoPrefixStatic, true
+	}
+	if !exists(dir) {
+		return acornFoxRepoPrefixActivations, true
+	}
+	if !exists(jsonPath) {
+		return acornFoxRepoPrefixActivationDir, true
+	}
+	if !acornFoxLiveExactFile(root, s, jsonPath, raw, durableFileMode, false) {
+		return 0, false
+	}
+	if state, ok := acornFoxRepoPointerPrefix(root, s, a.TransactionID, release, "../../releases/"+a.ReleaseID, acornFoxRepoPrefixActivationJSON, acornFoxRepoPrefixReleaseTemp, acornFoxRepoPrefixRelease); !ok || state != acornFoxRepoPrefixRelease {
+		return state, ok
+	}
+	if state, ok := acornFoxRepoPointerPrefix(root, s, a.TransactionID, acornFoxRepoActivePath(), "activations/"+a.ActivationID, acornFoxRepoPrefixRelease, acornFoxRepoPrefixActiveTemp, acornFoxRepoPrefixActive); !ok || state != acornFoxRepoPrefixActive {
+		return state, ok
+	}
+	if state, ok := acornFoxRepoPointerPrefix(root, s, a.TransactionID, acornFoxRepoCurrentPath(), "active/release", acornFoxRepoPrefixActive, acornFoxRepoPrefixCurrentTemp, acornFoxRepoPrefixCurrent); !ok || state != acornFoxRepoPrefixCurrent {
+		return state, ok
+	}
+	return acornFoxRepoPrefixCurrent, true
+}
+func acornFoxRepoPointerPrefix(root *os.Root, s *TaskAcornFoxRepoStore, tx, path, target string, before, tempState, finalState acornFoxRepoPrefixState) (acornFoxRepoPrefixState, bool) {
+	temp := acornFoxRepoTemp(tx, path)
+	tempInfo, tempErr := root.Lstat(temp)
+	finalInfo, finalErr := root.Lstat(path)
+	if tempErr == nil {
+		if !acornFoxRepoPointer(root, s, temp, target, true) {
+			return 0, false
+		}
+		if finalErr == nil {
+			if !os.SameFile(tempInfo, finalInfo) || !acornFoxRepoPointer(root, s, path, target, true) {
+				return 0, false
+			}
+		} else if !errors.Is(finalErr, os.ErrNotExist) {
+			return 0, false
+		}
+		return tempState, true
+	}
+	if !errors.Is(tempErr, os.ErrNotExist) {
+		return 0, false
+	}
+	if errors.Is(finalErr, os.ErrNotExist) {
+		return before, true
+	}
+	if finalErr != nil || !acornFoxRepoPointer(root, s, path, target, false) {
+		return 0, false
+	}
+	return finalState, true
+}
+func acornFoxRepoExactInventory(root *os.Root, s *TaskAcornFoxRepoStore, entries []SubstrateEntry, a AcornFoxRepoActivationV1, raw []byte, state acornFoxRepoPrefixState) bool {
 	type expectedNode struct {
 		directory     bool
 		mode          os.FileMode
 		pointerTarget string
+		allowTwo      bool
 	}
 	want := map[string]expectedNode{"receipt.json": {mode: durableFileMode}}
 	for _, entry := range entries {
 		want[entry.Path] = expectedNode{directory: entry.Kind == SubstrateEntryDirectory, mode: os.FileMode(entry.Mode)}
 	}
-	if acornFoxRepoRank(phase) >= acornFoxRepoRank(AcornFoxRepoActivationWritten) {
+	if state >= acornFoxRepoPrefixActivations {
 		want["opt/acornfox/activations"] = expectedNode{directory: true, mode: durableDirMode}
+	}
+	if state >= acornFoxRepoPrefixActivationDir {
 		want["opt/acornfox/activations/"+a.ActivationID] = expectedNode{directory: true, mode: durableDirMode}
+	}
+	if state >= acornFoxRepoPrefixActivationJSON {
 		want["opt/acornfox/activations/"+a.ActivationID+"/repo-activation.json"] = expectedNode{mode: durableFileMode}
-		want["opt/acornfox/activations/"+a.ActivationID+"/release"] = expectedNode{pointerTarget: "../../releases/" + a.ReleaseID}
 	}
-	if acornFoxRepoRank(phase) >= acornFoxRepoRank(AcornFoxRepoActivePublished) {
-		want["opt/acornfox/active"] = expectedNode{pointerTarget: "activations/" + a.ActivationID}
+	if state == acornFoxRepoPrefixReleaseTemp {
+		want["opt/acornfox/activations/"+a.ActivationID+"/"+filepath.Base(acornFoxRepoTemp(a.TransactionID, acornFoxRepoReleasePath(a.ActivationID)))] = expectedNode{pointerTarget: "../../releases/" + a.ReleaseID, allowTwo: true}
 	}
-	if acornFoxRepoRank(phase) >= acornFoxRepoRank(AcornFoxRepoCurrentPublished) {
-		want["opt/acornfox/current"] = expectedNode{pointerTarget: "active/release"}
+	if state >= acornFoxRepoPrefixRelease || state == acornFoxRepoPrefixReleaseTemp {
+		want["opt/acornfox/activations/"+a.ActivationID+"/release"] = expectedNode{pointerTarget: "../../releases/" + a.ReleaseID, allowTwo: state == acornFoxRepoPrefixReleaseTemp}
+	}
+	if state == acornFoxRepoPrefixActiveTemp {
+		want["opt/acornfox/"+filepath.Base(acornFoxRepoTemp(a.TransactionID, acornFoxRepoActivePath()))] = expectedNode{pointerTarget: "activations/" + a.ActivationID, allowTwo: true}
+	}
+	if state >= acornFoxRepoPrefixActive || state == acornFoxRepoPrefixActiveTemp {
+		want["opt/acornfox/active"] = expectedNode{pointerTarget: "activations/" + a.ActivationID, allowTwo: state == acornFoxRepoPrefixActiveTemp}
+	}
+	if state == acornFoxRepoPrefixCurrentTemp {
+		want["opt/acornfox/"+filepath.Base(acornFoxRepoTemp(a.TransactionID, acornFoxRepoCurrentPath()))] = expectedNode{pointerTarget: "active/release", allowTwo: true}
+	}
+	if state >= acornFoxRepoPrefixCurrent || state == acornFoxRepoPrefixCurrentTemp {
+		want["opt/acornfox/current"] = expectedNode{pointerTarget: "active/release", allowTwo: state == acornFoxRepoPrefixCurrentTemp}
 	}
 	var walk func(string) bool
 	walk = func(dir string) bool {
@@ -439,7 +535,7 @@ func acornFoxRepoExactInventory(root *os.Root, s *TaskAcornFoxRepoStore, entries
 				return false
 			}
 			if info.Mode()&os.ModeSymlink != 0 {
-				if expected.pointerTarget == "" || !acornFoxRepoPointer(root, s, path, expected.pointerTarget, false) {
+				if expected.pointerTarget == "" || !acornFoxRepoPointer(root, s, path, expected.pointerTarget, expected.allowTwo) {
 					return false
 				}
 				continue
@@ -460,7 +556,7 @@ func acornFoxRepoExactInventory(root *os.Root, s *TaskAcornFoxRepoStore, entries
 	if !walk(acornFoxLiveDir) {
 		return false
 	}
-	if acornFoxRepoRank(phase) >= acornFoxRepoRank(AcornFoxRepoActivationWritten) && !acornFoxLiveExactFile(root, s, acornFoxRepoActivationPath(a.ActivationID), raw, durableFileMode, false) {
+	if state >= acornFoxRepoPrefixActivationJSON && !acornFoxLiveExactFile(root, s, acornFoxRepoActivationPath(a.ActivationID), raw, durableFileMode, false) {
 		return false
 	}
 	return true
@@ -474,7 +570,8 @@ func acornFoxRepoVerifyLeaseInventory(root *os.Root, s *TaskAcornFoxRepoStore, j
 	if err != nil || !acornFoxRepoVerifyPinnedLive(root, s, entries, r) {
 		return false
 	}
-	return acornFoxRepoExactInventory(root, s, entries, r, a, raw, j.Phase)
+	state, ok := acornFoxRepoClassifyPrefix(root, s, a, raw)
+	return ok && acornFoxRepoExactInventory(root, s, entries, a, raw, state)
 }
 func acornFoxRepoVerifyPinnedLive(root *os.Root, s *TaskAcornFoxRepoStore, entries []SubstrateEntry, r AcornFoxLiveReceiptV1) bool {
 	for _, e := range entries {
