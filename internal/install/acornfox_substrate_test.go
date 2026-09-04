@@ -773,6 +773,19 @@ func TestTaskAcornFoxSubstratePublisherReleaseControlFaultsResumeFromFreshState(
 		name  string
 		apply func(*TaskAcornFoxSubstratePublisher, string)
 	}{
+		{"zero_byte_before_write", func(p *TaskAcornFoxSubstratePublisher, release string) {
+			base, once := p.fs, false
+			p.fs.openFile = func(root *os.Root, path string, flags int, mode os.FileMode) (acornFoxSubstrateFile, error) {
+				file, err := base.openFile(root, path, flags, mode)
+				if err != nil || once || !strings.HasPrefix(path, parentDirectory(release)+"/"+acornFoxSubstrateTempPrefix) || flags&os.O_CREATE == 0 {
+					return file, err
+				}
+				once = true
+				return acornFoxSubstrateTestFile{acornFoxSubstrateFile: file, write: func(acornFoxSubstrateFile, []byte) (int, error) {
+					return 0, errAcornFoxSubstrateInjected
+				}}, nil
+			}
+		}},
 		{"partial_write_error", func(p *TaskAcornFoxSubstratePublisher, release string) {
 			base, once := p.fs, false
 			p.fs.openFile = func(root *os.Root, path string, flags int, mode os.FileMode) (acornFoxSubstrateFile, error) {
@@ -909,6 +922,83 @@ func TestTaskAcornFoxSubstratePublisherReleaseControlFaultsResumeFromFreshState(
 				t.Fatalf("resume=%#v err=%v", result, err)
 			}
 		})
+	}
+}
+
+func TestTaskAcornFoxSubstratePublisherRecoversManifestModeTempAfterChmodFault(t *testing.T) {
+	for _, wantMode := range []os.FileMode{0o644, 0o755} {
+		t.Run(wantMode.String(), func(t *testing.T) {
+			root, publisher, stage, receipt := newAcornFoxSubstrateTestPublisher(t)
+			base, injected := publisher.fs, false
+			publisher.fs.openFile = func(handle *os.Root, path string, flags int, mode os.FileMode) (acornFoxSubstrateFile, error) {
+				file, err := base.openFile(handle, path, flags, mode)
+				if err != nil || injected || !strings.HasPrefix(path, acornFoxSubstrateRootfs+"/") || flags&os.O_CREATE == 0 {
+					return file, err
+				}
+				return acornFoxSubstrateTestFile{acornFoxSubstrateFile: file, chmod: func(file acornFoxSubstrateFile, mode os.FileMode) error {
+					if err := file.Chmod(mode); err != nil {
+						return err
+					}
+					if mode == wantMode {
+						injected = true
+						return errAcornFoxSubstrateInjected
+					}
+					return nil
+				}}, nil
+			}
+			if _, err := publisher.Publish(context.Background(), stage, receipt.BindingSHA256); !errors.Is(err, errAcornFoxSubstrateInjected) {
+				t.Fatalf("publish=%v", err)
+			}
+			fresh, err := NewTaskAcornFoxSubstratePublisher(root, os.Getuid(), os.Getgid())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer fresh.Close()
+			if result, err := fresh.Resume(context.Background(), receipt.BindingSHA256); err != nil || result.Outcome != AcornFoxReconcileCompleted {
+				t.Fatalf("resume=%#v err=%v", result, err)
+			}
+		})
+	}
+}
+
+func TestTaskAcornFoxSubstratePublisherRejectsForeignReleaseControlHardlinks(t *testing.T) {
+	root, publisher, stage, receipt := newAcornFoxSubstrateTestPublisher(t)
+	release := acornFoxSubstrateReleaseControlPath(receipt.ReleaseID)
+	base := publisher.fs
+	publisher.fs.link = func(root *os.Root, oldName, newName string) error {
+		err := base.link(root, oldName, newName)
+		if err == nil && newName == release {
+			return errAcornFoxSubstrateInjected
+		}
+		return err
+	}
+	if _, err := publisher.Publish(context.Background(), stage, receipt.BindingSHA256); !errors.Is(err, errAcornFoxSubstrateInjected) {
+		t.Fatalf("publish=%v", err)
+	}
+	releasePath := filepath.Join(root, filepath.FromSlash(release))
+	foreign := filepath.Join(filepath.Dir(releasePath), "foreign-release-control-link")
+	if err := os.Link(releasePath, foreign); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := NewTaskAcornFoxSubstratePublisher(root, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fresh.Close()
+	if inspection, err := fresh.Inspect(receipt.BindingSHA256); err != nil || inspection.Outcome != AcornFoxReconcileResume {
+		t.Fatalf("inspection=%#v err=%v", inspection, err)
+	}
+	if _, err := fresh.Resume(context.Background(), receipt.BindingSHA256); !errors.Is(err, ErrAcornFoxSubstrateConflict) {
+		t.Fatalf("foreign hardlink resume=%v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, acornFoxSubstrateReceipt)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("foreign hardlink wrote terminal receipt: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, stage.state.stageName)); err != nil {
+		t.Fatalf("foreign hardlink consumed stage: %v", err)
+	}
+	if _, err := os.Lstat(foreign); err != nil {
+		t.Fatalf("foreign hardlink was removed: %v", err)
 	}
 }
 
@@ -1360,7 +1450,7 @@ func TestTaskAcornFoxSubstratePublisherChownAndConsumeBoundaries(t *testing.T) {
 			t.Fatalf("owned control temps=%v err=%v", matches, err)
 		}
 		info, err := os.Lstat(matches[0])
-		if err != nil || !acornFoxSubstrateOwnedTemp(info, os.Getuid(), os.Getgid()) {
+		if err != nil || !acornFoxSubstrateUnlinkedTemp(info, acornFoxHelperReceiptMaxBytes, map[os.FileMode]struct{}{0o600: {}}, os.Getuid(), os.Getgid()) {
 			t.Fatalf("temp metadata=%v err=%v", info, err)
 		}
 		fresh, err := NewTaskAcornFoxSubstratePublisher(root, os.Getuid(), os.Getgid())

@@ -251,8 +251,42 @@ func (p *TaskAcornFoxSubstratePublisher) Resume(ctx context.Context, expectedBin
 	if err != nil {
 		return AcornFoxSubstratePublishResult{}, err
 	}
-	defer stage.Close()
-	return p.publishLocked(ctx, stage, expectedBindingSHA256, AcornFoxReconcileResume)
+	result, publishErr := p.publishLocked(ctx, stage, expectedBindingSHA256, AcornFoxReconcileResume)
+	closeErr := acornFoxSubstrateCloseReopenedStage(stage)
+	if publishErr != nil {
+		return result, publishErr
+	}
+	if closeErr != nil {
+		return result, closeErr
+	}
+	return result, nil
+}
+
+// acornFoxSubstrateCloseReopenedStage releases descriptors after Resume without
+// deleting an unconsumed stage. A later fresh Resume can then reacquire the
+// sealed on-disk capability; only lease.consume is allowed to remove it.
+func acornFoxSubstrateCloseReopenedStage(stage *StagedAcornFoxCandidateV1) error {
+	if stage == nil || stage.state == nil {
+		return nil
+	}
+	state := stage.state
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	var first error
+	if state.root != nil {
+		first = state.root.Close()
+		state.root = nil
+	}
+	if state.parent != nil {
+		if err := state.parent.Close(); first == nil {
+			first = err
+		}
+		state.parent = nil
+	}
+	if state.phase != acornFoxStageConsumed {
+		state.phase = acornFoxStageUnknown
+	}
+	return first
 }
 
 func (p *TaskAcornFoxSubstratePublisher) reconcileOwnedTempsLocked(expectedBindingSHA256 string) error {
@@ -624,6 +658,9 @@ func (h *PublishedAcornFoxSubstrateV1) verifyControlFiles() error {
 		}
 		if !strings.HasPrefix(child.Name(), acornFoxSubstrateTempPrefix) {
 			return errors.New("AcornFox substrate control set has an extra entry")
+		}
+		if !acornFoxSubstrateTempName(child.Name()) {
+			return errors.New("AcornFox substrate temporary control name is invalid")
 		}
 		path := filepath.ToSlash(filepath.Join(acornFoxSubstrateDir, child.Name()))
 		info, statErr := h.fs.lstat(h.root, path)

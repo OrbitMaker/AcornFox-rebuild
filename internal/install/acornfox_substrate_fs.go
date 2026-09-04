@@ -530,6 +530,9 @@ func acornFoxSubstrateReadTerminalReceipt(fs acornFoxSubstrateFS, root *os.Root,
 		if !strings.HasPrefix(child.Name(), acornFoxSubstrateTempPrefix) {
 			continue
 		}
+		if !acornFoxSubstrateTempName(child.Name()) {
+			return nil, errors.New("AcornFox substrate receipt temporary name is invalid")
+		}
 		path := filepath.ToSlash(filepath.Join(acornFoxSubstrateDir, child.Name()))
 		tempInfo, lstatErr := fs.lstat(root, path)
 		if lstatErr == nil && acornFoxSubstrateTerminalTemp(tempInfo, info, uid, gid) {
@@ -551,8 +554,15 @@ func acornFoxSubstrateControlMetadata(info os.FileInfo, uid, gid int) bool {
 	return info != nil && info.Mode().IsRegular() && info.Mode().Perm() == 0o600 && verifyOwner(info, uid, gid) == nil && info.Size() >= 1 && info.Size() <= acornFoxHelperReceiptMaxBytes
 }
 
-func acornFoxSubstrateOwnedTemp(info os.FileInfo, uid, gid int) bool {
-	return acornFoxSubstrateControlMetadata(info, uid, gid) && info.Mode()&os.ModeSymlink == 0
+func acornFoxSubstrateUnlinkedTemp(info os.FileInfo, maximum int64, modes map[os.FileMode]struct{}, uid, gid int) bool {
+	if info == nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || verifyOwner(info, uid, gid) != nil || !acornFoxSubstrateSingleLink(info) || info.Size() < 0 || info.Size() > maximum {
+		return false
+	}
+	if info.Mode().Perm() == 0o600 {
+		return true
+	}
+	_, ok := modes[info.Mode().Perm()]
+	return ok
 }
 
 func acornFoxSubstrateTempName(name string) bool {
@@ -565,7 +575,7 @@ func acornFoxSubstrateTempName(name string) bool {
 }
 
 func acornFoxSubstrateTerminalTemp(info, receipt os.FileInfo, uid, gid int) bool {
-	if !acornFoxSubstrateOwnedTemp(info, uid, gid) || !acornFoxSubstrateControlMetadata(receipt, uid, gid) || !os.SameFile(info, receipt) {
+	if !acornFoxSubstrateControlMetadata(info, uid, gid) || !acornFoxSubstrateControlMetadata(receipt, uid, gid) || !os.SameFile(info, receipt) {
 		return false
 	}
 	stat, ok := info.Sys().(*syscall.Stat_t)
@@ -606,6 +616,9 @@ func acornFoxSubstrateRemoveTerminalReceiptTemp(fs acornFoxSubstrateFS, root *os
 	for _, child := range children {
 		if !strings.HasPrefix(child.Name(), acornFoxSubstrateTempPrefix) {
 			continue
+		}
+		if !acornFoxSubstrateTempName(child.Name()) {
+			return ErrAcornFoxSubstrateConflict
 		}
 		path := filepath.ToSlash(filepath.Join(acornFoxSubstrateDir, child.Name()))
 		info, lstatErr := fs.lstat(root, path)
@@ -671,12 +684,29 @@ func acornFoxSubstrateCopyFully(output, input acornFoxSubstrateFile) error {
 
 // Only a regular temporary file owned by this task may be removed. Foreign
 // files, symlinks, and final paths remain evidence and are never cleaned.
+type acornFoxSubstrateTempPolicy struct {
+	maximum int64
+	modes   map[os.FileMode]struct{}
+}
+
 func acornFoxSubstrateRemoveOwnedTemps(fs acornFoxSubstrateFS, root *os.Root, entries []SubstrateEntry, exemptDirectory string, uid, gid int) error {
-	directories := map[string]struct{}{acornFoxSubstrateDir: {}, acornFoxSubstrateRootfs: {}}
+	directories := map[string]acornFoxSubstrateTempPolicy{
+		acornFoxSubstrateDir: {maximum: acornFoxHelperReceiptMaxBytes, modes: map[os.FileMode]struct{}{0o600: {}}},
+	}
 	for _, entry := range entries {
-		if entry.Kind == SubstrateEntryDirectory {
-			directories[acornFoxSubstrateTarget(entry.Path)] = struct{}{}
+		if entry.Kind != SubstrateEntryFile {
+			continue
 		}
+		directory := parentDirectory(acornFoxSubstrateTarget(entry.Path))
+		policy := directories[directory]
+		if policy.modes == nil {
+			policy.modes = map[os.FileMode]struct{}{}
+		}
+		policy.modes[os.FileMode(entry.Mode)] = struct{}{}
+		if entry.Size > policy.maximum {
+			policy.maximum = entry.Size
+		}
+		directories[directory] = policy
 	}
 	delete(directories, parentDirectory(exemptDirectory))
 	ordered := make([]string, 0, len(directories))
@@ -685,6 +715,7 @@ func acornFoxSubstrateRemoveOwnedTemps(fs acornFoxSubstrateFS, root *os.Root, en
 	}
 	sort.Strings(ordered)
 	for _, directory := range ordered {
+		policy := directories[directory]
 		dir, err := fs.openFile(root, directory, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 		if err != nil {
 			return err
@@ -701,9 +732,12 @@ func acornFoxSubstrateRemoveOwnedTemps(fs acornFoxSubstrateFS, root *os.Root, en
 			if !strings.HasPrefix(child.Name(), acornFoxSubstrateTempPrefix) {
 				continue
 			}
+			if !acornFoxSubstrateTempName(child.Name()) {
+				return ErrAcornFoxSubstrateConflict
+			}
 			path := filepath.ToSlash(filepath.Join(directory, child.Name()))
 			info, err := fs.lstat(root, path)
-			if err != nil || !acornFoxSubstrateOwnedTemp(info, uid, gid) {
+			if err != nil || !acornFoxSubstrateUnlinkedTemp(info, policy.maximum, policy.modes, uid, gid) {
 				return ErrAcornFoxSubstrateConflict
 			}
 			if err := fs.remove(root, path); err != nil {
@@ -740,17 +774,19 @@ func acornFoxSubstrateReconcileControlTemp(fs acornFoxSubstrateFS, root *os.Root
 		return ErrAcornFoxSubstrateConflict
 	}
 	var temporary string
+	var temporaryInfo os.FileInfo
 	for _, child := range children {
 		if !strings.HasPrefix(child.Name(), acornFoxSubstrateTempPrefix) {
 			continue
 		}
 		path := filepath.ToSlash(filepath.Join(parent, child.Name()))
 		info, lstatErr := fs.lstat(root, path)
-		if lstatErr != nil || !acornFoxSubstrateOwnedTemp(info, uid, gid) || !acornFoxSubstrateTempName(child.Name()) || temporary != "" {
+		if lstatErr != nil || !acornFoxSubstrateTempName(child.Name()) || temporary != "" {
 			return ErrAcornFoxSubstrateConflict
 		}
 		temporary = path
-		if finalMissing && acornFoxSubstrateSingleLink(info) {
+		temporaryInfo = info
+		if finalMissing && acornFoxSubstrateUnlinkedTemp(info, acornFoxHelperReceiptMaxBytes, map[os.FileMode]struct{}{0o600: {}}, uid, gid) {
 			continue
 		}
 		raw, evidence, readErr := acornFoxSubstrateReadControlEvidence(fs, root, path, uid, gid)
@@ -759,10 +795,26 @@ func acornFoxSubstrateReconcileControlTemp(fs acornFoxSubstrateFS, root *os.Root
 		}
 	}
 	if temporary == "" {
-		return nil
+		if finalMissing || acornFoxSubstrateSingleLink(finalInfo) {
+			return nil
+		}
+		return ErrAcornFoxSubstrateConflict
+	}
+	if !finalMissing && !acornFoxSubstrateTerminalTemp(temporaryInfo, finalInfo, uid, gid) {
+		return ErrAcornFoxSubstrateConflict
 	}
 	if err := fs.remove(root, temporary); err != nil {
 		return err
 	}
-	return fs.syncDirectory(root, parent)
+	if err := fs.syncDirectory(root, parent); err != nil {
+		return err
+	}
+	if finalMissing {
+		return nil
+	}
+	_, finalInfo, finalErr = acornFoxSubstrateReadControlEvidence(fs, root, final, uid, gid)
+	if finalErr != nil || !acornFoxSubstrateSingleLink(finalInfo) {
+		return ErrAcornFoxSubstrateConflict
+	}
+	return nil
 }
