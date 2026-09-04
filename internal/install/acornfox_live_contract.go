@@ -30,9 +30,12 @@ const (
 	AcornFoxLiveEdgeRole     AcornFoxLiveRole = "acornfox-edge"
 )
 
-type AcornFoxLiveModeledIdentityV1 struct {
+type AcornFoxLiveModeledUserV1 struct {
 	Role AcornFoxLiveRole `json:"role"`
 	UID  int              `json:"uid"`
+}
+type AcornFoxLiveModeledGroupV1 struct {
+	Role AcornFoxLiveRole `json:"role"`
 	GID  int              `json:"gid"`
 }
 
@@ -40,15 +43,16 @@ type AcornFoxLiveModeledIdentityV1 struct {
 // honest physical observation available in task-root preparation: the entry
 // is owned by the task-root owner.  It deliberately carries no host uid/gid.
 type AcornFoxLiveEntryV1 struct {
-	Path                     string                        `json:"path"`
-	Kind                     SubstrateEntryKind            `json:"kind"`
-	Mode                     uint32                        `json:"mode"`
-	Role                     AcornFoxLiveRole              `json:"role"`
-	Group                    AcornFoxLiveRole              `json:"group"`
-	RequestedModeledIdentity AcornFoxLiveModeledIdentityV1 `json:"requested_modeled_identity"`
-	PhysicalOwnerObservation string                        `json:"physical_owner_observation"`
-	Size                     int64                         `json:"size"`
-	SHA256                   string                        `json:"sha256"`
+	Path                     string                     `json:"path"`
+	Kind                     SubstrateEntryKind         `json:"kind"`
+	Mode                     uint32                     `json:"mode"`
+	Role                     AcornFoxLiveRole           `json:"role"`
+	Group                    AcornFoxLiveRole           `json:"group"`
+	RequestedModeledUser     AcornFoxLiveModeledUserV1  `json:"requested_modeled_user"`
+	RequestedModeledGroup    AcornFoxLiveModeledGroupV1 `json:"requested_modeled_group"`
+	PhysicalOwnerObservation string                     `json:"physical_owner_observation"`
+	Size                     int64                      `json:"size"`
+	SHA256                   string                     `json:"sha256"`
 }
 
 type acornFoxLiveTreeEnvelopeV1 struct {
@@ -77,7 +81,7 @@ type AcornFoxLiveReceiptV1 struct {
 	Entries                []AcornFoxLiveEntryV1 `json:"entries"`
 }
 
-func acornFoxLiveModeledIdentity(role AcornFoxLiveRole) (AcornFoxLiveModeledIdentityV1, bool) {
+func acornFoxLiveModeledUser(role AcornFoxLiveRole) (AcornFoxLiveModeledUserV1, bool) {
 	// The values are a protocol namespace, not a claim about host accounts.
 	ids := map[AcornFoxLiveRole]int{
 		AcornFoxLiveRootRole: 0, AcornFoxLiveServerRole: 10001,
@@ -85,7 +89,12 @@ func acornFoxLiveModeledIdentity(role AcornFoxLiveRole) (AcornFoxLiveModeledIden
 		AcornFoxLiveCaddyRole: 10004, AcornFoxLiveEdgeRole: 10005,
 	}
 	id, ok := ids[role]
-	return AcornFoxLiveModeledIdentityV1{Role: role, UID: id, GID: id}, ok
+	return AcornFoxLiveModeledUserV1{Role: role, UID: id}, ok
+}
+func acornFoxLiveModeledGroup(role AcornFoxLiveRole) (AcornFoxLiveModeledGroupV1, bool) {
+	ids := map[AcornFoxLiveRole]int{AcornFoxLiveRootRole: 0, AcornFoxLiveServerRole: 11001, AcornFoxLiveAgentRole: 11002, AcornFoxLiveBuildKitRole: 11003, AcornFoxLiveCaddyRole: 11004, AcornFoxLiveEdgeRole: 11005}
+	id, ok := ids[role]
+	return AcornFoxLiveModeledGroupV1{Role: role, GID: id}, ok
 }
 
 func acornFoxLiveRoleFor(entry SubstrateEntry) (AcornFoxLiveRole, bool) {
@@ -116,7 +125,7 @@ func acornFoxLiveEntryFor(entry SubstrateEntry) (AcornFoxLiveEntryV1, error) {
 	if !ok {
 		return AcornFoxLiveEntryV1{}, errors.New("AcornFox live entry role is invalid")
 	}
-	identity, ok := acornFoxLiveModeledIdentity(role)
+	user, ok := acornFoxLiveModeledUser(role)
 	if !ok {
 		return AcornFoxLiveEntryV1{}, errors.New("AcornFox live modeled identity is invalid")
 	}
@@ -124,7 +133,11 @@ func acornFoxLiveEntryFor(entry SubstrateEntry) (AcornFoxLiveEntryV1, error) {
 	if !ok {
 		return AcornFoxLiveEntryV1{}, errors.New("AcornFox live entry group is invalid")
 	}
-	return AcornFoxLiveEntryV1{Path: entry.Path, Kind: entry.Kind, Mode: entry.Mode, Role: role, Group: group, RequestedModeledIdentity: identity, PhysicalOwnerObservation: "task_root_owner", Size: entry.Size, SHA256: entry.SHA256}, nil
+	modeledGroup, ok := acornFoxLiveModeledGroup(group)
+	if !ok {
+		return AcornFoxLiveEntryV1{}, errors.New("AcornFox live modeled group is invalid")
+	}
+	return AcornFoxLiveEntryV1{Path: entry.Path, Kind: entry.Kind, Mode: entry.Mode, Role: role, Group: group, RequestedModeledUser: user, RequestedModeledGroup: modeledGroup, PhysicalOwnerObservation: "task_root_owner", Size: entry.Size, SHA256: entry.SHA256}, nil
 }
 
 func validateAcornFoxLiveEntries(entries []AcornFoxLiveEntryV1) error {
@@ -135,11 +148,12 @@ func validateAcornFoxLiveEntries(entries []AcornFoxLiveEntryV1) error {
 		if err := validateRelativePath(entry.Path); err != nil || entry.Mode > 0o777 || entry.Mode&0o022 != 0 || entry.Size < 0 || entry.PhysicalOwnerObservation != "task_root_owner" || (entry.Kind != SubstrateEntryFile && entry.Kind != SubstrateEntryDirectory) {
 			return errors.New("AcornFox live entry is invalid")
 		}
-		identity, ok := acornFoxLiveModeledIdentity(entry.Role)
-		if !ok || identity != entry.RequestedModeledIdentity {
+		user, ok := acornFoxLiveModeledUser(entry.Role)
+		if !ok || user != entry.RequestedModeledUser {
 			return errors.New("AcornFox live entry modeled identity is invalid")
 		}
-		if _, ok := acornFoxLiveModeledIdentity(entry.Group); !ok {
+		group, ok := acornFoxLiveModeledGroup(entry.Group)
+		if !ok || group != entry.RequestedModeledGroup {
 			return errors.New("AcornFox live entry modeled group is invalid")
 		}
 		if entry.Kind == SubstrateEntryDirectory {
@@ -173,15 +187,16 @@ func acornFoxLiveOwnershipDigest(entries []AcornFoxLiveEntryV1) (string, error) 
 		return "", err
 	}
 	type ownership struct {
-		Path      string                        `json:"path"`
-		Role      AcornFoxLiveRole              `json:"role"`
-		Group     AcornFoxLiveRole              `json:"group"`
-		Requested AcornFoxLiveModeledIdentityV1 `json:"requested_modeled_identity"`
-		Physical  string                        `json:"physical_owner_observation"`
+		Path          string                     `json:"path"`
+		Role          AcornFoxLiveRole           `json:"role"`
+		Group         AcornFoxLiveRole           `json:"group"`
+		User          AcornFoxLiveModeledUserV1  `json:"requested_modeled_user"`
+		GroupIdentity AcornFoxLiveModeledGroupV1 `json:"requested_modeled_group"`
+		Physical      string                     `json:"physical_owner_observation"`
 	}
 	values := make([]ownership, len(entries))
 	for i, entry := range entries {
-		values[i] = ownership{entry.Path, entry.Role, entry.Group, entry.RequestedModeledIdentity, entry.PhysicalOwnerObservation}
+		values[i] = ownership{entry.Path, entry.Role, entry.Group, entry.RequestedModeledUser, entry.RequestedModeledGroup, entry.PhysicalOwnerObservation}
 	}
 	raw, err := json.Marshal(struct {
 		SchemaVersion int         `json:"schema_version"`

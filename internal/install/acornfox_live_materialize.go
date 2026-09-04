@@ -13,30 +13,55 @@ import (
 	"syscall"
 )
 
-var ErrAcornFoxLiveConflict = errors.New("AcornFox live materialization conflicts with task state")
+var (
+	ErrAcornFoxLiveConflict        = errors.New("AcornFox live materialization conflicts with task state")
+	ErrAcornFoxLiveRecoveryUnknown = errors.New("AcornFox live recovery persistence is unknown")
+	ErrAcornFoxLiveReleaseUnknown  = errors.New("AcornFox live lease release is unknown")
+)
 
 // acornFoxLiveFaultStep is a deliberately local test seam for the live
 // materializer's persistence boundaries. Production uses the no-op function;
 // it is not a reusable filesystem layer and never accepts caller authority.
 var acornFoxLiveFaultStep = func(string) error { return nil }
+var acornFoxLiveLeaseRelease = func(lease *acornFoxPreparedRepoLease) error { return lease.Release() }
 
 func acornFoxLiveStep(name string) error { return acornFoxLiveFaultStep(name) }
 
 // materializeAcornFoxLive is deliberately package-private. Its only authority
 // is a sealed published substrate plus a locked repo-store lease; callers do
 // not provide deployment paths, units, accounts, versions, or host identity.
-func materializeAcornFoxLive(ctx context.Context, store *TaskAcornFoxRepoStore, substrate *PublishedAcornFoxSubstrateV1, bindingSHA256 string) (AcornFoxLiveReceiptV1, error) {
+func materializeAcornFoxLive(ctx context.Context, store *TaskAcornFoxRepoStore, substrate *PublishedAcornFoxSubstrateV1, bindingSHA256 string) (result AcornFoxLiveReceiptV1, returnedErr error) {
 	lease, err := store.mintPreparedLease(ctx, substrate, bindingSHA256)
 	if err != nil {
 		return AcornFoxLiveReceiptV1{}, err
 	}
-	defer lease.Release()
+	defer func() {
+		if releaseErr := acornFoxLiveLeaseRelease(lease); releaseErr != nil && returnedErr == nil {
+			result, returnedErr = AcornFoxLiveReceiptV1{}, ErrAcornFoxLiveReleaseUnknown
+		}
+	}()
 	return (&acornFoxLiveMaterializer{lease: lease}).Materialize(ctx)
 }
 
 type acornFoxLiveMaterializer struct{ lease *acornFoxPreparedRepoLease }
 
-func (m *acornFoxLiveMaterializer) Materialize(ctx context.Context) (AcornFoxLiveReceiptV1, error) {
+func (m *acornFoxLiveMaterializer) Materialize(ctx context.Context) (result AcornFoxLiveReceiptV1, returnedErr error) {
+	effectful := false
+	defer func() {
+		if returnedErr == nil || !effectful || m == nil || m.lease == nil || m.lease.store == nil || m.lease.journal.NeedsRecovery {
+			return
+		}
+		failed := acornFoxLiveFailureJournal(m.lease.journal)
+		if m.lease.store.Save(context.Background(), failed) == nil {
+			m.lease.journal = failed
+			return
+		}
+		observed, err := m.lease.store.Resume(context.Background())
+		if err == nil && sameAcornFoxRepoJournal(observed, failed) {
+			m.lease.journal = observed
+		}
+		returnedErr = ErrAcornFoxLiveRecoveryUnknown
+	}()
 	if ctx == nil || ctx.Err() != nil || m == nil || m.lease == nil || m.lease.store == nil || m.lease.substrate == nil || !m.lease.store.ownsLock() {
 		return AcornFoxLiveReceiptV1{}, ErrAcornFoxLiveConflict
 	}
@@ -77,6 +102,15 @@ func (m *acornFoxLiveMaterializer) Materialize(ctx context.Context) (AcornFoxLiv
 	if err = acornFoxLiveValidateExisting(target, m.lease.store, entries, receipt); err != nil {
 		return AcornFoxLiveReceiptV1{}, fmt.Errorf("validate existing: %w", ErrAcornFoxLiveConflict)
 	}
+	journal := m.lease.journal
+	if journal.NeedsRecovery {
+		next := acornFoxLiveRecoveredJournal(journal, receipt)
+		if m.lease.store.Save(ctx, next) != nil {
+			return AcornFoxLiveReceiptV1{}, ErrAcornFoxLiveRecoveryUnknown
+		}
+		journal, m.lease.journal = next, next
+	}
+	effectful = true
 	for _, entry := range entries {
 		if entry.Kind == SubstrateEntryDirectory && acornFoxLiveEnsureDir(target, m.lease.store, acornFoxLivePath(entry.Path), os.FileMode(entry.Mode)) != nil {
 			return AcornFoxLiveReceiptV1{}, fmt.Errorf("ensure directory %s: %w", entry.Path, ErrAcornFoxLiveConflict)
@@ -101,7 +135,6 @@ func (m *acornFoxLiveMaterializer) Materialize(ctx context.Context) (AcornFoxLiv
 	if err = acornFoxLiveVerifyTarget(target, m.lease.store, entries, receipt); err != nil {
 		return AcornFoxLiveReceiptV1{}, fmt.Errorf("verify live target: %w", ErrAcornFoxLiveConflict)
 	}
-	journal := m.lease.journal
 	if journal.Phase == AcornFoxRepoPrepared {
 		next, nextErr := acornFoxLiveAdvance(journal, AcornFoxRepoLiveMaterialized, receipt)
 		if nextErr != nil || m.lease.store.Save(ctx, next) != nil {
@@ -558,4 +591,22 @@ func acornFoxLiveAdvance(old AcornFoxRepoJournalV1, phase AcornFoxRepoPhase, rec
 		return AcornFoxRepoJournalV1{}, ErrAcornFoxLiveConflict
 	}
 	return next, nil
+}
+
+func acornFoxLiveFailureJournal(old AcornFoxRepoJournalV1) AcornFoxRepoJournalV1 {
+	next := old
+	next.Revision++
+	next.NeedsRecovery = true
+	next.Failure = &AcornFoxRepoFailureV1{Code: "live_materialize_effect_failure", Digest: acornFoxRepoEvidence("acornfox-live-effect-failure-v1\x00", old.BindingSHA256, old.SubstrateReceiptSHA256, string(old.Phase))}
+	next.History = append(next.History, AcornFoxRepoHistoryV1{Revision: next.Revision, Kind: AcornFoxRepoHistoryFailure, From: old.Phase, To: old.Phase, EvidenceSHA256: next.Failure.Digest})
+	return next
+}
+
+func acornFoxLiveRecoveredJournal(old AcornFoxRepoJournalV1, receipt AcornFoxLiveReceiptV1) AcornFoxRepoJournalV1 {
+	next := old
+	next.Revision++
+	next.NeedsRecovery, next.Failure = false, nil
+	evidence := acornFoxRepoEvidence("acornfox-live-disk-reconciled-v1\x00", old.BindingSHA256, old.SubstrateReceiptSHA256, string(old.Phase), receipt.LiveTreeSHA256, receipt.OwnershipPlanSHA256, receipt.StaticSetSHA256)
+	next.History = append(next.History, AcornFoxRepoHistoryV1{Revision: next.Revision, Kind: AcornFoxRepoHistoryRecovered, From: old.Phase, To: old.Phase, EvidenceSHA256: evidence})
+	return next
 }

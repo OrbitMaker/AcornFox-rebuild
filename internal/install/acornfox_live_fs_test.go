@@ -129,8 +129,26 @@ func TestAcornFoxLiveMaterializeFaultStepsFreshResume(t *testing.T) {
 			if !fired || !errors.Is(err, ErrAcornFoxLiveConflict) {
 				t.Fatalf("step=%s fired=%t err=%v", step, fired, err)
 			}
+			journal, journalErr := store.Resume(context.Background())
+			if journalErr != nil {
+				t.Fatal(journalErr)
+			}
+			expectsRecovery := step != "mkdir" && step != "mkdir-post" && step != "parent-sync"
+			if journal.NeedsRecovery != expectsRecovery {
+				t.Fatalf("step=%s recovery=%t", step, journal.NeedsRecovery)
+			}
+			if expectsRecovery && journal.History[len(journal.History)-1].Kind != AcornFoxRepoHistoryFailure {
+				t.Fatalf("step=%s history=%#v", step, journal.History)
+			}
 			if _, err = materializeAcornFoxLive(context.Background(), store, published, substrate.CandidateReceipt.BindingSHA256); err != nil {
 				t.Fatalf("fresh resume %s: %v", step, err)
+			}
+			journal, journalErr = store.Resume(context.Background())
+			if journalErr != nil || journal.Phase != AcornFoxRepoStaticVerified || journal.NeedsRecovery {
+				t.Fatalf("step=%s final=%#v err=%v", step, journal, journalErr)
+			}
+			if expectsRecovery && journal.History[len(journal.History)-3].Kind != AcornFoxRepoHistoryRecovered {
+				t.Fatalf("step=%s recovery order=%#v", step, journal.History)
 			}
 		})
 	}

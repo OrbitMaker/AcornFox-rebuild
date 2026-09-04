@@ -250,7 +250,7 @@ func (s *TaskAcornFoxRepoStore) mintPreparedLease(ctx context.Context, substrate
 	}
 	fail := func() (*acornFoxPreparedRepoLease, error) { _ = lock.Release(); return nil, ErrAcornFoxRepoConflict }
 	journal, err := s.Load(ctx)
-	if err != nil || (journal.Phase != AcornFoxRepoPrepared && journal.Phase != AcornFoxRepoLiveMaterialized && journal.Phase != AcornFoxRepoStaticVerified) || journal.NeedsRecovery || journal.BindingSHA256 != bindingSHA256 || substrate.Verify() != nil || !sameAcornFoxLiveTaskRoot(s, substrate) {
+	if err != nil || (journal.Phase != AcornFoxRepoPrepared && journal.Phase != AcornFoxRepoLiveMaterialized && journal.Phase != AcornFoxRepoStaticVerified) || journal.BindingSHA256 != bindingSHA256 || substrate.Verify() != nil || !sameAcornFoxLiveTaskRoot(s, substrate) {
 		return fail()
 	}
 	raw, err := MarshalInactiveSubstrateReceiptV1(substrate.receipt)

@@ -131,6 +131,9 @@ func TestAcornFoxLiveMaterializeRejectsForeignLiveState(t *testing.T) {
 	if _, err := os.Lstat(filepath.Join(root, acornFoxLiveDir, "foreign")); err != nil {
 		t.Fatalf("foreign state overwritten: %v", err)
 	}
+	if journal, journalErr := store.Resume(context.Background()); journalErr != nil || journal.NeedsRecovery {
+		t.Fatalf("foreign conflict wrote recovery=%#v err=%v", journal, journalErr)
+	}
 }
 
 func TestAcornFoxLiveMaterializeRejectsBindingMismatchWithoutLive(t *testing.T) {
@@ -141,5 +144,25 @@ func TestAcornFoxLiveMaterializeRejectsBindingMismatchWithoutLive(t *testing.T) 
 	}
 	if _, err := os.Lstat(filepath.Join(root, acornFoxLiveDir)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("mismatch mutated live: %v", err)
+	}
+}
+
+func TestAcornFoxLiveMaterializeDoesNotReturnReceiptWhenLeaseReleaseFails(t *testing.T) {
+	root, _, published, substrate := newAcornFox03CPublished(t)
+	store := newAcornFoxLiveStore(t, root, published, substrate)
+	acornFoxLiveLeaseRelease = func(lease *acornFoxPreparedRepoLease) error {
+		_ = lease.Release()
+		return errors.New("release injected")
+	}
+	t.Cleanup(func() {
+		acornFoxLiveLeaseRelease = func(lease *acornFoxPreparedRepoLease) error { return lease.Release() }
+	})
+	got, err := materializeAcornFoxLive(context.Background(), store, published, substrate.CandidateReceipt.BindingSHA256)
+	if !errors.Is(err, ErrAcornFoxLiveReleaseUnknown) || got.SchemaVersion != 0 || len(got.Entries) != 0 {
+		t.Fatalf("got=%#v err=%v", got, err)
+	}
+	acornFoxLiveLeaseRelease = func(lease *acornFoxPreparedRepoLease) error { return lease.Release() }
+	if _, err = materializeAcornFoxLive(context.Background(), store, published, substrate.CandidateReceipt.BindingSHA256); err != nil {
+		t.Fatalf("fresh retry=%v", err)
 	}
 }
