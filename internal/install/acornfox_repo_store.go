@@ -261,12 +261,60 @@ func (s *TaskAcornFoxRepoStore) ensureJournalDirectory(root *os.Root) error {
 	}
 	return nil
 }
-func (s *TaskAcornFoxRepoStore) cleanTemporary(root *os.Root, name string) error {
-	info, err := s.fs.lstat(root, name)
+
+// cleanCreateTemporary handles the only legitimate two-link topology: a
+// completed no-replace Link whose temporary name has not yet been removed.
+// A foreign hard link is never an owned temporary merely because it has the
+// same mode and owner.
+func (s *TaskAcornFoxRepoStore) cleanCreateTemporary(root *os.Root, want []byte) error {
+	info, err := s.fs.lstat(root, acornFoxRepoCreateTemporary)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
 	if err != nil || !safeAcornFoxRepoTemporary(info, s.uid, s.gid) {
+		return ErrAcornFoxRepoConflict
+	}
+	final, finalErr := s.fs.lstat(root, acornFoxRepoInstallJournal)
+	if errors.Is(finalErr, os.ErrNotExist) {
+		if acornFoxRepoNlink(info) != 1 {
+			return ErrAcornFoxRepoConflict
+		}
+	} else {
+		if finalErr != nil || acornFoxRepoNlink(info) != 2 || !safeAcornFoxRepoTemporary(final, s.uid, s.gid) || acornFoxRepoNlink(final) != 2 || !os.SameFile(info, final) || !s.readExactOwnedBytes(root, acornFoxRepoCreateTemporary, want, true) || !s.readExactOwnedBytes(root, acornFoxRepoInstallJournal, want, true) {
+			return ErrAcornFoxRepoConflict
+		}
+	}
+	if s.fs.remove(root, acornFoxRepoCreateTemporary) != nil || s.syncDirectory(root, acornFoxRepoInstallDir) != nil {
+		return ErrAcornFoxRepoConflict
+	}
+	if finalErr == nil && !s.readExactOwnedBytes(root, acornFoxRepoInstallJournal, want, false) {
+		return ErrAcornFoxRepoConflict
+	}
+	return nil
+}
+
+// Save temporary entries must never have been linked. Any hard-link topology
+// before Rename is ambiguous and is deliberately preserved for diagnosis.
+func (s *TaskAcornFoxRepoStore) cleanSaveTemporary(root *os.Root) error {
+	info, err := s.fs.lstat(root, acornFoxRepoSaveTemporary)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil || !safeAcornFoxRepoTemporary(info, s.uid, s.gid) || acornFoxRepoNlink(info) != 1 {
+		return ErrAcornFoxRepoConflict
+	}
+	if s.fs.remove(root, acornFoxRepoSaveTemporary) != nil || s.syncDirectory(root, acornFoxRepoInstallDir) != nil {
+		return ErrAcornFoxRepoConflict
+	}
+	return nil
+}
+
+func (s *TaskAcornFoxRepoStore) removeKnownSingleTemporary(root *os.Root, name string) error {
+	info, err := s.fs.lstat(root, name)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil || !safeAcornFoxRepoTemporary(info, s.uid, s.gid) || acornFoxRepoNlink(info) != 1 {
 		return ErrAcornFoxRepoConflict
 	}
 	if s.fs.remove(root, name) != nil || s.syncDirectory(root, acornFoxRepoInstallDir) != nil {
@@ -314,6 +362,20 @@ func (s *TaskAcornFoxRepoStore) readJournal(root *os.Root) (AcornFoxRepoJournalV
 func (s *TaskAcornFoxRepoStore) readExact(root *os.Root, want AcornFoxRepoJournalV1) bool {
 	got, _, _, err := s.readJournal(root)
 	return err == nil && sameAcornFoxRepoJournal(got, want)
+}
+func (s *TaskAcornFoxRepoStore) readExactOwnedBytes(root *os.Root, name string, want []byte, allowDoubleLink bool) bool {
+	info, err := s.fs.lstat(root, name)
+	if err != nil || (allowDoubleLink && !safeAcornFoxRepoTemporary(info, s.uid, s.gid)) || (!allowDoubleLink && !safeAcornFoxRepoFile(info, s.uid, s.gid)) || info.Size() != int64(len(want)) {
+		return false
+	}
+	file, err := s.fs.openFile(root, name, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return false
+	}
+	opened, statErr := file.Stat()
+	raw, readErr := io.ReadAll(io.LimitReader(file, acornFoxRepoMaxJournalSize+1))
+	closeErr := file.Close()
+	return statErr == nil && readErr == nil && closeErr == nil && os.SameFile(info, opened) && bytes.Equal(raw, want)
 }
 func writeAcornFoxRepoAll(file acornFoxRepoFile, raw []byte) error {
 	for len(raw) > 0 {
@@ -384,15 +446,22 @@ func (s *TaskAcornFoxRepoStore) Create(ctx context.Context, journal AcornFoxRepo
 	if err = s.ensureJournalDirectory(root); err != nil {
 		return err
 	}
-	if err = s.cleanTemporary(root, acornFoxRepoCreateTemporary); err != nil {
+	if err = s.cleanCreateTemporary(root, raw); err != nil {
 		return err
+	}
+	if _, finalErr := s.fs.lstat(root, acornFoxRepoInstallJournal); finalErr == nil {
+		if s.readExact(root, journal) {
+			return nil
+		}
+		return ErrAcornFoxRepoConflict
+	} else if !errors.Is(finalErr, os.ErrNotExist) {
+		return ErrAcornFoxRepoConflict
 	}
 	if err = s.writeTemporary(root, acornFoxRepoCreateTemporary, raw); err != nil {
 		return ErrAcornFoxRepoConflict
 	}
 	if err = s.fs.link(root, acornFoxRepoCreateTemporary, acornFoxRepoInstallJournal); err != nil {
-		if s.readExact(root, journal) {
-			_ = s.cleanTemporary(root, acornFoxRepoCreateTemporary)
+		if s.readExact(root, journal) && s.removeKnownSingleTemporary(root, acornFoxRepoCreateTemporary) == nil {
 			return nil
 		}
 		return ErrAcornFoxRepoConflict
@@ -403,7 +472,7 @@ func (s *TaskAcornFoxRepoStore) Create(ctx context.Context, journal AcornFoxRepo
 		}
 		return ErrAcornFoxRepoConflict
 	}
-	if err = s.cleanTemporary(root, acornFoxRepoCreateTemporary); err != nil {
+	if err = s.cleanCreateTemporary(root, raw); err != nil {
 		return ErrAcornFoxRepoConflict
 	}
 	if !s.readExact(root, journal) {
@@ -424,7 +493,7 @@ func (s *TaskAcornFoxRepoStore) Save(ctx context.Context, next AcornFoxRepoJourn
 		return err
 	}
 	defer root.Close()
-	if err = s.cleanTemporary(root, acornFoxRepoSaveTemporary); err != nil {
+	if err = s.cleanSaveTemporary(root); err != nil {
 		return err
 	}
 	old, oldRaw, oldInfo, err := s.readJournal(root)

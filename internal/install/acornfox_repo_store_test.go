@@ -161,6 +161,141 @@ func TestTaskAcornFoxRepoStoreFreshCreateCleansOnlyOwnedPartialTemporary(t *test
 	}
 }
 
+func TestTaskAcornFoxRepoStoreFreshCreateCompletesLegitimatePostLinkTemporary(t *testing.T) {
+	root := newAcornFoxRepoTaskRoot(t)
+	if err := os.Mkdir(filepath.Join(root, acornFoxRepoInstallDir), durableDirMode); err != nil {
+		t.Fatal(err)
+	}
+	journal := newAcornFoxRepoJournal()
+	raw, err := MarshalAcornFoxRepoJournalV1(journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, acornFoxRepoCreateTemporary), raw, durableFileMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(filepath.Join(root, acornFoxRepoCreateTemporary), filepath.Join(root, acornFoxRepoInstallJournal)); err != nil {
+		t.Fatal(err)
+	}
+	store, lock := acquireAcornFoxRepoStore(t, root)
+	defer store.Close()
+	defer lock.Release()
+	if err := store.Create(context.Background(), journal); err != nil {
+		t.Fatalf("post-link retry = %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, acornFoxRepoCreateTemporary)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("post-link temp remains: %v", err)
+	}
+	info, err := os.Lstat(filepath.Join(root, acornFoxRepoInstallJournal))
+	if err != nil || acornFoxRepoNlink(info) != 1 {
+		t.Fatalf("final link count = %v, %d", err, acornFoxRepoNlink(info))
+	}
+}
+
+func TestTaskAcornFoxRepoStoreRejectsAndPreservesForeignFixedTemporaryHardlinks(t *testing.T) {
+	for _, location := range []string{"same-dir", "other-dir"} {
+		t.Run(location, func(t *testing.T) {
+			root := newAcornFoxRepoTaskRoot(t)
+			if err := os.Mkdir(filepath.Join(root, acornFoxRepoInstallDir), durableDirMode); err != nil {
+				t.Fatal(err)
+			}
+			journal := newAcornFoxRepoJournal()
+			raw, err := MarshalAcornFoxRepoJournalV1(journal)
+			if err != nil {
+				t.Fatal(err)
+			}
+			temp := filepath.Join(root, acornFoxRepoCreateTemporary)
+			if err := os.WriteFile(temp, raw, durableFileMode); err != nil {
+				t.Fatal(err)
+			}
+			foreign := filepath.Join(root, "foreign-hardlink")
+			if location == "other-dir" {
+				foreign = filepath.Join(t.TempDir(), "foreign-hardlink")
+			}
+			if err := os.Link(temp, foreign); err != nil {
+				t.Fatal(err)
+			}
+			store, lock := acquireAcornFoxRepoStore(t, root)
+			defer store.Close()
+			defer lock.Release()
+			if err := store.Create(context.Background(), journal); !errors.Is(err, ErrAcornFoxRepoConflict) {
+				t.Fatalf("foreign temp = %v", err)
+			}
+			if _, err := os.Lstat(temp); err != nil {
+				t.Fatalf("foreign temp was deleted: %v", err)
+			}
+			if _, err := os.Lstat(filepath.Join(root, acornFoxRepoInstallJournal)); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("journal was overwritten: %v", err)
+			}
+		})
+	}
+}
+
+func TestTaskAcornFoxRepoStoreRejectsThreeLinkAndSaveHardlinkTopologies(t *testing.T) {
+	root := newAcornFoxRepoTaskRoot(t)
+	if err := os.Mkdir(filepath.Join(root, acornFoxRepoInstallDir), durableDirMode); err != nil {
+		t.Fatal(err)
+	}
+	journal := newAcornFoxRepoJournal()
+	raw, err := MarshalAcornFoxRepoJournalV1(journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	temp := filepath.Join(root, acornFoxRepoCreateTemporary)
+	if err := os.WriteFile(temp, raw, durableFileMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(temp, filepath.Join(root, "foreign-one")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(temp, filepath.Join(root, "foreign-two")); err != nil {
+		t.Fatal(err)
+	}
+	store, lock := acquireAcornFoxRepoStore(t, root)
+	if err := store.Create(context.Background(), journal); !errors.Is(err, ErrAcornFoxRepoConflict) {
+		t.Fatalf("three-link create = %v", err)
+	}
+	if err := lock.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(temp); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(root, "foreign-one")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(root, "foreign-two")); err != nil {
+		t.Fatal(err)
+	}
+	store, lock = acquireAcornFoxRepoStore(t, root)
+	defer store.Close()
+	defer lock.Release()
+	if err := store.Create(context.Background(), journal); err != nil {
+		t.Fatal(err)
+	}
+	next := advanceAcornFoxRepoJournal(t, journal, AcornFoxRepoLiveMaterialized, acornFoxRepoDigest("c"))
+	nextRaw, err := MarshalAcornFoxRepoJournalV1(next)
+	if err != nil {
+		t.Fatal(err)
+	}
+	saveTemp := filepath.Join(root, acornFoxRepoSaveTemporary)
+	if err := os.WriteFile(saveTemp, nextRaw, durableFileMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(saveTemp, filepath.Join(root, "save-foreign")); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(context.Background(), next); !errors.Is(err, ErrAcornFoxRepoConflict) {
+		t.Fatalf("hardlinked save temp = %v", err)
+	}
+	if got, err := store.Resume(context.Background()); err != nil || !sameAcornFoxRepoJournal(got, journal) {
+		t.Fatalf("hardlinked save overwrote journal: %#v, %v", got, err)
+	}
+}
+
 type acornFoxRepoFaultFile struct {
 	acornFoxRepoFile
 	write func([]byte) (int, error)
