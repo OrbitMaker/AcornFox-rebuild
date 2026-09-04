@@ -28,7 +28,7 @@ func witnessForInputs(t *testing.T, source SourcePolicyV1, tool ToolchainInputsV
 }
 func TestInputManifestsBindOnlyTheirWitnessDigest(t *testing.T) {
 	source := sourcePolicyFixture()
-	tool := ToolchainInputsV1{SchemaVersion: 1, Product: Product, Architecture: Architecture, GoVersion: "go1.25", NodeVersion: "v22", NPMVersion: "10", BuildPolicy: []string{"cgo_disabled", "trimpath"}}
+	tool := ToolchainInputsV1{SchemaVersion: 1, Product: Product, Architecture: Architecture, GoVersion: "go1.25.0", NodeVersion: "v22.0.0", NPMVersion: "10.0.0", BuildPolicy: []string{"cgo_disabled", "trimpath"}}
 	runtime := RuntimeInputsV1{SchemaVersion: 1, Product: Product, Architecture: Architecture, Files: []FileEntryV1{{Path: "etc/runtime.conf", SHA256: strings.Repeat("a", 64), Mode: 0o644}}}
 	license := LicenseInputsV1{SchemaVersion: 1, Product: Product, Files: []FileEntryV1{{Path: "LICENSE", SHA256: strings.Repeat("b", 64), Mode: 0o644}}}
 	w := witnessForInputs(t, source, tool, runtime, license)
@@ -54,5 +54,16 @@ func TestInputManifestsBindOnlyTheirWitnessDigest(t *testing.T) {
 	var zero Witness
 	if _, e := ParseLicenseInputsV1(zero, lr); e == nil {
 		t.Fatal("zero witness accepted")
+	}
+}
+
+func TestToolchainRejectsLooseVersionsAndPolicy(t *testing.T) {
+	v := ToolchainInputsV1{SchemaVersion: 1, Product: Product, Architecture: Architecture, GoVersion: "go1.2.3", NodeVersion: "v2.3.4", NPMVersion: "3.4.5", BuildPolicy: []string{"cgo_disabled", "trimpath"}}
+	for _, mutate := range []func(*ToolchainInputsV1){func(v *ToolchainInputsV1) { v.GoVersion = "go1.2" }, func(v *ToolchainInputsV1) { v.NodeVersion = "v2.3.4\n" }, func(v *ToolchainInputsV1) { v.BuildPolicy = []string{"network_enabled"} }} {
+		copy := v
+		mutate(&copy)
+		if copy.Validate() == nil {
+			t.Fatal("accepted")
+		}
 	}
 }

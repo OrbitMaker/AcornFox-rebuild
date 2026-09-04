@@ -78,3 +78,18 @@ func TestSourcePolicyRejectsTraversalOrderAndDuplicate(t *testing.T) {
 		}
 	}
 }
+
+func TestSourcePolicyAllowsDotfileButRejectsGitAndControls(t *testing.T) {
+	p := sourcePolicyFixture()
+	p.Files[0].Path = ".gitignore"
+	if _, err := CanonicalSourcePolicyV1(p); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{".git/config", "a/../b", "a//b", "a/\nb", "/absolute"} {
+		q := sourcePolicyFixture()
+		q.Files[0].Path = path
+		if _, err := CanonicalSourcePolicyV1(q); err == nil {
+			t.Fatalf("accepted %q", path)
+		}
+	}
+}

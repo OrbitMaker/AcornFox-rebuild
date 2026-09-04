@@ -2,17 +2,21 @@ package acornfoxrelease
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
 	"os"
-	"path/filepath"
-	"sort"
 	"strings"
 	"syscall"
 )
 
-const maxManifestBytes = 1 << 20
+const (
+	maxManifestBytes        = 1 << 20
+	maxInputFileBytes int64 = 16 << 20
+	maxInputTreeBytes int64 = 128 << 20
+)
 
 var ErrInputs = errors.New("acornfox release inputs are invalid")
 
@@ -43,7 +47,7 @@ func CanonicalSourcePolicyV1(p SourcePolicyV1) ([]byte, error) {
 }
 func ParseSourcePolicyV1(w Witness, raw []byte) (SourcePolicyV1, error) {
 	var p SourcePolicyV1
-	if !w.Valid() || parseCanonical(raw, &p) != nil || p.Validate() != nil || sha256Text(raw) != w.decision.SourcePolicySHA256 {
+	if !w.Valid() || parseCanonical(raw, &p) != nil || p.Validate() != nil || p.ModulePath != modulePathForRepository(w.decision.SourceRepository) || sha256Text(raw) != w.decision.SourcePolicySHA256 {
 		return p, ErrInputs
 	}
 	return p, nil
@@ -52,11 +56,18 @@ func ParseSourcePolicyV1(w Witness, raw []byte) (SourcePolicyV1, error) {
 // VerifySourceTree is local-only. A top-level .git directory is ignored as
 // repository metadata; every other hidden or extra entry is rejected.
 func VerifySourceTree(root string, policy SourcePolicyV1) error {
+	if policy.Validate() != nil {
+		return ErrInputs
+	}
 	return verifyFileTree(root, policy.Files, true)
 }
 
 func validModulePath(v string) bool {
-	return strings.HasPrefix(v, "github.com/") && !strings.ContainsAny(v, "\\\x00 ") && len(strings.Split(v, "/")) >= 3
+	parts := strings.Split(v, "/")
+	return len(parts) == 3 && parts[0] == "github.com" && githubPart.MatchString(parts[1]) && githubPart.MatchString(parts[2])
+}
+func modulePathForRepository(repository string) string {
+	return strings.TrimPrefix(repository, "https://")
 }
 func validateEntries(entries []FileEntryV1) error {
 	if len(entries) == 0 || len(entries) > 4096 {
@@ -70,7 +81,15 @@ func validateEntries(entries []FileEntryV1) error {
 	return nil
 }
 func validRelativeFile(p string) bool {
-	return p != "" && filepath.ToSlash(filepath.Clean(p)) == p && !strings.ContainsAny(p, "\\\x00") && !strings.HasPrefix(p, ".") && !strings.Contains(p, "//") && !strings.Contains(p, "..")
+	if p == "" || strings.ContainsAny(p, "\\\x00\r\n") || strings.HasPrefix(p, "/") {
+		return false
+	}
+	for _, part := range strings.Split(p, "/") {
+		if part == "" || part == "." || part == ".." || part == ".git" || strings.ContainsAny(part, "\x00\r\n") {
+			return false
+		}
+	}
+	return true
 }
 func parseCanonical(raw []byte, target any) error {
 	if len(raw) == 0 || len(raw) > maxManifestBytes {
@@ -99,48 +118,74 @@ func verifyFileTree(root string, entries []FileEntryV1, ignoreGit bool) error {
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return ErrInputs
 	}
+	rootFD, err := os.OpenRoot(root)
+	if err != nil {
+		return ErrInputs
+	}
+	defer rootFD.Close()
 	want := map[string]FileEntryV1{}
 	for _, e := range entries {
 		want[e.Path] = e
 	}
 	seen := map[string]bool{}
-	err = filepath.WalkDir(root, func(path string, d os.DirEntry, walkErr error) error {
-		if walkErr != nil {
+	var total int64
+	var walk func(string) error
+	walk = func(dir string) error {
+		f, e := rootFD.OpenFile(dir, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+		if e != nil {
 			return ErrInputs
 		}
-		if path == root {
-			return nil
-		}
-		rel, err := filepath.Rel(root, path)
-		if err != nil {
+		children, re := f.ReadDir(-1)
+		ce := f.Close()
+		if re != nil || ce != nil {
 			return ErrInputs
 		}
-		rel = filepath.ToSlash(rel)
-		if ignoreGit && rel == ".git" && d.IsDir() {
-			return filepath.SkipDir
+		for _, child := range children {
+			rel := child.Name()
+			if dir != "." {
+				rel = dir + "/" + rel
+			}
+			before, e := rootFD.Lstat(rel)
+			if e != nil {
+				return ErrInputs
+			}
+			if ignoreGit && dir == "." && child.Name() == ".git" && (before.IsDir() || before.Mode().IsRegular()) {
+				continue
+			}
+			if before.Mode()&os.ModeSymlink != 0 {
+				return ErrInputs
+			}
+			if before.IsDir() {
+				if walk(rel) != nil {
+					return ErrInputs
+				}
+				continue
+			}
+			entry, ok := want[rel]
+			if !ok || !before.Mode().IsRegular() || before.Mode().Perm() != os.FileMode(entry.Mode) || linkCount(before) != 1 || before.Size() < 0 || before.Size() > maxInputFileBytes {
+				return ErrInputs
+			}
+			file, e := rootFD.OpenFile(rel, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+			if e != nil {
+				return ErrInputs
+			}
+			opened, se := file.Stat()
+			h := sha256.New()
+			n, re := io.Copy(h, io.LimitReader(file, maxInputFileBytes+1))
+			ce = file.Close()
+			after, ae := rootFD.Lstat(rel)
+			if se != nil || re != nil || ce != nil || ae != nil || n != before.Size() || n > maxInputFileBytes || !os.SameFile(before, opened) || !os.SameFile(before, after) || hex.EncodeToString(h.Sum(nil)) != entry.SHA256 {
+				return ErrInputs
+			}
+			total += n
+			if total > maxInputTreeBytes {
+				return ErrInputs
+			}
+			seen[rel] = true
 		}
-		if d.Type()&os.ModeSymlink != 0 {
-			return ErrInputs
-		}
-		if d.IsDir() {
-			return nil
-		}
-		entry, ok := want[rel]
-		if !ok {
-			return ErrInputs
-		}
-		fi, err := os.Lstat(path)
-		if err != nil || !fi.Mode().IsRegular() || fi.Mode().Perm() != os.FileMode(entry.Mode) || linkCount(fi) != 1 {
-			return ErrInputs
-		}
-		raw, err := os.ReadFile(path)
-		if err != nil || sha256Text(raw) != entry.SHA256 {
-			return ErrInputs
-		}
-		seen[rel] = true
 		return nil
-	})
-	if err != nil {
+	}
+	if walk(".") != nil {
 		return ErrInputs
 	}
 	for _, e := range entries {
@@ -155,9 +200,4 @@ func linkCount(info os.FileInfo) uint64 {
 		return uint64(stat.Nlink)
 	}
 	return 1
-}
-func sortedEntries(entries []FileEntryV1) []FileEntryV1 {
-	out := append([]FileEntryV1(nil), entries...)
-	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
-	return out
 }

@@ -1,6 +1,16 @@
 package acornfoxrelease
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"regexp"
+)
+
+var (
+	goVersionText    = regexp.MustCompile(`^go[0-9]+\.[0-9]+\.[0-9]+$`)
+	nodeVersionText  = regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+$`)
+	npmVersionText   = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`)
+	fixedBuildPolicy = []string{"cgo_disabled", "trimpath"}
+)
 
 type ToolchainInputsV1 struct {
 	SchemaVersion int      `json:"schema_version"`
@@ -24,15 +34,18 @@ type LicenseInputsV1 struct {
 }
 
 func (v ToolchainInputsV1) Validate() error {
-	if v.SchemaVersion != 1 || v.Product != Product || v.Architecture != Architecture || v.GoVersion == "" || v.NodeVersion == "" || v.NPMVersion == "" || len(v.BuildPolicy) == 0 {
+	if v.SchemaVersion != 1 || v.Product != Product || v.Architecture != Architecture || !goVersionText.MatchString(v.GoVersion) || !nodeVersionText.MatchString(v.NodeVersion) || !npmVersionText.MatchString(v.NPMVersion) || len(v.BuildPolicy) != len(fixedBuildPolicy) {
 		return ErrInputs
 	}
 	for i, t := range v.BuildPolicy {
-		if t == "" || (i > 0 && v.BuildPolicy[i-1] >= t) {
+		if t != fixedBuildPolicy[i] {
 			return ErrInputs
 		}
 	}
 	return nil
+}
+func (v ToolchainInputsV1) BuildPolicyTokens() []string {
+	return append([]string(nil), v.BuildPolicy...)
 }
 func (v RuntimeInputsV1) Validate() error {
 	if v.SchemaVersion != 1 || v.Product != Product || v.Architecture != Architecture {
@@ -87,8 +100,14 @@ func ParseLicenseInputsV1(w Witness, raw []byte) (LicenseInputsV1, error) {
 	return v, nil
 }
 func VerifyRuntimeTree(root string, v RuntimeInputsV1) error {
+	if v.Validate() != nil {
+		return ErrInputs
+	}
 	return verifyFileTree(root, v.Files, false)
 }
 func VerifyLicenseTree(root string, v LicenseInputsV1) error {
+	if v.Validate() != nil {
+		return ErrInputs
+	}
 	return verifyFileTree(root, v.Files, false)
 }
