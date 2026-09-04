@@ -63,6 +63,47 @@ type goCommandRunner func(context.Context, string, []string, string, []string) (
 type executableResolver func(string) (string, error)
 type executableHasher func(string) (string, error)
 
+type boundExecutable struct {
+	path   string
+	digest string
+	run    goCommandRunner
+	hash   executableHasher
+}
+
+func bindExecutable(name, digest string, run goCommandRunner, lookup executableResolver, hash executableHasher) (boundExecutable, error) {
+	if !digestText.MatchString(digest) || run == nil || lookup == nil || hash == nil {
+		return boundExecutable{}, ErrGoPlan
+	}
+	path, err := resolveTrustedExecutable(name, lookup)
+	if err != nil {
+		return boundExecutable{}, ErrGoPlan
+	}
+	actual, err := hash(path)
+	if err != nil || actual != digest {
+		return boundExecutable{}, ErrGoPlan
+	}
+	return boundExecutable{path: path, digest: digest, run: run, hash: hash}, nil
+}
+
+func (b boundExecutable) Run(ctx context.Context, args []string, dir string, env []string) ([]byte, error) {
+	if b.path == "" || !digestText.MatchString(b.digest) || b.run == nil || b.hash == nil {
+		return nil, ErrGoPlan
+	}
+	before, err := b.hash(b.path)
+	if err != nil || before != b.digest {
+		return nil, ErrGoPlan
+	}
+	raw, err := b.run(ctx, b.path, args, dir, env)
+	after, hashErr := b.hash(b.path)
+	if hashErr != nil || after != b.digest {
+		return nil, ErrGoPlan
+	}
+	if err != nil {
+		return nil, err
+	}
+	return raw, nil
+}
+
 // PrepareGoBuildPlanV1 makes exactly one offline `go list` observation. It
 // never invokes `go build`, accepts no caller build flags, and rechecks the
 // pinned Git source after Go has inspected it.
@@ -86,36 +127,36 @@ func prepareGoBuildPlanWithDependencies(ctx context.Context, witness Witness, po
 	if sourceErr != nil || toolchainErr != nil || decisionErr != nil || sha256Text(sourceRaw) != witness.decision.SourcePolicySHA256 || sha256Text(toolchainRaw) != witness.decision.ToolchainSHA256 || policy.ModulePath != modulePathForRepository(witness.decision.SourceRepository) {
 		return GoBuildPlanV1{}, ErrGoPlan
 	}
-	if err := VerifyGitSourceV1(ctx, root, witness, policy); err != nil {
+	if err := VerifyGitSourceV1(ctx, root, witness, policy, toolchain); err != nil {
 		return GoBuildPlanV1{}, ErrGoPlan
 	}
-	root, modCache, env, err := sealedGoEnvironment(root, taskCacheRoot)
+	root, cache, env, err := sealedGoEnvironment(root, taskCacheRoot)
 	if err != nil {
 		return GoBuildPlanV1{}, ErrGoPlan
 	}
-	goPath, err := resolveTrustedExecutable("go", lookup)
+	goExecutable, err := bindExecutable("go", toolchain.GoBinarySHA256, run, lookup, hash)
 	if err != nil {
 		return GoBuildPlanV1{}, ErrGoPlan
 	}
-	goDigest, err := hash(goPath)
-	if err != nil || goDigest != toolchain.GoBinarySHA256 {
-		return GoBuildPlanV1{}, ErrGoPlan
-	}
-	version, err := run(ctx, goPath, []string{"version"}, root, env)
+	version, err := goExecutable.Run(ctx, []string{"version"}, root, env)
 	if err != nil || goVersionFromOutput(version) != toolchain.GoVersion {
 		return GoBuildPlanV1{}, ErrGoPlan
 	}
-	verified, err := run(ctx, goPath, []string{"mod", "verify"}, root, env)
+	verified, err := goExecutable.Run(ctx, []string{"mod", "verify"}, root, env)
 	if err != nil || string(verified) != "all modules verified\n" {
 		return GoBuildPlanV1{}, ErrGoPlan
 	}
 	packages := fixedPackagePaths(policy.ModulePath)
 	listArgs := append([]string{"list", "-mod=readonly", "-buildvcs=false", "-deps", "-json"}, packages...)
-	listRaw, err := run(ctx, goPath, listArgs, root, env)
-	if err != nil || len(listRaw) == 0 || len(listRaw) > maxGoListBytes || !verifyGoListClosure(listRaw, policy, root, modCache) {
+	listRaw, err := goExecutable.Run(ctx, listArgs, root, env)
+	if err != nil || len(listRaw) == 0 || len(listRaw) > maxGoListBytes || !verifyGoListClosure(listRaw, policy, root, cache.modPath) || !cache.valid() {
 		return GoBuildPlanV1{}, ErrGoPlan
 	}
-	if err := VerifyGitSourceV1(ctx, root, witness, policy); err != nil {
+	verified, err = goExecutable.Run(ctx, []string{"mod", "verify"}, root, env)
+	if err != nil || string(verified) != "all modules verified\n" || !cache.valid() {
+		return GoBuildPlanV1{}, ErrGoPlan
+	}
+	if err := VerifyGitSourceV1(ctx, root, witness, policy, toolchain); err != nil {
 		return GoBuildPlanV1{}, ErrGoPlan
 	}
 	targets := sealedTargets(witness)
@@ -164,22 +205,35 @@ func (b *cappedBuffer) Write(p []byte) (int, error) {
 	return b.Buffer.Write(p)
 }
 
-func sealedGoEnvironment(root, taskCacheRoot string) (string, string, []string, error) {
+type sealedGoCache struct {
+	taskPath string
+	goPath   string
+	modPath  string
+	taskInfo os.FileInfo
+	goInfo   os.FileInfo
+	modInfo  os.FileInfo
+}
+
+func sealedGoEnvironment(root, taskCacheRoot string) (string, sealedGoCache, []string, error) {
 	root, err := cleanExistingDirectory(root)
 	if err != nil {
-		return "", "", nil, err
+		return "", sealedGoCache{}, nil, err
 	}
 	taskCacheRoot, err = cleanExistingDirectory(taskCacheRoot)
 	if err != nil || taskCacheRoot == root || pathWithin(root, taskCacheRoot) {
-		return "", "", nil, ErrGoPlan
+		return "", sealedGoCache{}, nil, ErrGoPlan
 	}
-	goCache, err := pinnedCacheChild(taskCacheRoot, "go-cache")
+	taskInfo, err := os.Lstat(taskCacheRoot)
 	if err != nil {
-		return "", "", nil, ErrGoPlan
+		return "", sealedGoCache{}, nil, ErrGoPlan
 	}
-	modCache, err := pinnedCacheChild(taskCacheRoot, "go-mod-cache")
+	goCache, goInfo, err := pinnedCacheChild(taskCacheRoot, "go-cache")
 	if err != nil {
-		return "", "", nil, ErrGoPlan
+		return "", sealedGoCache{}, nil, ErrGoPlan
+	}
+	modCache, modInfo, err := pinnedCacheChild(taskCacheRoot, "go-mod-cache")
+	if err != nil {
+		return "", sealedGoCache{}, nil, ErrGoPlan
 	}
 	env := []string{
 		"PATH=" + os.Getenv("PATH"), "LANG=" + os.Getenv("LANG"), "TMPDIR=" + os.Getenv("TMPDIR"),
@@ -187,43 +241,55 @@ func sealedGoEnvironment(root, taskCacheRoot string) (string, string, []string, 
 		"GOCACHE=" + goCache, "GOMODCACHE=" + modCache,
 		"GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0",
 	}
-	return root, modCache, env, nil
+	return root, sealedGoCache{taskPath: taskCacheRoot, goPath: goCache, modPath: modCache, taskInfo: taskInfo, goInfo: goInfo, modInfo: modInfo}, env, nil
 }
 
-func pinnedCacheChild(parent, name string) (string, error) {
+func (cache sealedGoCache) valid() bool {
+	return samePinnedDirectory(cache.taskPath, cache.taskInfo) && samePinnedDirectory(cache.goPath, cache.goInfo) && samePinnedDirectory(cache.modPath, cache.modInfo)
+}
+
+func samePinnedDirectory(path string, expected os.FileInfo) bool {
+	info, err := os.Lstat(path)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || !os.SameFile(info, expected) {
+		return false
+	}
+	return true
+}
+
+func pinnedCacheChild(parent, name string) (string, os.FileInfo, error) {
 	if name != "go-cache" && name != "go-mod-cache" {
-		return "", ErrGoPlan
+		return "", nil, ErrGoPlan
 	}
 	root, err := os.OpenRoot(parent)
 	if err != nil {
-		return "", ErrGoPlan
+		return "", nil, ErrGoPlan
 	}
 	defer root.Close()
 	parentInfo, err := root.Stat(".")
 	if err != nil {
-		return "", ErrGoPlan
+		return "", nil, ErrGoPlan
 	}
 	outerInfo, err := os.Stat(parent)
 	if err != nil || !os.SameFile(parentInfo, outerInfo) {
-		return "", ErrGoPlan
+		return "", nil, ErrGoPlan
 	}
 	if err := root.Mkdir(name, 0o700); err != nil && !os.IsExist(err) {
-		return "", ErrGoPlan
+		return "", nil, ErrGoPlan
 	}
 	entry, err := root.Lstat(name)
 	if err != nil || !entry.IsDir() || entry.Mode()&os.ModeSymlink != 0 {
-		return "", ErrGoPlan
+		return "", nil, ErrGoPlan
 	}
 	child, err := root.OpenFile(name, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
-		return "", ErrGoPlan
+		return "", nil, ErrGoPlan
 	}
 	defer child.Close()
 	opened, err := child.Stat()
 	if err != nil || !opened.IsDir() || !os.SameFile(entry, opened) {
-		return "", ErrGoPlan
+		return "", nil, ErrGoPlan
 	}
-	return filepath.Join(parent, name), nil
+	return filepath.Join(parent, name), opened, nil
 }
 
 func cleanExistingDirectory(path string) (string, error) {

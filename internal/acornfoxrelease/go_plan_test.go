@@ -14,7 +14,7 @@ import (
 
 func TestPrepareGoBuildPlanV1SealsRealDetachedRepository(t *testing.T) {
 	root, cacheRoot, witness, policy, toolchain := syntheticGoReleaseRepository(t)
-	if err := VerifyGitSourceV1(context.Background(), root, witness, policy); err != nil {
+	if err := VerifyGitSourceV1(context.Background(), root, witness, policy, toolchain); err != nil {
 		t.Fatalf("precondition git verification: %v", err)
 	}
 	plan, err := PrepareGoBuildPlanV1(context.Background(), witness, policy, toolchain, root, cacheRoot)
@@ -62,7 +62,7 @@ func TestPrepareGoBuildPlanV1SealsRealDetachedRepository(t *testing.T) {
 
 func TestPrepareGoBuildPlanV1UsesOnlySealedGoList(t *testing.T) {
 	root, cacheRoot, witness, policy, toolchain := syntheticGoReleaseRepository(t)
-	if err := VerifyGitSourceV1(context.Background(), root, witness, policy); err != nil {
+	if err := VerifyGitSourceV1(context.Background(), root, witness, policy, toolchain); err != nil {
 		t.Fatalf("precondition git verification: %v", err)
 	}
 	var calls [][]string
@@ -94,13 +94,13 @@ func TestPrepareGoBuildPlanV1UsesOnlySealedGoList(t *testing.T) {
 		}
 	}
 	plan, err := prepareGoBuildPlanV1(context.Background(), witness, policy, toolchain, root, cacheRoot, runner)
-	if err != nil || !plan.Valid() || len(calls) != 3 {
-		if verifyErr := VerifyGitSourceV1(context.Background(), root, witness, policy); verifyErr != nil {
+	if err != nil || !plan.Valid() || len(calls) != 4 {
+		if verifyErr := VerifyGitSourceV1(context.Background(), root, witness, policy, toolchain); verifyErr != nil {
 			t.Fatalf("postcondition git verification: %v", verifyErr)
 		}
 		t.Fatalf("plan=%#v calls=%q err=%v", plan, calls, err)
 	}
-	if calls[0][0] != "version" || calls[1][0] != "mod" || calls[2][0] != "list" {
+	if calls[0][0] != "version" || calls[1][0] != "mod" || calls[2][0] != "list" || calls[3][0] != "mod" {
 		t.Fatalf("unexpected command order: %q", calls)
 	}
 	for _, call := range calls {
@@ -154,11 +154,79 @@ func TestPrepareGoBuildPlanV1PinsGoExecutableAndStopsOnVerifyFailure(t *testing.
 	}
 }
 
+func TestPrepareGoBuildPlanV1RejectsExecutableAndCacheDrift(t *testing.T) {
+	root, cacheRoot, witness, policy, toolchain := syntheticGoReleaseRepository(t)
+	goPath, err := resolveTrustedExecutable("go", exec.LookPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var goCalls int
+	driftHashCalls := 0
+	driftHasher := func(path string) (string, error) {
+		driftHashCalls++
+		if driftHashCalls == 3 {
+			return strings.Repeat("f", 64), nil
+		}
+		return hashTrustedExecutable(path)
+	}
+	plan, err := prepareGoBuildPlanWithDependencies(context.Background(), witness, policy, toolchain, root, cacheRoot, func(_ context.Context, name string, args []string, _ string, _ []string) ([]byte, error) {
+		if name != goPath {
+			t.Fatalf("unexpected executable %q", name)
+		}
+		goCalls++
+		return []byte("go version " + toolchain.GoVersion + " linux/amd64\n"), nil
+	}, func(string) (string, error) { return goPath, nil }, driftHasher)
+	if err == nil || plan.Valid() || goCalls != 1 {
+		t.Fatalf("plan=%#v calls=%d err=%v", plan, goCalls, err)
+	}
+
+	modCache := filepath.Join(cacheRoot, "go-mod-cache")
+	modVerifies := 0
+	plan, err = prepareGoBuildPlanV1(context.Background(), witness, policy, toolchain, root, cacheRoot, func(_ context.Context, _ string, args []string, dir string, _ []string) ([]byte, error) {
+		switch args[0] {
+		case "version":
+			return []byte("go version " + toolchain.GoVersion + " linux/amd64\n"), nil
+		case "mod":
+			modVerifies++
+			if modVerifies == 2 {
+				return nil, errors.New("post-list cache mutation")
+			}
+			return []byte("all modules verified\n"), nil
+		case "list":
+			return syntheticGoListJSON(t, policy, dir), nil
+		}
+		return nil, errors.New("unexpected command")
+	})
+	if err == nil || plan.Valid() || modVerifies != 2 {
+		t.Fatalf("post verify accepted: %#v verifies=%d err=%v", plan, modVerifies, err)
+	}
+	if _, err := os.Stat(modCache); err != nil {
+		t.Fatalf("cache was unexpectedly removed: %v", err)
+	}
+}
+
 func TestSealedGoEnvironmentRequiresCallerCreatedCacheRoot(t *testing.T) {
 	root, _, _, _, _ := syntheticGoReleaseRepository(t)
 	missing := filepath.Join(t.TempDir(), "not-created")
 	if _, _, _, err := sealedGoEnvironment(root, missing); err == nil {
 		t.Fatal("created caller task cache root")
+	}
+}
+
+func TestSealedGoEnvironmentRejectsCacheChildReplacement(t *testing.T) {
+	root, cacheRoot, _, _, _ := syntheticGoReleaseRepository(t)
+	_, cache, _, err := sealedGoEnvironment(root, cacheRoot)
+	if err != nil || !cache.valid() {
+		t.Fatalf("cache=%#v err=%v", cache, err)
+	}
+	if err := os.Remove(cache.modPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(cache.modPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if cache.valid() {
+		t.Fatal("replaced cache child accepted")
 	}
 }
 
@@ -190,7 +258,7 @@ func TestVerifyGoListClosureRejectsUnsafeObservations(t *testing.T) {
 
 func TestVerifyGoListClosureRequiresExistingCachedThirdPartyModule(t *testing.T) {
 	root, cacheRoot, _, policy, _ := syntheticGoReleaseRepository(t)
-	modCache, err := pinnedCacheChild(cacheRoot, "go-mod-cache")
+	modCache, _, err := pinnedCacheChild(cacheRoot, "go-mod-cache")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -214,7 +282,7 @@ func TestVerifyGoListClosureRequiresExistingCachedThirdPartyModule(t *testing.T)
 	if err := os.MkdirAll(packageDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pinnedCacheChild(cacheRoot, "go-cache"); err != nil {
+	if _, _, err := pinnedCacheChild(cacheRoot, "go-cache"); err != nil {
 		t.Fatal(err)
 	}
 	if verifyGoListClosure(raw, policy, root, filepath.Join(cacheRoot, "go-cache")) {
@@ -280,7 +348,7 @@ func syntheticGoReleaseRepository(t *testing.T) (string, string, Witness, Source
 	commit := gitRun(t, root, "rev-parse", "HEAD")
 	gitRun(t, root, "checkout", "-q", "--detach")
 	policy := policyForTree(t, root, module)
-	toolchain := ToolchainInputsV1{SchemaVersion: 1, Product: Product, Architecture: Architecture, GoVersion: localGoVersion(t), GoBinarySHA256: localGoBinaryDigest(t), NodeVersion: "v22.0.0", NPMVersion: "10.0.0", BuildPolicy: append([]string(nil), fixedBuildPolicy...)}
+	toolchain := ToolchainInputsV1{SchemaVersion: 1, Product: Product, Architecture: Architecture, GoVersion: localGoVersion(t), GoBinarySHA256: localGoBinaryDigest(t), GitVersion: localGitVersion(t), GitBinarySHA256: localGitBinaryDigest(t), NodeVersion: "v22.0.0", NPMVersion: "10.0.0", BuildPolicy: append([]string(nil), fixedBuildPolicy...)}
 	runtime := RuntimeInputsV1{SchemaVersion: 1, Product: Product, Architecture: Architecture, Files: []FileEntryV1{{Path: "runtime", SHA256: strings.Repeat("a", 64), Mode: 0o644}}}
 	license := LicenseInputsV1{SchemaVersion: 1, Product: Product, Files: []FileEntryV1{{Path: "LICENSE", SHA256: strings.Repeat("b", 64), Mode: 0o644}}}
 	witness := witnessForInputs(t, policy, toolchain, runtime, license)
@@ -378,6 +446,30 @@ func localGoVersion(t *testing.T) string {
 func localGoBinaryDigest(t *testing.T) string {
 	t.Helper()
 	path, err := resolveTrustedExecutable("go", exec.LookPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := hashTrustedExecutable(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return digest
+}
+func localGitVersion(t *testing.T) string {
+	t.Helper()
+	raw, err := exec.Command("git", "--version").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version := gitVersionFromOutput(raw)
+	if version == "" {
+		t.Fatalf("unexpected git version %q", raw)
+	}
+	return version
+}
+func localGitBinaryDigest(t *testing.T) string {
+	t.Helper()
+	path, err := resolveTrustedExecutable("git", exec.LookPath)
 	if err != nil {
 		t.Fatal(err)
 	}

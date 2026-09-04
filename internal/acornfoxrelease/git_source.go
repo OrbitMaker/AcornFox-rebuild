@@ -14,7 +14,7 @@ import (
 
 var ErrGitSource = errors.New("acornfox git source is invalid")
 
-type commandRunner func(context.Context, string, []string, string, []string) ([]byte, error)
+type commandRunner = goCommandRunner
 
 type commandExitError struct {
 	code int
@@ -29,7 +29,7 @@ func localCommand(ctx context.Context, name string, args []string, dir string, e
 	c.Dir = dir
 	path := os.Getenv("PATH")
 	lang := os.Getenv("LANG")
-	c.Env = append([]string{"PATH=" + path, "LANG=" + lang, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0"}, env...)
+	c.Env = append([]string{"PATH=" + path, "LANG=" + lang, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0", "GIT_NO_REPLACE_OBJECTS=1"}, env...)
 	var output cappedBuffer
 	output.limit = maxGoListBytes
 	c.Stdout = &output
@@ -46,17 +46,29 @@ func localCommand(ctx context.Context, name string, args []string, dir string, e
 
 // VerifyGitSourceV1 runs local read-only Git inspection only. A configured
 // local origin is bound to the decision but is never evidence of publication.
-func VerifyGitSourceV1(ctx context.Context, root string, witness Witness, policy SourcePolicyV1) error {
-	return verifyGitSource(ctx, root, witness, policy, localCommand)
+func VerifyGitSourceV1(ctx context.Context, root string, witness Witness, policy SourcePolicyV1, toolchain ToolchainInputsV1) error {
+	return verifyGitSource(ctx, root, witness, policy, toolchain, localCommand)
 }
-func verifyGitSource(ctx context.Context, root string, witness Witness, policy SourcePolicyV1, run commandRunner) error {
+func verifyGitSource(ctx context.Context, root string, witness Witness, policy SourcePolicyV1, toolchain ToolchainInputsV1, run commandRunner) error {
+	return verifyGitSourceWithDependencies(ctx, root, witness, policy, toolchain, run, exec.LookPath, hashTrustedExecutable)
+}
+func verifyGitSourceWithDependencies(ctx context.Context, root string, witness Witness, policy SourcePolicyV1, toolchain ToolchainInputsV1, run commandRunner, lookup executableResolver, hash executableHasher) error {
 	canonical, canonicalErr := CanonicalSourcePolicyV1(policy)
+	toolchainRaw, toolchainErr := CanonicalToolchainInputsV1(toolchain)
 	root, rootErr := cleanGitRoot(root)
-	if ctx == nil || ctx.Err() != nil || run == nil || rootErr != nil || !witness.Valid() || canonicalErr != nil || sha256Text(canonical) != witness.decision.SourcePolicySHA256 || policy.ModulePath != modulePathForRepository(witness.decision.SourceRepository) {
+	if ctx == nil || ctx.Err() != nil || run == nil || lookup == nil || hash == nil || rootErr != nil || !witness.Valid() || canonicalErr != nil || toolchainErr != nil || sha256Text(canonical) != witness.decision.SourcePolicySHA256 || sha256Text(toolchainRaw) != witness.decision.ToolchainSHA256 || policy.ModulePath != modulePathForRepository(witness.decision.SourceRepository) {
+		return ErrGitSource
+	}
+	git, err := bindExecutable("git", toolchain.GitBinarySHA256, run, lookup, hash)
+	if err != nil {
+		return ErrGitSource
+	}
+	version, err := git.Run(ctx, gitReadArgs("--version"), root, gitReadEnv())
+	if err != nil || gitVersionFromOutput(version) != toolchain.GitVersion {
 		return ErrGitSource
 	}
 	call := func(args ...string) (string, error) {
-		raw, e := run(ctx, "git", gitReadArgs(args...), root, gitReadEnv())
+		raw, e := git.Run(ctx, gitReadArgs(args...), root, gitReadEnv())
 		return strings.TrimSpace(string(raw)), e
 	}
 	top, e := call("rev-parse", "--show-toplevel")
@@ -87,12 +99,12 @@ func verifyGitSource(ctx context.Context, root string, witness Witness, policy S
 	if e != nil || !onlyExpectedRemoteURL(pushOrigin, witness.decision.SourceRepository) {
 		return ErrGitSource
 	}
-	raw, e := run(ctx, "git", gitReadArgs("ls-files", "-z", "--stage"), root, gitReadEnv())
+	raw, e := git.Run(ctx, gitReadArgs("ls-files", "-z", "--stage"), root, gitReadEnv())
 	if e != nil {
 		return ErrGitSource
 	}
-	tree, e := run(ctx, "git", gitReadArgs("ls-tree", "-r", "-z", witness.decision.SourceCommit), root, gitReadEnv())
-	if e != nil || !gitIndexMatches(raw, tree, policy.Files, ctx, root, run) {
+	tree, e := git.Run(ctx, gitReadArgs("ls-tree", "-r", "-z", witness.decision.SourceCommit), root, gitReadEnv())
+	if e != nil || !gitIndexMatches(raw, tree, policy.Files, ctx, root, git) {
 		return ErrGitSource
 	}
 	if VerifySourceTree(root, policy) != nil {
@@ -111,7 +123,9 @@ func verifyGitSource(ctx context.Context, root string, witness Witness, policy S
 func gitReadArgs(args ...string) []string {
 	return append([]string{"-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false"}, args...)
 }
-func gitReadEnv() []string { return []string{"GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0"} }
+func gitReadEnv() []string {
+	return []string{"GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0", "GIT_NO_REPLACE_OBJECTS=1"}
+}
 func hasExitCode(err error, want int) bool {
 	var typed *commandExitError
 	if errors.As(err, &typed) {
@@ -119,6 +133,13 @@ func hasExitCode(err error, want int) bool {
 	}
 	var exit *exec.ExitError
 	return errors.As(err, &exit) && exit.ExitCode() == want
+}
+func gitVersionFromOutput(raw []byte) string {
+	fields := strings.Fields(string(raw))
+	if len(fields) < 3 || fields[0] != "git" || fields[1] != "version" || !gitVersionText.MatchString(fields[2]) {
+		return ""
+	}
+	return fields[2]
 }
 func cleanGitRoot(path string) (string, error) {
 	if !filepath.IsAbs(path) {
@@ -140,7 +161,7 @@ func onlyExpectedRemoteURL(raw, expected string) bool {
 	return len(lines) == 1 && (lines[0] == expected || lines[0] == expected+".git")
 }
 
-func gitIndexMatches(raw, tree []byte, files []FileEntryV1, ctx context.Context, root string, run commandRunner) bool {
+func gitIndexMatches(raw, tree []byte, files []FileEntryV1, ctx context.Context, root string, git boundExecutable) bool {
 	expected := map[string]FileEntryV1{}
 	for _, f := range files {
 		expected[f.Path] = f
@@ -190,7 +211,7 @@ func gitIndexMatches(raw, tree []byte, files []FileEntryV1, ctx context.Context,
 			return false
 		}
 		treeSeen[string(parts[1])] = true
-		body, err := run(ctx, "git", gitReadArgs("cat-file", "blob", object.id), root, gitReadEnv())
+		body, err := git.Run(ctx, gitReadArgs("cat-file", "blob", object.id), root, gitReadEnv())
 		if err != nil || sha256Text(body) != entry.SHA256 {
 			return false
 		}
