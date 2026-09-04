@@ -133,3 +133,20 @@ func TestAcornFoxRepoBootstrapRejectsExtraFinalActivation(t *testing.T) {
 		t.Fatalf("extra overwritten=%v", err)
 	}
 }
+
+func TestAcornFoxRepoBootstrapReportsUnknownWhenFailureJournalIsNotPersisted(t *testing.T) {
+	_, store, published, receipt := acornFoxRepoBootstrapFixture(t)
+	oldStep, oldRename := acornFoxRepoBootstrapFaultStep, store.fs.rename
+	acornFoxRepoBootstrapFaultStep = func(step string) error {
+		if step == "journal-activation" {
+			return errors.New("fault")
+		}
+		return nil
+	}
+	store.fs.rename = func(*os.Root, string, string) error { return errors.New("journal rename unavailable") }
+	err := prepareAcornFoxRepository(context.Background(), store, published, receipt.CandidateReceipt.BindingSHA256)
+	acornFoxRepoBootstrapFaultStep, store.fs.rename = oldStep, oldRename
+	if !errors.Is(err, ErrAcornFoxRepoRecoveryUnknown) {
+		t.Fatalf("err=%v", err)
+	}
+}
