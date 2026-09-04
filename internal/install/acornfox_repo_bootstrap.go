@@ -395,21 +395,26 @@ func acornFoxRepoPrefix(root *os.Root, s *TaskAcornFoxRepoStore, j AcornFoxRepoJ
 	return acornFoxRepoRank(stage) >= minimum && (j.Phase == AcornFoxRepoPreparedFinal || acornFoxRepoRank(stage) <= acornFoxRepoRank(j.Phase)+1)
 }
 func acornFoxRepoExactInventory(root *os.Root, s *TaskAcornFoxRepoStore, entries []SubstrateEntry, r AcornFoxLiveReceiptV1, a AcornFoxRepoActivationV1, raw []byte, phase AcornFoxRepoPhase) bool {
-	want := map[string]bool{"receipt.json": true}
+	type expectedNode struct {
+		directory     bool
+		mode          os.FileMode
+		pointerTarget string
+	}
+	want := map[string]expectedNode{"receipt.json": {mode: durableFileMode}}
 	for _, entry := range entries {
-		want[entry.Path] = true
+		want[entry.Path] = expectedNode{directory: entry.Kind == SubstrateEntryDirectory, mode: os.FileMode(entry.Mode)}
 	}
 	if acornFoxRepoRank(phase) >= acornFoxRepoRank(AcornFoxRepoActivationWritten) {
-		want["opt/acornfox/activations"] = true
-		want["opt/acornfox/activations/"+a.ActivationID] = true
-		want["opt/acornfox/activations/"+a.ActivationID+"/repo-activation.json"] = true
-		want["opt/acornfox/activations/"+a.ActivationID+"/release"] = true
+		want["opt/acornfox/activations"] = expectedNode{directory: true, mode: durableDirMode}
+		want["opt/acornfox/activations/"+a.ActivationID] = expectedNode{directory: true, mode: durableDirMode}
+		want["opt/acornfox/activations/"+a.ActivationID+"/repo-activation.json"] = expectedNode{mode: durableFileMode}
+		want["opt/acornfox/activations/"+a.ActivationID+"/release"] = expectedNode{pointerTarget: "../../releases/" + a.ReleaseID}
 	}
 	if acornFoxRepoRank(phase) >= acornFoxRepoRank(AcornFoxRepoActivePublished) {
-		want["opt/acornfox/active"] = true
+		want["opt/acornfox/active"] = expectedNode{pointerTarget: "activations/" + a.ActivationID}
 	}
 	if acornFoxRepoRank(phase) >= acornFoxRepoRank(AcornFoxRepoCurrentPublished) {
-		want["opt/acornfox/current"] = true
+		want["opt/acornfox/current"] = expectedNode{pointerTarget: "active/release"}
 	}
 	var walk func(string) bool
 	walk = func(dir string) bool {
@@ -425,7 +430,8 @@ func acornFoxRepoExactInventory(root *os.Root, s *TaskAcornFoxRepoStore, entries
 		for _, child := range children {
 			path := filepath.ToSlash(filepath.Join(dir, child.Name()))
 			relative := path[len(acornFoxLiveDir)+1:]
-			if !want[relative] {
+			expected, ok := want[relative]
+			if !ok {
 				return false
 			}
 			info, statErr := root.Lstat(path)
@@ -433,12 +439,19 @@ func acornFoxRepoExactInventory(root *os.Root, s *TaskAcornFoxRepoStore, entries
 				return false
 			}
 			if info.Mode()&os.ModeSymlink != 0 {
+				if expected.pointerTarget == "" || !acornFoxRepoPointer(root, s, path, expected.pointerTarget, false) {
+					return false
+				}
 				continue
 			}
-			if !info.IsDir() {
-				continue
+			if expected.pointerTarget != "" || verifyOwner(info, s.uid, s.gid) != nil || info.Mode().Perm() != expected.mode {
+				return false
 			}
-			if !walk(path) {
+			if expected.directory {
+				if !info.IsDir() || !walk(path) {
+					return false
+				}
+			} else if !info.Mode().IsRegular() || acornFoxRepoNlink(info) != 1 {
 				return false
 			}
 		}

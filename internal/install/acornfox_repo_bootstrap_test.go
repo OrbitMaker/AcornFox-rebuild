@@ -223,3 +223,76 @@ func TestAcornFoxRepoBootstrapRejectsPhaseExtraWithoutMutation(t *testing.T) {
 		})
 	}
 }
+
+func TestAcornFoxRepoBootstrapRejectsSymlinkReplacementInExactInventory(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		path func(string, string) string
+	}{
+		{"activations", func(root, _ string) string {
+			return filepath.Join(root, acornFoxLiveDir, "opt", "acornfox", "activations")
+		}},
+		{"activation-directory", func(root, id string) string {
+			return filepath.Join(root, filepath.FromSlash(acornFoxRepoActivationDir(id)))
+		}},
+		{"base-directory", func(root, _ string) string { return filepath.Join(root, acornFoxLiveDir, "opt", "acornfox") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root, store, published, receipt := acornFoxRepoBootstrapFixture(t)
+			if err := prepareAcornFoxRepository(context.Background(), store, published, receipt.CandidateReceipt.BindingSHA256); err != nil {
+				t.Fatal(err)
+			}
+			id, _ := AcornFoxRepoActivationID(receipt.CandidateReceipt.BindingSHA256)
+			path := tc.path(root, id)
+			moved := path + ".moved"
+			if err := os.Rename(path, moved); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink("foreign", path); err != nil {
+				t.Fatal(err)
+			}
+			if lease, err := store.mintLiveVerifiedLease(context.Background(), published, receipt.CandidateReceipt.BindingSHA256); err == nil {
+				_ = lease.Release()
+				t.Fatal("mint accepted symlink replacement")
+			}
+			fresh, err := NewTaskAcornFoxRepoStore(root, os.Getuid(), os.Getgid())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer fresh.Close()
+			if err = prepareAcornFoxRepository(context.Background(), fresh, published, receipt.CandidateReceipt.BindingSHA256); err == nil {
+				t.Fatal("prepare accepted symlink replacement")
+			}
+			got, err := os.Readlink(path)
+			if err != nil || got != "foreign" {
+				t.Fatalf("foreign changed=%q %v", got, err)
+			}
+		})
+	}
+}
+
+func TestAcornFoxRepoBootstrapRejectsWrongFinalPointerTarget(t *testing.T) {
+	root, store, published, receipt := acornFoxRepoBootstrapFixture(t)
+	if err := prepareAcornFoxRepository(context.Background(), store, published, receipt.CandidateReceipt.BindingSHA256); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, filepath.FromSlash(acornFoxRepoActivePath()))
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("foreign", path); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := NewTaskAcornFoxRepoStore(root, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fresh.Close()
+	if err = prepareAcornFoxRepository(context.Background(), fresh, published, receipt.CandidateReceipt.BindingSHA256); err == nil {
+		t.Fatal("wrong pointer target accepted")
+	}
+	got, err := os.Readlink(path)
+	if err != nil || got != "foreign" {
+		t.Fatalf("foreign pointer changed=%q %v", got, err)
+	}
+}
