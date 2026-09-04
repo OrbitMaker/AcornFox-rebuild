@@ -44,6 +44,11 @@ type GoBuildPlanV1 struct {
 	environment        []string
 	packages           []string
 	targets            []GoBuildTargetV1
+	sourceRoot         string
+	sourcePolicy       SourcePolicyV1
+	toolchain          ToolchainInputsV1
+	goExecutable       boundExecutable
+	cache              sealedGoCache
 }
 
 var fixedTargets = []struct{ name, path, identity string }{
@@ -171,6 +176,11 @@ func prepareGoBuildPlanWithDependencies(ctx context.Context, witness Witness, po
 		environment:        append([]string(nil), env...),
 		packages:           append([]string(nil), packages...),
 		targets:            targets,
+		sourceRoot:         root,
+		sourcePolicy:       cloneSourcePolicy(policy),
+		toolchain:          cloneToolchain(toolchain),
+		goExecutable:       goExecutable,
+		cache:              cache,
 	}, nil
 }
 
@@ -470,7 +480,9 @@ func sealedTargets(witness Witness) []GoBuildTargetV1 {
 }
 
 func (p GoBuildPlanV1) Valid() bool {
-	return p.valid && len(p.targets) == len(fixedTargets) && len(p.packages) == len(fixedTargets) && p.decisionSHA256 != "" && p.sourcePolicySHA256 != "" && p.toolchainSHA256 != "" && p.module != "" && p.sourceCommit != ""
+	sourceRaw, sourceErr := CanonicalSourcePolicyV1(p.sourcePolicy)
+	toolchainRaw, toolchainErr := CanonicalToolchainInputsV1(p.toolchain)
+	return p.valid && len(p.targets) == len(fixedTargets) && len(p.packages) == len(fixedTargets) && p.decisionSHA256 != "" && p.sourcePolicySHA256 != "" && p.toolchainSHA256 != "" && p.module != "" && p.sourceCommit != "" && p.sourceRoot != "" && sourceErr == nil && toolchainErr == nil && sha256Text(sourceRaw) == p.sourcePolicySHA256 && sha256Text(toolchainRaw) == p.toolchainSHA256 && VerifySourceTree(p.sourceRoot, p.sourcePolicy) == nil && p.goExecutable.path != "" && p.goExecutable.digest == p.toolchain.GoBinarySHA256 && p.cache.valid()
 }
 func (p GoBuildPlanV1) Targets() []GoBuildTargetV1 { return copyTargets(p.targets, p.Valid()) }
 func (p GoBuildPlanV1) Packages() []string {
@@ -514,3 +526,16 @@ func copyTargets(targets []GoBuildTargetV1, valid bool) []GoBuildTargetV1 {
 	return out
 }
 func GoBaseFlags() []string { return []string{"-trimpath", "-buildvcs=false"} }
+
+func cloneSourcePolicy(policy SourcePolicyV1) SourcePolicyV1 {
+	copy := policy
+	copy.GoPackages = append([]string(nil), policy.GoPackages...)
+	copy.Files = append([]FileEntryV1(nil), policy.Files...)
+	return copy
+}
+
+func cloneToolchain(toolchain ToolchainInputsV1) ToolchainInputsV1 {
+	copy := toolchain
+	copy.BuildPolicy = append([]string(nil), toolchain.BuildPolicy...)
+	return copy
+}

@@ -337,7 +337,7 @@ func syntheticGoReleaseRepository(t *testing.T) (string, string, Witness, Source
 	module := "github.com/acme/acornfox-fixture"
 	writeReleaseFile(t, filepath.Join(root, "go.mod"), "module "+module+"\n\ngo 1.25.13\n")
 	for _, target := range fixedTargets {
-		writeReleaseFile(t, filepath.Join(root, strings.TrimPrefix(target.path, "./"), "main.go"), "package main\nfunc main() {}\n")
+		writeReleaseFile(t, filepath.Join(root, strings.TrimPrefix(target.path, "./"), "main.go"), "package main\nimport \"fmt\"\nvar processIdentity string\nvar buildVersion string\nvar buildSourceCommit string\nvar buildLayoutSchema string\nfunc main() { fmt.Print(processIdentity, buildVersion, buildSourceCommit, buildLayoutSchema) }\n")
 	}
 	gitRun(t, root, "init", "-q")
 	gitRun(t, root, "config", "user.email", "fixture@example.test")
@@ -492,6 +492,7 @@ func gitRun(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "GIT_AUTHOR_DATE=2000-01-01T00:00:00Z", "GIT_COMMITTER_DATE=2000-01-01T00:00:00Z")
 	raw, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %q: %v: %s", args, err, raw)
