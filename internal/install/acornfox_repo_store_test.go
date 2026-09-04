@@ -39,7 +39,7 @@ func TestTaskAcornFoxRepoStoreCreateReplayTransitionAndResume(t *testing.T) {
 	if err := store.Create(context.Background(), journal); err != nil {
 		t.Fatal(err)
 	}
-	next := advanceAcornFoxRepoJournal(t, journal, AcornFoxRepoLiveMaterialized, acornFoxRepoDigest("b"))
+	next := advanceAcornFoxRepoJournal(t, journal, AcornFoxRepoLiveMaterialized, acornFoxRepoDigest("c"))
 	if err := store.Save(context.Background(), next); err != nil {
 		t.Fatal(err)
 	}
@@ -76,7 +76,7 @@ func TestTaskAcornFoxRepoStoreRecoveryTransitionAndClosedSurface(t *testing.T) {
 	recovery.Revision++
 	recovery.NeedsRecovery = true
 	recovery.Failure = &AcornFoxRepoFailureV1{Code: "write_unknown", Digest: acornFoxRepoDigest("f")}
-	recovery.History = append(recovery.History, AcornFoxRepoHistoryV1{Revision: recovery.Revision, From: journal.Phase, To: journal.Phase, EvidenceSHA256: recovery.Failure.Digest})
+	recovery.History = append(recovery.History, AcornFoxRepoHistoryV1{Revision: recovery.Revision, Kind: AcornFoxRepoHistoryFailure, From: journal.Phase, To: journal.Phase, EvidenceSHA256: recovery.Failure.Digest})
 	if err := store.Save(context.Background(), recovery); err != nil {
 		t.Fatal(err)
 	}
@@ -84,7 +84,7 @@ func TestTaskAcornFoxRepoStoreRecoveryTransitionAndClosedSurface(t *testing.T) {
 	resolved.Revision++
 	resolved.NeedsRecovery = false
 	resolved.Failure = nil
-	resolved.History = append(resolved.History, AcornFoxRepoHistoryV1{Revision: resolved.Revision, From: recovery.Phase, To: recovery.Phase, EvidenceSHA256: recovery.History[len(recovery.History)-1].EvidenceSHA256})
+	resolved.History = append(resolved.History, AcornFoxRepoHistoryV1{Revision: resolved.Revision, Kind: AcornFoxRepoHistoryRecovered, From: recovery.Phase, To: recovery.Phase, EvidenceSHA256: acornFoxRepoDigest("e")})
 	if err := store.Save(context.Background(), resolved); err != nil {
 		t.Fatal(err)
 	}
@@ -138,6 +138,29 @@ func TestTaskAcornFoxRepoStoreConcurrentFirstCreateAndCAS(t *testing.T) {
 	}
 }
 
+func TestTaskAcornFoxRepoStoreFreshCreateCleansOnlyOwnedPartialTemporary(t *testing.T) {
+	root := newAcornFoxRepoTaskRoot(t)
+	if err := os.Mkdir(filepath.Join(root, acornFoxRepoInstallDir), durableDirMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, acornFoxRepoCreateTemporary), []byte(`{"partial"`), durableFileMode); err != nil {
+		t.Fatal(err)
+	}
+	store, lock := acquireAcornFoxRepoStore(t, root)
+	defer store.Close()
+	defer lock.Release()
+	journal := newAcornFoxRepoJournal()
+	if err := store.Create(context.Background(), journal); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, acornFoxRepoCreateTemporary)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("partial temp remains: %v", err)
+	}
+	if got, err := store.Resume(context.Background()); err != nil || !sameAcornFoxRepoJournal(got, journal) {
+		t.Fatalf("fresh create = %#v, %v", got, err)
+	}
+}
+
 type acornFoxRepoFaultFile struct {
 	acornFoxRepoFile
 	write func([]byte) (int, error)
@@ -154,11 +177,11 @@ func TestTaskAcornFoxRepoStoreSaveUnknownReadbackAndPartialFailure(t *testing.T)
 	if err := store.Create(context.Background(), journal); err != nil {
 		t.Fatal(err)
 	}
-	next := advanceAcornFoxRepoJournal(t, journal, AcornFoxRepoLiveMaterialized, acornFoxRepoDigest("b"))
+	next := advanceAcornFoxRepoJournal(t, journal, AcornFoxRepoLiveMaterialized, acornFoxRepoDigest("c"))
 	original := store.fs.openFile
 	store.fs.openFile = func(root *os.Root, name string, flags int, mode os.FileMode) (acornFoxRepoFile, error) {
 		file, err := original(root, name, flags, mode)
-		if err != nil || name != acornFoxRepoInstallJournal || flags&os.O_WRONLY == 0 {
+		if err != nil || name != acornFoxRepoSaveTemporary || flags&os.O_WRONLY == 0 {
 			return file, err
 		}
 		return acornFoxRepoFaultFile{acornFoxRepoFile: file, write: func(raw []byte) (int, error) {
@@ -166,14 +189,20 @@ func TestTaskAcornFoxRepoStoreSaveUnknownReadbackAndPartialFailure(t *testing.T)
 			return n, errors.New("post-write")
 		}}, nil
 	}
-	if err := store.Save(context.Background(), next); err != nil {
-		t.Fatalf("post-write unknown did not reconcile: %v", err)
+	if err := store.Save(context.Background(), next); !errors.Is(err, ErrAcornFoxRepoConflict) {
+		t.Fatalf("post-write before rename = %v, want old-state conflict", err)
 	}
 	store.fs.openFile = original
+	if got, err := store.Resume(context.Background()); err != nil || !sameAcornFoxRepoJournal(got, journal) {
+		t.Fatalf("pre-rename fault changed journal: %#v, %v", got, err)
+	}
+	if err := store.Save(context.Background(), next); err != nil {
+		t.Fatalf("retry after partial temp = %v", err)
+	}
 	partial := advanceAcornFoxRepoJournal(t, next, AcornFoxRepoStaticVerified, acornFoxRepoDigest("d"))
 	store.fs.openFile = func(root *os.Root, name string, flags int, mode os.FileMode) (acornFoxRepoFile, error) {
 		file, err := original(root, name, flags, mode)
-		if err != nil || name != acornFoxRepoInstallJournal || flags&os.O_WRONLY == 0 {
+		if err != nil || name != acornFoxRepoSaveTemporary || flags&os.O_WRONLY == 0 {
 			return file, err
 		}
 		return acornFoxRepoFaultFile{acornFoxRepoFile: file, write: func(raw []byte) (int, error) {
@@ -185,6 +214,31 @@ func TestTaskAcornFoxRepoStoreSaveUnknownReadbackAndPartialFailure(t *testing.T)
 	}
 	if err := store.Save(context.Background(), partial); !errors.Is(err, ErrAcornFoxRepoConflict) {
 		t.Fatalf("partial write = %v, want conflict", err)
+	}
+}
+
+func TestTaskAcornFoxRepoStoreRenameUnknownAcceptsOnlyExactNext(t *testing.T) {
+	root := newAcornFoxRepoTaskRoot(t)
+	store, lock := acquireAcornFoxRepoStore(t, root)
+	defer store.Close()
+	defer lock.Release()
+	old := newAcornFoxRepoJournal()
+	if err := store.Create(context.Background(), old); err != nil {
+		t.Fatal(err)
+	}
+	next := advanceAcornFoxRepoJournal(t, old, AcornFoxRepoLiveMaterialized, acornFoxRepoDigest("c"))
+	original := store.fs.rename
+	store.fs.rename = func(root *os.Root, oldName, newName string) error {
+		if err := original(root, oldName, newName); err != nil {
+			return err
+		}
+		return errors.New("rename-post")
+	}
+	if err := store.Save(context.Background(), next); err != nil {
+		t.Fatalf("rename unknown did not exact-readback next: %v", err)
+	}
+	if got, err := store.Resume(context.Background()); err != nil || !sameAcornFoxRepoJournal(got, next) {
+		t.Fatalf("rename unknown result = %#v, %v", got, err)
 	}
 }
 
