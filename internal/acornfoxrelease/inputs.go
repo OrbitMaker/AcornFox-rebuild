@@ -13,13 +13,14 @@ var (
 )
 
 type ToolchainInputsV1 struct {
-	SchemaVersion int      `json:"schema_version"`
-	Product       string   `json:"product"`
-	Architecture  string   `json:"architecture"`
-	GoVersion     string   `json:"go_version"`
-	NodeVersion   string   `json:"node_version"`
-	NPMVersion    string   `json:"npm_version"`
-	BuildPolicy   []string `json:"build_policy"`
+	SchemaVersion  int      `json:"schema_version"`
+	Product        string   `json:"product"`
+	Architecture   string   `json:"architecture"`
+	GoVersion      string   `json:"go_version"`
+	GoBinarySHA256 string   `json:"go_binary_sha256"`
+	NodeVersion    string   `json:"node_version"`
+	NPMVersion     string   `json:"npm_version"`
+	BuildPolicy    []string `json:"build_policy"`
 }
 type RuntimeInputsV1 struct {
 	SchemaVersion int           `json:"schema_version"`
@@ -34,7 +35,7 @@ type LicenseInputsV1 struct {
 }
 
 func (v ToolchainInputsV1) Validate() error {
-	if v.SchemaVersion != 1 || v.Product != Product || v.Architecture != Architecture || !goVersionText.MatchString(v.GoVersion) || !nodeVersionText.MatchString(v.NodeVersion) || !npmVersionText.MatchString(v.NPMVersion) || len(v.BuildPolicy) != len(fixedBuildPolicy) {
+	if v.SchemaVersion != 1 || v.Product != Product || v.Architecture != Architecture || !goVersionText.MatchString(v.GoVersion) || !digestText.MatchString(v.GoBinarySHA256) || !nodeVersionText.MatchString(v.NodeVersion) || !npmVersionText.MatchString(v.NPMVersion) || len(v.BuildPolicy) != len(fixedBuildPolicy) {
 		return ErrInputs
 	}
 	for i, t := range v.BuildPolicy {

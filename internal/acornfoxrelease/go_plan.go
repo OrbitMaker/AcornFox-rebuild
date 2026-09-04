@@ -3,21 +3,26 @@ package acornfoxrelease
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 )
 
 var ErrGoPlan = errors.New("acornfox go build plan is invalid")
 
-const maxGoListBytes = 64 << 20
-
-const maxGoPlanObservation = 30 * time.Second
+const (
+	maxGoListBytes       = 64 << 20
+	maxGoBinaryBytes     = 1 << 30
+	maxGoPlanObservation = 30 * time.Second
+)
 
 type GoBuildTargetV1 struct {
 	Name    string
@@ -55,6 +60,8 @@ var fixedTargets = []struct{ name, path, identity string }{
 }
 
 type goCommandRunner func(context.Context, string, []string, string, []string) ([]byte, error)
+type executableResolver func(string) (string, error)
+type executableHasher func(string) (string, error)
 
 // PrepareGoBuildPlanV1 makes exactly one offline `go list` observation. It
 // never invokes `go build`, accepts no caller build flags, and rechecks the
@@ -64,7 +71,11 @@ func PrepareGoBuildPlanV1(ctx context.Context, witness Witness, policy SourcePol
 }
 
 func prepareGoBuildPlanV1(ctx context.Context, witness Witness, policy SourcePolicyV1, toolchain ToolchainInputsV1, root, taskCacheRoot string, run goCommandRunner) (GoBuildPlanV1, error) {
-	if ctx == nil || ctx.Err() != nil || run == nil || !witness.Valid() {
+	return prepareGoBuildPlanWithDependencies(ctx, witness, policy, toolchain, root, taskCacheRoot, run, exec.LookPath, hashTrustedExecutable)
+}
+
+func prepareGoBuildPlanWithDependencies(ctx context.Context, witness Witness, policy SourcePolicyV1, toolchain ToolchainInputsV1, root, taskCacheRoot string, run goCommandRunner, lookup executableResolver, hash executableHasher) (GoBuildPlanV1, error) {
+	if ctx == nil || ctx.Err() != nil || run == nil || lookup == nil || hash == nil || !witness.Valid() {
 		return GoBuildPlanV1{}, ErrGoPlan
 	}
 	ctx, cancel := context.WithTimeout(ctx, maxGoPlanObservation)
@@ -78,18 +89,30 @@ func prepareGoBuildPlanV1(ctx context.Context, witness Witness, policy SourcePol
 	if err := VerifyGitSourceV1(ctx, root, witness, policy); err != nil {
 		return GoBuildPlanV1{}, ErrGoPlan
 	}
-	root, cacheRoot, env, err := sealedGoEnvironment(root, taskCacheRoot)
+	root, modCache, env, err := sealedGoEnvironment(root, taskCacheRoot)
 	if err != nil {
 		return GoBuildPlanV1{}, ErrGoPlan
 	}
-	version, err := run(ctx, "go", []string{"version"}, root, env)
+	goPath, err := resolveTrustedExecutable("go", lookup)
+	if err != nil {
+		return GoBuildPlanV1{}, ErrGoPlan
+	}
+	goDigest, err := hash(goPath)
+	if err != nil || goDigest != toolchain.GoBinarySHA256 {
+		return GoBuildPlanV1{}, ErrGoPlan
+	}
+	version, err := run(ctx, goPath, []string{"version"}, root, env)
 	if err != nil || goVersionFromOutput(version) != toolchain.GoVersion {
+		return GoBuildPlanV1{}, ErrGoPlan
+	}
+	verified, err := run(ctx, goPath, []string{"mod", "verify"}, root, env)
+	if err != nil || string(verified) != "all modules verified\n" {
 		return GoBuildPlanV1{}, ErrGoPlan
 	}
 	packages := fixedPackagePaths(policy.ModulePath)
 	listArgs := append([]string{"list", "-mod=readonly", "-buildvcs=false", "-deps", "-json"}, packages...)
-	listRaw, err := run(ctx, "go", listArgs, root, env)
-	if err != nil || len(listRaw) == 0 || len(listRaw) > maxGoListBytes || !verifyGoListClosure(listRaw, policy, root, cacheRoot) {
+	listRaw, err := run(ctx, goPath, listArgs, root, env)
+	if err != nil || len(listRaw) == 0 || len(listRaw) > maxGoListBytes || !verifyGoListClosure(listRaw, policy, root, modCache) {
 		return GoBuildPlanV1{}, ErrGoPlan
 	}
 	if err := VerifyGitSourceV1(ctx, root, witness, policy); err != nil {
@@ -146,33 +169,61 @@ func sealedGoEnvironment(root, taskCacheRoot string) (string, string, []string, 
 	if err != nil {
 		return "", "", nil, err
 	}
-	if !filepath.IsAbs(taskCacheRoot) || filepath.Clean(taskCacheRoot) == root {
+	taskCacheRoot, err = cleanExistingDirectory(taskCacheRoot)
+	if err != nil || taskCacheRoot == root || pathWithin(root, taskCacheRoot) {
 		return "", "", nil, ErrGoPlan
 	}
-	if err := os.MkdirAll(taskCacheRoot, 0o700); err != nil {
-		return "", "", nil, err
-	}
-	cacheRoot, err := cleanExistingDirectory(taskCacheRoot)
-	if err != nil || pathWithin(root, cacheRoot) {
+	goCache, err := pinnedCacheChild(taskCacheRoot, "go-cache")
+	if err != nil {
 		return "", "", nil, ErrGoPlan
 	}
-	goCache := filepath.Join(cacheRoot, "go-cache")
-	modCache := filepath.Join(cacheRoot, "go-mod-cache")
-	for _, path := range []string{goCache, modCache} {
-		if err := os.MkdirAll(path, 0o700); err != nil {
-			return "", "", nil, err
-		}
-		if _, err := cleanExistingDirectory(path); err != nil {
-			return "", "", nil, ErrGoPlan
-		}
+	modCache, err := pinnedCacheChild(taskCacheRoot, "go-mod-cache")
+	if err != nil {
+		return "", "", nil, ErrGoPlan
 	}
 	env := []string{
 		"PATH=" + os.Getenv("PATH"), "LANG=" + os.Getenv("LANG"), "TMPDIR=" + os.Getenv("TMPDIR"),
-		"GOOS=linux", "GOARCH=amd64", "CGO_ENABLED=0", "GOWORK=off", "GOENV=off", "GOTOOLCHAIN=local", "GOPROXY=off", "GOVCS=*:off",
+		"GOOS=linux", "GOARCH=amd64", "CGO_ENABLED=0", "GOWORK=off", "GOENV=off", "GOTOOLCHAIN=local", "GOPROXY=off", "GOVCS=*:off", "GOSUMDB=off",
 		"GOCACHE=" + goCache, "GOMODCACHE=" + modCache,
-		"GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0",
+		"GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0",
 	}
-	return root, cacheRoot, env, nil
+	return root, modCache, env, nil
+}
+
+func pinnedCacheChild(parent, name string) (string, error) {
+	if name != "go-cache" && name != "go-mod-cache" {
+		return "", ErrGoPlan
+	}
+	root, err := os.OpenRoot(parent)
+	if err != nil {
+		return "", ErrGoPlan
+	}
+	defer root.Close()
+	parentInfo, err := root.Stat(".")
+	if err != nil {
+		return "", ErrGoPlan
+	}
+	outerInfo, err := os.Stat(parent)
+	if err != nil || !os.SameFile(parentInfo, outerInfo) {
+		return "", ErrGoPlan
+	}
+	if err := root.Mkdir(name, 0o700); err != nil && !os.IsExist(err) {
+		return "", ErrGoPlan
+	}
+	entry, err := root.Lstat(name)
+	if err != nil || !entry.IsDir() || entry.Mode()&os.ModeSymlink != 0 {
+		return "", ErrGoPlan
+	}
+	child, err := root.OpenFile(name, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return "", ErrGoPlan
+	}
+	defer child.Close()
+	opened, err := child.Stat()
+	if err != nil || !opened.IsDir() || !os.SameFile(entry, opened) {
+		return "", ErrGoPlan
+	}
+	return filepath.Join(parent, name), nil
 }
 
 func cleanExistingDirectory(path string) (string, error) {
@@ -187,7 +238,53 @@ func cleanExistingDirectory(path string) (string, error) {
 	if err != nil {
 		return "", ErrGoPlan
 	}
-	return filepath.Clean(clean), nil
+	clean = filepath.Clean(clean)
+	opened, err := os.OpenRoot(clean)
+	if err != nil {
+		return "", ErrGoPlan
+	}
+	defer opened.Close()
+	rootInfo, err := opened.Stat(".")
+	if err != nil || !os.SameFile(info, rootInfo) {
+		return "", ErrGoPlan
+	}
+	return clean, nil
+}
+
+func resolveTrustedExecutable(name string, lookup executableResolver) (string, error) {
+	path, err := lookup(name)
+	if err != nil || !filepath.IsAbs(path) {
+		return "", ErrGoPlan
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", ErrGoPlan
+	}
+	info, err := os.Lstat(resolved)
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return "", ErrGoPlan
+	}
+	return filepath.Clean(resolved), nil
+}
+
+func hashTrustedExecutable(path string) (string, error) {
+	before, err := os.Lstat(path)
+	if err != nil || !before.Mode().IsRegular() || before.Size() < 0 || before.Size() > maxGoBinaryBytes {
+		return "", ErrGoPlan
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return "", ErrGoPlan
+	}
+	opened, err := file.Stat()
+	hash := sha256.New()
+	n, copyErr := io.Copy(hash, io.LimitReader(file, maxGoBinaryBytes+1))
+	closeErr := file.Close()
+	after, afterErr := os.Lstat(path)
+	if err != nil || copyErr != nil || closeErr != nil || afterErr != nil || n != before.Size() || n > maxGoBinaryBytes || !os.SameFile(before, opened) || !os.SameFile(before, after) {
+		return "", ErrGoPlan
+	}
+	return fmt.Sprintf("%x", hash.Sum(nil)), nil
 }
 
 func fixedPackagePaths(module string) []string {

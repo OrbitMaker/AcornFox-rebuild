@@ -2,6 +2,7 @@ package acornfoxrelease
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -54,6 +55,71 @@ func TestVerifyGitSourceV1RejectsCheckoutAndRemoteDrift(t *testing.T) {
 				t.Fatal("accepted " + name)
 			}
 		})
+	}
+}
+
+func TestVerifyGitSourceV1UsesHermeticReadArgumentsAndExactDetachedExit(t *testing.T) {
+	root, _, witness, policy, _ := syntheticGoReleaseRepository(t)
+	var calls [][]string
+	runner := func(ctx context.Context, name string, args []string, dir string, env []string) ([]byte, error) {
+		calls = append(calls, append([]string(nil), args...))
+		if len(args) >= 5 && args[4] == "symbolic-ref" {
+			return nil, &commandExitError{code: 2, err: errors.New("simulated failure")}
+		}
+		return localCommand(ctx, name, args, dir, env)
+	}
+	if err := verifyGitSource(context.Background(), root, witness, policy, runner); err == nil {
+		t.Fatal("accepted symbolic-ref failure other than detached exit 1")
+	}
+	if len(calls) < 3 {
+		t.Fatalf("calls=%q", calls)
+	}
+	for _, args := range calls {
+		if len(args) < 4 || args[0] != "-c" || args[1] != "core.fsmonitor=false" || args[2] != "-c" || args[3] != "core.untrackedCache=false" {
+			t.Fatalf("unsealed git args: %q", args)
+		}
+	}
+}
+
+func TestVerifyGitSourceV1PinsDecisionCommitAndDisablesLocalFsmonitor(t *testing.T) {
+	root, _, witness, policy, _ := syntheticGoReleaseRepository(t)
+	marker := filepath.Join(t.TempDir(), "fsmonitor-ran")
+	hook := filepath.Join(t.TempDir(), "fsmonitor-hook")
+	if err := os.WriteFile(hook, []byte("#!/bin/sh\ntouch '"+marker+"'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, root, "config", "core.fsmonitor", hook)
+	indexPath := filepath.Join(root, ".git", "index")
+	before, err := os.ReadFile(indexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var revParseCalls int
+	var lsTreeCommit string
+	runner := func(ctx context.Context, name string, args []string, dir string, env []string) ([]byte, error) {
+		if len(args) >= 5 && args[4] == "rev-parse" && args[5] == "HEAD^{commit}" {
+			revParseCalls++
+			if revParseCalls == 2 {
+				return []byte(strings.Repeat("f", 40) + "\n"), nil
+			}
+		}
+		if len(args) >= 5 && args[4] == "ls-tree" {
+			lsTreeCommit = args[len(args)-1]
+		}
+		return localCommand(ctx, name, args, dir, env)
+	}
+	if err := verifyGitSource(context.Background(), root, witness, policy, runner); err == nil {
+		t.Fatal("accepted post-observation head drift")
+	}
+	if lsTreeCommit != witness.decision.SourceCommit {
+		t.Fatalf("ls-tree commit=%q want=%q", lsTreeCommit, witness.decision.SourceCommit)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("repo fsmonitor hook ran: %v", err)
+	}
+	after, err := os.ReadFile(indexPath)
+	if err != nil || string(before) != string(after) {
+		t.Fatalf("index changed: %v", err)
 	}
 }
 

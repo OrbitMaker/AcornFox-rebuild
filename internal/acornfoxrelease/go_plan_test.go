@@ -3,6 +3,7 @@ package acornfoxrelease
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -65,14 +66,22 @@ func TestPrepareGoBuildPlanV1UsesOnlySealedGoList(t *testing.T) {
 		t.Fatalf("precondition git verification: %v", err)
 	}
 	var calls [][]string
-	runner := func(_ context.Context, name string, args []string, dir string, _ []string) ([]byte, error) {
-		if name != "go" {
-			t.Fatalf("unexpected command %q", name)
+	runner := func(_ context.Context, name string, args []string, dir string, env []string) ([]byte, error) {
+		if !filepath.IsAbs(name) {
+			t.Fatalf("untrusted go command %q", name)
+		}
+		if !containsString(env, "GOSUMDB=off") {
+			t.Fatalf("missing offline sumdb policy: %q", env)
 		}
 		calls = append(calls, append([]string(nil), args...))
 		switch args[0] {
 		case "version":
 			return []byte("go version " + toolchain.GoVersion + " linux/amd64\n"), nil
+		case "mod":
+			if !sameStrings(args, []string{"mod", "verify"}) {
+				t.Fatalf("verify args=%q", args)
+			}
+			return []byte("all modules verified\n"), nil
 		case "list":
 			want := append([]string{"list", "-mod=readonly", "-buildvcs=false", "-deps", "-json"}, fixedPackagePaths(policy.ModulePath)...)
 			if !sameStrings(args, want) {
@@ -85,16 +94,71 @@ func TestPrepareGoBuildPlanV1UsesOnlySealedGoList(t *testing.T) {
 		}
 	}
 	plan, err := prepareGoBuildPlanV1(context.Background(), witness, policy, toolchain, root, cacheRoot, runner)
-	if err != nil || !plan.Valid() || len(calls) != 2 {
+	if err != nil || !plan.Valid() || len(calls) != 3 {
 		if verifyErr := VerifyGitSourceV1(context.Background(), root, witness, policy); verifyErr != nil {
 			t.Fatalf("postcondition git verification: %v", verifyErr)
 		}
 		t.Fatalf("plan=%#v calls=%q err=%v", plan, calls, err)
 	}
+	if calls[0][0] != "version" || calls[1][0] != "mod" || calls[2][0] != "list" {
+		t.Fatalf("unexpected command order: %q", calls)
+	}
 	for _, call := range calls {
 		if call[0] == "build" {
 			t.Fatal("go build was invoked")
 		}
+	}
+}
+
+func TestPrepareGoBuildPlanV1PinsGoExecutableAndStopsOnVerifyFailure(t *testing.T) {
+	root, cacheRoot, witness, policy, toolchain := syntheticGoReleaseRepository(t)
+	goPath := filepath.Join(t.TempDir(), "go")
+	if err := os.WriteFile(goPath, []byte("fixture-go"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	resolvedGoPath, err := resolveTrustedExecutable("go", func(string) (string, error) { return goPath, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	goPath = resolvedGoPath
+	digest, err := hashTrustedExecutable(goPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	toolchain.GoBinarySHA256 = digest
+	witness = witnessForToolchain(t, witness, toolchain)
+	var calls [][]string
+	runner := func(_ context.Context, name string, args []string, dir string, _ []string) ([]byte, error) {
+		if name != goPath {
+			t.Fatalf("untrusted executable %q", name)
+		}
+		calls = append(calls, append([]string(nil), args...))
+		switch args[0] {
+		case "version":
+			return []byte("go version " + toolchain.GoVersion + " linux/amd64\n"), nil
+		case "mod":
+			return nil, errors.New("tampered module cache")
+		case "list":
+			t.Fatal("go list ran after failed mod verify")
+		}
+		return nil, errors.New("unexpected command")
+	}
+	plan, err := prepareGoBuildPlanWithDependencies(context.Background(), witness, policy, toolchain, root, cacheRoot, runner, func(string) (string, error) { return goPath, nil }, hashTrustedExecutable)
+	if err == nil || plan.Valid() || len(calls) != 2 || calls[1][0] != "mod" {
+		t.Fatalf("plan=%#v calls=%q err=%v", plan, calls, err)
+	}
+	toolchain.GoBinarySHA256 = strings.Repeat("0", 64)
+	witness = witnessForToolchain(t, witness, toolchain)
+	if plan, err := prepareGoBuildPlanWithDependencies(context.Background(), witness, policy, toolchain, root, cacheRoot, runner, func(string) (string, error) { return goPath, nil }, hashTrustedExecutable); err == nil || plan.Valid() {
+		t.Fatal("digest drift accepted")
+	}
+}
+
+func TestSealedGoEnvironmentRequiresCallerCreatedCacheRoot(t *testing.T) {
+	root, _, _, _, _ := syntheticGoReleaseRepository(t)
+	missing := filepath.Join(t.TempDir(), "not-created")
+	if _, _, _, err := sealedGoEnvironment(root, missing); err == nil {
+		t.Fatal("created caller task cache root")
 	}
 }
 
@@ -126,10 +190,11 @@ func TestVerifyGoListClosureRejectsUnsafeObservations(t *testing.T) {
 
 func TestVerifyGoListClosureRequiresExistingCachedThirdPartyModule(t *testing.T) {
 	root, cacheRoot, _, policy, _ := syntheticGoReleaseRepository(t)
-	if err := os.MkdirAll(cacheRoot, 0o700); err != nil {
+	modCache, err := pinnedCacheChild(cacheRoot, "go-mod-cache")
+	if err != nil {
 		t.Fatal(err)
 	}
-	moduleDir := filepath.Join(cacheRoot, "example.com", "module@v1.2.3")
+	moduleDir := filepath.Join(modCache, "example.com", "module@v1.2.3")
 	packageDir := filepath.Join(moduleDir, "pkg")
 	if err := os.MkdirAll(packageDir, 0o700); err != nil {
 		t.Fatal(err)
@@ -137,14 +202,23 @@ func TestVerifyGoListClosureRequiresExistingCachedThirdPartyModule(t *testing.T)
 	rows := syntheticGoListRows(policy, root)
 	rows = append(rows, map[string]any{"ImportPath": "example.com/module/pkg", "Dir": packageDir, "Module": map[string]any{"Path": "example.com/module", "Version": "v1.2.3", "Dir": moduleDir}})
 	raw := marshalGoListRows(t, rows)
-	if !verifyGoListClosure(raw, policy, root, cacheRoot) {
+	if !verifyGoListClosure(raw, policy, root, modCache) {
 		t.Fatal("cached third-party module rejected")
 	}
 	if err := os.RemoveAll(moduleDir); err != nil {
 		t.Fatal(err)
 	}
-	if verifyGoListClosure(raw, policy, root, cacheRoot) {
+	if verifyGoListClosure(raw, policy, root, modCache) {
 		t.Fatal("missing third-party module accepted")
+	}
+	if err := os.MkdirAll(packageDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pinnedCacheChild(cacheRoot, "go-cache"); err != nil {
+		t.Fatal(err)
+	}
+	if verifyGoListClosure(raw, policy, root, filepath.Join(cacheRoot, "go-cache")) {
+		t.Fatal("sibling cache accepted")
 	}
 }
 
@@ -166,9 +240,16 @@ func TestPrepareGoBuildPlanV1RejectsSourcePackageDrift(t *testing.T) {
 			candidate.GoPackages = append([]string(nil), policy.GoPackages...)
 			mutate(&candidate)
 			candidateWitness := witnessForPolicy(t, witness, candidate)
-			plan, err := prepareGoBuildPlanV1(context.Background(), candidateWitness, candidate, toolchain, root, filepath.Join(cacheRoot, name), func(_ context.Context, _ string, args []string, dir string, _ []string) ([]byte, error) {
+			candidateCache := filepath.Join(cacheRoot, name)
+			if err := os.Mkdir(candidateCache, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			plan, err := prepareGoBuildPlanV1(context.Background(), candidateWitness, candidate, toolchain, root, candidateCache, func(_ context.Context, _ string, args []string, dir string, _ []string) ([]byte, error) {
 				if args[0] == "version" {
 					return []byte("go version " + toolchain.GoVersion + " linux/amd64\n"), nil
+				}
+				if args[0] == "mod" {
+					return []byte("all modules verified\n"), nil
 				}
 				return syntheticGoListJSON(t, policy, dir), nil
 			})
@@ -199,7 +280,7 @@ func syntheticGoReleaseRepository(t *testing.T) (string, string, Witness, Source
 	commit := gitRun(t, root, "rev-parse", "HEAD")
 	gitRun(t, root, "checkout", "-q", "--detach")
 	policy := policyForTree(t, root, module)
-	toolchain := ToolchainInputsV1{SchemaVersion: 1, Product: Product, Architecture: Architecture, GoVersion: localGoVersion(t), NodeVersion: "v22.0.0", NPMVersion: "10.0.0", BuildPolicy: append([]string(nil), fixedBuildPolicy...)}
+	toolchain := ToolchainInputsV1{SchemaVersion: 1, Product: Product, Architecture: Architecture, GoVersion: localGoVersion(t), GoBinarySHA256: localGoBinaryDigest(t), NodeVersion: "v22.0.0", NPMVersion: "10.0.0", BuildPolicy: append([]string(nil), fixedBuildPolicy...)}
 	runtime := RuntimeInputsV1{SchemaVersion: 1, Product: Product, Architecture: Architecture, Files: []FileEntryV1{{Path: "runtime", SHA256: strings.Repeat("a", 64), Mode: 0o644}}}
 	license := LicenseInputsV1{SchemaVersion: 1, Product: Product, Files: []FileEntryV1{{Path: "LICENSE", SHA256: strings.Repeat("b", 64), Mode: 0o644}}}
 	witness := witnessForInputs(t, policy, toolchain, runtime, license)
@@ -212,7 +293,11 @@ func syntheticGoReleaseRepository(t *testing.T) (string, string, Witness, Source
 	if err != nil {
 		t.Fatal(err)
 	}
-	return root, filepath.Join(t.TempDir(), "cache"), witness, policy, toolchain
+	cacheRoot := filepath.Join(t.TempDir(), "cache")
+	if err := os.Mkdir(cacheRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return root, cacheRoot, witness, policy, toolchain
 }
 
 func policyForTree(t *testing.T, root, module string) SourcePolicyV1 {
@@ -290,6 +375,18 @@ func localGoVersion(t *testing.T) string {
 	}
 	return version
 }
+func localGoBinaryDigest(t *testing.T) string {
+	t.Helper()
+	path, err := resolveTrustedExecutable("go", exec.LookPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := hashTrustedExecutable(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return digest
+}
 func writeReleaseFile(t *testing.T, path, body string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -337,6 +434,25 @@ func witnessForPolicy(t *testing.T, witness Witness, policy SourcePolicyV1) Witn
 	}
 	decision := witness.decision
 	decision.SourcePolicySHA256 = sha256Text(raw)
+	encoded, err := CanonicalDecisionV1(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := ParseDecisionV1(encoded, sha256Text(encoded))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return parsed
+}
+
+func witnessForToolchain(t *testing.T, witness Witness, toolchain ToolchainInputsV1) Witness {
+	t.Helper()
+	raw, err := CanonicalToolchainInputsV1(toolchain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision := witness.decision
+	decision.ToolchainSHA256 = sha256Text(raw)
 	encoded, err := CanonicalDecisionV1(decision)
 	if err != nil {
 		t.Fatal(err)
