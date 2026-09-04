@@ -300,6 +300,42 @@ func acornFoxSubstrateWriteReceipt(fs acornFoxSubstrateFS, root *os.Root, receip
 	})
 }
 
+func acornFoxSubstrateWriteReleaseControl(fs acornFoxSubstrateFS, root *os.Root, receipt InactiveSubstrateReceiptV1, uid, gid int) error {
+	raw, err := MarshalInactiveSubstrateReceiptV1(receipt)
+	if err != nil {
+		return err
+	}
+	path := acornFoxSubstrateTarget("var/lib/acornfox/install/releases/" + receipt.CandidateReceipt.ReleaseID + ".json")
+	file, err := fs.openFile(root, path, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
+	if errors.Is(err, os.ErrExist) {
+		existing, readErr := acornFoxSubstrateReadControl(fs, root, path, uid, gid)
+		if readErr == nil && string(existing) == string(raw) {
+			return nil
+		}
+		return ErrAcornFoxSubstrateConflict
+	}
+	if err != nil {
+		return err
+	}
+	if err = acornFoxSubstrateWriteFully(file, raw); err == nil {
+		err = file.Chmod(0o600)
+	}
+	if err == nil {
+		err = file.Chown(uid, gid)
+	}
+	if err == nil {
+		err = file.Sync()
+	}
+	closeErr := file.Close()
+	if err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+	return fs.syncDirectory(root, parentDirectory(path))
+}
+
 func acornFoxSubstrateAtomicCopy(fs acornFoxSubstrateFS, root *os.Root, final string, input acornFoxSubstrateFile, entry SubstrateEntry, uid, gid int) error {
 	return acornFoxSubstrateAtomic(fs, root, final, os.FileMode(entry.Mode), uid, gid, func(output acornFoxSubstrateFile) error {
 		return acornFoxSubstrateCopyFully(output, input)
@@ -433,16 +469,33 @@ func acornFoxSubstrateReadControl(fs acornFoxSubstrateFS, root *os.Root, path st
 		return nil, err
 	}
 	info, statErr := file.Stat()
-	raw, readErr := readAcornFoxSubstrateFile(file)
-	closeErr := file.Close()
-	if statErr != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 || verifyOwner(info, uid, gid) != nil {
+	if statErr != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 || verifyOwner(info, uid, gid) != nil || info.Size() < 1 || info.Size() > acornFoxHelperReceiptMaxBytes || !acornFoxSubstrateSingleLink(info) {
+		_ = file.Close()
 		return nil, errors.New("AcornFox substrate control metadata is invalid")
 	}
+	raw, readErr := readAcornFoxSubstrateFileBounded(file, acornFoxHelperReceiptMaxBytes)
+	closeErr := file.Close()
 	if readErr != nil {
 		return nil, readErr
 	}
 	if closeErr != nil {
 		return nil, closeErr
+	}
+	return raw, nil
+}
+
+func acornFoxSubstrateSingleLink(info os.FileInfo) bool {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	return ok && stat.Nlink == 1
+}
+
+func readAcornFoxSubstrateFileBounded(file acornFoxSubstrateFile, maximum int64) ([]byte, error) {
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	raw, err := io.ReadAll(io.LimitReader(file, maximum+1))
+	if err != nil || int64(len(raw)) > maximum {
+		return nil, os.ErrInvalid
 	}
 	return raw, nil
 }
