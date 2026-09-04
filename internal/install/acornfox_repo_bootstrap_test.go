@@ -296,3 +296,33 @@ func TestAcornFoxRepoBootstrapRejectsWrongFinalPointerTarget(t *testing.T) {
 		t.Fatalf("foreign pointer changed=%q %v", got, err)
 	}
 }
+
+func TestAcornFoxRepoBootstrapRejectsFinalPointerHardlink(t *testing.T) {
+	root, store, published, receipt := acornFoxRepoBootstrapFixture(t)
+	if err := prepareAcornFoxRepository(context.Background(), store, published, receipt.CandidateReceipt.BindingSHA256); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, filepath.FromSlash(acornFoxRepoActivePath()))
+	foreign := acornFoxRepoActivePath() + ".foreign-link"
+	rootHandle, err := store.openRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = rootHandle.Link(acornFoxRepoActivePath(), foreign)
+	closeErr := rootHandle.Close()
+	if err != nil || closeErr != nil {
+		t.Fatalf("link=%v close=%v", err, closeErr)
+	}
+	fresh, err := NewTaskAcornFoxRepoStore(root, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fresh.Close()
+	if err = prepareAcornFoxRepository(context.Background(), fresh, published, receipt.CandidateReceipt.BindingSHA256); err == nil {
+		t.Fatal("hardlinked final pointer accepted")
+	}
+	info, err := os.Lstat(path)
+	if err != nil || acornFoxRepoNlink(info) != 2 {
+		t.Fatalf("hardlink changed: %#v %v", info, err)
+	}
+}
