@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
@@ -16,7 +18,9 @@ type commandRunner func(context.Context, string, []string, string, []string) ([]
 func localCommand(ctx context.Context, name string, args []string, dir string, env []string) ([]byte, error) {
 	c := exec.CommandContext(ctx, name, args...)
 	c.Dir = dir
-	c.Env = append(c.Environ(), env...)
+	path := os.Getenv("PATH")
+	lang := os.Getenv("LANG")
+	c.Env = append([]string{"PATH=" + path, "LANG=" + lang, "GIT_CONFIG_NOSYSTEM=1", "GIT_TERMINAL_PROMPT=0"}, env...)
 	return c.Output()
 }
 
@@ -26,7 +30,8 @@ func VerifyGitSourceV1(ctx context.Context, root string, witness Witness, policy
 	return verifyGitSource(ctx, root, witness, policy, localCommand)
 }
 func verifyGitSource(ctx context.Context, root string, witness Witness, policy SourcePolicyV1, run commandRunner) error {
-	if ctx == nil || ctx.Err() != nil || !witness.Valid() || policy.Validate() != nil || policy.ModulePath != modulePathForRepository(witness.decision.SourceRepository) {
+	canonical, canonicalErr := CanonicalSourcePolicyV1(policy)
+	if ctx == nil || ctx.Err() != nil || !witness.Valid() || canonicalErr != nil || sha256Text(canonical) != witness.decision.SourcePolicySHA256 || policy.ModulePath != modulePathForRepository(witness.decision.SourceRepository) {
 		return ErrGitSource
 	}
 	call := func(args ...string) (string, error) {
@@ -44,7 +49,7 @@ func verifyGitSource(ctx context.Context, root string, witness Witness, policy S
 	if _, e = call("symbolic-ref", "-q", "HEAD"); e == nil {
 		return ErrGitSource
 	}
-	status, e := call("status", "--porcelain=v1", "-z", "--ignore-submodules=none")
+	status, e := call("status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none")
 	if e != nil || status != "" {
 		return ErrGitSource
 	}
@@ -80,7 +85,7 @@ func gitIndexMatches(raw []byte, files []FileEntryV1) bool {
 			return false
 		}
 		meta := strings.Fields(string(parts[0]))
-		if len(meta) != 3 {
+		if len(meta) != 3 || meta[1] != "0" || !regexp.MustCompile(`^[0-9a-f]{40,64}$`).MatchString(meta[2]) {
 			return false
 		}
 		mode := meta[0]
