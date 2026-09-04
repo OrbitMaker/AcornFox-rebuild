@@ -186,8 +186,46 @@ func TestAcornFoxRepoHistoryKindsAreClosed(t *testing.T) {
 	recovered := failure
 	recovered.Revision++
 	recovered.NeedsRecovery, recovered.Failure = false, nil
-	recovered.History = append(recovered.History, AcornFoxRepoHistoryV1{Revision: recovered.Revision, Kind: AcornFoxRepoHistoryRecovered, From: failure.Phase, To: failure.Phase, EvidenceSHA256: acornFoxRepoDigest("e")})
+	recoveredEvidence, err := AcornFoxRepoRecoveredEvidence(failure, failure.Phase, failure.Failure.Digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered.History = append(recovered.History, AcornFoxRepoHistoryV1{Revision: recovered.Revision, Kind: AcornFoxRepoHistoryRecovered, From: failure.Phase, To: failure.Phase, EvidenceSHA256: recoveredEvidence})
 	if err := recovered.Validate(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestAcornFoxRepoRecoveredEvidenceBindsFailureAndPhaseEvidence(t *testing.T) {
+	journal := advanceAcornFoxRepoJournal(t, newAcornFoxRepoJournal(), AcornFoxRepoLiveMaterialized, acornFoxRepoDigest("c"))
+	failure := journal
+	failure.Revision++
+	failure.NeedsRecovery = true
+	failure.Failure = &AcornFoxRepoFailureV1{Code: "write_unknown", Digest: acornFoxRepoDigest("f")}
+	failure.History = append(failure.History, AcornFoxRepoHistoryV1{Revision: failure.Revision, Kind: AcornFoxRepoHistoryFailure, From: journal.Phase, To: journal.Phase, EvidenceSHA256: failure.Failure.Digest})
+	recovered := failure
+	recovered.Revision++
+	recovered.NeedsRecovery, recovered.Failure = false, nil
+	evidence, err := AcornFoxRepoRecoveredEvidence(failure, failure.Phase, failure.Failure.Digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered.History = append(recovered.History, AcornFoxRepoHistoryV1{Revision: recovered.Revision, Kind: AcornFoxRepoHistoryRecovered, From: failure.Phase, To: failure.Phase, EvidenceSHA256: evidence})
+	if err := recovered.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	for name, mutate := range map[string]func(*AcornFoxRepoJournalV1){
+		"arbitrary-recovered": func(j *AcornFoxRepoJournalV1) { j.History[len(j.History)-1].EvidenceSHA256 = acornFoxRepoDigest("e") },
+		"prior-failure":       func(j *AcornFoxRepoJournalV1) { j.History[len(j.History)-2].EvidenceSHA256 = acornFoxRepoDigest("d") },
+		"phase-evidence":      func(j *AcornFoxRepoJournalV1) { j.LiveTreeSHA256 = acornFoxRepoDigest("e") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			bad := recovered
+			bad.History = append([]AcornFoxRepoHistoryV1(nil), recovered.History...)
+			mutate(&bad)
+			if err := bad.Validate(); err == nil {
+				t.Fatal("mutated recovery history was accepted")
+			}
+		})
 	}
 }

@@ -84,7 +84,11 @@ func TestTaskAcornFoxRepoStoreRecoveryTransitionAndClosedSurface(t *testing.T) {
 	resolved.Revision++
 	resolved.NeedsRecovery = false
 	resolved.Failure = nil
-	resolved.History = append(resolved.History, AcornFoxRepoHistoryV1{Revision: resolved.Revision, Kind: AcornFoxRepoHistoryRecovered, From: recovery.Phase, To: recovery.Phase, EvidenceSHA256: acornFoxRepoDigest("e")})
+	recoveredEvidence, err := AcornFoxRepoRecoveredEvidence(recovery, recovery.Phase, recovery.Failure.Digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved.History = append(resolved.History, AcornFoxRepoHistoryV1{Revision: resolved.Revision, Kind: AcornFoxRepoHistoryRecovered, From: recovery.Phase, To: recovery.Phase, EvidenceSHA256: recoveredEvidence})
 	if err := store.Save(context.Background(), resolved); err != nil {
 		t.Fatal(err)
 	}
@@ -302,6 +306,139 @@ type acornFoxRepoFaultFile struct {
 }
 
 func (f acornFoxRepoFaultFile) Write(raw []byte) (int, error) { return f.write(raw) }
+
+type acornFoxRepoSyncFaultFile struct {
+	acornFoxRepoFile
+	sync func() error
+}
+
+func (f acornFoxRepoSyncFaultFile) Sync() error { return f.sync() }
+
+func faultAcornFoxRepoParentSync(store *TaskAcornFoxRepoStore, failures int) *int {
+	calls := new(int)
+	original := store.fs.openFile
+	store.fs.openFile = func(root *os.Root, name string, flags int, mode os.FileMode) (acornFoxRepoFile, error) {
+		file, err := original(root, name, flags, mode)
+		if err != nil || name != acornFoxRepoInstallDir {
+			return file, err
+		}
+		return acornFoxRepoSyncFaultFile{acornFoxRepoFile: file, sync: func() error {
+			*calls++
+			if *calls <= failures {
+				return errors.New("parent-sync")
+			}
+			return file.Sync()
+		}}, nil
+	}
+	return calls
+}
+
+func TestTaskAcornFoxRepoStoreCreateFsyncRecoveryIsTopologyBounded(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		failures int
+		wantErr  error
+	}{
+		{"retry-succeeds", 1, nil},
+		{"persistent-is-unknown", 2, ErrAcornFoxRepoRecoveryUnknown},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := newAcornFoxRepoTaskRoot(t)
+			if err := os.Mkdir(filepath.Join(root, acornFoxRepoInstallDir), durableDirMode); err != nil {
+				t.Fatal(err)
+			}
+			store, lock := acquireAcornFoxRepoStore(t, root)
+			journal := newAcornFoxRepoJournal()
+			calls := faultAcornFoxRepoParentSync(store, tc.failures)
+			err := store.Create(context.Background(), journal)
+			if !errors.Is(err, tc.wantErr) || (tc.wantErr == nil && err != nil) {
+				t.Fatalf("create error=%v want=%v", err, tc.wantErr)
+			}
+			if *calls < tc.failures {
+				t.Fatalf("parent sync calls=%d, want at least %d", *calls, tc.failures)
+			}
+			if err := lock.Release(); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			fresh, freshLock := acquireAcornFoxRepoStore(t, root)
+			defer fresh.Close()
+			defer freshLock.Release()
+			if err := fresh.Create(context.Background(), journal); err != nil {
+				t.Fatalf("fresh create reconciliation=%v", err)
+			}
+			if got, err := fresh.Load(context.Background()); err != nil || !sameAcornFoxRepoJournal(got, journal) {
+				t.Fatalf("fresh exact journal=%#v err=%v", got, err)
+			}
+			info, err := os.Lstat(filepath.Join(root, acornFoxRepoInstallJournal))
+			if err != nil || acornFoxRepoNlink(info) != 1 {
+				t.Fatalf("final topology err=%v nlink=%d", err, acornFoxRepoNlink(info))
+			}
+		})
+	}
+}
+
+func TestTaskAcornFoxRepoStoreSaveFsyncRecoveryRequiresDurableRetry(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		failures int
+		wantErr  error
+	}{
+		{"retry-succeeds", 1, nil},
+		{"persistent-is-unknown", 2, ErrAcornFoxRepoRecoveryUnknown},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := newAcornFoxRepoTaskRoot(t)
+			store, lock := acquireAcornFoxRepoStore(t, root)
+			defer store.Close()
+			defer lock.Release()
+			old := newAcornFoxRepoJournal()
+			if err := store.Create(context.Background(), old); err != nil {
+				t.Fatal(err)
+			}
+			next := advanceAcornFoxRepoJournal(t, old, AcornFoxRepoLiveMaterialized, acornFoxRepoDigest("c"))
+			calls := faultAcornFoxRepoParentSync(store, tc.failures)
+			err := store.Save(context.Background(), next)
+			if !errors.Is(err, tc.wantErr) || (tc.wantErr == nil && err != nil) {
+				t.Fatalf("save error=%v want=%v", err, tc.wantErr)
+			}
+			if *calls != 2 {
+				t.Fatalf("parent sync calls=%d want=2", *calls)
+			}
+			fresh, err := NewTaskAcornFoxRepoStore(root, os.Getuid(), os.Getgid())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer fresh.Close()
+			if got, err := fresh.Resume(context.Background()); err != nil || !sameAcornFoxRepoJournal(got, next) {
+				t.Fatalf("fresh exact next journal=%#v err=%v", got, err)
+			}
+		})
+	}
+}
+
+func TestTaskAcornFoxRepoStoreCreateUnknownLinkRequiresExactPairAndSync(t *testing.T) {
+	root := newAcornFoxRepoTaskRoot(t)
+	store, lock := acquireAcornFoxRepoStore(t, root)
+	defer store.Close()
+	defer lock.Release()
+	original := store.fs.link
+	store.fs.link = func(root *os.Root, oldName, newName string) error {
+		if err := original(root, oldName, newName); err != nil {
+			return err
+		}
+		return errors.New("link-post")
+	}
+	journal := newAcornFoxRepoJournal()
+	if err := store.Create(context.Background(), journal); err != nil {
+		t.Fatalf("exact post-link reconciliation=%v", err)
+	}
+	if got, err := store.Load(context.Background()); err != nil || !sameAcornFoxRepoJournal(got, journal) {
+		t.Fatalf("journal=%#v err=%v", got, err)
+	}
+}
 
 func TestTaskAcornFoxRepoStoreSaveUnknownReadbackAndPartialFailure(t *testing.T) {
 	root := newAcornFoxRepoTaskRoot(t)

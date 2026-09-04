@@ -79,7 +79,7 @@ func TestAcornFoxLiveMaterializePreparedSubstrateExactly(t *testing.T) {
 	if err = receipt.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	if receipt.State != "task_live_materialized" || receipt.OwnershipEvidence != "modeled" {
+	if receipt.State != "task_live_materialized" || receipt.OwnershipEvidence != "symbolic" {
 		t.Fatalf("receipt=%#v", receipt)
 	}
 	journal, err := store.Resume(context.Background())

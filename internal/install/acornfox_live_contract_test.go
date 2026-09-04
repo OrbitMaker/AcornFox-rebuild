@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-func TestAcornFoxLiveReceiptIsCanonicalAndModeled(t *testing.T) {
+func TestAcornFoxLiveReceiptIsCanonicalAndSymbolic(t *testing.T) {
 	_, _, published, substrate := newAcornFox03CPublished(t)
 	entries, err := acornFoxLiveExpectedEntries(published)
 	if err != nil {
@@ -34,28 +34,28 @@ func TestAcornFoxLiveReceiptIsCanonicalAndModeled(t *testing.T) {
 		t.Fatal("noncanonical live receipt accepted")
 	}
 	for _, entry := range receipt.Entries {
-		if entry.PhysicalOwnerObservation != "task_root_owner" || entry.RequestedModeledUser.Role != entry.Role || entry.RequestedModeledGroup.Role != entry.Group {
+		if entry.PhysicalOwnerObservation != "task_root_owner" || entry.Role == "" || entry.Group == "" {
 			t.Fatalf("ownership observation=%#v", entry)
 		}
 	}
 	bad := receipt
-	bad.Entries[0].RequestedModeledUser.UID++
+	bad.Entries[0].Role = "not-an-acornfox-role"
 	if bad.Validate() == nil {
-		t.Fatal("host-like modeled-id mutation was accepted")
+		t.Fatal("symbolic ownership mutation was accepted")
 	}
 }
 
-func TestAcornFoxLiveModeledOwnerAndGroupAreIndependent(t *testing.T) {
+func TestAcornFoxLiveSymbolicOwnerAndGroupAreIndependent(t *testing.T) {
 	for _, source := range []SubstrateEntry{{Path: "etc/acornfox/acornfox-edge.env", Kind: SubstrateEntryFile, Mode: 0o640, Role: OwnerRoleRoot, Group: GroupRoleEdge, Size: 1, SHA256: sha256Hex([]byte("x"))}, {Path: "var/lib/acornfox/uploads", Kind: SubstrateEntryDirectory, Mode: 0o750, Role: OwnerRoleServer, Group: GroupRoleServer}} {
 		entry, err := acornFoxLiveEntryFor(source)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if entry.RequestedModeledUser.Role != entry.Role || entry.RequestedModeledGroup.Role != entry.Group {
+		if entry.Role == "" || entry.Group == "" {
 			t.Fatalf("routing=%#v", entry)
 		}
-		if source.Group == GroupRoleEdge && entry.RequestedModeledUser.UID == entry.RequestedModeledGroup.GID {
-			t.Fatal("mixed root:edge reused modeled identity")
+		if source.Group == GroupRoleEdge && (entry.Role != AcornFoxLiveRootRole || entry.Group != AcornFoxLiveEdgeRole) {
+			t.Fatalf("mixed root:edge symbolic plan lost: %#v", entry)
 		}
 	}
 }

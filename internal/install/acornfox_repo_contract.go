@@ -104,6 +104,16 @@ func AcornFoxRepoFinalEvidence(journal AcornFoxRepoJournalV1) (string, error) {
 	return acornFoxRepoEvidence("acornfox-repo-final-v1\x00", journal.BindingSHA256, journal.SubstrateReceiptSHA256, journal.LiveTreeSHA256, journal.OwnershipPlanSHA256, journal.StaticSetSHA256, journal.ActivationSHA256, journal.ActivePointerSHA256, journal.CurrentPointerSHA256), nil
 }
 
+// AcornFoxRepoRecoveredEvidence seals a recovery to the exact failed phase,
+// its prior failure record, and the phase evidence that remained durable.
+func AcornFoxRepoRecoveredEvidence(journal AcornFoxRepoJournalV1, phase AcornFoxRepoPhase, priorFailureDigest string) (string, error) {
+	phaseEvidence := acornFoxRepoPhaseEvidence(journal, phase)
+	if !validSHA(journal.BindingSHA256) || acornFoxRepoRank(phase) < 0 || !validSHA(priorFailureDigest) || !validSHA(phaseEvidence) {
+		return "", errors.New("AcornFox repository recovered evidence input is invalid")
+	}
+	return acornFoxRepoEvidence("acornfox-repo-recovered-v1\x00", journal.BindingSHA256, string(phase), priorFailureDigest, phaseEvidence), nil
+}
+
 func AcornFoxRepoActivationID(bindingSHA256 string) (string, error) {
 	if !validSHA(bindingSHA256) {
 		return "", errors.New("AcornFox repository binding digest is invalid")
@@ -118,6 +128,7 @@ func (j AcornFoxRepoJournalV1) Validate() error {
 	prepared, _ := AcornFoxRepoPreparedEvidence(j.BindingSHA256, j.SubstrateReceiptSHA256)
 	phase := AcornFoxRepoPrepared
 	recovering := false
+	var priorFailureDigest string
 	for index, entry := range j.History {
 		if entry.Revision != int64(index+1) || !validSHA(entry.EvidenceSHA256) {
 			return errors.New("AcornFox repository history entry is invalid")
@@ -139,11 +150,14 @@ func (j AcornFoxRepoJournalV1) Validate() error {
 				return errors.New("AcornFox repository failure history is invalid")
 			}
 			recovering = true
+			priorFailureDigest = entry.EvidenceSHA256
 		case AcornFoxRepoHistoryRecovered:
-			if !recovering || entry.From != phase || entry.To != phase {
+			expected, err := AcornFoxRepoRecoveredEvidence(j, phase, priorFailureDigest)
+			if !recovering || err != nil || entry.From != phase || entry.To != phase || entry.EvidenceSHA256 != expected {
 				return errors.New("AcornFox repository recovery history is invalid")
 			}
 			recovering = false
+			priorFailureDigest = ""
 		default:
 			return errors.New("AcornFox repository history kind is invalid")
 		}

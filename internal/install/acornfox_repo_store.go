@@ -402,8 +402,16 @@ func (s *TaskAcornFoxRepoStore) cleanCreateTemporary(root *os.Root, want []byte)
 			return ErrAcornFoxRepoConflict
 		}
 	}
-	if s.fs.remove(root, acornFoxRepoCreateTemporary) != nil || s.syncDirectory(root, acornFoxRepoInstallDir) != nil {
+	if s.fs.remove(root, acornFoxRepoCreateTemporary) != nil {
 		return ErrAcornFoxRepoConflict
+	}
+	if err := s.syncVerifiedRepoParent(root, func() bool {
+		if _, err := s.fs.lstat(root, acornFoxRepoCreateTemporary); !errors.Is(err, os.ErrNotExist) {
+			return false
+		}
+		return finalErr != nil || s.readExactOwnedBytes(root, acornFoxRepoInstallJournal, want, false)
+	}); err != nil {
+		return err
 	}
 	if finalErr == nil && !s.readExactOwnedBytes(root, acornFoxRepoInstallJournal, want, false) {
 		return ErrAcornFoxRepoConflict
@@ -421,10 +429,13 @@ func (s *TaskAcornFoxRepoStore) cleanSaveTemporary(root *os.Root) error {
 	if err != nil || !safeAcornFoxRepoTemporary(info, s.uid, s.gid) || acornFoxRepoNlink(info) != 1 {
 		return ErrAcornFoxRepoConflict
 	}
-	if s.fs.remove(root, acornFoxRepoSaveTemporary) != nil || s.syncDirectory(root, acornFoxRepoInstallDir) != nil {
+	if s.fs.remove(root, acornFoxRepoSaveTemporary) != nil {
 		return ErrAcornFoxRepoConflict
 	}
-	return nil
+	return s.syncVerifiedRepoParent(root, func() bool {
+		_, err := s.fs.lstat(root, acornFoxRepoSaveTemporary)
+		return errors.Is(err, os.ErrNotExist)
+	})
 }
 
 func (s *TaskAcornFoxRepoStore) removeKnownSingleTemporary(root *os.Root, name string) error {
@@ -435,7 +446,60 @@ func (s *TaskAcornFoxRepoStore) removeKnownSingleTemporary(root *os.Root, name s
 	if err != nil || !safeAcornFoxRepoTemporary(info, s.uid, s.gid) || acornFoxRepoNlink(info) != 1 {
 		return ErrAcornFoxRepoConflict
 	}
-	if s.fs.remove(root, name) != nil || s.syncDirectory(root, acornFoxRepoInstallDir) != nil {
+	if s.fs.remove(root, name) != nil {
+		return ErrAcornFoxRepoConflict
+	}
+	return s.syncVerifiedRepoParent(root, func() bool {
+		_, err := s.fs.lstat(root, name)
+		return errors.Is(err, os.ErrNotExist)
+	})
+}
+
+// syncVerifiedRepoParent gives a completed namespace operation one bounded
+// retry. The verifier must prove the exact post-operation topology before the
+// retry; otherwise a sync failure remains a closed conflict. A second failed
+// fsync is explicitly uncertain rather than silently accepted by readback.
+func (s *TaskAcornFoxRepoStore) syncVerifiedRepoParent(root *os.Root, verify func() bool) error {
+	if s.syncDirectory(root, acornFoxRepoInstallDir) == nil {
+		return nil
+	}
+	if !verify() {
+		return ErrAcornFoxRepoConflict
+	}
+	if s.syncDirectory(root, acornFoxRepoInstallDir) != nil {
+		return ErrAcornFoxRepoRecoveryUnknown
+	}
+	if !verify() {
+		return ErrAcornFoxRepoConflict
+	}
+	return nil
+}
+
+func (s *TaskAcornFoxRepoStore) exactCreateLinkPair(root *os.Root, raw []byte) bool {
+	temporary, temporaryErr := s.fs.lstat(root, acornFoxRepoCreateTemporary)
+	final, finalErr := s.fs.lstat(root, acornFoxRepoInstallJournal)
+	return temporaryErr == nil && finalErr == nil && safeAcornFoxRepoTemporary(temporary, s.uid, s.gid) && safeAcornFoxRepoTemporary(final, s.uid, s.gid) && acornFoxRepoNlink(temporary) == 2 && acornFoxRepoNlink(final) == 2 && os.SameFile(temporary, final) && s.readExactOwnedBytes(root, acornFoxRepoCreateTemporary, raw, true) && s.readExactOwnedBytes(root, acornFoxRepoInstallJournal, raw, true)
+}
+
+func (s *TaskAcornFoxRepoStore) completeCreateLink(root *os.Root, raw []byte, journal AcornFoxRepoJournalV1) error {
+	pair := func() bool { return s.exactCreateLinkPair(root, raw) }
+	if !pair() {
+		return ErrAcornFoxRepoConflict
+	}
+	if err := s.syncVerifiedRepoParent(root, pair); err != nil {
+		return err
+	}
+	if s.fs.remove(root, acornFoxRepoCreateTemporary) != nil {
+		return ErrAcornFoxRepoConflict
+	}
+	final := func() bool {
+		info, err := s.fs.lstat(root, acornFoxRepoInstallJournal)
+		return err == nil && safeAcornFoxRepoFile(info, s.uid, s.gid) && acornFoxRepoNlink(info) == 1 && s.readExact(root, journal)
+	}
+	if err := s.syncVerifiedRepoParent(root, final); err != nil {
+		return err
+	}
+	if !final() {
 		return ErrAcornFoxRepoConflict
 	}
 	return nil
@@ -578,25 +642,11 @@ func (s *TaskAcornFoxRepoStore) Create(ctx context.Context, journal AcornFoxRepo
 	if err = s.writeTemporary(root, acornFoxRepoCreateTemporary, raw); err != nil {
 		return ErrAcornFoxRepoConflict
 	}
-	if err = s.fs.link(root, acornFoxRepoCreateTemporary, acornFoxRepoInstallJournal); err != nil {
-		if s.readExact(root, journal) && s.removeKnownSingleTemporary(root, acornFoxRepoCreateTemporary) == nil {
-			return nil
-		}
+	linkErr := s.fs.link(root, acornFoxRepoCreateTemporary, acornFoxRepoInstallJournal)
+	if linkErr != nil && !s.exactCreateLinkPair(root, raw) {
 		return ErrAcornFoxRepoConflict
 	}
-	if err = s.syncDirectory(root, acornFoxRepoInstallDir); err != nil {
-		if s.readExact(root, journal) {
-			return nil
-		}
-		return ErrAcornFoxRepoConflict
-	}
-	if err = s.cleanCreateTemporary(root, raw); err != nil {
-		return ErrAcornFoxRepoConflict
-	}
-	if !s.readExact(root, journal) {
-		return ErrAcornFoxRepoConflict
-	}
-	return nil
+	return s.completeCreateLink(root, raw, journal)
 }
 func acornFoxRepoInitialJournal(j AcornFoxRepoJournalV1) bool {
 	return j.Validate() == nil && j.Revision == 1 && j.Phase == AcornFoxRepoPrepared && !j.NeedsRecovery && j.Failure == nil && len(j.History) == 1 && j.LiveTreeSHA256 == "" && j.OwnershipPlanSHA256 == "" && j.StaticSetSHA256 == "" && j.ActivationSHA256 == "" && j.ActivePointerSHA256 == "" && j.CurrentPointerSHA256 == ""
@@ -629,20 +679,16 @@ func (s *TaskAcornFoxRepoStore) Save(ctx context.Context, next AcornFoxRepoJourn
 	if confirmErr != nil || !sameAcornFoxRepoJournal(confirmed, old) || !bytes.Equal(confirmedRaw, oldRaw) || !os.SameFile(confirmedInfo, oldInfo) {
 		return ErrAcornFoxRepoConflict
 	}
-	if err = s.fs.rename(root, acornFoxRepoSaveTemporary, acornFoxRepoInstallJournal); err != nil {
-		if s.readExact(root, next) {
-			return nil
-		}
+	renameErr := s.fs.rename(root, acornFoxRepoSaveTemporary, acornFoxRepoInstallJournal)
+	exactNext := func() bool { return s.readExact(root, next) }
+	if renameErr != nil && !exactNext() {
 		return ErrAcornFoxRepoConflict
 	}
-	if err = s.syncDirectory(root, acornFoxRepoInstallDir); err != nil {
-		if s.readExact(root, next) {
-			return nil
-		}
+	if renameErr == nil && !exactNext() {
 		return ErrAcornFoxRepoConflict
 	}
-	if !s.readExact(root, next) {
-		return ErrAcornFoxRepoConflict
+	if err = s.syncVerifiedRepoParent(root, exactNext); err != nil {
+		return err
 	}
 	return nil
 }

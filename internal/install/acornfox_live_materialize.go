@@ -207,7 +207,7 @@ func acornFoxLiveMakeReceipt(journal AcornFoxRepoJournalV1, substrate *Published
 	if err != nil {
 		return AcornFoxLiveReceiptV1{}, err
 	}
-	return AcornFoxLiveReceiptV1{SchemaVersion: AcornFoxLiveReceiptV1Schema, State: "task_live_materialized", BindingSHA256: journal.BindingSHA256, SubstrateReceiptSHA256: journal.SubstrateReceiptSHA256, ReleaseID: substrate.receipt.CandidateReceipt.ReleaseID, LiveTreeSHA256: tree, OwnershipPlanSHA256: plan, StaticSetSHA256: static, OwnershipEvidence: "modeled", Entries: entries}, nil
+	return AcornFoxLiveReceiptV1{SchemaVersion: AcornFoxLiveReceiptV1Schema, State: "task_live_materialized", BindingSHA256: journal.BindingSHA256, SubstrateReceiptSHA256: journal.SubstrateReceiptSHA256, ReleaseID: substrate.receipt.CandidateReceipt.ReleaseID, LiveTreeSHA256: tree, OwnershipPlanSHA256: plan, StaticSetSHA256: static, OwnershipEvidence: "symbolic", Entries: entries}, nil
 }
 
 func acornFoxLiveReadSource(root *os.Root, substrate *PublishedAcornFoxSubstrateV1, entry SubstrateEntry) ([]byte, error) {
@@ -641,7 +641,10 @@ func acornFoxLiveRecoveredJournal(old AcornFoxRepoJournalV1, receipt AcornFoxLiv
 	next := old
 	next.Revision++
 	next.NeedsRecovery, next.Failure = false, nil
-	evidence := acornFoxRepoEvidence("acornfox-live-disk-reconciled-v1\x00", old.BindingSHA256, old.SubstrateReceiptSHA256, string(old.Phase), receipt.LiveTreeSHA256, receipt.OwnershipPlanSHA256, receipt.StaticSetSHA256)
+	evidence := ""
+	if old.Failure != nil {
+		evidence, _ = AcornFoxRepoRecoveredEvidence(old, old.Phase, old.Failure.Digest)
+	}
 	next.History = append(next.History, AcornFoxRepoHistoryV1{Revision: next.Revision, Kind: AcornFoxRepoHistoryRecovered, From: old.Phase, To: old.Phase, EvidenceSHA256: evidence})
 	return next
 }

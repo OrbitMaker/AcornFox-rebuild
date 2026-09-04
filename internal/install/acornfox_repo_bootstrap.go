@@ -365,7 +365,11 @@ func acornFoxRepoRecovered(o AcornFoxRepoJournalV1, d string) AcornFoxRepoJourna
 	n.Revision++
 	n.NeedsRecovery = false
 	n.Failure = nil
-	n.History = append(n.History, AcornFoxRepoHistoryV1{n.Revision, AcornFoxRepoHistoryRecovered, o.Phase, o.Phase, acornFoxRepoEvidence("acornfox-repo-bootstrap-recovered-v1\x00", o.BindingSHA256, string(o.Phase), d)})
+	evidence := ""
+	if o.Failure != nil {
+		evidence, _ = AcornFoxRepoRecoveredEvidence(o, o.Phase, o.Failure.Digest)
+	}
+	n.History = append(n.History, AcornFoxRepoHistoryV1{n.Revision, AcornFoxRepoHistoryRecovered, o.Phase, o.Phase, evidence})
 	return n
 }
 
