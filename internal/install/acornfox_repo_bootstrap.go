@@ -397,25 +397,14 @@ func acornFoxRepoPrefix(root *os.Root, s *TaskAcornFoxRepoStore, j AcornFoxRepoJ
 	return state >= min && state <= max
 }
 func acornFoxRepoPrefixBounds(phase AcornFoxRepoPhase, recovery bool) (acornFoxRepoPrefixState, acornFoxRepoPrefixState) {
-	if recovery {
-		switch phase {
-		case AcornFoxRepoStaticVerified:
-			return acornFoxRepoPrefixStatic, acornFoxRepoPrefixRelease
-		case AcornFoxRepoActivationWritten:
-			return acornFoxRepoPrefixRelease, acornFoxRepoPrefixActive
-		case AcornFoxRepoActivePublished:
-			return acornFoxRepoPrefixActive, acornFoxRepoPrefixCurrent
-		default:
-			return acornFoxRepoPrefixCurrent, acornFoxRepoPrefixCurrent
-		}
-	}
+	_ = recovery // Clean and failed journals admit the same exact next boundary.
 	switch phase {
 	case AcornFoxRepoStaticVerified:
-		return acornFoxRepoPrefixStatic, acornFoxRepoPrefixStatic
+		return acornFoxRepoPrefixStatic, acornFoxRepoPrefixRelease
 	case AcornFoxRepoActivationWritten:
-		return acornFoxRepoPrefixRelease, acornFoxRepoPrefixRelease
+		return acornFoxRepoPrefixRelease, acornFoxRepoPrefixActive
 	case AcornFoxRepoActivePublished:
-		return acornFoxRepoPrefixActive, acornFoxRepoPrefixActive
+		return acornFoxRepoPrefixActive, acornFoxRepoPrefixCurrent
 	default:
 		return acornFoxRepoPrefixCurrent, acornFoxRepoPrefixCurrent
 	}
@@ -497,19 +486,22 @@ func acornFoxRepoExactInventory(root *os.Root, s *TaskAcornFoxRepoStore, entries
 	if state == acornFoxRepoPrefixReleaseTemp {
 		want["opt/acornfox/activations/"+a.ActivationID+"/"+filepath.Base(acornFoxRepoTemp(a.TransactionID, acornFoxRepoReleasePath(a.ActivationID)))] = expectedNode{pointerTarget: "../../releases/" + a.ReleaseID, allowTwo: true}
 	}
-	if state >= acornFoxRepoPrefixRelease || state == acornFoxRepoPrefixReleaseTemp {
+	_, releaseExists := root.Lstat(acornFoxRepoReleasePath(a.ActivationID))
+	if state >= acornFoxRepoPrefixRelease || (state == acornFoxRepoPrefixReleaseTemp && releaseExists == nil) {
 		want["opt/acornfox/activations/"+a.ActivationID+"/release"] = expectedNode{pointerTarget: "../../releases/" + a.ReleaseID, allowTwo: state == acornFoxRepoPrefixReleaseTemp}
 	}
 	if state == acornFoxRepoPrefixActiveTemp {
 		want["opt/acornfox/"+filepath.Base(acornFoxRepoTemp(a.TransactionID, acornFoxRepoActivePath()))] = expectedNode{pointerTarget: "activations/" + a.ActivationID, allowTwo: true}
 	}
-	if state >= acornFoxRepoPrefixActive || state == acornFoxRepoPrefixActiveTemp {
+	_, activeExists := root.Lstat(acornFoxRepoActivePath())
+	if state >= acornFoxRepoPrefixActive || (state == acornFoxRepoPrefixActiveTemp && activeExists == nil) {
 		want["opt/acornfox/active"] = expectedNode{pointerTarget: "activations/" + a.ActivationID, allowTwo: state == acornFoxRepoPrefixActiveTemp}
 	}
 	if state == acornFoxRepoPrefixCurrentTemp {
 		want["opt/acornfox/"+filepath.Base(acornFoxRepoTemp(a.TransactionID, acornFoxRepoCurrentPath()))] = expectedNode{pointerTarget: "active/release", allowTwo: true}
 	}
-	if state >= acornFoxRepoPrefixCurrent || state == acornFoxRepoPrefixCurrentTemp {
+	_, currentExists := root.Lstat(acornFoxRepoCurrentPath())
+	if state >= acornFoxRepoPrefixCurrent || (state == acornFoxRepoPrefixCurrentTemp && currentExists == nil) {
 		want["opt/acornfox/current"] = expectedNode{pointerTarget: "active/release", allowTwo: state == acornFoxRepoPrefixCurrentTemp}
 	}
 	var walk func(string) bool
@@ -571,7 +563,8 @@ func acornFoxRepoVerifyLeaseInventory(root *os.Root, s *TaskAcornFoxRepoStore, j
 		return false
 	}
 	state, ok := acornFoxRepoClassifyPrefix(root, s, a, raw)
-	return ok && acornFoxRepoExactInventory(root, s, entries, a, raw, state)
+	min, max := acornFoxRepoPrefixBounds(j.Phase, j.NeedsRecovery)
+	return ok && state >= min && state <= max && acornFoxRepoExactInventory(root, s, entries, a, raw, state)
 }
 func acornFoxRepoVerifyPinnedLive(root *os.Root, s *TaskAcornFoxRepoStore, entries []SubstrateEntry, r AcornFoxLiveReceiptV1) bool {
 	for _, e := range entries {

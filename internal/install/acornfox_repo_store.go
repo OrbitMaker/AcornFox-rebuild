@@ -277,7 +277,7 @@ func (s *TaskAcornFoxRepoStore) mintLiveVerifiedLease(ctx context.Context, subst
 	// Keep the original sealed full-tree verifier at the 04B handoff. Later
 	// phases retain the same entry set but also contain the closed 04C pointer
 	// suffix, which is checked by the repository verifier below.
-	if err != nil || (prepared.journal.Phase == AcornFoxRepoStaticVerified && !prepared.journal.NeedsRecovery && acornFoxLiveVerifyTarget(root, s, entries, receipt) != nil) || ((prepared.journal.Phase != AcornFoxRepoStaticVerified || prepared.journal.NeedsRecovery) && !acornFoxRepoVerifyPinnedLive(root, s, entries, receipt)) || (!prepared.journal.NeedsRecovery && prepared.journal.Phase != AcornFoxRepoStaticVerified && !acornFoxRepoVerifyLeaseInventory(root, s, prepared.journal, receipt, substrate)) {
+	if err != nil || (prepared.journal.Phase == AcornFoxRepoStaticVerified && !prepared.journal.NeedsRecovery && acornFoxLiveVerifyTarget(root, s, entries, receipt) != nil && !acornFoxRepoVerifyLeaseInventory(root, s, prepared.journal, receipt, substrate)) || ((prepared.journal.Phase != AcornFoxRepoStaticVerified || prepared.journal.NeedsRecovery) && !acornFoxRepoVerifyPinnedLive(root, s, entries, receipt)) || (!prepared.journal.NeedsRecovery && prepared.journal.Phase != AcornFoxRepoStaticVerified && !acornFoxRepoVerifyLeaseInventory(root, s, prepared.journal, receipt, substrate)) {
 		return fail()
 	}
 	return &acornFoxLiveVerifiedLease{prepared: prepared, receipt: receipt}, nil

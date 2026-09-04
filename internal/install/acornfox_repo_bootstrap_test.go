@@ -326,3 +326,71 @@ func TestAcornFoxRepoBootstrapRejectsFinalPointerHardlink(t *testing.T) {
 		t.Fatalf("hardlink changed: %#v %v", info, err)
 	}
 }
+
+func TestAcornFoxRepoBootstrapCleanJournalAcceptsExactNextPrefixes(t *testing.T) {
+	for _, state := range []acornFoxRepoPrefixState{acornFoxRepoPrefixActivations, acornFoxRepoPrefixActivationDir, acornFoxRepoPrefixActivationJSON, acornFoxRepoPrefixRelease} {
+		t.Run("prefix-"+string(rune('0'+state)), func(t *testing.T) {
+			root, store, published, receipt := acornFoxRepoBootstrapFixture(t)
+			journal, err := store.Resume(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			a, raw, err := acornFoxRepoActivation(journal, mustAcornFoxLiveReceipt(t, root), published)
+			if err != nil {
+				t.Fatal(err)
+			}
+			handle, err := store.openRoot()
+			if err != nil {
+				t.Fatal(err)
+			}
+			mark := func() {}
+			if state >= acornFoxRepoPrefixActivations {
+				if err = acornFoxRepoDir(handle, store, acornFoxLiveDir+"/opt/acornfox/activations", mark); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if state >= acornFoxRepoPrefixActivationDir {
+				if err = acornFoxRepoDir(handle, store, acornFoxRepoActivationDir(a.ActivationID), mark); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if state >= acornFoxRepoPrefixActivationJSON {
+				if err = acornFoxLiveWriteFile(handle, store, journal.TransactionID, acornFoxRepoActivationPath(a.ActivationID), raw, durableFileMode, mark); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if state >= acornFoxRepoPrefixRelease {
+				if err = acornFoxRepoEnsurePointer(handle, store, journal.TransactionID, acornFoxRepoReleasePath(a.ActivationID), "../../releases/"+a.ReleaseID, mark); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err = handle.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err = store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			fresh, err := NewTaskAcornFoxRepoStore(root, os.Getuid(), os.Getgid())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer fresh.Close()
+			if err = prepareAcornFoxRepository(context.Background(), fresh, published, receipt.CandidateReceipt.BindingSHA256); err != nil {
+				t.Fatalf("state=%d err=%v", state, err)
+			}
+		})
+	}
+}
+
+func mustAcornFoxLiveReceipt(t *testing.T, root string) AcornFoxLiveReceiptV1 {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(root, acornFoxLiveReceipt))
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := ParseAcornFoxLiveReceiptV1(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return receipt
+}
