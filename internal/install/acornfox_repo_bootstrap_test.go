@@ -87,3 +87,49 @@ func TestAcornFoxRepoBootstrapPreservesForeignPointer(t *testing.T) {
 		t.Fatalf("got=%q err=%v", got, e)
 	}
 }
+
+func TestAcornFoxRepoBootstrapRecoversLinkedPointerTemporary(t *testing.T) {
+	root, store, published, receipt := acornFoxRepoBootstrapFixture(t)
+	old := acornFoxRepoBootstrapFaultStep
+	acornFoxRepoBootstrapFaultStep = func(step string) error {
+		if step == "pointer-post-link" {
+			return errors.New("fault")
+		}
+		return nil
+	}
+	err := prepareAcornFoxRepository(context.Background(), store, published, receipt.CandidateReceipt.BindingSHA256)
+	acornFoxRepoBootstrapFaultStep = old
+	if !errors.Is(err, ErrAcornFoxRepoBootstrapConflict) {
+		t.Fatalf("fault=%v", err)
+	}
+	fresh, err := NewTaskAcornFoxRepoStore(root, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fresh.Close()
+	if err = prepareAcornFoxRepository(context.Background(), fresh, published, receipt.CandidateReceipt.BindingSHA256); err != nil {
+		t.Fatalf("recover=%v", err)
+	}
+}
+
+func TestAcornFoxRepoBootstrapRejectsExtraFinalActivation(t *testing.T) {
+	root, store, published, receipt := acornFoxRepoBootstrapFixture(t)
+	if err := prepareAcornFoxRepository(context.Background(), store, published, receipt.CandidateReceipt.BindingSHA256); err != nil {
+		t.Fatal(err)
+	}
+	extra := filepath.Join(root, acornFoxLiveDir, "opt", "acornfox", "activations", "foreign")
+	if err := os.Mkdir(extra, durableDirMode); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := NewTaskAcornFoxRepoStore(root, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fresh.Close()
+	if err = prepareAcornFoxRepository(context.Background(), fresh, published, receipt.CandidateReceipt.BindingSHA256); !errors.Is(err, ErrAcornFoxRepoConflict) {
+		t.Fatalf("extra=%v", err)
+	}
+	if _, err := os.Lstat(extra); err != nil {
+		t.Fatalf("extra overwritten=%v", err)
+	}
+}

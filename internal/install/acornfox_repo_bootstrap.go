@@ -10,7 +10,10 @@ import (
 	"syscall"
 )
 
-var ErrAcornFoxRepoBootstrapConflict = errors.New("AcornFox repository preparation conflicts with task state")
+var (
+	ErrAcornFoxRepoBootstrapConflict = errors.New("AcornFox repository preparation conflicts with task state")
+	ErrAcornFoxRepoRecoveryUnknown   = errors.New("AcornFox repository preparation recovery is unknown")
+)
 
 const AcornFoxRepoActivationV1Schema = 1
 
@@ -83,9 +86,19 @@ func prepareAcornFoxRepository(ctx context.Context, store *TaskAcornFoxRepoStore
 			failed := acornFoxRepoFailure(l.journal, digest)
 			if l.store.Save(context.Background(), failed) == nil {
 				l.journal = failed
+				return
 			}
+			observed, loadErr := l.store.Resume(context.Background())
+			if loadErr == nil && sameAcornFoxRepoJournal(observed, failed) {
+				l.journal = observed
+				return
+			}
+			err = ErrAcornFoxRepoRecoveryUnknown
 		}
 	}()
+	if err = acornFoxRepoRecoverPointerTemps(root, l.store, l.journal.TransactionID, a, mark); err != nil {
+		return ErrAcornFoxRepoBootstrapConflict
+	}
 	if l.journal.NeedsRecovery {
 		if !acornFoxRepoPrefix(root, l.store, l.journal, lease.receipt, l.substrate, a, raw) {
 			return ErrAcornFoxRepoBootstrapConflict
@@ -211,29 +224,43 @@ func acornFoxRepoPointer(root *os.Root, s *TaskAcornFoxRepoStore, p, target stri
 	return e == nil && got == target
 }
 func acornFoxRepoEnsurePointer(root *os.Root, s *TaskAcornFoxRepoStore, tx, p, target string, mark func()) error {
-	if _, e := root.Lstat(p); e == nil {
-		if acornFoxRepoPointer(root, s, p, target, false) {
-			return nil
-		}
-		return ErrAcornFoxRepoBootstrapConflict
-	} else if !errors.Is(e, os.ErrNotExist) {
-		return e
-	}
 	tmp := acornFoxRepoTemp(tx, p)
 	if info, e := root.Lstat(tmp); e == nil {
 		if !acornFoxRepoPointer(root, s, tmp, target, true) {
 			return ErrAcornFoxRepoBootstrapConflict
 		}
 		if acornFoxRepoNlink(info) == 2 {
+			final, finalErr := root.Lstat(p)
+			if finalErr != nil || !os.SameFile(info, final) || !acornFoxRepoPointer(root, s, p, target, true) {
+				return ErrAcornFoxRepoBootstrapConflict
+			}
+			if acornFoxRepoBootstrapStep("pointer-temp-remove") != nil || root.Remove(tmp) != nil {
+				return ErrAcornFoxRepoBootstrapConflict
+			}
+			mark()
+			if acornFoxRepoBootstrapStep("pointer-post-remove-sync") != nil || acornFoxLiveSyncDir(root, parentDirectory(p)) != nil || !acornFoxRepoPointer(root, s, p, target, false) {
+				return ErrAcornFoxRepoBootstrapConflict
+			}
+			return nil
+		}
+		if acornFoxRepoNlink(info) != 1 {
 			return ErrAcornFoxRepoBootstrapConflict
 		}
-		if root.Remove(tmp) != nil {
+		if acornFoxRepoBootstrapStep("pointer-temp-remove") != nil || root.Remove(tmp) != nil {
 			return ErrAcornFoxRepoBootstrapConflict
 		}
 		mark()
-		if acornFoxLiveSyncDir(root, parentDirectory(p)) != nil {
+		if acornFoxRepoBootstrapStep("pointer-post-remove-sync") != nil || acornFoxLiveSyncDir(root, parentDirectory(p)) != nil {
 			return ErrAcornFoxRepoBootstrapConflict
 		}
+	} else if !errors.Is(e, os.ErrNotExist) {
+		return e
+	}
+	if _, e := root.Lstat(p); e == nil {
+		if acornFoxRepoPointer(root, s, p, target, false) {
+			return nil
+		}
+		return ErrAcornFoxRepoBootstrapConflict
 	} else if !errors.Is(e, os.ErrNotExist) {
 		return e
 	}
@@ -251,18 +278,52 @@ func acornFoxRepoEnsurePointer(root *os.Root, s *TaskAcornFoxRepoStore, tx, p, t
 		return e
 	}
 	mark()
-	if acornFoxLiveSyncDir(root, parentDirectory(p)) != nil || !acornFoxRepoPointer(root, s, p, target, true) {
+	if acornFoxRepoBootstrapStep("pointer-post-link") != nil || acornFoxRepoBootstrapStep("pointer-parent-sync") != nil || acornFoxLiveSyncDir(root, parentDirectory(p)) != nil || !acornFoxRepoPointer(root, s, p, target, true) {
 		return ErrAcornFoxRepoBootstrapConflict
 	}
 	if acornFoxRepoBootstrapStep("pointer-readback") != nil {
 		return ErrAcornFoxRepoBootstrapConflict
 	}
-	if e := root.Remove(tmp); e != nil {
-		return e
+	if acornFoxRepoBootstrapStep("pointer-temp-remove") != nil || root.Remove(tmp) != nil {
+		return ErrAcornFoxRepoBootstrapConflict
 	}
 	mark()
-	if acornFoxLiveSyncDir(root, parentDirectory(p)) != nil || !acornFoxRepoPointer(root, s, p, target, false) {
+	if acornFoxRepoBootstrapStep("pointer-post-remove-sync") != nil || acornFoxLiveSyncDir(root, parentDirectory(p)) != nil || !acornFoxRepoPointer(root, s, p, target, false) {
 		return ErrAcornFoxRepoBootstrapConflict
+	}
+	return nil
+}
+
+// Recover only an authenticated no-replace symlink temporary. Any other
+// topology remains on disk for diagnosis and blocks progress.
+func acornFoxRepoRecoverPointerTemps(root *os.Root, s *TaskAcornFoxRepoStore, tx string, a AcornFoxRepoActivationV1, mark func()) error {
+	for _, v := range []struct{ path, target string }{{acornFoxRepoReleasePath(a.ActivationID), "../../releases/" + a.ReleaseID}, {acornFoxRepoActivePath(), "activations/" + a.ActivationID}, {acornFoxRepoCurrentPath(), "active/release"}} {
+		tmp := acornFoxRepoTemp(tx, v.path)
+		info, err := root.Lstat(tmp)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil || !acornFoxRepoPointer(root, s, tmp, v.target, true) {
+			return ErrAcornFoxRepoBootstrapConflict
+		}
+		if acornFoxRepoNlink(info) == 2 {
+			final, finalErr := root.Lstat(v.path)
+			if finalErr != nil || !os.SameFile(info, final) || !acornFoxRepoPointer(root, s, v.path, v.target, true) {
+				return ErrAcornFoxRepoBootstrapConflict
+			}
+		} else if acornFoxRepoNlink(info) != 1 {
+			return ErrAcornFoxRepoBootstrapConflict
+		}
+		if acornFoxRepoBootstrapStep("pointer-temp-remove") != nil || root.Remove(tmp) != nil {
+			return ErrAcornFoxRepoBootstrapConflict
+		}
+		mark()
+		if acornFoxRepoBootstrapStep("pointer-post-remove-sync") != nil || acornFoxLiveSyncDir(root, parentDirectory(v.path)) != nil {
+			return ErrAcornFoxRepoBootstrapConflict
+		}
+		if _, finalErr := root.Lstat(v.path); finalErr == nil && !acornFoxRepoPointer(root, s, v.path, v.target, false) {
+			return ErrAcornFoxRepoBootstrapConflict
+		}
 	}
 	return nil
 }
@@ -324,11 +385,83 @@ func acornFoxRepoPrefix(root *os.Root, s *TaskAcornFoxRepoStore, j AcornFoxRepoJ
 		}
 		stage = AcornFoxRepoCurrentPublished
 	}
+	if !acornFoxRepoExactInventory(root, s, entries, r, a, raw, stage) {
+		return false
+	}
 	minimum := acornFoxRepoRank(j.Phase)
 	if j.Phase == AcornFoxRepoPreparedFinal {
 		minimum = acornFoxRepoRank(AcornFoxRepoCurrentPublished)
 	}
 	return acornFoxRepoRank(stage) >= minimum && (j.Phase == AcornFoxRepoPreparedFinal || acornFoxRepoRank(stage) <= acornFoxRepoRank(j.Phase)+1)
+}
+func acornFoxRepoExactInventory(root *os.Root, s *TaskAcornFoxRepoStore, entries []SubstrateEntry, r AcornFoxLiveReceiptV1, a AcornFoxRepoActivationV1, raw []byte, phase AcornFoxRepoPhase) bool {
+	want := map[string]bool{"receipt.json": true}
+	for _, entry := range entries {
+		want[entry.Path] = true
+	}
+	if acornFoxRepoRank(phase) >= acornFoxRepoRank(AcornFoxRepoActivationWritten) {
+		want["opt/acornfox/activations"] = true
+		want["opt/acornfox/activations/"+a.ActivationID] = true
+		want["opt/acornfox/activations/"+a.ActivationID+"/repo-activation.json"] = true
+		want["opt/acornfox/activations/"+a.ActivationID+"/release"] = true
+	}
+	if acornFoxRepoRank(phase) >= acornFoxRepoRank(AcornFoxRepoActivePublished) {
+		want["opt/acornfox/active"] = true
+	}
+	if acornFoxRepoRank(phase) >= acornFoxRepoRank(AcornFoxRepoCurrentPublished) {
+		want["opt/acornfox/current"] = true
+	}
+	var walk func(string) bool
+	walk = func(dir string) bool {
+		f, err := root.OpenFile(dir, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+		if err != nil {
+			return false
+		}
+		children, readErr := f.ReadDir(-1)
+		closeErr := f.Close()
+		if readErr != nil || closeErr != nil {
+			return false
+		}
+		for _, child := range children {
+			path := filepath.ToSlash(filepath.Join(dir, child.Name()))
+			relative := path[len(acornFoxLiveDir)+1:]
+			if !want[relative] {
+				return false
+			}
+			info, statErr := root.Lstat(path)
+			if statErr != nil {
+				return false
+			}
+			if info.Mode()&os.ModeSymlink != 0 {
+				continue
+			}
+			if !info.IsDir() {
+				continue
+			}
+			if !walk(path) {
+				return false
+			}
+		}
+		return true
+	}
+	if !walk(acornFoxLiveDir) {
+		return false
+	}
+	if acornFoxRepoRank(phase) >= acornFoxRepoRank(AcornFoxRepoActivationWritten) && !acornFoxLiveExactFile(root, s, acornFoxRepoActivationPath(a.ActivationID), raw, durableFileMode, false) {
+		return false
+	}
+	return true
+}
+func acornFoxRepoVerifyLeaseInventory(root *os.Root, s *TaskAcornFoxRepoStore, j AcornFoxRepoJournalV1, r AcornFoxLiveReceiptV1, sub *PublishedAcornFoxSubstrateV1) bool {
+	a, raw, err := acornFoxRepoActivation(j, r, sub)
+	if err != nil {
+		return false
+	}
+	entries, err := acornFoxLiveExpectedEntries(sub)
+	if err != nil || !acornFoxRepoVerifyPinnedLive(root, s, entries, r) {
+		return false
+	}
+	return acornFoxRepoExactInventory(root, s, entries, r, a, raw, j.Phase)
 }
 func acornFoxRepoVerifyPinnedLive(root *os.Root, s *TaskAcornFoxRepoStore, entries []SubstrateEntry, r AcornFoxLiveReceiptV1) bool {
 	for _, e := range entries {
