@@ -46,6 +46,24 @@ func TestBuildGoBinariesV1BuildsAndClosesSyntheticStage(t *testing.T) {
 	if err != nil || again.Files[0].Path == "changed" {
 		t.Fatal("receipt leaked mutable files")
 	}
+	upgrade := plan.Targets()[8]
+	upgradePath := filepath.Join(stage.root, filepath.FromSlash(upgrade.Output))
+	wrong := upgrade
+	wrong.Ldflags = append([]string(nil), upgrade.Ldflags...)
+	wrong.Ldflags[1] = "-X=main.processIdentity=not-acornfox"
+	if _, err := inspectOneBinary(upgradePath, wrong, plan); err == nil {
+		t.Fatal("raw acornfox bytes substituted for exact linker symbol")
+	}
+	defaultOutput := filepath.Join(taskRoot, "default-build")
+	if _, err := plan.goExecutable.Run(context.Background(), []string{"build", "-o", defaultOutput, upgrade.Package}, root, plan.Environment()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := inspectOneBinary(defaultOutput, upgrade, plan); err == nil {
+		t.Fatal("default build ID or missing linker flags accepted")
+	}
+	if err := os.Remove(defaultOutput); err != nil {
+		t.Fatal(err)
+	}
 	stagePath := stagePath(stage)
 	if err := stage.Close(); err != nil {
 		t.Fatal(err)
@@ -173,6 +191,41 @@ func TestBuildGoBinariesV1CleansFailureAndProtectsReplacement(t *testing.T) {
 	}
 	if _, err := os.Stat(foreign); err != nil {
 		t.Fatalf("foreign replacement removed: %v", err)
+	}
+}
+
+func TestPinnedBinaryRejectsOversizeAndReplacement(t *testing.T) {
+	root := buildTaskRoot(t)
+	oversize := filepath.Join(root, "oversize")
+	file, err := os.OpenFile(oversize, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o755)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Truncate(maxGoBinaryOutputBytes + 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := openPinnedBinary(oversize, false); err == nil {
+		t.Fatal("oversized binary accepted")
+	}
+	path := filepath.Join(root, "replacement")
+	if err := os.WriteFile(path, []byte("first"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	binary, err := openPinnedBinary(path, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("second"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := binary.Close(); err == nil {
+		t.Fatal("replacement accepted after descriptor inspection")
 	}
 }
 

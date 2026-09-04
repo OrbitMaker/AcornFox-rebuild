@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"debug/buildinfo"
 	"debug/elf"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -300,12 +301,13 @@ func inspectReceiptTree(stageRoot string, receipt GoBinaryReceiptV1) ([]FileEntr
 	files := make([]FileEntryV1, 0, len(receipt.Files))
 	for _, expected := range receipt.Files {
 		path := filepath.Join(stageRoot, filepath.FromSlash(expected.Path))
-		info, err := os.Lstat(path)
-		if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o755 || linkCount(info) != 1 || info.Size() <= 0 || info.Size() > maxGoBinaryOutputBytes {
+		binary, err := openPinnedBinary(path, false)
+		if err != nil || binary.info.Mode().Perm() != 0o755 {
 			return nil, ErrGoStage
 		}
-		body, err := os.ReadFile(path)
-		if err != nil || sha256Text(body) != expected.SHA256 {
+		digest, digestErr := binary.digest()
+		closeErr := binary.Close()
+		if digestErr != nil || closeErr != nil || digest != expected.SHA256 {
 			return nil, ErrGoStage
 		}
 		files = append(files, FileEntryV1{Path: expected.Path, SHA256: expected.SHA256, Mode: 0o755})
@@ -314,36 +316,43 @@ func inspectReceiptTree(stageRoot string, receipt GoBinaryReceiptV1) ([]FileEntr
 }
 
 func inspectOneBinary(path string, target GoBuildTargetV1, plan GoBuildPlanV1) (FileEntryV1, error) {
-	info, err := os.Lstat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || linkCount(info) != 1 || info.Size() <= 0 || info.Size() > maxGoBinaryOutputBytes {
+	if !targetMatchesPlan(target, plan) {
 		return FileEntryV1{}, ErrGoStage
 	}
-	if err := os.Chmod(path, 0o755); err != nil {
+	binary, err := openPinnedBinary(path, true)
+	if err != nil {
 		return FileEntryV1{}, ErrGoStage
 	}
-	info, err = os.Lstat(path)
-	if err != nil || info.Mode().Perm() != 0o755 {
-		return FileEntryV1{}, ErrGoStage
-	}
-	elfFile, err := elf.Open(path)
+	elfFile, err := elf.NewFile(binary.file)
 	if err != nil || elfFile.Class != elf.ELFCLASS64 || elfFile.Data != elf.ELFDATA2LSB || elfFile.Machine != elf.EM_X86_64 {
 		if elfFile != nil {
-			elfFile.Close()
+			_ = elfFile.Close()
 		}
+		_ = binary.Close()
 		return FileEntryV1{}, ErrGoStage
 	}
-	if err := elfFile.Close(); err != nil {
+	build, err := buildinfo.Read(binary.file)
+	if err != nil || build.Main.Path != plan.module || build.GoVersion != plan.toolchain.GoVersion || !buildSettingsMatch(build, plan, target) || !ldflagsMatchELF(elfFile, binary.file, target.Ldflags) || !emptyGoBuildID(elfFile) {
+		_ = elfFile.Close()
+		_ = binary.Close()
 		return FileEntryV1{}, ErrGoStage
 	}
-	build, err := buildinfo.ReadFile(path)
-	if err != nil || build.Main.Path != plan.module || build.GoVersion != plan.toolchain.GoVersion || !buildSettingsMatch(build, plan, target) {
+	closeELF := elfFile.Close()
+	digest, digestErr := binary.digest()
+	closeBinary := binary.Close()
+	if closeELF != nil || digestErr != nil || closeBinary != nil {
 		return FileEntryV1{}, ErrGoStage
 	}
-	body, err := os.ReadFile(path)
-	if err != nil || !ldflagsPresent(body, target.Ldflags) {
-		return FileEntryV1{}, ErrGoStage
+	return FileEntryV1{Path: target.Output, SHA256: digest, Mode: 0o755}, nil
+}
+
+func targetMatchesPlan(target GoBuildTargetV1, plan GoBuildPlanV1) bool {
+	for _, expected := range plan.Targets() {
+		if target.Name == expected.Name && target.Package == expected.Package && target.Output == expected.Output && sameStrings(target.Ldflags, expected.Ldflags) {
+			return true
+		}
 	}
-	return FileEntryV1{Path: target.Output, SHA256: sha256Text(body), Mode: 0o755}, nil
+	return false
 }
 
 func buildSettingsMatch(build *buildinfo.BuildInfo, plan GoBuildPlanV1, target GoBuildTargetV1) bool {
@@ -354,6 +363,12 @@ func buildSettingsMatch(build *buildinfo.BuildInfo, plan GoBuildPlanV1, target G
 	if settings["GOOS"] != "linux" || settings["GOARCH"] != "amd64" || settings["CGO_ENABLED"] != "0" || settings["-trimpath"] != "true" {
 		return false
 	}
+	// Go 1.25 omits -ldflags from debug/buildinfo entirely. If a toolchain
+	// emits it, it must match exactly; otherwise exact ELF symbol checks below
+	// provide the portable authority for every -X value.
+	if value, present := settings["-ldflags"]; present && value != strings.Join(target.Ldflags, " ") {
+		return false
+	}
 	for _, key := range []string{"vcs.revision", "vcs.modified", "vcs.time"} {
 		if settings[key] != "" {
 			return false
@@ -362,20 +377,130 @@ func buildSettingsMatch(build *buildinfo.BuildInfo, plan GoBuildPlanV1, target G
 	return target.Package != "" && plan.module != ""
 }
 
-func ldflagsPresent(binary []byte, flags []string) bool {
+func ldflagsMatchELF(file *elf.File, descriptor *os.File, flags []string) bool {
 	for _, flag := range flags {
 		if strings.HasPrefix(flag, "-X=main.") {
-			_, value, ok := strings.Cut(flag, "=")
-			if !ok {
-				return false
-			}
-			_, value, ok = strings.Cut(value, "=")
-			if !ok || !strings.Contains(string(binary), value) {
+			field, value, ok := strings.Cut(strings.TrimPrefix(flag, "-X=main."), "=")
+			if !ok || field == "" || !matchGoStringSymbol(file, descriptor, "main."+field, []byte(value)) {
 				return false
 			}
 		}
 	}
 	return true
+}
+
+func matchGoStringSymbol(file *elf.File, descriptor *os.File, name string, expected []byte) bool {
+	symbols, err := file.Symbols()
+	if err != nil {
+		return false
+	}
+	var symbol *elf.Symbol
+	for index := range symbols {
+		if symbols[index].Name == name {
+			if symbol != nil {
+				return false
+			}
+			symbol = &symbols[index]
+		}
+	}
+	if symbol == nil || symbol.Size < 16 {
+		return false
+	}
+	header, err := readELFVirtual(descriptor, file, symbol.Value, 16)
+	if err != nil {
+		return false
+	}
+	pointer, length := binary.LittleEndian.Uint64(header[:8]), binary.LittleEndian.Uint64(header[8:])
+	if length != uint64(len(expected)) || length > 4096 {
+		return false
+	}
+	value, err := readELFVirtual(descriptor, file, pointer, length)
+	return err == nil && string(value) == string(expected)
+}
+
+func readELFVirtual(descriptor *os.File, file *elf.File, address, size uint64) ([]byte, error) {
+	for _, program := range file.Progs {
+		if program.Type != elf.PT_LOAD || address < program.Vaddr || address-program.Vaddr > program.Filesz || size > program.Filesz-(address-program.Vaddr) {
+			continue
+		}
+		if program.Off > uint64(^uint64(0)>>1) || address-program.Vaddr > uint64(^uint64(0)>>1) {
+			return nil, ErrGoStage
+		}
+		out := make([]byte, size)
+		reader := io.NewSectionReader(descriptor, int64(program.Off+address-program.Vaddr), int64(size))
+		if _, err := io.ReadFull(reader, out); err != nil {
+			return nil, ErrGoStage
+		}
+		return out, nil
+	}
+	return nil, ErrGoStage
+}
+
+func emptyGoBuildID(file *elf.File) bool {
+	section := file.Section(".note.go.buildid")
+	return section == nil || section.Size == 0
+}
+
+type pinnedBinary struct {
+	path string
+	file *os.File
+	info os.FileInfo
+}
+
+func openPinnedBinary(path string, normalize bool) (*pinnedBinary, error) {
+	before, err := os.Lstat(path)
+	if err != nil || !before.Mode().IsRegular() || before.Mode()&os.ModeSymlink != 0 || linkCount(before) != 1 || before.Size() <= 0 || before.Size() > maxGoBinaryOutputBytes {
+		return nil, ErrGoStage
+	}
+	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, ErrGoStage
+	}
+	opened, err := file.Stat()
+	if err != nil || !os.SameFile(before, opened) {
+		_ = file.Close()
+		return nil, ErrGoStage
+	}
+	if normalize {
+		if err := file.Chmod(0o755); err != nil {
+			_ = file.Close()
+			return nil, ErrGoStage
+		}
+		if opened, err = file.Stat(); err != nil || opened.Mode().Perm() != 0o755 {
+			_ = file.Close()
+			return nil, ErrGoStage
+		}
+	}
+	after, err := os.Lstat(path)
+	if err != nil || !os.SameFile(before, after) || (normalize && after.Mode().Perm() != 0o755) {
+		_ = file.Close()
+		return nil, ErrGoStage
+	}
+	return &pinnedBinary{path: path, file: file, info: opened}, nil
+}
+
+func (binary *pinnedBinary) digest() (string, error) {
+	if binary == nil || binary.file == nil || binary.info.Size() <= 0 || binary.info.Size() > maxGoBinaryOutputBytes {
+		return "", ErrGoStage
+	}
+	hash := sha256.New()
+	if _, err := io.Copy(hash, io.NewSectionReader(binary.file, 0, binary.info.Size())); err != nil {
+		return "", ErrGoStage
+	}
+	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+func (binary *pinnedBinary) Close() error {
+	if binary == nil || binary.file == nil {
+		return ErrGoStage
+	}
+	closeErr := binary.file.Close()
+	after, statErr := os.Lstat(binary.path)
+	binary.file = nil
+	if closeErr != nil || statErr != nil || !os.SameFile(binary.info, after) {
+		return ErrGoStage
+	}
+	return nil
 }
 
 func canonicalBinaryTree(files []FileEntryV1) ([]byte, error) {
