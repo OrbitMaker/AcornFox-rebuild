@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,8 +21,15 @@ func localCommand(ctx context.Context, name string, args []string, dir string, e
 	c.Dir = dir
 	path := os.Getenv("PATH")
 	lang := os.Getenv("LANG")
-	c.Env = append([]string{"PATH=" + path, "LANG=" + lang, "GIT_CONFIG_NOSYSTEM=1", "GIT_TERMINAL_PROMPT=0"}, env...)
-	return c.Output()
+	c.Env = append([]string{"PATH=" + path, "LANG=" + lang, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0"}, env...)
+	var output cappedBuffer
+	output.limit = maxGoListBytes
+	c.Stdout = &output
+	c.Stderr = io.Discard
+	if err := c.Run(); err != nil || output.exceeded {
+		return nil, ErrGitSource
+	}
+	return output.Bytes(), nil
 }
 
 // VerifyGitSourceV1 runs local read-only Git inspection only. A configured
@@ -31,7 +39,8 @@ func VerifyGitSourceV1(ctx context.Context, root string, witness Witness, policy
 }
 func verifyGitSource(ctx context.Context, root string, witness Witness, policy SourcePolicyV1, run commandRunner) error {
 	canonical, canonicalErr := CanonicalSourcePolicyV1(policy)
-	if ctx == nil || ctx.Err() != nil || !witness.Valid() || canonicalErr != nil || sha256Text(canonical) != witness.decision.SourcePolicySHA256 || policy.ModulePath != modulePathForRepository(witness.decision.SourceRepository) {
+	root, rootErr := cleanGitRoot(root)
+	if ctx == nil || ctx.Err() != nil || run == nil || rootErr != nil || !witness.Valid() || canonicalErr != nil || sha256Text(canonical) != witness.decision.SourcePolicySHA256 || policy.ModulePath != modulePathForRepository(witness.decision.SourceRepository) {
 		return ErrGitSource
 	}
 	call := func(args ...string) (string, error) {
@@ -39,7 +48,8 @@ func verifyGitSource(ctx context.Context, root string, witness Witness, policy S
 		return strings.TrimSpace(string(raw)), e
 	}
 	top, e := call("rev-parse", "--show-toplevel")
-	if e != nil || filepath.Clean(top) != filepath.Clean(root) {
+	top, topErr := cleanGitRoot(top)
+	if e != nil || topErr != nil || top != root {
 		return ErrGitSource
 	}
 	commit, e := call("rev-parse", "HEAD^{commit}")
@@ -57,25 +67,50 @@ func verifyGitSource(ctx context.Context, root string, witness Witness, policy S
 	if e != nil || remotes != "origin" {
 		return ErrGitSource
 	}
-	origin, e := call("remote", "get-url", "origin")
-	if e != nil || (origin != witness.decision.SourceRepository && origin != witness.decision.SourceRepository+".git") {
+	origin, e := call("remote", "get-url", "--all", "origin")
+	if e != nil || !onlyExpectedRemoteURL(origin, witness.decision.SourceRepository) {
+		return ErrGitSource
+	}
+	pushOrigin, e := call("remote", "get-url", "--push", "--all", "origin")
+	if e != nil || !onlyExpectedRemoteURL(pushOrigin, witness.decision.SourceRepository) {
 		return ErrGitSource
 	}
 	raw, e := run(ctx, "git", []string{"ls-files", "-z", "--stage"}, root, []string{"GIT_TERMINAL_PROMPT=0"})
 	if e != nil {
 		return ErrGitSource
 	}
-	if !gitIndexMatches(raw, policy.Files) {
+	tree, e := run(ctx, "git", []string{"ls-tree", "-r", "-z", "HEAD"}, root, []string{"GIT_TERMINAL_PROMPT=0"})
+	if e != nil || !gitIndexMatches(raw, tree, policy.Files, ctx, root, run) {
 		return ErrGitSource
 	}
 	return VerifySourceTree(root, policy)
 }
-func gitIndexMatches(raw []byte, files []FileEntryV1) bool {
+func cleanGitRoot(path string) (string, error) {
+	if !filepath.IsAbs(path) {
+		return "", ErrGitSource
+	}
+	info, err := os.Lstat(path)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return "", ErrGitSource
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", ErrGitSource
+	}
+	return filepath.Clean(resolved), nil
+}
+
+func onlyExpectedRemoteURL(raw, expected string) bool {
+	lines := strings.Fields(raw)
+	return len(lines) == 1 && (lines[0] == expected || lines[0] == expected+".git")
+}
+
+func gitIndexMatches(raw, tree []byte, files []FileEntryV1, ctx context.Context, root string, run commandRunner) bool {
 	expected := map[string]FileEntryV1{}
 	for _, f := range files {
 		expected[f.Path] = f
 	}
-	seen := map[string]bool{}
+	index := map[string]gitObject{}
 	for _, record := range bytes.Split(raw, []byte{0}) {
 		if len(record) == 0 {
 			continue
@@ -85,16 +120,53 @@ func gitIndexMatches(raw []byte, files []FileEntryV1) bool {
 			return false
 		}
 		meta := strings.Fields(string(parts[0]))
-		if len(meta) != 3 || meta[1] != "0" || !regexp.MustCompile(`^[0-9a-f]{40,64}$`).MatchString(meta[2]) {
+		if len(meta) != 3 || meta[2] != "0" || !gitObjectID.MatchString(meta[1]) {
 			return false
 		}
-		mode := meta[0]
 		path := string(parts[1])
 		entry, ok := expected[path]
-		if !ok || seen[path] || ((entry.Mode == 0o644 && mode != "100644") || (entry.Mode == 0o755 && mode != "100755")) {
+		if !ok || index[path].id != "" || !gitModeMatches(meta[0], entry.Mode) {
 			return false
 		}
-		seen[path] = true
+		index[path] = gitObject{mode: meta[0], id: meta[1]}
 	}
-	return len(seen) == len(expected)
+	if len(index) != len(expected) {
+		return false
+	}
+	treeSeen := map[string]bool{}
+	for _, record := range bytes.Split(tree, []byte{0}) {
+		if len(record) == 0 {
+			continue
+		}
+		parts := bytes.SplitN(record, []byte{'\t'}, 2)
+		if len(parts) != 2 {
+			return false
+		}
+		meta := strings.Fields(string(parts[0]))
+		if len(meta) != 3 || meta[1] != "blob" || !gitObjectID.MatchString(meta[2]) {
+			return false
+		}
+		object, ok := index[string(parts[1])]
+		if !ok || object.mode != meta[0] || object.id != meta[2] {
+			return false
+		}
+		entry := expected[string(parts[1])]
+		if treeSeen[string(parts[1])] {
+			return false
+		}
+		treeSeen[string(parts[1])] = true
+		body, err := run(ctx, "git", []string{"cat-file", "blob", object.id}, root, []string{"GIT_TERMINAL_PROMPT=0"})
+		if err != nil || sha256Text(body) != entry.SHA256 {
+			return false
+		}
+	}
+	return len(treeSeen) == len(expected)
+}
+
+var gitObjectID = regexp.MustCompile(`^[0-9a-f]{40,64}$`)
+
+type gitObject struct{ mode, id string }
+
+func gitModeMatches(mode string, want uint32) bool {
+	return (want == 0o644 && mode == "100644") || (want == 0o755 && mode == "100755")
 }
