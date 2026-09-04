@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -210,42 +211,6 @@ func TestTaskAcornFoxSubstratePublisherRejectsConflictingBindingWithoutOverwrite
 	}
 }
 
-func TestPublishedAcornFoxSubstrateVerifyAndDiscardAreTaskOnly(t *testing.T) {
-	root := t.TempDir()
-	if err := os.Chmod(root, acornFoxStageDirMode); err != nil {
-		t.Fatal(err)
-	}
-	stager, err := NewTaskAcornFoxStager(root, os.Getuid(), os.Getgid())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer stager.Close()
-	stage, receipt, err := stager.Stage(newAcornFoxFixture(t, "1.2.3-test.1", nil).input(nil))
-	if err != nil {
-		t.Fatal(err)
-	}
-	publisher, err := NewTaskAcornFoxSubstratePublisher(root, os.Getuid(), os.Getgid())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := publisher.Publish(context.Background(), &stage, receipt.BindingSHA256); err != nil {
-		t.Fatal(err)
-	}
-	published, err := publisher.Reopen(receipt.BindingSHA256)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := published.Discard(); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(root + "/substrate"); !os.IsNotExist(err) {
-		t.Fatalf("discard retained task substrate: %v", err)
-	}
-	if info, err := os.Stat(root + "/" + acornFoxSubstrateLock); err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
-		t.Fatalf("discard removed or changed task lock: info=%v err=%v", info, err)
-	}
-}
-
 func TestTaskAcornFoxSubstratePublisherResumeFindsOnlyMatchingFreshStage(t *testing.T) {
 	root := t.TempDir()
 	if err := os.Chmod(root, acornFoxStageDirMode); err != nil {
@@ -378,7 +343,7 @@ func TestTaskAcornFoxSubstratePublisherResumeRejectsTamperedSourceBeforeRootfs(t
 	}
 }
 
-func TestPublishedAcornFoxSubstrateRejectsExtraRootfsEntriesWithoutDiscarding(t *testing.T) {
+func TestPublishedAcornFoxSubstrateRejectsExtraRootfsEntries(t *testing.T) {
 	root := t.TempDir()
 	if err := os.Chmod(root, acornFoxStageDirMode); err != nil {
 		t.Fatal(err)
@@ -420,12 +385,6 @@ func TestPublishedAcornFoxSubstrateRejectsExtraRootfsEntriesWithoutDiscarding(t 
 	defer fresh.Close()
 	if inspection, err := fresh.Inspect(receipt.BindingSHA256); err != nil || inspection.Outcome != AcornFoxReconcileConflict {
 		t.Fatalf("inspection=%#v err=%v", inspection, err)
-	}
-	if err := published.Discard(); err == nil {
-		t.Fatal("discard removed conflicting substrate")
-	}
-	if _, err := os.Stat(root + "/substrate/rootfs/foreign"); err != nil {
-		t.Fatalf("discard mutated conflicting substrate: %v", err)
 	}
 }
 
@@ -916,7 +875,98 @@ func TestTaskAcornFoxSubstratePublisherTerminalReceiptAndCleanupFaultEvidence(t 
 	}
 }
 
-func TestTaskAcornFoxSubstratePublisherLockAndDiscardSyscallBoundaries(t *testing.T) {
+func TestTaskAcornFoxSubstratePublisherRejectsBadTerminalTemporaryMetadata(t *testing.T) {
+	root, publisher, stage, receipt := newAcornFoxSubstrateTestPublisher(t)
+	if _, err := publisher.Publish(context.Background(), stage, receipt.BindingSHA256); err != nil {
+		t.Fatal(err)
+	}
+	temporary := root + "/" + acornFoxSubstrateDir + "/" + acornFoxSubstrateTempPrefix + "foreign"
+	if err := os.WriteFile(temporary, []byte("foreign"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := NewTaskAcornFoxSubstratePublisher(root, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fresh.Close()
+	inspection, err := fresh.Inspect(receipt.BindingSHA256)
+	if err != nil || inspection.Outcome != AcornFoxReconcileConflict {
+		t.Fatalf("inspection=%#v err=%v", inspection, err)
+	}
+	stager, err := NewTaskAcornFoxStager(root, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stager.Close()
+	retry, retryReceipt, err := stager.Stage(newAcornFoxFixture(t, receipt.Version, nil).input(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer retry.Close()
+	if _, err := fresh.Publish(context.Background(), &retry, retryReceipt.BindingSHA256); !errors.Is(err, ErrAcornFoxSubstrateConflict) {
+		t.Fatalf("publish with foreign terminal temp=%v", err)
+	}
+	if _, err := os.Lstat(temporary); err != nil {
+		t.Fatalf("publish removed unproven terminal temp: %v", err)
+	}
+}
+
+func TestTaskAcornFoxSubstratePublisherTerminalLinkedReceiptStaysReadOnlyUntilPublish(t *testing.T) {
+	root, publisher, stage, receipt := newAcornFoxSubstrateTestPublisher(t)
+	base := publisher.fs
+	publisher.fs.link = func(root *os.Root, oldName, newName string) error {
+		err := base.link(root, oldName, newName)
+		if err == nil && newName == acornFoxSubstrateReceipt {
+			return errAcornFoxSubstrateInjected
+		}
+		return err
+	}
+	if _, err := publisher.Publish(context.Background(), stage, receipt.BindingSHA256); !errors.Is(err, errAcornFoxSubstrateInjected) {
+		t.Fatalf("publish=%v", err)
+	}
+	temps, err := filepath.Glob(root + "/" + acornFoxSubstrateDir + "/" + acornFoxSubstrateTempPrefix + "*")
+	if err != nil || len(temps) != 1 {
+		t.Fatalf("terminal temporary entries=%v err=%v", temps, err)
+	}
+	receiptInfo, err := os.Lstat(root + "/" + acornFoxSubstrateReceipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tempInfo, err := os.Lstat(temps[0])
+	if err != nil || !acornFoxSubstrateTerminalTemp(tempInfo, receiptInfo, os.Getuid(), os.Getgid()) {
+		t.Fatalf("terminal temporary metadata=%v err=%v", tempInfo, err)
+	}
+	fresh, err := NewTaskAcornFoxSubstratePublisher(root, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fresh.Close()
+	if inspection, err := fresh.Inspect(receipt.BindingSHA256); err != nil || inspection.Outcome != AcornFoxReconcileCleanupUnknown {
+		t.Fatalf("inspect=%#v err=%v", inspection, err)
+	}
+	if _, err := os.Lstat(temps[0]); err != nil {
+		t.Fatalf("inspect mutated terminal temp: %v", err)
+	}
+	published, err := fresh.Reopen(receipt.BindingSHA256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := published.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(temps[0]); err != nil {
+		t.Fatalf("reopen mutated terminal temp: %v", err)
+	}
+	result, err := fresh.Publish(context.Background(), stage, receipt.BindingSHA256)
+	if !errors.Is(err, ErrAcornFoxStageCleanupUnknown) || result.Outcome != AcornFoxReconcileCleanupUnknown {
+		t.Fatalf("reconcile publish=%#v err=%v", result, err)
+	}
+	if temps, err := filepath.Glob(root + "/" + acornFoxSubstrateDir + "/" + acornFoxSubstrateTempPrefix + "*"); err != nil || len(temps) != 0 {
+		t.Fatalf("publish did not reconcile owned terminal temp: %v err=%v", temps, err)
+	}
+}
+
+func TestTaskAcornFoxSubstratePublisherLockSyscallBoundaries(t *testing.T) {
 	t.Run("root_lstat_and_open_root_fail_closed", func(t *testing.T) {
 		for _, apply := range []func(*TaskAcornFoxSubstratePublisher){
 			func(p *TaskAcornFoxSubstratePublisher) {
@@ -1008,71 +1058,60 @@ func TestTaskAcornFoxSubstratePublisherLockAndDiscardSyscallBoundaries(t *testin
 		}
 	})
 
-	for _, test := range []struct {
-		name  string
-		apply func(*PublishedAcornFoxSubstrateV1)
-	}{
-		{"remove_all_after_effect", func(published *PublishedAcornFoxSubstrateV1) {
-			base := published.fs
-			published.fs.removeAll = func(root *os.Root, path string) error {
-				err := base.removeAll(root, path)
-				if err != nil {
-					return err
-				}
-				return errAcornFoxSubstrateInjected
-			}
-		}},
-		{"root_sync_after_effect", func(published *PublishedAcornFoxSubstrateV1) {
-			base, armed := published.fs, false
-			published.fs.removeAll = func(root *os.Root, path string) error {
-				err := base.removeAll(root, path)
-				if err == nil {
-					armed = true
-				}
-				return err
-			}
-			published.fs.openFile = func(root *os.Root, path string, flags int, mode os.FileMode) (acornFoxSubstrateFile, error) {
-				file, err := base.openFile(root, path, flags, mode)
-				if err != nil || !armed || path != "." {
-					return file, err
-				}
-				armed = false
-				return acornFoxSubstrateTestFile{acornFoxSubstrateFile: file, sync: func(file acornFoxSubstrateFile) error {
-					if err := file.Sync(); err != nil {
-						return err
-					}
-					return errAcornFoxSubstrateInjected
-				}}, nil
-			}
-		}},
-	} {
-		t.Run("discard_"+test.name, func(t *testing.T) {
-			root, publisher, stage, receipt := newAcornFoxSubstrateTestPublisher(t)
-			if _, err := publisher.Publish(context.Background(), stage, receipt.BindingSHA256); err != nil {
-				t.Fatal(err)
-			}
-			published, err := publisher.Reopen(receipt.BindingSHA256)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer published.Close()
-			test.apply(published)
-			if err := published.Discard(); !errors.Is(err, ErrAcornFoxStageCleanupUnknown) {
-				t.Fatalf("discard=%v", err)
-			}
-			fresh, err := NewTaskAcornFoxSubstratePublisher(root, os.Getuid(), os.Getgid())
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer fresh.Close()
-			if inspection, err := fresh.Inspect(receipt.BindingSHA256); err != nil || inspection.Outcome != AcornFoxReconcileAbsent {
-				t.Fatalf("inspection=%#v err=%v", inspection, err)
-			}
-		})
-	}
 }
 
 func TestTaskAcornFoxSubstratePublisherChownAndConsumeBoundaries(t *testing.T) {
+	t.Run("receipt_atomic_temp_chown_after_effect_recovers_from_fresh_publisher", func(t *testing.T) {
+		root, publisher, stage, receipt := newAcornFoxSubstrateTestPublisher(t)
+		base, controlTemps := publisher.fs, 0
+		publisher.fs.openFile = func(handle *os.Root, path string, flags int, mode os.FileMode) (acornFoxSubstrateFile, error) {
+			file, err := base.openFile(handle, path, flags, mode)
+			if err != nil || !strings.HasPrefix(path, acornFoxSubstrateDir+"/"+acornFoxSubstrateTempPrefix) || flags&os.O_CREATE == 0 {
+				return file, err
+			}
+			controlTemps++
+			if controlTemps != 2 {
+				return file, nil
+			}
+			return acornFoxSubstrateTestFile{acornFoxSubstrateFile: file, chown: func(file acornFoxSubstrateFile, uid, gid int) error {
+				if err := file.Chown(uid, gid); err != nil {
+					return err
+				}
+				return errAcornFoxSubstrateInjected
+			}}, nil
+		}
+		if _, err := publisher.Publish(context.Background(), stage, receipt.BindingSHA256); !errors.Is(err, errAcornFoxSubstrateInjected) {
+			t.Fatalf("publish=%v", err)
+		}
+		if controlTemps != 2 {
+			t.Fatalf("control atomic temp Chown calls=%d, want 2", controlTemps)
+		}
+		matches, err := filepath.Glob(root + "/" + acornFoxSubstrateDir + "/" + acornFoxSubstrateTempPrefix + "*")
+		if err != nil || len(matches) != 1 {
+			t.Fatalf("owned control temps=%v err=%v", matches, err)
+		}
+		info, err := os.Lstat(matches[0])
+		if err != nil || !acornFoxSubstrateOwnedTemp(info, os.Getuid(), os.Getgid()) {
+			t.Fatalf("temp metadata=%v err=%v", info, err)
+		}
+		fresh, err := NewTaskAcornFoxSubstratePublisher(root, os.Getuid(), os.Getgid())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer fresh.Close()
+		inspection, err := fresh.Inspect(receipt.BindingSHA256)
+		if err != nil || inspection.Outcome != AcornFoxReconcileResume {
+			t.Fatalf("fresh inspection=%#v err=%v", inspection, err)
+		}
+		result, err := fresh.Resume(context.Background(), receipt.BindingSHA256)
+		if err != nil || result.Outcome != AcornFoxReconcileCompleted {
+			t.Fatalf("resume=%#v err=%v", result, err)
+		}
+		if matches, err := filepath.Glob(root + "/" + acornFoxSubstrateDir + "/" + acornFoxSubstrateTempPrefix + "*"); err != nil || len(matches) != 0 {
+			t.Fatalf("recovered control temps=%v err=%v", matches, err)
+		}
+	})
+
 	t.Run("directory_chown_after_create", func(t *testing.T) {
 		root, publisher, stage, receipt := newAcornFoxSubstrateTestPublisher(t)
 		base, once := publisher.fs, false

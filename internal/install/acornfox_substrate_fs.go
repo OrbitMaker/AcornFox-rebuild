@@ -40,7 +40,6 @@ type acornFoxSubstrateFS struct {
 	lstat        func(*os.Root, string) (os.FileInfo, error)
 	link         func(*os.Root, string, string) error
 	remove       func(*os.Root, string) error
-	removeAll    func(*os.Root, string) error
 	flock        func(acornFoxSubstrateFile, int) error
 }
 
@@ -53,12 +52,11 @@ func newAcornFoxSubstrateFS() acornFoxSubstrateFS {
 		openFile: func(root *os.Root, path string, flags int, mode os.FileMode) (acornFoxSubstrateFile, error) {
 			return root.OpenFile(path, flags, mode)
 		},
-		mkdir:     func(root *os.Root, path string, mode os.FileMode) error { return root.Mkdir(path, mode) },
-		lstat:     func(root *os.Root, path string) (os.FileInfo, error) { return root.Lstat(path) },
-		link:      func(root *os.Root, oldName, newName string) error { return root.Link(oldName, newName) },
-		remove:    func(root *os.Root, path string) error { return root.Remove(path) },
-		removeAll: func(root *os.Root, path string) error { return root.RemoveAll(path) },
-		flock:     func(file acornFoxSubstrateFile, operation int) error { return syscall.Flock(int(file.Fd()), operation) },
+		mkdir:  func(root *os.Root, path string, mode os.FileMode) error { return root.Mkdir(path, mode) },
+		lstat:  func(root *os.Root, path string) (os.FileInfo, error) { return root.Lstat(path) },
+		link:   func(root *os.Root, oldName, newName string) error { return root.Link(oldName, newName) },
+		remove: func(root *os.Root, path string) error { return root.Remove(path) },
+		flock:  func(file acornFoxSubstrateFile, operation int) error { return syscall.Flock(int(file.Fd()), operation) },
 	}
 }
 
@@ -469,7 +467,7 @@ func acornFoxSubstrateReadControl(fs acornFoxSubstrateFS, root *os.Root, path st
 		return nil, err
 	}
 	info, statErr := file.Stat()
-	if statErr != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 || verifyOwner(info, uid, gid) != nil || info.Size() < 1 || info.Size() > acornFoxHelperReceiptMaxBytes || !acornFoxSubstrateSingleLink(info) {
+	if statErr != nil || !acornFoxSubstrateControlMetadata(info, uid, gid) || !acornFoxSubstrateSingleLink(info) {
 		_ = file.Close()
 		return nil, errors.New("AcornFox substrate control metadata is invalid")
 	}
@@ -484,9 +482,134 @@ func acornFoxSubstrateReadControl(fs acornFoxSubstrateFS, root *os.Root, path st
 	return raw, nil
 }
 
+// acornFoxSubstrateReadTerminalReceipt admits the one recoverable post-link
+// state: receipt.json and its same-directory temporary name are two links to
+// one authenticated inode. Inspection remains read-only; Publish or Resume
+// later removes that owned temporary inode while holding the task lock.
+func acornFoxSubstrateReadTerminalReceipt(fs acornFoxSubstrateFS, root *os.Root, uid, gid int) ([]byte, error) {
+	file, err := fs.openFile(root, acornFoxSubstrateReceipt, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+	info, statErr := file.Stat()
+	if statErr != nil || !acornFoxSubstrateControlMetadata(info, uid, gid) {
+		_ = file.Close()
+		return nil, errors.New("AcornFox substrate receipt metadata is invalid")
+	}
+	raw, readErr := readAcornFoxSubstrateFileBounded(file, acornFoxHelperReceiptMaxBytes)
+	closeErr := file.Close()
+	if readErr != nil {
+		return nil, readErr
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	if acornFoxSubstrateSingleLink(info) {
+		return raw, nil
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat.Nlink != 2 {
+		return nil, errors.New("AcornFox substrate receipt link count is invalid")
+	}
+	dir, err := fs.openFile(root, acornFoxSubstrateDir, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+	children, readDirErr := dir.ReadDir(-1)
+	closeDirErr := dir.Close()
+	if readDirErr != nil {
+		return nil, readDirErr
+	}
+	if closeDirErr != nil {
+		return nil, closeDirErr
+	}
+	found := 0
+	for _, child := range children {
+		if !strings.HasPrefix(child.Name(), acornFoxSubstrateTempPrefix) {
+			continue
+		}
+		path := filepath.ToSlash(filepath.Join(acornFoxSubstrateDir, child.Name()))
+		tempInfo, lstatErr := fs.lstat(root, path)
+		if lstatErr == nil && acornFoxSubstrateTerminalTemp(tempInfo, info, uid, gid) {
+			found++
+		}
+	}
+	if found != 1 {
+		return nil, errors.New("AcornFox substrate receipt temporary link is invalid")
+	}
+	return raw, nil
+}
+
 func acornFoxSubstrateSingleLink(info os.FileInfo) bool {
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	return ok && stat.Nlink == 1
+}
+
+func acornFoxSubstrateControlMetadata(info os.FileInfo, uid, gid int) bool {
+	return info != nil && info.Mode().IsRegular() && info.Mode().Perm() == 0o600 && verifyOwner(info, uid, gid) == nil && info.Size() >= 1 && info.Size() <= acornFoxHelperReceiptMaxBytes
+}
+
+func acornFoxSubstrateOwnedTemp(info os.FileInfo, uid, gid int) bool {
+	return acornFoxSubstrateControlMetadata(info, uid, gid) && info.Mode()&os.ModeSymlink == 0
+}
+
+func acornFoxSubstrateTerminalTemp(info, receipt os.FileInfo, uid, gid int) bool {
+	if !acornFoxSubstrateOwnedTemp(info, uid, gid) || !acornFoxSubstrateControlMetadata(receipt, uid, gid) || !os.SameFile(info, receipt) {
+		return false
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	return ok && stat.Nlink == 2
+}
+
+// acornFoxSubstrateRemoveTerminalReceiptTemp only removes the same inode that
+// a verified receipt proves was left behind by Link. It deliberately does not
+// treat a prefix match as deletion authority for terminal substrate state.
+func acornFoxSubstrateRemoveTerminalReceiptTemp(fs acornFoxSubstrateFS, root *os.Root, uid, gid int) error {
+	receipt, err := fs.lstat(root, acornFoxSubstrateReceipt)
+	if err != nil {
+		return err
+	}
+	if !acornFoxSubstrateControlMetadata(receipt, uid, gid) {
+		return ErrAcornFoxSubstrateConflict
+	}
+	if acornFoxSubstrateSingleLink(receipt) {
+		return nil
+	}
+	stat, ok := receipt.Sys().(*syscall.Stat_t)
+	if !ok || stat.Nlink != 2 {
+		return ErrAcornFoxSubstrateConflict
+	}
+	dir, err := fs.openFile(root, acornFoxSubstrateDir, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return err
+	}
+	children, readErr := dir.ReadDir(-1)
+	closeErr := dir.Close()
+	if readErr != nil {
+		return readErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	var temporary string
+	for _, child := range children {
+		if !strings.HasPrefix(child.Name(), acornFoxSubstrateTempPrefix) {
+			continue
+		}
+		path := filepath.ToSlash(filepath.Join(acornFoxSubstrateDir, child.Name()))
+		info, lstatErr := fs.lstat(root, path)
+		if lstatErr != nil || !acornFoxSubstrateTerminalTemp(info, receipt, uid, gid) || temporary != "" {
+			return ErrAcornFoxSubstrateConflict
+		}
+		temporary = path
+	}
+	if temporary == "" {
+		return ErrAcornFoxSubstrateConflict
+	}
+	if err := fs.remove(root, temporary); err != nil {
+		return err
+	}
+	return fs.syncDirectory(root, acornFoxSubstrateDir)
 }
 
 func readAcornFoxSubstrateFileBounded(file acornFoxSubstrateFile, maximum int64) ([]byte, error) {
@@ -568,7 +691,7 @@ func acornFoxSubstrateRemoveOwnedTemps(fs acornFoxSubstrateFS, root *os.Root, en
 			}
 			path := filepath.ToSlash(filepath.Join(directory, child.Name()))
 			info, err := fs.lstat(root, path)
-			if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || verifyOwner(info, uid, gid) != nil {
+			if err != nil || !acornFoxSubstrateOwnedTemp(info, uid, gid) {
 				return ErrAcornFoxSubstrateConflict
 			}
 			if err := fs.remove(root, path); err != nil {
