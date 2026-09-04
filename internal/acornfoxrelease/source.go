@@ -13,9 +13,15 @@ import (
 )
 
 const (
-	maxManifestBytes        = 1 << 20
-	maxInputFileBytes int64 = 16 << 20
-	maxInputTreeBytes int64 = 128 << 20
+	maxManifestBytes = 1 << 20
+	// Source limits keep local policy manifests modest. Runtime limits mirror
+	// the sealed installer intake bounds without importing installer authority.
+	sourceFileBytes  int64 = 16 << 20
+	sourceTreeBytes  int64 = 128 << 20
+	licenseFileBytes int64 = 16 << 20
+	licenseTreeBytes int64 = 64 << 20
+	runtimeFileBytes int64 = 128 << 20
+	runtimeTreeBytes int64 = 1 << 30
 )
 
 var ErrInputs = errors.New("acornfox release inputs are invalid")
@@ -59,7 +65,7 @@ func VerifySourceTree(root string, policy SourcePolicyV1) error {
 	if policy.Validate() != nil {
 		return ErrInputs
 	}
-	return verifyFileTree(root, policy.Files, true)
+	return verifyFileTree(root, policy.Files, true, treeLimits{sourceFileBytes, sourceTreeBytes})
 }
 
 func validModulePath(v string) bool {
@@ -81,15 +87,23 @@ func validateEntries(entries []FileEntryV1) error {
 	return nil
 }
 func validRelativeFile(p string) bool {
-	if p == "" || strings.ContainsAny(p, "\\\x00\r\n") || strings.HasPrefix(p, "/") {
+	if p == "" || strings.Contains(p, "\\") || strings.HasPrefix(p, "/") {
 		return false
 	}
 	for _, part := range strings.Split(p, "/") {
-		if part == "" || part == "." || part == ".." || part == ".git" || strings.ContainsAny(part, "\x00\r\n") {
+		if part == "" || part == "." || part == ".." || part == ".git" || hasASCIIControl(part) {
 			return false
 		}
 	}
 	return true
+}
+func hasASCIIControl(v string) bool {
+	for _, b := range []byte(v) {
+		if b < 0x20 || b == 0x7f {
+			return true
+		}
+	}
+	return false
 }
 func parseCanonical(raw []byte, target any) error {
 	if len(raw) == 0 || len(raw) > maxManifestBytes {
@@ -110,7 +124,9 @@ func parseCanonical(raw []byte, target any) error {
 	return nil
 }
 
-func verifyFileTree(root string, entries []FileEntryV1, ignoreGit bool) error {
+type treeLimits struct{ file, total int64 }
+
+func verifyFileTree(root string, entries []FileEntryV1, ignoreGit bool, limits treeLimits) error {
 	if validateEntries(entries) != nil {
 		return ErrInputs
 	}
@@ -123,6 +139,10 @@ func verifyFileTree(root string, entries []FileEntryV1, ignoreGit bool) error {
 		return ErrInputs
 	}
 	defer rootFD.Close()
+	openedRoot, err := rootFD.Stat(".")
+	if err != nil || !openedRoot.IsDir() || !os.SameFile(info, openedRoot) {
+		return ErrInputs
+	}
 	want := map[string]FileEntryV1{}
 	for _, e := range entries {
 		want[e.Path] = e
@@ -162,7 +182,7 @@ func verifyFileTree(root string, entries []FileEntryV1, ignoreGit bool) error {
 				continue
 			}
 			entry, ok := want[rel]
-			if !ok || !before.Mode().IsRegular() || before.Mode().Perm() != os.FileMode(entry.Mode) || linkCount(before) != 1 || before.Size() < 0 || before.Size() > maxInputFileBytes {
+			if !ok || !before.Mode().IsRegular() || before.Mode().Perm() != os.FileMode(entry.Mode) || linkCount(before) != 1 || before.Size() < 0 || before.Size() > limits.file {
 				return ErrInputs
 			}
 			file, e := rootFD.OpenFile(rel, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
@@ -171,14 +191,14 @@ func verifyFileTree(root string, entries []FileEntryV1, ignoreGit bool) error {
 			}
 			opened, se := file.Stat()
 			h := sha256.New()
-			n, re := io.Copy(h, io.LimitReader(file, maxInputFileBytes+1))
+			n, re := io.Copy(h, io.LimitReader(file, limits.file+1))
 			ce = file.Close()
 			after, ae := rootFD.Lstat(rel)
-			if se != nil || re != nil || ce != nil || ae != nil || n != before.Size() || n > maxInputFileBytes || !os.SameFile(before, opened) || !os.SameFile(before, after) || hex.EncodeToString(h.Sum(nil)) != entry.SHA256 {
+			if se != nil || re != nil || ce != nil || ae != nil || n != before.Size() || n > limits.file || !os.SameFile(before, opened) || !os.SameFile(before, after) || hex.EncodeToString(h.Sum(nil)) != entry.SHA256 {
 				return ErrInputs
 			}
 			total += n
-			if total > maxInputTreeBytes {
+			if total > limits.total {
 				return ErrInputs
 			}
 			seen[rel] = true

@@ -9,7 +9,7 @@ var (
 	goVersionText    = regexp.MustCompile(`^go[0-9]+\.[0-9]+\.[0-9]+$`)
 	nodeVersionText  = regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+$`)
 	npmVersionText   = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`)
-	fixedBuildPolicy = []string{"cgo_disabled", "trimpath"}
+	fixedBuildPolicy = []string{"build_id_empty", "build_vcs_disabled", "cgo_disabled", "trimpath"}
 )
 
 type ToolchainInputsV1 struct {
@@ -103,11 +103,11 @@ func VerifyRuntimeTree(root string, v RuntimeInputsV1) error {
 	if v.Validate() != nil {
 		return ErrInputs
 	}
-	return verifyFileTree(root, v.Files, false)
+	return verifyFileTree(root, v.Files, false, treeLimits{runtimeFileBytes, runtimeTreeBytes})
 }
 func VerifyLicenseTree(root string, v LicenseInputsV1) error {
 	if v.Validate() != nil {
 		return ErrInputs
 	}
-	return verifyFileTree(root, v.Files, false)
+	return verifyFileTree(root, v.Files, false, treeLimits{licenseFileBytes, licenseTreeBytes})
 }

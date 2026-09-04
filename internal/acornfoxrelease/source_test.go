@@ -85,11 +85,28 @@ func TestSourcePolicyAllowsDotfileButRejectsGitAndControls(t *testing.T) {
 	if _, err := CanonicalSourcePolicyV1(p); err != nil {
 		t.Fatal(err)
 	}
-	for _, path := range []string{".git/config", "a/../b", "a//b", "a/\nb", "/absolute"} {
+	for _, path := range []string{".git/config", "a/../b", "a//b", "a/\nb", "a/\tb", "a/\x01b", "a/\x1fb", "a/\x7fb", "/absolute"} {
 		q := sourcePolicyFixture()
 		q.Files[0].Path = path
 		if _, err := CanonicalSourcePolicyV1(q); err == nil {
 			t.Fatalf("accepted %q", path)
 		}
+	}
+}
+
+func TestVerifySourceTreeRejectsHardlinkAndAcceptsWorktreeGitFile(t *testing.T) {
+	root := t.TempDir()
+	p := sourcePolicyFixture()
+	writeFixtureFile(t, root, "cmd/main.go", "main", 0o644)
+	writeFixtureFile(t, root, "scripts/run", "run", 0o755)
+	writeFixtureFile(t, root, ".git", "gitdir: /synthetic", 0o644)
+	if err := VerifySourceTree(root, p); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(filepath.Join(root, "cmd/main.go"), filepath.Join(root, "copy")); err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifySourceTree(root, p); err == nil {
+		t.Fatal("hardlink accepted")
 	}
 }
