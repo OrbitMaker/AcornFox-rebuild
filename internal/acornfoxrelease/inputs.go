@@ -1,0 +1,94 @@
+package acornfoxrelease
+
+import "encoding/json"
+
+type ToolchainInputsV1 struct {
+	SchemaVersion int      `json:"schema_version"`
+	Product       string   `json:"product"`
+	Architecture  string   `json:"architecture"`
+	GoVersion     string   `json:"go_version"`
+	NodeVersion   string   `json:"node_version"`
+	NPMVersion    string   `json:"npm_version"`
+	BuildPolicy   []string `json:"build_policy"`
+}
+type RuntimeInputsV1 struct {
+	SchemaVersion int           `json:"schema_version"`
+	Product       string        `json:"product"`
+	Architecture  string        `json:"architecture"`
+	Files         []FileEntryV1 `json:"files"`
+}
+type LicenseInputsV1 struct {
+	SchemaVersion int           `json:"schema_version"`
+	Product       string        `json:"product"`
+	Files         []FileEntryV1 `json:"files"`
+}
+
+func (v ToolchainInputsV1) Validate() error {
+	if v.SchemaVersion != 1 || v.Product != Product || v.Architecture != Architecture || v.GoVersion == "" || v.NodeVersion == "" || v.NPMVersion == "" || len(v.BuildPolicy) == 0 {
+		return ErrInputs
+	}
+	for i, t := range v.BuildPolicy {
+		if t == "" || (i > 0 && v.BuildPolicy[i-1] >= t) {
+			return ErrInputs
+		}
+	}
+	return nil
+}
+func (v RuntimeInputsV1) Validate() error {
+	if v.SchemaVersion != 1 || v.Product != Product || v.Architecture != Architecture {
+		return ErrInputs
+	}
+	return validateEntries(v.Files)
+}
+func (v LicenseInputsV1) Validate() error {
+	if v.SchemaVersion != 1 || v.Product != Product {
+		return ErrInputs
+	}
+	return validateEntries(v.Files)
+}
+
+func CanonicalToolchainInputsV1(v ToolchainInputsV1) ([]byte, error) {
+	if v.Validate() != nil {
+		return nil, ErrInputs
+	}
+	return json.Marshal(v)
+}
+func CanonicalRuntimeInputsV1(v RuntimeInputsV1) ([]byte, error) {
+	if v.Validate() != nil {
+		return nil, ErrInputs
+	}
+	return json.Marshal(v)
+}
+func CanonicalLicenseInputsV1(v LicenseInputsV1) ([]byte, error) {
+	if v.Validate() != nil {
+		return nil, ErrInputs
+	}
+	return json.Marshal(v)
+}
+func ParseToolchainInputsV1(w Witness, raw []byte) (ToolchainInputsV1, error) {
+	var v ToolchainInputsV1
+	if !w.Valid() || parseCanonical(raw, &v) != nil || v.Validate() != nil || sha256Text(raw) != w.decision.ToolchainSHA256 {
+		return v, ErrInputs
+	}
+	return v, nil
+}
+func ParseRuntimeInputsV1(w Witness, raw []byte) (RuntimeInputsV1, error) {
+	var v RuntimeInputsV1
+	if !w.Valid() || parseCanonical(raw, &v) != nil || v.Validate() != nil || sha256Text(raw) != w.decision.RuntimeInputSHA256 {
+		return v, ErrInputs
+	}
+	return v, nil
+}
+func ParseLicenseInputsV1(w Witness, raw []byte) (LicenseInputsV1, error) {
+	var v LicenseInputsV1
+	if !w.Valid() || parseCanonical(raw, &v) != nil || v.Validate() != nil || sha256Text(raw) != w.decision.LicenseInputSHA256 {
+		return v, ErrInputs
+	}
+	return v, nil
+}
+func VerifyRuntimeTree(root string, v RuntimeInputsV1) error {
+	return verifyFileTree(root, v.Files, false)
+}
+func VerifyLicenseTree(root string, v LicenseInputsV1) error {
+	return verifyFileTree(root, v.Files, false)
+}
