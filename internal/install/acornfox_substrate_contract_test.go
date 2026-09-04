@@ -100,24 +100,24 @@ func TestInactiveSubstrateReceiptV1CanonicalAndSecretFree(t *testing.T) {
 }
 
 func TestAcornFoxSubstrateTreeEnvelopeRejectsOrderPathModeAndDigest(t *testing.T) {
-	good := AcornFoxSubstrateTreeEnvelopeV1{SchemaVersion: AcornFoxSubstrateTreeV1Schema, Entries: []SubstrateEntry{substrateEntry("a", SubstrateEntryFile, 0o700, OwnerRoleRoot), substrateEntry("b", SubstrateEntryFile, 0o700, OwnerRoleServer)}}
-	raw, err := MarshalAcornFoxSubstrateTreeEnvelopeV1(good)
+	good := acornFoxSubstrateTreeEnvelopeV1{SchemaVersion: AcornFoxSubstrateTreeV1Schema, Entries: []SubstrateEntry{substrateEntry("a", SubstrateEntryFile, 0o700, OwnerRoleRoot), substrateEntry("b", SubstrateEntryFile, 0o700, OwnerRoleServer)}}
+	raw, err := marshalAcornFoxSubstrateTreeEnvelopeV1(good)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if parsed, err := ParseAcornFoxSubstrateTreeEnvelopeV1(raw); err != nil || !reflect.DeepEqual(parsed, good) {
+	if parsed, err := parseAcornFoxSubstrateTreeEnvelopeV1(raw); err != nil || !reflect.DeepEqual(parsed, good) {
 		t.Fatalf("parsed=%#v err=%v", parsed, err)
 	}
-	for _, mutate := range []func(*AcornFoxSubstrateTreeEnvelopeV1){
-		func(v *AcornFoxSubstrateTreeEnvelopeV1) { v.Entries[1].Path = "a" },
-		func(v *AcornFoxSubstrateTreeEnvelopeV1) { v.Entries[0].Path = "../escape" },
-		func(v *AcornFoxSubstrateTreeEnvelopeV1) { v.Entries[0].Mode = 0o722 },
-		func(v *AcornFoxSubstrateTreeEnvelopeV1) { v.Entries[0].SHA256 = "bad" },
+	for _, mutate := range []func(*acornFoxSubstrateTreeEnvelopeV1){
+		func(v *acornFoxSubstrateTreeEnvelopeV1) { v.Entries[1].Path = "a" },
+		func(v *acornFoxSubstrateTreeEnvelopeV1) { v.Entries[0].Path = "../escape" },
+		func(v *acornFoxSubstrateTreeEnvelopeV1) { v.Entries[0].Mode = 0o722 },
+		func(v *acornFoxSubstrateTreeEnvelopeV1) { v.Entries[0].SHA256 = "bad" },
 	} {
 		changed := good
 		changed.Entries = append([]SubstrateEntry(nil), good.Entries...)
 		mutate(&changed)
-		if _, err := MarshalAcornFoxSubstrateTreeEnvelopeV1(changed); err == nil {
+		if _, err := marshalAcornFoxSubstrateTreeEnvelopeV1(changed); err == nil {
 			t.Fatalf("invalid tree accepted: %#v", changed)
 		}
 	}
@@ -132,7 +132,7 @@ func TestAcornFoxSubstrateTreeEnvelopeRejectsOrderPathModeAndDigest(t *testing.T
 	if bytes.Equal(alias, raw) {
 		t.Fatal("fixture did not produce a field-order alias")
 	}
-	if _, err := ParseAcornFoxSubstrateTreeEnvelopeV1(alias); err == nil {
+	if _, err := parseAcornFoxSubstrateTreeEnvelopeV1(alias); err == nil {
 		t.Fatal("field-order alias accepted")
 	}
 }

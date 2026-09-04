@@ -103,6 +103,9 @@ func (p *TaskAcornFoxSubstratePublisher) Publish(ctx context.Context, stage *Sta
 		return AcornFoxSubstratePublishResult{}, err
 	}
 	defer lock.Close()
+	if err := p.reconcileOwnedTempsLocked(expectedBindingSHA256); err != nil {
+		return AcornFoxSubstratePublishResult{}, err
+	}
 	return p.publishLocked(ctx, stage, expectedBindingSHA256, AcornFoxReconcileAbsent)
 }
 
@@ -220,6 +223,9 @@ func (p *TaskAcornFoxSubstratePublisher) Resume(ctx context.Context, expectedBin
 		return AcornFoxSubstratePublishResult{}, err
 	}
 	defer lock.Close()
+	if err := p.reconcileOwnedTempsLocked(expectedBindingSHA256); err != nil {
+		return AcornFoxSubstratePublishResult{}, err
+	}
 	inspection, err := p.inspectLocked(expectedBindingSHA256)
 	if err != nil {
 		return AcornFoxSubstratePublishResult{}, err
@@ -233,6 +239,26 @@ func (p *TaskAcornFoxSubstratePublisher) Resume(ctx context.Context, expectedBin
 	}
 	defer stage.Close()
 	return p.publishLocked(ctx, stage, expectedBindingSHA256, AcornFoxReconcileResume)
+}
+
+func (p *TaskAcornFoxSubstratePublisher) reconcileOwnedTempsLocked(expectedBindingSHA256 string) error {
+	root, err := p.openRoot()
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	raw, err := acornFoxSubstrateReadControl(p.fs, root, acornFoxSubstrateReceipt, p.uid, p.gid)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return ErrAcornFoxSubstrateConflict
+	}
+	receipt, err := ParseInactiveSubstrateReceiptV1(raw)
+	if err != nil || receipt.CandidateReceipt.BindingSHA256 != expectedBindingSHA256 {
+		return ErrAcornFoxSubstrateConflict
+	}
+	return acornFoxSubstrateRemoveOwnedTemps(p.fs, root, receipt.Entries, p.uid, p.gid)
 }
 
 func acornFoxSubstrateOutcomeError(outcome AcornFoxReconciliationOutcome) error {
@@ -269,14 +295,6 @@ func (p *TaskAcornFoxSubstratePublisher) inspectLocked(expectedBindingSHA256 str
 			return AcornFoxSubstrateInspection{Outcome: AcornFoxReconcileConflict}, nil
 		}
 		handle := &PublishedAcornFoxSubstrateV1{root: root, receipt: receipt, uid: p.uid, gid: p.gid, fs: p.fs}
-		// A completed final can be left beside our task-owned temporary inode
-		// when the prior process lost its post-link cleanup acknowledgement.
-		// A fresh locked publisher can prove and finish that cleanup before
-		// judging terminal evidence; foreign temp entries remain conflict proof.
-		if cleanupErr := acornFoxSubstrateRemoveOwnedTemps(p.fs, root, receipt.Entries, p.uid, p.gid); cleanupErr != nil {
-			handle.root = nil
-			return AcornFoxSubstrateInspection{Outcome: acornFoxSubstrateVerificationOutcome(cleanupErr)}, nil
-		}
 		if verifyErr := handle.Verify(); verifyErr != nil {
 			handle.root = nil
 			return AcornFoxSubstrateInspection{Outcome: acornFoxSubstrateVerificationOutcome(verifyErr)}, nil
@@ -366,13 +384,6 @@ func (p *TaskAcornFoxSubstratePublisher) reopenLocked(expectedBindingSHA256 stri
 	if err != nil || receipt.CandidateReceipt.BindingSHA256 != expectedBindingSHA256 {
 		root.Close()
 		return nil, ErrAcornFoxSubstrateConflict
-	}
-	// A failed post-link cleanup can leave only our private temp inode beside a
-	// durable receipt. It is neither a final entry nor foreign state; remove it
-	// only after the receipt has authenticated its exact directory inventory.
-	if err := acornFoxSubstrateRemoveOwnedTemps(p.fs, root, receipt.Entries, p.uid, p.gid); err != nil {
-		root.Close()
-		return nil, err
 	}
 	handle := &PublishedAcornFoxSubstrateV1{root: root, receipt: receipt, uid: p.uid, gid: p.gid, fs: p.fs, publisher: p}
 	if err := handle.Verify(); err != nil {

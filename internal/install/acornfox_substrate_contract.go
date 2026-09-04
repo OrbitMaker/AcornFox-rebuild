@@ -73,7 +73,7 @@ type SubstrateEntry struct {
 	SHA256 string             `json:"sha256"`
 }
 
-type AcornFoxSubstrateTreeEnvelopeV1 struct {
+type acornFoxSubstrateTreeEnvelopeV1 struct {
 	SchemaVersion int              `json:"schema_version"`
 	Entries       []SubstrateEntry `json:"entries"`
 }
@@ -162,25 +162,25 @@ func ComputeAcornFoxReleaseTreeSHA256(candidate AcornFoxStageReceiptV1, entries 
 	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
-func (e AcornFoxSubstrateTreeEnvelopeV1) Validate() error {
+func (e acornFoxSubstrateTreeEnvelopeV1) Validate() error {
 	if e.SchemaVersion != AcornFoxSubstrateTreeV1Schema {
 		return errors.New("AcornFox substrate tree schema is invalid")
 	}
 	return validateAcornFoxSubstrateEntries(e.Entries)
 }
 
-func ParseAcornFoxSubstrateTreeEnvelopeV1(raw []byte) (AcornFoxSubstrateTreeEnvelopeV1, error) {
-	var envelope AcornFoxSubstrateTreeEnvelopeV1
+func parseAcornFoxSubstrateTreeEnvelopeV1(raw []byte) (acornFoxSubstrateTreeEnvelopeV1, error) {
+	var envelope acornFoxSubstrateTreeEnvelopeV1
 	if err := strictCanonicalJSON(raw, &envelope, "AcornFox substrate tree envelope"); err != nil {
-		return AcornFoxSubstrateTreeEnvelopeV1{}, err
+		return acornFoxSubstrateTreeEnvelopeV1{}, err
 	}
 	if err := envelope.Validate(); err != nil {
-		return AcornFoxSubstrateTreeEnvelopeV1{}, err
+		return acornFoxSubstrateTreeEnvelopeV1{}, err
 	}
 	return envelope, nil
 }
 
-func MarshalAcornFoxSubstrateTreeEnvelopeV1(envelope AcornFoxSubstrateTreeEnvelopeV1) ([]byte, error) {
+func marshalAcornFoxSubstrateTreeEnvelopeV1(envelope acornFoxSubstrateTreeEnvelopeV1) ([]byte, error) {
 	if err := envelope.Validate(); err != nil {
 		return nil, err
 	}
@@ -192,7 +192,7 @@ func MarshalAcornFoxSubstrateTreeEnvelopeV1(envelope AcornFoxSubstrateTreeEnvelo
 // are already required to be strictly sorted; no caller-controlled hash shape
 // exists here.
 func ComputeAcornFoxSubstrateTreeSHA256(entries []SubstrateEntry) (string, error) {
-	raw, err := MarshalAcornFoxSubstrateTreeEnvelopeV1(AcornFoxSubstrateTreeEnvelopeV1{SchemaVersion: AcornFoxSubstrateTreeV1Schema, Entries: entries})
+	raw, err := marshalAcornFoxSubstrateTreeEnvelopeV1(acornFoxSubstrateTreeEnvelopeV1{SchemaVersion: AcornFoxSubstrateTreeV1Schema, Entries: entries})
 	if err != nil {
 		return "", err
 	}
