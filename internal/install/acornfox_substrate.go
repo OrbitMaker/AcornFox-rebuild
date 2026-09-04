@@ -54,6 +54,25 @@ type PublishedAcornFoxSubstrateV1 struct {
 	fs       acornFoxSubstrateFS
 }
 
+// sameAcornFoxLiveTaskRoot compares descriptor-root identities only.  It is
+// used by the package-private repository lease and never reopens a caller
+// supplied path.
+func sameAcornFoxLiveTaskRoot(store *TaskAcornFoxRepoStore, substrate *PublishedAcornFoxSubstrateV1) bool {
+	if store == nil || store.root == nil || substrate == nil || substrate.root == nil {
+		return false
+	}
+	storeInfo, storeErr := store.fs.lstat(store.root, ".")
+	substrateInfo, substrateErr := substrate.fs.lstat(substrate.root, ".")
+	return storeErr == nil && substrateErr == nil && os.SameFile(storeInfo, substrateInfo) && verifyOwner(storeInfo, store.uid, store.gid) == nil && verifyOwner(substrateInfo, substrate.uid, substrate.gid) == nil
+}
+
+func (h *PublishedAcornFoxSubstrateV1) openLiveSourceRoot() (*os.Root, error) {
+	if h == nil || h.root == nil || h.Verify() != nil {
+		return nil, ErrAcornFoxSubstrateConflict
+	}
+	return h.fs.openRoot(h.root, ".")
+}
+
 func NewTaskAcornFoxSubstratePublisher(taskRoot string, uid, gid int) (*TaskAcornFoxSubstratePublisher, error) {
 	fs := newAcornFoxSubstrateFS()
 	if uid < 0 || gid < 0 || !safeAbsoluteDurableRoot(taskRoot) || forbiddenAcornFoxStageRoot(taskRoot) {

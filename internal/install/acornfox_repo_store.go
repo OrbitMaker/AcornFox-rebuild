@@ -229,6 +229,46 @@ func (s *TaskAcornFoxRepoStore) ownsLock() bool {
 	return s != nil && s.lock != nil && s.lock.file != nil
 }
 
+// acornFoxPreparedRepoLease is intentionally package-private authority.  A
+// caller cannot supply a root, version, account, unit, or path: the lease pins
+// the store descriptor, an exact PREPARED journal, and the verified substrate
+// while retaining the store lock until the materializer is finished.
+type acornFoxPreparedRepoLease struct {
+	store     *TaskAcornFoxRepoStore
+	lock      AcornFoxRepoStoreLock
+	journal   AcornFoxRepoJournalV1
+	substrate *PublishedAcornFoxSubstrateV1
+}
+
+func (s *TaskAcornFoxRepoStore) mintPreparedLease(ctx context.Context, substrate *PublishedAcornFoxSubstrateV1, bindingSHA256 string) (*acornFoxPreparedRepoLease, error) {
+	if ctx == nil || ctx.Err() != nil || s == nil || substrate == nil || !validSHA(bindingSHA256) || s.ownsLock() {
+		return nil, ErrAcornFoxRepoConflict
+	}
+	lock, err := s.Acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	fail := func() (*acornFoxPreparedRepoLease, error) { _ = lock.Release(); return nil, ErrAcornFoxRepoConflict }
+	journal, err := s.Load(ctx)
+	if err != nil || (journal.Phase != AcornFoxRepoPrepared && journal.Phase != AcornFoxRepoLiveMaterialized && journal.Phase != AcornFoxRepoStaticVerified) || journal.NeedsRecovery || journal.BindingSHA256 != bindingSHA256 || substrate.Verify() != nil || !sameAcornFoxLiveTaskRoot(s, substrate) {
+		return fail()
+	}
+	raw, err := MarshalInactiveSubstrateReceiptV1(substrate.receipt)
+	if err != nil || sha256Hex(raw) != journal.SubstrateReceiptSHA256 || substrate.receipt.CandidateReceipt.BindingSHA256 != bindingSHA256 {
+		return fail()
+	}
+	return &acornFoxPreparedRepoLease{store: s, lock: lock, journal: journal, substrate: substrate}, nil
+}
+
+func (l *acornFoxPreparedRepoLease) Release() error {
+	if l == nil || l.lock == nil || l.store == nil || !l.store.ownsLock() {
+		return ErrAcornFoxRepoConflict
+	}
+	lock := l.lock
+	l.lock, l.store, l.substrate = nil, nil, nil
+	return lock.Release()
+}
+
 func (s *TaskAcornFoxRepoStore) syncDirectory(root *os.Root, name string) error {
 	file, err := s.fs.openFile(root, name, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
