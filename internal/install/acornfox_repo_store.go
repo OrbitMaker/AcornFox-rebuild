@@ -265,7 +265,7 @@ func (s *TaskAcornFoxRepoStore) mintLiveVerifiedLease(ctx context.Context, subst
 		return fail()
 	}
 	defer root.Close()
-	raw, err := root.ReadFile(acornFoxLiveReceipt)
+	raw, err := s.readExactLiveReceipt(root)
 	if err != nil {
 		return fail()
 	}
@@ -273,7 +273,30 @@ func (s *TaskAcornFoxRepoStore) mintLiveVerifiedLease(ctx context.Context, subst
 	if err != nil || receipt.BindingSHA256 != bindingSHA256 || receipt.SubstrateReceiptSHA256 != prepared.journal.SubstrateReceiptSHA256 || receipt.ReleaseID != substrate.receipt.CandidateReceipt.ReleaseID || receipt.LiveTreeSHA256 != prepared.journal.LiveTreeSHA256 || receipt.OwnershipPlanSHA256 != prepared.journal.OwnershipPlanSHA256 || receipt.StaticSetSHA256 != prepared.journal.StaticSetSHA256 {
 		return fail()
 	}
+	entries, err := acornFoxLiveExpectedEntries(substrate)
+	if err != nil || acornFoxLiveVerifyTarget(root, s, entries, receipt) != nil {
+		return fail()
+	}
 	return &acornFoxLiveVerifiedLease{prepared: prepared, receipt: receipt}, nil
+}
+
+func (s *TaskAcornFoxRepoStore) readExactLiveReceipt(root *os.Root) ([]byte, error) {
+	before, err := s.fs.lstat(root, acornFoxLiveReceipt)
+	if err != nil || !safeAcornFoxRepoFile(before, s.uid, s.gid) || before.Size() < 1 || before.Size() > acornFoxRepoMaxJournalSize {
+		return nil, ErrAcornFoxRepoConflict
+	}
+	file, err := s.fs.openFile(root, acornFoxLiveReceipt, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, ErrAcornFoxRepoConflict
+	}
+	opened, statErr := file.Stat()
+	raw, readErr := io.ReadAll(io.LimitReader(file, acornFoxRepoMaxJournalSize+1))
+	closeErr := file.Close()
+	after, afterErr := s.fs.lstat(root, acornFoxLiveReceipt)
+	if statErr != nil || readErr != nil || closeErr != nil || afterErr != nil || !safeAcornFoxRepoFile(opened, s.uid, s.gid) || !safeAcornFoxRepoFile(after, s.uid, s.gid) || !os.SameFile(before, opened) || !os.SameFile(before, after) || len(raw) < 1 || len(raw) > acornFoxRepoMaxJournalSize {
+		return nil, ErrAcornFoxRepoConflict
+	}
+	return raw, nil
 }
 func (l *acornFoxLiveVerifiedLease) Release() error {
 	if l == nil || l.prepared == nil {

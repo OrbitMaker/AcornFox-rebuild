@@ -166,3 +166,104 @@ func TestAcornFoxLiveMaterializeDoesNotReturnReceiptWhenLeaseReleaseFails(t *tes
 		t.Fatalf("fresh retry=%v", err)
 	}
 }
+
+func TestAcornFoxLiveVerifiedLeaseRejectsReceiptAndTreeDrift(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		apply func(*testing.T, string, InactiveSubstrateReceiptV1)
+	}{
+		{"receipt-symlink", func(t *testing.T, root string, _ InactiveSubstrateReceiptV1) {
+			path := filepath.Join(root, acornFoxLiveReceipt)
+			if err := os.Remove(path); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink("elsewhere", path); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"receipt-hardlink", func(t *testing.T, root string, _ InactiveSubstrateReceiptV1) {
+			if err := os.Link(filepath.Join(root, acornFoxLiveReceipt), filepath.Join(root, "receipt-link")); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"receipt-mode", func(t *testing.T, root string, _ InactiveSubstrateReceiptV1) {
+			if err := os.Chmod(filepath.Join(root, acornFoxLiveReceipt), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"receipt-noncanonical", func(t *testing.T, root string, _ InactiveSubstrateReceiptV1) {
+			path := filepath.Join(root, acornFoxLiveReceipt)
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = os.WriteFile(path, append(raw, ' '), durableFileMode); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"release-helper", func(t *testing.T, root string, r InactiveSubstrateReceiptV1) {
+			if err := os.WriteFile(filepath.Join(root, acornFoxLiveDir, filepath.FromSlash(AcornFoxHealthcheckHelperPath(r.CandidateReceipt))), []byte("x"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"extra-live", func(t *testing.T, root string, _ InactiveSubstrateReceiptV1) {
+			if err := os.WriteFile(filepath.Join(root, acornFoxLiveDir, "extra"), []byte("x"), durableFileMode); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"missing-live", func(t *testing.T, root string, _ InactiveSubstrateReceiptV1) {
+			if err := os.Remove(filepath.Join(root, acornFoxLiveDir, filepath.FromSlash(AcornFoxUpgradeHelperPath))); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root, _, published, substrate := newAcornFox03CPublished(t)
+			store := newAcornFoxLiveStore(t, root, published, substrate)
+			if _, err := materializeAcornFoxLive(context.Background(), store, published, substrate.CandidateReceipt.BindingSHA256); err != nil {
+				t.Fatal(err)
+			}
+			test.apply(t, root, substrate)
+			if lease, err := store.mintLiveVerifiedLease(context.Background(), published, substrate.CandidateReceipt.BindingSHA256); !errors.Is(err, ErrAcornFoxRepoConflict) || lease != nil {
+				t.Fatalf("lease=%#v err=%v", lease, err)
+			}
+			journal, err := store.Resume(context.Background())
+			if err != nil || journal.Phase != AcornFoxRepoStaticVerified {
+				t.Fatalf("journal=%#v err=%v", journal, err)
+			}
+		})
+	}
+}
+
+func TestAcornFoxLiveVerifiedLeaseRequiresVerifiedTreeAndReplays(t *testing.T) {
+	root, _, published, substrate := newAcornFox03CPublished(t)
+	store := newAcornFoxLiveStore(t, root, published, substrate)
+	if _, err := materializeAcornFoxLive(context.Background(), store, published, substrate.CandidateReceipt.BindingSHA256); err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.mintLiveVerifiedLease(context.Background(), published, substrate.CandidateReceipt.BindingSHA256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.receipt.ReleaseID != substrate.CandidateReceipt.ReleaseID {
+		t.Fatal("lease did not pin receipt")
+	}
+	other, err := NewTaskAcornFoxRepoStore(root, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	if blocked, lockErr := other.mintLiveVerifiedLease(context.Background(), published, substrate.CandidateReceipt.BindingSHA256); blocked != nil || !errors.Is(lockErr, ErrAcornFoxRepoLocked) {
+		t.Fatalf("lock lifetime lease=%#v err=%v", blocked, lockErr)
+	}
+	if err = first.Release(); err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.mintLiveVerifiedLease(context.Background(), published, substrate.CandidateReceipt.BindingSHA256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = second.Release(); err != nil {
+		t.Fatal(err)
+	}
+}
