@@ -239,7 +239,7 @@ func acornFoxSubstrateCreateDirs(fs acornFoxSubstrateFS, root *os.Root, entries 
 
 func acornFoxSubstrateCopyFiles(fs acornFoxSubstrateFS, ctx context.Context, target, source *os.Root, entries []SubstrateEntry, candidate AcornFoxStageReceiptV1, uid, gid int) error {
 	prefix := "opt/acornfox/releases/" + candidate.ReleaseID + "/"
-	if err := acornFoxSubstrateRemoveOwnedTemps(fs, target, entries, uid, gid); err != nil {
+	if err := acornFoxSubstrateRemoveOwnedTemps(fs, target, entries, acornFoxSubstrateReleaseControlPath(candidate.ReleaseID), uid, gid); err != nil {
 		return err
 	}
 	for index := range entries {
@@ -303,35 +303,21 @@ func acornFoxSubstrateWriteReleaseControl(fs acornFoxSubstrateFS, root *os.Root,
 	if err != nil {
 		return err
 	}
-	path := acornFoxSubstrateTarget("var/lib/acornfox/install/releases/" + receipt.CandidateReceipt.ReleaseID + ".json")
-	file, err := fs.openFile(root, path, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
-	if errors.Is(err, os.ErrExist) {
-		existing, readErr := acornFoxSubstrateReadControl(fs, root, path, uid, gid)
-		if readErr == nil && string(existing) == string(raw) {
-			return nil
+	path := acornFoxSubstrateReleaseControlPath(receipt.CandidateReceipt.ReleaseID)
+	if err := acornFoxSubstrateReconcileControlTemp(fs, root, path, raw, uid, gid); err != nil {
+		return err
+	}
+	return acornFoxSubstrateAtomicFile(fs, root, path, raw, 0o600, uid, gid, func(got []byte) error {
+		parsed, err := ParseInactiveSubstrateReceiptV1(got)
+		if err != nil || parsed.CandidateReceipt.BindingSHA256 != receipt.CandidateReceipt.BindingSHA256 || string(got) != string(raw) {
+			return errors.New("AcornFox substrate release control is invalid")
 		}
-		return ErrAcornFoxSubstrateConflict
-	}
-	if err != nil {
-		return err
-	}
-	if err = acornFoxSubstrateWriteFully(file, raw); err == nil {
-		err = file.Chmod(0o600)
-	}
-	if err == nil {
-		err = file.Chown(uid, gid)
-	}
-	if err == nil {
-		err = file.Sync()
-	}
-	closeErr := file.Close()
-	if err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		return err
-	}
-	return fs.syncDirectory(root, parentDirectory(path))
+		return nil
+	})
+}
+
+func acornFoxSubstrateReleaseControlPath(releaseID string) string {
+	return acornFoxSubstrateTarget("var/lib/acornfox/install/releases/" + releaseID + ".json")
 }
 
 func acornFoxSubstrateAtomicCopy(fs acornFoxSubstrateFS, root *os.Root, final string, input acornFoxSubstrateFile, entry SubstrateEntry, uid, gid int) error {
@@ -424,6 +410,12 @@ func acornFoxSubstrateAtomic(fs acornFoxSubstrateFS, root *os.Root, final string
 		}
 		return err
 	}
+	if !errors.Is(linkErr, os.ErrExist) {
+		same, sameErr := acornFoxSubstrateSameFile(fs, root, temp, final)
+		if sameErr != nil || !same {
+			return ErrAcornFoxSubstrateConflict
+		}
+	}
 	if err = fs.syncDirectory(root, parent); err != nil {
 		return err
 	}
@@ -431,6 +423,18 @@ func acornFoxSubstrateAtomic(fs acornFoxSubstrateFS, root *os.Root, final string
 		return err
 	}
 	return fs.syncDirectory(root, parent)
+}
+
+func acornFoxSubstrateSameFile(fs acornFoxSubstrateFS, root *os.Root, first, second string) (bool, error) {
+	firstInfo, err := fs.lstat(root, first)
+	if err != nil {
+		return false, err
+	}
+	secondInfo, err := fs.lstat(root, second)
+	if err != nil {
+		return false, err
+	}
+	return os.SameFile(firstInfo, secondInfo), nil
 }
 
 func acornFoxSubstrateVerifyFinal(fs acornFoxSubstrateFS, root *os.Root, path string, verify func(acornFoxSubstrateFile) error) error {
@@ -462,24 +466,35 @@ func readAcornFoxSubstrateFile(file acornFoxSubstrateFile) ([]byte, error) {
 }
 
 func acornFoxSubstrateReadControl(fs acornFoxSubstrateFS, root *os.Root, path string, uid, gid int) ([]byte, error) {
-	file, err := fs.openFile(root, path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	raw, info, err := acornFoxSubstrateReadControlEvidence(fs, root, path, uid, gid)
 	if err != nil {
 		return nil, err
 	}
-	info, statErr := file.Stat()
-	if statErr != nil || !acornFoxSubstrateControlMetadata(info, uid, gid) || !acornFoxSubstrateSingleLink(info) {
-		_ = file.Close()
+	if !acornFoxSubstrateSingleLink(info) {
 		return nil, errors.New("AcornFox substrate control metadata is invalid")
+	}
+	return raw, nil
+}
+
+func acornFoxSubstrateReadControlEvidence(fs acornFoxSubstrateFS, root *os.Root, path string, uid, gid int) ([]byte, os.FileInfo, error) {
+	file, err := fs.openFile(root, path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	info, statErr := file.Stat()
+	if statErr != nil || !acornFoxSubstrateControlMetadata(info, uid, gid) {
+		_ = file.Close()
+		return nil, nil, errors.New("AcornFox substrate control metadata is invalid")
 	}
 	raw, readErr := readAcornFoxSubstrateFileBounded(file, acornFoxHelperReceiptMaxBytes)
 	closeErr := file.Close()
 	if readErr != nil {
-		return nil, readErr
+		return nil, nil, readErr
 	}
 	if closeErr != nil {
-		return nil, closeErr
+		return nil, nil, closeErr
 	}
-	return raw, nil
+	return raw, info, nil
 }
 
 // acornFoxSubstrateReadTerminalReceipt admits the one recoverable post-link
@@ -487,22 +502,9 @@ func acornFoxSubstrateReadControl(fs acornFoxSubstrateFS, root *os.Root, path st
 // one authenticated inode. Inspection remains read-only; Publish or Resume
 // later removes that owned temporary inode while holding the task lock.
 func acornFoxSubstrateReadTerminalReceipt(fs acornFoxSubstrateFS, root *os.Root, uid, gid int) ([]byte, error) {
-	file, err := fs.openFile(root, acornFoxSubstrateReceipt, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	raw, info, err := acornFoxSubstrateReadControlEvidence(fs, root, acornFoxSubstrateReceipt, uid, gid)
 	if err != nil {
 		return nil, err
-	}
-	info, statErr := file.Stat()
-	if statErr != nil || !acornFoxSubstrateControlMetadata(info, uid, gid) {
-		_ = file.Close()
-		return nil, errors.New("AcornFox substrate receipt metadata is invalid")
-	}
-	raw, readErr := readAcornFoxSubstrateFileBounded(file, acornFoxHelperReceiptMaxBytes)
-	closeErr := file.Close()
-	if readErr != nil {
-		return nil, readErr
-	}
-	if closeErr != nil {
-		return nil, closeErr
 	}
 	if acornFoxSubstrateSingleLink(info) {
 		return raw, nil
@@ -551,6 +553,15 @@ func acornFoxSubstrateControlMetadata(info os.FileInfo, uid, gid int) bool {
 
 func acornFoxSubstrateOwnedTemp(info os.FileInfo, uid, gid int) bool {
 	return acornFoxSubstrateControlMetadata(info, uid, gid) && info.Mode()&os.ModeSymlink == 0
+}
+
+func acornFoxSubstrateTempName(name string) bool {
+	suffix, ok := strings.CutPrefix(name, acornFoxSubstrateTempPrefix)
+	if !ok || len(suffix) != 32 {
+		return false
+	}
+	_, err := hex.DecodeString(suffix)
+	return err == nil
 }
 
 func acornFoxSubstrateTerminalTemp(info, receipt os.FileInfo, uid, gid int) bool {
@@ -660,13 +671,14 @@ func acornFoxSubstrateCopyFully(output, input acornFoxSubstrateFile) error {
 
 // Only a regular temporary file owned by this task may be removed. Foreign
 // files, symlinks, and final paths remain evidence and are never cleaned.
-func acornFoxSubstrateRemoveOwnedTemps(fs acornFoxSubstrateFS, root *os.Root, entries []SubstrateEntry, uid, gid int) error {
+func acornFoxSubstrateRemoveOwnedTemps(fs acornFoxSubstrateFS, root *os.Root, entries []SubstrateEntry, exemptDirectory string, uid, gid int) error {
 	directories := map[string]struct{}{acornFoxSubstrateDir: {}, acornFoxSubstrateRootfs: {}}
 	for _, entry := range entries {
 		if entry.Kind == SubstrateEntryDirectory {
 			directories[acornFoxSubstrateTarget(entry.Path)] = struct{}{}
 		}
 	}
+	delete(directories, parentDirectory(exemptDirectory))
 	ordered := make([]string, 0, len(directories))
 	for directory := range directories {
 		ordered = append(ordered, directory)
@@ -703,4 +715,54 @@ func acornFoxSubstrateRemoveOwnedTemps(fs acornFoxSubstrateFS, root *os.Root, en
 		}
 	}
 	return nil
+}
+
+// acornFoxSubstrateReconcileControlTemp cleans only the prior atomic control
+// write that carries this exact canonical receipt. A linked temp additionally
+// has to be the final control inode; a name prefix never grants cleanup rights.
+func acornFoxSubstrateReconcileControlTemp(fs acornFoxSubstrateFS, root *os.Root, final string, expected []byte, uid, gid int) error {
+	parent := parentDirectory(final)
+	dir, err := fs.openFile(root, parent, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return err
+	}
+	children, readErr := dir.ReadDir(-1)
+	closeErr := dir.Close()
+	if readErr != nil {
+		return readErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	finalRaw, finalInfo, finalErr := acornFoxSubstrateReadControlEvidence(fs, root, final, uid, gid)
+	finalMissing := errors.Is(finalErr, os.ErrNotExist)
+	if !finalMissing && (finalErr != nil || string(finalRaw) != string(expected)) {
+		return ErrAcornFoxSubstrateConflict
+	}
+	var temporary string
+	for _, child := range children {
+		if !strings.HasPrefix(child.Name(), acornFoxSubstrateTempPrefix) {
+			continue
+		}
+		path := filepath.ToSlash(filepath.Join(parent, child.Name()))
+		info, lstatErr := fs.lstat(root, path)
+		if lstatErr != nil || !acornFoxSubstrateOwnedTemp(info, uid, gid) || !acornFoxSubstrateTempName(child.Name()) || temporary != "" {
+			return ErrAcornFoxSubstrateConflict
+		}
+		temporary = path
+		if finalMissing && acornFoxSubstrateSingleLink(info) {
+			continue
+		}
+		raw, evidence, readErr := acornFoxSubstrateReadControlEvidence(fs, root, path, uid, gid)
+		if readErr != nil || string(raw) != string(expected) || !os.SameFile(info, evidence) || finalMissing || !acornFoxSubstrateTerminalTemp(info, finalInfo, uid, gid) {
+			return ErrAcornFoxSubstrateConflict
+		}
+	}
+	if temporary == "" {
+		return nil
+	}
+	if err := fs.remove(root, temporary); err != nil {
+		return err
+	}
+	return fs.syncDirectory(root, parent)
 }

@@ -211,6 +211,40 @@ func TestTaskAcornFoxSubstratePublisherRejectsConflictingBindingWithoutOverwrite
 	}
 }
 
+func TestTaskAcornFoxSubstratePublisherRejectsDifferentTaskRootBeforePublisherState(t *testing.T) {
+	stageRoot, publisherRoot := t.TempDir(), t.TempDir()
+	for _, root := range []string{stageRoot, publisherRoot} {
+		if err := os.Chmod(root, acornFoxStageDirMode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stager, err := NewTaskAcornFoxStager(stageRoot, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stager.Close()
+	stage, receipt, err := stager.Stage(newAcornFoxFixture(t, "1.2.3-test.1", nil).input(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stage.Close()
+	publisher, err := NewTaskAcornFoxSubstratePublisher(publisherRoot, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer publisher.Close()
+	if _, err := publisher.Publish(context.Background(), &stage, receipt.BindingSHA256); err == nil {
+		t.Fatal("publisher accepted a stage from another task root")
+	}
+	for _, root := range []string{stageRoot, publisherRoot} {
+		for _, relative := range []string{acornFoxSubstrateLock, acornFoxSubstrateDir, acornFoxSubstrateIntent, acornFoxSubstrateRootfs} {
+			if _, err := os.Lstat(filepath.Join(root, relative)); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("root=%s publisher state %s err=%v", root, relative, err)
+			}
+		}
+	}
+}
+
 func TestTaskAcornFoxSubstratePublisherResumeFindsOnlyMatchingFreshStage(t *testing.T) {
 	root := t.TempDir()
 	if err := os.Chmod(root, acornFoxStageDirMode); err != nil {
@@ -729,6 +763,241 @@ func TestTaskAcornFoxSubstratePublisherFilesystemFaultEvidence(t *testing.T) {
 			inspection, err := fresh.Inspect(receipt.BindingSHA256)
 			if err != nil || inspection.Outcome != test.outcome {
 				t.Fatalf("inspection=%#v err=%v", inspection, err)
+			}
+		})
+	}
+}
+
+func TestTaskAcornFoxSubstratePublisherReleaseControlFaultsResumeFromFreshState(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		apply func(*TaskAcornFoxSubstratePublisher, string)
+	}{
+		{"partial_write_error", func(p *TaskAcornFoxSubstratePublisher, release string) {
+			base, once := p.fs, false
+			p.fs.openFile = func(root *os.Root, path string, flags int, mode os.FileMode) (acornFoxSubstrateFile, error) {
+				file, err := base.openFile(root, path, flags, mode)
+				if err != nil || once || !strings.HasPrefix(path, parentDirectory(release)+"/"+acornFoxSubstrateTempPrefix) || flags&os.O_CREATE == 0 {
+					return file, err
+				}
+				once = true
+				return acornFoxSubstrateTestFile{acornFoxSubstrateFile: file, write: func(file acornFoxSubstrateFile, raw []byte) (int, error) {
+					n, writeErr := file.Write(raw[:1])
+					if writeErr != nil {
+						return n, writeErr
+					}
+					return n, errAcornFoxSubstrateInjected
+				}}, nil
+			}
+		}},
+		{"chown_after_effect", func(p *TaskAcornFoxSubstratePublisher, release string) {
+			base, once := p.fs, false
+			p.fs.openFile = func(root *os.Root, path string, flags int, mode os.FileMode) (acornFoxSubstrateFile, error) {
+				file, err := base.openFile(root, path, flags, mode)
+				if err != nil || once || !strings.HasPrefix(path, parentDirectory(release)+"/"+acornFoxSubstrateTempPrefix) || flags&os.O_CREATE == 0 {
+					return file, err
+				}
+				once = true
+				return acornFoxSubstrateTestFile{acornFoxSubstrateFile: file, chown: func(file acornFoxSubstrateFile, uid, gid int) error {
+					if err := file.Chown(uid, gid); err != nil {
+						return err
+					}
+					return errAcornFoxSubstrateInjected
+				}}, nil
+			}
+		}},
+		{"sync_after_effect", func(p *TaskAcornFoxSubstratePublisher, release string) {
+			base, once := p.fs, false
+			p.fs.openFile = func(root *os.Root, path string, flags int, mode os.FileMode) (acornFoxSubstrateFile, error) {
+				file, err := base.openFile(root, path, flags, mode)
+				if err != nil || once || !strings.HasPrefix(path, parentDirectory(release)+"/"+acornFoxSubstrateTempPrefix) || flags&os.O_CREATE == 0 {
+					return file, err
+				}
+				once = true
+				return acornFoxSubstrateTestFile{acornFoxSubstrateFile: file, sync: func(file acornFoxSubstrateFile) error {
+					if err := file.Sync(); err != nil {
+						return err
+					}
+					return errAcornFoxSubstrateInjected
+				}}, nil
+			}
+		}},
+		{"close_after_effect", func(p *TaskAcornFoxSubstratePublisher, release string) {
+			base, once := p.fs, false
+			p.fs.openFile = func(root *os.Root, path string, flags int, mode os.FileMode) (acornFoxSubstrateFile, error) {
+				file, err := base.openFile(root, path, flags, mode)
+				if err != nil || once || !strings.HasPrefix(path, parentDirectory(release)+"/"+acornFoxSubstrateTempPrefix) || flags&os.O_CREATE == 0 {
+					return file, err
+				}
+				once = true
+				return acornFoxSubstrateTestFile{acornFoxSubstrateFile: file, close: func(file acornFoxSubstrateFile) error {
+					if err := file.Close(); err != nil {
+						return err
+					}
+					return errAcornFoxSubstrateInjected
+				}}, nil
+			}
+		}},
+		{"link_after_effect", func(p *TaskAcornFoxSubstratePublisher, release string) {
+			base := p.fs
+			p.fs.link = func(root *os.Root, oldName, newName string) error {
+				err := base.link(root, oldName, newName)
+				if err == nil && newName == release {
+					return errAcornFoxSubstrateInjected
+				}
+				return err
+			}
+		}},
+		{"parent_sync_after_effect", func(p *TaskAcornFoxSubstratePublisher, release string) {
+			base, armed := p.fs, false
+			p.fs.link = func(root *os.Root, oldName, newName string) error {
+				err := base.link(root, oldName, newName)
+				if err == nil && newName == release {
+					armed = true
+				}
+				return err
+			}
+			p.fs.openFile = func(root *os.Root, path string, flags int, mode os.FileMode) (acornFoxSubstrateFile, error) {
+				file, err := base.openFile(root, path, flags, mode)
+				if err != nil || !armed || path != parentDirectory(release) || flags&os.O_WRONLY != 0 {
+					return file, err
+				}
+				armed = false
+				return acornFoxSubstrateTestFile{acornFoxSubstrateFile: file, sync: func(file acornFoxSubstrateFile) error {
+					if err := file.Sync(); err != nil {
+						return err
+					}
+					return errAcornFoxSubstrateInjected
+				}}, nil
+			}
+		}},
+		{"temp_remove_after_effect", func(p *TaskAcornFoxSubstratePublisher, release string) {
+			base, armed := p.fs, false
+			p.fs.link = func(root *os.Root, oldName, newName string) error {
+				err := base.link(root, oldName, newName)
+				if err == nil && newName == release {
+					armed = true
+				}
+				return err
+			}
+			p.fs.remove = func(root *os.Root, path string) error {
+				err := base.remove(root, path)
+				if err == nil && armed && strings.HasPrefix(path, parentDirectory(release)+"/"+acornFoxSubstrateTempPrefix) {
+					return errAcornFoxSubstrateInjected
+				}
+				return err
+			}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root, publisher, stage, receipt := newAcornFoxSubstrateTestPublisher(t)
+			release := acornFoxSubstrateReleaseControlPath(receipt.ReleaseID)
+			test.apply(publisher, release)
+			if _, err := publisher.Publish(context.Background(), stage, receipt.BindingSHA256); err == nil {
+				t.Fatal("faulted release control publish succeeded")
+			}
+			fresh, err := NewTaskAcornFoxSubstratePublisher(root, os.Getuid(), os.Getgid())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer fresh.Close()
+			if inspection, err := fresh.Inspect(receipt.BindingSHA256); err != nil || inspection.Outcome != AcornFoxReconcileResume {
+				t.Fatalf("inspection=%#v err=%v", inspection, err)
+			}
+			result, err := fresh.Resume(context.Background(), receipt.BindingSHA256)
+			if err != nil || result.Outcome != AcornFoxReconcileCompleted {
+				t.Fatalf("resume=%#v err=%v", result, err)
+			}
+		})
+	}
+}
+
+func TestTaskAcornFoxSubstrateReleaseControlExistingFinalEvidence(t *testing.T) {
+	t.Run("canonical final is idempotent", func(t *testing.T) {
+		_, publisher, stage, candidate := newAcornFoxSubstrateTestPublisher(t)
+		result, err := publisher.Publish(context.Background(), stage, candidate.BindingSHA256)
+		if err != nil {
+			t.Fatal(err)
+		}
+		root, err := publisher.openRoot()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer root.Close()
+		if err := acornFoxSubstrateWriteReleaseControl(publisher.fs, root, result.Receipt, publisher.uid, publisher.gid); err != nil {
+			t.Fatalf("canonical replay=%v", err)
+		}
+	})
+
+	for _, test := range []struct {
+		name   string
+		mutate func(string, *TaskAcornFoxSubstratePublisher)
+	}{
+		{"foreign partial", func(path string, _ *TaskAcornFoxSubstratePublisher) {
+			if err := os.WriteFile(path, []byte("foreign partial"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"wrong mode", func(path string, _ *TaskAcornFoxSubstratePublisher) {
+			if err := os.Chmod(path, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"wrong owner evidence", func(_ string, publisher *TaskAcornFoxSubstratePublisher) {
+			base := publisher.fs
+			publisher.fs.openFile = func(root *os.Root, path string, flags int, mode os.FileMode) (acornFoxSubstrateFile, error) {
+				file, err := base.openFile(root, path, flags, mode)
+				if err != nil || !strings.HasSuffix(path, ".json") || flags&os.O_WRONLY != 0 {
+					return file, err
+				}
+				return acornFoxSubstrateTestFile{acornFoxSubstrateFile: file, stat: func(file acornFoxSubstrateFile) (os.FileInfo, error) {
+					info, statErr := file.Stat()
+					if statErr != nil {
+						return info, statErr
+					}
+					stat, ok := info.Sys().(*syscall.Stat_t)
+					if !ok {
+						return nil, errors.New("test cannot alter owner evidence")
+					}
+					copyStat := *stat
+					copyStat.Uid++
+					return ownerMismatchFileInfo{FileInfo: info, stat: copyStat}, nil
+				}}, nil
+			}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			rootPath, publisher, stage, candidate := newAcornFoxSubstrateTestPublisher(t)
+			result, err := publisher.Publish(context.Background(), stage, candidate.BindingSHA256)
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(rootPath, filepath.FromSlash(acornFoxSubstrateReleaseControlPath(result.Receipt.CandidateReceipt.ReleaseID)))
+			if test.name == "foreign partial" {
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+			}
+			test.mutate(path, publisher)
+			before, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			root, err := publisher.openRoot()
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = acornFoxSubstrateWriteReleaseControl(publisher.fs, root, result.Receipt, publisher.uid, publisher.gid)
+			closeErr := root.Close()
+			if err == nil || !errors.Is(err, ErrAcornFoxSubstrateConflict) {
+				t.Fatalf("foreign final error=%v", err)
+			}
+			if closeErr != nil {
+				t.Fatal(closeErr)
+			}
+			after, err := os.ReadFile(path)
+			if err != nil || string(after) != string(before) {
+				t.Fatalf("foreign final overwritten: before=%q after=%q err=%v", before, after, err)
 			}
 		})
 	}

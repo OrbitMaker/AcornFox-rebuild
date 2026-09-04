@@ -97,6 +97,12 @@ func (p *TaskAcornFoxSubstratePublisher) Close() error {
 
 // Publish creates an inactive substrate only from an absent task-root state.
 func (p *TaskAcornFoxSubstratePublisher) Publish(ctx context.Context, stage *StagedAcornFoxCandidateV1, expectedBindingSHA256 string) (AcornFoxSubstratePublishResult, error) {
+	// Reject a stage from another task root before creating this publisher's
+	// lock or any substrate state. publishLocked repeats the descriptor check
+	// under that lock to preserve the race boundary.
+	if acornFoxStageParentCheckRequired(stage) && !p.ownsStageParent(stage) {
+		return AcornFoxSubstratePublishResult{}, errors.New("AcornFox staged parent is not this task root")
+	}
 	lock, err := p.lock()
 	if err != nil {
 		return AcornFoxSubstratePublishResult{}, err
@@ -106,6 +112,15 @@ func (p *TaskAcornFoxSubstratePublisher) Publish(ctx context.Context, stage *Sta
 		return AcornFoxSubstratePublishResult{}, err
 	}
 	return p.publishLocked(ctx, stage, expectedBindingSHA256, AcornFoxReconcileAbsent)
+}
+
+func acornFoxStageParentCheckRequired(stage *StagedAcornFoxCandidateV1) bool {
+	if stage == nil || stage.state == nil {
+		return true
+	}
+	stage.state.mu.Lock()
+	defer stage.state.mu.Unlock()
+	return stage.state.phase != acornFoxStageConsumed
 }
 
 func (p *TaskAcornFoxSubstratePublisher) publishLocked(ctx context.Context, stage *StagedAcornFoxCandidateV1, expectedBindingSHA256 string, permitted AcornFoxReconciliationOutcome) (AcornFoxSubstratePublishResult, error) {
