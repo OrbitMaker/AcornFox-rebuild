@@ -150,3 +150,76 @@ func TestAcornFoxRepoBootstrapReportsUnknownWhenFailureJournalIsNotPersisted(t *
 		t.Fatalf("err=%v", err)
 	}
 }
+
+func TestAcornFoxRepoBootstrapPointerFaultPrefixesRecoverFresh(t *testing.T) {
+	steps := []string{"pointer-temp", "pointer-link", "pointer-post-link", "pointer-parent-sync", "pointer-readback", "pointer-temp-remove", "pointer-post-remove-sync"}
+	for pointer := 1; pointer <= 3; pointer++ {
+		for _, step := range steps {
+			t.Run(step+"-pointer-"+string(rune('0'+pointer)), func(t *testing.T) {
+				root, store, published, receipt := acornFoxRepoBootstrapFixture(t)
+				old := acornFoxRepoBootstrapFaultStep
+				seen := 0
+				acornFoxRepoBootstrapFaultStep = func(got string) error {
+					if got == step {
+						seen++
+						if seen == pointer {
+							return errors.New("fault")
+						}
+					}
+					return nil
+				}
+				err := prepareAcornFoxRepository(context.Background(), store, published, receipt.CandidateReceipt.BindingSHA256)
+				acornFoxRepoBootstrapFaultStep = old
+				if !errors.Is(err, ErrAcornFoxRepoBootstrapConflict) {
+					t.Fatalf("step=%s pointer=%d err=%v", step, pointer, err)
+				}
+				fresh, err := NewTaskAcornFoxRepoStore(root, os.Getuid(), os.Getgid())
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer fresh.Close()
+				if err = prepareAcornFoxRepository(context.Background(), fresh, published, receipt.CandidateReceipt.BindingSHA256); err != nil {
+					t.Fatalf("step=%s pointer=%d recover=%v", step, pointer, err)
+				}
+			})
+		}
+	}
+}
+
+func TestAcornFoxRepoBootstrapRejectsPhaseExtraWithoutMutation(t *testing.T) {
+	for _, tc := range []struct{ name, fault, extra string }{
+		{"activation", "journal-active", "extra-after-activation"},
+		{"active", "journal-current", "extra-after-active"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root, store, published, receipt := acornFoxRepoBootstrapFixture(t)
+			old := acornFoxRepoBootstrapFaultStep
+			acornFoxRepoBootstrapFaultStep = func(step string) error {
+				if step == tc.fault {
+					return errors.New("fault")
+				}
+				return nil
+			}
+			err := prepareAcornFoxRepository(context.Background(), store, published, receipt.CandidateReceipt.BindingSHA256)
+			acornFoxRepoBootstrapFaultStep = old
+			if !errors.Is(err, ErrAcornFoxRepoBootstrapConflict) {
+				t.Fatalf("fault=%v", err)
+			}
+			extra := filepath.Join(root, acornFoxLiveDir, "opt", "acornfox", "activations", tc.extra)
+			if err = os.Mkdir(extra, durableDirMode); err != nil {
+				t.Fatal(err)
+			}
+			fresh, err := NewTaskAcornFoxRepoStore(root, os.Getuid(), os.Getgid())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer fresh.Close()
+			if err = prepareAcornFoxRepository(context.Background(), fresh, published, receipt.CandidateReceipt.BindingSHA256); err == nil {
+				t.Fatal("extra activation was accepted")
+			}
+			if _, err = os.Lstat(extra); err != nil {
+				t.Fatalf("extra was mutated: %v", err)
+			}
+		})
+	}
+}
