@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/url"
 	"regexp"
@@ -50,13 +49,46 @@ type DecisionV1 struct {
 
 // Witness is produced only by ParseDecisionV1. Its decision is not exported
 // and all accessors return immutable scalar copies.
-type Witness struct{ decision DecisionV1 }
+type Witness struct {
+	decision DecisionV1
+	valid    bool
+}
 
-func (w Witness) Version() string          { return w.decision.Version }
-func (w Witness) ReleaseID() string        { return w.decision.ReleaseID }
-func (w Witness) SourceRepository() string { return w.decision.SourceRepository }
-func (w Witness) SourceCommit() string     { return w.decision.SourceCommit }
-func (w Witness) SHA256() string           { raw, _ := CanonicalDecisionV1(w.decision); return sha256Text(raw) }
+func (w Witness) Valid() bool { return w.valid && w.decision.Validate() == nil }
+func (w Witness) Version() (string, error) {
+	if !w.Valid() {
+		return "", ErrDecision
+	}
+	return w.decision.Version, nil
+}
+func (w Witness) ReleaseID() (string, error) {
+	if !w.Valid() {
+		return "", ErrDecision
+	}
+	return w.decision.ReleaseID, nil
+}
+func (w Witness) SourceRepository() (string, error) {
+	if !w.Valid() {
+		return "", ErrDecision
+	}
+	return w.decision.SourceRepository, nil
+}
+func (w Witness) SourceCommit() (string, error) {
+	if !w.Valid() {
+		return "", ErrDecision
+	}
+	return w.decision.SourceCommit, nil
+}
+func (w Witness) SHA256() (string, error) {
+	if !w.Valid() {
+		return "", ErrDecision
+	}
+	raw, err := CanonicalDecisionV1(w.decision)
+	if err != nil {
+		return "", ErrDecision
+	}
+	return sha256Text(raw), nil
+}
 
 func (d DecisionV1) Validate() error {
 	if d.SchemaVersion != DecisionV1Schema || d.Product != Product || d.Architecture != Architecture || d.Migration != Migration || d.Layout != Layout || !versionText.MatchString(d.Version) || d.ReleaseID != "release-"+d.Version || !validGitHubRepository(d.SourceRepository) || !commitText.MatchString(d.SourceCommit) {
@@ -72,7 +104,7 @@ func (d DecisionV1) Validate() error {
 
 func validGitHubRepository(value string) bool {
 	u, err := url.Parse(value)
-	if err != nil || u.Scheme != "https" || u.Host != "github.com" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || strings.HasSuffix(u.Path, "/") || strings.HasSuffix(u.Path, ".git") {
+	if err != nil || u.Scheme != "https" || u.Host != "github.com" || u.Hostname() != "github.com" || u.Port() != "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.RawPath != "" || strings.HasSuffix(u.Path, "/") || strings.HasSuffix(u.Path, ".git") {
 		return false
 	}
 	parts := strings.Split(strings.TrimPrefix(u.EscapedPath(), "/"), "/")
@@ -103,9 +135,7 @@ func ParseDecisionV1(raw []byte, independentSHA256 string) (Witness, error) {
 	if err != nil || !bytes.Equal(raw, canonical) || sha256Text(raw) != independentSHA256 {
 		return Witness{}, ErrDecision
 	}
-	return Witness{decision: decision}, nil
+	return Witness{decision: decision, valid: true}, nil
 }
 
 func sha256Text(raw []byte) string { sum := sha256.Sum256(raw); return hex.EncodeToString(sum[:]) }
-
-func (d DecisionV1) String() string { return fmt.Sprintf("%s:%s", d.Product, d.ReleaseID) }

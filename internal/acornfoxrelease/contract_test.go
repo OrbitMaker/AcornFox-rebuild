@@ -21,8 +21,26 @@ func decisionRaw(t *testing.T) ([]byte, string) {
 func TestDecisionV1CanonicalWitness(t *testing.T) {
 	raw, digest := decisionRaw(t)
 	witness, err := ParseDecisionV1(raw, digest)
-	if err != nil || witness.Version() != "1.2.3-rc.1" || witness.ReleaseID() != "release-1.2.3-rc.1" || witness.SourceRepository() != "https://github.com/acme/acornfox-fixture" || witness.SourceCommit() != strings.Repeat("a", 40) || witness.SHA256() != digest {
+	version, versionErr := witness.Version()
+	release, releaseErr := witness.ReleaseID()
+	repo, repoErr := witness.SourceRepository()
+	commit, commitErr := witness.SourceCommit()
+	gotDigest, digestErr := witness.SHA256()
+	if err != nil || !witness.Valid() || versionErr != nil || releaseErr != nil || repoErr != nil || commitErr != nil || digestErr != nil || version != "1.2.3-rc.1" || release != "release-1.2.3-rc.1" || repo != "https://github.com/acme/acornfox-fixture" || commit != strings.Repeat("a", 40) || gotDigest != digest {
 		t.Fatalf("witness=%#v err=%v", witness, err)
+	}
+}
+
+func TestDecisionV1ZeroWitnessIsExplicitlyInvalid(t *testing.T) {
+	var witness Witness
+	if witness.Valid() {
+		t.Fatal("zero witness is valid")
+	}
+	if value, err := witness.SHA256(); err == nil || value != "" {
+		t.Fatalf("zero SHA=%q err=%v", value, err)
+	}
+	if value, err := witness.Version(); err == nil || value != "" {
+		t.Fatalf("zero version=%q err=%v", value, err)
 	}
 }
 
@@ -46,6 +64,20 @@ func TestDecisionV1RejectsNonCanonicalAndDigestDrift(t *testing.T) {
 	}
 	if _, err := ParseDecisionV1(append(raw, make([]byte, maxDecisionBytes)...), digest); err == nil {
 		t.Fatal("oversize accepted")
+	}
+}
+
+func TestDecisionV1RejectsHostileGitHubURLs(t *testing.T) {
+	for _, repository := range []string{
+		"https://github.com/acme%2Fother/repo", "https://github.com/acme/%2e%2e", "https://github.com:443/acme/repo", "https://user@github.com/acme/repo", "https://github.com/acme/repo?x=1", "https://github.com/acme/repo?", "https://github.com/acme/repo#fragment", "https://github.com/acme/repo/", "https://github.com/acme/repo.git",
+	} {
+		t.Run(repository, func(t *testing.T) {
+			decision := decisionFixture()
+			decision.SourceRepository = repository
+			if _, err := CanonicalDecisionV1(decision); err == nil {
+				t.Fatal("accepted")
+			}
+		})
 	}
 }
 
