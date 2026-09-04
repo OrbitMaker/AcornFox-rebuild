@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 )
 
 const AcornFoxLiveReceiptV1Schema = 1
@@ -256,6 +257,9 @@ func (r AcornFoxLiveReceiptV1) Validate() error {
 	if err := validateAcornFoxLiveEntries(r.Entries); err != nil {
 		return err
 	}
+	if !acornFoxLiveReleaseEntriesMatch(r.ReleaseID, r.Entries) {
+		return errors.New("AcornFox live receipt release entries are invalid")
+	}
 	if tree, err := acornFoxLiveDigest(r.Entries); err != nil || tree != r.LiveTreeSHA256 {
 		return errors.New("AcornFox live receipt tree digest is invalid")
 	}
@@ -266,6 +270,28 @@ func (r AcornFoxLiveReceiptV1) Validate() error {
 		return errors.New("AcornFox live receipt static set is invalid")
 	}
 	return nil
+}
+
+func acornFoxLiveReleaseEntriesMatch(releaseID string, entries []AcornFoxLiveEntryV1) bool {
+	prefix := "opt/acornfox/releases/"
+	releasePrefix := prefix + releaseID + "/"
+	health, control := false, false
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Path, prefix) {
+			rest := strings.TrimPrefix(entry.Path, prefix)
+			part := strings.SplitN(rest, "/", 2)[0]
+			if part != releaseID || (entry.Path != prefix+releaseID && !strings.HasPrefix(entry.Path, releasePrefix)) {
+				return false
+			}
+			if entry.Path == releasePrefix+"bin/acornfox-healthcheck" && entry.Kind == SubstrateEntryFile {
+				health = true
+			}
+		}
+		if entry.Path == "var/lib/acornfox/install/releases/"+releaseID+".json" && entry.Kind == SubstrateEntryFile {
+			control = true
+		}
+	}
+	return health && control
 }
 
 func MarshalAcornFoxLiveReceiptV1(receipt AcornFoxLiveReceiptV1) ([]byte, error) {

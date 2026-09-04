@@ -240,6 +240,50 @@ type acornFoxPreparedRepoLease struct {
 	substrate *PublishedAcornFoxSubstrateV1
 }
 
+// acornFoxLiveVerifiedLease is the only 04C handoff authority. It couples the
+// current locked journal, same-root sealed substrate, and fixed live receipt;
+// a parsed receipt DTO alone is never authority to continue installation.
+type acornFoxLiveVerifiedLease struct {
+	prepared *acornFoxPreparedRepoLease
+	receipt  AcornFoxLiveReceiptV1
+}
+
+func (s *TaskAcornFoxRepoStore) mintLiveVerifiedLease(ctx context.Context, substrate *PublishedAcornFoxSubstrateV1, bindingSHA256 string) (*acornFoxLiveVerifiedLease, error) {
+	prepared, err := s.mintPreparedLease(ctx, substrate, bindingSHA256)
+	if err != nil {
+		return nil, err
+	}
+	fail := func() (*acornFoxLiveVerifiedLease, error) {
+		_ = prepared.Release()
+		return nil, ErrAcornFoxRepoConflict
+	}
+	if prepared.journal.Phase != AcornFoxRepoStaticVerified || prepared.journal.NeedsRecovery {
+		return fail()
+	}
+	root, err := s.openRoot()
+	if err != nil {
+		return fail()
+	}
+	defer root.Close()
+	raw, err := root.ReadFile(acornFoxLiveReceipt)
+	if err != nil {
+		return fail()
+	}
+	receipt, err := ParseAcornFoxLiveReceiptV1(raw)
+	if err != nil || receipt.BindingSHA256 != bindingSHA256 || receipt.SubstrateReceiptSHA256 != prepared.journal.SubstrateReceiptSHA256 || receipt.ReleaseID != substrate.receipt.CandidateReceipt.ReleaseID || receipt.LiveTreeSHA256 != prepared.journal.LiveTreeSHA256 || receipt.OwnershipPlanSHA256 != prepared.journal.OwnershipPlanSHA256 || receipt.StaticSetSHA256 != prepared.journal.StaticSetSHA256 {
+		return fail()
+	}
+	return &acornFoxLiveVerifiedLease{prepared: prepared, receipt: receipt}, nil
+}
+func (l *acornFoxLiveVerifiedLease) Release() error {
+	if l == nil || l.prepared == nil {
+		return ErrAcornFoxRepoConflict
+	}
+	prepared := l.prepared
+	l.prepared = nil
+	return prepared.Release()
+}
+
 func (s *TaskAcornFoxRepoStore) mintPreparedLease(ctx context.Context, substrate *PublishedAcornFoxSubstrateV1, bindingSHA256 string) (*acornFoxPreparedRepoLease, error) {
 	if ctx == nil || ctx.Err() != nil || s == nil || substrate == nil || !validSHA(bindingSHA256) || s.ownsLock() {
 		return nil, ErrAcornFoxRepoConflict

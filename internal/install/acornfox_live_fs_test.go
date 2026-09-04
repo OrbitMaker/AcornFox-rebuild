@@ -133,7 +133,7 @@ func TestAcornFoxLiveMaterializeFaultStepsFreshResume(t *testing.T) {
 			if journalErr != nil {
 				t.Fatal(journalErr)
 			}
-			expectsRecovery := step != "mkdir" && step != "mkdir-post" && step != "parent-sync"
+			expectsRecovery := step != "mkdir"
 			if journal.NeedsRecovery != expectsRecovery {
 				t.Fatalf("step=%s recovery=%t", step, journal.NeedsRecovery)
 			}

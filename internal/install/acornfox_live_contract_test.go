@@ -1,6 +1,9 @@
 package install
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestAcornFoxLiveReceiptIsCanonicalAndModeled(t *testing.T) {
 	_, _, published, substrate := newAcornFox03CPublished(t)
@@ -54,5 +57,37 @@ func TestAcornFoxLiveModeledOwnerAndGroupAreIndependent(t *testing.T) {
 		if source.Group == GroupRoleEdge && entry.RequestedModeledUser.UID == entry.RequestedModeledGroup.GID {
 			t.Fatal("mixed root:edge reused modeled identity")
 		}
+	}
+}
+
+func TestAcornFoxLiveReceiptBindsReleaseIDToEntries(t *testing.T) {
+	_, _, published, substrate := newAcornFox03CPublished(t)
+	entries, err := acornFoxLiveExpectedEntries(published)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := MarshalInactiveSubstrateReceiptV1(substrate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal := newAcornFoxRepoJournal()
+	journal.BindingSHA256, journal.SubstrateReceiptSHA256 = substrate.CandidateReceipt.BindingSHA256, sha256Hex(raw)
+	prepared, _ := AcornFoxRepoPreparedEvidence(journal.BindingSHA256, journal.SubstrateReceiptSHA256)
+	journal.History[0].EvidenceSHA256 = prepared
+	receipt, err := acornFoxLiveMakeReceipt(journal, published, entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrong := receipt
+	wrong.ReleaseID = "other-release"
+	if wrong.Validate() == nil {
+		t.Fatal("top-level release id detached from entries")
+	}
+	wrong = receipt
+	for i := range wrong.Entries {
+		wrong.Entries[i].Path = strings.Replace(wrong.Entries[i].Path, "opt/acornfox/releases/"+receipt.ReleaseID+"/", "opt/acornfox/releases/other-release/", 1)
+	}
+	if wrong.Validate() == nil {
+		t.Fatal("second release tree accepted")
 	}
 }

@@ -47,6 +47,7 @@ type acornFoxLiveMaterializer struct{ lease *acornFoxPreparedRepoLease }
 
 func (m *acornFoxLiveMaterializer) Materialize(ctx context.Context) (result AcornFoxLiveReceiptV1, returnedErr error) {
 	effectful := false
+	markEffect := func() { effectful = true }
 	defer func() {
 		if returnedErr == nil || !effectful || m == nil || m.lease == nil || m.lease.store == nil || m.lease.journal.NeedsRecovery {
 			return
@@ -93,10 +94,10 @@ func (m *acornFoxLiveMaterializer) Materialize(ctx context.Context) (result Acor
 	if err != nil {
 		return AcornFoxLiveReceiptV1{}, fmt.Errorf("validate existing: %w", ErrAcornFoxLiveConflict)
 	}
-	if err = acornFoxLiveEnsureRoot(target, m.lease.store); err != nil {
+	if err = acornFoxLiveEnsureRoot(target, m.lease.store, markEffect); err != nil {
 		return AcornFoxLiveReceiptV1{}, fmt.Errorf("ensure root: %w", ErrAcornFoxLiveConflict)
 	}
-	if err = acornFoxLiveCleanTemps(target, m.lease.store, m.lease.journal.TransactionID, source, m.lease.substrate, entries); err != nil {
+	if err = acornFoxLiveCleanTemps(target, m.lease.store, m.lease.journal.TransactionID, source, m.lease.substrate, entries, markEffect); err != nil {
 		return AcornFoxLiveReceiptV1{}, fmt.Errorf("clean temps: %w", ErrAcornFoxLiveConflict)
 	}
 	if err = acornFoxLiveValidateExisting(target, m.lease.store, entries, receipt); err != nil {
@@ -110,9 +111,8 @@ func (m *acornFoxLiveMaterializer) Materialize(ctx context.Context) (result Acor
 		}
 		journal, m.lease.journal = next, next
 	}
-	effectful = true
 	for _, entry := range entries {
-		if entry.Kind == SubstrateEntryDirectory && acornFoxLiveEnsureDir(target, m.lease.store, acornFoxLivePath(entry.Path), os.FileMode(entry.Mode)) != nil {
+		if entry.Kind == SubstrateEntryDirectory && acornFoxLiveEnsureDir(target, m.lease.store, acornFoxLivePath(entry.Path), os.FileMode(entry.Mode), markEffect) != nil {
 			return AcornFoxLiveReceiptV1{}, fmt.Errorf("ensure directory %s: %w", entry.Path, ErrAcornFoxLiveConflict)
 		}
 	}
@@ -124,12 +124,12 @@ func (m *acornFoxLiveMaterializer) Materialize(ctx context.Context) (result Acor
 		if readErr != nil {
 			return AcornFoxLiveReceiptV1{}, fmt.Errorf("read file %s: %w", entry.Path, ErrAcornFoxLiveConflict)
 		}
-		if writeErr := acornFoxLiveWriteFile(target, m.lease.store, m.lease.journal.TransactionID, acornFoxLivePath(entry.Path), raw, os.FileMode(entry.Mode)); writeErr != nil {
+		if writeErr := acornFoxLiveWriteFile(target, m.lease.store, m.lease.journal.TransactionID, acornFoxLivePath(entry.Path), raw, os.FileMode(entry.Mode), markEffect); writeErr != nil {
 			return AcornFoxLiveReceiptV1{}, fmt.Errorf("write file %s (%v): %w", entry.Path, writeErr, ErrAcornFoxLiveConflict)
 		}
 	}
 	raw, err := MarshalAcornFoxLiveReceiptV1(receipt)
-	if err != nil || acornFoxLiveWriteFile(target, m.lease.store, m.lease.journal.TransactionID, acornFoxLiveReceipt, raw, durableFileMode) != nil {
+	if err != nil || acornFoxLiveWriteFile(target, m.lease.store, m.lease.journal.TransactionID, acornFoxLiveReceipt, raw, durableFileMode, markEffect) != nil {
 		return AcornFoxLiveReceiptV1{}, fmt.Errorf("write receipt: %w", ErrAcornFoxLiveConflict)
 	}
 	if err = acornFoxLiveVerifyTarget(target, m.lease.store, entries, receipt); err != nil {
@@ -236,14 +236,18 @@ func acornFoxLiveTemp(transactionID, path string) string {
 	return filepath.ToSlash(filepath.Join(parentDirectory(path), ".acornfox-live.tmp-"+name))
 }
 
-func acornFoxLiveEnsureRoot(root *os.Root, store *TaskAcornFoxRepoStore) error {
+func acornFoxLiveEnsureRoot(root *os.Root, store *TaskAcornFoxRepoStore, markEffect func()) error {
 	info, err := root.Lstat(acornFoxLiveDir)
 	if errors.Is(err, os.ErrNotExist) {
 		if err = acornFoxLiveStep("mkdir"); err != nil {
 			return err
 		}
-		if err = root.Mkdir(acornFoxLiveDir, durableDirMode); err != nil && !errors.Is(err, os.ErrExist) {
-			return err
+		mkdirErr := root.Mkdir(acornFoxLiveDir, durableDirMode)
+		if mkdirErr != nil && !errors.Is(mkdirErr, os.ErrExist) {
+			return mkdirErr
+		}
+		if mkdirErr == nil {
+			markEffect()
 		}
 		if err = acornFoxLiveStep("mkdir-post"); err != nil {
 			return err
@@ -271,15 +275,19 @@ func acornFoxLiveEnsureRoot(root *os.Root, store *TaskAcornFoxRepoStore) error {
 	return nil
 }
 
-func acornFoxLiveEnsureDir(root *os.Root, store *TaskAcornFoxRepoStore, path string, mode os.FileMode) error {
+func acornFoxLiveEnsureDir(root *os.Root, store *TaskAcornFoxRepoStore, path string, mode os.FileMode, markEffect func()) error {
 	info, err := root.Lstat(path)
 	created := errors.Is(err, os.ErrNotExist)
 	if created {
 		if err = acornFoxLiveStep("mkdir"); err != nil {
 			return err
 		}
-		if err = root.Mkdir(path, mode); err != nil && !errors.Is(err, os.ErrExist) {
-			return err
+		mkdirErr := root.Mkdir(path, mode)
+		if mkdirErr != nil && !errors.Is(mkdirErr, os.ErrExist) {
+			return mkdirErr
+		}
+		if mkdirErr == nil {
+			markEffect()
 		}
 		if err = acornFoxLiveStep("mkdir-post"); err != nil {
 			return err
@@ -307,7 +315,7 @@ func acornFoxLiveEnsureDir(root *os.Root, store *TaskAcornFoxRepoStore, path str
 	return nil
 }
 
-func acornFoxLiveWriteFile(root *os.Root, store *TaskAcornFoxRepoStore, transactionID, path string, raw []byte, mode os.FileMode) error {
+func acornFoxLiveWriteFile(root *os.Root, store *TaskAcornFoxRepoStore, transactionID, path string, raw []byte, mode os.FileMode, markEffect func()) error {
 	if info, err := root.Lstat(path); err == nil {
 		if acornFoxLiveExactFile(root, store, path, raw, mode, false) {
 			return nil
@@ -322,7 +330,14 @@ func acornFoxLiveWriteFile(root *os.Root, store *TaskAcornFoxRepoStore, transact
 		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || acornFoxRepoNlink(info) != 1 || verifyOwner(info, store.uid, store.gid) != nil || !acornFoxLiveExactFile(root, store, temp, raw, mode, true) {
 			return ErrAcornFoxLiveConflict
 		}
-		if err = acornFoxLiveStep("remove"); err != nil || root.Remove(temp) != nil || acornFoxLiveSyncDir(root, parentDirectory(path)) != nil {
+		if err = acornFoxLiveStep("remove"); err != nil {
+			return ErrAcornFoxLiveConflict
+		}
+		if err = root.Remove(temp); err != nil {
+			return ErrAcornFoxLiveConflict
+		}
+		markEffect()
+		if acornFoxLiveSyncDir(root, parentDirectory(path)) != nil {
 			return ErrAcornFoxLiveConflict
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -335,6 +350,7 @@ func acornFoxLiveWriteFile(root *os.Root, store *TaskAcornFoxRepoStore, transact
 	if err != nil {
 		return err
 	}
+	markEffect()
 	if err = acornFoxLiveStep("chmod"); err == nil {
 		err = file.Chmod(mode)
 	}
@@ -353,6 +369,9 @@ func acornFoxLiveWriteFile(root *os.Root, store *TaskAcornFoxRepoStore, transact
 				chunk = chunk[:len(chunk)/2]
 			}
 			n, writeErr := file.Write(chunk)
+			if n > 0 {
+				markEffect()
+			}
 			if n < 0 || n > len(remaining) {
 				err = ErrAcornFoxLiveConflict
 				break
@@ -399,6 +418,8 @@ func acornFoxLiveWriteFile(root *os.Root, store *TaskAcornFoxRepoStore, transact
 		if !acornFoxLiveExactFile(root, store, path, raw, mode, false) {
 			return err
 		}
+	} else {
+		markEffect()
 	}
 	if err = acornFoxLiveStep("link-post"); err != nil {
 		return err
@@ -413,7 +434,14 @@ func acornFoxLiveWriteFile(root *os.Root, store *TaskAcornFoxRepoStore, transact
 	if tempErr != nil || acornFoxRepoNlink(tempInfo) != 2 || !acornFoxLiveExactFile(root, store, temp, raw, mode, true) {
 		return ErrAcornFoxLiveConflict
 	}
-	if err = acornFoxLiveStep("remove"); err != nil || root.Remove(temp) != nil || acornFoxLiveSyncDir(root, parentDirectory(path)) != nil {
+	if err = acornFoxLiveStep("remove"); err != nil {
+		return ErrAcornFoxLiveConflict
+	}
+	if err = root.Remove(temp); err != nil {
+		return ErrAcornFoxLiveConflict
+	}
+	markEffect()
+	if acornFoxLiveSyncDir(root, parentDirectory(path)) != nil {
 		return ErrAcornFoxLiveConflict
 	}
 	if !acornFoxLiveExactFile(root, store, path, raw, mode, false) {
@@ -459,7 +487,7 @@ func acornFoxLiveSyncDir(root *os.Root, path string) error {
 	return closeErr
 }
 
-func acornFoxLiveCleanTemps(root *os.Root, store *TaskAcornFoxRepoStore, transactionID string, source *os.Root, substrate *PublishedAcornFoxSubstrateV1, entries []SubstrateEntry) error {
+func acornFoxLiveCleanTemps(root *os.Root, store *TaskAcornFoxRepoStore, transactionID string, source *os.Root, substrate *PublishedAcornFoxSubstrateV1, entries []SubstrateEntry, markEffect func()) error {
 	for _, entry := range entries {
 		if entry.Kind == SubstrateEntryFile {
 			raw, err := acornFoxLiveReadSource(source, substrate, entry)
@@ -480,7 +508,14 @@ func acornFoxLiveCleanTemps(root *os.Root, store *TaskAcornFoxRepoStore, transac
 				} else if acornFoxRepoNlink(info) != 1 {
 					return ErrAcornFoxLiveConflict
 				}
-				if acornFoxLiveStep("remove") != nil || root.Remove(temp) != nil || acornFoxLiveSyncDir(root, parentDirectory(temp)) != nil {
+				if acornFoxLiveStep("remove") != nil {
+					return ErrAcornFoxLiveConflict
+				}
+				if root.Remove(temp) != nil {
+					return ErrAcornFoxLiveConflict
+				}
+				markEffect()
+				if acornFoxLiveSyncDir(root, parentDirectory(temp)) != nil {
 					return ErrAcornFoxLiveConflict
 				}
 			} else if !errors.Is(statErr, os.ErrNotExist) {
