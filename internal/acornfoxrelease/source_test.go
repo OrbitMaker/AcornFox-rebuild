@@ -7,7 +7,7 @@ import (
 )
 
 func sourcePolicyFixture() SourcePolicyV1 {
-	return SourcePolicyV1{SchemaVersion: 1, Product: Product, ModulePath: "github.com/acme/acornfox-fixture", Files: []FileEntryV1{{Path: "cmd/main.go", SHA256: sha256Text([]byte("main")), Mode: 0o644}, {Path: "scripts/run", SHA256: sha256Text([]byte("run")), Mode: 0o755}}}
+	return SourcePolicyV1{SchemaVersion: 1, Product: Product, ModulePath: "github.com/acme/acornfox-fixture", GoPackages: []string{"github.com/acme/acornfox-fixture/cmd/server"}, Files: []FileEntryV1{{Path: "cmd/main.go", SHA256: sha256Text([]byte("main")), Mode: 0o644}, {Path: "scripts/run", SHA256: sha256Text([]byte("run")), Mode: 0o755}}}
 }
 func writeFixtureFile(t *testing.T, root, path, body string, mode os.FileMode) {
 	t.Helper()

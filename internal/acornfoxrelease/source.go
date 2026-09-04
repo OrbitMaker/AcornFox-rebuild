@@ -36,12 +36,18 @@ type SourcePolicyV1 struct {
 	SchemaVersion int           `json:"schema_version"`
 	Product       string        `json:"product"`
 	ModulePath    string        `json:"module_path"`
+	GoPackages    []string      `json:"go_packages"`
 	Files         []FileEntryV1 `json:"files"`
 }
 
 func (p SourcePolicyV1) Validate() error {
-	if p.SchemaVersion != 1 || p.Product != Product || !validModulePath(p.ModulePath) {
+	if p.SchemaVersion != 1 || p.Product != Product || !validModulePath(p.ModulePath) || len(p.GoPackages) == 0 {
 		return ErrInputs
+	}
+	for i, pkg := range p.GoPackages {
+		if (pkg != p.ModulePath && !strings.HasPrefix(pkg, p.ModulePath+"/")) || (i > 0 && p.GoPackages[i-1] >= pkg) {
+			return ErrInputs
+		}
 	}
 	return validateEntries(p.Files)
 }
