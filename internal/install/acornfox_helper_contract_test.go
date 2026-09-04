@@ -28,7 +28,7 @@ func TestAcornFoxHelperContractsAreStrictAndExternalDigestBound(t *testing.T) {
 }
 
 func TestAcornFoxHelperFailureCodesRejectPartialEvidence(t *testing.T) {
-	for _, code := range []string{AcornFoxHelperCodeInvalidArguments, AcornFoxHelperCodeIdentityMismatch, AcornFoxHelperCodeReceiptUnavailable, AcornFoxHelperCodeReceiptInvalid, AcornFoxHelperCodeBindingMismatch, AcornFoxHelperCodeExecutableUnavailable, AcornFoxHelperCodeExecutableMismatch, AcornFoxHelperCodeInternalError} {
+	for _, code := range []string{AcornFoxHelperCodeInvalidArguments, AcornFoxHelperCodeIdentityMismatch, AcornFoxHelperCodeReceiptUnavailable, AcornFoxHelperCodeReceiptInvalid, AcornFoxHelperCodeBindingMismatch, AcornFoxHelperCodeExecutableUnavailable, AcornFoxHelperCodeExecutableMismatch} {
 		failure := AcornFoxHelperContractResultV1{SchemaVersion: AcornFoxHelperContractV1Schema, Code: code}
 		if err := failure.Validate(); err != nil {
 			t.Fatalf("failure code %s: %v", code, err)

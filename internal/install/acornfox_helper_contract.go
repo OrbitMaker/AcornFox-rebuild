@@ -44,7 +44,6 @@ const (
 	AcornFoxHelperCodeBindingMismatch       = "binding_mismatch"
 	AcornFoxHelperCodeExecutableUnavailable = "executable_unavailable"
 	AcornFoxHelperCodeExecutableMismatch    = "executable_mismatch"
-	AcornFoxHelperCodeInternalError         = "internal_error"
 )
 
 func (r AcornFoxHelperContractResultV1) Validate() error {
@@ -64,7 +63,7 @@ func (r AcornFoxHelperContractResultV1) Validate() error {
 
 func validAcornFoxHelperCode(code string) bool {
 	switch code {
-	case AcornFoxHelperCodeOK, AcornFoxHelperCodeInvalidArguments, AcornFoxHelperCodeIdentityMismatch, AcornFoxHelperCodeReceiptUnavailable, AcornFoxHelperCodeReceiptInvalid, AcornFoxHelperCodeBindingMismatch, AcornFoxHelperCodeExecutableUnavailable, AcornFoxHelperCodeExecutableMismatch, AcornFoxHelperCodeInternalError:
+	case AcornFoxHelperCodeOK, AcornFoxHelperCodeInvalidArguments, AcornFoxHelperCodeIdentityMismatch, AcornFoxHelperCodeReceiptUnavailable, AcornFoxHelperCodeReceiptInvalid, AcornFoxHelperCodeBindingMismatch, AcornFoxHelperCodeExecutableUnavailable, AcornFoxHelperCodeExecutableMismatch:
 		return true
 	default:
 		return false

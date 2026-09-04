@@ -11,15 +11,14 @@ import (
 const acornFoxHelperReceiptMaxBytes = 1 << 20
 const acornFoxHelperExecutableMaxBytes = 256 << 20
 
-type acornFoxHelperVerifyDependencies struct {
-	lstat  func(string) (os.FileInfo, error)
-	read   func(string) ([]byte, error)
-	digest func([]byte) string
+type acornFoxHelperOpenedFile interface {
+	io.Reader
+	io.Seeker
+	Stat() (os.FileInfo, error)
 }
 
-// VerifyProductionAcornFoxHelperContract reads only fixed production paths.
-// It returns the public result object directly so callers never format local
-// paths, errno values, or raw receipt contents into their output.
+// VerifyProductionAcornFoxHelperContract reads only fixed host paths. Both
+// production and modeled-rootfs callers converge on the opened-file core.
 func VerifyProductionAcornFoxHelperContract(identity AcornFoxBuildIdentityV1) AcornFoxHelperContractResultV1 {
 	fail := func(code string) AcornFoxHelperContractResultV1 {
 		return AcornFoxHelperContractResultV1{SchemaVersion: AcornFoxHelperContractV1Schema, Code: code}
@@ -52,61 +51,73 @@ func VerifyProductionAcornFoxHelperContract(identity AcornFoxBuildIdentityV1) Ac
 	if statErr != nil || closeErr != nil || directoryInfo == nil || !os.SameFile(parentInfo, directoryInfo) || !safeAcornFoxHelperReceiptParentInfo(directoryInfo) {
 		return fail(AcornFoxHelperCodeReceiptInvalid)
 	}
-	file, err := root.OpenFile(identity.ReleaseID+".json", os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	receipt, err := root.OpenFile(identity.ReleaseID+".json", os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return fail(AcornFoxHelperCodeReceiptUnavailable)
 	}
-	info, statErr := file.Stat()
-	if statErr != nil || !safeAcornFoxHelperReceiptInfo(info) {
-		_ = file.Close()
-		return fail(AcornFoxHelperCodeReceiptInvalid)
-	}
-	raw, readErr := readBoundedAcornFoxHelperOpenFile(file, acornFoxHelperReceiptMaxBytes)
-	closeErr = file.Close()
-	if readErr != nil || closeErr != nil {
-		return fail(AcornFoxHelperCodeReceiptUnavailable)
-	}
+	defer receipt.Close()
 	self, err := os.Open("/proc/self/exe")
 	if err != nil {
 		return fail(AcornFoxHelperCodeExecutableUnavailable)
 	}
-	selfInfo, selfStatErr := self.Stat()
-	if selfStatErr != nil || !safeAcornFoxHelperExecutableInfo(selfInfo) {
-		_ = self.Close()
-		return fail(AcornFoxHelperCodeExecutableUnavailable)
-	}
-	selfDigest, selfReadErr := hashAcornFoxHelperOpenFile(self, acornFoxHelperExecutableMaxBytes)
-	selfCloseErr := self.Close()
-	if selfReadErr != nil || selfCloseErr != nil {
-		return fail(AcornFoxHelperCodeExecutableUnavailable)
-	}
-	return verifyAcornFoxHelperResult(identity, raw, selfDigest)
+	defer self.Close()
+	return verifyAcornFoxHelperOpenedFiles(identity, receipt, self, 0, 0)
 }
 
-func verifyAcornFoxHelperContract(identity AcornFoxBuildIdentityV1, deps acornFoxHelperVerifyDependencies) AcornFoxHelperContractResultV1 {
+// verifyPublishedAcornFoxHelperContract opens through the pinned modeled root.
+// It is internal test/publisher evidence, not an activation API.
+func verifyPublishedAcornFoxHelperContract(identity AcornFoxBuildIdentityV1, published *PublishedAcornFoxSubstrateV1) AcornFoxHelperContractResultV1 {
 	fail := func(code string) AcornFoxHelperContractResultV1 {
 		return AcornFoxHelperContractResultV1{SchemaVersion: AcornFoxHelperContractV1Schema, Code: code}
 	}
-	if identity.Validate() != nil || deps.lstat == nil || deps.read == nil || deps.digest == nil {
+	if identity.Validate() != nil {
 		return fail(AcornFoxHelperCodeIdentityMismatch)
 	}
-	receiptPath := identity.ReleaseID + ".json"
-	info, err := deps.lstat(receiptPath)
+	if published == nil || published.root == nil {
+		return fail(AcornFoxHelperCodeReceiptUnavailable)
+	}
+	receiptPath := acornFoxSubstrateTarget("var/lib/acornfox/install/releases/" + identity.ReleaseID + ".json")
+	receipt, err := published.fs.openFile(published.root, receiptPath, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return fail(AcornFoxHelperCodeReceiptUnavailable)
 	}
-	if !safeAcornFoxHelperReceiptInfo(info) {
-		return fail(AcornFoxHelperCodeReceiptInvalid)
+	defer receipt.Close()
+	helperPath := AcornFoxUpgradeHelperPath
+	if identity.Role == "healthcheck" {
+		helperPath = AcornFoxHealthcheckHelperPath(published.receipt.CandidateReceipt)
 	}
-	raw, err := deps.read(receiptPath)
-	if err != nil {
-		return fail(AcornFoxHelperCodeReceiptUnavailable)
-	}
-	self, err := deps.read("/proc/self/exe")
+	helper, err := published.fs.openFile(published.root, acornFoxSubstrateTarget(helperPath), os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return fail(AcornFoxHelperCodeExecutableUnavailable)
 	}
-	return verifyAcornFoxHelperResult(identity, raw, deps.digest(self))
+	defer helper.Close()
+	return verifyAcornFoxHelperOpenedFiles(identity, receipt, helper, published.uid, published.gid)
+}
+
+func verifyAcornFoxHelperOpenedFiles(identity AcornFoxBuildIdentityV1, receiptFile, executable acornFoxHelperOpenedFile, uid, gid int) AcornFoxHelperContractResultV1 {
+	fail := func(code string) AcornFoxHelperContractResultV1 {
+		return AcornFoxHelperContractResultV1{SchemaVersion: AcornFoxHelperContractV1Schema, Code: code}
+	}
+	if identity.Validate() != nil || receiptFile == nil || executable == nil || uid < 0 || gid < 0 {
+		return fail(AcornFoxHelperCodeIdentityMismatch)
+	}
+	receiptInfo, err := receiptFile.Stat()
+	if err != nil || !safeAcornFoxHelperReceiptInfo(receiptInfo, uid, gid) {
+		return fail(AcornFoxHelperCodeReceiptInvalid)
+	}
+	raw, err := readBoundedAcornFoxHelperOpenedFile(receiptFile, acornFoxHelperReceiptMaxBytes)
+	if err != nil {
+		return fail(AcornFoxHelperCodeReceiptUnavailable)
+	}
+	executableInfo, err := executable.Stat()
+	if err != nil || !safeAcornFoxHelperExecutableInfo(executableInfo, uid, gid) {
+		return fail(AcornFoxHelperCodeExecutableUnavailable)
+	}
+	digest, err := hashAcornFoxHelperOpenedFile(executable, acornFoxHelperExecutableMaxBytes)
+	if err != nil {
+		return fail(AcornFoxHelperCodeExecutableUnavailable)
+	}
+	return verifyAcornFoxHelperResult(identity, raw, digest)
 }
 
 func verifyAcornFoxHelperResult(identity AcornFoxBuildIdentityV1, raw []byte, selfDigest string) AcornFoxHelperContractResultV1 {
@@ -136,12 +147,12 @@ func acornFoxHelperSHA256(data []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func safeAcornFoxHelperReceiptInfo(info os.FileInfo) bool {
+func safeAcornFoxHelperReceiptInfo(info os.FileInfo, uid, gid int) bool {
 	if info == nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
 		return false
 	}
 	stat, ok := info.Sys().(*syscall.Stat_t)
-	return ok && stat.Uid == 0 && stat.Gid == 0 && stat.Nlink == 1
+	return ok && stat.Uid == uint32(uid) && stat.Gid == uint32(gid) && stat.Nlink == 1
 }
 
 func safeAcornFoxHelperOwner(info os.FileInfo) bool {
@@ -152,31 +163,30 @@ func safeAcornFoxHelperOwner(info os.FileInfo) bool {
 func safeAcornFoxHelperReceiptParentInfo(info os.FileInfo) bool {
 	return info != nil && info.Mode()&os.ModeSymlink == 0 && info.IsDir() && info.Mode().Perm() == 0o755 && safeAcornFoxHelperOwner(info)
 }
-func safeAcornFoxHelperExecutableInfo(info os.FileInfo) bool {
-	return info != nil && info.Mode().IsRegular() && info.Mode().Perm()&0o111 != 0 && info.Size() >= 1 && info.Size() <= acornFoxHelperExecutableMaxBytes && safeAcornFoxHelperOwner(info)
+
+func safeAcornFoxHelperExecutableInfo(info os.FileInfo, uid, gid int) bool {
+	if info == nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 || info.Size() < 1 || info.Size() > acornFoxHelperExecutableMaxBytes {
+		return false
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	return ok && stat.Uid == uint32(uid) && stat.Gid == uint32(gid) && stat.Nlink == 1
 }
 
-func readBoundedAcornFoxHelperFile(path string) ([]byte, error) {
-	file, err := os.Open(path)
-	if err != nil {
+func readBoundedAcornFoxHelperOpenedFile(file io.ReadSeeker, maximum int64) ([]byte, error) {
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return nil, err
 	}
-	defer file.Close()
-	data, err := io.ReadAll(io.LimitReader(file, acornFoxHelperReceiptMaxBytes+1))
-	if err != nil || len(data) > acornFoxHelperReceiptMaxBytes {
-		return nil, os.ErrInvalid
-	}
-	return data, nil
-}
-
-func readBoundedAcornFoxHelperOpenFile(file *os.File, maximum int64) ([]byte, error) {
 	data, err := io.ReadAll(io.LimitReader(file, maximum+1))
 	if err != nil || int64(len(data)) > maximum {
 		return nil, os.ErrInvalid
 	}
 	return data, nil
 }
-func hashAcornFoxHelperOpenFile(file *os.File, maximum int64) (string, error) {
+
+func hashAcornFoxHelperOpenedFile(file io.ReadSeeker, maximum int64) (string, error) {
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return "", err
+	}
 	hash := sha256.New()
 	if _, err := io.CopyBuffer(hash, io.LimitReader(file, maximum+1), make([]byte, 32<<10)); err != nil {
 		return "", err
