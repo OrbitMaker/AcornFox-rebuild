@@ -147,14 +147,6 @@ func TestInactiveSubstrateIntentAndReconciliationOutcomesAreFixed(t *testing.T) 
 	if parsed, err := ParseAcornFoxInactiveSubstrateIntentV1(raw); err != nil || !reflect.DeepEqual(parsed, intent) {
 		t.Fatalf("parsed=%#v err=%v", parsed, err)
 	}
-	for _, outcome := range []AcornFoxReconciliationOutcome{AcornFoxReconcileAbsent, AcornFoxReconcileResume, AcornFoxReconcileCompleted, AcornFoxReconcileRecoveryRequired, AcornFoxReconcileConflict, AcornFoxReconcileCommitUnknown, AcornFoxReconcileCleanupUnknown} {
-		if err := outcome.Validate(); err != nil {
-			t.Fatalf("outcome %q: %v", outcome, err)
-		}
-	}
-	if err := AcornFoxReconciliationOutcome("mutable_journal").Validate(); err == nil {
-		t.Fatal("unknown reconciliation outcome accepted")
-	}
 }
 
 func TestInactiveSubstrateReceiptRejectsUnrelatedTreeAndHelperHashes(t *testing.T) {

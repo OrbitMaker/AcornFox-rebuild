@@ -509,12 +509,3 @@ const (
 	AcornFoxReconcileCommitUnknown    AcornFoxReconciliationOutcome = "commit_unknown"
 	AcornFoxReconcileCleanupUnknown   AcornFoxReconciliationOutcome = "cleanup_unknown"
 )
-
-func (o AcornFoxReconciliationOutcome) Validate() error {
-	switch o {
-	case AcornFoxReconcileAbsent, AcornFoxReconcileResume, AcornFoxReconcileCompleted, AcornFoxReconcileRecoveryRequired, AcornFoxReconcileConflict, AcornFoxReconcileCommitUnknown, AcornFoxReconcileCleanupUnknown:
-		return nil
-	default:
-		return errors.New("AcornFox reconciliation outcome is invalid")
-	}
-}
