@@ -257,7 +257,7 @@ func (s *TaskAcornFoxRepoStore) mintLiveVerifiedLease(ctx context.Context, subst
 		_ = prepared.Release()
 		return nil, ErrAcornFoxRepoConflict
 	}
-	if prepared.journal.Phase != AcornFoxRepoStaticVerified || prepared.journal.NeedsRecovery {
+	if prepared.journal.Phase != AcornFoxRepoStaticVerified && prepared.journal.Phase != AcornFoxRepoActivationWritten && prepared.journal.Phase != AcornFoxRepoActivePublished && prepared.journal.Phase != AcornFoxRepoCurrentPublished && prepared.journal.Phase != AcornFoxRepoPreparedFinal {
 		return fail()
 	}
 	root, err := s.openRoot()
@@ -274,7 +274,10 @@ func (s *TaskAcornFoxRepoStore) mintLiveVerifiedLease(ctx context.Context, subst
 		return fail()
 	}
 	entries, err := acornFoxLiveExpectedEntries(substrate)
-	if err != nil || acornFoxLiveVerifyTarget(root, s, entries, receipt) != nil {
+	// Keep the original sealed full-tree verifier at the 04B handoff. Later
+	// phases retain the same entry set but also contain the closed 04C pointer
+	// suffix, which is checked by the repository verifier below.
+	if err != nil || (prepared.journal.Phase == AcornFoxRepoStaticVerified && !prepared.journal.NeedsRecovery && acornFoxLiveVerifyTarget(root, s, entries, receipt) != nil) || ((prepared.journal.Phase != AcornFoxRepoStaticVerified || prepared.journal.NeedsRecovery) && !acornFoxRepoVerifyPinnedLive(root, s, entries, receipt)) {
 		return fail()
 	}
 	return &acornFoxLiveVerifiedLease{prepared: prepared, receipt: receipt}, nil
@@ -317,7 +320,7 @@ func (s *TaskAcornFoxRepoStore) mintPreparedLease(ctx context.Context, substrate
 	}
 	fail := func() (*acornFoxPreparedRepoLease, error) { _ = lock.Release(); return nil, ErrAcornFoxRepoConflict }
 	journal, err := s.Load(ctx)
-	if err != nil || (journal.Phase != AcornFoxRepoPrepared && journal.Phase != AcornFoxRepoLiveMaterialized && journal.Phase != AcornFoxRepoStaticVerified) || journal.BindingSHA256 != bindingSHA256 || substrate.Verify() != nil || !sameAcornFoxLiveTaskRoot(s, substrate) {
+	if err != nil || (journal.Phase != AcornFoxRepoPrepared && journal.Phase != AcornFoxRepoLiveMaterialized && journal.Phase != AcornFoxRepoStaticVerified && journal.Phase != AcornFoxRepoActivationWritten && journal.Phase != AcornFoxRepoActivePublished && journal.Phase != AcornFoxRepoCurrentPublished && journal.Phase != AcornFoxRepoPreparedFinal) || journal.BindingSHA256 != bindingSHA256 || substrate.Verify() != nil || !sameAcornFoxLiveTaskRoot(s, substrate) {
 		return fail()
 	}
 	raw, err := MarshalInactiveSubstrateReceiptV1(substrate.receipt)
