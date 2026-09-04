@@ -382,6 +382,255 @@ func TestAcornFoxRepoBootstrapCleanJournalAcceptsExactNextPrefixes(t *testing.T)
 	}
 }
 
+// These topologies are constructed directly rather than through
+// acornFoxRepoEnsurePointer: they model a process dying after the filesystem
+// operation while its defer has not had an opportunity to write recovery
+// state.  A clean journal may therefore resume only its exact next pointer
+// boundary, never an arbitrary later suffix.
+func TestAcornFoxRepoBootstrapCleanJournalDirectPointerCrashPrefixes(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		phase  AcornFoxRepoPhase
+		path   func(AcornFoxRepoActivationV1) string
+		target func(AcornFoxRepoActivationV1) string
+	}{
+		{"activation-written-active", AcornFoxRepoActivationWritten, func(AcornFoxRepoActivationV1) string { return acornFoxRepoActivePath() }, func(a AcornFoxRepoActivationV1) string { return "activations/" + a.ActivationID }},
+		{"active-published-current", AcornFoxRepoActivePublished, func(AcornFoxRepoActivationV1) string { return acornFoxRepoCurrentPath() }, func(AcornFoxRepoActivationV1) string { return "active/release" }},
+	} {
+		for _, topology := range []string{"temporary", "linked", "final"} {
+			t.Run(tc.name+"-"+topology, func(t *testing.T) {
+				root, store, published, receipt := acornFoxRepoBootstrapFixture(t)
+				a, journal := acornFoxRepoBootstrapAdvanceTo(t, root, store, published, tc.phase)
+				acornFoxRepoBootstrapWritePointerCrashPrefix(t, store, journal.TransactionID, tc.path(a), tc.target(a), topology)
+				if err := store.Close(); err != nil {
+					t.Fatal(err)
+				}
+				fresh, err := NewTaskAcornFoxRepoStore(root, os.Getuid(), os.Getgid())
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer fresh.Close()
+				if err = prepareAcornFoxRepository(context.Background(), fresh, published, receipt.CandidateReceipt.BindingSHA256); err != nil {
+					t.Fatalf("topology=%s recover=%v", topology, err)
+				}
+				final, err := fresh.Resume(context.Background())
+				if err != nil || final.Phase != AcornFoxRepoPreparedFinal || final.NeedsRecovery {
+					t.Fatalf("topology=%s journal=%#v err=%v", topology, final, err)
+				}
+			})
+		}
+	}
+}
+
+func TestAcornFoxRepoBootstrapCleanJournalDirectPointerPrefixRejectsForeignAndOutOfOrder(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		phase AcornFoxRepoPhase
+		write func(t *testing.T, store *TaskAcornFoxRepoStore, tx string, a AcornFoxRepoActivationV1)
+		read  func(root string, a AcornFoxRepoActivationV1) string
+		want  string
+	}{
+		{
+			name:  "foreign-active-temporary",
+			phase: AcornFoxRepoActivationWritten,
+			write: func(t *testing.T, store *TaskAcornFoxRepoStore, tx string, _ AcornFoxRepoActivationV1) {
+				acornFoxRepoBootstrapWritePointerCrashPrefix(t, store, tx, acornFoxRepoActivePath(), "foreign", "temporary")
+			},
+			read: func(root string, _ AcornFoxRepoActivationV1) string {
+				return filepath.Join(root, filepath.FromSlash(acornFoxRepoTemp("unused", acornFoxRepoActivePath())))
+			},
+		},
+		{
+			name:  "current-before-active",
+			phase: AcornFoxRepoActivationWritten,
+			write: func(t *testing.T, store *TaskAcornFoxRepoStore, tx string, _ AcornFoxRepoActivationV1) {
+				acornFoxRepoBootstrapWritePointerCrashPrefix(t, store, tx, acornFoxRepoCurrentPath(), "active/release", "final")
+			},
+			read: func(root string, _ AcornFoxRepoActivationV1) string {
+				return filepath.Join(root, filepath.FromSlash(acornFoxRepoCurrentPath()))
+			},
+			want: "active/release",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root, store, published, receipt := acornFoxRepoBootstrapFixture(t)
+			a, journal := acornFoxRepoBootstrapAdvanceTo(t, root, store, published, tc.phase)
+			tc.write(t, store, journal.TransactionID, a)
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			fresh, err := NewTaskAcornFoxRepoStore(root, os.Getuid(), os.Getgid())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer fresh.Close()
+			if err = prepareAcornFoxRepository(context.Background(), fresh, published, receipt.CandidateReceipt.BindingSHA256); !errors.Is(err, ErrAcornFoxRepoBootstrapConflict) && !errors.Is(err, ErrAcornFoxRepoConflict) {
+				t.Fatalf("err=%v", err)
+			}
+			if tc.name == "foreign-active-temporary" {
+				path := filepath.Join(root, filepath.FromSlash(acornFoxRepoTemp(journal.TransactionID, acornFoxRepoActivePath())))
+				got, readErr := os.Readlink(path)
+				if readErr != nil || got != "foreign" {
+					t.Fatalf("foreign pointer changed=%q %v", got, readErr)
+				}
+			} else {
+				path := tc.read(root, a)
+				got, readErr := os.Readlink(path)
+				if readErr != nil || got != tc.want {
+					t.Fatalf("out-of-order pointer changed=%q %v", got, readErr)
+				}
+			}
+		})
+	}
+}
+
+func TestAcornFoxRepoBootstrapStaticPrefixFallbackStillVerifiesPinnedLiveAndReceipt(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		tamper func(t *testing.T, root string, published *PublishedAcornFoxSubstrateV1)
+	}{
+		{
+			name: "base-live-bytes",
+			tamper: func(t *testing.T, root string, published *PublishedAcornFoxSubstrateV1) {
+				entries, err := acornFoxLiveExpectedEntries(published)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, entry := range entries {
+					if entry.Kind == SubstrateEntryFile {
+						if err = os.WriteFile(filepath.Join(root, filepath.FromSlash(acornFoxLivePath(entry.Path))), []byte("tampered"), os.FileMode(entry.Mode)); err != nil {
+							t.Fatal(err)
+						}
+						return
+					}
+				}
+				t.Fatal("no live file")
+			},
+		},
+		{
+			name: "receipt-bytes",
+			tamper: func(t *testing.T, root string, _ *PublishedAcornFoxSubstrateV1) {
+				if err := os.WriteFile(filepath.Join(root, acornFoxLiveReceipt), []byte("{}"), durableFileMode); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root, store, published, receipt := acornFoxRepoBootstrapFixture(t)
+			journal, err := store.Resume(context.Background())
+			if err != nil || journal.Phase != AcornFoxRepoStaticVerified {
+				t.Fatalf("journal=%#v err=%v", journal, err)
+			}
+			a, raw, err := acornFoxRepoActivation(journal, mustAcornFoxLiveReceipt(t, root), published)
+			if err != nil {
+				t.Fatal(err)
+			}
+			handle, err := store.openRoot()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = acornFoxRepoEnsureActivation(handle, store, journal.TransactionID, a, raw, func() {}); err != nil {
+				t.Fatal(err)
+			}
+			if err = handle.Close(); err != nil {
+				t.Fatal(err)
+			}
+			tc.tamper(t, root, published)
+			if err = store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			fresh, err := NewTaskAcornFoxRepoStore(root, os.Getuid(), os.Getgid())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer fresh.Close()
+			if err = prepareAcornFoxRepository(context.Background(), fresh, published, receipt.CandidateReceipt.BindingSHA256); !errors.Is(err, ErrAcornFoxRepoConflict) && !errors.Is(err, ErrAcornFoxRepoBootstrapConflict) {
+				t.Fatalf("tamper accepted: %v", err)
+			}
+		})
+	}
+}
+
+func acornFoxRepoBootstrapAdvanceTo(t *testing.T, root string, store *TaskAcornFoxRepoStore, published *PublishedAcornFoxSubstrateV1, phase AcornFoxRepoPhase) (AcornFoxRepoActivationV1, AcornFoxRepoJournalV1) {
+	t.Helper()
+	journal, err := store.Resume(context.Background())
+	if err != nil || journal.Phase != AcornFoxRepoStaticVerified {
+		t.Fatalf("journal=%#v err=%v", journal, err)
+	}
+	a, raw, err := acornFoxRepoActivation(journal, mustAcornFoxLiveReceipt(t, root), published)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := store.openRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = acornFoxRepoEnsureActivation(handle, store, journal.TransactionID, a, raw, func() {}); err != nil {
+		t.Fatal(err)
+	}
+	if err = handle.Close(); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := store.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := lock.Release(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	digest := sha256Hex(raw)
+	journal, err = acornFoxRepoAdvance(store, context.Background(), journal, AcornFoxRepoActivationWritten, digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if phase == AcornFoxRepoActivationWritten {
+		return a, journal
+	}
+	handle, err = store.openRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = acornFoxRepoEnsurePointer(handle, store, journal.TransactionID, acornFoxRepoActivePath(), "activations/"+a.ActivationID, func() {}); err != nil {
+		t.Fatal(err)
+	}
+	if err = handle.Close(); err != nil {
+		t.Fatal(err)
+	}
+	journal, err = acornFoxRepoAdvance(store, context.Background(), journal, AcornFoxRepoActivePublished, digest)
+	if err != nil || phase != AcornFoxRepoActivePublished {
+		t.Fatalf("phase=%s journal=%#v err=%v", phase, journal, err)
+	}
+	return a, journal
+}
+
+func acornFoxRepoBootstrapWritePointerCrashPrefix(t *testing.T, store *TaskAcornFoxRepoStore, tx, path, target, topology string) {
+	t.Helper()
+	handle, err := store.openRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer handle.Close()
+	tmp := acornFoxRepoTemp(tx, path)
+	switch topology {
+	case "temporary":
+		err = handle.Symlink(target, tmp)
+	case "linked":
+		if err = handle.Symlink(target, tmp); err == nil {
+			err = handle.Link(tmp, path)
+		}
+	case "final":
+		err = handle.Symlink(target, path)
+	default:
+		t.Fatalf("unknown topology %q", topology)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func mustAcornFoxLiveReceipt(t *testing.T, root string) AcornFoxLiveReceiptV1 {
 	t.Helper()
 	raw, err := os.ReadFile(filepath.Join(root, acornFoxLiveReceipt))

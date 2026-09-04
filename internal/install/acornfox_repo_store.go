@@ -274,10 +274,18 @@ func (s *TaskAcornFoxRepoStore) mintLiveVerifiedLease(ctx context.Context, subst
 		return fail()
 	}
 	entries, err := acornFoxLiveExpectedEntries(substrate)
-	// Keep the original sealed full-tree verifier at the 04B handoff. Later
-	// phases retain the same entry set but also contain the closed 04C pointer
-	// suffix, which is checked by the repository verifier below.
-	if err != nil || (prepared.journal.Phase == AcornFoxRepoStaticVerified && !prepared.journal.NeedsRecovery && acornFoxLiveVerifyTarget(root, s, entries, receipt) != nil && !acornFoxRepoVerifyLeaseInventory(root, s, prepared.journal, receipt, substrate)) || ((prepared.journal.Phase != AcornFoxRepoStaticVerified || prepared.journal.NeedsRecovery) && !acornFoxRepoVerifyPinnedLive(root, s, entries, receipt)) || (!prepared.journal.NeedsRecovery && prepared.journal.Phase != AcornFoxRepoStaticVerified && !acornFoxRepoVerifyLeaseInventory(root, s, prepared.journal, receipt, substrate)) {
+	// Every handoff verifies the pinned base tree and receipt before accepting a
+	// pointer prefix. The original 04B full-tree verifier remains the first
+	// authority for a clean static journal; the 04C exact-inventory verifier is
+	// its narrow fallback once a legitimate activation prefix exists.
+	if err != nil || !acornFoxRepoVerifyPinnedLive(root, s, entries, receipt) {
+		return fail()
+	}
+	if prepared.journal.Phase == AcornFoxRepoStaticVerified && !prepared.journal.NeedsRecovery {
+		if acornFoxLiveVerifyTarget(root, s, entries, receipt) != nil && !acornFoxRepoVerifyLeaseInventory(root, s, prepared.journal, receipt, substrate) {
+			return fail()
+		}
+	} else if !acornFoxRepoVerifyLeaseInventory(root, s, prepared.journal, receipt, substrate) {
 		return fail()
 	}
 	return &acornFoxLiveVerifiedLease{prepared: prepared, receipt: receipt}, nil
