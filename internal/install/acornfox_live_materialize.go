@@ -74,11 +74,16 @@ func (m *acornFoxLiveMaterializer) Materialize(ctx context.Context) (result Acor
 		return AcornFoxLiveReceiptV1{}, ErrAcornFoxLiveConflict
 	}
 	defer source.Close()
-	target, err := m.lease.store.openRoot()
+	target, err := m.lease.store.openHostRoot()
 	if err != nil {
 		return AcornFoxLiveReceiptV1{}, err
 	}
 	defer target.Close()
+	// L2 proves the independent host-root routing but does not yet possess the
+	// L3 ownership/evidence contract needed to mutate a production layout.
+	if m.lease.store.layout.mode != acornFoxInstallLayoutTask {
+		return AcornFoxLiveReceiptV1{}, ErrAcornFoxLiveConflict
+	}
 	entries, err := acornFoxLiveExpectedEntries(m.lease.substrate)
 	if err != nil {
 		return AcornFoxLiveReceiptV1{}, fmt.Errorf("clean temps: %w", ErrAcornFoxLiveConflict)
@@ -112,7 +117,7 @@ func (m *acornFoxLiveMaterializer) Materialize(ctx context.Context) (result Acor
 		journal, m.lease.journal = next, next
 	}
 	for _, entry := range entries {
-		if entry.Kind == SubstrateEntryDirectory && acornFoxLiveEnsureDir(target, m.lease.store, acornFoxLivePath(entry.Path), os.FileMode(entry.Mode), markEffect) != nil {
+		if entry.Kind == SubstrateEntryDirectory && acornFoxLiveEnsureDir(target, m.lease.store, m.lease.store.layout.livePath(entry.Path), os.FileMode(entry.Mode), markEffect) != nil {
 			return AcornFoxLiveReceiptV1{}, fmt.Errorf("ensure directory %s: %w", entry.Path, ErrAcornFoxLiveConflict)
 		}
 	}
@@ -124,12 +129,12 @@ func (m *acornFoxLiveMaterializer) Materialize(ctx context.Context) (result Acor
 		if readErr != nil {
 			return AcornFoxLiveReceiptV1{}, fmt.Errorf("read file %s: %w", entry.Path, ErrAcornFoxLiveConflict)
 		}
-		if writeErr := acornFoxLiveWriteFile(target, m.lease.store, m.lease.journal.TransactionID, acornFoxLivePath(entry.Path), raw, os.FileMode(entry.Mode), markEffect); writeErr != nil {
+		if writeErr := acornFoxLiveWriteFile(target, m.lease.store, m.lease.journal.TransactionID, m.lease.store.layout.livePath(entry.Path), raw, os.FileMode(entry.Mode), markEffect); writeErr != nil {
 			return AcornFoxLiveReceiptV1{}, fmt.Errorf("write file %s (%v): %w", entry.Path, writeErr, ErrAcornFoxLiveConflict)
 		}
 	}
 	raw, err := MarshalAcornFoxLiveReceiptV1(receipt)
-	if err != nil || acornFoxLiveWriteFile(target, m.lease.store, m.lease.journal.TransactionID, acornFoxLiveReceipt, raw, durableFileMode, markEffect) != nil {
+	if err != nil || acornFoxLiveWriteFile(target, m.lease.store, m.lease.journal.TransactionID, m.lease.store.layout.receiptPath(), raw, durableFileMode, markEffect) != nil {
 		return AcornFoxLiveReceiptV1{}, fmt.Errorf("write receipt: %w", ErrAcornFoxLiveConflict)
 	}
 	if err = acornFoxLiveVerifyTarget(target, m.lease.store, entries, receipt); err != nil {

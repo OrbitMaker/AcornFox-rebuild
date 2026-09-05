@@ -29,6 +29,9 @@ type TaskAcornFoxRepoStore struct {
 	rootPath           string
 	rootInfo           os.FileInfo
 	root               *os.Root
+	hostRootPath       string
+	hostRootInfo       os.FileInfo
+	hostRoot           *os.Root
 	uid, gid           int
 	layout             acornFoxInstallLayout
 	fs                 acornFoxRepoFS
@@ -79,20 +82,31 @@ func newAcornFoxRepoFS() acornFoxRepoFS {
 }
 
 func NewTaskAcornFoxRepoStore(taskRoot string, uid, gid int) (*TaskAcornFoxRepoStore, error) {
-	fs := newAcornFoxRepoFS()
 	layout, layoutErr := newTaskAcornFoxLayout(taskRoot, uid, gid)
 	if layoutErr != nil {
 		return nil, ErrAcornFoxRepoConflict
 	}
-	info := layout.stateRootInfo
-	if !safeAcornFoxRepoRoot(info, uid, gid) {
+	return newAcornFoxRepoStoreForLayout(layout)
+}
+
+// newAcornFoxRepoStoreForLayout is the package-private constructor shared by
+// task tests and the later fixed bridge. Its two descriptors are deliberately
+// opened independently, even for task mode where both paths name one inode.
+func newAcornFoxRepoStoreForLayout(layout acornFoxInstallLayout) (*TaskAcornFoxRepoStore, error) {
+	if layout.validate() != nil || !safeAcornFoxRepoRoot(layout.stateRootInfo, layout.stateOwner.uid, layout.stateOwner.gid) {
 		return nil, ErrAcornFoxRepoConflict
 	}
-	root, err := fs.openRoot(taskRoot)
+	fs := newAcornFoxRepoFS()
+	root, err := fs.openRoot(layout.stateRootPath)
 	if err != nil {
 		return nil, ErrAcornFoxRepoConflict
 	}
-	return &TaskAcornFoxRepoStore{rootPath: taskRoot, rootInfo: info, root: root, uid: uid, gid: gid, layout: layout, fs: fs}, nil
+	hostRoot, hostErr := fs.openRoot(layout.hostRootPath)
+	if hostErr != nil {
+		_ = root.Close()
+		return nil, ErrAcornFoxRepoConflict
+	}
+	return &TaskAcornFoxRepoStore{rootPath: layout.stateRootPath, rootInfo: layout.stateRootInfo, root: root, hostRootPath: layout.hostRootPath, hostRootInfo: layout.hostRootInfo, hostRoot: hostRoot, uid: layout.stateOwner.uid, gid: layout.stateOwner.gid, layout: layout, fs: fs}, nil
 }
 
 func safeAcornFoxRepoRoot(info os.FileInfo, uid, gid int) bool {
@@ -138,6 +152,24 @@ func (s *TaskAcornFoxRepoStore) openRoot() (*os.Root, error) {
 	}
 	return root, nil
 }
+
+// openHostRoot returns a fresh descriptor below the independently pinned host
+// root. It is intentionally separate from openRoot: journals remain state-root
+// data while future live files belong under hostRootPath.
+func (s *TaskAcornFoxRepoStore) openHostRoot() (*os.Root, error) {
+	if s == nil || s.hostRoot == nil || s.hostRootInfo == nil || s.layout.validate() != nil {
+		return nil, ErrAcornFoxRepoConflict
+	}
+	info, err := s.fs.lstatPath(s.hostRootPath)
+	if err != nil || !safeAcornFoxHostRoot(info) || !os.SameFile(info, s.hostRootInfo) || !s.layout.hostRootPinned() {
+		return nil, ErrAcornFoxRepoConflict
+	}
+	root, err := s.fs.openChild(s.hostRoot, ".")
+	if err != nil {
+		return nil, ErrAcornFoxRepoConflict
+	}
+	return root, nil
+}
 func (s *TaskAcornFoxRepoStore) Close() error {
 	if s == nil {
 		return nil
@@ -145,9 +177,12 @@ func (s *TaskAcornFoxRepoStore) Close() error {
 	if s.lock != nil && s.lock.Release() != nil {
 		return ErrAcornFoxRepoConflict
 	}
-	root := s.root
-	s.root, s.rootInfo = nil, nil
+	root, hostRoot := s.root, s.hostRoot
+	s.root, s.rootInfo, s.hostRoot, s.hostRootInfo = nil, nil, nil, nil
 	if root != nil && root.Close() != nil {
+		return ErrAcornFoxRepoConflict
+	}
+	if hostRoot != nil && hostRoot.Close() != nil {
 		return ErrAcornFoxRepoConflict
 	}
 	return nil
@@ -261,7 +296,7 @@ func (s *TaskAcornFoxRepoStore) mintLiveVerifiedLease(ctx context.Context, subst
 	if prepared.journal.Phase != AcornFoxRepoStaticVerified && prepared.journal.Phase != AcornFoxRepoActivationWritten && prepared.journal.Phase != AcornFoxRepoActivePublished && prepared.journal.Phase != AcornFoxRepoCurrentPublished && prepared.journal.Phase != AcornFoxRepoPreparedFinal {
 		return fail()
 	}
-	root, err := s.openRoot()
+	root, err := s.openHostRoot()
 	if err != nil {
 		return fail()
 	}
@@ -293,18 +328,19 @@ func (s *TaskAcornFoxRepoStore) mintLiveVerifiedLease(ctx context.Context, subst
 }
 
 func (s *TaskAcornFoxRepoStore) readExactLiveReceipt(root *os.Root) ([]byte, error) {
-	before, err := s.fs.lstat(root, acornFoxLiveReceipt)
+	path := s.layout.receiptPath()
+	before, err := s.fs.lstat(root, path)
 	if err != nil || !safeAcornFoxRepoFile(before, s.uid, s.gid) || before.Size() < 1 || before.Size() > acornFoxRepoMaxJournalSize {
 		return nil, ErrAcornFoxRepoConflict
 	}
-	file, err := s.fs.openFile(root, acornFoxLiveReceipt, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	file, err := s.fs.openFile(root, path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, ErrAcornFoxRepoConflict
 	}
 	opened, statErr := file.Stat()
 	raw, readErr := io.ReadAll(io.LimitReader(file, acornFoxRepoMaxJournalSize+1))
 	closeErr := file.Close()
-	after, afterErr := s.fs.lstat(root, acornFoxLiveReceipt)
+	after, afterErr := s.fs.lstat(root, path)
 	if statErr != nil || readErr != nil || closeErr != nil || afterErr != nil || !safeAcornFoxRepoFile(opened, s.uid, s.gid) || !safeAcornFoxRepoFile(after, s.uid, s.gid) || !os.SameFile(before, opened) || !os.SameFile(before, after) || len(raw) < 1 || len(raw) > acornFoxRepoMaxJournalSize {
 		return nil, ErrAcornFoxRepoConflict
 	}

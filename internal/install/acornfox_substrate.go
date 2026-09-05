@@ -65,7 +65,11 @@ func sameAcornFoxLiveTaskRoot(store *TaskAcornFoxRepoStore, substrate *Published
 	}
 	storeInfo, storeErr := store.fs.lstat(store.root, ".")
 	substrateInfo, substrateErr := substrate.fs.lstat(substrate.root, ".")
-	return storeErr == nil && substrateErr == nil && os.SameFile(storeInfo, substrateInfo) && store.layout.equivalent(substrate.layout) && verifyOwner(storeInfo, store.uid, store.gid) == nil && verifyOwner(substrateInfo, substrate.uid, substrate.gid) == nil
+	return storeErr == nil && substrateErr == nil && os.SameFile(storeInfo, substrateInfo) && sameAcornFoxInstallLayout(store.layout, substrate.layout) && verifyOwner(storeInfo, store.uid, store.gid) == nil && verifyOwner(substrateInfo, substrate.uid, substrate.gid) == nil
+}
+
+func sameAcornFoxInstallLayout(left, right acornFoxInstallLayout) bool {
+	return left.equivalent(right)
 }
 
 func (h *PublishedAcornFoxSubstrateV1) openLiveSourceRoot() (*os.Root, error) {
@@ -76,17 +80,24 @@ func (h *PublishedAcornFoxSubstrateV1) openLiveSourceRoot() (*os.Root, error) {
 }
 
 func NewTaskAcornFoxSubstratePublisher(taskRoot string, uid, gid int) (*TaskAcornFoxSubstratePublisher, error) {
-	fs := newAcornFoxSubstrateFS()
 	layout, layoutErr := newTaskAcornFoxLayout(taskRoot, uid, gid)
 	if layoutErr != nil || forbiddenAcornFoxStageRoot(taskRoot) {
 		return nil, errors.New("AcornFox task substrate root is unsafe")
 	}
+	return newAcornFoxSubstratePublisherForLayout(layout)
+}
+
+func newAcornFoxSubstratePublisherForLayout(layout acornFoxInstallLayout) (*TaskAcornFoxSubstratePublisher, error) {
+	fs := newAcornFoxSubstrateFS()
+	if layout.validate() != nil || forbiddenAcornFoxStageRoot(layout.stateRootPath) {
+		return nil, errors.New("AcornFox task substrate root is unsafe")
+	}
 	info := layout.stateRootInfo
-	root, err := fs.openRootPath(taskRoot)
+	root, err := fs.openRootPath(layout.stateRootPath)
 	if err != nil {
 		return nil, err
 	}
-	return &TaskAcornFoxSubstratePublisher{rootPath: taskRoot, rootInfo: info, root: root, uid: uid, gid: gid, layout: layout, fs: fs}, nil
+	return &TaskAcornFoxSubstratePublisher{rootPath: layout.stateRootPath, rootInfo: info, root: root, uid: layout.stateOwner.uid, gid: layout.stateOwner.gid, layout: layout, fs: fs}, nil
 }
 
 func (p *TaskAcornFoxSubstratePublisher) openRoot() (*os.Root, error) {

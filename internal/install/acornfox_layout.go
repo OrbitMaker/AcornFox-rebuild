@@ -12,8 +12,8 @@ import (
 
 // acornFoxInstallLayout is the one private seam between the task-root model
 // and the later fixed host model.  It is deliberately a value: no caller can
-// provide it through an exported constructor, and L1 does not route any write
-// through hostRootPath.
+// provide it through an exported constructor. L2 routes task-model writes
+// through a separately pinned host descriptor while production stays gated.
 type acornFoxInstallLayout struct {
 	mode            acornFoxInstallLayoutMode
 	stateRootPath   string
@@ -195,10 +195,28 @@ func (l acornFoxInstallLayout) livePath(path string) string {
 }
 
 func (l acornFoxInstallLayout) activationPath(id string) string {
+	return l.activationDir(id)
+}
+
+func (l acornFoxInstallLayout) activationDir(id string) string {
 	if !validID(id) {
 		return ""
 	}
 	return l.livePath("opt/acornfox/activations/" + id)
+}
+
+func (l acornFoxInstallLayout) activationReleasePath(id string) string {
+	if directory := l.activationDir(id); directory != "" {
+		return directory + "/release"
+	}
+	return ""
+}
+
+func (l acornFoxInstallLayout) activationReceiptPath(id string) string {
+	if directory := l.activationDir(id); directory != "" {
+		return directory + "/repo-activation.json"
+	}
+	return ""
 }
 
 func (l acornFoxInstallLayout) activePath() string  { return l.livePath("opt/acornfox/active") }
@@ -231,4 +249,11 @@ func (l acornFoxInstallLayout) hostRootPinned() bool {
 
 func (l acornFoxInstallLayout) receiptPath() string {
 	return strings.TrimPrefix(l.liveReceiptPath, "./")
+}
+
+// acornFoxProductionManagedRoots is deliberately an enumeration, not a root
+// walker. L2 may validate fixed descendants of these four paths later, but it
+// must never recurse across a host root (and therefore never across /).
+func acornFoxProductionManagedRoots() []string {
+	return []string{"opt/acornfox", "etc/acornfox", "var/lib/acornfox", "var/log/acornfox"}
 }

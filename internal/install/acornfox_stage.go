@@ -333,11 +333,18 @@ func NewTaskAcornFoxStager(taskRoot string, uid, gid int) (*TaskAcornFoxStager, 
 	if layoutErr != nil || forbiddenAcornFoxStageRoot(taskRoot) {
 		return nil, errors.New("AcornFox task root is unsafe")
 	}
-	root, err := os.OpenRoot(taskRoot)
+	return newAcornFoxStagerForLayout(layout)
+}
+
+func newAcornFoxStagerForLayout(layout acornFoxInstallLayout) (*TaskAcornFoxStager, error) {
+	if layout.validate() != nil || forbiddenAcornFoxStageRoot(layout.stateRootPath) {
+		return nil, errors.New("AcornFox task root is unsafe")
+	}
+	root, err := os.OpenRoot(layout.stateRootPath)
 	if err != nil {
 		return nil, err
 	}
-	return &TaskAcornFoxStager{rootPath: taskRoot, rootInfo: layout.stateRootInfo, root: root, uid: uid, gid: gid, layout: layout}, nil
+	return &TaskAcornFoxStager{rootPath: layout.stateRootPath, rootInfo: layout.stateRootInfo, root: root, uid: layout.stateOwner.uid, gid: layout.stateOwner.gid, layout: layout}, nil
 }
 
 func (s *TaskAcornFoxStager) Close() error {

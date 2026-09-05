@@ -69,11 +69,16 @@ func prepareAcornFoxRepository(ctx context.Context, store *TaskAcornFoxRepoStore
 		}
 	}()
 	l := lease.prepared
-	root, err := l.store.openRoot()
+	root, err := l.store.openHostRoot()
 	if err != nil {
 		return ErrAcornFoxRepoBootstrapConflict
 	}
 	defer root.Close()
+	// The L2 bridge only establishes a separate host-root seam. Production
+	// mutation stays fail-closed until L3 binds actual ownership evidence.
+	if l.store.layout.mode != acornFoxInstallLayoutTask {
+		return ErrAcornFoxRepoBootstrapConflict
+	}
 	a, raw, err := acornFoxRepoActivation(l.journal, lease.receipt, l.substrate)
 	if err != nil {
 		return err
@@ -117,7 +122,7 @@ func prepareAcornFoxRepository(ctx context.Context, store *TaskAcornFoxRepoStore
 		return ErrAcornFoxRepoBootstrapConflict
 	}
 	if l.journal.Phase == AcornFoxRepoStaticVerified {
-		if err = acornFoxRepoEnsureActivation(root, l.store, l.journal.TransactionID, a, raw, mark); err != nil {
+		if err = acornFoxRepoEnsureActivationForLayout(root, l.store, l.store.layout, l.journal.TransactionID, a, raw, mark); err != nil {
 			return ErrAcornFoxRepoBootstrapConflict
 		}
 		if acornFoxRepoBootstrapStep("journal-activation") != nil {
@@ -129,7 +134,7 @@ func prepareAcornFoxRepository(ctx context.Context, store *TaskAcornFoxRepoStore
 		}
 	}
 	if l.journal.Phase == AcornFoxRepoActivationWritten {
-		if err = acornFoxRepoEnsurePointer(root, l.store, l.journal.TransactionID, acornFoxRepoActivePath(), "activations/"+a.ActivationID, mark); err != nil {
+		if err = acornFoxRepoEnsurePointer(root, l.store, l.journal.TransactionID, l.store.layout.activePath(), "activations/"+a.ActivationID, mark); err != nil {
 			return ErrAcornFoxRepoBootstrapConflict
 		}
 		if acornFoxRepoBootstrapStep("journal-active") != nil {
@@ -141,7 +146,7 @@ func prepareAcornFoxRepository(ctx context.Context, store *TaskAcornFoxRepoStore
 		}
 	}
 	if l.journal.Phase == AcornFoxRepoActivePublished {
-		if err = acornFoxRepoEnsurePointer(root, l.store, l.journal.TransactionID, acornFoxRepoCurrentPath(), "active/release", mark); err != nil {
+		if err = acornFoxRepoEnsurePointer(root, l.store, l.journal.TransactionID, l.store.layout.currentPath(), "active/release", mark); err != nil {
 			return ErrAcornFoxRepoBootstrapConflict
 		}
 		if acornFoxRepoBootstrapStep("journal-current") != nil {
@@ -186,15 +191,25 @@ func acornFoxRepoReleasePath(id string) string { return acornFoxRepoActivationDi
 func acornFoxRepoActivePath() string           { return acornFoxLiveDir + "/opt/acornfox/active" }
 func acornFoxRepoCurrentPath() string          { return acornFoxLiveDir + "/opt/acornfox/current" }
 func acornFoxRepoEnsureActivation(root *os.Root, s *TaskAcornFoxRepoStore, tx string, a AcornFoxRepoActivationV1, raw []byte, mark func()) error {
-	for _, p := range []string{acornFoxLiveDir + "/opt/acornfox/activations", acornFoxRepoActivationDir(a.ActivationID)} {
+	if s == nil {
+		return ErrAcornFoxRepoBootstrapConflict
+	}
+	return acornFoxRepoEnsureActivationForLayout(root, s, s.layout, tx, a, raw, mark)
+}
+
+func acornFoxRepoEnsureActivationForLayout(root *os.Root, s *TaskAcornFoxRepoStore, layout acornFoxInstallLayout, tx string, a AcornFoxRepoActivationV1, raw []byte, mark func()) error {
+	if layout.validate() != nil || layout.mode != acornFoxInstallLayoutTask {
+		return ErrAcornFoxRepoBootstrapConflict
+	}
+	for _, p := range []string{layout.livePath("opt/acornfox/activations"), layout.activationDir(a.ActivationID)} {
 		if err := acornFoxRepoDir(root, s, p, mark); err != nil {
 			return err
 		}
 	}
-	if err := acornFoxLiveWriteFile(root, s, tx, acornFoxRepoActivationPath(a.ActivationID), raw, durableFileMode, mark); err != nil {
+	if err := acornFoxLiveWriteFile(root, s, tx, layout.activationReceiptPath(a.ActivationID), raw, durableFileMode, mark); err != nil {
 		return err
 	}
-	return acornFoxRepoEnsurePointer(root, s, tx, acornFoxRepoReleasePath(a.ActivationID), "../../releases/"+a.ReleaseID, mark)
+	return acornFoxRepoEnsurePointer(root, s, tx, layout.activationReleasePath(a.ActivationID), "../../releases/"+a.ReleaseID, mark)
 }
 func acornFoxRepoDir(root *os.Root, s *TaskAcornFoxRepoStore, p string, mark func()) error {
 	info, e := root.Lstat(p)
