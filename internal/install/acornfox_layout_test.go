@@ -364,12 +364,16 @@ func TestProductionLayoutPureReceiptAndFakeOwnershipEdge(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	install := substrateEntryAt(entries, "var/lib/acornfox/install")
+	if install == nil || install.Kind != SubstrateEntryDirectory || install.Mode != 0o700 || install.Role != OwnerRoleRoot || install.Group != GroupRoleRoot {
+		t.Fatalf("production install entry=%#v", install)
+	}
 	journal, err := newAcornFoxRepoJournalForLayout(layout, substrate.CandidateReceipt.BindingSHA256, sha256Hex(mustMarshalInactiveSubstrateReceipt(t, substrate)))
 	if err != nil {
 		t.Fatal(err)
 	}
 	receipt, err := acornFoxLiveMakeReceiptForLayout(layout, journal, published, entries)
-	if err != nil || receipt.Validate() != nil || receipt.State != "host_live_materialized" || receipt.OwnershipEvidence != "host_uid_gid_verified" || receipt.LayoutSHA256 != layout.evidence() {
+	if err != nil || receipt.Validate() != nil || receipt.State != "host_live_materialized" || receipt.OwnershipEvidence != "host_uid_gid_verified" || receipt.LayoutSHA256 != layout.evidence() || receipt.LayoutSHA256 == "" {
 		t.Fatalf("production receipt=%#v err=%v", receipt, err)
 	}
 	for _, entry := range receipt.Entries {

@@ -134,7 +134,8 @@ func (m *acornFoxLiveMaterializer) Materialize(ctx context.Context) (result Acor
 		}
 	}
 	raw, err := MarshalAcornFoxLiveReceiptV1(receipt)
-	if err != nil || acornFoxLiveWriteFile(target, m.lease.store, m.lease.journal.TransactionID, m.lease.store.layout.receiptPath(), raw, durableFileMode, markEffect) != nil {
+	rootPrincipal, rootOK := m.lease.store.layout.owner(AcornFoxLiveRootRole)
+	if err != nil || !rootOK || acornFoxLiveWriteFileOwned(target, m.lease.store, m.lease.journal.TransactionID, m.lease.store.layout.receiptPath(), raw, durableFileMode, rootPrincipal, markEffect) != nil {
 		return AcornFoxLiveReceiptV1{}, fmt.Errorf("write receipt: %w", ErrAcornFoxLiveConflict)
 	}
 	if err = acornFoxLiveVerifyTarget(target, m.lease.store, entries, receipt); err != nil {
@@ -261,6 +262,10 @@ func acornFoxLiveTemp(transactionID, path string) string {
 }
 
 func acornFoxLiveEnsureRoot(root *os.Root, store *TaskAcornFoxRepoStore, markEffect func()) error {
+	principal, ok := store.layout.owner(AcornFoxLiveRootRole)
+	if !ok {
+		return ErrAcornFoxLiveConflict
+	}
 	info, err := root.Lstat(acornFoxLiveDir)
 	if errors.Is(err, os.ErrNotExist) {
 		if err = acornFoxLiveStep("mkdir"); err != nil {
@@ -280,8 +285,12 @@ func acornFoxLiveEnsureRoot(root *os.Root, store *TaskAcornFoxRepoStore, markEff
 		if openErr != nil {
 			return openErr
 		}
+		ownerErr := acornFoxLiveApplyOwner(store, file, principal)
 		syncErr := file.Sync()
 		closeErr := file.Close()
+		if ownerErr != nil {
+			return ownerErr
+		}
 		if syncErr != nil {
 			return syncErr
 		}
@@ -293,7 +302,7 @@ func acornFoxLiveEnsureRoot(root *os.Root, store *TaskAcornFoxRepoStore, markEff
 		}
 		info, err = root.Lstat(acornFoxLiveDir)
 	}
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != durableDirMode || verifyOwner(info, store.uid, store.gid) != nil {
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != durableDirMode || !acornFoxLiveObservedOwner(store, info, principal) {
 		return ErrAcornFoxLiveConflict
 	}
 	return nil
@@ -352,7 +361,7 @@ func acornFoxLiveEnsureDirOwned(root *os.Root, store *TaskAcornFoxRepoStore, pat
 		}
 		info, err = root.Lstat(path)
 	}
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != mode || verifyOwner(info, store.uid, store.gid) != nil {
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != mode {
 		return ErrAcornFoxLiveConflict
 	}
 	if created {
@@ -372,7 +381,16 @@ func acornFoxLiveEnsureDirOwned(root *os.Root, store *TaskAcornFoxRepoStore, pat
 		if closeErr != nil {
 			return closeErr
 		}
-		return acornFoxLiveSyncDir(root, parentDirectory(path))
+		if err := acornFoxLiveSyncDir(root, parentDirectory(path)); err != nil {
+			return err
+		}
+		info, err = root.Lstat(path)
+		if err != nil {
+			return err
+		}
+	}
+	if !acornFoxLiveObservedOwner(store, info, principal) {
+		return ErrAcornFoxLiveConflict
 	}
 	return nil
 }
@@ -383,7 +401,7 @@ func acornFoxLiveWriteFile(root *os.Root, store *TaskAcornFoxRepoStore, transact
 
 func acornFoxLiveWriteFileOwned(root *os.Root, store *TaskAcornFoxRepoStore, transactionID, path string, raw []byte, mode os.FileMode, principal acornFoxInstallPrincipal, markEffect func()) error {
 	if info, err := root.Lstat(path); err == nil {
-		if acornFoxLiveExactFile(root, store, path, raw, mode, false) {
+		if acornFoxLiveExactFileOwned(root, store, path, raw, mode, principal, false) {
 			return nil
 		}
 		_ = info
@@ -393,7 +411,7 @@ func acornFoxLiveWriteFileOwned(root *os.Root, store *TaskAcornFoxRepoStore, tra
 	}
 	temp := acornFoxLiveTemp(transactionID, path)
 	if info, err := root.Lstat(temp); err == nil {
-		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || acornFoxRepoNlink(info) != 1 || verifyOwner(info, store.uid, store.gid) != nil || !acornFoxLiveExactFile(root, store, temp, raw, mode, true) {
+		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || acornFoxRepoNlink(info) != 1 || !acornFoxLiveObservedOwner(store, info, principal) || !acornFoxLiveExactFileOwned(root, store, temp, raw, mode, principal, true) {
 			return ErrAcornFoxLiveConflict
 		}
 		if err = acornFoxLiveStep("remove"); err != nil {
@@ -477,14 +495,14 @@ func acornFoxLiveWriteFileOwned(root *os.Root, store *TaskAcornFoxRepoStore, tra
 	if err != nil {
 		return err
 	}
-	if !acornFoxLiveExactFile(root, store, temp, raw, mode, true) {
+	if !acornFoxLiveExactFileOwned(root, store, temp, raw, mode, principal, true) {
 		return ErrAcornFoxLiveConflict
 	}
 	if err = acornFoxLiveStep("link"); err != nil {
 		return err
 	}
 	if err = root.Link(temp, path); err != nil {
-		if !acornFoxLiveExactFile(root, store, path, raw, mode, false) {
+		if !acornFoxLiveExactFileOwned(root, store, path, raw, mode, principal, false) {
 			return err
 		}
 	} else {
@@ -496,11 +514,11 @@ func acornFoxLiveWriteFileOwned(root *os.Root, store *TaskAcornFoxRepoStore, tra
 	if err = acornFoxLiveSyncDir(root, parentDirectory(path)); err != nil {
 		return err
 	}
-	if !acornFoxLiveExactFile(root, store, path, raw, mode, true) {
+	if !acornFoxLiveExactFileOwned(root, store, path, raw, mode, principal, true) {
 		return ErrAcornFoxLiveConflict
 	}
 	tempInfo, tempErr := root.Lstat(temp)
-	if tempErr != nil || acornFoxRepoNlink(tempInfo) != 2 || !acornFoxLiveExactFile(root, store, temp, raw, mode, true) {
+	if tempErr != nil || acornFoxRepoNlink(tempInfo) != 2 || !acornFoxLiveExactFileOwned(root, store, temp, raw, mode, principal, true) {
 		return ErrAcornFoxLiveConflict
 	}
 	if err = acornFoxLiveStep("remove"); err != nil {
@@ -513,18 +531,30 @@ func acornFoxLiveWriteFileOwned(root *os.Root, store *TaskAcornFoxRepoStore, tra
 	if acornFoxLiveSyncDir(root, parentDirectory(path)) != nil {
 		return ErrAcornFoxLiveConflict
 	}
-	if !acornFoxLiveExactFile(root, store, path, raw, mode, false) {
+	if !acornFoxLiveExactFileOwned(root, store, path, raw, mode, principal, false) {
 		return ErrAcornFoxLiveConflict
 	}
 	return nil
 }
 
 func acornFoxLiveExactFile(root *os.Root, store *TaskAcornFoxRepoStore, path string, raw []byte, mode os.FileMode, allowTwoLink bool) bool {
+	return acornFoxLiveExactFileOwned(root, store, path, raw, mode, acornFoxInstallPrincipal{uid: store.uid, gid: store.gid}, allowTwoLink)
+}
+
+func acornFoxLiveObservedOwner(store *TaskAcornFoxRepoStore, info os.FileInfo, principal acornFoxInstallPrincipal) bool {
+	if store == nil || store.ownership.observe == nil || principal.uid < 0 || principal.gid < 0 {
+		return false
+	}
+	observed, ok := store.ownership.observe(info)
+	return ok && observed == principal
+}
+
+func acornFoxLiveExactFileOwned(root *os.Root, store *TaskAcornFoxRepoStore, path string, raw []byte, mode os.FileMode, principal acornFoxInstallPrincipal, allowTwoLink bool) bool {
 	if acornFoxLiveStep("stat") != nil {
 		return false
 	}
 	info, err := root.Lstat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != mode || info.Size() != int64(len(raw)) || verifyOwner(info, store.uid, store.gid) != nil || (!allowTwoLink && acornFoxRepoNlink(info) != 1) || (allowTwoLink && acornFoxRepoNlink(info) != 1 && acornFoxRepoNlink(info) != 2) {
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != mode || info.Size() != int64(len(raw)) || !acornFoxLiveObservedOwner(store, info, principal) || (!allowTwoLink && acornFoxRepoNlink(info) != 1) || (allowTwoLink && acornFoxRepoNlink(info) != 1 && acornFoxRepoNlink(info) != 2) {
 		return false
 	}
 	file, err := root.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
@@ -565,13 +595,14 @@ func acornFoxLiveCleanTemps(root *os.Root, store *TaskAcornFoxRepoStore, transac
 			}
 			temp := acornFoxLiveTemp(transactionID, acornFoxLivePath(entry.Path))
 			if info, statErr := root.Lstat(temp); statErr == nil {
-				if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != os.FileMode(entry.Mode) || verifyOwner(info, store.uid, store.gid) != nil {
+				principal := acornFoxLivePrincipalForEntry(store.layout, entry)
+				if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != os.FileMode(entry.Mode) || !acornFoxLiveObservedOwner(store, info, principal) {
 					return ErrAcornFoxLiveConflict
 				}
 				if acornFoxRepoNlink(info) == 2 {
 					final := acornFoxLivePath(entry.Path)
 					finalInfo, finalErr := root.Lstat(final)
-					if finalErr != nil || !os.SameFile(info, finalInfo) || !acornFoxLiveExactFile(root, store, final, raw, os.FileMode(entry.Mode), true) {
+					if finalErr != nil || !os.SameFile(info, finalInfo) || !acornFoxLiveExactFileOwned(root, store, final, raw, os.FileMode(entry.Mode), principal, true) {
 						return ErrAcornFoxLiveConflict
 					}
 				} else if acornFoxRepoNlink(info) != 1 {
@@ -605,7 +636,7 @@ func acornFoxLiveValidateExisting(root *os.Root, store *TaskAcornFoxRepoStore, e
 			return nil
 		}
 		entry, ok := want[relative]
-		if !ok || (entry.Kind == SubstrateEntryDirectory) != info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != os.FileMode(entry.Mode) || verifyOwner(info, store.uid, store.gid) != nil || (!info.IsDir() && acornFoxRepoNlink(info) != 1) {
+		if !ok || (entry.Kind == SubstrateEntryDirectory) != info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != os.FileMode(entry.Mode) || !acornFoxLiveObservedOwner(store, info, acornFoxLivePrincipalForEntry(store.layout, entry)) || (!info.IsDir() && acornFoxRepoNlink(info) != 1) {
 			return ErrAcornFoxLiveConflict
 		}
 		return nil
@@ -622,7 +653,7 @@ func acornFoxLiveVerifyTarget(root *os.Root, store *TaskAcornFoxRepoStore, entri
 		path := acornFoxLivePath(entry.Path)
 		if entry.Kind == SubstrateEntryDirectory {
 			info, err := root.Lstat(path)
-			if err != nil || !info.IsDir() || info.Mode().Perm() != os.FileMode(entry.Mode) {
+			if err != nil || !info.IsDir() || info.Mode().Perm() != os.FileMode(entry.Mode) || !acornFoxLiveObservedOwner(store, info, acornFoxLivePrincipalForEntry(store.layout, entry)) {
 				return ErrAcornFoxLiveConflict
 			}
 			continue
@@ -643,7 +674,8 @@ func acornFoxLiveVerifyTarget(root *os.Root, store *TaskAcornFoxRepoStore, entri
 		return ErrAcornFoxLiveConflict
 	}
 	raw, err := MarshalAcornFoxLiveReceiptV1(receipt)
-	if err != nil || !acornFoxLiveExactFile(root, store, acornFoxLiveReceipt, raw, durableFileMode, false) {
+	rootPrincipal, ok := store.layout.owner(AcornFoxLiveRootRole)
+	if err != nil || !ok || !acornFoxLiveExactFileOwned(root, store, acornFoxLiveReceipt, raw, durableFileMode, rootPrincipal, false) {
 		return ErrAcornFoxLiveConflict
 	}
 	return nil
