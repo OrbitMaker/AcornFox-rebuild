@@ -182,8 +182,11 @@ func (b acornFoxHostBridge) finish(ctx context.Context, set *acornFoxCandidateSe
 			return AcornFoxHostBootstrapReceiptV1{}, err
 		}
 	case AcornFoxReconcileCompleted:
-		if err = newAcornFoxBindingStore(store).Put(set.bindingRaw); err != nil {
-			return AcornFoxHostBootstrapReceiptV1{}, err
+		// Once a substrate is terminal, replay may verify the supplied candidate
+		// but must not heal missing or altered retained binding evidence.
+		retained, readErr := newAcornFoxBindingStore(store).Read(set.bindingSHA256)
+		if readErr != nil || string(retained) != string(set.bindingRaw) {
+			return AcornFoxHostBootstrapReceiptV1{}, ErrAcornFoxRepoBootstrapConflict
 		}
 	default:
 		return AcornFoxHostBootstrapReceiptV1{}, ErrAcornFoxRepoBootstrapConflict
