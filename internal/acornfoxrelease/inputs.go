@@ -14,16 +14,18 @@ var (
 )
 
 type ToolchainInputsV1 struct {
-	SchemaVersion   int      `json:"schema_version"`
-	Product         string   `json:"product"`
-	Architecture    string   `json:"architecture"`
-	GoVersion       string   `json:"go_version"`
-	GoBinarySHA256  string   `json:"go_binary_sha256"`
-	GitVersion      string   `json:"git_version"`
-	GitBinarySHA256 string   `json:"git_binary_sha256"`
-	NodeVersion     string   `json:"node_version"`
-	NPMVersion      string   `json:"npm_version"`
-	BuildPolicy     []string `json:"build_policy"`
+	SchemaVersion    int      `json:"schema_version"`
+	Product          string   `json:"product"`
+	Architecture     string   `json:"architecture"`
+	GoVersion        string   `json:"go_version"`
+	GoBinarySHA256   string   `json:"go_binary_sha256"`
+	GitVersion       string   `json:"git_version"`
+	GitBinarySHA256  string   `json:"git_binary_sha256"`
+	NodeVersion      string   `json:"node_version"`
+	NodeBinarySHA256 string   `json:"node_binary_sha256"`
+	NPMVersion       string   `json:"npm_version"`
+	NPMCLISHA256     string   `json:"npm_cli_sha256"`
+	BuildPolicy      []string `json:"build_policy"`
 }
 type RuntimeInputsV1 struct {
 	SchemaVersion int           `json:"schema_version"`
@@ -38,7 +40,7 @@ type LicenseInputsV1 struct {
 }
 
 func (v ToolchainInputsV1) Validate() error {
-	if v.SchemaVersion != 1 || v.Product != Product || v.Architecture != Architecture || !goVersionText.MatchString(v.GoVersion) || !digestText.MatchString(v.GoBinarySHA256) || !gitVersionText.MatchString(v.GitVersion) || !digestText.MatchString(v.GitBinarySHA256) || !nodeVersionText.MatchString(v.NodeVersion) || !npmVersionText.MatchString(v.NPMVersion) || len(v.BuildPolicy) != len(fixedBuildPolicy) {
+	if v.SchemaVersion != 1 || v.Product != Product || v.Architecture != Architecture || !goVersionText.MatchString(v.GoVersion) || !digestText.MatchString(v.GoBinarySHA256) || !gitVersionText.MatchString(v.GitVersion) || !digestText.MatchString(v.GitBinarySHA256) || !nodeVersionText.MatchString(v.NodeVersion) || !digestText.MatchString(v.NodeBinarySHA256) || !npmVersionText.MatchString(v.NPMVersion) || !digestText.MatchString(v.NPMCLISHA256) || len(v.BuildPolicy) != len(fixedBuildPolicy) {
 		return ErrInputs
 	}
 	for i, t := range v.BuildPolicy {

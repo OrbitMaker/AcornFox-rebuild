@@ -17,7 +17,7 @@ func TestPrepareGoBuildPlanV1SealsRealDetachedRepository(t *testing.T) {
 	if err := VerifyGitSourceV1(context.Background(), root, witness, policy, toolchain); err != nil {
 		t.Fatalf("precondition git verification: %v", err)
 	}
-	plan, err := PrepareGoBuildPlanV1(context.Background(), witness, policy, toolchain, root, cacheRoot)
+	plan, err := PrepareGoBuildPlanV1(context.Background(), witness, policy, toolchain, root, cacheRoot, localNPMCLIPath(t))
 	if err != nil || !plan.Valid() {
 		t.Fatalf("plan=%#v err=%v", plan, err)
 	}
@@ -74,6 +74,14 @@ func TestPrepareGoBuildPlanV1UsesOnlySealedGoList(t *testing.T) {
 			t.Fatalf("missing offline sumdb policy: %q", env)
 		}
 		calls = append(calls, append([]string(nil), args...))
+		if name == localNodePath(t) {
+			if sameStrings(args, []string{"--version"}) {
+				return []byte(toolchain.NodeVersion + "\n"), nil
+			}
+			if sameStrings(args, []string{localNPMCLIPath(t), "--version"}) {
+				return []byte(toolchain.NPMVersion + "\n"), nil
+			}
+		}
 		switch args[0] {
 		case "version":
 			return []byte("go version " + toolchain.GoVersion + " linux/amd64\n"), nil
@@ -93,14 +101,14 @@ func TestPrepareGoBuildPlanV1UsesOnlySealedGoList(t *testing.T) {
 			return nil, nil
 		}
 	}
-	plan, err := prepareGoBuildPlanV1(context.Background(), witness, policy, toolchain, root, cacheRoot, runner)
-	if err != nil || !plan.Valid() || len(calls) != 4 {
+	plan, err := prepareGoBuildPlanV1(context.Background(), witness, policy, toolchain, root, cacheRoot, localNPMCLIPath(t), runner)
+	if err != nil || !plan.Valid() || len(calls) != 6 {
 		if verifyErr := VerifyGitSourceV1(context.Background(), root, witness, policy, toolchain); verifyErr != nil {
 			t.Fatalf("postcondition git verification: %v", verifyErr)
 		}
 		t.Fatalf("plan=%#v calls=%q err=%v", plan, calls, err)
 	}
-	if calls[0][0] != "version" || calls[1][0] != "mod" || calls[2][0] != "list" || calls[3][0] != "mod" {
+	if calls[0][0] != "version" || calls[1][0] != "mod" || calls[2][0] != "list" || calls[3][0] != "mod" || calls[4][0] != "--version" || calls[5][0] != localNPMCLIPath(t) {
 		t.Fatalf("unexpected command order: %q", calls)
 	}
 	for _, call := range calls {
@@ -143,13 +151,13 @@ func TestPrepareGoBuildPlanV1PinsGoExecutableAndStopsOnVerifyFailure(t *testing.
 		}
 		return nil, errors.New("unexpected command")
 	}
-	plan, err := prepareGoBuildPlanWithDependencies(context.Background(), witness, policy, toolchain, root, cacheRoot, runner, func(string) (string, error) { return goPath, nil }, hashTrustedExecutable)
+	plan, err := prepareGoBuildPlanWithDependencies(context.Background(), witness, policy, toolchain, root, cacheRoot, localNPMCLIPath(t), runner, func(string) (string, error) { return goPath, nil }, hashTrustedExecutable)
 	if err == nil || plan.Valid() || len(calls) != 2 || calls[1][0] != "mod" {
 		t.Fatalf("plan=%#v calls=%q err=%v", plan, calls, err)
 	}
 	toolchain.GoBinarySHA256 = strings.Repeat("0", 64)
 	witness = witnessForToolchain(t, witness, toolchain)
-	if plan, err := prepareGoBuildPlanWithDependencies(context.Background(), witness, policy, toolchain, root, cacheRoot, runner, func(string) (string, error) { return goPath, nil }, hashTrustedExecutable); err == nil || plan.Valid() {
+	if plan, err := prepareGoBuildPlanWithDependencies(context.Background(), witness, policy, toolchain, root, cacheRoot, localNPMCLIPath(t), runner, func(string) (string, error) { return goPath, nil }, hashTrustedExecutable); err == nil || plan.Valid() {
 		t.Fatal("digest drift accepted")
 	}
 }
@@ -169,7 +177,7 @@ func TestPrepareGoBuildPlanV1RejectsExecutableAndCacheDrift(t *testing.T) {
 		}
 		return hashTrustedExecutable(path)
 	}
-	plan, err := prepareGoBuildPlanWithDependencies(context.Background(), witness, policy, toolchain, root, cacheRoot, func(_ context.Context, name string, args []string, _ string, _ []string) ([]byte, error) {
+	plan, err := prepareGoBuildPlanWithDependencies(context.Background(), witness, policy, toolchain, root, cacheRoot, localNPMCLIPath(t), func(_ context.Context, name string, args []string, _ string, _ []string) ([]byte, error) {
 		if name != goPath {
 			t.Fatalf("unexpected executable %q", name)
 		}
@@ -182,7 +190,7 @@ func TestPrepareGoBuildPlanV1RejectsExecutableAndCacheDrift(t *testing.T) {
 
 	modCache := filepath.Join(cacheRoot, "go-mod-cache")
 	modVerifies := 0
-	plan, err = prepareGoBuildPlanV1(context.Background(), witness, policy, toolchain, root, cacheRoot, func(_ context.Context, _ string, args []string, dir string, _ []string) ([]byte, error) {
+	plan, err = prepareGoBuildPlanV1(context.Background(), witness, policy, toolchain, root, cacheRoot, localNPMCLIPath(t), func(_ context.Context, _ string, args []string, dir string, _ []string) ([]byte, error) {
 		switch args[0] {
 		case "version":
 			return []byte("go version " + toolchain.GoVersion + " linux/amd64\n"), nil
@@ -312,7 +320,7 @@ func TestPrepareGoBuildPlanV1RejectsSourcePackageDrift(t *testing.T) {
 			if err := os.Mkdir(candidateCache, 0o700); err != nil {
 				t.Fatal(err)
 			}
-			plan, err := prepareGoBuildPlanV1(context.Background(), candidateWitness, candidate, toolchain, root, candidateCache, func(_ context.Context, _ string, args []string, dir string, _ []string) ([]byte, error) {
+			plan, err := prepareGoBuildPlanV1(context.Background(), candidateWitness, candidate, toolchain, root, candidateCache, localNPMCLIPath(t), func(_ context.Context, _ string, args []string, dir string, _ []string) ([]byte, error) {
 				if args[0] == "version" {
 					return []byte("go version " + toolchain.GoVersion + " linux/amd64\n"), nil
 				}
@@ -336,6 +344,8 @@ func syntheticGoReleaseRepository(t *testing.T) (string, string, Witness, Source
 	}
 	module := "github.com/acme/acornfox-fixture"
 	writeReleaseFile(t, filepath.Join(root, "go.mod"), "module "+module+"\n\ngo 1.25.13\n")
+	writeReleaseFile(t, filepath.Join(root, "web", "package.json"), "{\"name\":\"fixture-web\",\"private\":true}\n")
+	writeReleaseFile(t, filepath.Join(root, "web", "package-lock.json"), "{\"lockfileVersion\":3}\n")
 	for _, target := range fixedTargets {
 		writeReleaseFile(t, filepath.Join(root, strings.TrimPrefix(target.path, "./"), "main.go"), "package main\nimport \"fmt\"\nvar processIdentity string\nvar buildVersion string\nvar buildSourceCommit string\nvar buildLayoutSchema string\nfunc main() { fmt.Print(processIdentity, buildVersion, buildSourceCommit, buildLayoutSchema) }\n")
 	}
@@ -348,7 +358,7 @@ func syntheticGoReleaseRepository(t *testing.T) (string, string, Witness, Source
 	commit := gitRun(t, root, "rev-parse", "HEAD")
 	gitRun(t, root, "checkout", "-q", "--detach")
 	policy := policyForTree(t, root, module)
-	toolchain := ToolchainInputsV1{SchemaVersion: 1, Product: Product, Architecture: Architecture, GoVersion: localGoVersion(t), GoBinarySHA256: localGoBinaryDigest(t), GitVersion: localGitVersion(t), GitBinarySHA256: localGitBinaryDigest(t), NodeVersion: "v22.0.0", NPMVersion: "10.0.0", BuildPolicy: append([]string(nil), fixedBuildPolicy...)}
+	toolchain := ToolchainInputsV1{SchemaVersion: 1, Product: Product, Architecture: Architecture, GoVersion: localGoVersion(t), GoBinarySHA256: localGoBinaryDigest(t), GitVersion: localGitVersion(t), GitBinarySHA256: localGitBinaryDigest(t), NodeVersion: localNodeVersion(t), NodeBinarySHA256: localNodeBinaryDigest(t), NPMVersion: localNPMVersion(t), NPMCLISHA256: localNPMCLIDigest(t), BuildPolicy: append([]string(nil), fixedBuildPolicy...)}
 	runtime := RuntimeInputsV1{SchemaVersion: 1, Product: Product, Architecture: Architecture, Files: []FileEntryV1{{Path: "runtime", SHA256: strings.Repeat("a", 64), Mode: 0o644}}}
 	license := LicenseInputsV1{SchemaVersion: 1, Product: Product, Files: []FileEntryV1{{Path: "LICENSE", SHA256: strings.Repeat("b", 64), Mode: 0o644}}}
 	witness := witnessForInputs(t, policy, toolchain, runtime, license)
@@ -478,6 +488,74 @@ func localGitBinaryDigest(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return digest
+}
+func localNodeVersion(t *testing.T) string {
+	t.Helper()
+	raw, err := exec.Command("node", "--version").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := strings.TrimSpace(string(raw))
+	if !nodeVersionText.MatchString(value) {
+		t.Fatalf("unexpected node version %q", raw)
+	}
+	return value
+}
+func localNodeBinaryDigest(t *testing.T) string {
+	t.Helper()
+	path, err := resolveTrustedExecutable("node", exec.LookPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := hashTrustedExecutable(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return digest
+}
+func localNodePath(t *testing.T) string {
+	t.Helper()
+	path, err := resolveTrustedExecutable("node", exec.LookPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+func localNPMCLIPath(t *testing.T) string {
+	t.Helper()
+	path, err := exec.LookPath("npm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := resolveTrustedFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resolved
+}
+func localNPMCLIDigest(t *testing.T) string {
+	t.Helper()
+	digest, err := hashTrustedExecutable(localNPMCLIPath(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return digest
+}
+func localNPMVersion(t *testing.T) string {
+	t.Helper()
+	node, err := resolveTrustedExecutable("node", exec.LookPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := exec.Command(node, localNPMCLIPath(t), "--version").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := strings.TrimSpace(string(raw))
+	if !npmVersionText.MatchString(value) {
+		t.Fatalf("unexpected npm version %q", raw)
+	}
+	return value
 }
 func writeReleaseFile(t *testing.T, path, body string) {
 	t.Helper()

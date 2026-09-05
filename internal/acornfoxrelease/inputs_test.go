@@ -51,7 +51,7 @@ func TestRuntimeLimitExceedsSourceLimit(t *testing.T) {
 }
 func TestInputManifestsBindOnlyTheirWitnessDigest(t *testing.T) {
 	source := sourcePolicyFixture()
-	tool := ToolchainInputsV1{SchemaVersion: 1, Product: Product, Architecture: Architecture, GoVersion: "go1.25.0", GoBinarySHA256: strings.Repeat("c", 64), GitVersion: "2.40.0", GitBinarySHA256: strings.Repeat("d", 64), NodeVersion: "v22.0.0", NPMVersion: "10.0.0", BuildPolicy: []string{"build_id_empty", "build_vcs_disabled", "cgo_disabled", "trimpath"}}
+	tool := ToolchainInputsV1{SchemaVersion: 1, Product: Product, Architecture: Architecture, GoVersion: "go1.25.0", GoBinarySHA256: strings.Repeat("c", 64), GitVersion: "2.40.0", GitBinarySHA256: strings.Repeat("d", 64), NodeVersion: "v22.0.0", NodeBinarySHA256: strings.Repeat("e", 64), NPMVersion: "10.0.0", NPMCLISHA256: strings.Repeat("f", 64), BuildPolicy: []string{"build_id_empty", "build_vcs_disabled", "cgo_disabled", "trimpath"}}
 	runtime := RuntimeInputsV1{SchemaVersion: 1, Product: Product, Architecture: Architecture, Files: []FileEntryV1{{Path: "etc/runtime.conf", SHA256: strings.Repeat("a", 64), Mode: 0o644}}}
 	license := LicenseInputsV1{SchemaVersion: 1, Product: Product, Files: []FileEntryV1{{Path: "LICENSE", SHA256: strings.Repeat("b", 64), Mode: 0o644}}}
 	w := witnessForInputs(t, source, tool, runtime, license)
@@ -81,7 +81,7 @@ func TestInputManifestsBindOnlyTheirWitnessDigest(t *testing.T) {
 }
 
 func TestToolchainRejectsLooseVersionsAndPolicy(t *testing.T) {
-	v := ToolchainInputsV1{SchemaVersion: 1, Product: Product, Architecture: Architecture, GoVersion: "go1.2.3", GoBinarySHA256: strings.Repeat("c", 64), GitVersion: "2.3.4", GitBinarySHA256: strings.Repeat("d", 64), NodeVersion: "v2.3.4", NPMVersion: "3.4.5", BuildPolicy: []string{"build_id_empty", "build_vcs_disabled", "cgo_disabled", "trimpath"}}
+	v := ToolchainInputsV1{SchemaVersion: 1, Product: Product, Architecture: Architecture, GoVersion: "go1.2.3", GoBinarySHA256: strings.Repeat("c", 64), GitVersion: "2.3.4", GitBinarySHA256: strings.Repeat("d", 64), NodeVersion: "v2.3.4", NodeBinarySHA256: strings.Repeat("e", 64), NPMVersion: "3.4.5", NPMCLISHA256: strings.Repeat("f", 64), BuildPolicy: []string{"build_id_empty", "build_vcs_disabled", "cgo_disabled", "trimpath"}}
 	for _, mutate := range []func(*ToolchainInputsV1){func(v *ToolchainInputsV1) { v.GoVersion = "go1.2" }, func(v *ToolchainInputsV1) { v.GoBinarySHA256 = "missing" }, func(v *ToolchainInputsV1) { v.GitVersion = "2.3" }, func(v *ToolchainInputsV1) { v.GitBinarySHA256 = "missing" }, func(v *ToolchainInputsV1) { v.NodeVersion = "v2.3.4\n" }, func(v *ToolchainInputsV1) { v.BuildPolicy = []string{"network_enabled"} }} {
 		copy := v
 		mutate(&copy)
