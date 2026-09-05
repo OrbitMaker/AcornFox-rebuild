@@ -23,6 +23,7 @@ import (
 	aitools "github.com/open-card/open-card/internal/ai/tools"
 	"github.com/open-card/open-card/internal/application"
 	"github.com/open-card/open-card/internal/auth"
+	"github.com/open-card/open-card/internal/buildnetwork"
 	"github.com/open-card/open-card/internal/contracts"
 	"github.com/open-card/open-card/internal/controllers"
 	"github.com/open-card/open-card/internal/importers/dockerfile"
@@ -204,7 +205,22 @@ func main() {
 				log.Fatal(err)
 			}
 			server.controller.SetSourcePreparer(sourceProvider)
-			buildProvider, err := buildkit.New(buildkit.Config{Command: getenv(acornfoxenv.BuildkitCommand), Builder: getenv(acornfoxenv.BuildkitWorker), Address: getenv(acornfoxenv.BuildkitAddress), WorkspaceRoot: workspaceRoot, WorkRoot: buildWorkRoot, StaticServerBinary: getenv(acornfoxenv.StaticServerBinary), ImageStore: imageStore, Capacity: capacityProvider, SecretResolver: secretProvider, LogSink: buildLogSink, RequireLogSink: true})
+			buildConfig := buildkit.Config{Command: getenv(acornfoxenv.BuildkitCommand), Builder: getenv(acornfoxenv.BuildkitWorker), Address: getenv(acornfoxenv.BuildkitAddress), WorkspaceRoot: workspaceRoot, WorkRoot: buildWorkRoot, StaticServerBinary: getenv(acornfoxenv.StaticServerBinary), ImageStore: imageStore, Capacity: capacityProvider, SecretResolver: secretProvider, LogSink: buildLogSink, RequireLogSink: true}
+			buildNetwork := contracts.NetworkPolicy{}
+			if environment.Clean() {
+				// The compiled policy is the requested contract. The privileged
+				// attestor checks the installed file and kernel state per build;
+				// a missing worker blocks builds without taking down diagnostics.
+				policy := buildnetwork.CanonicalPolicy()
+				_, digest, policyErr := buildnetwork.ParsePolicy(policy)
+				if policyErr != nil {
+					log.Fatal("invalid compiled AcornFox build policy")
+				}
+				buildConfig.ProductionNetworkPolicyRaw = policy
+				buildConfig.WorkerPolicyAttestor = buildnetwork.Client{}
+				buildNetwork = contracts.NetworkPolicy{Mode: contracts.NetworkModeControlledEgressV1, WorkerPolicyDigest: digest}
+			}
+			buildProvider, err := buildkit.New(buildConfig)
 			if err != nil {
 				log.Fatal(err)
 			}
@@ -215,7 +231,7 @@ func main() {
 			server.SetAcornFoxDeliveryCommand(acornFoxHTTPCommand{service: &application.AcornFoxDeliveryService{
 				Idempotency: acornFoxStore, Sources: acornFoxStore, Importer: dockerfile.New(), Builds: acornFoxStore,
 				Tasks: acornFoxStore, Runtime: acornFoxStore, Observer: acornFoxStore, Builder: buildProvider, Capacity: capacityProvider,
-				Config: application.AcornFoxDeliveryConfig{TargetRepository: "acornfox.local/apps", StorageKeyPrefix: "acornfox-builds"},
+				Config: application.AcornFoxDeliveryConfig{TargetRepository: "acornfox.local/apps", StorageKeyPrefix: "acornfox-builds", BuildNetwork: buildNetwork},
 			}})
 			if getenv(acornfoxenv.M2Enabled) == "true" {
 				registryTemp := buildWorkRoot + "/registry-config"

@@ -59,7 +59,7 @@ func newAcornFoxFixture(t *testing.T, version string, predecessor *acornFoxFixtu
 		SchemaVersion: ManifestSchemaVersion, Product: AcornFoxV1Product, Version: binding.Version, ReleaseID: binding.ReleaseID,
 		Architecture: AcornFoxV1Architecture, MigrationVersion: AcornFoxV1MigrationVersion, SourceCommit: binding.SourceCommit,
 		Protocol: AgentProtocolVersion, ConfigDir: AcornFoxV1ConfigDir, DataDir: AcornFoxV1DataDir,
-		Compatibility: Compatibility{MinDataVersion: 33, MaxDataVersion: 33, MinAgentProtocol: PreviousAgentProtocol, MaxAgentProtocol: AgentProtocolVersion}, Files: files,
+		Compatibility: Compatibility{MinDataVersion: AcornFoxV1DataVersion, MaxDataVersion: AcornFoxV1DataVersion, MinAgentProtocol: PreviousAgentProtocol, MaxAgentProtocol: AgentProtocolVersion}, Files: files,
 	}
 	if binding.NMinusOne != nil {
 		n := binding.NMinusOne

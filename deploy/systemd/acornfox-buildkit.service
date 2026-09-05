@@ -1,7 +1,8 @@
 [Unit]
 Description=AcornFox rootless BuildKit worker
-Requires=acornfox-upgrade-safe.target
-After=local-fs.target acornfox-upgrade-safe.target
+Requires=acornfox-upgrade-safe.target acornfox-build-network.service
+BindsTo=acornfox-build-network.service
+After=local-fs.target acornfox-upgrade-safe.target acornfox-build-network.service
 
 [Service]
 Type=simple
@@ -11,12 +12,18 @@ RuntimeDirectory=acornfox-buildkit
 RuntimeDirectoryMode=0750
 WorkingDirectory=/var/lib/acornfox/buildkit
 Environment=ACORNFOX_RUNTIME_MODE=clean
+Environment=HOME=/var/lib/acornfox/buildkit
+Environment=XDG_RUNTIME_DIR=/run/acornfox-buildkit
+Environment=PATH=/opt/acornfox/current/bin:/usr/bin:/bin
 EnvironmentFile=-/etc/acornfox/buildkit.env
 # Rootless BuildKit needs a user namespace and mount setup; these are the
 # intentionally retained exceptions to the otherwise unprivileged hardening.
 NoNewPrivileges=no
 Delegate=yes
-ExecStart=/opt/acornfox/current/bin/rootlesskit --state-dir=/var/lib/acornfox/buildkit/rootlesskit --net=none --disable-host-loopback --copy-up=/etc /opt/acornfox/current/bin/buildkitd --config /etc/acornfox/buildkitd.toml --root /var/lib/acornfox/buildkit/buildkitd --addr unix:///run/acornfox-buildkit/buildkitd.sock --group acornfox-buildkit
+NetworkNamespacePath=/run/netns/acornfox-buildkit
+BindReadOnlyPaths=/etc/acornfox/build-resolv.conf:/etc/resolv.conf
+# GID 0 in the rootless user namespace maps to acornfox-buildkit on the host.
+ExecStart=/opt/acornfox/current/bin/rootlesskit --state-dir=/var/lib/acornfox/buildkit/rootlesskit --net=host --copy-up=/etc --copy-up=/run --propagation=rslave /opt/acornfox/current/bin/buildkitd --config /etc/acornfox/buildkitd.toml --root /var/lib/acornfox/buildkit/buildkitd --addr unix:///run/acornfox-buildkit/buildkitd.sock --group 0
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=30s
@@ -25,19 +32,24 @@ PrivateDevices=yes
 DevicePolicy=closed
 ProtectSystem=strict
 ProtectHome=yes
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
+# Rootless runc must mount a fresh /proc. Inherited masked /proc submounts
+# would make the kernel reject that mount as too revealing. The host UID is
+# unprivileged; initial-userns networking remains owned by the root service.
+ProtectKernelTunables=no
+ProtectKernelModules=no
 ProtectClock=yes
 LockPersonality=yes
-RestrictSUIDSGID=yes
-ProtectProc=invisible
+# Layer extraction preserves image permission bits inside the mapped userns.
+RestrictSUIDSGID=no
+ProtectProc=default
 RestrictRealtime=yes
 RemoveIPC=yes
-MemoryDenyWriteExecute=yes
-RestrictAddressFamilies=AF_UNIX AF_NETLINK
+# Dockerfile RUN may execute Node/V8 and other JIT-based build tools.
+MemoryDenyWriteExecute=no
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
 SystemCallArchitectures=native
-# @mount is required by rootlesskit's deliberately retained namespace setup.
-SystemCallFilter=@system-service @mount
+# Rootless setup mounts filesystems; runc must install its child seccomp filter.
+SystemCallFilter=@system-service @mount seccomp sethostname
 ReadWritePaths=/var/lib/acornfox/buildkit /run/acornfox-buildkit
 MemoryMax=512M
 CPUQuota=50%

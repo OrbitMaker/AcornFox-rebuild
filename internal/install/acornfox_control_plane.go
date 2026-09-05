@@ -2,7 +2,7 @@ package install
 
 // This file owns the AcornFox V1 control-plane database transition.  It is
 // intentionally separate from the retained Open Card bootstrap database
-// implementation: AcornFox has a closed 33-migration release inventory and a
+// implementation: AcornFox has a closed release migration inventory and a
 // fixed single-node PostgreSQL identity.
 
 import (

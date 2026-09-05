@@ -446,7 +446,7 @@ func acornFoxFixedSubstrateEntries(candidate AcornFoxStageReceiptV1) map[string]
 		path := "etc/systemd/system/" + strings.TrimPrefix(unit, "systemd/")
 		entries[path] = file(path, 0o644, OwnerRoleRoot, GroupRoleRoot)
 	}
-	for destination := range map[string]string{"etc/acornfox/Caddyfile": "caddy/acornfox.Caddyfile.example", "etc/acornfox/acornfox-edge.Caddyfile": "caddy/acornfox-edge.Caddyfile.example", "etc/acornfox/acornfox-edge.env": "caddy/acornfox-edge.env.example", "etc/acornfox/buildkitd.toml": "config/acornfox-buildkitd.toml"} {
+	for destination := range map[string]string{"etc/acornfox/Caddyfile": "caddy/acornfox.Caddyfile.example", "etc/acornfox/acornfox-edge.Caddyfile": "caddy/acornfox-edge.Caddyfile.example", "etc/acornfox/acornfox-edge.env": "caddy/acornfox-edge.env.example", "etc/acornfox/buildkitd.toml": "config/acornfox-buildkitd.toml", "etc/acornfox/build-network-policy.json": "config/acornfox-build-network-policy-v1.json", "etc/acornfox/build-resolv.conf": "config/acornfox-build-resolv.conf", "etc/acornfox/rootlesskit.apparmor": "config/acornfox-rootlesskit.apparmor"} {
 		mode, group := uint32(0o644), GroupRoleRoot
 		if strings.HasSuffix(destination, ".env") {
 			mode, group = 0o640, GroupRoleEdge
@@ -466,7 +466,7 @@ func acornFoxInstalledSource(candidate AcornFoxStageReceiptV1, path string) stri
 	if strings.HasPrefix(path, "etc/systemd/system/") {
 		return "systemd/" + strings.TrimPrefix(path, "etc/systemd/system/")
 	}
-	return map[string]string{"etc/acornfox/Caddyfile": "caddy/acornfox.Caddyfile.example", "etc/acornfox/acornfox-edge.Caddyfile": "caddy/acornfox-edge.Caddyfile.example", "etc/acornfox/acornfox-edge.env": "caddy/acornfox-edge.env.example", "etc/acornfox/buildkitd.toml": "config/acornfox-buildkitd.toml"}[path]
+	return map[string]string{"etc/acornfox/Caddyfile": "caddy/acornfox.Caddyfile.example", "etc/acornfox/acornfox-edge.Caddyfile": "caddy/acornfox-edge.Caddyfile.example", "etc/acornfox/acornfox-edge.env": "caddy/acornfox-edge.env.example", "etc/acornfox/buildkitd.toml": "config/acornfox-buildkitd.toml", "etc/acornfox/build-network-policy.json": "config/acornfox-build-network-policy-v1.json", "etc/acornfox/build-resolv.conf": "config/acornfox-build-resolv.conf", "etc/acornfox/rootlesskit.apparmor": "config/acornfox-rootlesskit.apparmor"}[path]
 }
 
 type AcornFoxInactiveSubstrateIntentV1 struct {

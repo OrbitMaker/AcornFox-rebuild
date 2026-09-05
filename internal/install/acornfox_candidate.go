@@ -15,7 +15,8 @@ import (
 const (
 	AcornFoxV1Product          = "acornfox"
 	AcornFoxV1Architecture     = "amd64"
-	AcornFoxV1MigrationVersion = "0033"
+	AcornFoxV1MigrationVersion = "0034"
+	AcornFoxV1DataVersion      = 34
 	AcornFoxV1InstallPrefix    = "/opt/acornfox"
 	AcornFoxV1ConfigDir        = "/etc/acornfox"
 	AcornFoxV1DataDir          = "/var/lib/acornfox"
@@ -44,6 +45,7 @@ var (
 		"bin/buildkitd", "bin/buildctl", "bin/buildkit-runc", "bin/rootlesskit", "bin/docker-buildx", "bin/caddy",
 	}
 	acornFoxV1Units = []string{
+		"systemd/acornfox-build-network.service",
 		"systemd/acornfox-server.service", "systemd/acornfox-agent.service", "systemd/acornfox-buildkit.service",
 		"systemd/acornfox-caddy.service", "systemd/acornfox-edge.service", "systemd/acornfox-healthcheck.service",
 		"systemd/acornfox-healthcheck.timer", "systemd/acornfox-upgrade-recover.service",
@@ -65,6 +67,7 @@ var (
 		"0025_acornfox_build_plan_binding.sql", "0026_acornfox_build_network_policy.sql", "0027_acornfox_probe_observations.sql",
 		"0028_acornfox_log_metadata.sql", "0029_acornfox_log_provenance.sql", "0030_dns_change_provider_neutral.sql",
 		"0031_acornfox_public_access.sql", "0032_dns_change_execution.sql", "0033_acornfox_discovery_task_lookup.sql",
+		"0034_artifacts_per_build.sql",
 	}
 	acornFoxV1WebAssetName = regexp.MustCompile(`^[A-Za-z0-9_.-]+-[A-Za-z0-9_-]{8,}\.(?:css|js|map|png|jpe?g|svg|gif|webp|ico|woff2?|ttf)$`)
 	acornFoxGitHubPath     = regexp.MustCompile(`^/[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$`)
@@ -92,6 +95,9 @@ func AcornFoxV1RequiredFiles() []AcornFoxV1PackageFile {
 		files = append(files, AcornFoxV1PackageFile{"migrations/control-plane/" + name, 0o640})
 	}
 	return append(files,
+		AcornFoxV1PackageFile{"config/acornfox-build-network-policy-v1.json", 0o644},
+		AcornFoxV1PackageFile{"config/acornfox-build-resolv.conf", 0o644},
+		AcornFoxV1PackageFile{"config/acornfox-rootlesskit.apparmor", 0o644},
 		AcornFoxV1PackageFile{"config/acornfox-buildkitd.toml", 0o644},
 		AcornFoxV1PackageFile{"caddy/acornfox.Caddyfile.example", 0o644},
 		AcornFoxV1PackageFile{"caddy/acornfox-edge.env.example", 0o640},
@@ -295,7 +301,7 @@ func validateAcornFoxCandidateManifest(m Manifest, b AcornFoxCandidateBindingV1)
 	if m.ConfigDir != AcornFoxV1ConfigDir || m.DataDir != AcornFoxV1DataDir {
 		return errors.New("AcornFox manifest layout is invalid")
 	}
-	if m.Protocol != AgentProtocolVersion || m.Compatibility.MinAgentProtocol != PreviousAgentProtocol || m.Compatibility.MaxAgentProtocol != AgentProtocolVersion || m.Compatibility.MinDataVersion != 33 || m.Compatibility.MaxDataVersion != 33 {
+	if m.Protocol != AgentProtocolVersion || m.Compatibility.MinAgentProtocol != PreviousAgentProtocol || m.Compatibility.MaxAgentProtocol != AgentProtocolVersion || m.Compatibility.MinDataVersion != AcornFoxV1DataVersion || m.Compatibility.MaxDataVersion != AcornFoxV1DataVersion {
 		return errors.New("AcornFox manifest protocol compatibility is invalid")
 	}
 	if !sameAcornFoxNMinusOne(m.NMinusOne, b.NMinusOne) {

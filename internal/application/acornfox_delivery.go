@@ -89,13 +89,16 @@ type AcornFoxRuntimeObservationStore interface {
 type AcornFoxDeliveryConfig struct {
 	TargetRepository string
 	StorageKeyPrefix string
+	// BuildNetwork is supplied by the trusted server composition, never by a
+	// public delivery request. Its zero value preserves the offline contract.
+	BuildNetwork contracts.NetworkPolicy
 }
 
 func (config AcornFoxDeliveryConfig) validate() error {
 	if strings.TrimSpace(config.TargetRepository) == "" || strings.TrimSpace(config.StorageKeyPrefix) == "" {
 		return errors.New("AcornFox delivery target repository and storage key prefix are required")
 	}
-	return nil
+	return config.BuildNetwork.Validate()
 }
 
 // AcornFoxDeliveryService is the narrow command service behind the standalone
@@ -219,7 +222,15 @@ func (service *AcornFoxDeliveryService) create(ctx context.Context, request Acor
 		return AcornFoxDeliveryResult{}, errors.New("AcornFox delivery definition persistence returned an invalid result")
 	}
 
-	buildRequest, err := (AcornFoxBuildBinder{}).Bind(definition, source, request.IdempotencyKey+":build", strings.TrimSpace(service.Config.TargetRepository), acornFoxDeliveryStorageKey(service.Config.StorageKeyPrefix, request.ApplicationID, source.ID, request.IdempotencyKey), now)
+	binder := AcornFoxBuildBinder{}
+	target := strings.TrimSpace(service.Config.TargetRepository)
+	storageKey := acornFoxDeliveryStorageKey(service.Config.StorageKeyPrefix, request.ApplicationID, source.ID, request.IdempotencyKey)
+	var buildRequest contracts.BuildRequest
+	if service.Config.BuildNetwork.EffectiveMode() == contracts.NetworkModeControlledEgressV1 {
+		buildRequest, err = binder.BindControlledEgress(definition, source, request.IdempotencyKey+":build", target, storageKey, service.Config.BuildNetwork.WorkerPolicyDigest, now)
+	} else {
+		buildRequest, err = binder.Bind(definition, source, request.IdempotencyKey+":build", target, storageKey, now)
+	}
 	if err != nil {
 		return AcornFoxDeliveryResult{}, err
 	}

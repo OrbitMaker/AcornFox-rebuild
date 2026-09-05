@@ -22,8 +22,9 @@ import (
 )
 
 var (
-	ErrOutOfOrderAgentEvent = errors.New("agent event sequence is out of order")
-	ErrTaskResultConflict   = errors.New("task result conflicts with the recorded result")
+	ErrOutOfOrderAgentEvent       = errors.New("agent event sequence is out of order")
+	ErrTaskResultConflict         = errors.New("task result conflicts with the recorded result")
+	ErrEnvironmentOperationActive = errors.New("environment already has an active operation")
 )
 
 type ControllerTask struct {
@@ -436,7 +437,7 @@ func (s *Store) preemptReadOnlyControllerOperationTx(ctx context.Context, tx *sq
 		return err
 	}
 	if operation.Type != domain.OperationObserve {
-		return domain.NewError(domain.ErrConflict, "environment already has an active operation")
+		return domain.WrapError(domain.ErrConflict, "environment already has an active operation", ErrEnvironmentOperationActive)
 	}
 	reason := "background observation superseded by foreground operation"
 	result, err := tx.ExecContext(ctx, `UPDATE task_leases SET state='cancelled',lease_owner=NULL,lease_until=NULL,last_error=$1,completed_at=$2,updated_at=$2 WHERE operation_id=$3 AND state IN ('ready','leased')`, reason, now, activeID.String())
@@ -462,7 +463,7 @@ func mapControllerOperationInsertError(err error) error {
 	if errors.As(err, &postgresError) {
 		switch postgresError.ConstraintName {
 		case "operations_one_active_per_environment":
-			return domain.WrapError(domain.ErrConflict, "environment already has an active operation", err)
+			return domain.WrapError(domain.ErrConflict, "environment already has an active operation", errors.Join(ErrEnvironmentOperationActive, err))
 		case "operations_environment_id_idempotency_key_key", "operations_pkey":
 			return domain.WrapError(domain.ErrConflict, "controller operation identity already exists", err)
 		}

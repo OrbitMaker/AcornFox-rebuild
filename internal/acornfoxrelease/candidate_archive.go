@@ -186,7 +186,7 @@ func SealCandidateArtifactsV1(tree *CandidateTreeStageV1, taskRoot string) (*Can
 			return failWith("copy tree")
 		}
 	}
-	manifest := install.Manifest{SchemaVersion: install.ManifestSchemaVersion, Product: Product, Version: treeReceipt.Version, ReleaseID: treeReceipt.ReleaseID, Architecture: Architecture, MigrationVersion: Migration, SourceCommit: treeReceipt.SourceCommit, Protocol: install.AgentProtocolVersion, ConfigDir: install.AcornFoxV1ConfigDir, DataDir: install.AcornFoxV1DataDir, Compatibility: install.Compatibility{MinDataVersion: 33, MaxDataVersion: 33, MinAgentProtocol: install.PreviousAgentProtocol, MaxAgentProtocol: install.AgentProtocolVersion}, Files: entries}
+	manifest := install.Manifest{SchemaVersion: install.ManifestSchemaVersion, Product: Product, Version: treeReceipt.Version, ReleaseID: treeReceipt.ReleaseID, Architecture: Architecture, MigrationVersion: Migration, SourceCommit: treeReceipt.SourceCommit, Protocol: install.AgentProtocolVersion, ConfigDir: install.AcornFoxV1ConfigDir, DataDir: install.AcornFoxV1DataDir, Compatibility: install.Compatibility{MinDataVersion: install.AcornFoxV1DataVersion, MaxDataVersion: install.AcornFoxV1DataVersion, MinAgentProtocol: install.PreviousAgentProtocol, MaxAgentProtocol: install.AgentProtocolVersion}, Files: entries}
 	manifestRaw, err := json.Marshal(manifest)
 	if err != nil {
 		return fail()
@@ -583,7 +583,7 @@ func verifyPayloadTree(root string, tree CandidateTreeReceiptV1, receipt Candida
 
 func verifyManifest(raw []byte, tree CandidateTreeReceiptV1, receipt CandidateArtifactReceiptV1) bool {
 	var manifest install.Manifest
-	if strictCandidateJSON(raw, &manifest) != nil || manifest.SchemaVersion != install.ManifestSchemaVersion || manifest.Product != Product || manifest.Version != receipt.Version || manifest.ReleaseID != receipt.ReleaseID || manifest.Architecture != Architecture || manifest.MigrationVersion != Migration || manifest.SourceCommit != receipt.SourceCommit || manifest.Protocol != install.AgentProtocolVersion || manifest.ConfigDir != install.AcornFoxV1ConfigDir || manifest.DataDir != install.AcornFoxV1DataDir || manifest.NMinusOne != nil || manifest.Compatibility.MinDataVersion != 33 || manifest.Compatibility.MaxDataVersion != 33 || manifest.Compatibility.MinAgentProtocol != install.PreviousAgentProtocol || manifest.Compatibility.MaxAgentProtocol != install.AgentProtocolVersion || len(manifest.Files) != len(tree.Files) {
+	if strictCandidateJSON(raw, &manifest) != nil || manifest.SchemaVersion != install.ManifestSchemaVersion || manifest.Product != Product || manifest.Version != receipt.Version || manifest.ReleaseID != receipt.ReleaseID || manifest.Architecture != Architecture || manifest.MigrationVersion != Migration || manifest.SourceCommit != receipt.SourceCommit || manifest.Protocol != install.AgentProtocolVersion || manifest.ConfigDir != install.AcornFoxV1ConfigDir || manifest.DataDir != install.AcornFoxV1DataDir || manifest.NMinusOne != nil || manifest.Compatibility.MinDataVersion != install.AcornFoxV1DataVersion || manifest.Compatibility.MaxDataVersion != install.AcornFoxV1DataVersion || manifest.Compatibility.MinAgentProtocol != install.PreviousAgentProtocol || manifest.Compatibility.MaxAgentProtocol != install.AgentProtocolVersion || len(manifest.Files) != len(tree.Files) {
 		return false
 	}
 	return sameInstallFileEntries(manifest.Files, tree.Files)

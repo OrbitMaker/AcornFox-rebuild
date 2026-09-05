@@ -821,7 +821,7 @@ func (s *Store) CompleteBuild(ctx context.Context, artifact domain.Artifact, rel
 	}
 	build.Status, build.ArtifactID, build.UpdatedAt = domain.BuildSucceeded, artifact.ID, now
 	if release != nil {
-		if err := s.insertReadyReleaseTx(ctx, tx, *release, build.PlanID, now); err != nil {
+		if err := s.insertReadyReleaseTx(ctx, tx, *release, build.PlanID, artifact, now); err != nil {
 			return rollback(err)
 		}
 	}
@@ -982,12 +982,12 @@ func (s *Store) TransitionDeployment(ctx context.Context, id domain.ID, to domai
 	return deployment, nil
 }
 
-func (s *Store) insertReadyReleaseTx(ctx context.Context, tx *sql.Tx, creation ReleaseCreation, planID domain.ID, now time.Time) error {
-	var definitionApplication, definitionSource, planSource string
+func (s *Store) insertReadyReleaseTx(ctx context.Context, tx *sql.Tx, creation ReleaseCreation, planID domain.ID, completed domain.Artifact, now time.Time) error {
+	var definitionApplication, definitionSource, planSource, planService string
 	if err := tx.QueryRowContext(ctx, `SELECT application_id,source_revision_id FROM delivery_definitions WHERE id=$1`, creation.DefinitionID.String()).Scan(&definitionApplication, &definitionSource); err != nil {
 		return fmt.Errorf("load release definition: %w", err)
 	}
-	if err := tx.QueryRowContext(ctx, `SELECT source_revision_id FROM build_plans WHERE id=$1`, planID.String()).Scan(&planSource); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT source_revision_id,service_name FROM build_plans WHERE id=$1`, planID.String()).Scan(&planSource, &planService); err != nil {
 		return fmt.Errorf("load release build plan: %w", err)
 	}
 	if definitionApplication != creation.Release.ApplicationID.String() || definitionSource != planSource {
@@ -996,8 +996,15 @@ func (s *Store) insertReadyReleaseTx(ctx context.Context, tx *sql.Tx, creation R
 	digests := creation.Release.ServiceDigests()
 	artifactByService := make(map[string]string, len(digests))
 	for service, image := range digests {
+		if service == planService {
+			if completed.Image.Repository != image.Repository || completed.Image.Digest != image.Digest {
+				return ErrBuildNotSuccessful
+			}
+			artifactByService[service] = completed.ID.String()
+			continue
+		}
 		var artifactID string
-		err := tx.QueryRowContext(ctx, `SELECT a.id FROM artifacts a JOIN builds b ON b.id=a.build_id JOIN build_plans p ON p.id=b.plan_id JOIN source_revisions src ON src.id=p.source_revision_id WHERE src.application_id=$1 AND b.state='succeeded' AND a.image_repository=$2 AND a.image_digest=$3 ORDER BY a.created_at DESC LIMIT 1`, creation.Release.ApplicationID.String(), image.Repository, image.Digest).Scan(&artifactID)
+		err := tx.QueryRowContext(ctx, `SELECT a.id FROM artifacts a JOIN builds b ON b.id=a.build_id JOIN build_plans p ON p.id=b.plan_id JOIN source_revisions src ON src.id=p.source_revision_id WHERE src.application_id=$1 AND b.state='succeeded' AND a.image_repository=$2 AND a.image_digest=$3 AND src.id=$4 AND p.service_name=$5 ORDER BY a.created_at DESC,a.id DESC LIMIT 1`, creation.Release.ApplicationID.String(), image.Repository, image.Digest, definitionSource, service).Scan(&artifactID)
 		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("%w: service %q", ErrBuildNotSuccessful, service)
 		}

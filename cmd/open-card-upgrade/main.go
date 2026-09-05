@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/open-card/open-card/internal/buildnetwork"
 	"github.com/open-card/open-card/internal/install"
 )
 
@@ -330,6 +331,26 @@ func runWithDependencies(ctx context.Context, args []string, stdout, stderr io.W
 // helper.  It intentionally shares no parser or runtime constructor with the
 // legacy Open Card upgrade engine.
 func runAcornFoxClean(ctx context.Context, args []string, stdout io.Writer, role string, deps acornFoxCleanDependencies) int {
+	if len(args) == 1 && (args[0] == "build-network-serve" || args[0] == "build-network-cleanup") {
+		identity, ok := acornFoxCleanBuildIdentity(role)
+		if !ok || os.Geteuid() != 0 || !install.VerifyProductionAcornFoxHelperContract(identity).OK {
+			return writeAcornFoxCleanError(stdout, exitIneligible, "helper_identity_ineligible")
+		}
+		manager, err := buildnetwork.NewProductionManager()
+		if err != nil {
+			return writeAcornFoxCleanError(stdout, exitIneligible, "build_network_ineligible")
+		}
+		defer manager.Close()
+		if args[0] == "build-network-cleanup" {
+			err = manager.Cleanup(ctx)
+		} else {
+			err = manager.Serve(ctx)
+		}
+		if err != nil {
+			return writeAcornFoxCleanError(stdout, exitIneligible, "build_network_unavailable")
+		}
+		return exitOK
+	}
 	if len(args) > 0 && args[0] == "contract-check" {
 		return runAcornFoxContractCheck(args, stdout, role)
 	}

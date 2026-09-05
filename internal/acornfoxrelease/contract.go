@@ -11,13 +11,15 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+
+	"github.com/open-card/open-card/internal/install"
 )
 
 const (
 	DecisionV1Schema = 1
 	Product          = "acornfox"
 	Architecture     = "amd64"
-	Migration        = "0033"
+	Migration        = install.AcornFoxV1MigrationVersion
 	Layout           = 1
 	maxDecisionBytes = 16 << 10
 )

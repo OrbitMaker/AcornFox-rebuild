@@ -12,6 +12,7 @@ import (
 type acornFoxUnitSections map[string]map[string][]string
 
 var acornFoxSystemdFiles = []string{
+	"acornfox-build-network.service",
 	"acornfox-server.service",
 	"acornfox-agent.service",
 	"acornfox-buildkit.service",
@@ -107,7 +108,7 @@ func TestAcornFoxSystemdInventoryMatchesPackageContract(t *testing.T) {
 	}
 }
 
-func TestAcornFoxBuildKitCandidateConfigIsFixedAndOffline(t *testing.T) {
+func TestAcornFoxBuildKitCandidateConfigIsFixedAndControlled(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join(acornFoxDeployRoot(t), "buildkit", "acornfox-buildkitd.toml"))
 	if err != nil {
 		t.Fatal(err)
@@ -115,12 +116,13 @@ func TestAcornFoxBuildKitCandidateConfigIsFixedAndOffline(t *testing.T) {
 	config := string(raw)
 	for _, required := range []string{
 		"root = \"/var/lib/acornfox/buildkit/buildkitd\"", "max-parallelism = 1", "[worker.oci]", "enabled = true", "rootless = true", "snapshotter = \"native\"", "[worker.containerd]", "enabled = false",
+		"nameservers = [\"1.1.1.1\", \"1.0.0.1\"]", "[registry.\"docker.io\"]", "mirrors = [\"public.ecr.aws/docker\"]",
 	} {
 		if !strings.Contains(config, required) {
 			t.Fatalf("candidate BuildKit config missing %q", required)
 		}
 	}
-	for _, forbidden := range []string{"registry", "mirror", "entitlement", "network."} {
+	for _, forbidden := range []string{"http = true", "insecure = true", "entitlement", "network."} {
 		if strings.Contains(strings.ToLower(config), forbidden) {
 			t.Fatalf("candidate BuildKit config retained forbidden %q", forbidden)
 		}
@@ -145,6 +147,9 @@ func TestAcornFoxSystemdNamesPathsAndEnvironmentContract(t *testing.T) {
 			}
 		}
 		for _, value := range sections["Service"]["Environment"] {
+			if name == "acornfox-buildkit.service" && (value == "HOME=/var/lib/acornfox/buildkit" || value == "XDG_RUNTIME_DIR=/run/acornfox-buildkit" || value == "PATH=/opt/acornfox/current/bin:/usr/bin:/bin") {
+				continue
+			}
 			if !strings.HasPrefix(value, "ACORNFOX_") {
 				t.Fatalf("%s has non-AcornFox Environment=%q", name, value)
 			}
@@ -159,6 +164,9 @@ func TestAcornFoxSystemdNamesPathsAndEnvironmentContract(t *testing.T) {
 				continue
 			}
 			for _, value := range values {
+				if name == "acornfox-build-network.service" && key == "ExecStartPost" && value == "/usr/bin/systemctl --no-block start acornfox-buildkit.service" {
+					continue
+				}
 				command := strings.Fields(value)
 				if len(command) == 0 {
 					t.Fatalf("%s has empty %s", name, key)
@@ -265,8 +273,13 @@ func TestAcornFoxSystemdBootDagAndHardening(t *testing.T) {
 	_, buildkit := readAcornFoxUnit(t, "acornfox-buildkit.service")
 	requireAcornFoxDirective(t, buildkit, "Service", "NoNewPrivileges", "no")
 	requireAcornFoxDirective(t, buildkit, "Service", "Delegate", "yes")
-	requireAcornFoxDirective(t, buildkit, "Service", "RestrictAddressFamilies", "AF_UNIX AF_NETLINK")
-	requireAcornFoxDirective(t, buildkit, "Service", "SystemCallFilter", "@system-service @mount")
+	requireAcornFoxDirective(t, buildkit, "Service", "RestrictAddressFamilies", "AF_UNIX AF_NETLINK AF_INET AF_INET6")
+	requireAcornFoxDirective(t, buildkit, "Service", "SystemCallFilter", "@system-service @mount seccomp sethostname")
+	requireAcornFoxDirective(t, buildkit, "Service", "ProtectKernelTunables", "no")
+	requireAcornFoxDirective(t, buildkit, "Service", "ProtectKernelModules", "no")
+	requireAcornFoxDirective(t, buildkit, "Service", "ProtectProc", "default")
+	requireAcornFoxDirective(t, buildkit, "Service", "RestrictSUIDSGID", "no")
+	requireAcornFoxDirective(t, buildkit, "Service", "MemoryDenyWriteExecute", "no")
 	requireAcornFoxDirective(t, buildkit, "Service", "ReadWritePaths", "/var/lib/acornfox/buildkit /run/acornfox-buildkit")
 }
 

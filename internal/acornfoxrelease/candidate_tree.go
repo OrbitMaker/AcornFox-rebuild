@@ -290,6 +290,12 @@ func staticSourcePath(destination string) (string, bool) {
 		return "deploy/systemd/" + strings.TrimPrefix(destination, "systemd/"), true
 	case destination == "config/acornfox-buildkitd.toml":
 		return "deploy/buildkit/acornfox-buildkitd.toml", true
+	case destination == "config/acornfox-build-network-policy-v1.json":
+		return "deploy/buildkit/acornfox-build-network-policy-v1.json", true
+	case destination == "config/acornfox-build-resolv.conf":
+		return "deploy/buildkit/acornfox-build-resolv.conf", true
+	case destination == "config/acornfox-rootlesskit.apparmor":
+		return "deploy/buildkit/acornfox-rootlesskit.apparmor", true
 	case strings.HasPrefix(destination, "caddy/"):
 		return "deploy/caddy/" + strings.TrimPrefix(destination, "caddy/"), true
 	case strings.HasPrefix(destination, "api/") || strings.HasPrefix(destination, "migrations/") || strings.HasPrefix(destination, "scripts/acornfox/"):

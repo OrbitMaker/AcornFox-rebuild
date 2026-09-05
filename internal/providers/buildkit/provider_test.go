@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/open-card/open-card/internal/acornfoxrelease"
+	"github.com/open-card/open-card/internal/buildnetwork"
 	"github.com/open-card/open-card/internal/contracts"
 	"github.com/open-card/open-card/internal/domain"
 	"github.com/open-card/open-card/internal/foundation"
@@ -118,7 +119,7 @@ func (s *countingImageStore) callCount() int {
 }
 
 func (r *fakeRunner) Run(ctx context.Context, command string, args []string, stdout, stderr io.Writer) error {
-	if command != "buildctl" {
+	if command != "buildctl" && command != "/opt/acornfox/current/bin/buildctl" {
 		return fmt.Errorf("unexpected command %q", command)
 	}
 	r.mu.Lock()
@@ -160,14 +161,26 @@ func TestExecRunnerUsesMinimalChildEnvironment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := string(raw), "PATH=/usr/bin:/bin\x00LANG=C\x00LC_ALL=C\x00"; got != want {
-		t.Fatalf("buildctl child inherited ambient environment: got %q want %q", got, want)
+	entries := strings.Split(strings.TrimSuffix(string(raw), "\x00"), "\x00")
+	if len(entries) != 6 || strings.Join(entries[:3], "\x00") != "PATH=/usr/bin:/bin\x00LANG=C\x00LC_ALL=C" || entries[5] != "BUILDKIT_NO_CLIENT_TOKEN=true" {
+		t.Fatalf("buildctl child inherited ambient environment: %q", raw)
+	}
+	home := strings.TrimPrefix(entries[3], "HOME=")
+	if !filepath.IsAbs(home) || !strings.HasPrefix(filepath.Base(home), "acornfox-buildctl-home-") || entries[4] != "DOCKER_CONFIG="+filepath.Join(home, ".docker") {
+		t.Fatalf("buildctl home is not isolated: %q", entries)
+	}
+	if _, err := os.Stat(home); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("temporary buildctl home was not removed")
 	}
 }
 
 func TestExecRunnerEnvironmentHelper(t *testing.T) {
 	for index, arg := range os.Args {
 		if arg == "--acornfox-capture-env" && index+1 < len(os.Args) {
+			home, err := os.Stat(os.Getenv("HOME"))
+			if err != nil || !home.IsDir() || home.Mode().Perm() != 0700 {
+				t.Fatal("child home is not a private directory")
+			}
 			if err := os.WriteFile(os.Args[index+1], []byte(strings.Join(os.Environ(), "\x00")+"\x00"), 0o600); err != nil {
 				t.Fatal(err)
 			}
@@ -624,8 +637,8 @@ func TestControlledEgressAdmitsOnlyExactAttestedAcornFoxBuild(t *testing.T) {
 		t.Fatalf("attestation was not before build effects: %#v", events)
 	}
 	args := strings.Join(runner.calls[0], " ")
-	if !strings.Contains(args, "--opt network=default") || strings.Contains(args, "network=none") {
-		t.Fatalf("controlled build did not use default BuildKit network: %s", args)
+	if !strings.Contains(args, "--opt network=none") || strings.Contains(args, "network=default") {
+		t.Fatalf("source-specific download policy allowed networked RUN steps: %s", args)
 	}
 	for _, forbidden := range []string{"--allow", "network.host", "security.insecure", "--ssh", "--add-host", "proxy"} {
 		if strings.Contains(args, forbidden) {
@@ -646,6 +659,51 @@ func TestControlledEgressAdmitsOnlyExactAttestedAcornFoxBuild(t *testing.T) {
 	}
 	if entries, err := os.ReadDir(filepath.Join(root, "work")); err != nil || len(entries) != 0 {
 		t.Fatalf("controlled build did not clean its workspace: entries=%#v err=%v", entries, err)
+	}
+}
+
+func TestProductionExecutionPolicyAllowsNetworkedRUNThroughAttestedWorker(t *testing.T) {
+	runner := writingRunner(t, "production controlled output\n")
+	provider, _, source := testProvider(t, runner)
+	config := provider.config
+	config.ProductionNetworkPolicyRaw = buildnetwork.CanonicalPolicy()
+	attestor := &fakeWorkerPolicyAttestor{}
+	config.WorkerPolicyAttestor = attestor
+	config.Address = "unix:///run/acornfox-buildkit/buildkitd.sock"
+	config.Command = "/opt/acornfox/current/bin/buildctl"
+	for name, change := range map[string]func(*Config){
+		"legacy socket":     func(c *Config) { c.Address = "unix:///run/open-card-buildkit/buildkitd.sock" },
+		"default socket":    func(c *Config) { c.Address = "" },
+		"different command": func(c *Config) { c.Command = "/tmp/buildctl" },
+		"path command":      func(c *Config) { c.Command = "" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			mismatch := config
+			change(&mismatch)
+			if _, err := New(mismatch); err == nil {
+				t.Fatal("production builder differing from attested identity accepted")
+			}
+		})
+	}
+	provider, err := New(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, digest, err := buildnetwork.ParsePolicy(buildnetwork.CanonicalPolicy())
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := provider.Build(context.Background(), controlledRequest(t, "installed-network", source, digest))
+	if err != nil || result.Artifact == nil || attestor.callCount() != 1 {
+		t.Fatal(result, err)
+	}
+	if !strings.Contains(strings.Join(runner.calls[0], " "), "--opt network=default") {
+		t.Fatal("installed build-execution policy was not selected")
+	}
+	config.ControlledEgressInputsRaw = []byte("{}")
+	config.ControlledEgressPolicyRaw = []byte("{}")
+	if _, err := New(config); err == nil {
+		t.Fatal("mixed self-build and production authority accepted")
 	}
 }
 

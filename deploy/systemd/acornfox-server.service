@@ -1,7 +1,7 @@
 [Unit]
 Description=AcornFox control-plane server
-Wants=network-online.target
-Requires=acornfox-buildkit.service acornfox-upgrade-safe.target
+Wants=network-online.target acornfox-buildkit.service
+Requires=acornfox-upgrade-safe.target
 After=network-online.target acornfox-buildkit.service acornfox-upgrade-safe.target
 
 [Service]
@@ -41,7 +41,7 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 ReadWritePaths=/var/lib/acornfox/uploads /var/lib/acornfox/workspaces /var/lib/acornfox/build-work /var/lib/acornfox/oci /var/lib/acornfox/secrets /var/lib/acornfox/secret-materials /var/log/acornfox/server
-BindReadOnlyPaths=/run/acornfox-buildkit
+BindReadOnlyPaths=-/run/acornfox-buildkit -/run/acornfox-build-policy
 UMask=0077
 
 [Install]

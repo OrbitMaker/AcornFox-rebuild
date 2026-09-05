@@ -37,6 +37,24 @@ func TestAcornFoxDeliveryCreateReplaysAndRejectsConflict(t *testing.T) {
 	}
 }
 
+func TestAcornFoxDeliveryUsesOnlyTrustedCompositionNetworkPolicy(t *testing.T) {
+	fixture := newAcornFoxDeliveryFixture(t)
+	digest := "sha256:" + strings.Repeat("a", 64)
+	fixture.service.Config.BuildNetwork = contracts.NetworkPolicy{Mode: contracts.NetworkModeControlledEgressV1, WorkerPolicyDigest: digest}
+	request := AcornFoxDeliveryCreateRequest{ApplicationID: fixture.source.ApplicationID, SourceRevisionID: fixture.source.ID, ContainerPort: 8080, IdempotencyKey: "controlled-delivery", Actor: "admin"}
+	if _, err := fixture.service.Create(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if got := fixture.buildProvider.lastRequest.Network; got.EffectiveMode() != contracts.NetworkModeControlledEgressV1 || got.WorkerPolicyDigest != digest {
+		t.Fatalf("trusted network policy not bound: %+v", got)
+	}
+	fixture = newAcornFoxDeliveryFixture(t)
+	fixture.service.Config.BuildNetwork = contracts.NetworkPolicy{Mode: contracts.NetworkModeControlledEgressV1, WorkerPolicyDigest: "invalid"}
+	if _, err := fixture.service.Create(context.Background(), request); err == nil || fixture.buildProvider.calls != 0 || len(fixture.requests) != 0 {
+		t.Fatal("invalid composition policy reached delivery effects")
+	}
+}
+
 func TestAcornFoxDeliveryProviderFailureDoesNotQueueRuntimeTask(t *testing.T) {
 	fixture := newAcornFoxDeliveryFixture(t)
 	fixture.buildProvider.err = errors.New("build failed")
@@ -239,8 +257,9 @@ func (f *acornFoxDeliveryFixture) GetAcornFoxRuntimeRequest(_ context.Context, _
 }
 
 type acornFoxBuildProvider struct {
-	calls int
-	err   error
+	calls       int
+	err         error
+	lastRequest contracts.BuildRequest
 }
 
 func (p *acornFoxBuildProvider) Metadata(context.Context) contracts.ProviderMetadata {
@@ -249,6 +268,7 @@ func (p *acornFoxBuildProvider) Metadata(context.Context) contracts.ProviderMeta
 func (p *acornFoxBuildProvider) Cancel(context.Context, contracts.OperationContext) error { return nil }
 func (p *acornFoxBuildProvider) Build(_ context.Context, request contracts.BuildRequest) (contracts.BuildResult, error) {
 	p.calls++
+	p.lastRequest = request
 	if p.err != nil {
 		return contracts.BuildResult{}, p.err
 	}

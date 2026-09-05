@@ -118,7 +118,7 @@ safe_helper "$bootstrap_helper" "$bootstrap_helper_sha256" || fail
 # read-only, so its canonical receipt is deliberately passed through.
 "${CLEAN_ENV[@]}" "$PREFLIGHT" --phase pre
 effect /usr/bin/apt-get update
-effect /usr/bin/apt-get install -y --no-install-recommends ca-certificates docker.io postgresql postgresql-client uidmap util-linux apparmor apparmor-utils
+effect /usr/bin/apt-get install -y --no-install-recommends ca-certificates docker.io postgresql postgresql-client uidmap util-linux apparmor apparmor-utils nftables iptables iproute2
 
 for account in acornfox acornfox-agent acornfox-buildkit acornfox-caddy acornfox-edge; do
   require_account "$account"
@@ -135,6 +135,7 @@ effect /usr/bin/systemctl enable --now postgresql.service
 "${CLEAN_ENV[@]}" "$MIGRATE" --pending
 effect /usr/bin/systemctl daemon-reload
 effect /usr/bin/systemctl enable acornfox-upgrade-safe.target
+effect /usr/bin/systemctl enable acornfox-build-network.service
 effect /usr/bin/systemctl enable acornfox-buildkit.service
 effect /usr/bin/systemctl enable acornfox-caddy.service
 effect /usr/bin/systemctl enable acornfox-server.service
@@ -142,6 +143,7 @@ effect /usr/bin/systemctl enable acornfox-agent.service
 effect /usr/bin/systemctl enable acornfox-edge.service
 effect /usr/bin/systemctl enable acornfox-healthcheck.timer
 effect /usr/bin/systemctl start acornfox-upgrade-safe.target
+effect /usr/bin/systemctl start acornfox-build-network.service
 effect /usr/bin/systemctl start acornfox-buildkit.service
 effect /usr/bin/systemctl start acornfox-caddy.service
 effect /usr/bin/systemctl start acornfox-server.service
@@ -149,7 +151,7 @@ effect /usr/bin/systemctl start acornfox-agent.service
 effect /usr/bin/systemctl start acornfox-edge.service
 effect /usr/bin/systemctl start acornfox-healthcheck.timer
 effect /usr/bin/systemctl start acornfox-healthcheck.service
-for unit in acornfox-upgrade-safe.target acornfox-buildkit.service acornfox-caddy.service acornfox-server.service acornfox-agent.service acornfox-edge.service acornfox-healthcheck.timer; do
+for unit in acornfox-upgrade-safe.target acornfox-build-network.service acornfox-buildkit.service acornfox-caddy.service acornfox-server.service acornfox-agent.service acornfox-edge.service acornfox-healthcheck.timer; do
   clean_output /usr/bin/systemctl is-enabled --quiet "$unit" || fail
   clean_output /usr/bin/systemctl is-active --quiet "$unit" || fail
 done

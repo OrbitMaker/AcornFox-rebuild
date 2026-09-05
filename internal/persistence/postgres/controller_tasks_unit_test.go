@@ -30,6 +30,9 @@ func TestMapControllerOperationInsertError(t *testing.T) {
 			if !domain.IsCode(err, test.wantCode) {
 				t.Fatalf("expected %s, got %v", test.wantCode, err)
 			}
+			if errors.Is(err, ErrEnvironmentOperationActive) != (test.constraint == "operations_one_active_per_environment") {
+				t.Fatal("active operation conflict lost its distinct identity")
+			}
 		})
 	}
 

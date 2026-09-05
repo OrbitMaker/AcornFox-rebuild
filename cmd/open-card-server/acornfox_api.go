@@ -411,6 +411,17 @@ func errOrNotFound(err error) error {
 	return application.ErrNotFound
 }
 func writeAcornFoxError(w http.ResponseWriter, err error) {
+	if errors.Is(err, postgres.ErrEnvironmentOperationActive) {
+		writeJSONError(w, http.StatusConflict, "operation_conflict", "another operation is still running for this application")
+		return
+	}
+	// Built-in providers publish fixed, sanitized source/build failure messages.
+	// Keep their actionable reason while withholding causes and private details.
+	var providerErr *contracts.ProviderError
+	if errors.As(err, &providerErr) && (providerErr.Provider == "bounded-source" || providerErr.Provider == "rootless-buildkit-buildctl") {
+		writeDomainError(w, providerErr)
+		return
+	}
 	if errors.Is(err, application.ErrNotFound) || errors.Is(err, postgres.ErrNotFound) || domain.IsCode(err, domain.ErrNotFound) {
 		writeJSONError(w, http.StatusNotFound, "not_found", "resource not found")
 		return

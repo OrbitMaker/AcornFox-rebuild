@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/open-card/open-card/internal/acornfoxrelease"
+	"github.com/open-card/open-card/internal/buildnetwork"
 	"github.com/open-card/open-card/internal/contracts"
 	"github.com/open-card/open-card/internal/domain"
 	"github.com/open-card/open-card/internal/foundation"
@@ -60,23 +61,15 @@ type WorkerPolicyAttestor interface {
 	AttestWorkerPolicy(context.Context, WorkerPolicyAttestationRequest) (WorkerPolicyAttestationReceipt, error)
 }
 
-type WorkerPolicyAttestationRequest struct {
-	SchemaVersion      int
-	PolicyDigest       string
-	RequestFingerprint string
-}
-
-type WorkerPolicyAttestationReceipt struct {
-	SchemaVersion      int
-	PolicyDigest       string
-	RequestFingerprint string
-}
+type WorkerPolicyAttestationRequest = buildnetwork.AttestationRequest
+type WorkerPolicyAttestationReceipt = buildnetwork.AttestationReceipt
 
 // controlledEgressAuthority is deliberately opaque outside this package. It
 // can only be sealed from AcornFox's canonical P0 input and policy files.
 type controlledEgressAuthority struct {
-	policyDigest string
-	sealed       bool
+	policyDigest         string
+	sealed               bool
+	offlineBuildRequired bool
 }
 
 func sealControlledEgressAuthority(inputsRaw, policyRaw []byte) (controlledEgressAuthority, error) {
@@ -84,26 +77,35 @@ func sealControlledEgressAuthority(inputsRaw, policyRaw []byte) (controlledEgres
 	if err != nil {
 		return controlledEgressAuthority{}, err
 	}
-	return controlledEgressAuthority{policyDigest: inputs.ControlledEgressPolicySHA, sealed: true}, nil
+	return controlledEgressAuthority{policyDigest: inputs.ControlledEgressPolicySHA, sealed: true, offlineBuildRequired: true}, nil
 }
 
 func (a controlledEgressAuthority) matches(digest string) bool {
 	return a.sealed && contracts.IsSHA256Digest(a.policyDigest) && a.policyDigest == digest
 }
 
-func (r WorkerPolicyAttestationReceipt) matches(request WorkerPolicyAttestationRequest) bool {
+func attestationMatches(r WorkerPolicyAttestationReceipt, request WorkerPolicyAttestationRequest) bool {
 	return r.SchemaVersion == 1 && request.SchemaVersion == 1 && contracts.IsSHA256Digest(r.PolicyDigest) && r.PolicyDigest == request.PolicyDigest && r.RequestFingerprint != "" && r.RequestFingerprint == request.RequestFingerprint
 }
 
 type execRunner struct{}
 
 func (execRunner) Run(ctx context.Context, command string, args []string, stdout, stderr io.Writer) error {
+	// buildctl's anonymous registry auth session still needs a writable home.
+	// A fresh private directory prevents it from reading host Docker credentials.
+	home, err := os.MkdirTemp("", "acornfox-buildctl-home-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(home)
 	cmd := exec.CommandContext(ctx, command, args...)
 	// Never inherit the controller process environment: proxy, cloud, registry,
 	// database, and ambient credential variables have no place at buildctl's
 	// process boundary. Commands are absolute in production configuration; the
 	// fixed PATH exists only for standard helper lookup.
-	cmd.Env = []string{"PATH=/usr/bin:/bin", "LANG=C", "LC_ALL=C"}
+	// Registry challenge URLs are untrusted build input. Fetch anonymous tokens
+	// inside the isolated daemon, never through the controller-side client.
+	cmd.Env = []string{"PATH=/usr/bin:/bin", "LANG=C", "LC_ALL=C", "HOME=" + home, "DOCKER_CONFIG=" + filepath.Join(home, ".docker"), "BUILDKIT_NO_CLIENT_TOKEN=true"}
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	return cmd.Run()
@@ -131,6 +133,9 @@ type Config struct {
 	ControlledEgressInputsRaw []byte
 	ControlledEgressPolicyRaw []byte
 	WorkerPolicyAttestor      WorkerPolicyAttestor
+	// ProductionNetworkPolicyRaw is the distinct installed build-execution
+	// policy. It must not be mixed with the source-specific self-build proof.
+	ProductionNetworkPolicyRaw []byte
 	// RequireLogSink keeps legacy BuildKit composition optional while allowing
 	// a composition root to require durable logs for every build it serves.
 	// AcornFox-bound plans require a sink regardless of this switch.
@@ -155,7 +160,7 @@ func (c Config) normalized() (Config, error) {
 	if c.Address == "" {
 		c.Address = "unix:///run/open-card-buildkit/buildkitd.sock"
 	}
-	if !strings.HasPrefix(c.Address, "unix:///run/open-card-buildkit/") || strings.Contains(c.Address, "..") || strings.ContainsAny(c.Address, "\r\n\x00 ") {
+	if (!strings.HasPrefix(c.Address, "unix:///run/open-card-buildkit/") && c.Address != "unix:///run/acornfox-buildkit/buildkitd.sock") || strings.Contains(c.Address, "..") || strings.ContainsAny(c.Address, "\r\n\x00 ") {
 		return Config{}, fmt.Errorf("buildkit address must be a bounded worker unix socket")
 	}
 	var err error
@@ -191,7 +196,8 @@ func (c Config) normalized() (Config, error) {
 	}
 	hasInputs := len(c.ControlledEgressInputsRaw) != 0
 	hasPolicy := len(c.ControlledEgressPolicyRaw) != 0
-	if hasInputs != hasPolicy || hasInputs != (c.WorkerPolicyAttestor != nil) {
+	hasProduction := len(c.ProductionNetworkPolicyRaw) != 0
+	if hasInputs != hasPolicy || (hasInputs && hasProduction) || (hasInputs || hasProduction) != (c.WorkerPolicyAttestor != nil) {
 		return Config{}, fmt.Errorf("buildkit controlled egress requires one canonical policy digest and live worker attestor")
 	}
 	if hasInputs {
@@ -202,6 +208,17 @@ func (c Config) normalized() (Config, error) {
 		c.controlledEgress = authority
 		c.ControlledEgressInputsRaw = nil
 		c.ControlledEgressPolicyRaw = nil
+	}
+	if hasProduction {
+		if c.Address != "unix://"+buildnetwork.BuildkitSocketPath || c.Command != "/opt/acornfox/current/bin/buildctl" {
+			return Config{}, fmt.Errorf("production buildkit must use the attested worker socket and installed buildctl")
+		}
+		_, digest, err := buildnetwork.ParsePolicy(c.ProductionNetworkPolicyRaw)
+		if err != nil {
+			return Config{}, fmt.Errorf("invalid installed build execution policy")
+		}
+		c.controlledEgress = controlledEgressAuthority{policyDigest: digest, sealed: true}
+		c.ProductionNetworkPolicyRaw = nil
 	}
 	return c, nil
 }
@@ -585,7 +602,7 @@ func (p *Provider) attestControlledEgress(ctx context.Context, request contracts
 	if err != nil {
 		return p.providerError(request.Operation, contracts.ErrUnavailable, "controlled egress worker attestation is unavailable", contracts.RetryBackoff, true, nil)
 	}
-	if !receipt.matches(attestationRequest) {
+	if !attestationMatches(receipt, attestationRequest) {
 		return p.providerError(request.Operation, contracts.ErrForbidden, "controlled egress worker attestation does not match build request", contracts.RetryNever, false, nil)
 	}
 	return nil
@@ -825,13 +842,17 @@ func (p *Provider) mountSecrets(ctx context.Context, references []domain.SecretR
 func (p *Provider) commandArgs(network contracts.NetworkPolicy, contextPath, dockerfilePath, metadataPath, outputPath string, secretArgs []string) []string {
 	dockerfileDirectory := filepath.Dir(dockerfilePath)
 	dockerfileName := filepath.Base(dockerfilePath)
+	mode := buildKitNetworkMode(network)
+	if p.config.controlledEgress.offlineBuildRequired {
+		mode = "none"
+	}
 	args := []string{
 		"--addr", p.config.Address,
 		"build", "--frontend", "dockerfile.v0",
 		"--local", "context=" + contextPath,
 		"--local", "dockerfile=" + dockerfileDirectory,
 		"--opt", "filename=" + dockerfileName,
-		"--opt", "network=" + buildKitNetworkMode(network),
+		"--opt", "network=" + mode,
 		"--progress", "rawjson",
 		"--metadata-file", metadataPath,
 		"--output", "type=oci,dest=" + outputPath,

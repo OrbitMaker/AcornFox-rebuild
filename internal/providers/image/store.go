@@ -151,7 +151,7 @@ func (p *Provider) StoreOCI(ctx context.Context, request contracts.StoreOCIReque
 	}
 
 	if existing, err := p.readRecord(recordPath, archivePath, request.Image); err == nil {
-		if existing.ContentDigest != contentDigest || existing.SizeBytes != size {
+		if (existing.ContentDigest != contentDigest || existing.SizeBytes != size) && !equivalentOCIArchives(archivePath, temporary, request.Image.Digest) {
 			return contracts.StoreOCIResult{}, p.failure(request.Operation, contracts.CapabilityImageStoreOCI, storeAction, contracts.ErrConflict, "immutable image already exists with different archive content", nil)
 		}
 		result := p.result(request.Operation, existing)

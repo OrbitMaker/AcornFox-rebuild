@@ -122,7 +122,7 @@ func writeAcornFoxControlPlaneActivationEnv(t *testing.T, prepared acornFoxProdu
 	prepared.owners.set(info, acornFoxInstallPrincipal{})
 }
 
-func TestAcornFoxControlPlaneMigratesClosed33PrefixAndReplays(t *testing.T) {
+func TestAcornFoxControlPlaneMigratesClosed34PrefixAndReplays(t *testing.T) {
 	ledger, runner := &acornFoxControlPlaneLedgerFake{}, &acornFoxControlPlaneProvisionerFake{}
 	service, prepared := newAcornFoxControlPlanePrepared(t, ledger, runner)
 	if _, err := service.bridge.verifyPrepared(context.Background()); err != nil {
@@ -132,7 +132,7 @@ func TestAcornFoxControlPlaneMigratesClosed33PrefixAndReplays(t *testing.T) {
 		t.Fatalf("authority=%v", err)
 	}
 	first, err := service.migrate(context.Background())
-	if err != nil || first.Validate() != nil || first.BindingSHA256 != prepared.binding || len(ledger.rows) != 33 {
+	if err != nil || first.Validate() != nil || first.BindingSHA256 != prepared.binding || len(ledger.rows) != AcornFoxV1DataVersion {
 		t.Fatalf("receipt=%#v rows=%d err=%v", first, len(ledger.rows), err)
 	}
 	if !validAcornFoxControlPlaneProvisionArgv(runner.argv) || !bytes.Contains(runner.stdin, []byte("CREATE ROLE acornfox")) || strings.Contains(strings.Join(runner.argv, " "), "Bw") {
@@ -150,7 +150,7 @@ func TestAcornFoxControlPlaneMigratesClosed33PrefixAndReplays(t *testing.T) {
 		t.Fatalf("replay precondition=%v", err)
 	}
 	second, err := service.migrate(context.Background())
-	if err != nil || second != first || len(ledger.rows) != 33 {
+	if err != nil || second != first || len(ledger.rows) != AcornFoxV1DataVersion {
 		t.Fatalf("replay=%#v rows=%d err=%v", second, len(ledger.rows), err)
 	}
 	for _, path := range []string{
@@ -308,7 +308,7 @@ func TestAcornFoxControlPlaneResumesStateOnlyEnvironmentWithoutNewSecret(t *test
 	}
 	writeAcornFoxControlPlaneStateEnv(t, prepared, env)
 	receipt, err := service.migrate(context.Background())
-	if err != nil || receipt.Validate() != nil || len(ledger.rows) != 33 {
+	if err != nil || receipt.Validate() != nil || len(ledger.rows) != AcornFoxV1DataVersion {
 		t.Fatalf("receipt=%#v rows=%d err=%v", receipt, len(ledger.rows), err)
 	}
 	activation, _ := AcornFoxRepoActivationID(prepared.binding)
@@ -356,7 +356,7 @@ func TestAcornFoxControlPlaneStateOnlyRetriesAfterActivationFailure(t *testing.T
 		t.Fatal(err)
 	}
 	prepared.owners.set(info, acornFoxInstallPrincipal{})
-	if _, err := service.migrate(context.Background()); err != nil || len(ledger.rows) != 33 {
+	if _, err := service.migrate(context.Background()); err != nil || len(ledger.rows) != AcornFoxV1DataVersion {
 		t.Fatalf("exact retry err=%v rows=%d", err, len(ledger.rows))
 	}
 	prepared.assertExternalSentinel(t)
@@ -434,7 +434,7 @@ func TestAcornFoxControlPlaneReceiptFailureAndExactRetry(t *testing.T) {
 			service, prepared := newAcornFoxControlPlanePrepared(t, ledger, runner)
 			write := service.writeReceipt
 			service.writeReceipt = test.write
-			if _, err := service.migrate(context.Background()); !errors.Is(err, ErrAcornFoxControlPlaneUnknown) || len(ledger.rows) != 33 {
+			if _, err := service.migrate(context.Background()); !errors.Is(err, ErrAcornFoxControlPlaneUnknown) || len(ledger.rows) != AcornFoxV1DataVersion {
 				t.Fatalf("first err=%v rows=%d", err, len(ledger.rows))
 			}
 			activation, _ := AcornFoxRepoActivationID(prepared.binding)
@@ -445,7 +445,7 @@ func TestAcornFoxControlPlaneReceiptFailureAndExactRetry(t *testing.T) {
 			prepared.owners.set(info, acornFoxInstallPrincipal{})
 			service.writeReceipt = write
 			receipt, err := service.migrate(context.Background())
-			if err != nil || receipt.Validate() != nil || len(ledger.rows) != 33 {
+			if err != nil || receipt.Validate() != nil || len(ledger.rows) != AcornFoxV1DataVersion {
 				t.Fatalf("retry receipt=%#v err=%v rows=%d stored=%t", receipt, err, len(ledger.rows), test.wasStored)
 			}
 			prepared.assertExternalSentinel(t)
@@ -497,12 +497,12 @@ func TestAcornFoxControlPlaneRejectsStaleReceiptIdentity(t *testing.T) {
 
 func TestEnsureAcornFoxControlPlaneLedgerAcceptsAmbiguousExactCommit(t *testing.T) {
 	migrations := acornFoxControlPlaneMigrations{rows: []MigrationRow{{Version: "0001_foundation", Checksum: acornFoxFixtureDigest("a")}}, sql: []string{"SELECT 1"}}
-	// The shared validator intentionally requires the closed 33-member table;
+	// The shared validator intentionally requires the closed migration table;
 	// use the manifest fixture to exercise the real ambiguous-commit path.
 	ledger, runner := &acornFoxControlPlaneLedgerFake{failCommit: true}, &acornFoxControlPlaneProvisionerFake{}
 	service, _ := newAcornFoxControlPlanePrepared(t, ledger, runner)
 	_, err := service.migrate(context.Background())
-	if err != nil || len(ledger.rows) != 33 || migrations.valid() {
+	if err != nil || len(ledger.rows) != AcornFoxV1DataVersion || migrations.valid() {
 		t.Fatalf("ambiguous err=%v rows=%d", err, len(ledger.rows))
 	}
 }
@@ -514,7 +514,7 @@ func TestEnsureAcornFoxControlPlaneLedgerAcceptsOnlyExactPrefixes(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, prefix := range []int{0, 1, 32, 33} {
+	for _, prefix := range []int{0, 1, AcornFoxV1DataVersion - 1, AcornFoxV1DataVersion} {
 		t.Run("prefix", func(t *testing.T) {
 			ledger := &acornFoxControlPlaneLedgerFake{rows: append([]MigrationRow(nil), migrations.rows[:prefix]...)}
 			if err := ensureAcornFoxControlPlaneLedger(context.Background(), ledger, migrations); err != nil || !matchesExpected(ledger.rows, migrations.rows) {

@@ -192,7 +192,7 @@ func acornFoxLiveOwnershipDigest(entries []AcornFoxLiveEntryV1) (string, error) 
 func acornFoxLiveStaticDigest(entries []AcornFoxLiveEntryV1) (string, error) {
 	static := make([]AcornFoxLiveEntryV1, 0, len(entries))
 	for _, entry := range entries {
-		if entry.Kind == SubstrateEntryFile && (entry.Path == AcornFoxUpgradeHelperPath || entry.Path == "etc/acornfox/Caddyfile" || entry.Path == "etc/acornfox/acornfox-edge.Caddyfile" || entry.Path == "etc/acornfox/acornfox-edge.env" || entry.Path == "etc/acornfox/buildkitd.toml" || len(entry.Path) > len("etc/systemd/system/") && entry.Path[:len("etc/systemd/system/")] == "etc/systemd/system/") {
+		if entry.Kind == SubstrateEntryFile && (entry.Path == AcornFoxUpgradeHelperPath || entry.Path == "etc/acornfox/Caddyfile" || entry.Path == "etc/acornfox/acornfox-edge.Caddyfile" || entry.Path == "etc/acornfox/acornfox-edge.env" || entry.Path == "etc/acornfox/buildkitd.toml" || entry.Path == "etc/acornfox/build-network-policy.json" || entry.Path == "etc/acornfox/build-resolv.conf" || entry.Path == "etc/acornfox/rootlesskit.apparmor" || len(entry.Path) > len("etc/systemd/system/") && entry.Path[:len("etc/systemd/system/")] == "etc/systemd/system/") {
 			static = append(static, entry)
 		}
 	}
