@@ -351,6 +351,11 @@ func validAcornFoxV1WebAsset(path string) bool {
 	return name != "" && !strings.Contains(name, "/") && acornFoxV1WebAssetName.MatchString(name)
 }
 
+// IsAcornFoxV1WebAssetPath reports whether path is an installer-permitted
+// direct hashed web asset. Release assembly must use this policy rather than
+// maintaining a second asset-name classifier.
+func IsAcornFoxV1WebAssetPath(path string) bool { return validAcornFoxV1WebAsset(path) }
+
 func verifyAcornFoxBundleManifest(raw []byte, binding AcornFoxCandidateBindingV1) error {
 	if len(raw) == 0 || len(raw) > acornFoxBundleManifestMaxBytes || sha256Hex(raw) != binding.BundleManifestSHA256 {
 		return errors.New("AcornFox bundle manifest sha256 mismatch")

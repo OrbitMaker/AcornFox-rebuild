@@ -19,6 +19,19 @@ type acornFoxFixture struct {
 
 func acornFoxFixtureDigest(value string) string { return strings.Repeat(value, 64) }
 
+func TestIsAcornFoxV1WebAssetPathUsesInstallerPolicy(t *testing.T) {
+	for _, path := range []string{"web/dist/assets/app-12345678.js", "web/dist/assets/app-12345678.css"} {
+		if !IsAcornFoxV1WebAssetPath(path) {
+			t.Fatalf("valid asset rejected: %s", path)
+		}
+	}
+	for _, path := range []string{"web/dist/assets/app.js", "web/dist/assets/nested/app-12345678.js", "web/dist/index.html", "web/dist/assets/app-12345678.exe"} {
+		if IsAcornFoxV1WebAssetPath(path) {
+			t.Fatalf("invalid asset accepted: %s", path)
+		}
+	}
+}
+
 func newAcornFoxFixture(t *testing.T, version string, predecessor *acornFoxFixture) acornFoxFixture {
 	t.Helper()
 	binding := AcornFoxCandidateBindingV1{

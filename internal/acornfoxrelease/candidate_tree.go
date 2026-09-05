@@ -10,7 +10,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -20,12 +19,6 @@ import (
 )
 
 var ErrCandidateTree = errors.New("acornfox synthetic candidate tree is invalid")
-
-var candidateWebAssetName = regexp.MustCompile(`^[A-Za-z0-9_.-]+-[A-Za-z0-9_-]{8,}\.(?:css|js|map|png|jpe?g|svg|gif|webp|ico|woff2?|ttf)$`)
-
-var candidateRuntimePaths = []string{
-	"bin/buildkitd", "bin/buildctl", "bin/buildkit-runc", "bin/rootlesskit", "bin/docker-buildx", "bin/caddy",
-}
 
 type CandidateTreeReceiptV1 struct {
 	SchemaVersion      int                  `json:"schema_version"`
@@ -127,7 +120,8 @@ func BuildCandidateTreeV1(plan GoBuildPlanV1, goStage *GoBinaryStageV1, webStage
 	entries := make([]install.FileDigest, 0, len(required)+16)
 	added := make(map[string]bool, len(required)+16)
 	add := func(path string, mode uint32, sourceRoot, sourcePath string, expected FileEntryV1, maximum int64) error {
-		if added[path] || (!required[path] && !validCandidateWebAsset(path)) {
+		requiredMode, isRequired := required[path]
+		if added[path] || (!isRequired && !validCandidateWebAsset(path)) || (isRequired && requiredMode != mode) {
 			return ErrCandidateTree
 		}
 		if err := copyCandidateFile(sourceRoot, sourcePath, target, path, expected, mode, maximum); err != nil {
@@ -144,10 +138,10 @@ func BuildCandidateTreeV1(plan GoBuildPlanV1, goStage *GoBinaryStageV1, webStage
 	if err := copyWebStage(plan, webStage, add); err != nil {
 		return failWith("web stage")
 	}
-	if err := copyInputGroup(runtimeRoot, runtime.Files, candidateRuntimePaths, add, runtimeFileBytes); err != nil {
+	if err := copyInputGroup(runtimeRoot, runtime.Files, installerPaths(required, added, func(path string) bool { return strings.HasPrefix(path, "bin/") }), add, runtimeFileBytes); err != nil {
 		return failWith("runtime input")
 	}
-	if err := copyLicenseGroup(licenseRoot, license.Files, add); err != nil {
+	if err := copyInputGroup(licenseRoot, license.Files, installerPaths(required, added, func(path string) bool { return strings.HasPrefix(path, "docs/licenses/") }), add, licenseFileBytes); err != nil {
 		return failWith("license input")
 	}
 	if err := copyStaticSource(plan, required, added, add); err != nil || VerifySourceTree(plan.sourceRoot, plan.sourcePolicy) != nil || VerifyRuntimeTree(runtimeRoot, runtime) != nil || VerifyLicenseTree(licenseRoot, license) != nil {
@@ -199,13 +193,14 @@ func pinCandidateParent(path string) (string, os.FileInfo, error) {
 	return path, info, nil
 }
 
-func requiredCandidatePaths() (map[string]bool, error) {
-	required := make(map[string]bool)
+func requiredCandidatePaths() (map[string]uint32, error) {
+	required := make(map[string]uint32)
 	for _, file := range install.AcornFoxV1RequiredFiles() {
-		if !validRelativeFile(file.Path) || (file.Mode != 0o640 && file.Mode != 0o644 && file.Mode != 0o755) || required[file.Path] {
+		_, duplicate := required[file.Path]
+		if !validRelativeFile(file.Path) || (file.Mode != 0o640 && file.Mode != 0o644 && file.Mode != 0o755) || duplicate {
 			return nil, ErrCandidateTree
 		}
-		required[file.Path] = true
+		required[file.Path] = file.Mode
 	}
 	return required, nil
 }
@@ -241,23 +236,27 @@ func validWebReceiptPath(path string) bool {
 	if path == "web/dist/index.html" || path == "web/dist/build-metadata.json" {
 		return true
 	}
-	name := strings.TrimPrefix(path, "web/dist/assets/")
-	return name != path && name != "" && !strings.Contains(name, "/") && candidateWebAssetName.MatchString(name)
+	return install.IsAcornFoxV1WebAssetPath(path)
 }
-func validCandidateWebAsset(path string) bool {
-	return validWebReceiptPath(path) && strings.HasPrefix(path, "web/dist/assets/")
+func validCandidateWebAsset(path string) bool { return install.IsAcornFoxV1WebAssetPath(path) }
+
+func installerPaths(required map[string]uint32, added map[string]bool, match func(string) bool) map[string]uint32 {
+	want := map[string]uint32{}
+	for path, mode := range required {
+		if !added[path] && match(path) {
+			want[path] = mode
+		}
+	}
+	return want
 }
 
-func copyInputGroup(root string, files []FileEntryV1, paths []string, add func(string, uint32, string, string, FileEntryV1, int64) error, maximum int64) error {
-	want := make(map[string]bool, len(paths))
-	for _, path := range paths {
-		want[path] = true
-	}
+func copyInputGroup(root string, files []FileEntryV1, want map[string]uint32, add func(string, uint32, string, string, FileEntryV1, int64) error, maximum int64) error {
 	if len(files) != len(want) {
 		return ErrCandidateTree
 	}
 	for _, file := range files {
-		if !want[file.Path] || file.Mode != 0o755 || add(file.Path, 0o755, root, file.Path, file, maximum) != nil {
+		mode, ok := want[file.Path]
+		if !ok || file.Mode != mode || add(file.Path, mode, root, file.Path, file, maximum) != nil {
 			return ErrCandidateTree
 		}
 		delete(want, file.Path)
@@ -265,21 +264,7 @@ func copyInputGroup(root string, files []FileEntryV1, paths []string, add func(s
 	return boolError(len(want) == 0)
 }
 
-func copyLicenseGroup(root string, files []FileEntryV1, add func(string, uint32, string, string, FileEntryV1, int64) error) error {
-	want := map[string]bool{"docs/licenses/licenses-manifest.json": true, "docs/licenses/README.md": true, "docs/licenses/THIRD_PARTY_NOTICES.md": true}
-	if len(files) != len(want) {
-		return ErrCandidateTree
-	}
-	for _, file := range files {
-		if !want[file.Path] || file.Mode != 0o644 || add(file.Path, 0o644, root, file.Path, file, licenseFileBytes) != nil {
-			return ErrCandidateTree
-		}
-		delete(want, file.Path)
-	}
-	return boolError(len(want) == 0)
-}
-
-func copyStaticSource(plan GoBuildPlanV1, required, added map[string]bool, add func(string, uint32, string, string, FileEntryV1, int64) error) error {
+func copyStaticSource(plan GoBuildPlanV1, required map[string]uint32, added map[string]bool, add func(string, uint32, string, string, FileEntryV1, int64) error) error {
 	source := make(map[string]FileEntryV1, len(plan.sourcePolicy.Files))
 	for _, entry := range plan.sourcePolicy.Files {
 		source[entry.Path] = entry
@@ -290,7 +275,7 @@ func copyStaticSource(plan GoBuildPlanV1, required, added map[string]bool, add f
 		}
 		sourcePath, ok := staticSourcePath(destination)
 		entry, found := source[sourcePath]
-		if !ok || !found || add(destination, requiredMode(destination), plan.sourceRoot, sourcePath, entry, sourceFileBytes) != nil {
+		if !ok || !found || add(destination, required[destination], plan.sourceRoot, sourcePath, entry, sourceFileBytes) != nil {
 			return ErrCandidateTree
 		}
 	}
@@ -312,14 +297,6 @@ func staticSourcePath(destination string) (string, bool) {
 	}
 }
 
-func requiredMode(path string) uint32 {
-	for _, file := range install.AcornFoxV1RequiredFiles() {
-		if file.Path == path {
-			return file.Mode
-		}
-	}
-	return 0
-}
 func boolError(ok bool) error {
 	if !ok {
 		return ErrCandidateTree
@@ -358,12 +335,18 @@ func copyCandidateFile(sourceRoot, sourcePath string, target *os.Root, destinati
 		_ = input.Close()
 		return ErrCandidateTree
 	}
+	if err := output.Chmod(os.FileMode(targetMode)); err != nil {
+		_ = output.Close()
+		_ = input.Close()
+		return ErrCandidateTree
+	}
+	targetOpened, targetStatErr := output.Stat()
 	hash := sha256.New()
 	n, copyErr := io.Copy(io.MultiWriter(output, hash), io.LimitReader(input, maximum+1))
 	closeOut, closeIn := output.Close(), input.Close()
 	after, afterErr := source.Lstat(sourcePath)
 	targetInfo, targetErr := target.Lstat(destination)
-	if copyErr != nil || closeOut != nil || closeIn != nil || afterErr != nil || targetErr != nil || n != before.Size() || n > maximum || !os.SameFile(before, opened) || !os.SameFile(before, after) || hex.EncodeToString(hash.Sum(nil)) != expected.SHA256 || !targetInfo.Mode().IsRegular() || targetInfo.Mode().Perm() != os.FileMode(targetMode) || linkCount(targetInfo) != 1 {
+	if targetStatErr != nil || !targetOpened.Mode().IsRegular() || targetOpened.Mode().Perm() != os.FileMode(targetMode) || copyErr != nil || closeOut != nil || closeIn != nil || afterErr != nil || targetErr != nil || n != before.Size() || n > maximum || !os.SameFile(before, opened) || !os.SameFile(before, after) || !os.SameFile(targetOpened, targetInfo) || hex.EncodeToString(hash.Sum(nil)) != expected.SHA256 || !targetInfo.Mode().IsRegular() || targetInfo.Mode().Perm() != os.FileMode(targetMode) || linkCount(targetInfo) != 1 {
 		return ErrCandidateTree
 	}
 	return nil
@@ -399,10 +382,15 @@ func addGenerated(root *os.Root, path string, mode uint32, body []byte, entries 
 	if err != nil {
 		return ErrCandidateTree
 	}
+	if err := file.Chmod(os.FileMode(mode)); err != nil {
+		_ = file.Close()
+		return ErrCandidateTree
+	}
+	opened, openErr := file.Stat()
 	_, writeErr := file.Write(body)
 	closeErr := file.Close()
 	info, statErr := root.Lstat(path)
-	if writeErr != nil || closeErr != nil || statErr != nil || !info.Mode().IsRegular() || info.Mode().Perm() != os.FileMode(mode) || linkCount(info) != 1 || info.Size() != int64(len(body)) {
+	if openErr != nil || !opened.Mode().IsRegular() || opened.Mode().Perm() != os.FileMode(mode) || writeErr != nil || closeErr != nil || statErr != nil || !os.SameFile(opened, info) || !info.Mode().IsRegular() || info.Mode().Perm() != os.FileMode(mode) || linkCount(info) != 1 || info.Size() != int64(len(body)) {
 		return ErrCandidateTree
 	}
 	added[path] = true
@@ -421,29 +409,53 @@ func sourceManifest(policy SourcePolicyV1) []byte {
 func syntheticSPDX(plan GoBuildPlanV1, files []install.FileDigest) []byte {
 	files = append([]install.FileDigest(nil), files...)
 	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
-	type checksum struct{ Algorithm, ChecksumValue string }
-	type file struct {
-		SPDXID, FileName string
-		Checksums        []checksum
+	type checksum struct {
+		Algorithm     string `json:"algorithm"`
+		ChecksumValue string `json:"checksumValue"`
 	}
-	type relationship struct{ SpdxElementID, RelationshipType, RelatedSpdxElement string }
+	type file struct {
+		SPDXID           string     `json:"SPDXID"`
+		FileName         string     `json:"fileName"`
+		Checksums        []checksum `json:"checksums"`
+		LicenseConcluded string     `json:"licenseConcluded"`
+		CopyrightText    string     `json:"copyrightText"`
+	}
+	type relationship struct {
+		SpdxElementID      string `json:"spdxElementId"`
+		RelationshipType   string `json:"relationshipType"`
+		RelatedSpdxElement string `json:"relatedSpdxElement"`
+	}
+	type pkg struct {
+		SPDXID           string `json:"SPDXID"`
+		Name             string `json:"name"`
+		DownloadLocation string `json:"downloadLocation"`
+		FilesAnalyzed    bool   `json:"filesAnalyzed"`
+		LicenseConcluded string `json:"licenseConcluded"`
+		LicenseDeclared  string `json:"licenseDeclared"`
+		CopyrightText    string `json:"copyrightText"`
+	}
 	document := struct {
-		SPDXVersion, DataLicense, SPDXID, Name, DocumentNamespace, Comment string
-		CreationInfo                                                       struct {
-			Created  string
-			Creators []string
-		}
-		DocumentDescribes []string
-		Packages          []struct{ SPDXID, Name, DownloadLocation string }
-		Files             []file
-		Relationships     []relationship
+		SPDXVersion       string `json:"spdxVersion"`
+		DataLicense       string `json:"dataLicense"`
+		SPDXID            string `json:"SPDXID"`
+		Name              string `json:"name"`
+		DocumentNamespace string `json:"documentNamespace"`
+		Comment           string `json:"comment"`
+		CreationInfo      struct {
+			Created  string   `json:"created"`
+			Creators []string `json:"creators"`
+		} `json:"creationInfo"`
+		DocumentDescribes []string       `json:"documentDescribes"`
+		Packages          []pkg          `json:"packages"`
+		Files             []file         `json:"files"`
+		Relationships     []relationship `json:"relationships"`
 	}{SPDXVersion: "SPDX-2.3", DataLicense: "CC0-1.0", SPDXID: "SPDXRef-DOCUMENT", Name: "AcornFox synthetic release tree", DocumentNamespace: "https://acornfox.invalid/spdx/" + plan.decisionSHA256, Comment: "Synthetic release-tree evidence only; legal and dependency completeness are deferred to RELEASE-12B."}
 	document.CreationInfo.Created, document.CreationInfo.Creators = "1970-01-01T00:00:00Z", []string{"Tool: AcornFox synthetic release tree"}
 	document.DocumentDescribes = []string{"SPDXRef-Package-AcornFox"}
-	document.Packages = append(document.Packages, struct{ SPDXID, Name, DownloadLocation string }{"SPDXRef-Package-AcornFox", "AcornFox", "NOASSERTION"})
+	document.Packages = append(document.Packages, pkg{SPDXID: "SPDXRef-Package-AcornFox", Name: "AcornFox", DownloadLocation: "NOASSERTION", FilesAnalyzed: true, LicenseConcluded: "NOASSERTION", LicenseDeclared: "NOASSERTION", CopyrightText: "NOASSERTION"})
 	for index, entry := range files {
 		id := "SPDXRef-File-" + fmtSPDXIndex(index+1)
-		document.Files = append(document.Files, file{SPDXID: id, FileName: "./" + entry.Path, Checksums: []checksum{{Algorithm: "SHA256", ChecksumValue: entry.SHA256}}})
+		document.Files = append(document.Files, file{SPDXID: id, FileName: "./" + entry.Path, Checksums: []checksum{{Algorithm: "SHA256", ChecksumValue: entry.SHA256}}, LicenseConcluded: "NOASSERTION", CopyrightText: "NOASSERTION"})
 		document.Relationships = append(document.Relationships, relationship{SpdxElementID: "SPDXRef-Package-AcornFox", RelationshipType: "CONTAINS", RelatedSpdxElement: id})
 	}
 	raw, _ := json.Marshal(document)

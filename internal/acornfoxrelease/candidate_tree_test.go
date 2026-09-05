@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/open-card/open-card/internal/install"
@@ -53,27 +54,47 @@ func TestBuildCandidateTreeV1MaterializesDeterministicSyntheticTree(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	var parsed struct {
-		Packages []json.RawMessage `json:"Packages"`
-		Files    []struct {
-			FileName string `json:"FileName"`
-		} `json:"Files"`
-		Relationships []struct {
-			RelationshipType string `json:"RelationshipType"`
-		} `json:"Relationships"`
-		Comment string `json:"Comment"`
+	var parsed map[string]any
+	if err := json.Unmarshal(sbom, &parsed); err != nil {
+		t.Fatal(err)
 	}
-	if err := json.Unmarshal(sbom, &parsed); err != nil || len(parsed.Packages) != 1 || len(parsed.Files) != len(left.Files)-1 || !strings.Contains(parsed.Comment, "RELEASE-12B") {
-		t.Fatalf("invalid SPDX: %s %v", sbom, err)
-	}
-	for _, relationship := range parsed.Relationships {
-		if relationship.RelationshipType != "CONTAINS" {
-			t.Fatalf("unexpected relationship %q", relationship.RelationshipType)
+	for _, key := range []string{"spdxVersion", "dataLicense", "SPDXID", "name", "documentNamespace", "comment", "creationInfo", "documentDescribes", "packages", "files", "relationships"} {
+		if _, ok := parsed[key]; !ok {
+			t.Fatalf("missing SPDX key %q", key)
 		}
 	}
-	for _, file := range parsed.Files {
-		if file.FileName == "./sbom.spdx.json" {
+	for _, legacy := range []string{"SPDXVersion", "DataLicense", "DocumentNamespace", "Packages", "Files", "Relationships"} {
+		if _, ok := parsed[legacy]; ok {
+			t.Fatalf("legacy uppercase SPDX key %q", legacy)
+		}
+	}
+	packages := parsed["packages"].([]any)
+	files := parsed["files"].([]any)
+	relationships := parsed["relationships"].([]any)
+	if len(packages) != 1 || len(files) != len(left.Files)-1 || !strings.Contains(parsed["comment"].(string), "RELEASE-12B") {
+		t.Fatalf("invalid SPDX payload: %s", sbom)
+	}
+	rootPackage := packages[0].(map[string]any)
+	for _, key := range []string{"SPDXID", "name", "downloadLocation", "filesAnalyzed", "licenseConcluded", "licenseDeclared", "copyrightText"} {
+		if _, ok := rootPackage[key]; !ok {
+			t.Fatalf("package missing %s", key)
+		}
+	}
+	for _, rawFile := range files {
+		file := rawFile.(map[string]any)
+		for _, key := range []string{"SPDXID", "fileName", "checksums", "licenseConcluded", "copyrightText"} {
+			if _, ok := file[key]; !ok {
+				t.Fatalf("file missing %s", key)
+			}
+		}
+		if file["fileName"] == "./sbom.spdx.json" {
 			t.Fatal("SPDX self-reference")
+		}
+	}
+	for _, rawRelationship := range relationships {
+		relationship := rawRelationship.(map[string]any)
+		if relationship["relationshipType"] != "CONTAINS" || relationship["relationshipType"] == "DEPENDS_ON" {
+			t.Fatalf("unexpected relationship %#v", relationship)
 		}
 	}
 }
@@ -130,6 +151,33 @@ func TestCandidateTreeStageRejectsReplacementAndCloseIsSafe(t *testing.T) {
 	}
 }
 
+func TestBuildCandidateTreeV1OverridesRestrictiveUmask(t *testing.T) {
+	plan, goStage, webStage, runtimeRoot, runtime, licenseRoot, license := candidateTreeFixture(t)
+	defer goStage.Close()
+	defer webStage.Close()
+	old := syscall.Umask(0o077)
+	defer syscall.Umask(old)
+	stage, err := BuildCandidateTreeV1(plan, goStage, webStage, runtimeRoot, runtime, licenseRoot, license, buildTaskRoot(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stage.Close()
+	second, err := BuildCandidateTreeV1(plan, goStage, webStage, runtimeRoot, runtime, licenseRoot, license, buildTaskRoot(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	if receipt, err := second.Receipt(); err != nil || receipt.TreeSHA256 != stage.receipt.TreeSHA256 || !sameCandidateFiles(receipt.Files, stage.receipt.Files) {
+		t.Fatalf("umask changed synthetic tree: %#v %v", receipt, err)
+	}
+	for _, file := range stage.receipt.Files {
+		info, err := os.Lstat(filepath.Join(stage.root, "release", filepath.FromSlash(file.Path)))
+		if err != nil || info.Mode().Perm() != os.FileMode(file.Mode) {
+			t.Fatalf("mode %s=%o want=%o err=%v", file.Path, info.Mode().Perm(), file.Mode, err)
+		}
+	}
+}
+
 func candidateTreeFixture(t *testing.T) (GoBuildPlanV1, *GoBinaryStageV1, *WebAssetStageV1, string, RuntimeInputsV1, string, LicenseInputsV1) {
 	t.Helper()
 	root, cache, _, _, toolchain := syntheticGoReleaseRepository(t)
@@ -152,8 +200,8 @@ func candidateTreeFixture(t *testing.T) (GoBuildPlanV1, *GoBinaryStageV1, *WebAs
 	gitRun(t, root, "add", ".")
 	gitRun(t, root, "commit", "-qm", "candidate-tree-inputs")
 	gitRun(t, root, "checkout", "-q", "--detach")
-	runtimeRoot, runtime := candidateInputRoot(t, candidateRuntimePaths, 0o755)
-	licensePaths := []string{"docs/licenses/licenses-manifest.json", "docs/licenses/README.md", "docs/licenses/THIRD_PARTY_NOTICES.md"}
+	runtimeRoot, runtime := candidateInputRoot(t, candidateRuntimeFixturePaths(), 0o755)
+	licensePaths := installerFixturePaths(func(path string) bool { return strings.HasPrefix(path, "docs/licenses/") })
 	licenseRoot, license := candidateLicenseRoot(t, licensePaths)
 	policy := policyForTree(t, root, "github.com/acme/acornfox-fixture")
 	commit := gitRun(t, root, "rev-parse", "HEAD")
@@ -172,6 +220,25 @@ func candidateTreeFixture(t *testing.T) (GoBuildPlanV1, *GoBinaryStageV1, *WebAs
 		t.Fatalf("plan=%#v err=%v", plan, err)
 	}
 	return plan, fakeCandidateGoStage(t, plan), fakeCandidateWebStage(t, plan), runtimeRoot, runtime, licenseRoot, license
+}
+
+func candidateRuntimeFixturePaths() []string {
+	goFiles := map[string]bool{}
+	for _, target := range fixedTargets {
+		goFiles["bin/"+target.name] = true
+	}
+	return installerFixturePaths(func(path string) bool { return strings.HasPrefix(path, "bin/") && !goFiles[path] })
+}
+
+func installerFixturePaths(match func(string) bool) []string {
+	var paths []string
+	for _, file := range install.AcornFoxV1RequiredFiles() {
+		if match(file.Path) {
+			paths = append(paths, file.Path)
+		}
+	}
+	sort.Strings(paths)
+	return paths
 }
 
 func candidateInputRoot(t *testing.T, paths []string, mode os.FileMode) (string, RuntimeInputsV1) {
