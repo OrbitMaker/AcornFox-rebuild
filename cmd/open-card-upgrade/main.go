@@ -65,6 +65,9 @@ type upgradeCommandConfig struct {
 	expectLegacy   bool
 	pending        bool
 	confirmation   string
+	candidateDir   string
+	bindingSHA256  string
+	selfSHA256     string
 }
 
 type upgradeRuntime struct {
@@ -108,6 +111,17 @@ type upgradeDependencies struct {
 	verifyCommittedBootstrap     func(context.Context, install.BootstrapRequest) error
 	finalizeBootstrap            func(context.Context, install.BootstrapRequest) (install.BootstrapFinalizationReceipt, error)
 	newInstallationIdentityStore func() (installationIdentityMigrationStore, error)
+	acornFoxClean                acornFoxCleanDependencies
+}
+
+// acornFoxCleanDependencies is intentionally separate from the legacy
+// runtime providers. Its four functions are the complete clean-mode effect
+// surface and are injected directly by focused command tests.
+type acornFoxCleanDependencies struct {
+	euid           func() int
+	bootstrap      func(context.Context, install.AcornFoxCandidateSetRequestV1) (install.AcornFoxHostBootstrapReceiptV1, error)
+	recover        func(context.Context) (install.AcornFoxHostBootstrapReceiptV1, error)
+	verifyPrepared func(context.Context) (install.AcornFoxHostBootstrapReceiptV1, error)
 }
 
 type productionBootstrapRuntimeDependencies struct {
@@ -222,6 +236,12 @@ func productionUpgradeDependencies() upgradeDependencies {
 		newInstallationIdentityStore: func() (installationIdentityMigrationStore, error) {
 			return install.NewProductionInstallationIdentityStore()
 		},
+		acornFoxClean: acornFoxCleanDependencies{
+			euid:           os.Geteuid,
+			bootstrap:      install.BootstrapAcornFoxHostV1,
+			recover:        install.RecoverAcornFoxHostV1,
+			verifyPrepared: install.VerifyPreparedAcornFoxHostV1,
+		},
 	}
 }
 
@@ -288,7 +308,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 func runWithDependencies(ctx context.Context, args []string, stdout, stderr io.Writer, deps upgradeDependencies) (code int) {
 	if processIdentity == "acornfox" {
-		return runAcornFoxContractCheck(args, stdout, helperRole)
+		return runAcornFoxClean(ctx, args, stdout, helperRole, deps.acornFoxClean)
 	}
 	if processIdentity != "legacy" {
 		return writeAcornFoxContractFailure(stdout, install.AcornFoxHelperCodeIdentityMismatch)
@@ -302,6 +322,102 @@ func runWithDependencies(ctx context.Context, args []string, stdout, stderr io.W
 		_, _ = stderr.Write(bufferedStderr.Bytes())
 	}()
 	return runWithDependenciesCore(ctx, args, &bufferedStdout, &bufferedStderr, deps)
+}
+
+// runAcornFoxClean is a closed dispatch table for the standalone AcornFox
+// helper.  It intentionally shares no parser or runtime constructor with the
+// legacy Open Card upgrade engine.
+func runAcornFoxClean(ctx context.Context, args []string, stdout io.Writer, role string, deps acornFoxCleanDependencies) int {
+	if len(args) > 0 && args[0] == "contract-check" {
+		return runAcornFoxContractCheck(args, stdout, role)
+	}
+	config, err := parseAcornFoxCleanArgs(args)
+	if err != nil {
+		return writeAcornFoxCleanError(stdout, exitArgs, "invalid_arguments")
+	}
+	if deps.euid == nil || deps.euid() != 0 {
+		return writeAcornFoxCleanError(stdout, exitIneligible, "root_ineligible")
+	}
+	var receipt install.AcornFoxHostBootstrapReceiptV1
+	switch config.command {
+	case "repository-bootstrap":
+		if deps.bootstrap == nil {
+			return writeAcornFoxCleanError(stdout, exitIneligible, "candidate_ineligible")
+		}
+		receipt, err = deps.bootstrap(ctx, install.AcornFoxCandidateSetRequestV1{Directory: config.candidateDir, BindingSHA256: config.bindingSHA256, SelfSHA256: config.selfSHA256})
+	case "recover-prepare":
+		if deps.recover == nil {
+			return writeAcornFoxCleanError(stdout, exitRecovery, "recovery_unknown")
+		}
+		receipt, err = deps.recover(ctx)
+	case "recover-finalize":
+		if deps.verifyPrepared == nil {
+			return writeAcornFoxCleanError(stdout, exitRecovery, "recovery_unknown")
+		}
+		receipt, err = deps.verifyPrepared(ctx)
+	default:
+		return writeAcornFoxCleanError(stdout, exitArgs, "invalid_arguments")
+	}
+	if err != nil || receipt.Validate() != nil {
+		return writeAcornFoxCleanBridgeError(stdout, err)
+	}
+	return writeUpgradeJSON(stdout, exitOK, map[string]any{"ok": true, "command": config.command, "receipt": receipt})
+}
+
+func parseAcornFoxCleanArgs(args []string) (upgradeCommandConfig, error) {
+	if len(args) == 0 {
+		return upgradeCommandConfig{}, errors.New("command required")
+	}
+	config := upgradeCommandConfig{command: args[0]}
+	switch config.command {
+	case "repository-bootstrap":
+		if len(args) != 7 {
+			return upgradeCommandConfig{}, errors.New("invalid repository bootstrap")
+		}
+		for index := 1; index < len(args); index += 2 {
+			flag, value := args[index], args[index+1]
+			switch flag {
+			case "--candidate-dir":
+				config.candidateDir = value
+			case "--binding-sha256":
+				config.bindingSHA256 = value
+			case "--self-sha256":
+				config.selfSHA256 = value
+			default:
+				return upgradeCommandConfig{}, errors.New("unsupported flag")
+			}
+		}
+		if !filepath.IsAbs(config.candidateDir) || filepath.Clean(config.candidateDir) == string(filepath.Separator) || !validCLISHA(config.bindingSHA256) || !validCLISHA(config.selfSHA256) || !containsExactly(args[1:], "--candidate-dir", "--binding-sha256", "--self-sha256") {
+			return upgradeCommandConfig{}, errors.New("invalid repository bootstrap")
+		}
+	case "recover-prepare", "recover-finalize":
+		if len(args) != 2 || args[1] != "--pending" {
+			return upgradeCommandConfig{}, errors.New("invalid recovery")
+		}
+		config.pending = true
+	default:
+		return upgradeCommandConfig{}, errors.New("unsupported clean command")
+	}
+	return config, nil
+}
+
+func writeAcornFoxCleanBridgeError(stdout io.Writer, err error) int {
+	switch {
+	case err == nil:
+		return writeAcornFoxCleanError(stdout, exitIneligible, "candidate_ineligible")
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded), errors.Is(err, install.ErrAcornFoxRepoRecoveryUnknown), errors.Is(err, install.ErrAcornFoxLiveRecoveryUnknown), errors.Is(err, install.ErrAcornFoxLiveReleaseUnknown):
+		return writeAcornFoxCleanError(stdout, exitRecovery, "recovery_unknown")
+	case errors.Is(err, install.ErrAcornFoxRepoLocked):
+		return writeAcornFoxCleanError(stdout, exitLocked, "repository_locked")
+	case errors.Is(err, install.ErrAcornFoxRepoBootstrapConflict), errors.Is(err, install.ErrAcornFoxRepoConflict), errors.Is(err, install.ErrAcornFoxLiveConflict):
+		return writeAcornFoxCleanError(stdout, exitConflict, "repository_conflict")
+	default:
+		return writeAcornFoxCleanError(stdout, exitIneligible, "candidate_ineligible")
+	}
+}
+
+func writeAcornFoxCleanError(stdout io.Writer, code int, message string) int {
+	return writeUpgradeError(stdout, code, message)
 }
 
 func runAcornFoxContractCheck(args []string, stdout io.Writer, role string) int {

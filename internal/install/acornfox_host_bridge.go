@@ -67,6 +67,17 @@ func RecoverAcornFoxHostV1(ctx context.Context) (AcornFoxHostBootstrapReceiptV1,
 	return newAcornFoxHostBridge(layout, newAcornFoxProductionSelfVerifier()).recover(ctx)
 }
 
+// VerifyPreparedAcornFoxHostV1 re-opens and verifies an already completed
+// repository preparation.  Unlike recovery, it never advances an incomplete
+// journal: callers use it only after recover has reached REPO_PREPARED.
+func VerifyPreparedAcornFoxHostV1(ctx context.Context) (AcornFoxHostBootstrapReceiptV1, error) {
+	layout, err := newProductionAcornFoxLayout()
+	if err != nil {
+		return AcornFoxHostBootstrapReceiptV1{}, err
+	}
+	return newAcornFoxHostBridge(layout, newAcornFoxProductionSelfVerifier()).verifyPrepared(ctx)
+}
+
 // acornFoxHostBridge is package-private so temporary production layouts can
 // exercise the exact sequence without granting callers a configurable host
 // installer. Tests supply an already validated layout and a fake ownership
@@ -112,6 +123,40 @@ func (b acornFoxHostBridge) recover(ctx context.Context) (AcornFoxHostBootstrapR
 	}
 	if _, err = newAcornFoxBindingStore(store).Read(journal.BindingSHA256); err != nil {
 		return AcornFoxHostBootstrapReceiptV1{}, ErrAcornFoxRepoRecoveryUnknown
+	}
+	substrate, err := b.reopenSubstrate(ctx, publisher, journal.BindingSHA256)
+	if err != nil {
+		return AcornFoxHostBootstrapReceiptV1{}, err
+	}
+	defer substrate.Close()
+	return b.materializeAndPrepare(ctx, store, substrate, journal.BindingSHA256)
+}
+
+// verifyPrepared deliberately performs the same retained-evidence and final
+// scope checks as a completed recovery, but its phase gate comes first. This
+// makes it a read/verify facade rather than an alternate way to complete an
+// unfinished installation.
+func (b acornFoxHostBridge) verifyPrepared(ctx context.Context) (AcornFoxHostBootstrapReceiptV1, error) {
+	if ctx == nil || ctx.Err() != nil || b.layout.validate() != nil {
+		return AcornFoxHostBootstrapReceiptV1{}, ErrAcornFoxRepoRecoveryUnknown
+	}
+	publisher, err := newAcornFoxSubstratePublisherForLayout(b.layout)
+	if err != nil {
+		return AcornFoxHostBootstrapReceiptV1{}, ErrAcornFoxRepoRecoveryUnknown
+	}
+	defer publisher.Close()
+	store, err := newAcornFoxRepoStoreForLayout(b.layout)
+	if err != nil {
+		return AcornFoxHostBootstrapReceiptV1{}, ErrAcornFoxRepoRecoveryUnknown
+	}
+	store.ownership = b.ownership
+	defer store.Close()
+	journal, err := store.Resume(ctx)
+	if err != nil || journal.Phase != AcornFoxRepoPreparedFinal || journal.NeedsRecovery || journal.LayoutSHA256 != b.layout.evidence() || !validSHA(journal.BindingSHA256) {
+		return AcornFoxHostBootstrapReceiptV1{}, ErrAcornFoxRepoBootstrapConflict
+	}
+	if _, err = newAcornFoxBindingStore(store).Read(journal.BindingSHA256); err != nil {
+		return AcornFoxHostBootstrapReceiptV1{}, ErrAcornFoxRepoBootstrapConflict
 	}
 	substrate, err := b.reopenSubstrate(ctx, publisher, journal.BindingSHA256)
 	if err != nil {

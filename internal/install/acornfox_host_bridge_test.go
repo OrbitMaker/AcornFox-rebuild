@@ -3,6 +3,7 @@ package install
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -87,6 +88,37 @@ func TestAcornFoxHostBridgeRejectsPreparedStateTamper(t *testing.T) {
 			prepared.assertExternalSentinel(t)
 		})
 	}
+}
+
+func TestAcornFoxHostBridgeVerifyPreparedRequiresFinalAndRechecksScope(t *testing.T) {
+	prepared := newAcornFoxProductionPreparedFixture(t)
+	bridge := newAcornFoxHostBridge(prepared.layout, acornFoxSelfVerifier{path: filepath.Join(prepared.parent, "self"), uid: os.Getuid(), gid: os.Getgid()})
+	bridge.ownership = prepared.owners.edge()
+	before, err := prepared.store.Resume(context.Background())
+	if err != nil || before.Phase != AcornFoxRepoStaticVerified {
+		t.Fatalf("before=%#v err=%v", before, err)
+	}
+	if _, err := bridge.verifyPrepared(context.Background()); !errors.Is(err, ErrAcornFoxRepoBootstrapConflict) {
+		t.Fatalf("unfinished journal accepted: %v", err)
+	}
+	after, err := prepared.store.Resume(context.Background())
+	if err != nil || !sameAcornFoxRepoJournal(after, before) {
+		t.Fatalf("unfinished journal changed: before=%#v after=%#v err=%v", before, after, err)
+	}
+	if err := prepareAcornFoxRepository(context.Background(), prepared.store, prepared.published, prepared.binding); err != nil {
+		t.Fatal(err)
+	}
+	verified, err := bridge.verifyPrepared(context.Background())
+	if err != nil || verified.Validate() != nil {
+		t.Fatalf("verified=%#v err=%v", verified, err)
+	}
+	if err := os.WriteFile(filepath.Join(prepared.host, "opt", "acornfox", "foreign"), []byte("foreign"), durableFileMode); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := bridge.verifyPrepared(context.Background()); err == nil {
+		t.Fatal("tampered managed scope accepted")
+	}
+	prepared.assertExternalSentinel(t)
 }
 
 type acornFoxHostRootInfo struct {
