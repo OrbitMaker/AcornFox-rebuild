@@ -115,7 +115,7 @@ func newProductionAcornFoxLayout() (acornFoxInstallLayout, error) {
 	stateRoot, hostRoot := "/var/lib/acornfox/install", "/"
 	stateInfo, stateErr := os.Lstat(stateRoot)
 	hostInfo, hostErr := os.Lstat(hostRoot)
-	if stateErr != nil || hostErr != nil || !safeAcornFoxInstallRoot(stateInfo, 0, 0, true) || !safeAcornFoxHostRoot(hostInfo) {
+	if stateErr != nil || hostErr != nil || !safeAcornFoxInstallRoot(stateInfo, 0, 0, true) || !safeAcornFoxProductionHostRoot(hostInfo) {
 		return acornFoxInstallLayout{}, errors.New("AcornFox production layout roots are unsafe")
 	}
 	principals := map[AcornFoxLiveRole]acornFoxInstallPrincipal{AcornFoxLiveRootRole: {}}
@@ -161,6 +161,10 @@ func safeAcornFoxInstallRoot(info os.FileInfo, uid, gid int, exactMode bool) boo
 
 func safeAcornFoxHostRoot(info os.FileInfo) bool {
 	return info != nil && info.IsDir() && info.Mode()&os.ModeSymlink == 0 && info.Mode().Perm()&0o022 == 0
+}
+
+func safeAcornFoxProductionHostRoot(info os.FileInfo) bool {
+	return safeAcornFoxHostRoot(info) && verifyOwner(info, 0, 0) == nil
 }
 
 func (l acornFoxInstallLayout) validate() error {

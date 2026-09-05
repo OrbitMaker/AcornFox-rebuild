@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"regexp"
 )
+
+var acornFoxHostSourceCommit = regexp.MustCompile(`^[a-f0-9]{40}$`)
 
 // AcornFoxHostBootstrapReceiptV1 is the deliberately small public result of
 // repository preparation. It contains durable identities only; paths, uid/gid,
@@ -21,7 +24,7 @@ type AcornFoxHostBootstrapReceiptV1 struct {
 }
 
 func (r AcornFoxHostBootstrapReceiptV1) Validate() error {
-	if r.SchemaVersion != 1 || r.State != string(AcornFoxRepoPreparedFinal) || !validSHA(r.BindingSHA256) || !validID(r.ReleaseID) || len(r.SourceCommit) != 40 || !validSHA(r.LayoutSHA256) || !validSHA(r.SubstrateReceiptSHA256) || !validSHA(r.FinalEvidenceSHA256) {
+	if r.SchemaVersion != 1 || r.State != string(AcornFoxRepoPreparedFinal) || !validSHA(r.BindingSHA256) || !validID(r.ReleaseID) || !acornFoxHostSourceCommit.MatchString(r.SourceCommit) || !validSHA(r.LayoutSHA256) || !validSHA(r.SubstrateReceiptSHA256) || !validSHA(r.FinalEvidenceSHA256) {
 		return errors.New("AcornFox host bootstrap receipt is invalid")
 	}
 	return nil
@@ -230,7 +233,14 @@ func (b acornFoxHostBridge) ensurePreparedJournal(ctx context.Context, store *Ta
 
 func (b acornFoxHostBridge) materializeAndPrepare(ctx context.Context, store *TaskAcornFoxRepoStore, substrate *PublishedAcornFoxSubstrateV1, binding string) (AcornFoxHostBootstrapReceiptV1, error) {
 	if current, err := store.Resume(ctx); err == nil && current.Phase == AcornFoxRepoPreparedFinal {
-		return b.receiptForJournal(current, substrate, binding)
+		if err := prepareAcornFoxRepository(ctx, store, substrate, binding); err != nil {
+			return AcornFoxHostBootstrapReceiptV1{}, err
+		}
+		verified, resumeErr := store.Resume(ctx)
+		if resumeErr != nil {
+			return AcornFoxHostBootstrapReceiptV1{}, ErrAcornFoxRepoBootstrapConflict
+		}
+		return b.receiptForJournal(verified, substrate, binding)
 	}
 	if _, err := materializeAcornFoxLive(ctx, store, substrate, binding); err != nil {
 		return AcornFoxHostBootstrapReceiptV1{}, err
