@@ -34,6 +34,9 @@ func TestSealCandidateArtifactsV1ProducesDeterministicPrivateArtifacts(t *testin
 		t.Fatal(err)
 	}
 	defer second.Close()
+	if err := tree.Close(); err != nil {
+		t.Fatal(err)
+	}
 	left, err := first.Receipt()
 	if err != nil || left.Validate() != nil {
 		t.Fatalf("receipt=%#v err=%v", left, err)

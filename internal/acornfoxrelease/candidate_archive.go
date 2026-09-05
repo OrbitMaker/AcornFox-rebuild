@@ -20,15 +20,30 @@ import (
 var ErrCandidateArtifacts = errors.New("acornfox synthetic artifacts are invalid")
 
 type CandidateArtifactReceiptV1 struct {
-	SchemaVersion                                                                                           int `json:"schema_version"`
-	Product, Version, ReleaseID, SourceRepository, SourceCommit                                             string
-	DecisionSHA256, SourcePolicySHA256, ToolchainSHA256, RuntimeInputSHA256, LicenseInputSHA256, TreeSHA256 string
-	ManifestSHA256, ArchiveSHA256, BundleSHA256, BindingSHA256, BuildRecordSHA256                           string
-	Files                                                                                                   []FileEntryV1 `json:"files"`
+	SchemaVersion      int           `json:"schema_version"`
+	Product            string        `json:"product"`
+	Version            string        `json:"version"`
+	ReleaseID          string        `json:"release_id"`
+	SourceRepository   string        `json:"source_repository"`
+	SourceCommit       string        `json:"source_commit"`
+	Architecture       string        `json:"architecture"`
+	MigrationVersion   string        `json:"migration_version"`
+	DecisionSHA256     string        `json:"decision_sha256"`
+	SourcePolicySHA256 string        `json:"source_policy_sha256"`
+	ToolchainSHA256    string        `json:"toolchain_sha256"`
+	RuntimeInputSHA256 string        `json:"runtime_input_sha256"`
+	LicenseInputSHA256 string        `json:"license_input_sha256"`
+	TreeSHA256         string        `json:"tree_sha256"`
+	ManifestSHA256     string        `json:"manifest_sha256"`
+	ArchiveSHA256      string        `json:"archive_sha256"`
+	BundleSHA256       string        `json:"bundle_sha256"`
+	BindingSHA256      string        `json:"binding_sha256"`
+	BuildRecordSHA256  string        `json:"build_record_sha256"`
+	Files              []FileEntryV1 `json:"files"`
 }
 
 func (r CandidateArtifactReceiptV1) Validate() error {
-	if r.SchemaVersion != 1 || r.Product != Product || !versionText.MatchString(r.Version) || r.ReleaseID != "release-"+r.Version || !validGitHubRepository(r.SourceRepository) || !commitText.MatchString(r.SourceCommit) || len(r.Files) != 6 || validateArtifactFiles(r.Files) != nil {
+	if r.SchemaVersion != 1 || r.Product != Product || r.Architecture != Architecture || r.MigrationVersion != Migration || !versionText.MatchString(r.Version) || r.ReleaseID != "release-"+r.Version || !validGitHubRepository(r.SourceRepository) || !commitText.MatchString(r.SourceCommit) || len(r.Files) != 6 || validateArtifactFiles(r.Files) != nil {
 		return ErrCandidateArtifacts
 	}
 	for _, value := range []string{r.DecisionSHA256, r.SourcePolicySHA256, r.ToolchainSHA256, r.RuntimeInputSHA256, r.LicenseInputSHA256, r.TreeSHA256, r.ManifestSHA256, r.ArchiveSHA256, r.BundleSHA256, r.BindingSHA256, r.BuildRecordSHA256} {
@@ -51,7 +66,7 @@ type CandidateArtifactStageV1 struct {
 	root, parent          string
 	parentInfo, stageInfo os.FileInfo
 	receipt               CandidateArtifactReceiptV1
-	tree                  *CandidateTreeStageV1
+	treeReceipt           CandidateTreeReceiptV1
 	closed                bool
 }
 
@@ -69,7 +84,7 @@ func SealCandidateArtifactsV1(tree *CandidateTreeStageV1, taskRoot string) (*Can
 		return nil, ErrCandidateArtifacts
 	}
 	stageInfo, err := os.Lstat(stageRoot)
-	stage := &CandidateArtifactStageV1{root: stageRoot, parent: parent, parentInfo: parentInfo, stageInfo: stageInfo, tree: tree}
+	stage := &CandidateArtifactStageV1{root: stageRoot, parent: parent, parentInfo: parentInfo, stageInfo: stageInfo, treeReceipt: treeReceipt}
 	fail := func() (*CandidateArtifactStageV1, error) {
 		if samePinnedDirectory(parent, parentInfo) && samePinnedDirectory(stageRoot, stageInfo) {
 			_ = os.RemoveAll(stageRoot)
@@ -127,8 +142,17 @@ func SealCandidateArtifactsV1(tree *CandidateTreeStageV1, taskRoot string) (*Can
 	}
 	type record struct {
 		SchemaVersion      int    `json:"schema_version"`
+		Product            string `json:"product"`
+		Version            string `json:"version"`
+		ReleaseID          string `json:"release_id"`
+		SourceRepository   string `json:"source_repository"`
+		SourceCommit       string `json:"source_commit"`
+		Architecture       string `json:"architecture"`
+		MigrationVersion   string `json:"migration_version"`
+		Synthetic          bool   `json:"synthetic"`
 		State              string `json:"state"`
 		ProductionAccepted bool   `json:"production_accepted"`
+		CandidateAccepted  bool   `json:"candidate_accepted"`
 		DecisionSHA256     string `json:"decision_sha256"`
 		SourcePolicySHA256 string `json:"source_policy_sha256"`
 		ToolchainSHA256    string `json:"toolchain_sha256"`
@@ -140,7 +164,7 @@ func SealCandidateArtifactsV1(tree *CandidateTreeStageV1, taskRoot string) (*Can
 		BundleSHA256       string `json:"bundle_sha256"`
 		BindingSHA256      string `json:"binding_sha256"`
 	}
-	recordRaw, err := json.Marshal(record{1, "SYNTHETIC_UNAPPROVED", false, treeReceipt.DecisionSHA256, treeReceipt.SourcePolicySHA256, treeReceipt.ToolchainSHA256, treeReceipt.RuntimeInputSHA256, treeReceipt.LicenseInputSHA256, treeReceipt.TreeSHA256, sha256Text(manifestRaw), archiveSHA, sha256Text(bundle), sha256Text(bindingRaw)})
+	recordRaw, err := json.Marshal(record{SchemaVersion: 1, Product: Product, Version: treeReceipt.Version, ReleaseID: treeReceipt.ReleaseID, SourceRepository: treeReceipt.SourceRepository, SourceCommit: treeReceipt.SourceCommit, Architecture: Architecture, MigrationVersion: Migration, Synthetic: true, State: "BUILT_UNAPPROVED", ProductionAccepted: false, CandidateAccepted: false, DecisionSHA256: treeReceipt.DecisionSHA256, SourcePolicySHA256: treeReceipt.SourcePolicySHA256, ToolchainSHA256: treeReceipt.ToolchainSHA256, RuntimeInputSHA256: treeReceipt.RuntimeInputSHA256, LicenseInputSHA256: treeReceipt.LicenseInputSHA256, TreeSHA256: treeReceipt.TreeSHA256, ManifestSHA256: sha256Text(manifestRaw), ArchiveSHA256: archiveSHA, BundleSHA256: sha256Text(bundle), BindingSHA256: sha256Text(bindingRaw)})
 	if err != nil {
 		return fail()
 	}
@@ -154,7 +178,7 @@ func SealCandidateArtifactsV1(tree *CandidateTreeStageV1, taskRoot string) (*Can
 	if err != nil {
 		return failWith("artifact inspection")
 	}
-	stage.receipt = CandidateArtifactReceiptV1{1, Product, treeReceipt.Version, treeReceipt.ReleaseID, treeReceipt.SourceRepository, treeReceipt.SourceCommit, treeReceipt.DecisionSHA256, treeReceipt.SourcePolicySHA256, treeReceipt.ToolchainSHA256, treeReceipt.RuntimeInputSHA256, treeReceipt.LicenseInputSHA256, treeReceipt.TreeSHA256, sha256Text(manifestRaw), archiveSHA, sha256Text(bundle), sha256Text(bindingRaw), sha256Text(recordRaw), files}
+	stage.receipt = CandidateArtifactReceiptV1{SchemaVersion: 1, Product: Product, Version: treeReceipt.Version, ReleaseID: treeReceipt.ReleaseID, SourceRepository: treeReceipt.SourceRepository, SourceCommit: treeReceipt.SourceCommit, Architecture: Architecture, MigrationVersion: Migration, DecisionSHA256: treeReceipt.DecisionSHA256, SourcePolicySHA256: treeReceipt.SourcePolicySHA256, ToolchainSHA256: treeReceipt.ToolchainSHA256, RuntimeInputSHA256: treeReceipt.RuntimeInputSHA256, LicenseInputSHA256: treeReceipt.LicenseInputSHA256, TreeSHA256: treeReceipt.TreeSHA256, ManifestSHA256: sha256Text(manifestRaw), ArchiveSHA256: archiveSHA, BundleSHA256: sha256Text(bundle), BindingSHA256: sha256Text(bindingRaw), BuildRecordSHA256: sha256Text(recordRaw), Files: files}
 	if stage.receipt.Validate() != nil || !stage.valid() {
 		return failWith("receipt")
 	}
@@ -334,10 +358,10 @@ func (stage *CandidateArtifactStageV1) Close() error {
 	return nil
 }
 func (stage *CandidateArtifactStageV1) valid() bool {
-	if stage == nil || stage.closed || stage.receipt.Validate() != nil || !samePinnedDirectory(stage.parent, stage.parentInfo) || !samePinnedDirectory(stage.root, stage.stageInfo) || stage.tree == nil {
+	if stage == nil || stage.closed || stage.receipt.Validate() != nil || stage.treeReceipt.Validate() != nil || !samePinnedDirectory(stage.parent, stage.parentInfo) || !samePinnedDirectory(stage.root, stage.stageInfo) {
 		return false
 	}
-	if _, err := stage.tree.Receipt(); err != nil {
+	if !payloadFilesMatch(filepath.Join(stage.root, "payload", "release"), stage.treeReceipt.Files) {
 		return false
 	}
 	files, err := inspectArtifactFiles(stage.root, func() []string {
@@ -348,4 +372,27 @@ func (stage *CandidateArtifactStageV1) valid() bool {
 		return out
 	}())
 	return err == nil && sameFileEntries(files, stage.receipt.Files)
+}
+
+func payloadFilesMatch(root string, files []install.FileDigest) bool {
+	anchored, err := os.OpenRoot(root)
+	if err != nil {
+		return false
+	}
+	defer anchored.Close()
+	for _, expected := range files {
+		f, err := anchored.OpenFile(expected.Path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+		if err != nil {
+			return false
+		}
+		info, statErr := f.Stat()
+		h := sha256.New()
+		n, readErr := io.Copy(h, io.LimitReader(f, runtimeFileBytes+1))
+		closeErr := f.Close()
+		after, afterErr := anchored.Lstat(expected.Path)
+		if statErr != nil || readErr != nil || closeErr != nil || afterErr != nil || !os.SameFile(info, after) || !info.Mode().IsRegular() || info.Mode().Perm() != os.FileMode(expected.Mode) || linkCount(info) != 1 || n != info.Size() || hex.EncodeToString(h.Sum(nil)) != expected.SHA256 {
+			return false
+		}
+	}
+	return true
 }
