@@ -6,7 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"os/user"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 )
 
@@ -102,6 +105,42 @@ func newTestProductionAcornFoxLayout(stateRoot, hostRoot string, stateUID, state
 	return layout, nil
 }
 
+// newProductionAcornFoxLayout has deliberately no configurable inputs. It is
+// the only production layout constructor and therefore cannot be redirected to
+// a caller-selected host root, account, or state directory.
+func newProductionAcornFoxLayout() (acornFoxInstallLayout, error) {
+	if runtime.GOOS != "linux" || os.Geteuid() != 0 {
+		return acornFoxInstallLayout{}, errors.New("AcornFox production layout requires Linux root")
+	}
+	stateRoot, hostRoot := "/var/lib/acornfox/install", "/"
+	stateInfo, stateErr := os.Lstat(stateRoot)
+	hostInfo, hostErr := os.Lstat(hostRoot)
+	if stateErr != nil || hostErr != nil || !safeAcornFoxInstallRoot(stateInfo, 0, 0, true) || !safeAcornFoxHostRoot(hostInfo) {
+		return acornFoxInstallLayout{}, errors.New("AcornFox production layout roots are unsafe")
+	}
+	principals := map[AcornFoxLiveRole]acornFoxInstallPrincipal{AcornFoxLiveRootRole: {}}
+	for role, name := range map[AcornFoxLiveRole]string{
+		AcornFoxLiveServerRole: "acornfox", AcornFoxLiveAgentRole: "acornfox-agent", AcornFoxLiveBuildKitRole: "acornfox-buildkit", AcornFoxLiveCaddyRole: "acornfox-caddy", AcornFoxLiveEdgeRole: "acornfox-edge",
+	} {
+		account, err := user.Lookup(name)
+		if err != nil {
+			return acornFoxInstallLayout{}, errors.New("AcornFox production account is unavailable")
+		}
+		uid, uidErr := strconv.Atoi(account.Uid)
+		gid, gidErr := strconv.Atoi(account.Gid)
+		if uidErr != nil || gidErr != nil || uid <= 0 || gid <= 0 {
+			return acornFoxInstallLayout{}, errors.New("AcornFox production account is invalid")
+		}
+		principals[role] = acornFoxInstallPrincipal{uid: uid, gid: gid}
+	}
+	layout := acornFoxInstallLayout{mode: acornFoxInstallLayoutProduction, stateRootPath: stateRoot, hostRootPath: hostRoot, liveReceiptPath: "var/lib/acornfox/install/live-receipt.json", stateOwner: acornFoxInstallPrincipal{}, principals: principals, stateRootInfo: stateInfo, hostRootInfo: hostInfo}
+	if err := layout.validate(); err != nil {
+		return acornFoxInstallLayout{}, err
+	}
+	layout.evidenceSHA256 = layout.digest()
+	return layout, nil
+}
+
 func safeAcornFoxTestRoot(path string) bool {
 	if !safeAbsoluteDurableRoot(path) || filepath.Clean(path) == string(filepath.Separator) {
 		return false
@@ -125,7 +164,7 @@ func safeAcornFoxHostRoot(info os.FileInfo) bool {
 }
 
 func (l acornFoxInstallLayout) validate() error {
-	if l.mode != acornFoxInstallLayoutTask && l.mode != acornFoxInstallLayoutProduction || !safeAbsoluteDurableRoot(l.stateRootPath) || !safeAbsoluteDurableRoot(l.hostRootPath) || filepath.Clean(l.stateRootPath) == string(filepath.Separator) || filepath.Clean(l.hostRootPath) == string(filepath.Separator) || l.stateOwner.uid < 0 || l.stateOwner.gid < 0 || l.stateRootInfo == nil || l.hostRootInfo == nil || len(l.principals) != len(acornFoxInstallLayoutRoles) {
+	if l.mode != acornFoxInstallLayoutTask && l.mode != acornFoxInstallLayoutProduction || !safeAbsoluteDurableRoot(l.stateRootPath) || (!safeAbsoluteDurableRoot(l.hostRootPath) && filepath.Clean(l.hostRootPath) != string(filepath.Separator)) || filepath.Clean(l.stateRootPath) == string(filepath.Separator) || l.stateOwner.uid < 0 || l.stateOwner.gid < 0 || l.stateRootInfo == nil || l.hostRootInfo == nil || len(l.principals) != len(acornFoxInstallLayoutRoles) {
 		return errors.New("AcornFox install layout is invalid")
 	}
 	if l.mode == acornFoxInstallLayoutTask {
@@ -139,7 +178,9 @@ func (l acornFoxInstallLayout) validate() error {
 		}
 		return nil
 	}
-	if l.stateRootPath == l.hostRootPath || !safeAcornFoxTestRoot(l.stateRootPath) || !safeAcornFoxTestRoot(l.hostRootPath) || l.stateRootPath != filepath.Join(l.hostRootPath, "var", "lib", "acornfox", "install") || l.livePrefix != "" || l.liveReceiptPath != "var/lib/acornfox/install/live-receipt.json" || !safeAcornFoxInstallRoot(l.stateRootInfo, l.stateOwner.uid, l.stateOwner.gid, true) || !safeAcornFoxHostRoot(l.hostRootInfo) || l.principals[AcornFoxLiveRootRole] != (acornFoxInstallPrincipal{}) || (l.evidenceSHA256 != "" && (!validSHA(l.evidenceSHA256) || l.evidenceSHA256 != l.digest())) {
+	productionRoot := l.hostRootPath == "/" && l.stateRootPath == "/var/lib/acornfox/install" && l.stateOwner == (acornFoxInstallPrincipal{})
+	testRoot := l.stateRootPath != l.hostRootPath && safeAcornFoxTestRoot(l.stateRootPath) && safeAcornFoxTestRoot(l.hostRootPath) && l.stateRootPath == filepath.Join(l.hostRootPath, "var", "lib", "acornfox", "install")
+	if (!productionRoot && !testRoot) || l.livePrefix != "" || l.liveReceiptPath != "var/lib/acornfox/install/live-receipt.json" || !safeAcornFoxInstallRoot(l.stateRootInfo, l.stateOwner.uid, l.stateOwner.gid, true) || !safeAcornFoxHostRoot(l.hostRootInfo) || l.principals[AcornFoxLiveRootRole] != (acornFoxInstallPrincipal{}) || (l.evidenceSHA256 != "" && (!validSHA(l.evidenceSHA256) || l.evidenceSHA256 != l.digest())) {
 		return errors.New("AcornFox production install layout is invalid")
 	}
 	seen := map[acornFoxInstallPrincipal]bool{}

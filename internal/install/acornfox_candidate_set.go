@@ -21,11 +21,18 @@ const (
 	acornFoxCandidateSetMaxFileBytes   = 2 << 20
 )
 
-type acornFoxCandidateSetRequest struct {
+// AcornFoxCandidateSetRequestV1 is the complete caller authority for a
+// bootstrap candidate.  It intentionally has no root, account, unit, or
+// executable override: those are fixed by the host bridge.
+type AcornFoxCandidateSetRequestV1 struct {
 	Directory     string
 	BindingSHA256 string
 	SelfSHA256    string
 }
+
+// Keep the old package-local spelling for the existing focused tests while
+// exposing only the sealed three-field request to bridge callers.
+type acornFoxCandidateSetRequest = AcornFoxCandidateSetRequestV1
 
 // acornFoxCandidateSet is a short-lived sealed input to the later stager. Its
 // archive descriptor is rewound after verification; callers cannot substitute
@@ -33,6 +40,7 @@ type acornFoxCandidateSetRequest struct {
 type acornFoxCandidateSet struct {
 	bindingRaw, manifestRaw, bundleRaw, buildRecordRaw []byte
 	bindingSHA256                                      string
+	binding                                            VerifiedAcornFoxBindingV1
 	archive                                            *os.File
 	archiveSize                                        int64
 }
@@ -133,7 +141,19 @@ func loadAcornFoxCandidateSet(request acornFoxCandidateSetRequest, predecessor [
 	if err != nil || !safeAcornFoxCandidateSetFile(archiveAfter, acornFoxArchiveMaxBytes) || !os.SameFile(archiveInfo, archiveAfter) {
 		return fail()
 	}
-	return &acornFoxCandidateSet{bindingRaw: bindingRaw, manifestRaw: manifestRaw, bundleRaw: bundleRaw, buildRecordRaw: buildRecordRaw, bindingSHA256: request.BindingSHA256, archive: archive, archiveSize: opened.Size()}, nil
+	return &acornFoxCandidateSet{bindingRaw: bindingRaw, manifestRaw: manifestRaw, bundleRaw: bundleRaw, buildRecordRaw: buildRecordRaw, bindingSHA256: request.BindingSHA256, binding: binding, archive: archive, archiveSize: opened.Size()}, nil
+}
+
+// stageInput returns a single pinned, rewound archive descriptor. The caller
+// cannot replace the stream after the closed candidate set was verified.
+func (s *acornFoxCandidateSet) stageInput() (VerifyAcornFoxCandidateArtifactsV1Input, error) {
+	if s == nil || !s.binding.valid() || s.archive == nil || !validSHA(s.bindingSHA256) {
+		return VerifyAcornFoxCandidateArtifactsV1Input{}, errors.New("AcornFox candidate set is invalid")
+	}
+	if _, err := s.archive.Seek(0, io.SeekStart); err != nil {
+		return VerifyAcornFoxCandidateArtifactsV1Input{}, errors.New("AcornFox candidate archive cannot rewind")
+	}
+	return VerifyAcornFoxCandidateArtifactsV1Input{Binding: s.bindingRaw, BindingSHA256: s.bindingSHA256, Manifest: s.manifestRaw, BundleManifest: s.bundleRaw, Archive: s.archive, ArchiveSize: s.archiveSize}, nil
 }
 
 func validateAcornFoxCandidateSetNames(root *os.Root, archiveName string) error {
