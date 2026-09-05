@@ -52,6 +52,29 @@ type BuildLogSink interface {
 	StoreBuildLog(context.Context, contracts.BuildRequest, string) (string, error)
 }
 
+// WorkerPolicyAttestor is a read-only boundary to the independently
+// provisioned worker. P1 verifies only a typed digest receipt; P2 must prove
+// that the worker enforces the policy itself.
+type WorkerPolicyAttestor interface {
+	AttestWorkerPolicy(context.Context, WorkerPolicyAttestationRequest) (WorkerPolicyAttestationReceipt, error)
+}
+
+type WorkerPolicyAttestationRequest struct {
+	SchemaVersion      int
+	PolicyDigest       string
+	RequestFingerprint string
+}
+
+type WorkerPolicyAttestationReceipt struct {
+	SchemaVersion      int
+	PolicyDigest       string
+	RequestFingerprint string
+}
+
+func (r WorkerPolicyAttestationReceipt) matches(request WorkerPolicyAttestationRequest) bool {
+	return r.SchemaVersion == 1 && request.SchemaVersion == 1 && contracts.IsSHA256Digest(r.PolicyDigest) && r.PolicyDigest == request.PolicyDigest && r.RequestFingerprint != "" && r.RequestFingerprint == request.RequestFingerprint
+}
+
 type execRunner struct{}
 
 func (execRunner) Run(ctx context.Context, command string, args []string, stdout, stderr io.Writer) error {
@@ -77,6 +100,11 @@ type Config struct {
 	SecretResolver     contracts.BuildSecretResolver
 	Runner             CommandRunner
 	LogSink            BuildLogSink
+	// ControlledEgressPolicyDigest is one reviewed policy identity. It is not
+	// a caller-selected network rule and it has no effect unless the live
+	// worker returns a matching typed receipt.
+	ControlledEgressPolicyDigest string
+	WorkerPolicyAttestor         WorkerPolicyAttestor
 	// RequireLogSink keeps legacy BuildKit composition optional while allowing
 	// a composition root to require durable logs for every build it serves.
 	// AcornFox-bound plans require a sink regardless of this switch.
@@ -132,6 +160,9 @@ func (c Config) normalized() (Config, error) {
 	}
 	if c.RequireLogSink && c.LogSink == nil {
 		return Config{}, fmt.Errorf("buildkit durable log sink is required")
+	}
+	if (c.ControlledEgressPolicyDigest == "") != (c.WorkerPolicyAttestor == nil) || c.ControlledEgressPolicyDigest != "" && !contracts.IsSHA256Digest(c.ControlledEgressPolicyDigest) {
+		return Config{}, fmt.Errorf("buildkit controlled egress requires one canonical policy digest and live worker attestor")
 	}
 	return c, nil
 }
@@ -281,11 +312,11 @@ func (p *Provider) validateRequest(ctx context.Context, request contracts.BuildR
 	if err := validatePlanNetworkIdentity(request.Plan, request.Network); err != nil {
 		return p.providerError(request.Operation, contracts.ErrForbidden, "build network policy does not match the immutable build plan", contracts.RetryNever, false, err)
 	}
-	if err := p.validateNetwork(request.Network); err != nil {
-		return p.providerError(request.Operation, contracts.ErrForbidden, "build network policy is unavailable", contracts.RetryNever, false, err)
-	}
 	if err := validateAcornFoxPlan(request.Plan); err != nil {
 		return p.providerError(request.Operation, contracts.ErrValidation, "AcornFox build plan is invalid", contracts.RetryNever, false, err)
+	}
+	if err := p.validateNetwork(request.Plan, request.Network); err != nil {
+		return p.providerError(request.Operation, contracts.ErrForbidden, "build network policy is unavailable", contracts.RetryNever, false, err)
 	}
 	if err := domain.RequireID(request.BuildID, "build id"); err != nil {
 		return p.providerError(request.Operation, contracts.ErrValidation, "build id is invalid", contracts.RetryNever, false, err)
@@ -381,17 +412,25 @@ func validateResources(resources contracts.ResourceLimits) error {
 	return nil
 }
 
-func (p *Provider) validateNetwork(network contracts.NetworkPolicy) error {
+func (p *Provider) validateNetwork(plan domain.BuildPlan, network contracts.NetworkPolicy) error {
 	if err := network.Validate(); err != nil {
 		return err
 	}
 	if network.EffectiveMode() == contracts.NetworkModeControlledEgressV1 {
-		return errors.New("controlled egress worker policy is unavailable")
+		if !requiresDurableLog(plan) || plan.Kind != domain.BuildDockerfile || plan.ContextPath != "." || plan.DockerfilePath != "Dockerfile" {
+			return errors.New("controlled egress requires an AcornFox root Dockerfile plan")
+		}
+		if p.config.WorkerPolicyAttestor == nil || p.config.ControlledEgressPolicyDigest == "" || p.config.ControlledEgressPolicyDigest != network.WorkerPolicyDigest {
+			return errors.New("controlled egress worker policy is unavailable")
+		}
 	}
 	return nil
 }
 
 func (p *Provider) run(ctx context.Context, request contracts.BuildRequest, record *record) (contracts.BuildResult, error) {
+	if err := p.attestControlledEgress(ctx, request, requestFingerprint(request)); err != nil {
+		return contracts.BuildResult{}, err
+	}
 	if err := p.acquire(ctx, request.Operation); err != nil {
 		return contracts.BuildResult{}, err
 	}
@@ -439,7 +478,7 @@ func (p *Provider) run(ctx context.Context, request contracts.BuildRequest, reco
 	}()
 	metadataPath := filepath.Join(runRoot, "metadata.json")
 	outputPath := filepath.Join(runRoot, "image.oci.tar")
-	args := p.commandArgs(contextPath, dockerfilePath, metadataPath, outputPath, secretArgs)
+	args := p.commandArgs(request.Network, contextPath, dockerfilePath, metadataPath, outputPath, secretArgs)
 	if err := p.config.Capacity.Activate(runCtx, *request.Capacity, contracts.OperationContext{IdempotencyKey: request.Operation.IdempotencyKey + ":capacity-activate", Deadline: request.Operation.Deadline, Actor: request.Operation.Actor}); err != nil {
 		return contracts.BuildResult{}, err
 	}
@@ -493,6 +532,24 @@ func (p *Provider) run(ctx context.Context, request contracts.BuildRequest, reco
 		return contracts.BuildResult{}, p.providerError(request.Operation, contracts.ErrUnavailable, "close OCI output", contracts.RetryBackoff, true, closeErr)
 	}
 	return p.success(request, stored, metadata, successLogs, logRef), nil
+}
+
+func (p *Provider) attestControlledEgress(ctx context.Context, request contracts.BuildRequest, fingerprint string) error {
+	if request.Network.EffectiveMode() != contracts.NetworkModeControlledEgressV1 {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return p.contextError(request.Operation, err)
+	}
+	attestationRequest := WorkerPolicyAttestationRequest{SchemaVersion: 1, PolicyDigest: request.Network.WorkerPolicyDigest, RequestFingerprint: fingerprint}
+	receipt, err := p.config.WorkerPolicyAttestor.AttestWorkerPolicy(ctx, attestationRequest)
+	if err != nil {
+		return p.providerError(request.Operation, contracts.ErrUnavailable, "controlled egress worker attestation is unavailable", contracts.RetryBackoff, true, nil)
+	}
+	if !receipt.matches(attestationRequest) {
+		return p.providerError(request.Operation, contracts.ErrForbidden, "controlled egress worker attestation does not match build request", contracts.RetryNever, false, nil)
+	}
+	return nil
 }
 
 func safePreparationFailure(err error) string {
@@ -726,7 +783,7 @@ func (p *Provider) mountSecrets(ctx context.Context, references []domain.SecretR
 	return args, mounted, nil
 }
 
-func (p *Provider) commandArgs(contextPath, dockerfilePath, metadataPath, outputPath string, secretArgs []string) []string {
+func (p *Provider) commandArgs(network contracts.NetworkPolicy, contextPath, dockerfilePath, metadataPath, outputPath string, secretArgs []string) []string {
 	dockerfileDirectory := filepath.Dir(dockerfilePath)
 	dockerfileName := filepath.Base(dockerfilePath)
 	args := []string{
@@ -735,13 +792,20 @@ func (p *Provider) commandArgs(contextPath, dockerfilePath, metadataPath, output
 		"--local", "context=" + contextPath,
 		"--local", "dockerfile=" + dockerfileDirectory,
 		"--opt", "filename=" + dockerfileName,
-		"--opt", "network=none",
+		"--opt", "network=" + buildKitNetworkMode(network),
 		"--progress", "rawjson",
 		"--metadata-file", metadataPath,
 		"--output", "type=oci,dest=" + outputPath,
 	}
 	args = append(args, secretArgs...)
 	return args
+}
+
+func buildKitNetworkMode(network contracts.NetworkPolicy) string {
+	if network.EffectiveMode() == contracts.NetworkModeControlledEgressV1 {
+		return "default"
+	}
+	return "none"
 }
 
 func (p *Provider) success(request contracts.BuildRequest, stored contracts.StoreOCIResult, metadata []byte, logs, logRef string) contracts.BuildResult {

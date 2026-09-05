@@ -29,6 +29,36 @@ type fakeRunner struct {
 	run   func(context.Context, []string, io.Writer, io.Writer) error
 }
 
+type fakeWorkerPolicyAttestor struct {
+	mu      sync.Mutex
+	calls   []WorkerPolicyAttestationRequest
+	receipt func(WorkerPolicyAttestationRequest) WorkerPolicyAttestationReceipt
+	err     error
+	events  *[]string
+}
+
+func (a *fakeWorkerPolicyAttestor) AttestWorkerPolicy(_ context.Context, request WorkerPolicyAttestationRequest) (WorkerPolicyAttestationReceipt, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.calls = append(a.calls, request)
+	if a.events != nil {
+		*a.events = append(*a.events, "attest")
+	}
+	if a.err != nil {
+		return WorkerPolicyAttestationReceipt{}, a.err
+	}
+	if a.receipt != nil {
+		return a.receipt(request), nil
+	}
+	return WorkerPolicyAttestationReceipt{SchemaVersion: request.SchemaVersion, PolicyDigest: request.PolicyDigest, RequestFingerprint: request.RequestFingerprint}, nil
+}
+
+func (a *fakeWorkerPolicyAttestor) callCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return len(a.calls)
+}
+
 type fakeBuildLogSink struct {
 	mu      sync.Mutex
 	calls   int
@@ -155,10 +185,14 @@ func (fakeCapacity) Release(context.Context, contracts.CapacityLease, contracts.
 type countingCapacity struct {
 	fakeCapacity
 	activations int
+	events      *[]string
 }
 
 func (c *countingCapacity) Activate(context.Context, contracts.CapacityLease, contracts.OperationContext) error {
 	c.activations++
+	if c.events != nil {
+		*c.events = append(*c.events, "capacity")
+	}
 	return nil
 }
 
@@ -238,6 +272,21 @@ func bindAcornFoxDigests(t *testing.T, request *contracts.BuildRequest) {
 	}
 	request.Plan.AcornFoxDefinitionDigest = definition.DefinitionDigest
 	request.Plan.AcornFoxDockerfileDigest = definition.DockerfileDigest
+}
+
+func controlledRequest(t *testing.T, key string, source domain.SourceRevision, policyDigest string) contracts.BuildRequest {
+	t.Helper()
+	request := testRequest(key, source)
+	bindAcornFoxDigests(t, &request)
+	request.Network = contracts.NetworkPolicy{Mode: contracts.NetworkModeControlledEgressV1, WorkerPolicyDigest: policyDigest}
+	request.Plan.AcornFoxNetworkMode = string(request.Network.Mode)
+	request.Plan.AcornFoxWorkerPolicyDigest = request.Network.WorkerPolicyDigest
+	return request
+}
+
+func enableControlledEgress(provider *Provider, policyDigest string, attestor WorkerPolicyAttestor) {
+	provider.config.ControlledEgressPolicyDigest = policyDigest
+	provider.config.WorkerPolicyAttestor = attestor
 }
 
 func testRequest(key string, source domain.SourceRevision) contracts.BuildRequest {
@@ -479,6 +528,213 @@ func TestControlledEgressChangesFingerprintWithoutExecuting(t *testing.T) {
 	if runner.callCount() != 0 {
 		t.Fatalf("controlled egress executed despite dormant contract: %d", runner.callCount())
 	}
+}
+
+func TestControlledEgressAdmitsOnlyExactAttestedAcornFoxBuild(t *testing.T) {
+	const policyDigest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	runner := writingRunner(t, "controlled build output\n")
+	provider, root, source := testProvider(t, runner)
+	events := []string{}
+	attestor := &fakeWorkerPolicyAttestor{events: &events}
+	capacity := &countingCapacity{events: &events}
+	provider.config.Capacity = capacity
+	enableControlledEgress(provider, policyDigest, attestor)
+	request := controlledRequest(t, "controlled-success", source, policyDigest)
+	result, err := provider.Build(context.Background(), request)
+	if err != nil || result.Artifact == nil || attestor.callCount() != 1 || runner.callCount() != 1 || capacity.activations != 1 {
+		t.Fatalf("controlled build was not admitted exactly once: result=%#v err=%v attests=%d runs=%d capacity=%d", result, err, attestor.callCount(), runner.callCount(), capacity.activations)
+	}
+	if len(events) < 2 || events[0] != "attest" || events[1] != "capacity" {
+		t.Fatalf("attestation was not before build effects: %#v", events)
+	}
+	args := strings.Join(runner.calls[0], " ")
+	if !strings.Contains(args, "--opt network=default") || strings.Contains(args, "network=none") {
+		t.Fatalf("controlled build did not use default BuildKit network: %s", args)
+	}
+	for _, forbidden := range []string{"--allow", "network.host", "security.insecure", "--ssh", "--add-host", "proxy"} {
+		if strings.Contains(args, forbidden) {
+			t.Fatalf("controlled build expanded authority with %q: %s", forbidden, args)
+		}
+	}
+	again, err := provider.Build(context.Background(), request)
+	if err != nil || again.Build.ID != result.Build.ID || attestor.callCount() != 1 || runner.callCount() != 1 {
+		t.Fatalf("successful controlled replay did not use cached result: result=%#v err=%v attests=%d runs=%d", again, err, attestor.callCount(), runner.callCount())
+	}
+
+	differentDigest := request
+	differentDigest.Network.WorkerPolicyDigest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	differentDigest.Plan.AcornFoxWorkerPolicyDigest = differentDigest.Network.WorkerPolicyDigest
+	assertProviderCode(t, mustBuild(provider, differentDigest), contracts.ErrForbidden)
+	if attestor.callCount() != 1 || runner.callCount() != 1 {
+		t.Fatalf("different controlled policy digest repeated an admitted build: attests=%d runs=%d", attestor.callCount(), runner.callCount())
+	}
+	if entries, err := os.ReadDir(filepath.Join(root, "work")); err != nil || len(entries) != 0 {
+		t.Fatalf("controlled build did not clean its workspace: entries=%#v err=%v", entries, err)
+	}
+}
+
+func TestControlledEgressConfigAndOfflineBuildStayBounded(t *testing.T) {
+	const policyDigest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	runner := writingRunner(t, "")
+	provider, _, source := testProvider(t, runner)
+	base := provider.config
+	for name, configure := range map[string]func(*Config){
+		"digest without attestor": func(c *Config) { c.ControlledEgressPolicyDigest = policyDigest },
+		"attestor without digest": func(c *Config) { c.WorkerPolicyAttestor = &fakeWorkerPolicyAttestor{} },
+		"uppercase digest": func(c *Config) {
+			c.ControlledEgressPolicyDigest = "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+			c.WorkerPolicyAttestor = &fakeWorkerPolicyAttestor{}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			config := base
+			configure(&config)
+			if _, err := New(config); err == nil {
+				t.Fatal("invalid controlled-egress configuration was accepted")
+			}
+		})
+	}
+	attestor := &fakeWorkerPolicyAttestor{}
+	enableControlledEgress(provider, policyDigest, attestor)
+	if _, err := provider.Build(context.Background(), testRequest("offline-with-attestor", source)); err != nil {
+		t.Fatal(err)
+	}
+	if attestor.callCount() != 0 || runner.callCount() != 1 || !strings.Contains(strings.Join(runner.calls[0], " "), "--opt network=none") {
+		t.Fatalf("offline build changed under configured controlled authority: attests=%d calls=%d args=%#v", attestor.callCount(), runner.callCount(), runner.calls)
+	}
+}
+
+func TestControlledEgressFailsClosedBeforeBuildPreparation(t *testing.T) {
+	const policyDigest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	tests := []struct {
+		name      string
+		configure func(*Provider, *fakeWorkerPolicyAttestor)
+		mutate    func(*contracts.BuildRequest)
+		want      contracts.ErrorCode
+	}{
+		{"missing authority", func(_ *Provider, _ *fakeWorkerPolicyAttestor) {}, func(_ *contracts.BuildRequest) {}, contracts.ErrForbidden},
+		{"configured digest mismatch", func(p *Provider, a *fakeWorkerPolicyAttestor) {
+			enableControlledEgress(p, "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", a)
+		}, func(_ *contracts.BuildRequest) {}, contracts.ErrForbidden},
+		{"missing attestor", func(p *Provider, _ *fakeWorkerPolicyAttestor) { p.config.ControlledEgressPolicyDigest = policyDigest }, func(_ *contracts.BuildRequest) {}, contracts.ErrForbidden},
+		{"plan digest mismatch", func(p *Provider, a *fakeWorkerPolicyAttestor) { enableControlledEgress(p, policyDigest, a) }, func(r *contracts.BuildRequest) {
+			r.Plan.AcornFoxWorkerPolicyDigest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+		}, contracts.ErrForbidden},
+		{"attestor error", func(p *Provider, a *fakeWorkerPolicyAttestor) {
+			a.err = errors.New("private attestor failure")
+			enableControlledEgress(p, policyDigest, a)
+		}, func(_ *contracts.BuildRequest) {}, contracts.ErrUnavailable},
+		{"malformed receipt", func(p *Provider, a *fakeWorkerPolicyAttestor) {
+			a.receipt = func(WorkerPolicyAttestationRequest) WorkerPolicyAttestationReceipt {
+				return WorkerPolicyAttestationReceipt{}
+			}
+			enableControlledEgress(p, policyDigest, a)
+		}, func(_ *contracts.BuildRequest) {}, contracts.ErrForbidden},
+		{"receipt digest drift", func(p *Provider, a *fakeWorkerPolicyAttestor) {
+			a.receipt = func(r WorkerPolicyAttestationRequest) WorkerPolicyAttestationReceipt {
+				return WorkerPolicyAttestationReceipt{SchemaVersion: 1, PolicyDigest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", RequestFingerprint: r.RequestFingerprint}
+			}
+			enableControlledEgress(p, policyDigest, a)
+		}, func(_ *contracts.BuildRequest) {}, contracts.ErrForbidden},
+		{"receipt fingerprint drift", func(p *Provider, a *fakeWorkerPolicyAttestor) {
+			a.receipt = func(r WorkerPolicyAttestationRequest) WorkerPolicyAttestationReceipt {
+				return WorkerPolicyAttestationReceipt{SchemaVersion: 1, PolicyDigest: r.PolicyDigest, RequestFingerprint: "other"}
+			}
+			enableControlledEgress(p, policyDigest, a)
+		}, func(_ *contracts.BuildRequest) {}, contracts.ErrForbidden},
+		{"static plan", func(p *Provider, a *fakeWorkerPolicyAttestor) { enableControlledEgress(p, policyDigest, a) }, func(r *contracts.BuildRequest) {
+			r.Plan.Kind = domain.BuildStatic
+			r.Plan.DockerfilePath = ""
+			r.Plan.StaticRuntimeDigest = testDigest
+			r.Plan.AcornFoxDefinitionDigest = ""
+			r.Plan.AcornFoxDockerfileDigest = ""
+			r.Plan.AcornFoxNetworkMode = ""
+			r.Plan.AcornFoxWorkerPolicyDigest = ""
+		}, contracts.ErrForbidden},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			runner := writingRunner(t, "")
+			provider, root, source := testProvider(t, runner)
+			logs := &fakeBuildLogSink{ref: "memory://build-log/controlled"}
+			store := &countingImageStore{ImageStore: contracts.NewFakeImageStore(true)}
+			capacity := &countingCapacity{}
+			secrets := &countingSecretResolver{fakeSecretResolver: fakeSecretResolver{root: filepath.Join(root, "counted-secrets")}}
+			if err := os.Mkdir(secrets.root, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			provider.config.LogSink, provider.config.ImageStore, provider.config.Capacity, provider.config.SecretResolver = logs, store, capacity, secrets
+			attestor := &fakeWorkerPolicyAttestor{}
+			tc.configure(provider, attestor)
+			request := controlledRequest(t, "controlled-reject-"+strings.ReplaceAll(tc.name, " ", "-"), source, policyDigest)
+			tc.mutate(&request)
+			err := mustBuild(provider, request)
+			assertProviderCode(t, err, tc.want)
+			if strings.Contains(fmt.Sprint(err), "private attestor failure") {
+				t.Fatal("attestor details leaked")
+			}
+			if runner.callCount() != 0 || logs.callCount() != 0 || store.callCount() != 0 || capacity.activations != 0 || secrets.calls != 0 {
+				t.Fatalf("controlled rejection had downstream effects: runner=%d logs=%d store=%d capacity=%d secrets=%d", runner.callCount(), logs.callCount(), store.callCount(), capacity.activations, secrets.calls)
+			}
+		})
+	}
+}
+
+func TestControlledEgressAttestsBeforeSourcePreparationAndPreservesFailures(t *testing.T) {
+	const policyDigest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	t.Run("attests before source preparation", func(t *testing.T) {
+		runner := writingRunner(t, "")
+		provider, _, source := testProvider(t, runner)
+		attestor := &fakeWorkerPolicyAttestor{}
+		enableControlledEgress(provider, policyDigest, attestor)
+		request := controlledRequest(t, "controlled-source-drift", source, policyDigest)
+		request.Source.ContentDigest = "sha256:" + strings.Repeat("b", 64)
+		request.Plan.SourceDigest = request.Source.ContentDigest
+		assertProviderCode(t, mustBuild(provider, request), contracts.ErrValidation)
+		if attestor.callCount() != 1 || runner.callCount() != 0 {
+			t.Fatalf("source preparation ran before attestation or invoked runner: attests=%d runs=%d", attestor.callCount(), runner.callCount())
+		}
+	})
+	t.Run("durable log failure prevents OCI", func(t *testing.T) {
+		runner := writingRunner(t, "")
+		provider, _, source := testProvider(t, runner)
+		attestor := &fakeWorkerPolicyAttestor{}
+		enableControlledEgress(provider, policyDigest, attestor)
+		logs := &fakeBuildLogSink{err: errors.New("durable log unavailable")}
+		store := &countingImageStore{ImageStore: contracts.NewFakeImageStore(true)}
+		provider.config.LogSink, provider.config.ImageStore = logs, store
+		assertProviderCode(t, mustBuild(provider, controlledRequest(t, "controlled-log-failure", source, policyDigest)), contracts.ErrUnavailable)
+		if attestor.callCount() != 1 || logs.callCount() != 1 || store.callCount() != 0 {
+			t.Fatalf("controlled log failure changed OCI semantics: attests=%d logs=%d oci=%d", attestor.callCount(), logs.callCount(), store.callCount())
+		}
+	})
+	t.Run("OCI failure retains durable log", func(t *testing.T) {
+		runner := writingRunner(t, "")
+		provider, _, source := testProvider(t, runner)
+		attestor := &fakeWorkerPolicyAttestor{}
+		enableControlledEgress(provider, policyDigest, attestor)
+		logs := &fakeBuildLogSink{ref: "memory://build-log/controlled-retained"}
+		store := &countingImageStore{ImageStore: contracts.NewFakeImageStore(true), err: errors.New("OCI store unavailable")}
+		provider.config.LogSink, provider.config.ImageStore = logs, store
+		result, err := provider.Build(context.Background(), controlledRequest(t, "controlled-oci-failure", source, policyDigest))
+		assertProviderCode(t, err, contracts.ErrUnavailable)
+		var providerErr *contracts.ProviderError
+		if result.Artifact != nil || attestor.callCount() != 1 || logs.callCount() != 1 || store.callCount() != 1 || !errors.As(err, &providerErr) || providerErr.Details["log_ref"] != logs.ref {
+			t.Fatalf("controlled OCI failure lost durable log truth: result=%#v err=%#v attests=%d logs=%d oci=%d", result, err, attestor.callCount(), logs.callCount(), store.callCount())
+		}
+	})
+	t.Run("cancelled request does not attest", func(t *testing.T) {
+		runner := writingRunner(t, "")
+		provider, _, source := testProvider(t, runner)
+		attestor := &fakeWorkerPolicyAttestor{}
+		enableControlledEgress(provider, policyDigest, attestor)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		assertProviderCode(t, mustBuild(provider, controlledRequest(t, "controlled-cancelled", source, policyDigest), ctx), contracts.ErrCancelled)
+		if attestor.callCount() != 0 || runner.callCount() != 0 {
+			t.Fatalf("cancelled controlled request had effects: attests=%d runs=%d", attestor.callCount(), runner.callCount())
+		}
+	})
 }
 
 func TestBuildTimeoutAndCancelAreClassified(t *testing.T) {
