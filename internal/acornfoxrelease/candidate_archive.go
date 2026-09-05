@@ -2,11 +2,13 @@ package acornfoxrelease
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -18,6 +20,40 @@ import (
 )
 
 var ErrCandidateArtifacts = errors.New("acornfox synthetic artifacts are invalid")
+
+// candidateBuildRecordV1 is intentionally private: a synthetic build record
+// documents private construction bytes, not an approval or publication claim.
+type candidateBuildRecordV1 struct {
+	SchemaVersion      int    `json:"schema_version"`
+	Product            string `json:"product"`
+	Version            string `json:"version"`
+	ReleaseID          string `json:"release_id"`
+	SourceRepository   string `json:"source_repository"`
+	SourceCommit       string `json:"source_commit"`
+	Architecture       string `json:"architecture"`
+	MigrationVersion   string `json:"migration_version"`
+	Synthetic          bool   `json:"synthetic"`
+	State              string `json:"state"`
+	ProductionAccepted bool   `json:"production_accepted"`
+	CandidateAccepted  bool   `json:"candidate_accepted"`
+	DecisionSHA256     string `json:"decision_sha256"`
+	SourcePolicySHA256 string `json:"source_policy_sha256"`
+	ToolchainSHA256    string `json:"toolchain_sha256"`
+	RuntimeInputSHA256 string `json:"runtime_input_sha256"`
+	LicenseInputSHA256 string `json:"license_input_sha256"`
+	TreeSHA256         string `json:"tree_sha256"`
+	ManifestSHA256     string `json:"manifest_sha256"`
+	ArchiveSHA256      string `json:"archive_sha256"`
+	BundleSHA256       string `json:"bundle_sha256"`
+	BindingSHA256      string `json:"binding_sha256"`
+}
+
+func (r candidateBuildRecordV1) ValidateAgainst(receipt CandidateArtifactReceiptV1, tree CandidateTreeReceiptV1) error {
+	if r.SchemaVersion != 1 || r.Product != Product || r.Version != receipt.Version || r.ReleaseID != receipt.ReleaseID || r.SourceRepository != receipt.SourceRepository || r.SourceCommit != receipt.SourceCommit || r.Architecture != Architecture || r.MigrationVersion != Migration || !r.Synthetic || r.State != "BUILT_UNAPPROVED" || r.ProductionAccepted || r.CandidateAccepted || r.DecisionSHA256 != tree.DecisionSHA256 || r.SourcePolicySHA256 != tree.SourcePolicySHA256 || r.ToolchainSHA256 != tree.ToolchainSHA256 || r.RuntimeInputSHA256 != tree.RuntimeInputSHA256 || r.LicenseInputSHA256 != tree.LicenseInputSHA256 || r.TreeSHA256 != tree.TreeSHA256 || r.ManifestSHA256 != receipt.ManifestSHA256 || r.ArchiveSHA256 != receipt.ArchiveSHA256 || r.BundleSHA256 != receipt.BundleSHA256 || r.BindingSHA256 != receipt.BindingSHA256 {
+		return ErrCandidateArtifacts
+	}
+	return nil
+}
 
 type CandidateArtifactReceiptV1 struct {
 	SchemaVersion      int           `json:"schema_version"`
@@ -43,7 +79,7 @@ type CandidateArtifactReceiptV1 struct {
 }
 
 func (r CandidateArtifactReceiptV1) Validate() error {
-	if r.SchemaVersion != 1 || r.Product != Product || r.Architecture != Architecture || r.MigrationVersion != Migration || !versionText.MatchString(r.Version) || r.ReleaseID != "release-"+r.Version || !validGitHubRepository(r.SourceRepository) || !commitText.MatchString(r.SourceCommit) || len(r.Files) != 6 || validateArtifactFiles(r.Files) != nil {
+	if r.SchemaVersion != 1 || r.Product != Product || r.Architecture != Architecture || r.MigrationVersion != Migration || !versionText.MatchString(r.Version) || r.ReleaseID != "release-"+r.Version || !validGitHubRepository(r.SourceRepository) || !commitText.MatchString(r.SourceCommit) {
 		return ErrCandidateArtifacts
 	}
 	for _, value := range []string{r.DecisionSHA256, r.SourcePolicySHA256, r.ToolchainSHA256, r.RuntimeInputSHA256, r.LicenseInputSHA256, r.TreeSHA256, r.ManifestSHA256, r.ArchiveSHA256, r.BundleSHA256, r.BindingSHA256, r.BuildRecordSHA256} {
@@ -51,11 +87,40 @@ func (r CandidateArtifactReceiptV1) Validate() error {
 			return ErrCandidateArtifacts
 		}
 	}
-	return nil
+	return validateArtifactFiles(r.Files, r)
 }
-func validateArtifactFiles(files []FileEntryV1) error {
+func candidateArtifactNames(version string) []string {
+	names := []string{
+		"acornfox-" + version + "-production.tar.gz",
+		"build-record.json",
+		"bundle-manifest.sha256",
+		"candidate-binding.json",
+		"candidate-binding.sha256",
+		"release-manifest.json",
+	}
+	sort.Strings(names)
+	return names
+}
+
+func candidateArtifactDigests(r CandidateArtifactReceiptV1) map[string]string {
+	archive := "acornfox-" + r.Version + "-production.tar.gz"
+	return map[string]string{
+		archive:                    r.ArchiveSHA256,
+		"release-manifest.json":    r.ManifestSHA256,
+		"bundle-manifest.sha256":   r.BundleSHA256,
+		"candidate-binding.json":   r.BindingSHA256,
+		"candidate-binding.sha256": sha256Text([]byte(r.BindingSHA256 + "\n")),
+		"build-record.json":        r.BuildRecordSHA256,
+	}
+}
+
+func validateArtifactFiles(files []FileEntryV1, receipt CandidateArtifactReceiptV1) error {
+	names, expected := candidateArtifactNames(receipt.Version), candidateArtifactDigests(receipt)
+	if len(files) != len(names) {
+		return ErrCandidateArtifacts
+	}
 	for i, f := range files {
-		if !validRelativeFile(f.Path) || !digestText.MatchString(f.SHA256) || f.Mode != 0o644 || (i > 0 && files[i-1].Path >= f.Path) {
+		if f.Path != names[i] || !digestText.MatchString(f.SHA256) || f.Mode != 0o644 || expected[f.Path] != f.SHA256 {
 			return ErrCandidateArtifacts
 		}
 	}
@@ -140,31 +205,7 @@ func SealCandidateArtifactsV1(tree *CandidateTreeStageV1, taskRoot string) (*Can
 	if err != nil {
 		return fail()
 	}
-	type record struct {
-		SchemaVersion      int    `json:"schema_version"`
-		Product            string `json:"product"`
-		Version            string `json:"version"`
-		ReleaseID          string `json:"release_id"`
-		SourceRepository   string `json:"source_repository"`
-		SourceCommit       string `json:"source_commit"`
-		Architecture       string `json:"architecture"`
-		MigrationVersion   string `json:"migration_version"`
-		Synthetic          bool   `json:"synthetic"`
-		State              string `json:"state"`
-		ProductionAccepted bool   `json:"production_accepted"`
-		CandidateAccepted  bool   `json:"candidate_accepted"`
-		DecisionSHA256     string `json:"decision_sha256"`
-		SourcePolicySHA256 string `json:"source_policy_sha256"`
-		ToolchainSHA256    string `json:"toolchain_sha256"`
-		RuntimeInputSHA256 string `json:"runtime_input_sha256"`
-		LicenseInputSHA256 string `json:"license_input_sha256"`
-		TreeSHA256         string `json:"tree_sha256"`
-		ManifestSHA256     string `json:"manifest_sha256"`
-		ArchiveSHA256      string `json:"archive_sha256"`
-		BundleSHA256       string `json:"bundle_sha256"`
-		BindingSHA256      string `json:"binding_sha256"`
-	}
-	recordRaw, err := json.Marshal(record{SchemaVersion: 1, Product: Product, Version: treeReceipt.Version, ReleaseID: treeReceipt.ReleaseID, SourceRepository: treeReceipt.SourceRepository, SourceCommit: treeReceipt.SourceCommit, Architecture: Architecture, MigrationVersion: Migration, Synthetic: true, State: "BUILT_UNAPPROVED", ProductionAccepted: false, CandidateAccepted: false, DecisionSHA256: treeReceipt.DecisionSHA256, SourcePolicySHA256: treeReceipt.SourcePolicySHA256, ToolchainSHA256: treeReceipt.ToolchainSHA256, RuntimeInputSHA256: treeReceipt.RuntimeInputSHA256, LicenseInputSHA256: treeReceipt.LicenseInputSHA256, TreeSHA256: treeReceipt.TreeSHA256, ManifestSHA256: sha256Text(manifestRaw), ArchiveSHA256: archiveSHA, BundleSHA256: sha256Text(bundle), BindingSHA256: sha256Text(bindingRaw)})
+	recordRaw, err := json.Marshal(candidateBuildRecordV1{SchemaVersion: 1, Product: Product, Version: treeReceipt.Version, ReleaseID: treeReceipt.ReleaseID, SourceRepository: treeReceipt.SourceRepository, SourceCommit: treeReceipt.SourceCommit, Architecture: Architecture, MigrationVersion: Migration, Synthetic: true, State: "BUILT_UNAPPROVED", ProductionAccepted: false, CandidateAccepted: false, DecisionSHA256: treeReceipt.DecisionSHA256, SourcePolicySHA256: treeReceipt.SourcePolicySHA256, ToolchainSHA256: treeReceipt.ToolchainSHA256, RuntimeInputSHA256: treeReceipt.RuntimeInputSHA256, LicenseInputSHA256: treeReceipt.LicenseInputSHA256, TreeSHA256: treeReceipt.TreeSHA256, ManifestSHA256: sha256Text(manifestRaw), ArchiveSHA256: archiveSHA, BundleSHA256: sha256Text(bundle), BindingSHA256: sha256Text(bindingRaw)})
 	if err != nil {
 		return fail()
 	}
@@ -361,36 +402,264 @@ func (stage *CandidateArtifactStageV1) valid() bool {
 	if stage == nil || stage.closed || stage.receipt.Validate() != nil || stage.treeReceipt.Validate() != nil || !samePinnedDirectory(stage.parent, stage.parentInfo) || !samePinnedDirectory(stage.root, stage.stageInfo) {
 		return false
 	}
-	if !payloadFilesMatch(filepath.Join(stage.root, "payload", "release"), stage.treeReceipt.Files) {
+	if !verifyArtifactRoot(stage.root, stage.receipt) {
 		return false
 	}
-	files, err := inspectArtifactFiles(stage.root, func() []string {
-		out := make([]string, 0, len(stage.receipt.Files))
-		for _, f := range stage.receipt.Files {
-			out = append(out, f.Path)
-		}
-		return out
-	}())
-	return err == nil && sameFileEntries(files, stage.receipt.Files)
+	files, err := inspectArtifactFiles(stage.root, candidateArtifactNames(stage.receipt.Version))
+	if err != nil || !sameFileEntries(files, stage.receipt.Files) {
+		return false
+	}
+	manifest, err := verifyPayloadTree(filepath.Join(stage.root, "payload", "release"), stage.treeReceipt, stage.receipt)
+	if err != nil || !verifyManifest(manifest, stage.treeReceipt, stage.receipt) {
+		return false
+	}
+	return verifyArtifactSemantics(stage.root, manifest, stage.receipt, stage.treeReceipt)
 }
 
-func payloadFilesMatch(root string, files []install.FileDigest) bool {
+func verifyArtifactRoot(root string, receipt CandidateArtifactReceiptV1) bool {
+	outer, err := os.Lstat(root)
+	if err != nil || !outer.IsDir() || outer.Mode()&os.ModeSymlink != 0 {
+		return false
+	}
 	anchored, err := os.OpenRoot(root)
 	if err != nil {
 		return false
 	}
 	defer anchored.Close()
-	for _, expected := range files {
-		f, err := anchored.OpenFile(expected.Path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
-		if err != nil {
+	opened, err := anchored.Stat(".")
+	if err != nil || !os.SameFile(outer, opened) {
+		return false
+	}
+	dir, err := anchored.OpenFile(".", os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return false
+	}
+	children, readErr := dir.ReadDir(-1)
+	closeErr := dir.Close()
+	if readErr != nil || closeErr != nil || len(children) != len(receipt.Files)+1 {
+		return false
+	}
+	want := map[string]bool{"payload": true}
+	for _, name := range candidateArtifactNames(receipt.Version) {
+		want[name] = true
+	}
+	for _, child := range children {
+		before, err := anchored.Lstat(child.Name())
+		if err != nil || before.Mode()&os.ModeSymlink != 0 || !want[child.Name()] {
 			return false
 		}
-		info, statErr := f.Stat()
-		h := sha256.New()
-		n, readErr := io.Copy(h, io.LimitReader(f, runtimeFileBytes+1))
-		closeErr := f.Close()
-		after, afterErr := anchored.Lstat(expected.Path)
-		if statErr != nil || readErr != nil || closeErr != nil || afterErr != nil || !os.SameFile(info, after) || !info.Mode().IsRegular() || info.Mode().Perm() != os.FileMode(expected.Mode) || linkCount(info) != 1 || n != info.Size() || hex.EncodeToString(h.Sum(nil)) != expected.SHA256 {
+		if child.Name() == "payload" {
+			if !before.IsDir() || !verifyPayloadContainer(anchored) {
+				return false
+			}
+		} else if !before.Mode().IsRegular() || before.Mode().Perm() != 0o644 || linkCount(before) != 1 {
+			return false
+		}
+	}
+	return true
+}
+
+func verifyPayloadContainer(root *os.Root) bool {
+	payload, err := root.OpenRoot("payload")
+	if err != nil {
+		return false
+	}
+	defer payload.Close()
+	dir, err := payload.OpenFile(".", os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return false
+	}
+	children, readErr := dir.ReadDir(-1)
+	closeErr := dir.Close()
+	if readErr != nil || closeErr != nil || len(children) != 1 || children[0].Name() != "release" {
+		return false
+	}
+	info, err := payload.Lstat("release")
+	return err == nil && info.IsDir() && info.Mode()&os.ModeSymlink == 0
+}
+
+func verifyPayloadTree(root string, tree CandidateTreeReceiptV1, receipt CandidateArtifactReceiptV1) ([]byte, error) {
+	if tree.Validate() != nil {
+		return nil, ErrCandidateArtifacts
+	}
+	want := make(map[string]FileEntryV1, len(tree.Files)+1)
+	parents := map[string]bool{".": true}
+	for _, file := range tree.Files {
+		want[file.Path] = FileEntryV1{Path: file.Path, SHA256: file.SHA256, Mode: file.Mode}
+		for parent := filepath.ToSlash(filepath.Dir(file.Path)); parent != "."; parent = filepath.ToSlash(filepath.Dir(parent)) {
+			parents[parent] = true
+		}
+	}
+	if _, exists := want["manifest.json"]; exists {
+		return nil, ErrCandidateArtifacts
+	}
+	want["manifest.json"] = FileEntryV1{Path: "manifest.json", SHA256: receipt.ManifestSHA256, Mode: 0o644}
+	outer, err := os.Lstat(root)
+	if err != nil || !outer.IsDir() || outer.Mode()&os.ModeSymlink != 0 {
+		return nil, ErrCandidateArtifacts
+	}
+	anchored, err := os.OpenRoot(root)
+	if err != nil {
+		return nil, ErrCandidateArtifacts
+	}
+	defer anchored.Close()
+	openedRoot, err := anchored.Stat(".")
+	if err != nil || !os.SameFile(outer, openedRoot) {
+		return nil, ErrCandidateArtifacts
+	}
+	seen := map[string]bool{}
+	var total int64
+	var manifest []byte
+	var walk func(string) error
+	walk = func(dir string) error {
+		directory, err := anchored.OpenFile(dir, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+		if err != nil {
+			return ErrCandidateArtifacts
+		}
+		children, readErr := directory.ReadDir(-1)
+		closeErr := directory.Close()
+		if readErr != nil || closeErr != nil {
+			return ErrCandidateArtifacts
+		}
+		for _, child := range children {
+			path := child.Name()
+			if dir != "." {
+				path = dir + "/" + path
+			}
+			before, err := anchored.Lstat(path)
+			if err != nil || before.Mode()&os.ModeSymlink != 0 {
+				return ErrCandidateArtifacts
+			}
+			if before.IsDir() {
+				if !parents[path] || walk(path) != nil {
+					return ErrCandidateArtifacts
+				}
+				continue
+			}
+			expected, ok := want[path]
+			if !ok || !before.Mode().IsRegular() || before.Mode().Perm() != os.FileMode(expected.Mode) || linkCount(before) != 1 || before.Size() < 0 || before.Size() > runtimeFileBytes || before.Size() > runtimeTreeBytes-total {
+				return ErrCandidateArtifacts
+			}
+			input, err := anchored.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+			if err != nil {
+				return ErrCandidateArtifacts
+			}
+			opened, statErr := input.Stat()
+			hash := sha256.New()
+			var body bytes.Buffer
+			writer := io.Writer(hash)
+			if path == "manifest.json" {
+				writer = io.MultiWriter(hash, &body)
+			}
+			n, readErr := io.Copy(writer, io.LimitReader(input, runtimeFileBytes+1))
+			closeErr := input.Close()
+			after, afterErr := anchored.Lstat(path)
+			if statErr != nil || readErr != nil || closeErr != nil || afterErr != nil || n != before.Size() || n > runtimeFileBytes || !os.SameFile(before, opened) || !os.SameFile(before, after) || hex.EncodeToString(hash.Sum(nil)) != expected.SHA256 {
+				return ErrCandidateArtifacts
+			}
+			total += n
+			seen[path] = true
+			if path == "manifest.json" {
+				manifest = append([]byte(nil), body.Bytes()...)
+			}
+		}
+		return nil
+	}
+	if walk(".") != nil || len(seen) != len(want) || len(manifest) == 0 {
+		return nil, ErrCandidateArtifacts
+	}
+	return manifest, nil
+}
+
+func verifyManifest(raw []byte, tree CandidateTreeReceiptV1, receipt CandidateArtifactReceiptV1) bool {
+	var manifest install.Manifest
+	if strictCandidateJSON(raw, &manifest) != nil || manifest.SchemaVersion != install.ManifestSchemaVersion || manifest.Product != Product || manifest.Version != receipt.Version || manifest.ReleaseID != receipt.ReleaseID || manifest.Architecture != Architecture || manifest.MigrationVersion != Migration || manifest.SourceCommit != receipt.SourceCommit || manifest.Protocol != install.AgentProtocolVersion || manifest.ConfigDir != install.AcornFoxV1ConfigDir || manifest.DataDir != install.AcornFoxV1DataDir || manifest.NMinusOne != nil || manifest.Compatibility.MinDataVersion != 33 || manifest.Compatibility.MaxDataVersion != 33 || manifest.Compatibility.MinAgentProtocol != install.PreviousAgentProtocol || manifest.Compatibility.MaxAgentProtocol != install.AgentProtocolVersion || len(manifest.Files) != len(tree.Files) {
+		return false
+	}
+	return sameInstallFileEntries(manifest.Files, tree.Files)
+}
+
+func verifyArtifactSemantics(root string, manifest []byte, receipt CandidateArtifactReceiptV1, tree CandidateTreeReceiptV1) bool {
+	read := func(name string) ([]byte, bool) {
+		body, err := readCandidateSmallFile(root, name)
+		return body, err == nil
+	}
+	bundle, ok := read("bundle-manifest.sha256")
+	if !ok || !bytes.Equal(bundle, []byte(receipt.ArchiveSHA256+"  acornfox-"+receipt.Version+"-production.tar.gz\n"+receipt.ManifestSHA256+"  release/manifest.json\n")) {
+		return false
+	}
+	bindingRaw, ok := read("candidate-binding.json")
+	if !ok || sha256Text(bindingRaw) != receipt.BindingSHA256 {
+		return false
+	}
+	if _, err := install.ParseAcornFoxCandidateBindingV1(bindingRaw, receipt.BindingSHA256); err != nil {
+		return false
+	}
+	var binding install.AcornFoxCandidateBindingV1
+	if strictCandidateJSON(bindingRaw, &binding) != nil || binding.SchemaVersion != install.AcornFoxCandidateBindingV1Schema || binding.Product != Product || binding.Version != receipt.Version || binding.ReleaseID != receipt.ReleaseID || binding.SourceRepository != receipt.SourceRepository || binding.SourceCommit != receipt.SourceCommit || binding.Architecture != Architecture || binding.MigrationVersion != Migration || binding.ManifestSHA256 != receipt.ManifestSHA256 || binding.ArchiveSHA256 != receipt.ArchiveSHA256 || binding.BundleManifestSHA256 != receipt.BundleSHA256 || binding.NMinusOne != nil {
+		return false
+	}
+	bindingDigest, ok := read("candidate-binding.sha256")
+	if !ok || !bytes.Equal(bindingDigest, []byte(receipt.BindingSHA256+"\n")) {
+		return false
+	}
+	recordRaw, ok := read("build-record.json")
+	if !ok || sha256Text(recordRaw) != receipt.BuildRecordSHA256 {
+		return false
+	}
+	var record candidateBuildRecordV1
+	if strictCandidateJSON(recordRaw, &record) != nil || record.ValidateAgainst(receipt, tree) != nil {
+		return false
+	}
+	return sha256Text(manifest) == receipt.ManifestSHA256
+}
+
+func readCandidateSmallFile(root, name string) ([]byte, error) {
+	anchored, err := os.OpenRoot(root)
+	if err != nil {
+		return nil, ErrCandidateArtifacts
+	}
+	defer anchored.Close()
+	before, err := anchored.Lstat(name)
+	if err != nil || !before.Mode().IsRegular() || before.Mode()&os.ModeSymlink != 0 || before.Mode().Perm() != 0o644 || linkCount(before) != 1 || before.Size() < 0 || before.Size() > 1<<20 {
+		return nil, ErrCandidateArtifacts
+	}
+	file, err := anchored.OpenFile(name, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, ErrCandidateArtifacts
+	}
+	opened, statErr := file.Stat()
+	body, readErr := io.ReadAll(io.LimitReader(file, (1<<20)+1))
+	closeErr := file.Close()
+	after, afterErr := anchored.Lstat(name)
+	if statErr != nil || readErr != nil || closeErr != nil || afterErr != nil || int64(len(body)) != before.Size() || len(body) > 1<<20 || !os.SameFile(before, opened) || !os.SameFile(before, after) {
+		return nil, ErrCandidateArtifacts
+	}
+	return body, nil
+}
+
+func strictCandidateJSON(raw []byte, target any) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return fmt.Errorf("decode candidate JSON: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return ErrCandidateArtifacts
+	}
+	canonical, err := json.Marshal(target)
+	if err != nil || !bytes.Equal(raw, canonical) {
+		return ErrCandidateArtifacts
+	}
+	return nil
+}
+
+func sameInstallFileEntries(left, right []install.FileDigest) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
 			return false
 		}
 	}
