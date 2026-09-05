@@ -40,6 +40,7 @@ type dependencies struct {
 	euid      func() int
 	newRunner func() (productionRunner, error)
 	timeout   time.Duration
+	acornFox  acornFoxHealthDependencies
 }
 
 type commandOutput struct {
@@ -60,7 +61,8 @@ func productionDependencies() dependencies {
 		newRunner: func() (productionRunner, error) {
 			return healthcheck.NewProductionRunner()
 		},
-		timeout: commandTimeout,
+		timeout:  commandTimeout,
+		acornFox: productionAcornFoxHealthDependencies(),
 	}
 }
 
@@ -70,7 +72,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 func runWithDependencies(ctx context.Context, args []string, stdout, stderr io.Writer, deps dependencies) int {
 	if processIdentity == "acornfox" {
-		return runAcornFoxContractCheck(args, stdout, helperRole)
+		if len(args) != 0 {
+			return runAcornFoxContractCheck(args, stdout, helperRole)
+		}
+		return runAcornFoxHealth(ctx, stdout, deps.euid, deps.acornFox)
 	}
 	if processIdentity != "legacy" {
 		return writeAcornFoxContractFailure(stdout, install.AcornFoxHelperCodeIdentityMismatch)
