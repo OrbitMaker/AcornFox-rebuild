@@ -49,7 +49,7 @@ type candidateBuildRecordV1 struct {
 }
 
 func (r candidateBuildRecordV1) ValidateAgainst(receipt CandidateArtifactReceiptV1, tree CandidateTreeReceiptV1) error {
-	if r.SchemaVersion != 1 || r.Product != Product || r.Version != receipt.Version || r.ReleaseID != receipt.ReleaseID || r.SourceRepository != receipt.SourceRepository || r.SourceCommit != receipt.SourceCommit || r.Architecture != Architecture || r.MigrationVersion != Migration || !r.Synthetic || r.State != "BUILT_UNAPPROVED" || r.ProductionAccepted || r.CandidateAccepted || r.DecisionSHA256 != tree.DecisionSHA256 || r.SourcePolicySHA256 != tree.SourcePolicySHA256 || r.ToolchainSHA256 != tree.ToolchainSHA256 || r.RuntimeInputSHA256 != tree.RuntimeInputSHA256 || r.LicenseInputSHA256 != tree.LicenseInputSHA256 || r.TreeSHA256 != tree.TreeSHA256 || r.ManifestSHA256 != receipt.ManifestSHA256 || r.ArchiveSHA256 != receipt.ArchiveSHA256 || r.BundleSHA256 != receipt.BundleSHA256 || r.BindingSHA256 != receipt.BindingSHA256 {
+	if r.SchemaVersion != 1 || r.Product != Product || r.Version != receipt.Version || r.ReleaseID != receipt.ReleaseID || r.SourceRepository != receipt.SourceRepository || r.SourceCommit != receipt.SourceCommit || r.Architecture != Architecture || r.MigrationVersion != Migration || r.Synthetic != receipt.Synthetic || r.Synthetic != tree.Synthetic || r.State != "BUILT_UNAPPROVED" || r.ProductionAccepted || r.CandidateAccepted || r.DecisionSHA256 != tree.DecisionSHA256 || r.SourcePolicySHA256 != tree.SourcePolicySHA256 || r.ToolchainSHA256 != tree.ToolchainSHA256 || r.RuntimeInputSHA256 != tree.RuntimeInputSHA256 || r.LicenseInputSHA256 != tree.LicenseInputSHA256 || r.TreeSHA256 != tree.TreeSHA256 || r.ManifestSHA256 != receipt.ManifestSHA256 || r.ArchiveSHA256 != receipt.ArchiveSHA256 || r.BundleSHA256 != receipt.BundleSHA256 || r.BindingSHA256 != receipt.BindingSHA256 {
 		return ErrCandidateArtifacts
 	}
 	return nil
@@ -57,6 +57,7 @@ func (r candidateBuildRecordV1) ValidateAgainst(receipt CandidateArtifactReceipt
 
 type CandidateArtifactReceiptV1 struct {
 	SchemaVersion      int           `json:"schema_version"`
+	Synthetic          bool          `json:"synthetic"`
 	Product            string        `json:"product"`
 	Version            string        `json:"version"`
 	ReleaseID          string        `json:"release_id"`
@@ -128,11 +129,11 @@ func validateArtifactFiles(files []FileEntryV1, receipt CandidateArtifactReceipt
 }
 
 type CandidateArtifactStageV1 struct {
-	root, parent          string
-	parentInfo, stageInfo os.FileInfo
-	receipt               CandidateArtifactReceiptV1
-	treeReceipt           CandidateTreeReceiptV1
-	closed, transferred   bool
+	root, parent        string
+	parentPin, stagePin *directoryPin
+	receipt             CandidateArtifactReceiptV1
+	treeReceipt         CandidateTreeReceiptV1
+	closed, transferred bool
 }
 
 func SealCandidateArtifactsV1(tree *CandidateTreeStageV1, taskRoot string) (*CandidateArtifactStageV1, error) {
@@ -140,18 +141,20 @@ func SealCandidateArtifactsV1(tree *CandidateTreeStageV1, taskRoot string) (*Can
 	if err != nil {
 		return nil, ErrCandidateArtifacts
 	}
-	parent, parentInfo, err := pinCandidateParent(taskRoot)
+	parent, parentPin, err := pinCandidateParent(taskRoot)
 	if err != nil {
 		return nil, ErrCandidateArtifacts
 	}
 	stageRoot, err := os.MkdirTemp(parent, ".acornfox-candidate-artifacts-")
 	if err != nil {
+		parentPin.close()
 		return nil, ErrCandidateArtifacts
 	}
-	stageInfo, err := os.Lstat(stageRoot)
-	stage := &CandidateArtifactStageV1{root: stageRoot, parent: parent, parentInfo: parentInfo, stageInfo: stageInfo, treeReceipt: treeReceipt}
+	stagePin, err := pinDirectory(stageRoot)
+	stage := &CandidateArtifactStageV1{root: stageRoot, parent: parent, parentPin: parentPin, stagePin: stagePin, treeReceipt: treeReceipt}
 	fail := func() (*CandidateArtifactStageV1, error) {
-		if samePinnedDirectory(parent, parentInfo) && samePinnedDirectory(stageRoot, stageInfo) {
+		defer func() { stage.closed = true; stage.stagePin.close(); stage.parentPin.close() }()
+		if parentPin.validAt(parent) && stagePin.validAt(stageRoot) {
 			_ = os.RemoveAll(stageRoot)
 		}
 		return nil, ErrCandidateArtifacts
@@ -205,7 +208,7 @@ func SealCandidateArtifactsV1(tree *CandidateTreeStageV1, taskRoot string) (*Can
 	if err != nil {
 		return fail()
 	}
-	recordRaw, err := json.Marshal(candidateBuildRecordV1{SchemaVersion: 1, Product: Product, Version: treeReceipt.Version, ReleaseID: treeReceipt.ReleaseID, SourceRepository: treeReceipt.SourceRepository, SourceCommit: treeReceipt.SourceCommit, Architecture: Architecture, MigrationVersion: Migration, Synthetic: true, State: "BUILT_UNAPPROVED", ProductionAccepted: false, CandidateAccepted: false, DecisionSHA256: treeReceipt.DecisionSHA256, SourcePolicySHA256: treeReceipt.SourcePolicySHA256, ToolchainSHA256: treeReceipt.ToolchainSHA256, RuntimeInputSHA256: treeReceipt.RuntimeInputSHA256, LicenseInputSHA256: treeReceipt.LicenseInputSHA256, TreeSHA256: treeReceipt.TreeSHA256, ManifestSHA256: sha256Text(manifestRaw), ArchiveSHA256: archiveSHA, BundleSHA256: sha256Text(bundle), BindingSHA256: sha256Text(bindingRaw)})
+	recordRaw, err := json.Marshal(candidateBuildRecordV1{SchemaVersion: 1, Product: Product, Version: treeReceipt.Version, ReleaseID: treeReceipt.ReleaseID, SourceRepository: treeReceipt.SourceRepository, SourceCommit: treeReceipt.SourceCommit, Architecture: Architecture, MigrationVersion: Migration, Synthetic: treeReceipt.Synthetic, State: "BUILT_UNAPPROVED", ProductionAccepted: false, CandidateAccepted: false, DecisionSHA256: treeReceipt.DecisionSHA256, SourcePolicySHA256: treeReceipt.SourcePolicySHA256, ToolchainSHA256: treeReceipt.ToolchainSHA256, RuntimeInputSHA256: treeReceipt.RuntimeInputSHA256, LicenseInputSHA256: treeReceipt.LicenseInputSHA256, TreeSHA256: treeReceipt.TreeSHA256, ManifestSHA256: sha256Text(manifestRaw), ArchiveSHA256: archiveSHA, BundleSHA256: sha256Text(bundle), BindingSHA256: sha256Text(bindingRaw)})
 	if err != nil {
 		return fail()
 	}
@@ -219,7 +222,7 @@ func SealCandidateArtifactsV1(tree *CandidateTreeStageV1, taskRoot string) (*Can
 	if err != nil {
 		return failWith("artifact inspection")
 	}
-	stage.receipt = CandidateArtifactReceiptV1{SchemaVersion: 1, Product: Product, Version: treeReceipt.Version, ReleaseID: treeReceipt.ReleaseID, SourceRepository: treeReceipt.SourceRepository, SourceCommit: treeReceipt.SourceCommit, Architecture: Architecture, MigrationVersion: Migration, DecisionSHA256: treeReceipt.DecisionSHA256, SourcePolicySHA256: treeReceipt.SourcePolicySHA256, ToolchainSHA256: treeReceipt.ToolchainSHA256, RuntimeInputSHA256: treeReceipt.RuntimeInputSHA256, LicenseInputSHA256: treeReceipt.LicenseInputSHA256, TreeSHA256: treeReceipt.TreeSHA256, ManifestSHA256: sha256Text(manifestRaw), ArchiveSHA256: archiveSHA, BundleSHA256: sha256Text(bundle), BindingSHA256: sha256Text(bindingRaw), BuildRecordSHA256: sha256Text(recordRaw), Files: files}
+	stage.receipt = CandidateArtifactReceiptV1{SchemaVersion: 1, Synthetic: treeReceipt.Synthetic, Product: Product, Version: treeReceipt.Version, ReleaseID: treeReceipt.ReleaseID, SourceRepository: treeReceipt.SourceRepository, SourceCommit: treeReceipt.SourceCommit, Architecture: Architecture, MigrationVersion: Migration, DecisionSHA256: treeReceipt.DecisionSHA256, SourcePolicySHA256: treeReceipt.SourcePolicySHA256, ToolchainSHA256: treeReceipt.ToolchainSHA256, RuntimeInputSHA256: treeReceipt.RuntimeInputSHA256, LicenseInputSHA256: treeReceipt.LicenseInputSHA256, TreeSHA256: treeReceipt.TreeSHA256, ManifestSHA256: sha256Text(manifestRaw), ArchiveSHA256: archiveSHA, BundleSHA256: sha256Text(bundle), BindingSHA256: sha256Text(bindingRaw), BuildRecordSHA256: sha256Text(recordRaw), Files: files}
 	if stage.receipt.Validate() != nil || !stage.validOwned() {
 		return failWith("receipt")
 	}
@@ -395,6 +398,7 @@ func (stage *CandidateArtifactStageV1) Close() error {
 	if stage.closed {
 		return nil
 	}
+	defer func() { stage.closed = true; stage.stagePin.close(); stage.parentPin.close() }()
 	if !stage.validOwned() {
 		return ErrCandidateArtifacts
 	}
@@ -409,7 +413,7 @@ func (stage *CandidateArtifactStageV1) validOwned() bool {
 }
 
 func (stage *CandidateArtifactStageV1) validStage() bool {
-	if stage == nil || stage.closed || stage.receipt.Validate() != nil || stage.treeReceipt.Validate() != nil || !samePinnedDirectory(stage.parent, stage.parentInfo) || !samePinnedDirectory(stage.root, stage.stageInfo) {
+	if stage == nil || stage.closed || stage.receipt.Validate() != nil || stage.treeReceipt.Validate() != nil || !stage.parentPin.validAt(stage.parent) || !stage.stagePin.validAt(stage.root) {
 		return false
 	}
 	if !verifyArtifactRoot(stage.root, stage.receipt) {

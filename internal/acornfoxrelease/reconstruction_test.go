@@ -134,6 +134,7 @@ func reconstructSyntheticCandidate(t *testing.T, root string, toolchain Toolchai
 		t.Fatal(err)
 	}
 	plan, err := PrepareGoBuildPlanV1(context.Background(), witness, policy, toolchain, root, buildTaskRoot(t), localNPMCLIPath(t))
+	defer plan.Close()
 	if err != nil || !plan.Valid() {
 		t.Fatalf("plan=%#v err=%v", plan, err)
 	}

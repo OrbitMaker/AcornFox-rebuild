@@ -58,12 +58,12 @@ func (r GoBinaryReceiptV1) Validate() error {
 }
 
 type GoBinaryStageV1 struct {
-	root       string
-	parent     string
-	parentInfo os.FileInfo
-	stageInfo  os.FileInfo
-	receipt    GoBinaryReceiptV1
-	closed     bool
+	root      string
+	parent    string
+	parentPin *directoryPin
+	stagePin  *directoryPin
+	receipt   GoBinaryReceiptV1
+	closed    bool
 }
 
 func BuildGoBinariesV1(ctx context.Context, plan GoBuildPlanV1, taskRoot string) (*GoBinaryStageV1, error) {
@@ -74,16 +74,17 @@ func buildGoBinariesV1(ctx context.Context, plan GoBuildPlanV1, taskRoot string,
 	if ctx == nil || ctx.Err() != nil || !plan.Valid() || runner == nil || VerifySourceTree(plan.sourceRoot, plan.sourcePolicy) != nil {
 		return nil, ErrGoStage
 	}
-	taskRoot, parentInfo, err := pinStageParent(taskRoot)
+	taskRoot, parentPin, err := pinStageParent(taskRoot)
 	if err != nil {
 		return nil, ErrGoStage
 	}
 	stageRoot, err := os.MkdirTemp(taskRoot, ".acornfox-go-stage-")
 	if err != nil {
+		parentPin.close()
 		return nil, ErrGoStage
 	}
-	stageInfo, err := os.Lstat(stageRoot)
-	stage := &GoBinaryStageV1{root: stageRoot, parent: taskRoot, parentInfo: parentInfo, stageInfo: stageInfo}
+	stagePin, err := pinDirectory(stageRoot)
+	stage := &GoBinaryStageV1{root: stageRoot, parent: taskRoot, parentPin: parentPin, stagePin: stagePin}
 	if err != nil || os.Chmod(stageRoot, 0o700) != nil {
 		return nil, cleanupFailedStage(stage, ErrGoStage)
 	}
@@ -161,6 +162,7 @@ func (stage *GoBinaryStageV1) Close() error {
 	if stage == nil || stage.closed {
 		return nil
 	}
+	defer func() { stage.closed = true; stage.stagePin.close(); stage.parentPin.close() }()
 	if !stage.valid() {
 		return ErrGoStage
 	}
@@ -172,7 +174,7 @@ func (stage *GoBinaryStageV1) Close() error {
 }
 
 func (stage *GoBinaryStageV1) valid() bool {
-	if stage == nil || stage.closed || stage.receipt.Validate() != nil || !samePinnedDirectory(stage.parent, stage.parentInfo) || !samePinnedDirectory(stage.root, stage.stageInfo) {
+	if stage == nil || stage.closed || stage.receipt.Validate() != nil || !stage.parentPin.validAt(stage.parent) || !stage.stagePin.validAt(stage.root) {
 		return false
 	}
 	files, err := inspectReceiptTree(stage.root, stage.receipt)
@@ -183,25 +185,34 @@ func (stage *GoBinaryStageV1) valid() bool {
 }
 
 func cleanupFailedStage(stage *GoBinaryStageV1, err error) error {
-	if stage != nil && samePinnedDirectory(stage.parent, stage.parentInfo) && samePinnedDirectory(stage.root, stage.stageInfo) {
+	if stage != nil {
+		defer func() { stage.closed = true; stage.stagePin.close(); stage.parentPin.close() }()
+	}
+	if stage != nil && stage.parentPin.validAt(stage.parent) && stage.stagePin.validAt(stage.root) {
 		_ = os.RemoveAll(stage.root)
 	}
 	return ErrGoStage
 }
 
-func pinStageParent(root string) (string, os.FileInfo, error) {
+func pinStageParent(root string) (string, *directoryPin, error) {
 	root, err := cleanExistingDirectory(root)
 	if err != nil {
 		return "", nil, ErrGoStage
 	}
-	info, err := os.Lstat(root)
+	pin, err := pinDirectory(root)
+	if err != nil {
+		return "", nil, ErrGoStage
+	}
+	info, err := pin.file.Stat()
 	if err != nil || info.Mode().Perm() != 0o700 || linkCount(info) > 2 {
+		pin.close()
 		return "", nil, ErrGoStage
 	}
 	if stat, ok := info.Sys().(*syscall.Stat_t); !ok || int(stat.Uid) != os.Getuid() {
+		pin.close()
 		return "", nil, ErrGoStage
 	}
-	return root, info, nil
+	return root, pin, nil
 }
 
 func copyFrozenSource(sourceRoot, destination string, policy SourcePolicyV1) error {

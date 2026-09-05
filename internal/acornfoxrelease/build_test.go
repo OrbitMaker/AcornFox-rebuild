@@ -12,6 +12,7 @@ import (
 func TestBuildGoBinariesV1BuildsAndClosesSyntheticStage(t *testing.T) {
 	root, cacheRoot, witness, policy, toolchain := syntheticGoReleaseRepository(t)
 	plan, err := PrepareGoBuildPlanV1(context.Background(), witness, policy, toolchain, root, cacheRoot, localNPMCLIPath(t))
+	defer plan.Close()
 	if err != nil || !plan.Valid() {
 		t.Fatalf("plan=%#v err=%v", plan, err)
 	}
@@ -83,10 +84,12 @@ func TestBuildGoBinariesV1IsDeterministicAndFailsClosed(t *testing.T) {
 	firstRoot, firstCache, firstWitness, firstPolicy, firstToolchain := syntheticGoReleaseRepository(t)
 	secondRoot, secondCache, secondWitness, secondPolicy, secondToolchain := syntheticGoReleaseRepository(t)
 	firstPlan, err := PrepareGoBuildPlanV1(context.Background(), firstWitness, firstPolicy, firstToolchain, firstRoot, firstCache, localNPMCLIPath(t))
+	defer firstPlan.Close()
 	if err != nil {
 		t.Fatal(err)
 	}
 	secondPlan, err := PrepareGoBuildPlanV1(context.Background(), secondWitness, secondPolicy, secondToolchain, secondRoot, secondCache, localNPMCLIPath(t))
+	defer secondPlan.Close()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,6 +117,7 @@ func TestBuildGoBinariesV1IsDeterministicAndFailsClosed(t *testing.T) {
 
 	root, cacheRoot, witness, policy, toolchain := syntheticGoReleaseRepository(t)
 	plan, err := PrepareGoBuildPlanV1(context.Background(), witness, policy, toolchain, root, cacheRoot, localNPMCLIPath(t))
+	defer plan.Close()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,6 +134,7 @@ func TestBuildGoBinariesV1IsDeterministicAndFailsClosed(t *testing.T) {
 func TestBuildGoBinariesV1CleansFailureAndProtectsReplacement(t *testing.T) {
 	root, cacheRoot, witness, policy, toolchain := syntheticGoReleaseRepository(t)
 	plan, err := PrepareGoBuildPlanV1(context.Background(), witness, policy, toolchain, root, cacheRoot, localNPMCLIPath(t))
+	defer plan.Close()
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -56,7 +56,7 @@ func verifyGitSourceWithDependencies(ctx context.Context, root string, witness W
 	canonical, canonicalErr := CanonicalSourcePolicyV1(policy)
 	toolchainRaw, toolchainErr := CanonicalToolchainInputsV1(toolchain)
 	root, rootErr := cleanGitRoot(root)
-	if ctx == nil || ctx.Err() != nil || run == nil || lookup == nil || hash == nil || rootErr != nil || !witness.Valid() || canonicalErr != nil || toolchainErr != nil || sha256Text(canonical) != witness.decision.SourcePolicySHA256 || sha256Text(toolchainRaw) != witness.decision.ToolchainSHA256 || policy.ModulePath != modulePathForRepository(witness.decision.SourceRepository) {
+	if ctx == nil || ctx.Err() != nil || run == nil || lookup == nil || hash == nil || rootErr != nil || !witness.Valid() || canonicalErr != nil || toolchainErr != nil || sha256Text(canonical) != witness.decision.SourcePolicySHA256 || sha256Text(toolchainRaw) != witness.decision.ToolchainSHA256 {
 		return ErrGitSource
 	}
 	git, err := bindExecutable("git", toolchain.GitBinarySHA256, run, lookup, hash)

@@ -18,6 +18,7 @@ func TestPrepareGoBuildPlanV1SealsRealDetachedRepository(t *testing.T) {
 		t.Fatalf("precondition git verification: %v", err)
 	}
 	plan, err := PrepareGoBuildPlanV1(context.Background(), witness, policy, toolchain, root, cacheRoot, localNPMCLIPath(t))
+	defer plan.Close()
 	if err != nil || !plan.Valid() {
 		t.Fatalf("plan=%#v err=%v", plan, err)
 	}
@@ -34,12 +35,12 @@ func TestPrepareGoBuildPlanV1SealsRealDetachedRepository(t *testing.T) {
 		if target.Output != "bin/"+target.Name || len(target.Ldflags) == 0 || target.Ldflags[0] != "-buildid=" {
 			t.Fatalf("unsealed target: %#v", target)
 		}
-		if target.Name == "acornfox-server" || target.Name == "acornfox-agent" || target.Name == "acornfox-upgrade" || target.Name == "acornfox-healthcheck" {
+		if target.Name == "acornfox-server" || target.Name == "acornfox-agent" || target.Name == "acornfox-upgrade" || target.Name == "acornfox-healthcheck" || target.Name == "acornfox-admin" {
 			if !containsString(target.Ldflags, "-X=main.processIdentity=acornfox") {
 				t.Fatalf("missing process identity: %#v", target)
 			}
 		}
-		if target.Name == "acornfox-upgrade" || target.Name == "acornfox-healthcheck" {
+		if target.Name == "acornfox-upgrade" || target.Name == "acornfox-healthcheck" || target.Name == "acornfox-admin" {
 			if !containsString(target.Ldflags, "-X=main.buildVersion="+witness.decision.Version) || !containsString(target.Ldflags, "-X=main.buildSourceCommit="+witness.decision.SourceCommit) || !containsString(target.Ldflags, "-X=main.buildLayoutSchema=1") {
 				t.Fatalf("missing recovery build binding: %#v", target)
 			}
@@ -102,6 +103,7 @@ func TestPrepareGoBuildPlanV1UsesOnlySealedGoList(t *testing.T) {
 		}
 	}
 	plan, err := prepareGoBuildPlanV1(context.Background(), witness, policy, toolchain, root, cacheRoot, localNPMCLIPath(t), runner)
+	defer plan.Close()
 	if err != nil || !plan.Valid() || len(calls) != 6 {
 		if verifyErr := VerifyGitSourceV1(context.Background(), root, witness, policy, toolchain); verifyErr != nil {
 			t.Fatalf("postcondition git verification: %v", verifyErr)
@@ -224,6 +226,7 @@ func TestSealedGoEnvironmentRequiresCallerCreatedCacheRoot(t *testing.T) {
 func TestSealedGoEnvironmentRejectsCacheChildReplacement(t *testing.T) {
 	root, cacheRoot, _, _, _ := syntheticGoReleaseRepository(t)
 	_, cache, _, err := sealedGoEnvironment(root, cacheRoot)
+	defer cache.close()
 	if err != nil || !cache.valid() {
 		t.Fatalf("cache=%#v err=%v", cache, err)
 	}
@@ -266,7 +269,8 @@ func TestVerifyGoListClosureRejectsUnsafeObservations(t *testing.T) {
 
 func TestVerifyGoListClosureRequiresExistingCachedThirdPartyModule(t *testing.T) {
 	root, cacheRoot, _, policy, _ := syntheticGoReleaseRepository(t)
-	modCache, _, err := pinnedCacheChild(cacheRoot, "go-mod-cache")
+	modCache, modPin, err := pinnedCacheChild(cacheRoot, "go-mod-cache")
+	defer modPin.close()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -290,7 +294,9 @@ func TestVerifyGoListClosureRequiresExistingCachedThirdPartyModule(t *testing.T)
 	if err := os.MkdirAll(packageDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := pinnedCacheChild(cacheRoot, "go-cache"); err != nil {
+	_, goPin, err := pinnedCacheChild(cacheRoot, "go-cache")
+	defer goPin.close()
+	if err != nil {
 		t.Fatal(err)
 	}
 	if verifyGoListClosure(raw, policy, root, filepath.Join(cacheRoot, "go-cache")) {

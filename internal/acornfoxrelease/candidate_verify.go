@@ -13,8 +13,9 @@ import (
 )
 
 const syntheticCandidateInternallyVerified = "SYNTHETIC_CANDIDATE_INTERNALLY_VERIFIED"
+const releaseCandidateInternallyVerified = "RELEASE_CANDIDATE_INTERNALLY_VERIFIED"
 
-var ErrVerifiedCandidate = errors.New("acornfox synthetic candidate verification is invalid")
+var ErrVerifiedCandidate = errors.New("acornfox candidate verification is invalid")
 
 // VerifiedCandidateReceiptV1 records only the local verification result. It is
 // deliberately not a publication, installation, or production-acceptance
@@ -31,7 +32,7 @@ type VerifiedCandidateReceiptV1 struct {
 }
 
 func (r VerifiedCandidateReceiptV1) Validate() error {
-	if r.SchemaVersion != 1 || r.State != syntheticCandidateInternallyVerified || !r.Synthetic || !r.InstallerVerified || r.ProductionAccepted || r.PublicReleased || r.Artifact.Validate() != nil || !digestText.MatchString(r.VerificationSHA256) {
+	if r.SchemaVersion != 1 || r.State != candidateVerifiedState(r.Synthetic) || r.Synthetic != r.Artifact.Synthetic || !r.InstallerVerified || r.ProductionAccepted || r.PublicReleased || r.Artifact.Validate() != nil || !digestText.MatchString(r.VerificationSHA256) {
 		return ErrVerifiedCandidate
 	}
 	if r.VerificationSHA256 != candidateVerificationDigest(r.Artifact) {
@@ -47,8 +48,15 @@ func candidateVerificationDigest(artifact CandidateArtifactReceiptV1) string {
 	}
 	hash := sha256.New()
 	_, _ = hash.Write(raw)
-	_, _ = hash.Write([]byte("\n" + syntheticCandidateInternallyVerified))
+	_, _ = hash.Write([]byte("\n" + candidateVerifiedState(artifact.Synthetic)))
 	return hex.EncodeToString(hash.Sum(nil))
+}
+
+func candidateVerifiedState(synthetic bool) string {
+	if synthetic {
+		return syntheticCandidateInternallyVerified
+	}
+	return releaseCandidateInternallyVerified
 }
 
 // VerifiedCandidateStageV1 owns a successfully re-verified private stage.
@@ -63,6 +71,22 @@ type VerifiedCandidateStageV1 struct {
 // descriptor-pinned bytes. On success it transfers the one cleanup right from
 // stage to the returned wrapper; on failure stage remains valid and caller-owned.
 func VerifySyntheticCandidateV1(stage *CandidateArtifactStageV1) (*VerifiedCandidateStageV1, error) {
+	if stage == nil || !stage.receipt.Synthetic {
+		return nil, ErrVerifiedCandidate
+	}
+	return verifyCandidateV1(stage)
+}
+
+// VerifyReleaseCandidateV1 checks a real candidate with the same installer
+// verifier. It does not grant host acceptance or publish anything.
+func VerifyReleaseCandidateV1(stage *CandidateArtifactStageV1) (*VerifiedCandidateStageV1, error) {
+	if stage == nil || stage.receipt.Synthetic {
+		return nil, ErrVerifiedCandidate
+	}
+	return verifyCandidateV1(stage)
+}
+
+func verifyCandidateV1(stage *CandidateArtifactStageV1) (*VerifiedCandidateStageV1, error) {
 	if stage == nil || !stage.validOwned() {
 		return nil, ErrVerifiedCandidate
 	}
@@ -99,7 +123,7 @@ func VerifySyntheticCandidateV1(stage *CandidateArtifactStageV1) (*VerifiedCandi
 	if !stage.validOwned() {
 		return nil, ErrVerifiedCandidate
 	}
-	receipt := VerifiedCandidateReceiptV1{SchemaVersion: 1, State: syntheticCandidateInternallyVerified, Synthetic: true, InstallerVerified: true, ProductionAccepted: false, PublicReleased: false, Artifact: cloneArtifactReceipt(stage.receipt)}
+	receipt := VerifiedCandidateReceiptV1{SchemaVersion: 1, State: candidateVerifiedState(stage.receipt.Synthetic), Synthetic: stage.receipt.Synthetic, InstallerVerified: true, ProductionAccepted: false, PublicReleased: false, Artifact: cloneArtifactReceipt(stage.receipt)}
 	receipt.VerificationSHA256 = candidateVerificationDigest(receipt.Artifact)
 	if receipt.Validate() != nil {
 		return nil, ErrVerifiedCandidate
@@ -156,6 +180,14 @@ func (stage *VerifiedCandidateStageV1) Close() error {
 	if stage == nil || stage.closed {
 		return nil
 	}
+	defer func() {
+		stage.closed = true
+		if stage.stage != nil {
+			stage.stage.closed = true
+			stage.stage.stagePin.close()
+			stage.stage.parentPin.close()
+		}
+	}()
 	if stage.stage == nil || !stage.stage.transferred || !stage.stage.validStage() || stage.receipt.Validate() != nil || !sameArtifactReceipt(stage.receipt.Artifact, stage.stage.receipt) {
 		return ErrVerifiedCandidate
 	}
@@ -168,7 +200,7 @@ func (stage *VerifiedCandidateStageV1) Close() error {
 }
 
 func sameArtifactReceipt(left, right CandidateArtifactReceiptV1) bool {
-	if left.SchemaVersion != right.SchemaVersion || left.Product != right.Product || left.Version != right.Version || left.ReleaseID != right.ReleaseID || left.SourceRepository != right.SourceRepository || left.SourceCommit != right.SourceCommit || left.Architecture != right.Architecture || left.MigrationVersion != right.MigrationVersion || left.DecisionSHA256 != right.DecisionSHA256 || left.SourcePolicySHA256 != right.SourcePolicySHA256 || left.ToolchainSHA256 != right.ToolchainSHA256 || left.RuntimeInputSHA256 != right.RuntimeInputSHA256 || left.LicenseInputSHA256 != right.LicenseInputSHA256 || left.TreeSHA256 != right.TreeSHA256 || left.ManifestSHA256 != right.ManifestSHA256 || left.ArchiveSHA256 != right.ArchiveSHA256 || left.BundleSHA256 != right.BundleSHA256 || left.BindingSHA256 != right.BindingSHA256 || left.BuildRecordSHA256 != right.BuildRecordSHA256 {
+	if left.SchemaVersion != right.SchemaVersion || left.Synthetic != right.Synthetic || left.Product != right.Product || left.Version != right.Version || left.ReleaseID != right.ReleaseID || left.SourceRepository != right.SourceRepository || left.SourceCommit != right.SourceCommit || left.Architecture != right.Architecture || left.MigrationVersion != right.MigrationVersion || left.DecisionSHA256 != right.DecisionSHA256 || left.SourcePolicySHA256 != right.SourcePolicySHA256 || left.ToolchainSHA256 != right.ToolchainSHA256 || left.RuntimeInputSHA256 != right.RuntimeInputSHA256 || left.LicenseInputSHA256 != right.LicenseInputSHA256 || left.TreeSHA256 != right.TreeSHA256 || left.ManifestSHA256 != right.ManifestSHA256 || left.ArchiveSHA256 != right.ArchiveSHA256 || left.BundleSHA256 != right.BundleSHA256 || left.BindingSHA256 != right.BindingSHA256 || left.BuildRecordSHA256 != right.BuildRecordSHA256 {
 		return false
 	}
 	return sameFileEntries(left.Files, right.Files)

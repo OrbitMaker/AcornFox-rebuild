@@ -23,6 +23,7 @@ var ErrCandidateTree = errors.New("acornfox synthetic candidate tree is invalid"
 
 type CandidateTreeReceiptV1 struct {
 	SchemaVersion      int                  `json:"schema_version"`
+	Synthetic          bool                 `json:"synthetic"`
 	Product            string               `json:"product"`
 	Architecture       string               `json:"architecture"`
 	Version            string               `json:"version"`
@@ -70,30 +71,46 @@ func validateCandidateDigests(files []install.FileDigest) error {
 }
 
 type CandidateTreeStageV1 struct {
-	root, parent          string
-	parentInfo, stageInfo os.FileInfo
-	receipt               CandidateTreeReceiptV1
-	closed                bool
+	root, parent        string
+	parentPin, stagePin *directoryPin
+	receipt             CandidateTreeReceiptV1
+	closed              bool
 }
 
 // BuildCandidateTreeV1 only produces a private synthetic tree for later
 // packaging tests. It does not write an archive, binding, candidate, or host.
 func BuildCandidateTreeV1(plan GoBuildPlanV1, goStage *GoBinaryStageV1, webStage *WebAssetStageV1, runtimeRoot string, runtime RuntimeInputsV1, licenseRoot string, license LicenseInputsV1, taskRoot string) (*CandidateTreeStageV1, error) {
+	return buildCandidateTreeV1(plan, goStage, webStage, runtimeRoot, runtime, licenseRoot, license, taskRoot, nil)
+}
+
+// BuildReleaseCandidateTreeV1 requires explicit project and dependency license
+// material. Its output remains unapproved for installation or publication.
+func BuildReleaseCandidateTreeV1(plan GoBuildPlanV1, goStage *GoBinaryStageV1, webStage *WebAssetStageV1, runtimeRoot string, runtime RuntimeInputsV1, licenseRoot string, license LicenseInputsV1, taskRoot string) (*CandidateTreeStageV1, error) {
+	metadata, err := readReleaseLicenseManifest(licenseRoot, license)
+	if err != nil {
+		return nil, err
+	}
+	return buildCandidateTreeV1(plan, goStage, webStage, runtimeRoot, runtime, licenseRoot, license, taskRoot, &metadata)
+}
+
+func buildCandidateTreeV1(plan GoBuildPlanV1, goStage *GoBinaryStageV1, webStage *WebAssetStageV1, runtimeRoot string, runtime RuntimeInputsV1, licenseRoot string, license LicenseInputsV1, taskRoot string, metadata *ReleaseLicenseManifestV1) (*CandidateTreeStageV1, error) {
 	if !plan.Valid() || goStage == nil || webStage == nil || VerifyRuntimeTree(runtimeRoot, runtime) != nil || VerifyLicenseTree(licenseRoot, license) != nil || inputDigest(runtime, CanonicalRuntimeInputsV1) != plan.runtimeInputSHA256 || inputDigest(license, CanonicalLicenseInputsV1) != plan.licenseInputSHA256 {
 		return nil, ErrCandidateTree
 	}
-	parent, parentInfo, err := pinCandidateParent(taskRoot)
+	parent, parentPin, err := pinCandidateParent(taskRoot)
 	if err != nil {
 		return nil, ErrCandidateTree
 	}
 	stageRoot, err := os.MkdirTemp(parent, ".acornfox-candidate-tree-")
 	if err != nil {
+		parentPin.close()
 		return nil, ErrCandidateTree
 	}
-	stageInfo, err := os.Lstat(stageRoot)
-	stage := &CandidateTreeStageV1{root: stageRoot, parent: parent, parentInfo: parentInfo, stageInfo: stageInfo}
+	stagePin, err := pinDirectory(stageRoot)
+	stage := &CandidateTreeStageV1{root: stageRoot, parent: parent, parentPin: parentPin, stagePin: stagePin}
 	fail := func() (*CandidateTreeStageV1, error) {
-		if samePinnedDirectory(stage.parent, stage.parentInfo) && samePinnedDirectory(stage.root, stage.stageInfo) {
+		defer func() { stage.closed = true; stage.stagePin.close(); stage.parentPin.close() }()
+		if stage.parentPin.validAt(stage.parent) && stage.stagePin.validAt(stage.root) {
 			_ = os.RemoveAll(stage.root)
 		}
 		return nil, ErrCandidateTree
@@ -151,7 +168,7 @@ func BuildCandidateTreeV1(plan GoBuildPlanV1, goStage *GoBinaryStageV1, webStage
 	if err := addGenerated(target, "source-manifest.sha256", 0o644, sourceManifest(plan.sourcePolicy), &entries, added); err != nil {
 		return failWith("source manifest")
 	}
-	sbom, err := syntheticSPDX(plan, release, entries)
+	sbom, err := candidateSPDX(plan, release, entries, metadata)
 	if err != nil || addGenerated(target, "sbom.spdx.json", 0o644, sbom, &entries, added) != nil {
 		return failWith("SPDX")
 	}
@@ -168,7 +185,7 @@ func BuildCandidateTreeV1(plan GoBuildPlanV1, goStage *GoBinaryStageV1, webStage
 	if err != nil {
 		return failWith("tree receipt")
 	}
-	stage.receipt = CandidateTreeReceiptV1{SchemaVersion: 1, Product: Product, Architecture: Architecture, Version: plan.releaseVersion, ReleaseID: "release-" + plan.releaseVersion, SourceRepository: plan.sourceRepositoryURL, SourceCommit: plan.sourceCommit, DecisionSHA256: plan.decisionSHA256, SourcePolicySHA256: plan.sourcePolicySHA256, ToolchainSHA256: plan.toolchainSHA256, RuntimeInputSHA256: plan.runtimeInputSHA256, LicenseInputSHA256: plan.licenseInputSHA256, TreeSHA256: sha256Text(tree), Files: append([]install.FileDigest(nil), entries...)}
+	stage.receipt = CandidateTreeReceiptV1{SchemaVersion: 1, Synthetic: metadata == nil, Product: Product, Architecture: Architecture, Version: plan.releaseVersion, ReleaseID: "release-" + plan.releaseVersion, SourceRepository: plan.sourceRepositoryURL, SourceCommit: plan.sourceCommit, DecisionSHA256: plan.decisionSHA256, SourcePolicySHA256: plan.sourcePolicySHA256, ToolchainSHA256: plan.toolchainSHA256, RuntimeInputSHA256: plan.runtimeInputSHA256, LicenseInputSHA256: plan.licenseInputSHA256, TreeSHA256: sha256Text(tree), Files: append([]install.FileDigest(nil), entries...)}
 	if stage.receipt.Validate() != nil || !stage.valid() {
 		return failWith("stage receipt")
 	}
@@ -183,13 +200,14 @@ func inputDigest[T any](value T, canonical func(T) ([]byte, error)) string {
 	return sha256Text(raw)
 }
 
-func pinCandidateParent(path string) (string, os.FileInfo, error) {
+func pinCandidateParent(path string) (string, *directoryPin, error) {
 	path, info, err := pinStageParent(path)
 	if err != nil {
 		return "", nil, ErrCandidateTree
 	}
 	entries, err := os.ReadDir(path)
 	if err != nil || len(entries) != 0 {
+		info.close()
 		return "", nil, ErrCandidateTree
 	}
 	return path, info, nil
@@ -414,7 +432,7 @@ func sourceManifest(policy SourcePolicyV1) []byte {
 	return out.Bytes()
 }
 
-func syntheticSPDX(plan GoBuildPlanV1, root string, files []install.FileDigest) ([]byte, error) {
+func candidateSPDX(plan GoBuildPlanV1, root string, files []install.FileDigest, metadata *ReleaseLicenseManifestV1) ([]byte, error) {
 	checksums, err := spdxPayloadChecksums(root, files)
 	if err != nil {
 		return nil, ErrCandidateTree
@@ -435,18 +453,24 @@ func syntheticSPDX(plan GoBuildPlanV1, root string, files []install.FileDigest) 
 		RelationshipType   string `json:"relationshipType"`
 		RelatedSpdxElement string `json:"relatedSpdxElement"`
 	}
+	type verificationCode struct {
+		Value         string   `json:"packageVerificationCodeValue"`
+		ExcludedFiles []string `json:"packageVerificationCodeExcludedFiles"`
+	}
 	type pkg struct {
-		SPDXID                  string `json:"SPDXID"`
-		Name                    string `json:"name"`
-		DownloadLocation        string `json:"downloadLocation"`
-		FilesAnalyzed           bool   `json:"filesAnalyzed"`
-		LicenseConcluded        string `json:"licenseConcluded"`
-		LicenseDeclared         string `json:"licenseDeclared"`
-		CopyrightText           string `json:"copyrightText"`
-		PackageVerificationCode struct {
-			Value         string   `json:"packageVerificationCodeValue"`
-			ExcludedFiles []string `json:"packageVerificationCodeExcludedFiles"`
-		} `json:"packageVerificationCode"`
+		SPDXID                  string            `json:"SPDXID"`
+		Name                    string            `json:"name"`
+		VersionInfo             string            `json:"versionInfo,omitempty"`
+		DownloadLocation        string            `json:"downloadLocation"`
+		FilesAnalyzed           bool              `json:"filesAnalyzed"`
+		LicenseConcluded        string            `json:"licenseConcluded"`
+		LicenseDeclared         string            `json:"licenseDeclared"`
+		CopyrightText           string            `json:"copyrightText"`
+		PackageVerificationCode *verificationCode `json:"packageVerificationCode,omitempty"`
+	}
+	type extractedLicense struct {
+		LicenseID     string `json:"licenseId"`
+		ExtractedText string `json:"extractedText"`
 	}
 	document := struct {
 		SPDXVersion       string `json:"spdxVersion"`
@@ -459,14 +483,29 @@ func syntheticSPDX(plan GoBuildPlanV1, root string, files []install.FileDigest) 
 			Created  string   `json:"created"`
 			Creators []string `json:"creators"`
 		} `json:"creationInfo"`
-		DocumentDescribes []string       `json:"documentDescribes"`
-		Packages          []pkg          `json:"packages"`
-		Files             []file         `json:"files"`
-		Relationships     []relationship `json:"relationships"`
+		DocumentDescribes []string           `json:"documentDescribes"`
+		Packages          []pkg              `json:"packages"`
+		Files             []file             `json:"files"`
+		Relationships     []relationship     `json:"relationships"`
+		ExtractedLicenses []extractedLicense `json:"hasExtractedLicensingInfos,omitempty"`
 	}{SPDXVersion: "SPDX-2.3", DataLicense: "CC0-1.0", SPDXID: "SPDXRef-DOCUMENT", Name: "AcornFox synthetic release tree", DocumentNamespace: "https://acornfox.invalid/spdx/" + plan.decisionSHA256, Comment: "Synthetic release-tree evidence only; legal and dependency completeness are deferred to RELEASE-12B."}
 	document.CreationInfo.Created, document.CreationInfo.Creators = "1970-01-01T00:00:00Z", []string{"Tool: AcornFox synthetic release tree"}
 	document.DocumentDescribes = []string{"SPDXRef-Package-AcornFox"}
-	rootPackage := pkg{SPDXID: "SPDXRef-Package-AcornFox", Name: "AcornFox", DownloadLocation: "NOASSERTION", FilesAnalyzed: true, LicenseConcluded: "NOASSERTION", LicenseDeclared: "NOASSERTION", CopyrightText: "NOASSERTION"}
+	rootPackage := pkg{SPDXID: "SPDXRef-Package-AcornFox", Name: "AcornFox", DownloadLocation: "NOASSERTION", FilesAnalyzed: true, LicenseConcluded: "NOASSERTION", LicenseDeclared: "NOASSERTION", CopyrightText: "NOASSERTION", PackageVerificationCode: &verificationCode{}}
+	if metadata != nil {
+		if metadata.Validate() != nil {
+			return nil, ErrCandidateTree
+		}
+		document.Name = "AcornFox " + plan.releaseVersion + " release candidate"
+		document.DocumentNamespace = plan.sourceRepositoryURL + "/spdx/" + plan.decisionSHA256
+		document.Comment = "Reproducible candidate payload. License declarations and timestamp come from frozen inputs; file-level license conclusions and host/public acceptance are not asserted."
+		document.CreationInfo.Created = metadata.Created
+		document.CreationInfo.Creators = []string{"Tool: AcornFox release builder"}
+		rootPackage.VersionInfo = plan.releaseVersion
+		rootPackage.DownloadLocation = plan.sourceRepositoryURL + "/archive/" + plan.sourceCommit + ".tar.gz"
+		rootPackage.LicenseDeclared = metadata.License
+		rootPackage.CopyrightText = metadata.Copyright
+	}
 	sha1Values := make([]string, 0, len(checksums))
 	for _, entry := range checksums {
 		sha1Values = append(sha1Values, entry.SHA1)
@@ -476,6 +515,22 @@ func syntheticSPDX(plan GoBuildPlanV1, root string, files []install.FileDigest) 
 	rootPackage.PackageVerificationCode.Value = hex.EncodeToString(verification[:])
 	rootPackage.PackageVerificationCode.ExcludedFiles = []string{"./sbom.spdx.json"}
 	document.Packages = append(document.Packages, rootPackage)
+	if metadata != nil {
+		extracted := map[string]string{}
+		for i, entry := range metadata.Components {
+			if strings.HasPrefix(entry.License, "LicenseRef-") {
+				if previous, exists := extracted[entry.License]; exists && previous != entry.Notice {
+					return nil, ErrCandidateTree
+				} else if !exists {
+					document.ExtractedLicenses = append(document.ExtractedLicenses, extractedLicense{LicenseID: entry.License, ExtractedText: entry.Notice})
+					extracted[entry.License] = entry.Notice
+				}
+			}
+			id := "SPDXRef-Dependency-" + fmtSPDXIndex(i+1)
+			document.Packages = append(document.Packages, pkg{SPDXID: id, Name: entry.Name, VersionInfo: entry.Version, DownloadLocation: entry.Source, FilesAnalyzed: false, LicenseConcluded: "NOASSERTION", LicenseDeclared: entry.License, CopyrightText: "NOASSERTION"})
+			document.Relationships = append(document.Relationships, relationship{SpdxElementID: rootPackage.SPDXID, RelationshipType: "DEPENDS_ON", RelatedSpdxElement: id})
+		}
+	}
 	for index, entry := range checksums {
 		id := "SPDXRef-File-" + fmtSPDXIndex(index+1)
 		document.Files = append(document.Files, file{SPDXID: id, FileName: "./" + entry.Path, Checksums: []checksum{{Algorithm: "SHA1", ChecksumValue: entry.SHA1}, {Algorithm: "SHA256", ChecksumValue: entry.SHA256}}, LicenseConcluded: "NOASSERTION", CopyrightText: "NOASSERTION"})
@@ -620,6 +675,7 @@ func (stage *CandidateTreeStageV1) Close() error {
 	if stage == nil || stage.closed {
 		return nil
 	}
+	defer func() { stage.closed = true; stage.stagePin.close(); stage.parentPin.close() }()
 	if !stage.valid() {
 		return ErrCandidateTree
 	}
@@ -630,7 +686,7 @@ func (stage *CandidateTreeStageV1) Close() error {
 	return nil
 }
 func (stage *CandidateTreeStageV1) valid() bool {
-	if stage == nil || stage.closed || stage.receipt.Validate() != nil || !samePinnedDirectory(stage.parent, stage.parentInfo) || !samePinnedDirectory(stage.root, stage.stageInfo) {
+	if stage == nil || stage.closed || stage.receipt.Validate() != nil || !stage.parentPin.validAt(stage.parent) || !stage.stagePin.validAt(stage.root) {
 		return false
 	}
 	return verifyCandidateTree(filepath.Join(stage.root, "release"), stage.receipt.Files) == nil

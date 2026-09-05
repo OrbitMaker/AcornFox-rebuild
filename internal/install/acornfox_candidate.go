@@ -42,7 +42,7 @@ var (
 		"bin/acornfox-server", "bin/acornfox-agent", "bin/acornfox-static-server",
 		"bin/acornfox-secretctl", "bin/acornfox-security-probe", "bin/acornfox-imagegc",
 		"bin/acornfox", "bin/acornfox-admin", "bin/acornfox-upgrade", "bin/acornfox-healthcheck",
-		"bin/buildkitd", "bin/buildctl", "bin/buildkit-runc", "bin/rootlesskit", "bin/docker-buildx", "bin/caddy",
+		"bin/buildkitd", "bin/buildctl", "bin/buildkit-runc", "bin/rootlesskit", "bin/caddy",
 	}
 	acornFoxV1Units = []string{
 		"systemd/acornfox-build-network.service",
@@ -69,7 +69,7 @@ var (
 		"0031_acornfox_public_access.sql", "0032_dns_change_execution.sql", "0033_acornfox_discovery_task_lookup.sql",
 		"0034_artifacts_per_build.sql",
 	}
-	acornFoxV1WebAssetName = regexp.MustCompile(`^[A-Za-z0-9_.-]+-[A-Za-z0-9_-]{8,}\.(?:css|js|map|png|jpe?g|svg|gif|webp|ico|woff2?|ttf)$`)
+	acornFoxV1WebAssetName = regexp.MustCompile(`^[A-Za-z0-9_.-]+-[A-Za-z0-9_-]{8,}\.(?:(?:css|js)(?:\.map)?|map|png|jpe?g|svg|gif|webp|ico|woff2?|ttf)$`)
 	acornFoxGitHubPath     = regexp.MustCompile(`^/[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$`)
 )
 
@@ -108,6 +108,7 @@ func AcornFoxV1RequiredFiles() []AcornFoxV1PackageFile {
 		AcornFoxV1PackageFile{"docs/licenses/licenses-manifest.json", 0o644},
 		AcornFoxV1PackageFile{"docs/licenses/README.md", 0o644},
 		AcornFoxV1PackageFile{"docs/licenses/THIRD_PARTY_NOTICES.md", 0o644},
+		AcornFoxV1PackageFile{"docs/licenses/AGPL-3.0-only.txt", 0o644},
 		AcornFoxV1PackageFile{"sbom.spdx.json", 0o644},
 		AcornFoxV1PackageFile{"source-manifest.sha256", 0o644},
 	)

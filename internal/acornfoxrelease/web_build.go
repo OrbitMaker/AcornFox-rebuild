@@ -57,18 +57,18 @@ func validateWebEntries(entries []FileEntryV1) error {
 }
 
 type WebAssetStageV1 struct {
-	root, parent          string
-	parentInfo, stageInfo os.FileInfo
-	receipt               WebBuildReceiptV1
-	dist                  string
-	plan                  GoBuildPlanV1
-	npmCache              pinnedNPMCache
-	closed                bool
+	root, parent        string
+	parentPin, stagePin *directoryPin
+	receipt             WebBuildReceiptV1
+	dist                string
+	plan                GoBuildPlanV1
+	npmCache            pinnedNPMCache
+	closed              bool
 }
 
 type pinnedNPMCache struct {
 	path string
-	info os.FileInfo
+	pin  *directoryPin
 }
 
 func pinNPMCache(path string) (pinnedNPMCache, error) {
@@ -87,28 +87,35 @@ func pinNPMCache(path string) (pinnedNPMCache, error) {
 	if err != nil {
 		return pinnedNPMCache{}, ErrWebStage
 	}
-	defer root.Close()
 	opened, err := root.Stat(".")
 	if err != nil || opened.Mode().Perm() != 0o700 || !os.SameFile(info, opened) {
+		_ = root.Close()
 		return pinnedNPMCache{}, ErrWebStage
 	}
-	return pinnedNPMCache{path: path, info: opened}, nil
+	file, err := root.OpenFile(".", os.O_RDONLY, 0)
+	_ = root.Close()
+	if err != nil {
+		return pinnedNPMCache{}, ErrWebStage
+	}
+	pin := &directoryPin{path: path, file: file}
+	if !pin.validAt(path) {
+		pin.close()
+		return pinnedNPMCache{}, ErrWebStage
+	}
+	return pinnedNPMCache{path: path, pin: pin}, nil
 }
 func (cache pinnedNPMCache) valid() bool {
-	info, err := os.Lstat(cache.path)
-	if err != nil || !info.IsDir() || info.Mode().Perm() != 0o700 || info.Mode()&os.ModeSymlink != 0 || !os.SameFile(info, cache.info) {
+	if !cache.pin.validAt(cache.path) {
+		return false
+	}
+	info, err := cache.pin.file.Stat()
+	if err != nil || !info.IsDir() || info.Mode().Perm() != 0o700 {
 		return false
 	}
 	if stat, ok := info.Sys().(*syscall.Stat_t); !ok || int(stat.Uid) != os.Getuid() {
 		return false
 	}
-	root, err := os.OpenRoot(cache.path)
-	if err != nil {
-		return false
-	}
-	defer root.Close()
-	opened, err := root.Stat(".")
-	return err == nil && opened.IsDir() && opened.Mode().Perm() == 0o700 && os.SameFile(cache.info, opened)
+	return true
 }
 
 func BuildWebAssetsV1(ctx context.Context, plan GoBuildPlanV1, taskRoot, npmCacheRoot string) (*WebAssetStageV1, error) {
@@ -119,22 +126,32 @@ func buildWebAssetsV1(ctx context.Context, plan GoBuildPlanV1, taskRoot, npmCach
 	if ctx == nil || ctx.Err() != nil || !plan.Valid() || runner == nil || VerifySourceTree(plan.sourceRoot, plan.sourcePolicy) != nil {
 		return nil, ErrWebStage
 	}
-	taskRoot, parentInfo, err := pinStageParent(taskRoot)
+	taskRoot, parentPin, err := pinStageParent(taskRoot)
 	if err != nil {
 		return nil, ErrWebStage
 	}
 	npmCache, err := pinNPMCache(npmCacheRoot)
 	if err != nil || npmCache.path == taskRoot || pathWithin(taskRoot, npmCache.path) || pathWithin(npmCache.path, taskRoot) {
+		parentPin.close()
+		npmCache.pin.close()
 		return nil, ErrWebStage
 	}
 	stageRoot, err := os.MkdirTemp(taskRoot, ".acornfox-web-stage-")
 	if err != nil {
+		parentPin.close()
+		npmCache.pin.close()
 		return nil, ErrWebStage
 	}
-	stageInfo, err := os.Lstat(stageRoot)
-	stage := &WebAssetStageV1{root: stageRoot, parent: taskRoot, parentInfo: parentInfo, stageInfo: stageInfo}
+	stagePin, err := pinDirectory(stageRoot)
+	stage := &WebAssetStageV1{root: stageRoot, parent: taskRoot, parentPin: parentPin, stagePin: stagePin, npmCache: npmCache}
 	fail := func() (*WebAssetStageV1, error) {
-		if samePinnedDirectory(stage.parent, stage.parentInfo) && samePinnedDirectory(stage.root, stage.stageInfo) {
+		defer func() {
+			stage.closed = true
+			stage.stagePin.close()
+			stage.parentPin.close()
+			stage.npmCache.pin.close()
+		}()
+		if stage.parentPin.validAt(stage.parent) && stage.stagePin.validAt(stage.root) {
 			_ = os.RemoveAll(stage.root)
 		}
 		return nil, ErrWebStage
@@ -219,7 +236,7 @@ func buildWebAssetsV1(ctx context.Context, plan GoBuildPlanV1, taskRoot, npmCach
 }
 
 func (stage *WebAssetStageV1) Receipt() (WebBuildReceiptV1, error) {
-	if stage == nil || stage.closed || stage.receipt.Validate() != nil || !samePinnedDirectory(stage.parent, stage.parentInfo) || !samePinnedDirectory(stage.root, stage.stageInfo) || !stage.npmCache.valid() {
+	if stage == nil || stage.closed || stage.receipt.Validate() != nil || !stage.parentPin.validAt(stage.parent) || !stage.stagePin.validAt(stage.root) || !stage.npmCache.valid() {
 		return WebBuildReceiptV1{}, ErrWebStage
 	}
 	files, err := inspectWebDist(stage.dist, stage.plan)
@@ -234,7 +251,13 @@ func (stage *WebAssetStageV1) Close() error {
 	if stage == nil || stage.closed {
 		return nil
 	}
-	if !samePinnedDirectory(stage.parent, stage.parentInfo) || !samePinnedDirectory(stage.root, stage.stageInfo) {
+	defer func() {
+		stage.closed = true
+		stage.stagePin.close()
+		stage.parentPin.close()
+		stage.npmCache.pin.close()
+	}()
+	if !stage.parentPin.validAt(stage.parent) || !stage.stagePin.validAt(stage.root) {
 		return ErrWebStage
 	}
 	if err := os.RemoveAll(stage.root); err != nil {

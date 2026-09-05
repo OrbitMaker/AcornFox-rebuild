@@ -186,6 +186,15 @@ func safeAcornFoxCandidateSetFile(info os.FileInfo, limit int64) bool {
 	return info != nil && info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0 && info.Mode().Perm() == 0o644 && acornFoxRepoNlink(info) == 1 && info.Size() >= 0 && info.Size() <= limit
 }
 
+// ValidateAcornFoxCandidateSetLayoutV1 exposes the installer's read-only flat
+// six-file layout check. VerifyAcornFoxCandidateArtifactsV1 checks the contents.
+func ValidateAcornFoxCandidateSetLayoutV1(root *os.Root, version string) error {
+	if ParseVersion(version) != nil {
+		return errors.New("candidate version is invalid")
+	}
+	return validateAcornFoxCandidateSetNames(root, acornFoxCandidateArchiveName(version))
+}
+
 func readAcornFoxCandidateSetFile(root *os.Root, name string, limit int64) ([]byte, error) {
 	if root == nil || name == "" || strings.Contains(name, "/") || limit < 1 {
 		return nil, errors.New("AcornFox candidate set file name is invalid")

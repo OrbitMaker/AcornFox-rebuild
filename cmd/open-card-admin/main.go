@@ -51,6 +51,12 @@ func run(args []string, stderr io.Writer) error {
 }
 
 func runWithEUID(args []string, stderr io.Writer, euid func() int) error {
+	if processIdentity == "acornfox" {
+		return runAcornFoxAdmin(args, stderr, euid)
+	}
+	if processIdentity != "legacy" {
+		return errors.New("administrator build identity is invalid")
+	}
 	return runWithDependencies(args, stderr, euid, os.Lstat, resolveActiveDatabase, nil)
 }
 
@@ -62,6 +68,10 @@ func runWithDependencies(
 	resolve adminResolveFunc,
 	validate adminValidationFunc,
 ) error {
+	return runWithDatabaseValidation(args, stderr, euid, lstat, resolve, validate, nil)
+}
+
+func runWithDatabaseValidation(args []string, stderr io.Writer, euid func() int, lstat adminLstatFunc, resolve adminResolveFunc, validate adminValidationFunc, validateDatabase func(context.Context, *sql.DB) error) error {
 	config, err := parseArgs(args)
 	if err != nil {
 		return err
@@ -90,6 +100,11 @@ func runWithDependencies(
 	defer cancel()
 	if err := database.PingContext(ctx); err != nil {
 		return errors.New("ping active administrator database failed")
+	}
+	if validateDatabase != nil {
+		if err := validateDatabase(ctx, database); err != nil {
+			return err
+		}
 	}
 	if config.command == "activation-validate" || config.command == "candidate-validate" {
 		if config.command == "candidate-validate" {

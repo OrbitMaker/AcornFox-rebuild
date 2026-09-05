@@ -33,11 +33,13 @@ type FileEntryV1 struct {
 }
 
 type SourcePolicyV1 struct {
-	SchemaVersion int           `json:"schema_version"`
-	Product       string        `json:"product"`
-	ModulePath    string        `json:"module_path"`
-	GoPackages    []string      `json:"go_packages"`
-	Files         []FileEntryV1 `json:"files"`
+	SchemaVersion int    `json:"schema_version"`
+	Product       string `json:"product"`
+	// The module declaration is independently bound by this policy and checked
+	// by offline go list; a published fork may retain its original import paths.
+	ModulePath string        `json:"module_path"`
+	GoPackages []string      `json:"go_packages"`
+	Files      []FileEntryV1 `json:"files"`
 }
 
 func (p SourcePolicyV1) Validate() error {
@@ -59,7 +61,7 @@ func CanonicalSourcePolicyV1(p SourcePolicyV1) ([]byte, error) {
 }
 func ParseSourcePolicyV1(w Witness, raw []byte) (SourcePolicyV1, error) {
 	var p SourcePolicyV1
-	if !w.Valid() || parseCanonical(raw, &p) != nil || p.Validate() != nil || p.ModulePath != modulePathForRepository(w.decision.SourceRepository) || sha256Text(raw) != w.decision.SourcePolicySHA256 {
+	if !w.Valid() || parseCanonical(raw, &p) != nil || p.Validate() != nil || sha256Text(raw) != w.decision.SourcePolicySHA256 {
 		return p, ErrInputs
 	}
 	return p, nil
@@ -77,9 +79,6 @@ func VerifySourceTree(root string, policy SourcePolicyV1) error {
 func validModulePath(v string) bool {
 	parts := strings.Split(v, "/")
 	return len(parts) == 3 && parts[0] == "github.com" && githubPart.MatchString(parts[1]) && githubPart.MatchString(parts[2])
-}
-func modulePathForRepository(repository string) string {
-	return strings.TrimPrefix(repository, "https://")
 }
 func validateEntries(entries []FileEntryV1) error {
 	if len(entries) == 0 || len(entries) > 4096 {

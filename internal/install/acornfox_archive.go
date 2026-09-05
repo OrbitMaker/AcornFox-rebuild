@@ -2,6 +2,7 @@ package install
 
 import (
 	"archive/tar"
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"crypto/sha256"
@@ -39,7 +40,10 @@ func newAcornFoxExactArchiveReader(reader io.Reader, size int64) (*acornFoxExact
 	if reader == nil || size < 1 || size > acornFoxArchiveMaxBytes {
 		return nil, errors.New("AcornFox archive size is invalid")
 	}
-	return &acornFoxExactArchiveReader{reader: reader, remaining: size, hash: sha256.New()}, nil
+	// Keep compressed-byte accounting above the buffer: prefetched trailer
+	// bytes remain unread here and are still rejected by finish. Buffering
+	// avoids a file syscall for each byte requested by the flate decoder.
+	return &acornFoxExactArchiveReader{reader: bufio.NewReaderSize(reader, acornFoxArchiveStreamBuffer), remaining: size, hash: sha256.New()}, nil
 }
 
 func (r *acornFoxExactArchiveReader) Read(target []byte) (int, error) {

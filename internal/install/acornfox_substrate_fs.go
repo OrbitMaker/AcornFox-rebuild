@@ -114,12 +114,14 @@ func (p *TaskAcornFoxSubstratePublisher) lock() (*acornFoxSubstrateTaskLock, err
 			err = file.Chown(p.uid, p.gid)
 		}
 	}
+	var openedInfo os.FileInfo
 	if err == nil {
-		openedInfo, openedErr := file.Stat()
+		var openedErr error
+		openedInfo, openedErr = file.Stat()
 		if created {
 			info, statErr = openedInfo, openedErr
 		}
-		if statErr != nil || openedErr != nil || !info.Mode().IsRegular() || !openedInfo.Mode().IsRegular() || info.Mode().Perm() != 0o600 || openedInfo.Mode().Perm() != 0o600 || verifyOwner(info, p.uid, p.gid) != nil || verifyOwner(openedInfo, p.uid, p.gid) != nil || (!created && !os.SameFile(info, openedInfo)) {
+		if statErr != nil || openedErr != nil || !info.Mode().IsRegular() || !openedInfo.Mode().IsRegular() || info.Size() != 0 || openedInfo.Size() != 0 || fileNlink(info) != 1 || fileNlink(openedInfo) != 1 || info.Mode().Perm() != 0o600 || openedInfo.Mode().Perm() != 0o600 || verifyOwner(info, p.uid, p.gid) != nil || verifyOwner(openedInfo, p.uid, p.gid) != nil || (!created && !os.SameFile(info, openedInfo)) {
 			err = errors.New("AcornFox substrate lock is unsafe")
 		}
 	}
@@ -130,6 +132,12 @@ func (p *TaskAcornFoxSubstratePublisher) lock() (*acornFoxSubstrateTaskLock, err
 	if err := p.fs.flock(file, syscall.LOCK_EX); err != nil {
 		file.Close()
 		return nil, err
+	}
+	current, err := p.fs.lstat(root, acornFoxSubstrateLock)
+	if err != nil || !os.SameFile(openedInfo, current) || !current.Mode().IsRegular() || current.Size() != 0 || current.Mode().Perm() != 0600 || fileNlink(current) != 1 || verifyOwner(current, p.uid, p.gid) != nil {
+		_ = p.fs.flock(file, syscall.LOCK_UN)
+		_ = file.Close()
+		return nil, errors.New("AcornFox substrate lock changed while acquiring it")
 	}
 	return &acornFoxSubstrateTaskLock{file: file, fs: p.fs}, nil
 }

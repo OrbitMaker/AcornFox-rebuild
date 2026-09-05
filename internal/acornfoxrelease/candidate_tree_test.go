@@ -207,7 +207,7 @@ func TestBuildCandidateTreeV1OverridesRestrictiveUmask(t *testing.T) {
 	}
 }
 
-func candidateTreeFixture(t *testing.T) (GoBuildPlanV1, *GoBinaryStageV1, *WebAssetStageV1, string, RuntimeInputsV1, string, LicenseInputsV1) {
+func candidateTreeFixture(t *testing.T, licenseBuilders ...func(*testing.T, []string) (string, LicenseInputsV1)) (GoBuildPlanV1, *GoBinaryStageV1, *WebAssetStageV1, string, RuntimeInputsV1, string, LicenseInputsV1) {
 	t.Helper()
 	root, cache, _, _, toolchain := syntheticGoReleaseRepository(t)
 	for _, required := range install.AcornFoxV1RequiredFiles() {
@@ -231,7 +231,11 @@ func candidateTreeFixture(t *testing.T) (GoBuildPlanV1, *GoBinaryStageV1, *WebAs
 	gitRun(t, root, "checkout", "-q", "--detach")
 	runtimeRoot, runtime := candidateInputRoot(t, candidateRuntimeFixturePaths(), 0o755)
 	licensePaths := installerFixturePaths(func(path string) bool { return strings.HasPrefix(path, "docs/licenses/") })
-	licenseRoot, license := candidateLicenseRoot(t, licensePaths)
+	licenseBuilder := candidateLicenseRoot
+	if len(licenseBuilders) == 1 {
+		licenseBuilder = licenseBuilders[0]
+	}
+	licenseRoot, license := licenseBuilder(t, licensePaths)
 	policy := policyForTree(t, root, "github.com/acme/acornfox-fixture")
 	commit := gitRun(t, root, "rev-parse", "HEAD")
 	witness := witnessForInputs(t, policy, toolchain, runtime, license)
@@ -245,6 +249,7 @@ func candidateTreeFixture(t *testing.T) (GoBuildPlanV1, *GoBinaryStageV1, *WebAs
 		t.Fatal(err)
 	}
 	plan, err := PrepareGoBuildPlanV1(context.Background(), witness, policy, toolchain, root, cache, localNPMCLIPath(t))
+	t.Cleanup(func() { _ = plan.Close() })
 	if err != nil || !plan.Valid() {
 		t.Fatalf("plan=%#v err=%v", plan, err)
 	}
@@ -332,9 +337,17 @@ func fakeCandidateGoStage(t *testing.T, plan GoBuildPlanV1) *GoBinaryStageV1 {
 	if err != nil {
 		t.Fatal(err)
 	}
-	parentInfo, _ := os.Lstat(parent)
-	stageInfo, _ := os.Lstat(root)
-	return &GoBinaryStageV1{root: root, parent: parent, parentInfo: parentInfo, stageInfo: stageInfo, receipt: GoBinaryReceiptV1{SchemaVersion: 1, Product: Product, Architecture: Architecture, SourceCommit: plan.sourceCommit, DecisionSHA256: plan.decisionSHA256, SourcePolicySHA256: plan.sourcePolicySHA256, ToolchainSHA256: plan.toolchainSHA256, TreeSHA256: sha256Text(tree), Files: files}}
+	parentPin, err := pinDirectory(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(parentPin.close)
+	stagePin, err := pinDirectory(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(stagePin.close)
+	return &GoBinaryStageV1{root: root, parent: parent, parentPin: parentPin, stagePin: stagePin, receipt: GoBinaryReceiptV1{SchemaVersion: 1, Product: Product, Architecture: Architecture, SourceCommit: plan.sourceCommit, DecisionSHA256: plan.decisionSHA256, SourcePolicySHA256: plan.sourcePolicySHA256, ToolchainSHA256: plan.toolchainSHA256, TreeSHA256: sha256Text(tree), Files: files}}
 }
 
 func fakeCandidateWebStage(t *testing.T, plan GoBuildPlanV1) *WebAssetStageV1 {
@@ -358,13 +371,22 @@ func fakeCandidateWebStage(t *testing.T, plan GoBuildPlanV1) *WebAssetStageV1 {
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
 	tree, _ := json.Marshal(files)
-	parentInfo, _ := os.Lstat(parent)
-	stageInfo, _ := os.Lstat(root)
-	pinned, err := pinNPMCache(cache)
+	parentPin, err := pinDirectory(parent)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &WebAssetStageV1{root: root, parent: parent, parentInfo: parentInfo, stageInfo: stageInfo, dist: dist, plan: plan, npmCache: pinned, receipt: WebBuildReceiptV1{SchemaVersion: 1, Product: Product, Architecture: Architecture, Version: plan.releaseVersion, ReleaseID: "release-" + plan.releaseVersion, SourceRepository: plan.sourceRepositoryURL, SourceCommit: plan.sourceCommit, DecisionSHA256: plan.decisionSHA256, SourcePolicySHA256: plan.sourcePolicySHA256, ToolchainSHA256: plan.toolchainSHA256, TreeSHA256: sha256Text(tree), Files: files}}
+	t.Cleanup(parentPin.close)
+	stagePin, err := pinDirectory(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(stagePin.close)
+	pinned, err := pinNPMCache(cache)
+	t.Cleanup(pinned.pin.close)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &WebAssetStageV1{root: root, parent: parent, parentPin: parentPin, stagePin: stagePin, dist: dist, plan: plan, npmCache: pinned, receipt: WebBuildReceiptV1{SchemaVersion: 1, Product: Product, Architecture: Architecture, Version: plan.releaseVersion, ReleaseID: "release-" + plan.releaseVersion, SourceRepository: plan.sourceRepositoryURL, SourceCommit: plan.sourceCommit, DecisionSHA256: plan.decisionSHA256, SourcePolicySHA256: plan.sourcePolicySHA256, ToolchainSHA256: plan.toolchainSHA256, TreeSHA256: sha256Text(tree), Files: files}}
 }
 
 func sameCandidateFiles(left, right []install.FileDigest) bool {

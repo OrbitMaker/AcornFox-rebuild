@@ -13,6 +13,7 @@ import (
 func TestBuildWebAssetsV1UsesTrustedNode(t *testing.T) {
 	root, cache, witness, policy, tool := syntheticGoReleaseRepository(t)
 	plan, err := PrepareGoBuildPlanV1(context.Background(), witness, policy, tool, root, cache, localNPMCLIPath(t))
+	defer plan.Close()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -39,6 +40,7 @@ func TestBuildWebAssetsV1UsesTrustedNode(t *testing.T) {
 func TestBuildWebAssetsV1CleansFailure(t *testing.T) {
 	root, cache, witness, policy, tool := syntheticGoReleaseRepository(t)
 	plan, err := PrepareGoBuildPlanV1(context.Background(), witness, policy, tool, root, cache, localNPMCLIPath(t))
+	defer plan.Close()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,6 +62,7 @@ func TestBuildWebAssetsV1CleansFailure(t *testing.T) {
 func TestBuildWebAssetsV1ProducesIdenticalReceiptsForIndependentStages(t *testing.T) {
 	root, cache, witness, policy, tool := syntheticGoReleaseRepository(t)
 	plan, err := PrepareGoBuildPlanV1(context.Background(), witness, policy, tool, root, cache, localNPMCLIPath(t))
+	defer plan.Close()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,6 +97,7 @@ func TestBuildWebAssetsV1ProducesIdenticalReceiptsForIndependentStages(t *testin
 func TestWebBuildReceiptRejectsIdentityTamperAndCopiesFiles(t *testing.T) {
 	root, cache, witness, policy, tool := syntheticGoReleaseRepository(t)
 	plan, err := PrepareGoBuildPlanV1(context.Background(), witness, policy, tool, root, cache, localNPMCLIPath(t))
+	defer plan.Close()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,6 +145,7 @@ func TestWebBuildReceiptRejectsIdentityTamperAndCopiesFiles(t *testing.T) {
 func TestBuildWebAssetsV1RejectsReplacedCacheWithoutDeletingReplacement(t *testing.T) {
 	root, cache, witness, policy, tool := syntheticGoReleaseRepository(t)
 	plan, err := PrepareGoBuildPlanV1(context.Background(), witness, policy, tool, root, cache, localNPMCLIPath(t))
+	defer plan.Close()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,6 +185,7 @@ func TestPinNPMCacheAllowsPopulatedPinnedDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	pinned, err := pinNPMCache(cache)
+	defer pinned.pin.close()
 	if err != nil || !pinned.valid() {
 		t.Fatalf("populated cache not pinned: %#v %v", pinned, err)
 	}
@@ -263,6 +269,7 @@ func TestInspectWebDistRejectsMetadataTamperAndTrailingValue(t *testing.T) {
 func TestWebAssetStageRejectsReplacedStageRootAndClosedReceipt(t *testing.T) {
 	root, cache, witness, policy, tool := syntheticGoReleaseRepository(t)
 	plan, err := PrepareGoBuildPlanV1(context.Background(), witness, policy, tool, root, cache, localNPMCLIPath(t))
+	defer plan.Close()
 	if err != nil {
 		t.Fatal(err)
 	}

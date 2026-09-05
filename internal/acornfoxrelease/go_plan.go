@@ -65,7 +65,7 @@ var fixedTargets = []struct{ name, path, identity string }{
 	{"acornfox-security-probe", "./cmd/open-card-security-probe", ""},
 	{"acornfox-imagegc", "./cmd/open-card-imagegc", ""},
 	{"acornfox", "./cmd/acornfox", ""},
-	{"acornfox-admin", "./cmd/open-card-admin", ""},
+	{"acornfox-admin", "./cmd/open-card-admin", "acornfox"},
 	{"acornfox-upgrade", "./cmd/open-card-upgrade", "acornfox"},
 	{"acornfox-healthcheck", "./cmd/open-card-healthcheck", "acornfox"},
 }
@@ -160,7 +160,7 @@ func prepareGoBuildPlanWithDependencies(ctx context.Context, witness Witness, po
 	sourceRaw, sourceErr := CanonicalSourcePolicyV1(policy)
 	toolchainRaw, toolchainErr := CanonicalToolchainInputsV1(toolchain)
 	decisionSHA, decisionErr := witness.SHA256()
-	if sourceErr != nil || toolchainErr != nil || decisionErr != nil || sha256Text(sourceRaw) != witness.decision.SourcePolicySHA256 || sha256Text(toolchainRaw) != witness.decision.ToolchainSHA256 || policy.ModulePath != modulePathForRepository(witness.decision.SourceRepository) {
+	if sourceErr != nil || toolchainErr != nil || decisionErr != nil || sha256Text(sourceRaw) != witness.decision.SourcePolicySHA256 || sha256Text(toolchainRaw) != witness.decision.ToolchainSHA256 {
 		return GoBuildPlanV1{}, ErrGoPlan
 	}
 	if err := VerifyGitSourceV1(ctx, root, witness, policy, toolchain); err != nil {
@@ -170,6 +170,12 @@ func prepareGoBuildPlanWithDependencies(ctx context.Context, witness Witness, po
 	if err != nil {
 		return GoBuildPlanV1{}, ErrGoPlan
 	}
+	transferred := false
+	defer func() {
+		if !transferred {
+			cache.close()
+		}
+	}()
 	goExecutable, err := bindExecutable("go", toolchain.GoBinarySHA256, run, lookup, hash)
 	if err != nil {
 		return GoBuildPlanV1{}, ErrGoPlan
@@ -212,6 +218,7 @@ func prepareGoBuildPlanWithDependencies(ctx context.Context, witness Witness, po
 		return GoBuildPlanV1{}, ErrGoPlan
 	}
 	targets := sealedTargets(witness)
+	transferred = true
 	return GoBuildPlanV1{
 		valid:               true,
 		decisionSHA256:      decisionSHA,
@@ -272,9 +279,9 @@ type sealedGoCache struct {
 	taskPath string
 	goPath   string
 	modPath  string
-	taskInfo os.FileInfo
-	goInfo   os.FileInfo
-	modInfo  os.FileInfo
+	taskPin  *directoryPin
+	goPin    *directoryPin
+	modPin   *directoryPin
 }
 
 func sealedGoEnvironment(root, taskCacheRoot string) (string, sealedGoCache, []string, error) {
@@ -286,16 +293,19 @@ func sealedGoEnvironment(root, taskCacheRoot string) (string, sealedGoCache, []s
 	if err != nil || taskCacheRoot == root || pathWithin(root, taskCacheRoot) {
 		return "", sealedGoCache{}, nil, ErrGoPlan
 	}
-	taskInfo, err := os.Lstat(taskCacheRoot)
+	taskPin, err := pinDirectory(taskCacheRoot)
 	if err != nil {
 		return "", sealedGoCache{}, nil, ErrGoPlan
 	}
-	goCache, goInfo, err := pinnedCacheChild(taskCacheRoot, "go-cache")
+	goCache, goPin, err := pinnedCacheChild(taskCacheRoot, "go-cache")
 	if err != nil {
+		taskPin.close()
 		return "", sealedGoCache{}, nil, ErrGoPlan
 	}
-	modCache, modInfo, err := pinnedCacheChild(taskCacheRoot, "go-mod-cache")
+	modCache, modPin, err := pinnedCacheChild(taskCacheRoot, "go-mod-cache")
 	if err != nil {
+		taskPin.close()
+		goPin.close()
 		return "", sealedGoCache{}, nil, ErrGoPlan
 	}
 	env := []string{
@@ -304,12 +314,23 @@ func sealedGoEnvironment(root, taskCacheRoot string) (string, sealedGoCache, []s
 		"GOCACHE=" + goCache, "GOMODCACHE=" + modCache,
 		"GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0",
 	}
-	return root, sealedGoCache{taskPath: taskCacheRoot, goPath: goCache, modPath: modCache, taskInfo: taskInfo, goInfo: goInfo, modInfo: modInfo}, env, nil
+	cache := sealedGoCache{taskPath: taskCacheRoot, goPath: goCache, modPath: modCache, taskPin: taskPin, goPin: goPin, modPin: modPin}
+	if !cache.valid() {
+		cache.close()
+		return "", sealedGoCache{}, nil, ErrGoPlan
+	}
+	return root, cache, env, nil
 }
 
 func (cache sealedGoCache) valid() bool {
-	return samePinnedDirectory(cache.taskPath, cache.taskInfo) && samePinnedDirectory(cache.goPath, cache.goInfo) && samePinnedDirectory(cache.modPath, cache.modInfo)
+	return cache.taskPin.validAt(cache.taskPath) && cache.goPin.validAt(cache.goPath) && cache.modPin.validAt(cache.modPath)
 }
+
+func (cache sealedGoCache) close() { cache.taskPin.close(); cache.goPin.close(); cache.modPin.close() }
+
+// Close releases cache identities after every stage using this plan is closed.
+// Copies share those handles; caller-owned cache directories are never deleted.
+func (p GoBuildPlanV1) Close() error { p.cache.close(); return nil }
 
 func samePinnedDirectory(path string, expected os.FileInfo) bool {
 	info, err := os.Lstat(path)
@@ -319,7 +340,7 @@ func samePinnedDirectory(path string, expected os.FileInfo) bool {
 	return true
 }
 
-func pinnedCacheChild(parent, name string) (string, os.FileInfo, error) {
+func pinnedCacheChild(parent, name string) (string, *directoryPin, error) {
 	if name != "go-cache" && name != "go-mod-cache" {
 		return "", nil, ErrGoPlan
 	}
@@ -347,12 +368,18 @@ func pinnedCacheChild(parent, name string) (string, os.FileInfo, error) {
 	if err != nil {
 		return "", nil, ErrGoPlan
 	}
-	defer child.Close()
 	opened, err := child.Stat()
 	if err != nil || !opened.IsDir() || !os.SameFile(entry, opened) {
+		_ = child.Close()
 		return "", nil, ErrGoPlan
 	}
-	return filepath.Join(parent, name), opened, nil
+	path := filepath.Join(parent, name)
+	pin := &directoryPin{path: path, file: child}
+	if !pin.valid() {
+		pin.close()
+		return "", nil, ErrGoPlan
+	}
+	return path, pin, nil
 }
 
 func cleanExistingDirectory(path string) (string, error) {
@@ -550,7 +577,7 @@ func sealedTargets(witness Witness) []GoBuildTargetV1 {
 		if target.identity != "" {
 			flags = append(flags, "-X=main.processIdentity=acornfox")
 		}
-		if target.name == "acornfox-upgrade" || target.name == "acornfox-healthcheck" {
+		if target.name == "acornfox-upgrade" || target.name == "acornfox-healthcheck" || target.name == "acornfox-admin" {
 			flags = append(flags, "-X=main.buildVersion="+witness.decision.Version, "-X=main.buildSourceCommit="+witness.decision.SourceCommit, "-X=main.buildLayoutSchema=1")
 		}
 		targets = append(targets, GoBuildTargetV1{Name: target.name, Package: target.path, Output: "bin/" + target.name, Ldflags: flags})
