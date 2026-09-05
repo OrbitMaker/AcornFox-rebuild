@@ -209,3 +209,22 @@ func verifyBridgeAddress(raw []byte) error {
 	}
 	return nil
 }
+
+// ValidateApplicationTopology checks only a Docker network-inspect JSON value
+// against the fixed application network topology, labels, and policy digest.
+// It is suitable for an unprivileged consumer that must never create or adopt
+// a replacement network. The ownership token must be well formed, but this
+// function does not authenticate it against root's intent or inspect nft.
+// Root-owned firewall readiness still requires Ensure/Verify separately.
+func ValidateApplicationTopology(raw []byte) error {
+	var networks []dockerNetwork
+	if decode(raw, &networks) != nil || len(networks) != 1 {
+		return ErrConflict
+	}
+	owner := networks[0].Labels[ownerLabel]
+	if !digestOK(owner) {
+		return ErrConflict
+	}
+	_, err := inspectNetwork(raw, owner, "")
+	return err
+}

@@ -81,7 +81,7 @@ func policyObjects(owner string) []object {
 		name := "private_" + string(rune('a'+i)) + "_denied"
 		rule("forward", name, "drop", ingress(), match(payload("ip", "daddr"), "==", prefix(cidr)))
 	}
-	for _, resolver := range []string{"223.5.5.5", "223.6.6.6"} {
+	for _, resolver := range PublicResolvers() {
 		for _, protocol := range []string{"tcp", "udp"} {
 			rule("forward", "dns_"+strings.ReplaceAll(resolver, ".", "_")+"_"+protocol, "accept", ingress(), match(payload("ip", "daddr"), "==", resolver), match(payload(protocol, "dport"), "==", 53))
 		}
@@ -133,4 +133,10 @@ func dockerLabels(owner string) map[string]string {
 	return map[string]string{
 		"open-card.managed": "true", "open-card.task-prefix": "acornfox", ownerLabel: owner, policyLabel: originDigest(),
 	}
+}
+
+// PublicResolvers returns a fresh copy of the runtime policy's public IPv4
+// DNS endpoints. Callers cannot mutate the policy through the returned slice.
+func PublicResolvers() []string {
+	return []string{"223.5.5.5", "223.6.6.6"}
 }
