@@ -80,6 +80,7 @@ func acornFoxValidateProductionAcornFoxTree(root *os.Root, store *TaskAcornFoxRe
 	pointers := map[string]acornFoxProductionPointer{}
 	directories := map[string]bool{}
 	files := map[string][]byte{}
+	controlPlaneFiles := map[string][]byte{}
 	if state != acornFoxRepoPrefixStatic {
 		if activation.Validate() != nil || len(activationRaw) == 0 || activation.Mode != "production_host" || activation.LayoutSHA256 != store.layout.evidence() {
 			return ErrAcornFoxLiveConflict
@@ -91,6 +92,23 @@ func acornFoxValidateProductionAcornFoxTree(root *os.Root, store *TaskAcornFoxRe
 		}
 		if state >= acornFoxRepoPrefixActivationJSON {
 			files[store.layout.activationReceiptPath(activation.ActivationID)] = activationRaw
+		}
+		// The control-plane migration owns exactly one root-only activation
+		// file: database.env. Its completion receipt stays in the fixed state
+		// root, so an activation remains unable to carry arbitrary receipts.
+		if state >= acornFoxRepoPrefixActivationDir {
+			principal, ownerOK := store.layout.owner(AcornFoxLiveRootRole)
+			envPath := activationDir + "/database.env"
+			envRaw, envOK := acornFoxReadControlPlaneScopedFile(root, store, envPath, principal)
+			if !ownerOK {
+				return ErrAcornFoxLiveConflict
+			}
+			if envOK {
+				if !validAcornFoxControlPlaneEnvironment(envRaw) {
+					return ErrAcornFoxLiveConflict
+				}
+				controlPlaneFiles[envPath] = envRaw
+			}
 		}
 		addPointer := func(path, target string, allowTwo bool) {
 			pointers[path] = acornFoxProductionPointer{target: target, allowTwo: allowTwo}
@@ -178,6 +196,13 @@ func acornFoxValidateProductionAcornFoxTree(root *os.Root, store *TaskAcornFoxRe
 				}
 				continue
 			}
+			if raw, ok := controlPlaneFiles[childPath]; ok {
+				principal, ownerOK := store.layout.owner(AcornFoxLiveRootRole)
+				if !ownerOK || !acornFoxLiveExactFileOwned(root, store, childPath, raw, durableFileMode, principal, false) {
+					return ErrAcornFoxLiveConflict
+				}
+				continue
+			}
 			if pointer, ok := pointers[childPath]; ok && acornFoxRepoPointerForLayout(root, store, store.layout, childPath, pointer.target, pointer.allowTwo) {
 				continue
 			}
@@ -186,6 +211,29 @@ func acornFoxValidateProductionAcornFoxTree(root *os.Root, store *TaskAcornFoxRe
 		return nil
 	}
 	return walk("opt/acornfox")
+}
+
+func acornFoxReadControlPlaneScopedFile(root *os.Root, store *TaskAcornFoxRepoStore, path string, principal acornFoxInstallPrincipal) ([]byte, bool) {
+	if root == nil || store == nil {
+		return nil, false
+	}
+	info, err := root.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, false
+	}
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != durableFileMode || acornFoxRepoNlink(info) != 1 || !acornFoxLiveObservedOwner(store, info, principal) {
+		return nil, false
+	}
+	file, err := root.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, false
+	}
+	raw, readErr := io.ReadAll(file)
+	closeErr := file.Close()
+	if readErr != nil || closeErr != nil {
+		return nil, false
+	}
+	return raw, true
 }
 
 func acornFoxProductionSharedParent(path string) bool {
@@ -217,8 +265,55 @@ func acornFoxValidatePinnedProductionState(root *os.Root, store *TaskAcornFoxRep
 	// Validate every retained raw witness through its typed store before the
 	// host scope accepts any activation prefix.
 	bindingErr := newAcornFoxBindingStore(store).validate(state)
-	if closeErr := state.Close(); closeErr != nil || bindingErr != nil {
+	controlErr := acornFoxValidateControlPlaneState(state, store)
+	if closeErr := state.Close(); closeErr != nil || bindingErr != nil || controlErr != nil {
 		return ErrAcornFoxLiveConflict
+	}
+	return nil
+}
+
+// acornFoxValidateControlPlaneState recognizes only the two direct state
+// witnesses added by the migration leaf. They are optional before the leaf
+// starts; a receipt cannot exist without a valid matching environment.
+func acornFoxValidateControlPlaneState(root *os.Root, store *TaskAcornFoxRepoStore) error {
+	if root == nil || store == nil {
+		return ErrAcornFoxLiveConflict
+	}
+	read := func(name string) ([]byte, bool, error) {
+		info, err := root.Lstat(name)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, false, nil
+		}
+		if err != nil || !safeAcornFoxRepoFile(info, store.uid, store.gid) {
+			return nil, false, ErrAcornFoxLiveConflict
+		}
+		file, err := root.OpenFile(name, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+		if err != nil {
+			return nil, false, ErrAcornFoxLiveConflict
+		}
+		raw, readErr := io.ReadAll(file)
+		closeErr := file.Close()
+		if readErr != nil || closeErr != nil {
+			return nil, false, ErrAcornFoxLiveConflict
+		}
+		return raw, true, nil
+	}
+	env, envOK, err := read(acornFoxControlPlaneStateEnv)
+	if err != nil {
+		return err
+	}
+	receiptRaw, receiptOK, err := read(acornFoxControlPlaneReceipt)
+	if err != nil {
+		return err
+	}
+	if envOK && !validAcornFoxControlPlaneEnvironment(env) || receiptOK && !envOK {
+		return ErrAcornFoxLiveConflict
+	}
+	if receiptOK {
+		receipt, parseErr := ParseAcornFoxControlPlaneMigrationReceiptV1(receiptRaw)
+		if parseErr != nil || receipt.DatabaseEnvSHA256 != sha256Bytes(env) || receipt.DatabaseIdentitySHA256 != acornFoxControlPlaneIdentitySHA256() {
+			return ErrAcornFoxLiveConflict
+		}
 	}
 	return nil
 }
