@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"syscall"
@@ -348,7 +349,7 @@ func inspectOneBinary(path string, target GoBuildTargetV1, plan GoBuildPlanV1) (
 
 func targetMatchesPlan(target GoBuildTargetV1, plan GoBuildPlanV1) bool {
 	for _, expected := range plan.Targets() {
-		if target.Name == expected.Name && target.Package == expected.Package && target.Output == expected.Output && sameStrings(target.Ldflags, expected.Ldflags) {
+		if target.Name == expected.Name && target.Package == expected.Package && target.Output == expected.Output && slices.Equal(target.Ldflags, expected.Ldflags) {
 			return true
 		}
 	}
