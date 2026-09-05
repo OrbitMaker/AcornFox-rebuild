@@ -38,6 +38,8 @@ type GoBuildPlanV1 struct {
 	decisionSHA256      string
 	sourcePolicySHA256  string
 	toolchainSHA256     string
+	runtimeInputSHA256  string
+	licenseInputSHA256  string
 	module              string
 	sourceCommit        string
 	releaseVersion      string
@@ -215,6 +217,8 @@ func prepareGoBuildPlanWithDependencies(ctx context.Context, witness Witness, po
 		decisionSHA256:      decisionSHA,
 		sourcePolicySHA256:  sha256Text(sourceRaw),
 		toolchainSHA256:     sha256Text(toolchainRaw),
+		runtimeInputSHA256:  witness.decision.RuntimeInputSHA256,
+		licenseInputSHA256:  witness.decision.LicenseInputSHA256,
 		module:              policy.ModulePath,
 		sourceCommit:        witness.decision.SourceCommit,
 		releaseVersion:      witness.decision.Version,
@@ -557,7 +561,7 @@ func sealedTargets(witness Witness) []GoBuildTargetV1 {
 func (p GoBuildPlanV1) Valid() bool {
 	sourceRaw, sourceErr := CanonicalSourcePolicyV1(p.sourcePolicy)
 	toolchainRaw, toolchainErr := CanonicalToolchainInputsV1(p.toolchain)
-	return p.valid && len(p.targets) == len(fixedTargets) && len(p.packages) == len(fixedTargets) && p.decisionSHA256 != "" && p.sourcePolicySHA256 != "" && p.toolchainSHA256 != "" && p.module != "" && p.sourceCommit != "" && p.sourceRoot != "" && sourceErr == nil && toolchainErr == nil && sha256Text(sourceRaw) == p.sourcePolicySHA256 && sha256Text(toolchainRaw) == p.toolchainSHA256 && VerifySourceTree(p.sourceRoot, p.sourcePolicy) == nil && p.goExecutable.path != "" && p.goExecutable.digest == p.toolchain.GoBinarySHA256 && p.nodeExecutable.path != "" && p.nodeExecutable.digest == p.toolchain.NodeBinarySHA256 && p.npmCLI.valid() && p.cache.valid()
+	return p.valid && len(p.targets) == len(fixedTargets) && len(p.packages) == len(fixedTargets) && p.decisionSHA256 != "" && p.sourcePolicySHA256 != "" && p.toolchainSHA256 != "" && digestText.MatchString(p.runtimeInputSHA256) && digestText.MatchString(p.licenseInputSHA256) && p.module != "" && p.sourceCommit != "" && p.sourceRoot != "" && sourceErr == nil && toolchainErr == nil && sha256Text(sourceRaw) == p.sourcePolicySHA256 && sha256Text(toolchainRaw) == p.toolchainSHA256 && VerifySourceTree(p.sourceRoot, p.sourcePolicy) == nil && p.goExecutable.path != "" && p.goExecutable.digest == p.toolchain.GoBinarySHA256 && p.nodeExecutable.path != "" && p.nodeExecutable.digest == p.toolchain.NodeBinarySHA256 && p.npmCLI.valid() && p.cache.valid()
 }
 func (p GoBuildPlanV1) Targets() []GoBuildTargetV1 { return copyTargets(p.targets, p.Valid()) }
 func (p GoBuildPlanV1) Packages() []string {
@@ -581,6 +585,8 @@ func (p GoBuildPlanV1) Environment() []string {
 func (p GoBuildPlanV1) DecisionSHA256() string     { return sealedPlanValue(p, p.decisionSHA256) }
 func (p GoBuildPlanV1) SourcePolicySHA256() string { return sealedPlanValue(p, p.sourcePolicySHA256) }
 func (p GoBuildPlanV1) ToolchainSHA256() string    { return sealedPlanValue(p, p.toolchainSHA256) }
+func (p GoBuildPlanV1) RuntimeInputSHA256() string { return sealedPlanValue(p, p.runtimeInputSHA256) }
+func (p GoBuildPlanV1) LicenseInputSHA256() string { return sealedPlanValue(p, p.licenseInputSHA256) }
 func (p GoBuildPlanV1) Module() string             { return sealedPlanValue(p, p.module) }
 func (p GoBuildPlanV1) SourceCommit() string       { return sealedPlanValue(p, p.sourceCommit) }
 func sealedPlanValue(p GoBuildPlanV1, value string) string {
