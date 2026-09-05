@@ -82,12 +82,14 @@ class AcornFoxInstallScriptsTest(unittest.TestCase):
             "/usr/bin/systemctl start acornfox-server.service",
             "/usr/bin/systemctl start acornfox-agent.service",
             "/usr/bin/systemctl start acornfox-edge.service",
+            "/usr/bin/systemctl start acornfox-healthcheck.timer",
             "/usr/bin/systemctl start acornfox-healthcheck.service",
         )
         positions = [text.index(item) for item in sequence]
         self.assertEqual(positions, sorted(positions))
         self.assertIn("ACORNFOX_INSTALL_CONFIRMATION", text)
         self.assertIn("ACORNFOX_DEDICATED_HOST_CONFIRMATION", text)
+        self.assertIn("/usr/bin/systemctl start acornfox-healthcheck.timer", text)
         self.assertIn("/usr/bin/systemctl start acornfox-healthcheck.service", text)
         self.assertNotIn("is-active --quiet acornfox-healthcheck.service", text)
         for forbidden in ("rm -", "docker rm", "docker system prune", "rollback", "downgrade", "backup", "restore"):

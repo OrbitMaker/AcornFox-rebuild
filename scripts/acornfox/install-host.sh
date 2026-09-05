@@ -147,6 +147,7 @@ effect /usr/bin/systemctl start acornfox-caddy.service
 effect /usr/bin/systemctl start acornfox-server.service
 effect /usr/bin/systemctl start acornfox-agent.service
 effect /usr/bin/systemctl start acornfox-edge.service
+effect /usr/bin/systemctl start acornfox-healthcheck.timer
 effect /usr/bin/systemctl start acornfox-healthcheck.service
 for unit in acornfox-upgrade-safe.target acornfox-buildkit.service acornfox-caddy.service acornfox-server.service acornfox-agent.service acornfox-edge.service acornfox-healthcheck.timer; do
   clean_output /usr/bin/systemctl is-enabled --quiet "$unit" || fail
