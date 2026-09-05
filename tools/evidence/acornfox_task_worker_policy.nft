@@ -1,0 +1,43 @@
+table inet acornfox_p0 {
+  set resolvers_v4 {
+    type ipv4_addr
+    elements = { 1.0.0.1, 1.1.1.1 }
+  }
+
+  set private_v4 {
+    type ipv4_addr
+    flags interval
+    elements = {
+      0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 172.16.0.0/12,
+      192.0.0.0/24, 192.0.2.0/24, 192.88.99.0/24, 192.168.0.0/16,
+      198.18.0.0/15, 198.51.100.0/24, 203.0.113.0/24,
+      224.0.0.0/4, 240.0.0.0/4
+    }
+  }
+
+  chain input {
+    type filter hook input priority filter; policy accept;
+    ct state established,related accept
+    counter packets 0 bytes 0 drop comment "ingress_denied"
+  }
+
+  chain forward {
+    type filter hook forward priority filter; policy drop;
+  }
+
+  chain output {
+    type filter hook output priority filter; policy drop;
+    ct state established,related accept
+    ip6 daddr ::/0 counter packets 0 bytes 0 drop comment "ipv6_denied"
+    oifname "lo" counter packets 0 bytes 0 drop comment "loopback_denied"
+    ip daddr 127.0.0.0/8 counter packets 0 bytes 0 drop comment "loopback_denied"
+    ip daddr 169.254.0.0/16 counter packets 0 bytes 0 drop comment "metadata_denied"
+    ip daddr @private_v4 counter packets 0 bytes 0 drop comment "private_or_special_ipv4_denied"
+    ip daddr @resolvers_v4 udp dport 53 counter packets 0 bytes 0 accept comment "dns_udp_allowed"
+    ip daddr @resolvers_v4 tcp dport 53 counter packets 0 bytes 0 accept comment "dns_tcp_allowed"
+    udp dport 53 counter packets 0 bytes 0 drop comment "unexpected_dns_udp_denied"
+    tcp dport 53 counter packets 0 bytes 0 drop comment "unexpected_dns_tcp_denied"
+    tcp dport { 80, 443 } counter packets 0 bytes 0 accept comment "public_web_allowed"
+    counter packets 0 bytes 0 drop comment "other_egress_denied"
+  }
+}

@@ -75,7 +75,7 @@ var expectedEgressDenyCIDRsV1 = []string{
 	"203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4",
 }
 var expectedDownloadDomainsV1 = []string{
-	"proxy.golang.org", "registry.npmjs.org", "storage.googleapis.com", "sum.golang.org",
+	"goproxy.cn", "proxy.golang.org", "registry.npmjs.org", "storage.googleapis.com", "sum.golang.google.cn", "sum.golang.org",
 }
 
 func (v ControlledEgressPolicyV1) Validate() error {
