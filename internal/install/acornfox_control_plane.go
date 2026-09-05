@@ -102,11 +102,12 @@ func (m acornFoxControlPlaneMigrations) valid() bool {
 // acornFoxControlPlane is package-private so tests can model the exact
 // production layout while production has no configurable root/DSN/tool seam.
 type acornFoxControlPlane struct {
-	layout      acornFoxInstallLayout
-	bridge      acornFoxHostBridge
-	random      io.Reader
-	provisioner acornFoxControlPlaneProvisioner
-	open        func([]byte) (BootstrapMigrationControl, error)
+	layout          acornFoxInstallLayout
+	bridge          acornFoxHostBridge
+	random          io.Reader
+	provisioner     acornFoxControlPlaneProvisioner
+	open            func([]byte) (BootstrapMigrationControl, error)
+	writeActivation func(*DurableWriter, []byte) error
 }
 
 // MigrateAcornFoxControlPlaneV1 is the sole production entrypoint.  It has no
@@ -134,11 +135,13 @@ func newAcornFoxControlPlane(layout acornFoxInstallLayout, bridge acornFoxHostBr
 	if layout.validate() != nil || layout.mode != acornFoxInstallLayoutProduction || random == nil || provisioner == nil || open == nil {
 		return nil, ErrAcornFoxControlPlaneUnknown
 	}
-	return &acornFoxControlPlane{layout: layout, bridge: bridge, random: random, provisioner: provisioner, open: open}, nil
+	return &acornFoxControlPlane{layout: layout, bridge: bridge, random: random, provisioner: provisioner, open: open, writeActivation: func(writer *DurableWriter, raw []byte) error {
+		return writer.CreateMetadata(acornFoxControlPlaneActivationEnv, raw)
+	}}, nil
 }
 
 func (s *acornFoxControlPlane) migrate(ctx context.Context) (AcornFoxControlPlaneMigrationReceiptV1, error) {
-	if s == nil || ctx == nil || ctx.Err() != nil {
+	if s == nil || ctx == nil || ctx.Err() != nil || s.writeActivation == nil {
 		return AcornFoxControlPlaneMigrationReceiptV1{}, ErrAcornFoxControlPlaneUnknown
 	}
 	authority, migrations, err := s.authority(ctx)
@@ -165,9 +168,21 @@ func (s *acornFoxControlPlane) migrate(ctx context.Context) (AcornFoxControlPlan
 			err = state.CreateMetadata(acornFoxControlPlaneStateEnv, env)
 		}
 		if err == nil {
-			err = host.CreateMetadata(activationEnv, env)
+			err = s.writeActivation(host, env)
 		}
 		if err != nil {
+			return AcornFoxControlPlaneMigrationReceiptV1{}, ErrAcornFoxControlPlaneUnknown
+		}
+	case stateErr == nil && errors.Is(activationErr, os.ErrNotExist):
+		// A durable state environment preceding the activation copy is the one
+		// recoverable prefix this leaf owns. Reuse its exact bytes; a failed or
+		// uncertain no-replace publish remains unknown so the next replay can
+		// re-read the activation slot and converge only on byte equality.
+		env = stateEnv
+		if !validAcornFoxControlPlaneEnvironment(env) {
+			return AcornFoxControlPlaneMigrationReceiptV1{}, ErrAcornFoxControlPlaneConflict
+		}
+		if err := s.writeActivation(host, env); err != nil {
 			return AcornFoxControlPlaneMigrationReceiptV1{}, ErrAcornFoxControlPlaneUnknown
 		}
 	case stateErr == nil && activationErr == nil && bytes.Equal(stateEnv, activation):

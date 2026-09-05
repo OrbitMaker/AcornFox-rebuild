@@ -67,6 +67,40 @@ func newAcornFoxControlPlanePrepared(t *testing.T, ledger *acornFoxControlPlaneL
 	return service, prepared
 }
 
+func writeAcornFoxControlPlaneStateEnv(t *testing.T, prepared acornFoxProductionPreparedFixture, raw []byte) {
+	t.Helper()
+	writer, err := TaskDurableWriter(prepared.state, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	if err := writer.CreateMetadata(acornFoxControlPlaneStateEnv, raw); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeAcornFoxControlPlaneActivationEnv(t *testing.T, prepared acornFoxProductionPreparedFixture, raw []byte) {
+	t.Helper()
+	activation, err := AcornFoxRepoActivationID(prepared.binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(prepared.host, "opt", "acornfox", "activations", activation)
+	writer, err := TaskDurableWriter(path, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	if err := writer.CreateMetadata(acornFoxControlPlaneActivationEnv, raw); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(filepath.Join(path, acornFoxControlPlaneActivationEnv))
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared.owners.set(info, acornFoxInstallPrincipal{})
+}
+
 func TestAcornFoxControlPlaneMigratesClosed33PrefixAndReplays(t *testing.T) {
 	ledger, runner := &acornFoxControlPlaneLedgerFake{}, &acornFoxControlPlaneProvisionerFake{}
 	service, prepared := newAcornFoxControlPlanePrepared(t, ledger, runner)
@@ -124,6 +158,104 @@ func TestAcornFoxControlPlaneRejectsLedgerGapAndPreservesExternalSentinel(t *tes
 		t.Fatalf("gap err=%v", err)
 	}
 	prepared.assertExternalSentinel(t)
+}
+
+func TestAcornFoxControlPlaneResumesStateOnlyEnvironmentWithoutNewSecret(t *testing.T) {
+	ledger, runner := &acornFoxControlPlaneLedgerFake{}, &acornFoxControlPlaneProvisionerFake{}
+	service, prepared := newAcornFoxControlPlanePrepared(t, ledger, runner)
+	env, err := service.newEnvironment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeAcornFoxControlPlaneStateEnv(t, prepared, env)
+	receipt, err := service.migrate(context.Background())
+	if err != nil || receipt.Validate() != nil || len(ledger.rows) != 33 {
+		t.Fatalf("receipt=%#v rows=%d err=%v", receipt, len(ledger.rows), err)
+	}
+	activation, _ := AcornFoxRepoActivationID(prepared.binding)
+	got, err := os.ReadFile(filepath.Join(prepared.host, "opt", "acornfox", "activations", activation, acornFoxControlPlaneActivationEnv))
+	if err != nil || !bytes.Equal(got, env) || len(runner.stdin) == 0 || bytes.Contains(runner.stdin, []byte("ACORNFOX_DATABASE_URL")) {
+		t.Fatalf("activation=%q env=%q runner=%q err=%v", got, env, runner.stdin, err)
+	}
+	prepared.assertExternalSentinel(t)
+}
+
+func TestAcornFoxControlPlaneStateOnlyRetriesAfterActivationFailure(t *testing.T) {
+	ledger, runner := &acornFoxControlPlaneLedgerFake{}, &acornFoxControlPlaneProvisionerFake{}
+	service, prepared := newAcornFoxControlPlanePrepared(t, ledger, runner)
+	env, err := service.newEnvironment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeAcornFoxControlPlaneStateEnv(t, prepared, env)
+	activation, _ := AcornFoxRepoActivationID(prepared.binding)
+	directory := filepath.Join(prepared.host, "opt", "acornfox", "activations", activation)
+	write := service.writeActivation
+	service.writeActivation = func(*DurableWriter, []byte) error { return errors.New("injected activation publish failure") }
+	if _, err := service.migrate(context.Background()); !errors.Is(err, ErrAcornFoxControlPlaneUnknown) || len(ledger.rows) != 0 || len(runner.argv) != 0 {
+		t.Fatalf("failed create err=%v rows=%d argv=%q", err, len(ledger.rows), runner.argv)
+	}
+	service.writeActivation = func(writer *DurableWriter, raw []byte) error {
+		if err := writer.CreateMetadata(acornFoxControlPlaneActivationEnv, raw); err != nil {
+			return err
+		}
+		return errors.New("injected uncertain activation publish")
+	}
+	if _, err := service.migrate(context.Background()); !errors.Is(err, ErrAcornFoxControlPlaneUnknown) || len(ledger.rows) != 0 || len(runner.argv) != 0 {
+		t.Fatalf("uncertain create err=%v rows=%d argv=%q", err, len(ledger.rows), runner.argv)
+	}
+	// This models an uncertain publish result: the exact activation bytes are
+	// now visible before retry. The retry must reread and converge, not mint a
+	// different secret or try to replace the durable file.
+	service.writeActivation = write
+	got, err := os.ReadFile(filepath.Join(directory, acornFoxControlPlaneActivationEnv))
+	if err != nil || !bytes.Equal(got, env) {
+		t.Fatalf("uncertain artifact=%q env=%q err=%v", got, env, err)
+	}
+	info, err := os.Lstat(filepath.Join(directory, acornFoxControlPlaneActivationEnv))
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared.owners.set(info, acornFoxInstallPrincipal{})
+	if _, err := service.migrate(context.Background()); err != nil || len(ledger.rows) != 33 {
+		t.Fatalf("exact retry err=%v rows=%d", err, len(ledger.rows))
+	}
+	prepared.assertExternalSentinel(t)
+}
+
+func TestAcornFoxControlPlaneRejectsActivationOnlyAndUnequalCopies(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		state bool
+		other bool
+	}{
+		{name: "activation only"},
+		{name: "unequal", state: true, other: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ledger, runner := &acornFoxControlPlaneLedgerFake{}, &acornFoxControlPlaneProvisionerFake{}
+			service, prepared := newAcornFoxControlPlanePrepared(t, ledger, runner)
+			first, err := service.newEnvironment()
+			if err != nil {
+				t.Fatal(err)
+			}
+			second := append([]byte(nil), first...)
+			second[len(second)-2] = 'A'
+			if test.state {
+				writeAcornFoxControlPlaneStateEnv(t, prepared, first)
+			}
+			writeAcornFoxControlPlaneActivationEnv(t, prepared, func() []byte {
+				if test.other {
+					return second
+				}
+				return first
+			}())
+			if _, err := service.migrate(context.Background()); !errors.Is(err, ErrAcornFoxControlPlaneConflict) || len(ledger.rows) != 0 || len(runner.argv) != 0 {
+				t.Fatalf("err=%v rows=%d argv=%q", err, len(ledger.rows), runner.argv)
+			}
+			prepared.assertExternalSentinel(t)
+		})
+	}
 }
 
 func TestEnsureAcornFoxControlPlaneLedgerAcceptsAmbiguousExactCommit(t *testing.T) {
