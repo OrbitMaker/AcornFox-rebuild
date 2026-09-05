@@ -213,7 +213,11 @@ func acornFoxValidatePinnedProductionState(root *os.Root, store *TaskAcornFoxRep
 	if err != nil {
 		return ErrAcornFoxLiveConflict
 	}
-	if closeErr := state.Close(); closeErr != nil {
+	// `bindings` is a closed state namespace, not a path-prefix exemption.
+	// Validate every retained raw witness through its typed store before the
+	// host scope accepts any activation prefix.
+	bindingErr := newAcornFoxBindingStore(store).validate(state)
+	if closeErr := state.Close(); closeErr != nil || bindingErr != nil {
 		return ErrAcornFoxLiveConflict
 	}
 	return nil

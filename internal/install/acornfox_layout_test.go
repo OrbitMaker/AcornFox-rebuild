@@ -219,7 +219,8 @@ func TestProductionTestLayoutSeparatesStateAndPinnedHostBeforeL3(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer stager.Close()
-	stage, receipt, err := stager.Stage(newAcornFoxFixture(t, "1.2.3-test.1", nil).input(nil))
+	fixture := newAcornFoxFixture(t, "1.2.3-test.1", nil)
+	stage, receipt, err := stager.Stage(fixture.input(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -238,6 +239,9 @@ func TestProductionTestLayoutSeparatesStateAndPinnedHostBeforeL3(t *testing.T) {
 	defer published.Close()
 	store, err := newAcornFoxRepoStoreForLayout(layout)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := newAcornFoxBindingStore(store).Put(fixture.bindingRaw); err != nil {
 		t.Fatal(err)
 	}
 	defer store.Close()
@@ -669,7 +673,8 @@ func newAcornFoxProductionPreparedFixture(t *testing.T) acornFoxProductionPrepar
 		t.Fatal(err)
 	}
 	defer stager.Close()
-	stage, receipt, err := stager.Stage(newAcornFoxFixture(t, "1.2.3-test.1", nil).input(nil))
+	fixture := newAcornFoxFixture(t, "1.2.3-test.1", nil)
+	stage, receipt, err := stager.Stage(fixture.input(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -688,6 +693,9 @@ func newAcornFoxProductionPreparedFixture(t *testing.T) acornFoxProductionPrepar
 	t.Cleanup(func() { _ = published.Close() })
 	store, err := newAcornFoxRepoStoreForLayout(layout)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := newAcornFoxBindingStore(store).Put(fixture.bindingRaw); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = store.Close() })

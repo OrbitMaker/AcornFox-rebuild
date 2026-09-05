@@ -110,6 +110,7 @@ func (f acornFoxProductionScopeFixture) firstFile(t *testing.T) string {
 func newAcornFoxProductionScopeFixture(t *testing.T) acornFoxProductionScopeFixture {
 	t.Helper()
 	_, _, published, substrate := newAcornFox03CPublished(t)
+	fixture := newAcornFoxFixture(t, substrate.CandidateReceipt.Version, nil)
 	parent, host := t.TempDir(), ""
 	host = filepath.Join(parent, "host")
 	state := filepath.Join(host, "var", "lib", "acornfox", "install")
@@ -129,6 +130,15 @@ func newAcornFoxProductionScopeFixture(t *testing.T) acornFoxProductionScopeFixt
 	store, err := newAcornFoxRepoStoreForLayout(layout)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if fixture.bindingSHA != substrate.CandidateReceipt.BindingSHA256 {
+		t.Fatal("scope fixture binding unexpectedly diverged")
+	}
+	if err := newAcornFoxBindingStore(store).Put(fixture.bindingRaw); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := newAcornFoxBindingStore(store).Read(fixture.bindingSHA); err != nil {
+		t.Fatalf("binding read after put: %v", err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	entries, err := acornFoxLiveExpectedEntriesForLayout(layout, published)

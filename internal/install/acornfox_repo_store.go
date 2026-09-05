@@ -387,7 +387,7 @@ func (s *TaskAcornFoxRepoStore) mintPreparedLease(ctx context.Context, substrate
 	}
 	fail := func() (*acornFoxPreparedRepoLease, error) { _ = lock.Release(); return nil, ErrAcornFoxRepoConflict }
 	journal, err := s.Load(ctx)
-	if err != nil || (journal.Phase != AcornFoxRepoPrepared && journal.Phase != AcornFoxRepoLiveMaterialized && journal.Phase != AcornFoxRepoStaticVerified && journal.Phase != AcornFoxRepoActivationWritten && journal.Phase != AcornFoxRepoActivePublished && journal.Phase != AcornFoxRepoCurrentPublished && journal.Phase != AcornFoxRepoPreparedFinal) || journal.BindingSHA256 != bindingSHA256 || journal.LayoutSHA256 != s.layout.evidence() || substrate.Verify() != nil || !sameAcornFoxLiveTaskRoot(s, substrate) {
+	if err != nil || (journal.Phase != AcornFoxRepoPrepared && journal.Phase != AcornFoxRepoLiveMaterialized && journal.Phase != AcornFoxRepoStaticVerified && journal.Phase != AcornFoxRepoActivationWritten && journal.Phase != AcornFoxRepoActivePublished && journal.Phase != AcornFoxRepoCurrentPublished && journal.Phase != AcornFoxRepoPreparedFinal) || journal.BindingSHA256 != bindingSHA256 || journal.LayoutSHA256 != s.layout.evidence() || substrate.Verify() != nil || !sameAcornFoxLiveTaskRoot(s, substrate) || (s.layout.mode == acornFoxInstallLayoutProduction && s.validateProductionBindingEvidence(journal, substrate) != nil) {
 		return fail()
 	}
 	raw, err := MarshalInactiveSubstrateReceiptV1(substrate.receipt)
@@ -395,6 +395,28 @@ func (s *TaskAcornFoxRepoStore) mintPreparedLease(ctx context.Context, substrate
 		return fail()
 	}
 	return &acornFoxPreparedRepoLease{store: s, lock: lock, journal: journal, substrate: substrate}, nil
+}
+
+// Production leases must retain the raw binding that the journal only names by
+// digest. Task-model receipts deliberately predate this host boundary, so their
+// canonical bytes and lease behavior remain unchanged.
+func (s *TaskAcornFoxRepoStore) validateProductionBindingEvidence(journal AcornFoxRepoJournalV1, substrate *PublishedAcornFoxSubstrateV1) error {
+	if s == nil || substrate == nil || s.layout.mode != acornFoxInstallLayoutProduction || journal.BindingSHA256 != substrate.receipt.CandidateReceipt.BindingSHA256 {
+		return ErrAcornFoxRepoConflict
+	}
+	raw, err := newAcornFoxBindingStore(s).Read(journal.BindingSHA256)
+	if err != nil {
+		return ErrAcornFoxRepoConflict
+	}
+	binding, err := ParseAcornFoxCandidateBindingV1(raw, journal.BindingSHA256)
+	if err != nil {
+		return ErrAcornFoxRepoConflict
+	}
+	r := substrate.receipt.CandidateReceipt
+	if binding.binding.Version != r.Version || binding.binding.ReleaseID != r.ReleaseID || binding.binding.ManifestSHA256 != r.ManifestSHA256 || binding.binding.ArchiveSHA256 != r.ArchiveSHA256 || binding.binding.BundleManifestSHA256 != r.BundleManifestSHA256 || binding.binding.SourceCommit != r.SourceCommit || binding.binding.Architecture != r.Architecture || binding.binding.MigrationVersion != r.MigrationVersion {
+		return ErrAcornFoxRepoConflict
+	}
+	return nil
 }
 
 func (l *acornFoxPreparedRepoLease) Release() error {
