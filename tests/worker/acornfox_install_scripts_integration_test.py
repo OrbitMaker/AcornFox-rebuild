@@ -204,6 +204,10 @@ def main():
         if args != ["migrate-control-plane", "--pending"]:
             raise SystemExit(2)
         print('{"command":"migrate-control-plane","ok":true,"receipt":{"binding_sha256":"' + SHA + '","database_env_sha256":"' + SHA + '","database_identity_sha256":"' + SHA + '","migration_rows_sha256":"' + SHA + '","migration_version":1,"release_id":"release-1.2.3-test.1","schema_version":1,"source_commit":"0123456789abcdef0123456789abcdef01234567","state":"CONTROL_PLANE_MIGRATED"}}')
+    elif name == "successor-helper":
+        if len(args) != 9 or args[0] != "repository-upgrade":
+            raise SystemExit(2)
+        print('{"command":"repository-upgrade","ok":true,"test_only":true}')
     # apt-get/install/systemctl and all other modeled effects succeed.
 
 if __name__ == "__main__":
@@ -220,6 +224,7 @@ class RewrittenHost:
         self.candidate = self.root / "candidate"
         self.bootstrap = self.root / "bootstrap-helper"
         self.current = self.root / "current-helper"
+        self.successor = self.root / "successor-helper"
         self.log = self.root / "calls.jsonl"
         self.control = self.root / "control"
         self._prepare()
@@ -245,6 +250,7 @@ class RewrittenHost:
                 raise AssertionError(f"token drift {token}: {count} != {expected}")
             self._write_fake(pathlib.Path(replacements[token]))
         self._write_fake(self.bootstrap)
+        self._write_fake(self.successor)
         for name in NAMES:
             script = (SOURCE / name).read_text(encoding="utf-8")
             for token in sorted(replacements, key=len, reverse=True):
@@ -282,7 +288,14 @@ class RewrittenHost:
         return [json.loads(line) for line in self.log.read_text(encoding="utf-8").splitlines()]
 
     def run(self, script: str, args: list[str], confirmations: bool = False) -> subprocess.CompletedProcess[str]:
-        env = {"PATH": "/usr/bin:/bin"}
+        # The fakes must prove rewritten CLEAN_ENV children do not inherit
+        # these deliberately hostile parent values.
+        env = {
+            "PATH": "/usr/bin:/bin",
+            "ACORNFOX_TEST_SECRET": "must-not-reach-child",
+            "HTTPS_PROXY": "http://parent-proxy.invalid",
+            "DATABASE_URL": "postgresql://parent-secret.invalid/db",
+        }
         if confirmations:
             env.update({"ACORNFOX_INSTALL_CONFIRMATION": "ACORNFOX-INSTALL", "ACORNFOX_DEDICATED_HOST_CONFIRMATION": "ACORNFOX-DEDICATED-HOST"})
         return subprocess.run(["/bin/bash", str(self.scripts / script), *args], capture_output=True, text=True, env=env, check=False)
@@ -297,11 +310,22 @@ class AcornFoxInstallScriptIntegrationTest(unittest.TestCase):
         self.addCleanup(self.host.close)
 
     def assert_clean_child_env(self) -> None:
+        direct_non_clean = set()
+        injected = {"ACORNFOX_TEST_SECRET", "HTTPS_PROXY", "DATABASE_URL"}
+        parent_injection_seen = False
         for call in self.host.calls():
-            if call["name"] == "env" or "LANG" not in call["env_keys"]:
+            if call["name"] == "env":
+                continue
+            if "LANG" not in call["env_keys"]:
+                self.assertIn(call["name"], {"id", "dirname"}, call)
+                direct_non_clean.add(call["name"])
+                parent_injection_seen |= injected.issubset(set(call["env_keys"]))
                 continue
             self.assertEqual(set(call["env_keys"]) - {"__CF_USER_TEXT_ENCODING", "PWD", "SHLVL", "_"}, {"LANG", "LC_ALL", "PATH"}, call)
             self.assertEqual(call["env"], {"LANG": "C", "LC_ALL": "C", "PATH": "/usr/sbin:/usr/bin:/sbin:/bin"}, call)
+            self.assertFalse(injected.intersection(call["env_keys"]), call)
+        self.assertTrue(direct_non_clean.issubset({"id", "dirname"}))
+        self.assertTrue(parent_injection_seen, "test parent did not carry injected secret/proxy/DSN")
 
     def test_install_host_runs_complete_ordered_task_root_flow(self) -> None:
         sentinel = self.host.root / "application-data"
@@ -325,6 +349,29 @@ class AcornFoxInstallScriptIntegrationTest(unittest.TestCase):
         self.assertNotIn(["is-active", "--quiet", "acornfox-healthcheck.service"], systemctl)
         self.assert_clean_child_env()
         self.assertEqual((sentinel.stat().st_ino, sentinel.read_bytes()), before)
+
+    def test_upgrade_wrapper_handoffs_only_to_a_test_successor(self) -> None:
+        next_binding = "b" * 64
+        current_binding = "c" * 64
+        args = [
+            "--candidate-dir", str(self.host.candidate),
+            "--next-binding-sha256", next_binding,
+            "--current-binding-sha256", current_binding,
+            "--successor-helper", str(self.host.successor),
+            "--successor-helper-sha256", SHA,
+        ]
+        result = self.host.run("upgrade.sh", args, confirmations=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {"command": "repository-upgrade", "ok": True, "test_only": True})
+        calls = [call for call in self.host.calls() if call["name"] == "successor-helper"]
+        self.assertEqual(len(calls), 1, calls)
+        self.assertEqual(calls[0]["argv"], [
+            "repository-upgrade", "--candidate-dir", str(self.host.candidate),
+            "--binding-sha256", next_binding,
+            "--current-binding-sha256", current_binding,
+            "--self-sha256", SHA,
+        ])
+        self.assert_clean_child_env()
 
     def test_invalid_forms_are_rejected_before_effects(self) -> None:
         cases = {
