@@ -58,7 +58,7 @@ candidate_dir=$2
 binding_sha256=$4
 bootstrap_helper=$6
 bootstrap_helper_sha256=$8
-[[ ${EUID:-1} -eq 0 ]] || fail
+[[ $(/usr/bin/id -u) -eq 0 ]] || fail
 is_sha256 "$binding_sha256" && is_sha256 "$bootstrap_helper_sha256" || fail
 safe_candidate_dir "$candidate_dir" || fail
 safe_helper "$bootstrap_helper" "$bootstrap_helper_sha256" || fail

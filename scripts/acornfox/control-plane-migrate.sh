@@ -34,7 +34,7 @@ fi
 if [[ $# -ne 1 || $1 != --pending ]]; then
   bad_args
 fi
-[[ ${EUID:-1} -eq 0 ]] || fail
+[[ $(/usr/bin/id -u) -eq 0 ]] || fail
 safe_helper || fail
 
 exec "${CLEAN_ENV[@]}" "$HELPER" migrate-control-plane --pending

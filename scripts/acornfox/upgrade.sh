@@ -59,7 +59,7 @@ next_binding_sha256=$4
 current_binding_sha256=$6
 successor_helper=$8
 successor_helper_sha256=${10}
-[[ ${EUID:-1} -eq 0 ]] || fail
+[[ $(/usr/bin/id -u) -eq 0 ]] || fail
 is_sha256 "$next_binding_sha256" && is_sha256 "$current_binding_sha256" && is_sha256 "$successor_helper_sha256" || fail
 [[ $next_binding_sha256 != "$current_binding_sha256" ]] || fail
 safe_candidate_dir "$candidate_dir" || fail

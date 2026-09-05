@@ -103,7 +103,7 @@ fi
 if [[ $# -ne 8 || $1 != --candidate-dir || $3 != --binding-sha256 || $5 != --bootstrap-helper || $7 != --bootstrap-helper-sha256 ]]; then
   bad_args
 fi
-[[ ${EUID:-1} -eq 0 ]] || fail
+[[ $(/usr/bin/id -u) -eq 0 ]] || fail
 [[ ${ACORNFOX_INSTALL_CONFIRMATION:-} == ACORNFOX-INSTALL ]] || fail
 [[ ${ACORNFOX_DEDICATED_HOST_CONFIRMATION:-} == ACORNFOX-DEDICATED-HOST ]] || fail
 candidate_dir=$2

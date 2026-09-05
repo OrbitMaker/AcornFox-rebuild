@@ -32,7 +32,7 @@ if [[ $# -ne 2 || $1 != --phase || ( $2 != pre && $2 != post ) ]]; then
 fi
 phase=$2
 
-[[ ${EUID:-1} -eq 0 ]] || fail
+[[ $(/usr/bin/id -u) -eq 0 ]] || fail
 [[ -r /etc/os-release ]] || fail
 if ! clean /usr/bin/grep -qx 'ID=ubuntu' /etc/os-release || ! clean /usr/bin/grep -Eq '^VERSION_ID="?24\.04"?$' /etc/os-release; then
   fail
