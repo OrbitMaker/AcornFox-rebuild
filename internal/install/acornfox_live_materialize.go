@@ -117,7 +117,7 @@ func (m *acornFoxLiveMaterializer) Materialize(ctx context.Context) (result Acor
 		journal, m.lease.journal = next, next
 	}
 	for _, entry := range entries {
-		if entry.Kind == SubstrateEntryDirectory && acornFoxLiveEnsureDir(target, m.lease.store, m.lease.store.layout.livePath(entry.Path), os.FileMode(entry.Mode), markEffect) != nil {
+		if entry.Kind == SubstrateEntryDirectory && acornFoxLiveEnsureDirOwned(target, m.lease.store, m.lease.store.layout.livePath(entry.Path), os.FileMode(entry.Mode), acornFoxLivePrincipalForEntry(m.lease.store.layout, entry), markEffect) != nil {
 			return AcornFoxLiveReceiptV1{}, fmt.Errorf("ensure directory %s: %w", entry.Path, ErrAcornFoxLiveConflict)
 		}
 	}
@@ -129,7 +129,7 @@ func (m *acornFoxLiveMaterializer) Materialize(ctx context.Context) (result Acor
 		if readErr != nil {
 			return AcornFoxLiveReceiptV1{}, fmt.Errorf("read file %s: %w", entry.Path, ErrAcornFoxLiveConflict)
 		}
-		if writeErr := acornFoxLiveWriteFile(target, m.lease.store, m.lease.journal.TransactionID, m.lease.store.layout.livePath(entry.Path), raw, os.FileMode(entry.Mode), markEffect); writeErr != nil {
+		if writeErr := acornFoxLiveWriteFileOwned(target, m.lease.store, m.lease.journal.TransactionID, m.lease.store.layout.livePath(entry.Path), raw, os.FileMode(entry.Mode), acornFoxLivePrincipalForEntry(m.lease.store.layout, entry), markEffect); writeErr != nil {
 			return AcornFoxLiveReceiptV1{}, fmt.Errorf("write file %s (%v): %w", entry.Path, writeErr, ErrAcornFoxLiveConflict)
 		}
 	}
@@ -300,6 +300,40 @@ func acornFoxLiveEnsureRoot(root *os.Root, store *TaskAcornFoxRepoStore, markEff
 }
 
 func acornFoxLiveEnsureDir(root *os.Root, store *TaskAcornFoxRepoStore, path string, mode os.FileMode, markEffect func()) error {
+	return acornFoxLiveEnsureDirOwned(root, store, path, mode, acornFoxInstallPrincipal{uid: store.uid, gid: store.gid}, markEffect)
+}
+
+func acornFoxLivePrincipalForEntry(layout acornFoxInstallLayout, entry SubstrateEntry) acornFoxInstallPrincipal {
+	role, ok := acornFoxLiveRoleFor(entry)
+	if !ok {
+		return acornFoxInstallPrincipal{uid: -1, gid: -1}
+	}
+	principal, ok := layout.owner(role)
+	if !ok {
+		return acornFoxInstallPrincipal{uid: -1, gid: -1}
+	}
+	return principal
+}
+
+func acornFoxLiveApplyOwner(store *TaskAcornFoxRepoStore, file acornFoxRepoFile, principal acornFoxInstallPrincipal) error {
+	if store == nil || store.ownership.chown == nil || store.ownership.observe == nil || principal.uid < 0 || principal.gid < 0 {
+		return ErrAcornFoxLiveConflict
+	}
+	if err := store.ownership.chown(file, principal.uid, principal.gid); err != nil {
+		return err
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	observed, ok := store.ownership.observe(info)
+	if !ok || observed != principal {
+		return ErrAcornFoxLiveConflict
+	}
+	return nil
+}
+
+func acornFoxLiveEnsureDirOwned(root *os.Root, store *TaskAcornFoxRepoStore, path string, mode os.FileMode, principal acornFoxInstallPrincipal, markEffect func()) error {
 	info, err := root.Lstat(path)
 	created := errors.Is(err, os.ErrNotExist)
 	if created {
@@ -326,8 +360,12 @@ func acornFoxLiveEnsureDir(root *os.Root, store *TaskAcornFoxRepoStore, path str
 		if openErr != nil {
 			return openErr
 		}
+		ownerErr := acornFoxLiveApplyOwner(store, file, principal)
 		syncErr := file.Sync()
 		closeErr := file.Close()
+		if ownerErr != nil {
+			return ownerErr
+		}
 		if syncErr != nil {
 			return syncErr
 		}
@@ -340,6 +378,10 @@ func acornFoxLiveEnsureDir(root *os.Root, store *TaskAcornFoxRepoStore, path str
 }
 
 func acornFoxLiveWriteFile(root *os.Root, store *TaskAcornFoxRepoStore, transactionID, path string, raw []byte, mode os.FileMode, markEffect func()) error {
+	return acornFoxLiveWriteFileOwned(root, store, transactionID, path, raw, mode, acornFoxInstallPrincipal{uid: store.uid, gid: store.gid}, markEffect)
+}
+
+func acornFoxLiveWriteFileOwned(root *os.Root, store *TaskAcornFoxRepoStore, transactionID, path string, raw []byte, mode os.FileMode, principal acornFoxInstallPrincipal, markEffect func()) error {
 	if info, err := root.Lstat(path); err == nil {
 		if acornFoxLiveExactFile(root, store, path, raw, mode, false) {
 			return nil
@@ -377,6 +419,9 @@ func acornFoxLiveWriteFile(root *os.Root, store *TaskAcornFoxRepoStore, transact
 	markEffect()
 	if err = acornFoxLiveStep("chmod"); err == nil {
 		err = file.Chmod(mode)
+	}
+	if err == nil {
+		err = acornFoxLiveApplyOwner(store, file, principal)
 	}
 	if err == nil {
 		err = acornFoxLiveStep("modeled-apply")
