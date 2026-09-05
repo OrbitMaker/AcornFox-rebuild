@@ -16,6 +16,9 @@ func TestBuildWebAssetsV1UsesTrustedNode(t *testing.T) {
 		t.Fatal(err)
 	}
 	task, npmCache := buildTaskRoot(t), buildTaskRoot(t)
+	if err := os.Mkdir(filepath.Join(npmCache, "_cacache"), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	stage, err := buildWebAssetsV1(context.Background(), plan, task, npmCache, fakeWebNode(t, plan))
 	if err != nil || stage == nil {
 		t.Fatalf("stage=%#v err=%v", stage, err)

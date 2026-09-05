@@ -101,7 +101,8 @@ function buildAttestationPlugin(contract: BuildContract, release?: ReleaseContra
           release
             ? {
                 apiBaseUrl: contract.apiBaseUrl,
-                mode: RELEASE_MODE,
+                mode: LIVE_API_MODE,
+                product: "acornfox",
                 releaseId: release.releaseId,
                 schemaVersion: RELEASE_SCHEMA_VERSION,
                 sourceCommit: release.sourceCommit,

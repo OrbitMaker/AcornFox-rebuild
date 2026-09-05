@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 )
 
 var ErrWebStage = errors.New("acornfox web stage is invalid")
@@ -45,6 +46,45 @@ type WebAssetStageV1 struct {
 	closed                bool
 }
 
+type pinnedNPMCache struct {
+	path string
+	info os.FileInfo
+}
+
+func pinNPMCache(path string) (pinnedNPMCache, error) {
+	path, err := cleanExistingDirectory(path)
+	if err != nil {
+		return pinnedNPMCache{}, ErrWebStage
+	}
+	info, err := os.Lstat(path)
+	if err != nil || info.Mode().Perm() != 0o700 {
+		return pinnedNPMCache{}, ErrWebStage
+	}
+	if stat, ok := info.Sys().(*syscall.Stat_t); !ok || int(stat.Uid) != os.Getuid() {
+		return pinnedNPMCache{}, ErrWebStage
+	}
+	root, err := os.OpenRoot(path)
+	if err != nil {
+		return pinnedNPMCache{}, ErrWebStage
+	}
+	defer root.Close()
+	opened, err := root.Stat(".")
+	if err != nil || !os.SameFile(info, opened) {
+		return pinnedNPMCache{}, ErrWebStage
+	}
+	return pinnedNPMCache{path, info}, nil
+}
+func (cache pinnedNPMCache) valid() bool {
+	info, err := os.Lstat(cache.path)
+	if err != nil || info.Mode().Perm() != 0o700 || !os.SameFile(info, cache.info) {
+		return false
+	}
+	if stat, ok := info.Sys().(*syscall.Stat_t); !ok || int(stat.Uid) != os.Getuid() {
+		return false
+	}
+	return true
+}
+
 func BuildWebAssetsV1(ctx context.Context, plan GoBuildPlanV1, taskRoot, npmCacheRoot string) (*WebAssetStageV1, error) {
 	return buildWebAssetsV1(ctx, plan, taskRoot, npmCacheRoot, plan.nodeExecutable.run)
 }
@@ -57,8 +97,8 @@ func buildWebAssetsV1(ctx context.Context, plan GoBuildPlanV1, taskRoot, npmCach
 	if err != nil {
 		return nil, ErrWebStage
 	}
-	npmCacheRoot, _, err = pinStageParent(npmCacheRoot)
-	if err != nil || npmCacheRoot == taskRoot || pathWithin(taskRoot, npmCacheRoot) || pathWithin(npmCacheRoot, taskRoot) {
+	npmCache, err := pinNPMCache(npmCacheRoot)
+	if err != nil || npmCache.path == taskRoot || pathWithin(taskRoot, npmCache.path) || pathWithin(npmCache.path, taskRoot) {
 		return nil, ErrWebStage
 	}
 	stageRoot, err := os.MkdirTemp(taskRoot, ".acornfox-web-stage-")
@@ -89,13 +129,22 @@ func buildWebAssetsV1(ctx context.Context, plan GoBuildPlanV1, taskRoot, npmCach
 	if err := copyFrozenWeb(frozen, webRoot, plan.sourcePolicy); err != nil {
 		return fail()
 	}
-	env, err := webStageEnvironment(plan.Environment(), stageRoot, npmCacheRoot, plan)
+	env, err := webStageEnvironment(plan.Environment(), stageRoot, npmCache.path, plan)
 	if err != nil {
 		return fail()
 	}
 	node := plan.nodeExecutable
 	node.run = runner
-	runNPM := func(args ...string) ([]byte, error) { return runNPMCLI(ctx, node, plan.npmCLI, args, webRoot, env) }
+	runNPM := func(args ...string) ([]byte, error) {
+		if len(args) > 0 && args[0] != "--version" && !npmCache.valid() {
+			return nil, ErrWebStage
+		}
+		out, err := runNPMCLI(ctx, node, plan.npmCLI, args, webRoot, env)
+		if len(args) > 0 && args[0] != "--version" && !npmCache.valid() {
+			return nil, ErrWebStage
+		}
+		return out, err
+	}
 	if output, err := node.Run(ctx, []string{"--version"}, webRoot, env); err != nil || strings.TrimSpace(string(output)) != plan.toolchain.NodeVersion {
 		return fail()
 	}
@@ -114,7 +163,7 @@ func buildWebAssetsV1(ctx context.Context, plan GoBuildPlanV1, taskRoot, npmCach
 	if _, err := node.Run(ctx, []string{filepath.Join(webRoot, "node_modules", "vite", "bin", "vite.js"), "build", "--mode", "acornfox-release"}, webRoot, env); err != nil {
 		return fail()
 	}
-	if _, err := runNPM("cache", "verify"); err != nil || !plan.npmCLI.valid() || !plan.cache.valid() {
+	if _, err := runNPM("cache", "verify"); err != nil || !plan.npmCLI.valid() || !plan.cache.valid() || !npmCache.valid() {
 		return fail()
 	}
 	files, err := inspectWebDist(filepath.Join(webRoot, "dist"), plan)

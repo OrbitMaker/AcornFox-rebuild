@@ -31,7 +31,8 @@ test("release mode emits exact release metadata", async () => {
   const metadata = JSON.parse(await readFile(join(webRoot, "dist", "build-metadata.json"), "utf8"));
   assert.deepEqual(metadata, {
     apiBaseUrl: "/api/v1",
-    mode: "acornfox-release",
+    mode: "live",
+    product: "acornfox",
     releaseId: "release-1.2.3-rc.1",
     schemaVersion: "acornfox-release-build-attestation.v1",
     sourceCommit: source.ACORNFOX_SOURCE_COMMIT,
