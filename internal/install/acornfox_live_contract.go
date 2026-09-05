@@ -67,6 +67,7 @@ type AcornFoxLiveReceiptV1 struct {
 	LiveTreeSHA256         string                `json:"live_tree_sha256"`
 	OwnershipPlanSHA256    string                `json:"ownership_plan_sha256"`
 	StaticSetSHA256        string                `json:"static_set_sha256"`
+	LayoutSHA256           string                `json:"layout_sha256,omitempty"`
 	OwnershipEvidence      string                `json:"ownership_evidence"`
 	Entries                []AcornFoxLiveEntryV1 `json:"entries"`
 }
@@ -221,7 +222,7 @@ func hasAcornFoxLiveHealthPath(path string) bool {
 }
 
 func (r AcornFoxLiveReceiptV1) Validate() error {
-	if r.SchemaVersion != AcornFoxLiveReceiptV1Schema || r.State != "task_live_materialized" || !validSHA(r.BindingSHA256) || !validSHA(r.SubstrateReceiptSHA256) || !validID(r.ReleaseID) || !validSHA(r.LiveTreeSHA256) || !validSHA(r.OwnershipPlanSHA256) || !validSHA(r.StaticSetSHA256) || r.OwnershipEvidence != "symbolic" {
+	if r.SchemaVersion != AcornFoxLiveReceiptV1Schema || (r.State != "task_live_materialized" && r.State != "host_live_materialized") || !validSHA(r.BindingSHA256) || !validSHA(r.SubstrateReceiptSHA256) || !validID(r.ReleaseID) || !validSHA(r.LiveTreeSHA256) || !validSHA(r.OwnershipPlanSHA256) || !validSHA(r.StaticSetSHA256) || (r.LayoutSHA256 != "" && !validSHA(r.LayoutSHA256)) || (r.State == "task_live_materialized" && (r.LayoutSHA256 != "" || r.OwnershipEvidence != "symbolic")) || (r.State == "host_live_materialized" && (r.LayoutSHA256 == "" || r.OwnershipEvidence != "host_uid_gid_verified")) {
 		return errors.New("AcornFox live receipt identity is invalid")
 	}
 	if err := validateAcornFoxLiveEntries(r.Entries); err != nil {

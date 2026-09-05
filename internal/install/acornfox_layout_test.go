@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -35,12 +36,16 @@ func TestTaskAcornFoxLayoutKeepsExistingTaskTopology(t *testing.T) {
 
 func TestTestProductionAcornFoxLayoutRejectsHostileRootsAndPrincipals(t *testing.T) {
 	parent := t.TempDir()
-	state := filepath.Join(parent, "state")
 	host := filepath.Join(parent, "host")
-	for _, path := range []string{state, host} {
-		if err := os.Mkdir(path, durableDirMode); err != nil {
-			t.Fatal(err)
-		}
+	state := filepath.Join(host, "var", "lib", "acornfox", "install")
+	if err := os.Mkdir(host, durableDirMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(state, durableDirMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(state, durableDirMode); err != nil {
+		t.Fatal(err)
 	}
 	principals := acornFoxTestLayoutPrincipals()
 	first, err := newTestProductionAcornFoxLayout(state, host, os.Getuid(), os.Getgid(), principals)
@@ -71,8 +76,8 @@ func TestTestProductionAcornFoxLayoutRejectsHostileRootsAndPrincipals(t *testing
 			}
 		})
 	}
-	if _, err := newTestProductionAcornFoxLayout(state, state, os.Getuid(), os.Getgid(), principals); err == nil {
-		t.Fatal("same production roots were accepted")
+	if _, err := newTestProductionAcornFoxLayout(filepath.Join(host, "wrong"), host, os.Getuid(), os.Getgid(), principals); err == nil {
+		t.Fatal("noncanonical production state root was accepted")
 	}
 	if err := os.Chmod(state, 0o755); err != nil {
 		t.Fatal(err)
@@ -190,11 +195,16 @@ func TestTaskAcornFoxLayoutDoesNotChangeCanonicalTaskBytes(t *testing.T) {
 
 func TestProductionTestLayoutSeparatesStateAndPinnedHostBeforeL3(t *testing.T) {
 	parent := t.TempDir()
-	state, host := filepath.Join(parent, "state"), filepath.Join(parent, "host")
-	for _, path := range []string{state, host} {
-		if err := os.Mkdir(path, durableDirMode); err != nil {
-			t.Fatal(err)
-		}
+	host := filepath.Join(parent, "host")
+	state := filepath.Join(host, "var", "lib", "acornfox", "install")
+	if err := os.Mkdir(host, durableDirMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(state, durableDirMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(state, durableDirMode); err != nil {
+		t.Fatal(err)
 	}
 	layout, err := newTestProductionAcornFoxLayout(state, host, os.Getuid(), os.Getgid(), acornFoxTestLayoutPrincipals())
 	if err != nil {
@@ -231,8 +241,8 @@ func TestProductionTestLayoutSeparatesStateAndPinnedHostBeforeL3(t *testing.T) {
 	}
 	defer store.Close()
 	acornFoxLayoutCreatePreparedJournal(t, store, published.receipt)
-	if files, err := os.ReadDir(host); err != nil || len(files) != 0 {
-		t.Fatalf("host received state data files=%v err=%v", files, err)
+	if _, err := os.Lstat(filepath.Join(host, acornFoxRepoInstallDir)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("host received state journal err=%v", err)
 	}
 	if files, err := os.ReadDir(state); err != nil || len(files) == 0 {
 		t.Fatalf("state lacks stage/substrate/journal files=%v err=%v", files, err)
@@ -247,8 +257,8 @@ func TestProductionTestLayoutSeparatesStateAndPinnedHostBeforeL3(t *testing.T) {
 	if _, err := materializeAcornFoxLive(context.Background(), store, published, receipt.BindingSHA256); !errors.Is(err, ErrAcornFoxLiveConflict) {
 		t.Fatalf("L2 production materialize=%v", err)
 	}
-	if files, err := os.ReadDir(host); err != nil || len(files) != 0 {
-		t.Fatalf("gated L2 materialization changed host files=%v err=%v", files, err)
+	if _, err := os.Lstat(filepath.Join(host, "opt")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("gated L2 materialization changed host live paths err=%v", err)
 	}
 	if err := os.Rename(host, host+"-old"); err != nil {
 		t.Fatal(err)
@@ -265,17 +275,70 @@ func TestProductionTestLayoutSeparatesStateAndPinnedHostBeforeL3(t *testing.T) {
 	if files, err := os.ReadDir(host); err != nil || len(files) != 0 {
 		t.Fatalf("replaced host root received effects files=%v err=%v", files, err)
 	}
-	if err := os.Rename(state, state+"-old"); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Mkdir(state, durableDirMode); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.openRoot(); !errors.Is(err, ErrAcornFoxRepoConflict) {
-		t.Fatalf("replaced state root open=%v", err)
-	}
 	if got := acornFoxProductionManagedRoots(); !sameAcornFoxStringSlice(got, []string{"opt/acornfox", "etc/acornfox", "var/lib/acornfox", "var/log/acornfox"}) {
 		t.Fatalf("production scope=%q", got)
+	}
+}
+
+func TestProductionLayoutEvidenceBindsDTOsWithoutHostEffects(t *testing.T) {
+	parent := t.TempDir()
+	host := filepath.Join(parent, "host")
+	state := filepath.Join(host, "var", "lib", "acornfox", "install")
+	if err := os.Mkdir(host, durableDirMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(state, durableDirMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(state, durableDirMode); err != nil {
+		t.Fatal(err)
+	}
+	layout, err := newTestProductionAcornFoxLayout(state, host, os.Getuid(), os.Getgid(), acornFoxTestLayoutPrincipals())
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding, substrate := strings.Repeat("a", 64), strings.Repeat("b", 64)
+	journal, err := newAcornFoxRepoJournalForLayout(layout, binding, substrate)
+	if err != nil || journal.LayoutSHA256 != layout.evidence() || journal.History[0].EvidenceSHA256 == "" {
+		t.Fatalf("production journal=%#v err=%v", journal, err)
+	}
+	taskPrepared, _ := AcornFoxRepoPreparedEvidence(binding, substrate)
+	if journal.History[0].EvidenceSHA256 == taskPrepared {
+		t.Fatal("production prepared evidence reused task domain")
+	}
+	if _, err := MarshalAcornFoxRepoJournalV1(journal); err != nil {
+		t.Fatal(err)
+	}
+	taskJournal := journal
+	taskJournal.History = append([]AcornFoxRepoHistoryV1(nil), journal.History...)
+	taskJournal.LayoutSHA256 = ""
+	taskJournal.History[0].EvidenceSHA256 = taskPrepared
+	if err := taskJournal.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := newAcornFoxRepoStoreForLayout(layout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	lock, err := store.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Create(context.Background(), taskJournal); !errors.Is(err, ErrAcornFoxRepoConflict) {
+		t.Fatalf("production accepted task journal=%v", err)
+	}
+	if err := journal.Validate(); err != nil {
+		t.Fatalf("production journal validate=%v journal=%#v", err, journal)
+	}
+	if err := store.Create(context.Background(), journal); err != nil {
+		t.Fatal(err)
+	}
+	if err := lock.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(host, "opt")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("DTO-only test changed host tree err=%v", err)
 	}
 }
 
@@ -318,7 +381,8 @@ func acornFoxLayoutCreatePreparedJournal(t *testing.T, store *TaskAcornFoxRepoSt
 	journal := newAcornFoxRepoJournal()
 	journal.BindingSHA256 = receipt.CandidateReceipt.BindingSHA256
 	journal.SubstrateReceiptSHA256 = sha256Hex(raw)
-	prepared, err := AcornFoxRepoPreparedEvidence(journal.BindingSHA256, journal.SubstrateReceiptSHA256)
+	journal.LayoutSHA256 = store.layout.evidence()
+	prepared, err := acornFoxRepoPreparedEvidenceForLayout(journal.LayoutSHA256, journal.BindingSHA256, journal.SubstrateReceiptSHA256)
 	if err == nil {
 		journal.History[0].EvidenceSHA256 = prepared
 		err = journal.Validate()

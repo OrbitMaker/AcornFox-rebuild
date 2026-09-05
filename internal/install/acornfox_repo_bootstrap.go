@@ -29,13 +29,14 @@ type AcornFoxRepoActivationV1 struct {
 	LiveTreeSHA256         string `json:"live_tree_sha256"`
 	StaticSetSHA256        string `json:"static_set_sha256"`
 	OwnershipPlanSHA256    string `json:"ownership_plan_sha256"`
+	LayoutSHA256           string `json:"layout_sha256,omitempty"`
 	ReleaseID              string `json:"release_id"`
 	ReleaseTreeSHA256      string `json:"release_tree_sha256"`
 }
 
 func (a AcornFoxRepoActivationV1) Validate() error {
 	id, err := AcornFoxRepoActivationID(a.BindingSHA256)
-	if err != nil || a.SchemaVersion != 1 || a.Mode != "task_model" || !validID(a.TransactionID) || a.ActivationID != id || !validSHA(a.SubstrateReceiptSHA256) || !validSHA(a.LiveTreeSHA256) || !validSHA(a.StaticSetSHA256) || !validSHA(a.OwnershipPlanSHA256) || !validID(a.ReleaseID) || !validSHA(a.ReleaseTreeSHA256) {
+	if err != nil || a.SchemaVersion != 1 || (a.Mode != "task_model" && a.Mode != "production_host") || !validID(a.TransactionID) || a.ActivationID != id || !validSHA(a.SubstrateReceiptSHA256) || !validSHA(a.LiveTreeSHA256) || !validSHA(a.StaticSetSHA256) || !validSHA(a.OwnershipPlanSHA256) || !validID(a.ReleaseID) || !validSHA(a.ReleaseTreeSHA256) || (a.LayoutSHA256 != "" && !validSHA(a.LayoutSHA256)) || (a.Mode == "task_model" && a.LayoutSHA256 != "") || (a.Mode == "production_host" && a.LayoutSHA256 == "") {
 		return ErrAcornFoxRepoBootstrapConflict
 	}
 	return nil
@@ -173,11 +174,19 @@ func prepareAcornFoxRepository(ctx context.Context, store *TaskAcornFoxRepoStore
 }
 
 func acornFoxRepoActivation(j AcornFoxRepoJournalV1, r AcornFoxLiveReceiptV1, s *PublishedAcornFoxSubstrateV1) (AcornFoxRepoActivationV1, []byte, error) {
+	return acornFoxRepoActivationForLayout(acornFoxInstallLayout{mode: acornFoxInstallLayoutTask}, j, r, s)
+}
+
+func acornFoxRepoActivationForLayout(layout acornFoxInstallLayout, j AcornFoxRepoJournalV1, r AcornFoxLiveReceiptV1, s *PublishedAcornFoxSubstrateV1) (AcornFoxRepoActivationV1, []byte, error) {
 	id, e := AcornFoxRepoActivationID(j.BindingSHA256)
 	if e != nil {
 		return AcornFoxRepoActivationV1{}, nil, e
 	}
-	a := AcornFoxRepoActivationV1{1, "task_model", j.TransactionID, id, j.BindingSHA256, j.SubstrateReceiptSHA256, r.LiveTreeSHA256, r.StaticSetSHA256, r.OwnershipPlanSHA256, s.receipt.CandidateReceipt.ReleaseID, s.receipt.ReleaseTreeSHA256}
+	mode := "task_model"
+	if layout.mode == acornFoxInstallLayoutProduction {
+		mode = "production_host"
+	}
+	a := AcornFoxRepoActivationV1{SchemaVersion: 1, Mode: mode, TransactionID: j.TransactionID, ActivationID: id, BindingSHA256: j.BindingSHA256, SubstrateReceiptSHA256: j.SubstrateReceiptSHA256, LiveTreeSHA256: r.LiveTreeSHA256, StaticSetSHA256: r.StaticSetSHA256, OwnershipPlanSHA256: r.OwnershipPlanSHA256, LayoutSHA256: layout.evidence(), ReleaseID: s.receipt.CandidateReceipt.ReleaseID, ReleaseTreeSHA256: s.receipt.ReleaseTreeSHA256}
 	raw, e := MarshalAcornFoxRepoActivationV1(a)
 	return a, raw, e
 }

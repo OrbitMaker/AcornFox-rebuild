@@ -77,7 +77,7 @@ func newTaskAcornFoxLayout(root string, uid, gid int) (acornFoxInstallLayout, er
 // created temporary roots and modeled principals; it never permits real / or
 // a public configurable production path.
 func newTestProductionAcornFoxLayout(stateRoot, hostRoot string, stateUID, stateGID int, principals map[AcornFoxLiveRole]acornFoxInstallPrincipal) (acornFoxInstallLayout, error) {
-	if stateUID < 0 || stateGID < 0 || stateRoot == hostRoot || !safeAcornFoxTestRoot(stateRoot) || !safeAcornFoxTestRoot(hostRoot) {
+	if stateUID < 0 || stateGID < 0 || !safeAcornFoxTestRoot(stateRoot) || !safeAcornFoxTestRoot(hostRoot) || stateRoot != filepath.Join(hostRoot, "var", "lib", "acornfox", "install") {
 		return acornFoxInstallLayout{}, errors.New("AcornFox production test layout roots are unsafe")
 	}
 	stateInfo, stateErr := os.Lstat(stateRoot)
@@ -139,7 +139,7 @@ func (l acornFoxInstallLayout) validate() error {
 		}
 		return nil
 	}
-	if l.stateRootPath == l.hostRootPath || !safeAcornFoxTestRoot(l.stateRootPath) || !safeAcornFoxTestRoot(l.hostRootPath) || l.livePrefix != "" || l.liveReceiptPath != "var/lib/acornfox/install/live-receipt.json" || !safeAcornFoxInstallRoot(l.stateRootInfo, l.stateOwner.uid, l.stateOwner.gid, true) || !safeAcornFoxHostRoot(l.hostRootInfo) || l.principals[AcornFoxLiveRootRole] != (acornFoxInstallPrincipal{}) || (l.evidenceSHA256 != "" && (!validSHA(l.evidenceSHA256) || l.evidenceSHA256 != l.digest())) {
+	if l.stateRootPath == l.hostRootPath || !safeAcornFoxTestRoot(l.stateRootPath) || !safeAcornFoxTestRoot(l.hostRootPath) || l.stateRootPath != filepath.Join(l.hostRootPath, "var", "lib", "acornfox", "install") || l.livePrefix != "" || l.liveReceiptPath != "var/lib/acornfox/install/live-receipt.json" || !safeAcornFoxInstallRoot(l.stateRootInfo, l.stateOwner.uid, l.stateOwner.gid, true) || !safeAcornFoxHostRoot(l.hostRootInfo) || l.principals[AcornFoxLiveRootRole] != (acornFoxInstallPrincipal{}) || (l.evidenceSHA256 != "" && (!validSHA(l.evidenceSHA256) || l.evidenceSHA256 != l.digest())) {
 		return errors.New("AcornFox production install layout is invalid")
 	}
 	seen := map[acornFoxInstallPrincipal]bool{}
@@ -249,6 +249,13 @@ func (l acornFoxInstallLayout) hostRootPinned() bool {
 
 func (l acornFoxInstallLayout) receiptPath() string {
 	return strings.TrimPrefix(l.liveReceiptPath, "./")
+}
+
+func (l acornFoxInstallLayout) evidence() string {
+	if l.mode == acornFoxInstallLayoutProduction {
+		return l.evidenceSHA256
+	}
+	return ""
 }
 
 // acornFoxProductionManagedRoots is deliberately an enumeration, not a root

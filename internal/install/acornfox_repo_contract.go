@@ -56,6 +56,7 @@ type AcornFoxRepoJournalV1 struct {
 	NeedsRecovery          bool                    `json:"needs_recovery"`
 	BindingSHA256          string                  `json:"binding_sha256"`
 	SubstrateReceiptSHA256 string                  `json:"substrate_receipt_sha256"`
+	LayoutSHA256           string                  `json:"layout_sha256,omitempty"`
 	LiveTreeSHA256         string                  `json:"live_tree_sha256,omitempty"`
 	OwnershipPlanSHA256    string                  `json:"ownership_plan_sha256,omitempty"`
 	StaticSetSHA256        string                  `json:"static_set_sha256,omitempty"`
@@ -93,6 +94,16 @@ func AcornFoxRepoPreparedEvidence(bindingSHA256, substrateReceiptSHA256 string) 
 	return acornFoxRepoEvidence("acornfox-repo-prepared-v1\x00", bindingSHA256, substrateReceiptSHA256), nil
 }
 
+func acornFoxRepoPreparedEvidenceForLayout(layoutSHA256, bindingSHA256, substrateReceiptSHA256 string) (string, error) {
+	if layoutSHA256 == "" {
+		return AcornFoxRepoPreparedEvidence(bindingSHA256, substrateReceiptSHA256)
+	}
+	if !validSHA(layoutSHA256) || !validSHA(bindingSHA256) || !validSHA(substrateReceiptSHA256) {
+		return "", errors.New("AcornFox repository prepared layout evidence inputs are invalid")
+	}
+	return acornFoxRepoEvidence("acornfox-repo-production-prepared-v1\x00", layoutSHA256, bindingSHA256, substrateReceiptSHA256), nil
+}
+
 // AcornFoxRepoFinalEvidence covers every immutable digest accepted by the
 // closed repository protocol, preventing a final receipt from omitting one.
 func AcornFoxRepoFinalEvidence(journal AcornFoxRepoJournalV1) (string, error) {
@@ -100,6 +111,12 @@ func AcornFoxRepoFinalEvidence(journal AcornFoxRepoJournalV1) (string, error) {
 		if !validSHA(digest) {
 			return "", errors.New("AcornFox repository final evidence input is invalid")
 		}
+	}
+	if journal.LayoutSHA256 != "" {
+		if !validSHA(journal.LayoutSHA256) {
+			return "", errors.New("AcornFox repository final layout evidence input is invalid")
+		}
+		return acornFoxRepoEvidence("acornfox-repo-production-final-v1\x00", journal.LayoutSHA256, journal.BindingSHA256, journal.SubstrateReceiptSHA256, journal.LiveTreeSHA256, journal.OwnershipPlanSHA256, journal.StaticSetSHA256, journal.ActivationSHA256, journal.ActivePointerSHA256, journal.CurrentPointerSHA256), nil
 	}
 	return acornFoxRepoEvidence("acornfox-repo-final-v1\x00", journal.BindingSHA256, journal.SubstrateReceiptSHA256, journal.LiveTreeSHA256, journal.OwnershipPlanSHA256, journal.StaticSetSHA256, journal.ActivationSHA256, journal.ActivePointerSHA256, journal.CurrentPointerSHA256), nil
 }
@@ -111,6 +128,12 @@ func AcornFoxRepoRecoveredEvidence(journal AcornFoxRepoJournalV1, phase AcornFox
 	if !validSHA(journal.BindingSHA256) || acornFoxRepoRank(phase) < 0 || !validSHA(priorFailureDigest) || !validSHA(phaseEvidence) {
 		return "", errors.New("AcornFox repository recovered evidence input is invalid")
 	}
+	if journal.LayoutSHA256 != "" {
+		if !validSHA(journal.LayoutSHA256) {
+			return "", errors.New("AcornFox repository recovered layout evidence input is invalid")
+		}
+		return acornFoxRepoEvidence("acornfox-repo-production-recovered-v1\x00", journal.LayoutSHA256, journal.BindingSHA256, string(phase), priorFailureDigest, phaseEvidence), nil
+	}
 	return acornFoxRepoEvidence("acornfox-repo-recovered-v1\x00", journal.BindingSHA256, string(phase), priorFailureDigest, phaseEvidence), nil
 }
 
@@ -121,11 +144,26 @@ func AcornFoxRepoActivationID(bindingSHA256 string) (string, error) {
 	return "acornfox-repo-" + acornFoxRepoEvidence("acornfox-repo-activation-v1\x00", bindingSHA256), nil
 }
 
+// newAcornFoxRepoJournalForLayout mints the initial journal evidence without
+// exposing a caller-configurable production constructor. Task callers retain
+// their existing journal path and therefore their historical bytes.
+func newAcornFoxRepoJournalForLayout(layout acornFoxInstallLayout, bindingSHA256, substrateReceiptSHA256 string) (AcornFoxRepoJournalV1, error) {
+	if layout.validate() != nil || !validSHA(bindingSHA256) || !validSHA(substrateReceiptSHA256) {
+		return AcornFoxRepoJournalV1{}, errors.New("AcornFox layout journal inputs are invalid")
+	}
+	prepared, err := acornFoxRepoPreparedEvidenceForLayout(layout.evidence(), bindingSHA256, substrateReceiptSHA256)
+	if err != nil {
+		return AcornFoxRepoJournalV1{}, err
+	}
+	journal := AcornFoxRepoJournalV1{SchemaVersion: AcornFoxRepoJournalV1Schema, TransactionID: "acornfox-layout-" + bindingSHA256[:12], Revision: 1, Phase: AcornFoxRepoPrepared, BindingSHA256: bindingSHA256, SubstrateReceiptSHA256: substrateReceiptSHA256, LayoutSHA256: layout.evidence(), History: []AcornFoxRepoHistoryV1{{Revision: 1, Kind: AcornFoxRepoHistoryAdvance, To: AcornFoxRepoPrepared, EvidenceSHA256: prepared}}}
+	return journal, journal.Validate()
+}
+
 func (j AcornFoxRepoJournalV1) Validate() error {
-	if j.SchemaVersion != AcornFoxRepoJournalV1Schema || !validID(j.TransactionID) || j.Revision < 1 || acornFoxRepoRank(j.Phase) < 0 || !validSHA(j.BindingSHA256) || !validSHA(j.SubstrateReceiptSHA256) || int64(len(j.History)) != j.Revision || len(j.History) == 0 {
+	if j.SchemaVersion != AcornFoxRepoJournalV1Schema || !validID(j.TransactionID) || j.Revision < 1 || acornFoxRepoRank(j.Phase) < 0 || !validSHA(j.BindingSHA256) || !validSHA(j.SubstrateReceiptSHA256) || (j.LayoutSHA256 != "" && !validSHA(j.LayoutSHA256)) || int64(len(j.History)) != j.Revision || len(j.History) == 0 {
 		return errors.New("AcornFox repository journal identity is invalid")
 	}
-	prepared, _ := AcornFoxRepoPreparedEvidence(j.BindingSHA256, j.SubstrateReceiptSHA256)
+	prepared, _ := acornFoxRepoPreparedEvidenceForLayout(j.LayoutSHA256, j.BindingSHA256, j.SubstrateReceiptSHA256)
 	phase := AcornFoxRepoPrepared
 	recovering := false
 	var priorFailureDigest string
@@ -239,7 +277,7 @@ func sameAcornFoxRepoJournal(left, right AcornFoxRepoJournalV1) bool {
 func acornFoxRepoPhaseEvidence(journal AcornFoxRepoJournalV1, phase AcornFoxRepoPhase) string {
 	switch phase {
 	case AcornFoxRepoPrepared:
-		evidence, _ := AcornFoxRepoPreparedEvidence(journal.BindingSHA256, journal.SubstrateReceiptSHA256)
+		evidence, _ := acornFoxRepoPreparedEvidenceForLayout(journal.LayoutSHA256, journal.BindingSHA256, journal.SubstrateReceiptSHA256)
 		return evidence
 	case AcornFoxRepoLiveMaterialized:
 		return journal.LiveTreeSHA256

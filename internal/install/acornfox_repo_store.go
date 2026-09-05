@@ -365,7 +365,7 @@ func (s *TaskAcornFoxRepoStore) mintPreparedLease(ctx context.Context, substrate
 	}
 	fail := func() (*acornFoxPreparedRepoLease, error) { _ = lock.Release(); return nil, ErrAcornFoxRepoConflict }
 	journal, err := s.Load(ctx)
-	if err != nil || (journal.Phase != AcornFoxRepoPrepared && journal.Phase != AcornFoxRepoLiveMaterialized && journal.Phase != AcornFoxRepoStaticVerified && journal.Phase != AcornFoxRepoActivationWritten && journal.Phase != AcornFoxRepoActivePublished && journal.Phase != AcornFoxRepoCurrentPublished && journal.Phase != AcornFoxRepoPreparedFinal) || journal.BindingSHA256 != bindingSHA256 || substrate.Verify() != nil || !sameAcornFoxLiveTaskRoot(s, substrate) {
+	if err != nil || (journal.Phase != AcornFoxRepoPrepared && journal.Phase != AcornFoxRepoLiveMaterialized && journal.Phase != AcornFoxRepoStaticVerified && journal.Phase != AcornFoxRepoActivationWritten && journal.Phase != AcornFoxRepoActivePublished && journal.Phase != AcornFoxRepoCurrentPublished && journal.Phase != AcornFoxRepoPreparedFinal) || journal.BindingSHA256 != bindingSHA256 || journal.LayoutSHA256 != s.layout.evidence() || substrate.Verify() != nil || !sameAcornFoxLiveTaskRoot(s, substrate) {
 		return fail()
 	}
 	raw, err := MarshalInactiveSubstrateReceiptV1(substrate.receipt)
@@ -650,7 +650,7 @@ func (s *TaskAcornFoxRepoStore) writeTemporary(root *os.Root, name string, raw [
 }
 
 func (s *TaskAcornFoxRepoStore) Create(ctx context.Context, journal AcornFoxRepoJournalV1) error {
-	if ctx == nil || ctx.Err() != nil || !s.ownsLock() || !acornFoxRepoInitialJournal(journal) {
+	if ctx == nil || ctx.Err() != nil || !s.ownsLock() || !acornFoxRepoInitialJournal(journal) || journal.LayoutSHA256 != s.layout.evidence() {
 		return ErrAcornFoxRepoConflict
 	}
 	raw, err := MarshalAcornFoxRepoJournalV1(journal)
@@ -690,7 +690,7 @@ func acornFoxRepoInitialJournal(j AcornFoxRepoJournalV1) bool {
 }
 
 func (s *TaskAcornFoxRepoStore) Save(ctx context.Context, next AcornFoxRepoJournalV1) error {
-	if ctx == nil || ctx.Err() != nil || !s.ownsLock() || next.Validate() != nil {
+	if ctx == nil || ctx.Err() != nil || !s.ownsLock() || next.Validate() != nil || next.LayoutSHA256 != s.layout.evidence() {
 		return ErrAcornFoxRepoConflict
 	}
 	root, err := s.openRoot()
@@ -730,7 +730,7 @@ func (s *TaskAcornFoxRepoStore) Save(ctx context.Context, next AcornFoxRepoJourn
 	return nil
 }
 func validAcornFoxRepoSave(old, next AcornFoxRepoJournalV1) bool {
-	if next.Revision != old.Revision+1 || next.SchemaVersion != old.SchemaVersion || next.TransactionID != old.TransactionID || next.BindingSHA256 != old.BindingSHA256 || next.SubstrateReceiptSHA256 != old.SubstrateReceiptSHA256 || len(next.History) != len(old.History)+1 {
+	if next.Revision != old.Revision+1 || next.SchemaVersion != old.SchemaVersion || next.TransactionID != old.TransactionID || next.BindingSHA256 != old.BindingSHA256 || next.SubstrateReceiptSHA256 != old.SubstrateReceiptSHA256 || next.LayoutSHA256 != old.LayoutSHA256 || len(next.History) != len(old.History)+1 {
 		return false
 	}
 	for i := range old.History {
