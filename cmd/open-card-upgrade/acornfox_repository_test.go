@@ -127,6 +127,73 @@ func TestAcornFoxCleanRefusesNonRootBeforeBridge(t *testing.T) {
 	}
 }
 
+func TestAcornFoxCleanRefusesInvalidEmbeddedIdentityBeforeDependencies(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		role   string
+		mutate func()
+	}{
+		{"blank-version", "upgrade", func() { buildVersion = "" }},
+		{"bad-source", "upgrade", func() { buildSourceCommit = "not-a-commit" }},
+		{"bad-layout", "upgrade", func() { buildLayoutSchema = "2" }},
+		{"wrong-role", "healthcheck", func() {}},
+		{"wrong-process-identity", "upgrade", func() { processIdentity = "not-acornfox" }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			withAcornFoxIdentity(t)
+			test.mutate()
+			calls := 0
+			var stdout bytes.Buffer
+			code := runAcornFoxClean(context.Background(), []string{"recover-prepare", "--pending"}, &stdout, test.role, acornFoxCleanDependencies{
+				euid: func() int { calls++; return 0 },
+				recover: func(context.Context) (install.AcornFoxHostBootstrapReceiptV1, error) {
+					calls++
+					return cleanReceipt(), nil
+				},
+			})
+			if code != exitIneligible || calls != 0 {
+				t.Fatalf("code=%d calls=%d stdout=%q", code, calls, stdout.String())
+			}
+			if result := cleanJSON(t, stdout.Bytes()); result["code"] != "helper_identity_ineligible" {
+				t.Fatalf("result=%#v", result)
+			}
+		})
+	}
+}
+
+func TestAcornFoxCleanRefusesReceiptIdentityMismatch(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*install.AcornFoxHostBootstrapReceiptV1)
+	}{
+		{"release", func(receipt *install.AcornFoxHostBootstrapReceiptV1) { receipt.ReleaseID = "release-9.9.9" }},
+		{"source", func(receipt *install.AcornFoxHostBootstrapReceiptV1) {
+			receipt.SourceCommit = "abcdefabcdefabcdefabcdefabcdefabcdefabcd"
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			withAcornFoxIdentity(t)
+			calls := 0
+			var stdout, stderr bytes.Buffer
+			code := runWithDependencies(context.Background(), []string{"recover-finalize", "--pending"}, &stdout, &stderr, upgradeDependencies{acornFoxClean: acornFoxCleanDependencies{
+				euid: func() int { calls++; return 0 },
+				verifyPrepared: func(context.Context) (install.AcornFoxHostBootstrapReceiptV1, error) {
+					calls++
+					receipt := cleanReceipt()
+					test.mutate(&receipt)
+					return receipt, nil
+				},
+			}})
+			if code != exitIneligible || calls != 2 || stderr.Len() != 0 {
+				t.Fatalf("code=%d calls=%d stdout=%q stderr=%q", code, calls, stdout.String(), stderr.String())
+			}
+			if result := cleanJSON(t, stdout.Bytes()); result["code"] != "helper_identity_ineligible" {
+				t.Fatalf("result=%#v", result)
+			}
+		})
+	}
+}
+
 func TestAcornFoxCleanMapsBridgeErrors(t *testing.T) {
 	withAcornFoxIdentity(t)
 	for _, test := range []struct {
@@ -139,6 +206,9 @@ func TestAcornFoxCleanMapsBridgeErrors(t *testing.T) {
 		{"conflict", install.ErrAcornFoxRepoConflict, exitConflict, "repository_conflict"},
 		{"recovery", install.ErrAcornFoxRepoRecoveryUnknown, exitRecovery, "recovery_unknown"},
 		{"cancelled", context.Canceled, exitRecovery, "recovery_unknown"},
+		{"substrate-conflict", install.ErrAcornFoxSubstrateConflict, exitConflict, "repository_conflict"},
+		{"substrate-recovery", install.ErrAcornFoxSubstrateRecoveryRequired, exitRecovery, "recovery_unknown"},
+		{"stage-cleanup", install.ErrAcornFoxStageCleanupUnknown, exitRecovery, "recovery_unknown"},
 		{"input", errors.New("untrusted candidate"), exitIneligible, "candidate_ineligible"},
 	} {
 		t.Run(test.name, func(t *testing.T) {

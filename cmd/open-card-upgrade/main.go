@@ -335,6 +335,10 @@ func runAcornFoxClean(ctx context.Context, args []string, stdout io.Writer, role
 	if err != nil {
 		return writeAcornFoxCleanError(stdout, exitArgs, "invalid_arguments")
 	}
+	identity, ok := acornFoxCleanBuildIdentity(role)
+	if !ok {
+		return writeAcornFoxCleanError(stdout, exitIneligible, "helper_identity_ineligible")
+	}
 	if deps.euid == nil || deps.euid() != 0 {
 		return writeAcornFoxCleanError(stdout, exitIneligible, "root_ineligible")
 	}
@@ -361,7 +365,26 @@ func runAcornFoxClean(ctx context.Context, args []string, stdout io.Writer, role
 	if err != nil || receipt.Validate() != nil {
 		return writeAcornFoxCleanBridgeError(stdout, err)
 	}
+	if receipt.ReleaseID != identity.ReleaseID || receipt.SourceCommit != identity.SourceCommit {
+		return writeAcornFoxCleanError(stdout, exitIneligible, "helper_identity_ineligible")
+	}
 	return writeUpgradeJSON(stdout, exitOK, map[string]any{"ok": true, "command": config.command, "receipt": receipt})
+}
+
+// acornFoxCleanBuildIdentity is intentionally local: the clean bootstrap
+// command may run before a candidate is installed, so it cannot call the
+// installed-helper contract verifier to learn its identity.
+func acornFoxCleanBuildIdentity(role string) (install.AcornFoxBuildIdentityV1, bool) {
+	identity := install.AcornFoxBuildIdentityV1{
+		SchemaVersion: install.AcornFoxHelperContractV1Schema,
+		Product:       install.AcornFoxV1Product,
+		LayoutVersion: install.AcornFoxSubstrateLayoutV1,
+		Role:          role,
+		Version:       buildVersion,
+		ReleaseID:     "release-" + buildVersion,
+		SourceCommit:  buildSourceCommit,
+	}
+	return identity, processIdentity == "acornfox" && buildLayoutSchema == "1" && role == "upgrade" && identity.Validate() == nil
 }
 
 func parseAcornFoxCleanArgs(args []string) (upgradeCommandConfig, error) {
@@ -409,7 +432,9 @@ func writeAcornFoxCleanBridgeError(stdout io.Writer, err error) int {
 		return writeAcornFoxCleanError(stdout, exitRecovery, "recovery_unknown")
 	case errors.Is(err, install.ErrAcornFoxRepoLocked):
 		return writeAcornFoxCleanError(stdout, exitLocked, "repository_locked")
-	case errors.Is(err, install.ErrAcornFoxRepoBootstrapConflict), errors.Is(err, install.ErrAcornFoxRepoConflict), errors.Is(err, install.ErrAcornFoxLiveConflict):
+	case errors.Is(err, install.ErrAcornFoxSubstrateRecoveryRequired), errors.Is(err, install.ErrAcornFoxStageCleanupUnknown):
+		return writeAcornFoxCleanError(stdout, exitRecovery, "recovery_unknown")
+	case errors.Is(err, install.ErrAcornFoxRepoBootstrapConflict), errors.Is(err, install.ErrAcornFoxRepoConflict), errors.Is(err, install.ErrAcornFoxLiveConflict), errors.Is(err, install.ErrAcornFoxSubstrateConflict):
 		return writeAcornFoxCleanError(stdout, exitConflict, "repository_conflict")
 	default:
 		return writeAcornFoxCleanError(stdout, exitIneligible, "candidate_ineligible")
