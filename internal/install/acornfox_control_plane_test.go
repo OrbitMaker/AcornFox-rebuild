@@ -79,6 +79,18 @@ func writeAcornFoxControlPlaneStateEnv(t *testing.T, prepared acornFoxProduction
 	}
 }
 
+func writeAcornFoxControlPlaneStateReceipt(t *testing.T, prepared acornFoxProductionPreparedFixture, raw []byte) {
+	t.Helper()
+	writer, err := TaskDurableWriter(prepared.state, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	if err := writer.CreateMetadata(acornFoxControlPlaneReceipt, raw); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func writeAcornFoxControlPlaneActivationEnv(t *testing.T, prepared acornFoxProductionPreparedFixture, raw []byte) {
 	t.Helper()
 	activation, err := AcornFoxRepoActivationID(prepared.binding)
@@ -252,6 +264,104 @@ func TestAcornFoxControlPlaneRejectsActivationOnlyAndUnequalCopies(t *testing.T)
 			}())
 			if _, err := service.migrate(context.Background()); !errors.Is(err, ErrAcornFoxControlPlaneConflict) || len(ledger.rows) != 0 || len(runner.argv) != 0 {
 				t.Fatalf("err=%v rows=%d argv=%q", err, len(ledger.rows), runner.argv)
+			}
+			prepared.assertExternalSentinel(t)
+		})
+	}
+}
+
+func TestAcornFoxControlPlaneEnvironmentRejectsKeyAndQueryDrift(t *testing.T) {
+	service, _ := newAcornFoxControlPlanePrepared(t, &acornFoxControlPlaneLedgerFake{}, &acornFoxControlPlaneProvisionerFake{})
+	valid, err := service.newEnvironment()
+	if err != nil || !validAcornFoxControlPlaneEnvironment(valid) {
+		t.Fatalf("valid env=%q err=%v", valid, err)
+	}
+	for _, raw := range [][]byte{
+		bytes.Replace(valid, []byte("ACORNFOX_DATABASE_URL="), []byte("OPEN_CARD_DATABASE_URL="), 1),
+		bytes.Replace(valid, []byte("sslmode=disable"), []byte("sslmode=disable&x=1"), 1),
+		bytes.Replace(valid, []byte("sslmode=disable"), []byte("sslmode=require"), 1),
+		append(append([]byte(nil), valid[:len(valid)-1]...), []byte("\nextra\n")...),
+	} {
+		if validAcornFoxControlPlaneEnvironment(raw) {
+			t.Fatalf("drift accepted: %q", raw)
+		}
+	}
+}
+
+func TestAcornFoxControlPlaneReceiptFailureAndExactRetry(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		write     func(*DurableWriter, []byte) error
+		wasStored bool
+	}{
+		{name: "hard failure", write: func(*DurableWriter, []byte) error { return errors.New("injected receipt failure") }},
+		{name: "uncertain exact", wasStored: true, write: func(writer *DurableWriter, raw []byte) error {
+			if err := writer.CreateMetadata(acornFoxControlPlaneReceipt, raw); err != nil {
+				return err
+			}
+			return errors.New("injected receipt uncertainty")
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ledger, runner := &acornFoxControlPlaneLedgerFake{}, &acornFoxControlPlaneProvisionerFake{}
+			service, prepared := newAcornFoxControlPlanePrepared(t, ledger, runner)
+			write := service.writeReceipt
+			service.writeReceipt = test.write
+			if _, err := service.migrate(context.Background()); !errors.Is(err, ErrAcornFoxControlPlaneUnknown) || len(ledger.rows) != 33 {
+				t.Fatalf("first err=%v rows=%d", err, len(ledger.rows))
+			}
+			activation, _ := AcornFoxRepoActivationID(prepared.binding)
+			info, err := os.Lstat(filepath.Join(prepared.host, "opt", "acornfox", "activations", activation, acornFoxControlPlaneActivationEnv))
+			if err != nil {
+				t.Fatal(err)
+			}
+			prepared.owners.set(info, acornFoxInstallPrincipal{})
+			service.writeReceipt = write
+			receipt, err := service.migrate(context.Background())
+			if err != nil || receipt.Validate() != nil || len(ledger.rows) != 33 {
+				t.Fatalf("retry receipt=%#v err=%v rows=%d stored=%t", receipt, err, len(ledger.rows), test.wasStored)
+			}
+			prepared.assertExternalSentinel(t)
+		})
+	}
+}
+
+func TestAcornFoxControlPlaneRejectsStaleReceiptIdentity(t *testing.T) {
+	for _, field := range []string{"binding", "release", "source", "rows", "env", "identity"} {
+		t.Run(field, func(t *testing.T) {
+			ledger, runner := &acornFoxControlPlaneLedgerFake{}, &acornFoxControlPlaneProvisionerFake{}
+			service, prepared := newAcornFoxControlPlanePrepared(t, ledger, runner)
+			env, err := service.newEnvironment()
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeAcornFoxControlPlaneStateEnv(t, prepared, env)
+			authority, migrations, err := service.authority(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			receipt := AcornFoxControlPlaneMigrationReceiptV1{SchemaVersion: 1, State: "CONTROL_PLANE_MIGRATED", BindingSHA256: authority.binding, ReleaseID: authority.releaseID, SourceCommit: authority.sourceCommit, MigrationVersion: AcornFoxV1MigrationVersion, MigrationRowsSHA256: acornFoxMigrationRowsSHA256(migrations.rows), DatabaseEnvSHA256: sha256Bytes(env), DatabaseIdentitySHA256: acornFoxControlPlaneIdentitySHA256()}
+			switch field {
+			case "binding":
+				receipt.BindingSHA256 = acornFoxFixtureDigest("f")
+			case "release":
+				receipt.ReleaseID = "release-wrong"
+			case "source":
+				receipt.SourceCommit = strings.Repeat("f", 40)
+			case "rows":
+				receipt.MigrationRowsSHA256 = acornFoxFixtureDigest("f")
+			case "env":
+				receipt.DatabaseEnvSHA256 = acornFoxFixtureDigest("f")
+			case "identity":
+				receipt.DatabaseIdentitySHA256 = acornFoxFixtureDigest("f")
+			}
+			raw, err := MarshalAcornFoxControlPlaneMigrationReceiptV1(receipt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeAcornFoxControlPlaneStateReceipt(t, prepared, raw)
+			if _, err := service.migrate(context.Background()); !errors.Is(err, ErrAcornFoxControlPlaneConflict) || len(ledger.rows) != 0 || len(runner.argv) != 0 {
+				t.Fatalf("field=%s err=%v rows=%d argv=%q", field, err, len(ledger.rows), runner.argv)
 			}
 			prepared.assertExternalSentinel(t)
 		})

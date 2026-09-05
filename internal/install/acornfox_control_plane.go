@@ -108,6 +108,7 @@ type acornFoxControlPlane struct {
 	provisioner     acornFoxControlPlaneProvisioner
 	open            func([]byte) (BootstrapMigrationControl, error)
 	writeActivation func(*DurableWriter, []byte) error
+	writeReceipt    func(*DurableWriter, []byte) error
 }
 
 // MigrateAcornFoxControlPlaneV1 is the sole production entrypoint.  It has no
@@ -137,11 +138,13 @@ func newAcornFoxControlPlane(layout acornFoxInstallLayout, bridge acornFoxHostBr
 	}
 	return &acornFoxControlPlane{layout: layout, bridge: bridge, random: random, provisioner: provisioner, open: open, writeActivation: func(writer *DurableWriter, raw []byte) error {
 		return writer.CreateMetadata(acornFoxControlPlaneActivationEnv, raw)
+	}, writeReceipt: func(writer *DurableWriter, raw []byte) error {
+		return writer.CreateMetadata(acornFoxControlPlaneReceipt, raw)
 	}}, nil
 }
 
 func (s *acornFoxControlPlane) migrate(ctx context.Context) (AcornFoxControlPlaneMigrationReceiptV1, error) {
-	if s == nil || ctx == nil || ctx.Err() != nil || s.writeActivation == nil {
+	if s == nil || ctx == nil || ctx.Err() != nil || s.writeActivation == nil || s.writeReceipt == nil {
 		return AcornFoxControlPlaneMigrationReceiptV1{}, ErrAcornFoxControlPlaneUnknown
 	}
 	authority, migrations, err := s.authority(ctx)
@@ -195,7 +198,7 @@ func (s *acornFoxControlPlane) migrate(ctx context.Context) (AcornFoxControlPlan
 	}
 	if existing, readErr := state.ReadMetadata(acornFoxControlPlaneReceipt); readErr == nil {
 		receipt, parseErr := ParseAcornFoxControlPlaneMigrationReceiptV1(existing)
-		if parseErr != nil || receipt.BindingSHA256 != authority.binding || receipt.ReleaseID != authority.releaseID || receipt.SourceCommit != authority.sourceCommit || receipt.DatabaseEnvSHA256 != sha256Bytes(env) || receipt.DatabaseIdentitySHA256 != acornFoxControlPlaneIdentitySHA256() {
+		if parseErr != nil || receipt.BindingSHA256 != authority.binding || receipt.ReleaseID != authority.releaseID || receipt.SourceCommit != authority.sourceCommit || receipt.MigrationRowsSHA256 != acornFoxMigrationRowsSHA256(migrations.rows) || receipt.DatabaseEnvSHA256 != sha256Bytes(env) || receipt.DatabaseIdentitySHA256 != acornFoxControlPlaneIdentitySHA256() {
 			return AcornFoxControlPlaneMigrationReceiptV1{}, ErrAcornFoxControlPlaneConflict
 		}
 	} else if !errors.Is(readErr, os.ErrNotExist) {
@@ -228,7 +231,7 @@ func (s *acornFoxControlPlane) migrate(ctx context.Context) (AcornFoxControlPlan
 			return AcornFoxControlPlaneMigrationReceiptV1{}, ErrAcornFoxControlPlaneConflict
 		}
 	} else if errors.Is(readErr, os.ErrNotExist) {
-		if err := state.CreateMetadata(acornFoxControlPlaneReceipt, raw); err != nil {
+		if err := s.writeReceipt(state, raw); err != nil {
 			return AcornFoxControlPlaneMigrationReceiptV1{}, ErrAcornFoxControlPlaneUnknown
 		}
 	} else {
@@ -321,7 +324,7 @@ func validAcornFoxControlPlaneEnvironment(raw []byte) bool {
 		return false
 	}
 	password, ok := u.User.Password()
-	if !ok || len(password) != base64.RawURLEncoding.EncodedLen(32) || u.User.Username() != acornFoxControlPlaneRole || u.Hostname() != "127.0.0.1" || u.Port() != "5432" || strings.Trim(u.Path, "/") != acornFoxControlPlaneDatabase || u.Query().Get("sslmode") != "disable" {
+	if !ok || len(password) != base64.RawURLEncoding.EncodedLen(32) || (u.Scheme != "postgres" && u.Scheme != "postgresql") || u.User.Username() != acornFoxControlPlaneRole || u.Hostname() != "127.0.0.1" || u.Port() != "5432" || u.Path != "/"+acornFoxControlPlaneDatabase || u.RawPath != "" || u.RawQuery != "sslmode=disable" || u.Fragment != "" || u.User.String() != acornFoxControlPlaneRole+":"+password {
 		return false
 	}
 	_, err = base64.RawURLEncoding.DecodeString(password)
