@@ -293,6 +293,20 @@ func TestProductionTestLayoutSeparatesStateAndPinnedHostBeforeL3(t *testing.T) {
 	if journal, err := store.Resume(context.Background()); err != nil || journal.Phase != AcornFoxRepoPreparedFinal || journal.LayoutSHA256 != layout.evidence() {
 		t.Fatalf("production journal=%#v err=%v", journal, err)
 	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := newAcornFoxRepoStoreForLayout(layout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fresh.ownership = owners.edge()
+	if err := prepareAcornFoxRepository(context.Background(), fresh, published, receipt.BindingSHA256); err != nil {
+		t.Fatalf("fresh production repository resume=%v", err)
+	}
+	if err := fresh.Close(); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Rename(host, host+"-old"); err != nil {
 		t.Fatal(err)
 	}
