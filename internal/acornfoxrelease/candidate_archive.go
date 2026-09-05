@@ -132,7 +132,7 @@ type CandidateArtifactStageV1 struct {
 	parentInfo, stageInfo os.FileInfo
 	receipt               CandidateArtifactReceiptV1
 	treeReceipt           CandidateTreeReceiptV1
-	closed                bool
+	closed, transferred   bool
 }
 
 func SealCandidateArtifactsV1(tree *CandidateTreeStageV1, taskRoot string) (*CandidateArtifactStageV1, error) {
@@ -220,7 +220,7 @@ func SealCandidateArtifactsV1(tree *CandidateTreeStageV1, taskRoot string) (*Can
 		return failWith("artifact inspection")
 	}
 	stage.receipt = CandidateArtifactReceiptV1{SchemaVersion: 1, Product: Product, Version: treeReceipt.Version, ReleaseID: treeReceipt.ReleaseID, SourceRepository: treeReceipt.SourceRepository, SourceCommit: treeReceipt.SourceCommit, Architecture: Architecture, MigrationVersion: Migration, DecisionSHA256: treeReceipt.DecisionSHA256, SourcePolicySHA256: treeReceipt.SourcePolicySHA256, ToolchainSHA256: treeReceipt.ToolchainSHA256, RuntimeInputSHA256: treeReceipt.RuntimeInputSHA256, LicenseInputSHA256: treeReceipt.LicenseInputSHA256, TreeSHA256: treeReceipt.TreeSHA256, ManifestSHA256: sha256Text(manifestRaw), ArchiveSHA256: archiveSHA, BundleSHA256: sha256Text(bundle), BindingSHA256: sha256Text(bindingRaw), BuildRecordSHA256: sha256Text(recordRaw), Files: files}
-	if stage.receipt.Validate() != nil || !stage.valid() {
+	if stage.receipt.Validate() != nil || !stage.validOwned() {
 		return failWith("receipt")
 	}
 	return stage, nil
@@ -378,7 +378,7 @@ func inspectArtifactFiles(root string, names []string) ([]FileEntryV1, error) {
 	return out, nil
 }
 func (stage *CandidateArtifactStageV1) Receipt() (CandidateArtifactReceiptV1, error) {
-	if stage == nil || stage.closed || !stage.valid() {
+	if stage == nil || stage.transferred || !stage.validOwned() {
 		return CandidateArtifactReceiptV1{}, ErrCandidateArtifacts
 	}
 	copy := stage.receipt
@@ -386,10 +386,16 @@ func (stage *CandidateArtifactStageV1) Receipt() (CandidateArtifactReceiptV1, er
 	return copy, nil
 }
 func (stage *CandidateArtifactStageV1) Close() error {
-	if stage == nil || stage.closed {
+	if stage == nil {
 		return nil
 	}
-	if !stage.valid() {
+	if stage.transferred {
+		return ErrCandidateArtifacts
+	}
+	if stage.closed {
+		return nil
+	}
+	if !stage.validOwned() {
 		return ErrCandidateArtifacts
 	}
 	if err := os.RemoveAll(stage.root); err != nil {
@@ -398,7 +404,11 @@ func (stage *CandidateArtifactStageV1) Close() error {
 	stage.closed = true
 	return nil
 }
-func (stage *CandidateArtifactStageV1) valid() bool {
+func (stage *CandidateArtifactStageV1) validOwned() bool {
+	return stage != nil && !stage.transferred && stage.validStage()
+}
+
+func (stage *CandidateArtifactStageV1) validStage() bool {
 	if stage == nil || stage.closed || stage.receipt.Validate() != nil || stage.treeReceipt.Validate() != nil || !samePinnedDirectory(stage.parent, stage.parentInfo) || !samePinnedDirectory(stage.root, stage.stageInfo) {
 		return false
 	}
