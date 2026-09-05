@@ -33,6 +33,8 @@ func TestAcornFoxCleanRejectsHostileArgumentsBeforeDependencies(t *testing.T) {
 		{"repository-bootstrap", "--candidate-dir", "/candidate", "--binding-sha256", sha, "--unknown", sha},
 		{"recover-prepare"},
 		{"recover-finalize", "--pending", "extra"},
+		{"migrate-control-plane", "--wrong"},
+		{"migrate-control-plane", "--pending", "extra"},
 		{"run", "--transaction-id", "legacy"},
 		{"repository-upgrade"},
 		{"migrate-control-plane"},
@@ -71,6 +73,7 @@ func TestAcornFoxCleanDispatchesOnlyOneInjectedBridgeOperation(t *testing.T) {
 		{"bootstrap", []string{"repository-bootstrap", "--self-sha256", selfSHA, "--candidate-dir", "/candidate", "--binding-sha256", sha}, "repository-bootstrap", "bootstrap"},
 		{"prepare", []string{"recover-prepare", "--pending"}, "recover-prepare", "recover"},
 		{"finalize", []string{"recover-finalize", "--pending"}, "recover-finalize", "finalize"},
+		{"migrate", []string{"migrate-control-plane", "--pending"}, "migrate-control-plane", "migrate"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			calls := map[string]int{}
@@ -91,6 +94,10 @@ func TestAcornFoxCleanDispatchesOnlyOneInjectedBridgeOperation(t *testing.T) {
 					calls["finalize"]++
 					return cleanReceipt(), nil
 				},
+				migrateControlPlane: func(context.Context) (install.AcornFoxControlPlaneMigrationReceiptV1, error) {
+					calls["migrate"]++
+					return cleanControlPlaneReceipt(), nil
+				},
 			}}
 			var stdout, stderr bytes.Buffer
 			if code := runWithDependencies(context.Background(), test.args, &stdout, &stderr, deps); code != exitOK {
@@ -100,11 +107,102 @@ func TestAcornFoxCleanDispatchesOnlyOneInjectedBridgeOperation(t *testing.T) {
 			if result["ok"] != true || result["command"] != test.command || stderr.Len() != 0 || strings.Contains(stdout.String(), "/candidate") || strings.Contains(stdout.String(), selfSHA) {
 				t.Fatalf("result=%#v stdout=%q stderr=%q", result, stdout.String(), stderr.String())
 			}
-			if calls["euid"] != 1 || calls[test.callKey] != 1 || calls["bootstrap"]+calls["recover"]+calls["finalize"] != 1 {
+			if calls["euid"] != 1 || calls[test.callKey] != 1 || calls["bootstrap"]+calls["recover"]+calls["finalize"]+calls["migrate"] != 1 {
 				t.Fatalf("calls=%#v", calls)
 			}
 		})
 	}
+}
+
+func TestAcornFoxCleanMigrateControlPlaneOrderingReceiptAndErrors(t *testing.T) {
+	t.Run("identity-before-root-and-dependency", func(t *testing.T) {
+		withAcornFoxIdentity(t)
+		buildVersion = ""
+		calls := 0
+		var stdout bytes.Buffer
+		code := runAcornFoxClean(context.Background(), []string{"migrate-control-plane", "--pending"}, &stdout, helperRole, acornFoxCleanDependencies{
+			euid: func() int { calls++; return 0 },
+			migrateControlPlane: func(context.Context) (install.AcornFoxControlPlaneMigrationReceiptV1, error) {
+				calls++
+				return cleanControlPlaneReceipt(), nil
+			},
+		})
+		if code != exitIneligible || calls != 0 || cleanJSON(t, stdout.Bytes())["code"] != "helper_identity_ineligible" {
+			t.Fatalf("code=%d calls=%d stdout=%q", code, calls, stdout.String())
+		}
+	})
+	t.Run("root-before-dependency", func(t *testing.T) {
+		withAcornFoxIdentity(t)
+		called := false
+		var stdout bytes.Buffer
+		code := runAcornFoxClean(context.Background(), []string{"migrate-control-plane", "--pending"}, &stdout, helperRole, acornFoxCleanDependencies{
+			euid: func() int { return 501 },
+			migrateControlPlane: func(context.Context) (install.AcornFoxControlPlaneMigrationReceiptV1, error) {
+				called = true
+				return cleanControlPlaneReceipt(), nil
+			},
+		})
+		if code != exitIneligible || called || cleanJSON(t, stdout.Bytes())["code"] != "root_ineligible" {
+			t.Fatalf("code=%d called=%t stdout=%q", code, called, stdout.String())
+		}
+	})
+	t.Run("unavailable-dependency", func(t *testing.T) {
+		withAcornFoxIdentity(t)
+		var stdout bytes.Buffer
+		code := runAcornFoxClean(context.Background(), []string{"migrate-control-plane", "--pending"}, &stdout, helperRole, acornFoxCleanDependencies{euid: func() int { return 0 }})
+		if code != exitIneligible || cleanJSON(t, stdout.Bytes())["code"] != "control_plane_ineligible" {
+			t.Fatalf("code=%d stdout=%q", code, stdout.String())
+		}
+	})
+	t.Run("receipt-and-error-map", func(t *testing.T) {
+		for _, test := range []struct {
+			name    string
+			receipt install.AcornFoxControlPlaneMigrationReceiptV1
+			err     error
+			code    int
+			want    string
+		}{
+			{"valid", cleanControlPlaneReceipt(), nil, exitOK, ""},
+			{"invalid", install.AcornFoxControlPlaneMigrationReceiptV1{}, nil, exitIneligible, "control_plane_ineligible"},
+			{"release-mismatch", func() install.AcornFoxControlPlaneMigrationReceiptV1 {
+				r := cleanControlPlaneReceipt()
+				r.ReleaseID = "release-other"
+				return r
+			}(), nil, exitIneligible, "helper_identity_ineligible"},
+			{"source-mismatch", func() install.AcornFoxControlPlaneMigrationReceiptV1 {
+				r := cleanControlPlaneReceipt()
+				r.SourceCommit = strings.Repeat("f", 40)
+				return r
+			}(), nil, exitIneligible, "helper_identity_ineligible"},
+			{"locked", install.AcornFoxControlPlaneMigrationReceiptV1{}, install.ErrAcornFoxRepoLocked, exitLocked, "repository_locked"},
+			{"conflict", install.AcornFoxControlPlaneMigrationReceiptV1{}, install.ErrAcornFoxControlPlaneConflict, exitConflict, "control_plane_conflict"},
+			{"unknown", install.AcornFoxControlPlaneMigrationReceiptV1{}, install.ErrAcornFoxControlPlaneUnknown, exitRecovery, "control_plane_recovery_unknown"},
+			{"cancelled", install.AcornFoxControlPlaneMigrationReceiptV1{}, context.Canceled, exitRecovery, "control_plane_recovery_unknown"},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				withAcornFoxIdentity(t)
+				calls := 0
+				var stdout, stderr bytes.Buffer
+				code := runWithDependencies(context.Background(), []string{"migrate-control-plane", "--pending"}, &stdout, &stderr, upgradeDependencies{acornFoxClean: acornFoxCleanDependencies{
+					euid: func() int { return 0 },
+					migrateControlPlane: func(context.Context) (install.AcornFoxControlPlaneMigrationReceiptV1, error) {
+						calls++
+						return test.receipt, test.err
+					},
+				}})
+				if code != test.code || calls != 1 || stderr.Len() != 0 {
+					t.Fatalf("code=%d calls=%d stdout=%q stderr=%q", code, calls, stdout.String(), stderr.String())
+				}
+				result := cleanJSON(t, stdout.Bytes())
+				if test.want != "" && result["code"] != test.want {
+					t.Fatalf("result=%#v", result)
+				}
+				if test.want == "" && (result["ok"] != true || result["command"] != "migrate-control-plane" || strings.Contains(stdout.String(), "postgresql://")) {
+					t.Fatalf("result=%#v stdout=%q", result, stdout.String())
+				}
+			})
+		}
+	})
 }
 
 func TestAcornFoxCleanRefusesNonRootBeforeBridge(t *testing.T) {
@@ -241,6 +339,11 @@ func withAcornFoxIdentity(t *testing.T) {
 func cleanReceipt() install.AcornFoxHostBootstrapReceiptV1 {
 	digest := strings.Repeat("a", 64)
 	return install.AcornFoxHostBootstrapReceiptV1{SchemaVersion: 1, State: "REPO_PREPARED", BindingSHA256: digest, ReleaseID: "release-1.2.3-test.1", SourceCommit: "0123456789abcdef0123456789abcdef01234567", LayoutSHA256: digest, SubstrateReceiptSHA256: digest, FinalEvidenceSHA256: digest}
+}
+
+func cleanControlPlaneReceipt() install.AcornFoxControlPlaneMigrationReceiptV1 {
+	digest := strings.Repeat("a", 64)
+	return install.AcornFoxControlPlaneMigrationReceiptV1{SchemaVersion: 1, State: "CONTROL_PLANE_MIGRATED", BindingSHA256: digest, ReleaseID: "release-1.2.3-test.1", SourceCommit: "0123456789abcdef0123456789abcdef01234567", MigrationVersion: install.AcornFoxV1MigrationVersion, MigrationRowsSHA256: digest, DatabaseEnvSHA256: digest, DatabaseIdentitySHA256: digest}
 }
 
 func cleanJSON(t *testing.T, raw []byte) map[string]any {

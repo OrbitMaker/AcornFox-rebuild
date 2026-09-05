@@ -43,13 +43,21 @@ func (f *acornFoxControlPlaneTxFake) Commit() error {
 func (*acornFoxControlPlaneTxFake) Rollback() error { return nil }
 
 type acornFoxControlPlaneProvisionerFake struct {
-	argv  []string
-	stdin []byte
-	err   error
+	argv    []string
+	stdin   []byte
+	err     error
+	started chan struct{}
+	resume  <-chan struct{}
 }
 
 func (f *acornFoxControlPlaneProvisionerFake) Run(_ context.Context, argv []string, stdin []byte) error {
 	f.argv, f.stdin = append([]string(nil), argv...), append([]byte(nil), stdin...)
+	if f.started != nil {
+		close(f.started)
+	}
+	if f.resume != nil {
+		<-f.resume
+	}
 	return f.err
 }
 
@@ -159,6 +167,68 @@ func TestAcornFoxControlPlaneMigratesClosed33PrefixAndReplays(t *testing.T) {
 		if readErr != nil || !bytes.HasPrefix(raw, []byte("ACORNFOX_DATABASE_URL=")) || bytes.Contains(raw, []byte("OPEN_CARD_")) {
 			t.Fatalf("persisted env path=%s raw=%q err=%v", path, raw, readErr)
 		}
+	}
+	prepared.assertExternalSentinel(t)
+}
+
+func TestAcornFoxControlPlaneMigrationSerializesFixedRepositoryLock(t *testing.T) {
+	ledger := &acornFoxControlPlaneLedgerFake{}
+	resume := make(chan struct{})
+	runner := &acornFoxControlPlaneProvisionerFake{started: make(chan struct{}), resume: resume}
+	service, prepared := newAcornFoxControlPlanePrepared(t, ledger, runner)
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := service.migrate(context.Background())
+		firstDone <- err
+	}()
+	<-runner.started // provision is a C1 effect; the fixed repo lock is held now.
+
+	otherRunner := &acornFoxControlPlaneProvisionerFake{}
+	other, err := newTaskAcornFoxControlPlane(prepared.layout, bytes.NewReader(bytes.Repeat([]byte{9}, 32)), otherRunner, func([]byte) (BootstrapMigrationControl, error) { return ledger, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	other.bridge.ownership = prepared.owners.edge()
+	if _, err := other.migrate(context.Background()); !errors.Is(err, ErrAcornFoxRepoLocked) {
+		t.Fatalf("concurrent migration err=%v", err)
+	}
+	close(resume)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first migration err=%v", err)
+	}
+	activation, err := AcornFoxRepoActivationID(prepared.binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(filepath.Join(prepared.host, "opt", "acornfox", "activations", activation, acornFoxControlPlaneActivationEnv))
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared.owners.set(info, acornFoxInstallPrincipal{})
+	if _, err := other.migrate(context.Background()); err != nil {
+		t.Fatalf("migration after lock release err=%v", err)
+	}
+	prepared.assertExternalSentinel(t)
+}
+
+func TestAcornFoxControlPlaneMigrationReleasesLockAfterFailure(t *testing.T) {
+	ledger, runner := &acornFoxControlPlaneLedgerFake{}, &acornFoxControlPlaneProvisionerFake{err: errors.New("provision failed")}
+	service, prepared := newAcornFoxControlPlanePrepared(t, ledger, runner)
+	if _, err := service.migrate(context.Background()); !errors.Is(err, ErrAcornFoxControlPlaneUnknown) {
+		t.Fatalf("migration err=%v", err)
+	}
+	other, err := newAcornFoxRepoStoreForLayout(prepared.layout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	other.ownership = prepared.owners.edge()
+	lock, err := other.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("fixed lock remained held after failure: %v", err)
+	}
+	if err := lock.Release(); err != nil {
+		t.Fatal(err)
 	}
 	prepared.assertExternalSentinel(t)
 }

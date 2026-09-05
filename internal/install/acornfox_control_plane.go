@@ -147,7 +147,31 @@ func (s *acornFoxControlPlane) migrate(ctx context.Context) (AcornFoxControlPlan
 	if s == nil || ctx == nil || ctx.Err() != nil || s.writeActivation == nil || s.writeReceipt == nil {
 		return AcornFoxControlPlaneMigrationReceiptV1{}, ErrAcornFoxControlPlaneUnknown
 	}
-	authority, migrations, err := s.authority(ctx)
+	// The prepared-state verifier is deliberately retained ahead of the
+	// migration lock: it may repair only an already-prepared repository and
+	// owns its own repository lease.  Once it has returned, every C1 effect is
+	// serialized by exactly one fixed repository-install lock below.
+	if _, err := s.bridge.verifyPrepared(ctx); err != nil {
+		if errors.Is(err, ErrAcornFoxRepoLocked) {
+			return AcornFoxControlPlaneMigrationReceiptV1{}, ErrAcornFoxRepoLocked
+		}
+		return AcornFoxControlPlaneMigrationReceiptV1{}, ErrAcornFoxControlPlaneConflict
+	}
+	store, err := newAcornFoxRepoStoreForLayout(s.layout)
+	if err != nil {
+		return AcornFoxControlPlaneMigrationReceiptV1{}, ErrAcornFoxControlPlaneUnknown
+	}
+	store.ownership = s.bridge.ownership
+	defer store.Close()
+	lock, err := store.Acquire(ctx)
+	if err != nil {
+		if errors.Is(err, ErrAcornFoxRepoLocked) {
+			return AcornFoxControlPlaneMigrationReceiptV1{}, ErrAcornFoxRepoLocked
+		}
+		return AcornFoxControlPlaneMigrationReceiptV1{}, ErrAcornFoxControlPlaneConflict
+	}
+	defer lock.Release()
+	authority, migrations, err := s.authorityForStore(ctx, store)
 	if err != nil {
 		return AcornFoxControlPlaneMigrationReceiptV1{}, err
 	}
@@ -246,6 +270,9 @@ type acornFoxControlPlaneAuthority struct {
 
 func (s *acornFoxControlPlane) authority(ctx context.Context) (acornFoxControlPlaneAuthority, acornFoxControlPlaneMigrations, error) {
 	if _, err := s.bridge.verifyPrepared(ctx); err != nil {
+		if errors.Is(err, ErrAcornFoxRepoLocked) {
+			return acornFoxControlPlaneAuthority{}, acornFoxControlPlaneMigrations{}, ErrAcornFoxRepoLocked
+		}
 		return acornFoxControlPlaneAuthority{}, acornFoxControlPlaneMigrations{}, ErrAcornFoxControlPlaneConflict
 	}
 	store, err := newAcornFoxRepoStoreForLayout(s.layout)
@@ -254,6 +281,25 @@ func (s *acornFoxControlPlane) authority(ctx context.Context) (acornFoxControlPl
 	}
 	defer store.Close()
 	store.ownership = s.bridge.ownership
+	lock, err := store.Acquire(ctx)
+	if err != nil {
+		if errors.Is(err, ErrAcornFoxRepoLocked) {
+			return acornFoxControlPlaneAuthority{}, acornFoxControlPlaneMigrations{}, ErrAcornFoxRepoLocked
+		}
+		return acornFoxControlPlaneAuthority{}, acornFoxControlPlaneMigrations{}, ErrAcornFoxControlPlaneConflict
+	}
+	defer lock.Release()
+	return s.authorityForStore(ctx, store)
+}
+
+// authorityForStore consumes the store descriptor that migrate has already
+// locked. It must not acquire a second lock: the migration's authority,
+// environment, provisioning, SQL ledger and receipt are one serialized C1
+// transition.
+func (s *acornFoxControlPlane) authorityForStore(ctx context.Context, store *TaskAcornFoxRepoStore) (acornFoxControlPlaneAuthority, acornFoxControlPlaneMigrations, error) {
+	if s == nil || store == nil || !store.ownsLock() {
+		return acornFoxControlPlaneAuthority{}, acornFoxControlPlaneMigrations{}, ErrAcornFoxControlPlaneConflict
+	}
 	journal, err := store.Resume(ctx)
 	if err != nil || journal.Phase != AcornFoxRepoPreparedFinal || journal.NeedsRecovery || journal.LayoutSHA256 != s.layout.evidence() {
 		return acornFoxControlPlaneAuthority{}, acornFoxControlPlaneMigrations{}, ErrAcornFoxControlPlaneConflict
