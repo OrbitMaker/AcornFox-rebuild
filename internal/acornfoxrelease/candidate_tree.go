@@ -2,6 +2,7 @@ package acornfoxrelease
 
 import (
 	"bytes"
+	"crypto/sha1" // SPDX package verification compatibility; release integrity remains SHA-256.
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -150,7 +151,8 @@ func BuildCandidateTreeV1(plan GoBuildPlanV1, goStage *GoBinaryStageV1, webStage
 	if err := addGenerated(target, "source-manifest.sha256", 0o644, sourceManifest(plan.sourcePolicy), &entries, added); err != nil {
 		return failWith("source manifest")
 	}
-	if err := addGenerated(target, "sbom.spdx.json", 0o644, syntheticSPDX(plan, entries), &entries, added); err != nil {
+	sbom, err := syntheticSPDX(plan, release, entries)
+	if err != nil || addGenerated(target, "sbom.spdx.json", 0o644, sbom, &entries, added) != nil {
 		return failWith("SPDX")
 	}
 	for path := range required {
@@ -406,9 +408,11 @@ func sourceManifest(policy SourcePolicyV1) []byte {
 	return out.Bytes()
 }
 
-func syntheticSPDX(plan GoBuildPlanV1, files []install.FileDigest) []byte {
-	files = append([]install.FileDigest(nil), files...)
-	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
+func syntheticSPDX(plan GoBuildPlanV1, root string, files []install.FileDigest) ([]byte, error) {
+	checksums, err := spdxPayloadChecksums(root, files)
+	if err != nil {
+		return nil, ErrCandidateTree
+	}
 	type checksum struct {
 		Algorithm     string `json:"algorithm"`
 		ChecksumValue string `json:"checksumValue"`
@@ -426,13 +430,17 @@ func syntheticSPDX(plan GoBuildPlanV1, files []install.FileDigest) []byte {
 		RelatedSpdxElement string `json:"relatedSpdxElement"`
 	}
 	type pkg struct {
-		SPDXID           string `json:"SPDXID"`
-		Name             string `json:"name"`
-		DownloadLocation string `json:"downloadLocation"`
-		FilesAnalyzed    bool   `json:"filesAnalyzed"`
-		LicenseConcluded string `json:"licenseConcluded"`
-		LicenseDeclared  string `json:"licenseDeclared"`
-		CopyrightText    string `json:"copyrightText"`
+		SPDXID                  string `json:"SPDXID"`
+		Name                    string `json:"name"`
+		DownloadLocation        string `json:"downloadLocation"`
+		FilesAnalyzed           bool   `json:"filesAnalyzed"`
+		LicenseConcluded        string `json:"licenseConcluded"`
+		LicenseDeclared         string `json:"licenseDeclared"`
+		CopyrightText           string `json:"copyrightText"`
+		PackageVerificationCode struct {
+			Value         string   `json:"packageVerificationCodeValue"`
+			ExcludedFiles []string `json:"packageVerificationCodeExcludedFiles"`
+		} `json:"packageVerificationCode"`
 	}
 	document := struct {
 		SPDXVersion       string `json:"spdxVersion"`
@@ -452,14 +460,62 @@ func syntheticSPDX(plan GoBuildPlanV1, files []install.FileDigest) []byte {
 	}{SPDXVersion: "SPDX-2.3", DataLicense: "CC0-1.0", SPDXID: "SPDXRef-DOCUMENT", Name: "AcornFox synthetic release tree", DocumentNamespace: "https://acornfox.invalid/spdx/" + plan.decisionSHA256, Comment: "Synthetic release-tree evidence only; legal and dependency completeness are deferred to RELEASE-12B."}
 	document.CreationInfo.Created, document.CreationInfo.Creators = "1970-01-01T00:00:00Z", []string{"Tool: AcornFox synthetic release tree"}
 	document.DocumentDescribes = []string{"SPDXRef-Package-AcornFox"}
-	document.Packages = append(document.Packages, pkg{SPDXID: "SPDXRef-Package-AcornFox", Name: "AcornFox", DownloadLocation: "NOASSERTION", FilesAnalyzed: true, LicenseConcluded: "NOASSERTION", LicenseDeclared: "NOASSERTION", CopyrightText: "NOASSERTION"})
-	for index, entry := range files {
+	rootPackage := pkg{SPDXID: "SPDXRef-Package-AcornFox", Name: "AcornFox", DownloadLocation: "NOASSERTION", FilesAnalyzed: true, LicenseConcluded: "NOASSERTION", LicenseDeclared: "NOASSERTION", CopyrightText: "NOASSERTION"}
+	sha1Values := make([]string, 0, len(checksums))
+	for _, entry := range checksums {
+		sha1Values = append(sha1Values, entry.SHA1)
+	}
+	sort.Strings(sha1Values)
+	verification := sha1.Sum([]byte(strings.Join(sha1Values, "")))
+	rootPackage.PackageVerificationCode.Value = hex.EncodeToString(verification[:])
+	rootPackage.PackageVerificationCode.ExcludedFiles = []string{"./sbom.spdx.json"}
+	document.Packages = append(document.Packages, rootPackage)
+	for index, entry := range checksums {
 		id := "SPDXRef-File-" + fmtSPDXIndex(index+1)
-		document.Files = append(document.Files, file{SPDXID: id, FileName: "./" + entry.Path, Checksums: []checksum{{Algorithm: "SHA256", ChecksumValue: entry.SHA256}}, LicenseConcluded: "NOASSERTION", CopyrightText: "NOASSERTION"})
+		document.Files = append(document.Files, file{SPDXID: id, FileName: "./" + entry.Path, Checksums: []checksum{{Algorithm: "SHA1", ChecksumValue: entry.SHA1}, {Algorithm: "SHA256", ChecksumValue: entry.SHA256}}, LicenseConcluded: "NOASSERTION", CopyrightText: "NOASSERTION"})
 		document.Relationships = append(document.Relationships, relationship{SpdxElementID: "SPDXRef-Package-AcornFox", RelationshipType: "CONTAINS", RelatedSpdxElement: id})
 	}
-	raw, _ := json.Marshal(document)
-	return append(raw, '\n')
+	raw, err := json.Marshal(document)
+	if err != nil {
+		return nil, ErrCandidateTree
+	}
+	return append(raw, '\n'), nil
+}
+
+type spdxPayloadChecksum struct{ Path, SHA1, SHA256 string }
+
+func spdxPayloadChecksums(root string, files []install.FileDigest) ([]spdxPayloadChecksum, error) {
+	files = append([]install.FileDigest(nil), files...)
+	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
+	anchored, err := os.OpenRoot(root)
+	if err != nil {
+		return nil, ErrCandidateTree
+	}
+	defer anchored.Close()
+	out := make([]spdxPayloadChecksum, 0, len(files))
+	for _, expected := range files {
+		if expected.Path == "sbom.spdx.json" || !validRelativeFile(expected.Path) {
+			return nil, ErrCandidateTree
+		}
+		before, err := anchored.Lstat(expected.Path)
+		if err != nil || !before.Mode().IsRegular() || before.Mode()&os.ModeSymlink != 0 || before.Mode().Perm() != os.FileMode(expected.Mode) || linkCount(before) != 1 || before.Size() < 0 || before.Size() > runtimeFileBytes {
+			return nil, ErrCandidateTree
+		}
+		file, err := anchored.OpenFile(expected.Path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+		if err != nil {
+			return nil, ErrCandidateTree
+		}
+		opened, statErr := file.Stat()
+		sha1Hash, sha256Hash := sha1.New(), sha256.New()
+		n, readErr := io.Copy(io.MultiWriter(sha1Hash, sha256Hash), io.LimitReader(file, runtimeFileBytes+1))
+		closeErr := file.Close()
+		after, afterErr := anchored.Lstat(expected.Path)
+		if statErr != nil || readErr != nil || closeErr != nil || afterErr != nil || n != before.Size() || n > runtimeFileBytes || !os.SameFile(before, opened) || !os.SameFile(before, after) || hex.EncodeToString(sha256Hash.Sum(nil)) != expected.SHA256 {
+			return nil, ErrCandidateTree
+		}
+		out = append(out, spdxPayloadChecksum{Path: expected.Path, SHA1: hex.EncodeToString(sha1Hash.Sum(nil)), SHA256: expected.SHA256})
+	}
+	return out, nil
 }
 
 func fmtSPDXIndex(index int) string {

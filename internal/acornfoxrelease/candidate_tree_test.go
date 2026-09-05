@@ -2,6 +2,8 @@ package acornfoxrelease
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -75,11 +77,16 @@ func TestBuildCandidateTreeV1MaterializesDeterministicSyntheticTree(t *testing.T
 		t.Fatalf("invalid SPDX payload: %s", sbom)
 	}
 	rootPackage := packages[0].(map[string]any)
-	for _, key := range []string{"SPDXID", "name", "downloadLocation", "filesAnalyzed", "licenseConcluded", "licenseDeclared", "copyrightText"} {
+	for _, key := range []string{"SPDXID", "name", "downloadLocation", "filesAnalyzed", "licenseConcluded", "licenseDeclared", "copyrightText", "packageVerificationCode"} {
 		if _, ok := rootPackage[key]; !ok {
 			t.Fatalf("package missing %s", key)
 		}
 	}
+	verification := rootPackage["packageVerificationCode"].(map[string]any)
+	if verification["packageVerificationCodeExcludedFiles"].([]any)[0] != "./sbom.spdx.json" {
+		t.Fatalf("missing self exclusion %#v", verification)
+	}
+	var sha1Values []string
 	for _, rawFile := range files {
 		file := rawFile.(map[string]any)
 		for _, key := range []string{"SPDXID", "fileName", "checksums", "licenseConcluded", "copyrightText"} {
@@ -90,6 +97,28 @@ func TestBuildCandidateTreeV1MaterializesDeterministicSyntheticTree(t *testing.T
 		if file["fileName"] == "./sbom.spdx.json" {
 			t.Fatal("SPDX self-reference")
 		}
+		path := strings.TrimPrefix(file["fileName"].(string), "./")
+		body, err := os.ReadFile(filepath.Join(first.root, "release", filepath.FromSlash(path)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		sha1Sum := sha1.Sum(body)
+		expectedSHA1 := hex.EncodeToString(sha1Sum[:])
+		expectedSHA256 := sha256Text(body)
+		checksums := file["checksums"].([]any)
+		if len(checksums) != 2 {
+			t.Fatalf("unexpected checksums %#v", checksums)
+		}
+		firstChecksum, secondChecksum := checksums[0].(map[string]any), checksums[1].(map[string]any)
+		if firstChecksum["algorithm"] != "SHA1" || firstChecksum["checksumValue"] != expectedSHA1 || secondChecksum["algorithm"] != "SHA256" || secondChecksum["checksumValue"] != expectedSHA256 {
+			t.Fatalf("checksum mismatch for %s: %#v", path, checksums)
+		}
+		sha1Values = append(sha1Values, expectedSHA1)
+	}
+	sort.Strings(sha1Values)
+	verificationSum := sha1.Sum([]byte(strings.Join(sha1Values, "")))
+	if verification["packageVerificationCodeValue"] != hex.EncodeToString(verificationSum[:]) {
+		t.Fatalf("package verification code mismatch %#v", verification)
 	}
 	for _, rawRelationship := range relationships {
 		relationship := rawRelationship.(map[string]any)
