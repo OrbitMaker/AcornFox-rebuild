@@ -105,6 +105,10 @@ func validAcornFoxLiveRole(role AcornFoxLiveRole) bool {
 }
 
 func acornFoxLiveEntryFor(entry SubstrateEntry) (AcornFoxLiveEntryV1, error) {
+	return acornFoxLiveEntryForLayout(acornFoxInstallLayout{mode: acornFoxInstallLayoutTask}, entry)
+}
+
+func acornFoxLiveEntryForLayout(layout acornFoxInstallLayout, entry SubstrateEntry) (AcornFoxLiveEntryV1, error) {
 	role, ok := acornFoxLiveRoleFor(entry)
 	if !ok {
 		return AcornFoxLiveEntryV1{}, errors.New("AcornFox live entry role is invalid")
@@ -113,7 +117,11 @@ func acornFoxLiveEntryFor(entry SubstrateEntry) (AcornFoxLiveEntryV1, error) {
 	if !ok {
 		return AcornFoxLiveEntryV1{}, errors.New("AcornFox live entry group is invalid")
 	}
-	return AcornFoxLiveEntryV1{Path: entry.Path, Kind: entry.Kind, Mode: entry.Mode, Role: role, Group: group, PhysicalOwnerObservation: "task_root_owner", Size: entry.Size, SHA256: entry.SHA256}, nil
+	observation := "task_root_owner"
+	if layout.mode == acornFoxInstallLayoutProduction {
+		observation = "role_uid_gid_verified"
+	}
+	return AcornFoxLiveEntryV1{Path: entry.Path, Kind: entry.Kind, Mode: entry.Mode, Role: role, Group: group, PhysicalOwnerObservation: observation, Size: entry.Size, SHA256: entry.SHA256}, nil
 }
 
 func validateAcornFoxLiveEntries(entries []AcornFoxLiveEntryV1) error {
@@ -121,7 +129,7 @@ func validateAcornFoxLiveEntries(entries []AcornFoxLiveEntryV1) error {
 		return errors.New("AcornFox live entry count is invalid")
 	}
 	for index, entry := range entries {
-		if err := validateRelativePath(entry.Path); err != nil || entry.Mode > 0o777 || entry.Mode&0o022 != 0 || entry.Size < 0 || entry.PhysicalOwnerObservation != "task_root_owner" || (entry.Kind != SubstrateEntryFile && entry.Kind != SubstrateEntryDirectory) {
+		if err := validateRelativePath(entry.Path); err != nil || entry.Mode > 0o777 || entry.Mode&0o022 != 0 || entry.Size < 0 || (entry.PhysicalOwnerObservation != "task_root_owner" && entry.PhysicalOwnerObservation != "role_uid_gid_verified") || (entry.Kind != SubstrateEntryFile && entry.Kind != SubstrateEntryDirectory) {
 			return errors.New("AcornFox live entry is invalid")
 		}
 		if !validAcornFoxLiveRole(entry.Role) {

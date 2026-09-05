@@ -164,6 +164,10 @@ func (m *acornFoxLiveMaterializer) Materialize(ctx context.Context) (result Acor
 }
 
 func acornFoxLiveExpectedEntries(substrate *PublishedAcornFoxSubstrateV1) ([]SubstrateEntry, error) {
+	return acornFoxLiveExpectedEntriesForLayout(acornFoxInstallLayout{mode: acornFoxInstallLayoutTask}, substrate)
+}
+
+func acornFoxLiveExpectedEntriesForLayout(layout acornFoxInstallLayout, substrate *PublishedAcornFoxSubstrateV1) ([]SubstrateEntry, error) {
 	if substrate == nil || substrate.receipt.Validate() != nil {
 		return nil, ErrAcornFoxLiveConflict
 	}
@@ -173,6 +177,13 @@ func acornFoxLiveExpectedEntries(substrate *PublishedAcornFoxSubstrateV1) ([]Sub
 		return nil, err
 	}
 	entries = append(entries, SubstrateEntry{Path: "var/lib/acornfox/install/releases/" + substrate.receipt.CandidateReceipt.ReleaseID + ".json", Kind: SubstrateEntryFile, Mode: durableFileMode, Role: OwnerRoleRoot, Group: GroupRoleRoot, Size: int64(len(raw)), SHA256: sha256Hex(raw)})
+	if layout.mode == acornFoxInstallLayoutProduction {
+		for index := range entries {
+			if entries[index].Path == "var/lib/acornfox/install" && entries[index].Kind == SubstrateEntryDirectory {
+				entries[index].Mode, entries[index].Role, entries[index].Group = 0o700, OwnerRoleRoot, GroupRoleRoot
+			}
+		}
+	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Path < entries[j].Path })
 	if err := validateAcornFoxLiveSourceEntries(entries); err != nil {
 		return nil, err
@@ -192,9 +203,13 @@ func validateAcornFoxLiveSourceEntries(entries []SubstrateEntry) error {
 }
 
 func acornFoxLiveMakeReceipt(journal AcornFoxRepoJournalV1, substrate *PublishedAcornFoxSubstrateV1, source []SubstrateEntry) (AcornFoxLiveReceiptV1, error) {
+	return acornFoxLiveMakeReceiptForLayout(acornFoxInstallLayout{mode: acornFoxInstallLayoutTask}, journal, substrate, source)
+}
+
+func acornFoxLiveMakeReceiptForLayout(layout acornFoxInstallLayout, journal AcornFoxRepoJournalV1, substrate *PublishedAcornFoxSubstrateV1, source []SubstrateEntry) (AcornFoxLiveReceiptV1, error) {
 	entries := make([]AcornFoxLiveEntryV1, 0, len(source))
 	for _, entry := range source {
-		live, err := acornFoxLiveEntryFor(entry)
+		live, err := acornFoxLiveEntryForLayout(layout, entry)
 		if err != nil {
 			return AcornFoxLiveReceiptV1{}, err
 		}
@@ -212,7 +227,11 @@ func acornFoxLiveMakeReceipt(journal AcornFoxRepoJournalV1, substrate *Published
 	if err != nil {
 		return AcornFoxLiveReceiptV1{}, err
 	}
-	return AcornFoxLiveReceiptV1{SchemaVersion: AcornFoxLiveReceiptV1Schema, State: "task_live_materialized", BindingSHA256: journal.BindingSHA256, SubstrateReceiptSHA256: journal.SubstrateReceiptSHA256, ReleaseID: substrate.receipt.CandidateReceipt.ReleaseID, LiveTreeSHA256: tree, OwnershipPlanSHA256: plan, StaticSetSHA256: static, OwnershipEvidence: "symbolic", Entries: entries}, nil
+	state, evidence := "task_live_materialized", "symbolic"
+	if layout.mode == acornFoxInstallLayoutProduction {
+		state, evidence = "host_live_materialized", "host_uid_gid_verified"
+	}
+	return AcornFoxLiveReceiptV1{SchemaVersion: AcornFoxLiveReceiptV1Schema, State: state, BindingSHA256: journal.BindingSHA256, SubstrateReceiptSHA256: journal.SubstrateReceiptSHA256, ReleaseID: substrate.receipt.CandidateReceipt.ReleaseID, LiveTreeSHA256: tree, OwnershipPlanSHA256: plan, StaticSetSHA256: static, LayoutSHA256: layout.evidence(), OwnershipEvidence: evidence, Entries: entries}, nil
 }
 
 func acornFoxLiveReadSource(root *os.Root, substrate *PublishedAcornFoxSubstrateV1, entry SubstrateEntry) ([]byte, error) {

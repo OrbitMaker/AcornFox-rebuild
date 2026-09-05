@@ -35,8 +35,27 @@ type TaskAcornFoxRepoStore struct {
 	uid, gid           int
 	layout             acornFoxInstallLayout
 	fs                 acornFoxRepoFS
+	ownership          acornFoxOwnershipEdge
 	lock               *acornFoxRepoStoreLock
 	afterRootPathCheck func()
+}
+
+// acornFoxOwnershipEdge is the only private seam for production role
+// ownership. It is intentionally narrower than the filesystem fault seams:
+// it can apply ownership to a just-opened descriptor and observe an inode.
+type acornFoxOwnershipEdge struct {
+	chown   func(acornFoxRepoFile, int, int) error
+	observe func(os.FileInfo) (acornFoxInstallPrincipal, bool)
+}
+
+func newAcornFoxRealOwnershipEdge() acornFoxOwnershipEdge {
+	return acornFoxOwnershipEdge{
+		chown: func(file acornFoxRepoFile, uid, gid int) error { return file.Chown(uid, gid) },
+		observe: func(info os.FileInfo) (acornFoxInstallPrincipal, bool) {
+			stat, ok := info.Sys().(*syscall.Stat_t)
+			return acornFoxInstallPrincipal{uid: int(stat.Uid), gid: int(stat.Gid)}, ok
+		},
+	}
 }
 
 type acornFoxRepoFile interface {
@@ -106,7 +125,7 @@ func newAcornFoxRepoStoreForLayout(layout acornFoxInstallLayout) (*TaskAcornFoxR
 		_ = root.Close()
 		return nil, ErrAcornFoxRepoConflict
 	}
-	return &TaskAcornFoxRepoStore{rootPath: layout.stateRootPath, rootInfo: layout.stateRootInfo, root: root, hostRootPath: layout.hostRootPath, hostRootInfo: layout.hostRootInfo, hostRoot: hostRoot, uid: layout.stateOwner.uid, gid: layout.stateOwner.gid, layout: layout, fs: fs}, nil
+	return &TaskAcornFoxRepoStore{rootPath: layout.stateRootPath, rootInfo: layout.stateRootInfo, root: root, hostRootPath: layout.hostRootPath, hostRootInfo: layout.hostRootInfo, hostRoot: hostRoot, uid: layout.stateOwner.uid, gid: layout.stateOwner.gid, layout: layout, fs: fs, ownership: newAcornFoxRealOwnershipEdge()}, nil
 }
 
 func safeAcornFoxRepoRoot(info os.FileInfo, uid, gid int) bool {

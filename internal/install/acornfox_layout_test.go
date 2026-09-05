@@ -342,6 +342,85 @@ func TestProductionLayoutEvidenceBindsDTOsWithoutHostEffects(t *testing.T) {
 	}
 }
 
+func TestProductionLayoutPureReceiptAndFakeOwnershipEdge(t *testing.T) {
+	parent := t.TempDir()
+	host := filepath.Join(parent, "host")
+	state := filepath.Join(host, "var", "lib", "acornfox", "install")
+	if err := os.Mkdir(host, durableDirMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(state, durableDirMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(state, durableDirMode); err != nil {
+		t.Fatal(err)
+	}
+	layout, err := newTestProductionAcornFoxLayout(state, host, os.Getuid(), os.Getgid(), acornFoxTestLayoutPrincipals())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, published, substrate := newAcornFox03CPublished(t)
+	entries, err := acornFoxLiveExpectedEntriesForLayout(layout, published)
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal, err := newAcornFoxRepoJournalForLayout(layout, substrate.CandidateReceipt.BindingSHA256, sha256Hex(mustMarshalInactiveSubstrateReceipt(t, substrate)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := acornFoxLiveMakeReceiptForLayout(layout, journal, published, entries)
+	if err != nil || receipt.Validate() != nil || receipt.State != "host_live_materialized" || receipt.OwnershipEvidence != "host_uid_gid_verified" || receipt.LayoutSHA256 != layout.evidence() {
+		t.Fatalf("production receipt=%#v err=%v", receipt, err)
+	}
+	for _, entry := range receipt.Entries {
+		if entry.PhysicalOwnerObservation != "role_uid_gid_verified" {
+			t.Fatalf("entry observation=%#v", entry)
+		}
+	}
+	filePath := filepath.Join(parent, "edge")
+	if err := os.WriteFile(filePath, []byte("x"), durableFileMode); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(filePath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	records := map[uint64]acornFoxInstallPrincipal{}
+	key := func(info os.FileInfo) uint64 { return acornFoxRepoNlink(info)<<32 | uint64(info.ModTime().UnixNano()) }
+	edge := acornFoxOwnershipEdge{
+		chown: func(target acornFoxRepoFile, uid, gid int) error {
+			info, err := target.Stat()
+			if err != nil {
+				return err
+			}
+			records[key(info)] = acornFoxInstallPrincipal{uid: uid, gid: gid}
+			return nil
+		},
+		observe: func(info os.FileInfo) (acornFoxInstallPrincipal, bool) {
+			value, ok := records[key(info)]
+			return value, ok
+		},
+	}
+	want, _ := layout.owner(AcornFoxLiveEdgeRole)
+	if err := edge.chown(file, want.uid, want.gid); err != nil {
+		t.Fatal(err)
+	}
+	info, err := file.Stat()
+	if got, ok := edge.observe(info); err != nil || !ok || got != want {
+		t.Fatalf("fake ownership got=%#v ok=%t err=%v", got, ok, err)
+	}
+}
+
+func mustMarshalInactiveSubstrateReceipt(t *testing.T, receipt InactiveSubstrateReceiptV1) []byte {
+	t.Helper()
+	raw, err := MarshalInactiveSubstrateReceiptV1(receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
 func acornFoxTestLayoutPrincipals() map[AcornFoxLiveRole]acornFoxInstallPrincipal {
 	return map[AcornFoxLiveRole]acornFoxInstallPrincipal{
 		AcornFoxLiveRootRole:     {},
