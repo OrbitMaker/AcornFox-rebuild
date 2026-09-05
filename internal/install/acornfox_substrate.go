@@ -31,6 +31,7 @@ type TaskAcornFoxSubstratePublisher struct {
 	rootInfo os.FileInfo
 	root     *os.Root
 	uid, gid int
+	layout   acornFoxInstallLayout
 	fs       acornFoxSubstrateFS
 	// afterRootPathCheck is a package-private race seam. It must never affect
 	// authority: the returned root is always derived from p.root.
@@ -51,6 +52,7 @@ type PublishedAcornFoxSubstrateV1 struct {
 	root     *os.Root
 	receipt  InactiveSubstrateReceiptV1
 	uid, gid int
+	layout   acornFoxInstallLayout
 	fs       acornFoxSubstrateFS
 }
 
@@ -63,7 +65,7 @@ func sameAcornFoxLiveTaskRoot(store *TaskAcornFoxRepoStore, substrate *Published
 	}
 	storeInfo, storeErr := store.fs.lstat(store.root, ".")
 	substrateInfo, substrateErr := substrate.fs.lstat(substrate.root, ".")
-	return storeErr == nil && substrateErr == nil && os.SameFile(storeInfo, substrateInfo) && verifyOwner(storeInfo, store.uid, store.gid) == nil && verifyOwner(substrateInfo, substrate.uid, substrate.gid) == nil
+	return storeErr == nil && substrateErr == nil && os.SameFile(storeInfo, substrateInfo) && store.layout.equivalent(substrate.layout) && verifyOwner(storeInfo, store.uid, store.gid) == nil && verifyOwner(substrateInfo, substrate.uid, substrate.gid) == nil
 }
 
 func (h *PublishedAcornFoxSubstrateV1) openLiveSourceRoot() (*os.Root, error) {
@@ -75,18 +77,16 @@ func (h *PublishedAcornFoxSubstrateV1) openLiveSourceRoot() (*os.Root, error) {
 
 func NewTaskAcornFoxSubstratePublisher(taskRoot string, uid, gid int) (*TaskAcornFoxSubstratePublisher, error) {
 	fs := newAcornFoxSubstrateFS()
-	if uid < 0 || gid < 0 || !safeAbsoluteDurableRoot(taskRoot) || forbiddenAcornFoxStageRoot(taskRoot) {
+	layout, layoutErr := newTaskAcornFoxLayout(taskRoot, uid, gid)
+	if layoutErr != nil || forbiddenAcornFoxStageRoot(taskRoot) {
 		return nil, errors.New("AcornFox task substrate root is unsafe")
 	}
-	info, err := fs.lstatPath(taskRoot)
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o022 != 0 || verifyOwner(info, uid, gid) != nil {
-		return nil, errors.New("AcornFox task substrate root is unsafe")
-	}
+	info := layout.stateRootInfo
 	root, err := fs.openRootPath(taskRoot)
 	if err != nil {
 		return nil, err
 	}
-	return &TaskAcornFoxSubstratePublisher{rootPath: taskRoot, rootInfo: info, root: root, uid: uid, gid: gid, fs: fs}, nil
+	return &TaskAcornFoxSubstratePublisher{rootPath: taskRoot, rootInfo: info, root: root, uid: uid, gid: gid, layout: layout, fs: fs}, nil
 }
 
 func (p *TaskAcornFoxSubstratePublisher) openRoot() (*os.Root, error) {
@@ -361,7 +361,7 @@ func (p *TaskAcornFoxSubstratePublisher) inspectLocked(expectedBindingSHA256 str
 		if parseErr != nil || receipt.CandidateReceipt.BindingSHA256 != expectedBindingSHA256 {
 			return AcornFoxSubstrateInspection{Outcome: AcornFoxReconcileConflict}, nil
 		}
-		handle := &PublishedAcornFoxSubstrateV1{root: root, receipt: receipt, uid: p.uid, gid: p.gid, fs: p.fs}
+		handle := &PublishedAcornFoxSubstrateV1{root: root, receipt: receipt, uid: p.uid, gid: p.gid, layout: p.layout, fs: p.fs}
 		if verifyErr := handle.Verify(); verifyErr != nil {
 			handle.root = nil
 			return AcornFoxSubstrateInspection{Outcome: acornFoxSubstrateVerificationOutcome(verifyErr)}, nil
@@ -452,7 +452,7 @@ func (p *TaskAcornFoxSubstratePublisher) reopenLocked(expectedBindingSHA256 stri
 		root.Close()
 		return nil, ErrAcornFoxSubstrateConflict
 	}
-	handle := &PublishedAcornFoxSubstrateV1{root: root, receipt: receipt, uid: p.uid, gid: p.gid, fs: p.fs}
+	handle := &PublishedAcornFoxSubstrateV1{root: root, receipt: receipt, uid: p.uid, gid: p.gid, layout: p.layout, fs: p.fs}
 	if err := handle.Verify(); err != nil {
 		root.Close()
 		return nil, err

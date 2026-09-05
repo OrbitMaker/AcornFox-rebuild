@@ -82,6 +82,7 @@ type TaskAcornFoxStager struct {
 	root     *os.Root
 	uid      int
 	gid      int
+	layout   acornFoxInstallLayout
 	fault    acornFoxStageFault
 }
 
@@ -328,18 +329,15 @@ func acornFoxStageRun(fault acornFoxStageFault, step acornFoxStageFaultStep, ope
 }
 
 func NewTaskAcornFoxStager(taskRoot string, uid, gid int) (*TaskAcornFoxStager, error) {
-	if uid < 0 || gid < 0 || !safeAbsoluteDurableRoot(taskRoot) || forbiddenAcornFoxStageRoot(taskRoot) {
-		return nil, errors.New("AcornFox task root is unsafe")
-	}
-	info, err := os.Lstat(taskRoot)
-	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm()&0o022 != 0 || verifyOwner(info, uid, gid) != nil {
+	layout, layoutErr := newTaskAcornFoxLayout(taskRoot, uid, gid)
+	if layoutErr != nil || forbiddenAcornFoxStageRoot(taskRoot) {
 		return nil, errors.New("AcornFox task root is unsafe")
 	}
 	root, err := os.OpenRoot(taskRoot)
 	if err != nil {
 		return nil, err
 	}
-	return &TaskAcornFoxStager{rootPath: taskRoot, rootInfo: info, root: root, uid: uid, gid: gid}, nil
+	return &TaskAcornFoxStager{rootPath: taskRoot, rootInfo: layout.stateRootInfo, root: root, uid: uid, gid: gid, layout: layout}, nil
 }
 
 func (s *TaskAcornFoxStager) Close() error {

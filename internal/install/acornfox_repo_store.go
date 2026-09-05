@@ -6,7 +6,6 @@ import (
 	"errors"
 	"io"
 	"os"
-	"path/filepath"
 	"syscall"
 )
 
@@ -31,6 +30,7 @@ type TaskAcornFoxRepoStore struct {
 	rootInfo           os.FileInfo
 	root               *os.Root
 	uid, gid           int
+	layout             acornFoxInstallLayout
 	fs                 acornFoxRepoFS
 	lock               *acornFoxRepoStoreLock
 	afterRootPathCheck func()
@@ -80,18 +80,19 @@ func newAcornFoxRepoFS() acornFoxRepoFS {
 
 func NewTaskAcornFoxRepoStore(taskRoot string, uid, gid int) (*TaskAcornFoxRepoStore, error) {
 	fs := newAcornFoxRepoFS()
-	if uid < 0 || gid < 0 || !safeAbsoluteDurableRoot(taskRoot) || filepath.Clean(taskRoot) == string(filepath.Separator) {
+	layout, layoutErr := newTaskAcornFoxLayout(taskRoot, uid, gid)
+	if layoutErr != nil {
 		return nil, ErrAcornFoxRepoConflict
 	}
-	info, err := fs.lstatPath(taskRoot)
-	if err != nil || !safeAcornFoxRepoRoot(info, uid, gid) {
+	info := layout.stateRootInfo
+	if !safeAcornFoxRepoRoot(info, uid, gid) {
 		return nil, ErrAcornFoxRepoConflict
 	}
 	root, err := fs.openRoot(taskRoot)
 	if err != nil {
 		return nil, ErrAcornFoxRepoConflict
 	}
-	return &TaskAcornFoxRepoStore{rootPath: taskRoot, rootInfo: info, root: root, uid: uid, gid: gid, fs: fs}, nil
+	return &TaskAcornFoxRepoStore{rootPath: taskRoot, rootInfo: info, root: root, uid: uid, gid: gid, layout: layout, fs: fs}, nil
 }
 
 func safeAcornFoxRepoRoot(info os.FileInfo, uid, gid int) bool {
