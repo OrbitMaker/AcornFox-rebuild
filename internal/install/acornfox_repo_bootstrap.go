@@ -75,12 +75,7 @@ func prepareAcornFoxRepository(ctx context.Context, store *TaskAcornFoxRepoStore
 		return ErrAcornFoxRepoBootstrapConflict
 	}
 	defer root.Close()
-	// The L2 bridge only establishes a separate host-root seam. Production
-	// mutation stays fail-closed until L3 binds actual ownership evidence.
-	if l.store.layout.mode != acornFoxInstallLayoutTask {
-		return ErrAcornFoxRepoBootstrapConflict
-	}
-	a, raw, err := acornFoxRepoActivation(l.journal, lease.receipt, l.substrate)
+	a, raw, err := acornFoxRepoActivationForLayout(l.store.layout, l.journal, lease.receipt, l.substrate)
 	if err != nil {
 		return err
 	}
@@ -104,13 +99,13 @@ func prepareAcornFoxRepository(ctx context.Context, store *TaskAcornFoxRepoStore
 	}()
 	wasRecovery := l.journal.NeedsRecovery
 	if l.journal.NeedsRecovery {
-		if !acornFoxRepoPrefix(root, l.store, l.journal, lease.receipt, l.substrate, a, raw) {
+		if !acornFoxRepoPrefixForLayout(root, l.store, l.store.layout, l.journal, lease.receipt, l.substrate, a, raw) {
 			return ErrAcornFoxRepoBootstrapConflict
 		}
-		if err = acornFoxRepoRecoverPointerTemps(root, l.store, l.journal.TransactionID, a, mark); err != nil {
+		if err = acornFoxRepoRecoverPointerTempsForLayout(root, l.store, l.store.layout, l.journal.TransactionID, a, mark); err != nil {
 			return ErrAcornFoxRepoBootstrapConflict
 		}
-		if !acornFoxRepoPrefix(root, l.store, l.journal, lease.receipt, l.substrate, a, raw) {
+		if !acornFoxRepoPrefixForLayout(root, l.store, l.store.layout, l.journal, lease.receipt, l.substrate, a, raw) {
 			return ErrAcornFoxRepoBootstrapConflict
 		}
 		next := acornFoxRepoRecovered(l.journal, digest)
@@ -119,7 +114,7 @@ func prepareAcornFoxRepository(ctx context.Context, store *TaskAcornFoxRepoStore
 		}
 		l.journal = next
 	}
-	if !wasRecovery && !acornFoxRepoPrefix(root, l.store, l.journal, lease.receipt, l.substrate, a, raw) {
+	if !wasRecovery && !acornFoxRepoPrefixForLayout(root, l.store, l.store.layout, l.journal, lease.receipt, l.substrate, a, raw) {
 		return ErrAcornFoxRepoBootstrapConflict
 	}
 	if l.journal.Phase == AcornFoxRepoStaticVerified {
@@ -135,7 +130,7 @@ func prepareAcornFoxRepository(ctx context.Context, store *TaskAcornFoxRepoStore
 		}
 	}
 	if l.journal.Phase == AcornFoxRepoActivationWritten {
-		if err = acornFoxRepoEnsurePointer(root, l.store, l.journal.TransactionID, l.store.layout.activePath(), "activations/"+a.ActivationID, mark); err != nil {
+		if err = acornFoxRepoEnsurePointerForLayout(root, l.store, l.store.layout, l.journal.TransactionID, l.store.layout.activePath(), "activations/"+a.ActivationID, mark); err != nil {
 			return ErrAcornFoxRepoBootstrapConflict
 		}
 		if acornFoxRepoBootstrapStep("journal-active") != nil {
@@ -147,7 +142,7 @@ func prepareAcornFoxRepository(ctx context.Context, store *TaskAcornFoxRepoStore
 		}
 	}
 	if l.journal.Phase == AcornFoxRepoActivePublished {
-		if err = acornFoxRepoEnsurePointer(root, l.store, l.journal.TransactionID, l.store.layout.currentPath(), "active/release", mark); err != nil {
+		if err = acornFoxRepoEnsurePointerForLayout(root, l.store, l.store.layout, l.journal.TransactionID, l.store.layout.currentPath(), "active/release", mark); err != nil {
 			return ErrAcornFoxRepoBootstrapConflict
 		}
 		if acornFoxRepoBootstrapStep("journal-current") != nil {
@@ -159,7 +154,7 @@ func prepareAcornFoxRepository(ctx context.Context, store *TaskAcornFoxRepoStore
 		}
 	}
 	if l.journal.Phase == AcornFoxRepoCurrentPublished {
-		if !acornFoxRepoFinal(root, l.store, l.journal, lease.receipt, l.substrate, a, raw) {
+		if !acornFoxRepoFinalForLayout(root, l.store, l.store.layout, l.journal, lease.receipt, l.substrate, a, raw) {
 			return ErrAcornFoxRepoBootstrapConflict
 		}
 		l.journal, err = acornFoxRepoAdvance(l.store, ctx, l.journal, AcornFoxRepoPreparedFinal, digest)
@@ -167,7 +162,7 @@ func prepareAcornFoxRepository(ctx context.Context, store *TaskAcornFoxRepoStore
 			return err
 		}
 	}
-	if l.journal.Phase != AcornFoxRepoPreparedFinal || !acornFoxRepoFinal(root, l.store, l.journal, lease.receipt, l.substrate, a, raw) {
+	if l.journal.Phase != AcornFoxRepoPreparedFinal || !acornFoxRepoFinalForLayout(root, l.store, l.store.layout, l.journal, lease.receipt, l.substrate, a, raw) {
 		return ErrAcornFoxRepoBootstrapConflict
 	}
 	return nil
@@ -207,20 +202,24 @@ func acornFoxRepoEnsureActivation(root *os.Root, s *TaskAcornFoxRepoStore, tx st
 }
 
 func acornFoxRepoEnsureActivationForLayout(root *os.Root, s *TaskAcornFoxRepoStore, layout acornFoxInstallLayout, tx string, a AcornFoxRepoActivationV1, raw []byte, mark func()) error {
-	if layout.validate() != nil || layout.mode != acornFoxInstallLayoutTask {
+	if layout.validate() != nil {
 		return ErrAcornFoxRepoBootstrapConflict
 	}
 	for _, p := range []string{layout.livePath("opt/acornfox/activations"), layout.activationDir(a.ActivationID)} {
-		if err := acornFoxRepoDir(root, s, p, mark); err != nil {
+		if err := acornFoxRepoDirForLayout(root, s, layout, p, mark); err != nil {
 			return err
 		}
 	}
-	if err := acornFoxLiveWriteFile(root, s, tx, layout.activationReceiptPath(a.ActivationID), raw, durableFileMode, mark); err != nil {
-		return err
+	rootPrincipal, ok := layout.owner(AcornFoxLiveRootRole)
+	if !ok || acornFoxLiveWriteFileOwned(root, s, tx, layout.activationReceiptPath(a.ActivationID), raw, durableFileMode, rootPrincipal, mark) != nil {
+		return ErrAcornFoxRepoBootstrapConflict
 	}
-	return acornFoxRepoEnsurePointer(root, s, tx, layout.activationReleasePath(a.ActivationID), "../../releases/"+a.ReleaseID, mark)
+	return acornFoxRepoEnsurePointerForLayout(root, s, layout, tx, layout.activationReleasePath(a.ActivationID), "../../releases/"+a.ReleaseID, mark)
 }
 func acornFoxRepoDir(root *os.Root, s *TaskAcornFoxRepoStore, p string, mark func()) error {
+	return acornFoxRepoDirForLayout(root, s, s.layout, p, mark)
+}
+func acornFoxRepoDirForLayout(root *os.Root, s *TaskAcornFoxRepoStore, layout acornFoxInstallLayout, p string, mark func()) error {
 	info, e := root.Lstat(p)
 	if errors.Is(e, os.ErrNotExist) {
 		if acornFoxRepoBootstrapStep("mkdir") != nil {
@@ -230,12 +229,27 @@ func acornFoxRepoDir(root *os.Root, s *TaskAcornFoxRepoStore, p string, mark fun
 			return e
 		}
 		mark()
+		file, openErr := root.OpenFile(p, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+		if openErr != nil {
+			return openErr
+		}
+		rootPrincipal, ownerOK := layout.owner(AcornFoxLiveRootRole)
+		ownerErr := ErrAcornFoxRepoBootstrapConflict
+		if ownerOK {
+			ownerErr = acornFoxLiveApplyOwner(s, file, rootPrincipal)
+		}
+		syncErr := file.Sync()
+		closeErr := file.Close()
+		if ownerErr != nil || syncErr != nil || closeErr != nil {
+			return ErrAcornFoxRepoBootstrapConflict
+		}
 		if acornFoxLiveSyncDir(root, parentDirectory(p)) != nil {
 			return ErrAcornFoxRepoBootstrapConflict
 		}
 		info, e = root.Lstat(p)
 	}
-	if e != nil || !safeAcornFoxRepoDir(info, s.uid, s.gid) {
+	principal, ok := layout.owner(AcornFoxLiveRootRole)
+	if e != nil || !ok || !info.IsDir() || info.Mode().Perm() != durableDirMode || !acornFoxLiveObservedOwner(s, info, principal) {
 		return ErrAcornFoxRepoBootstrapConflict
 	}
 	return nil
@@ -244,29 +258,36 @@ func acornFoxRepoTemp(tx, p string) string {
 	return filepath.ToSlash(filepath.Join(parentDirectory(p), ".acornfox-repo-link-"+sha256Hex([]byte(tx+"\x00"+p))))
 }
 func acornFoxRepoPointer(root *os.Root, s *TaskAcornFoxRepoStore, p, target string, two bool) bool {
+	return acornFoxRepoPointerForLayout(root, s, s.layout, p, target, two)
+}
+func acornFoxRepoPointerForLayout(root *os.Root, s *TaskAcornFoxRepoStore, layout acornFoxInstallLayout, p, target string, two bool) bool {
 	info, e := root.Lstat(p)
-	if e != nil || info.Mode()&os.ModeSymlink == 0 || verifyOwner(info, s.uid, s.gid) != nil || (!two && acornFoxRepoNlink(info) != 1) || (two && acornFoxRepoNlink(info) != 1 && acornFoxRepoNlink(info) != 2) {
+	principal, ok := layout.owner(AcornFoxLiveRootRole)
+	if e != nil || !ok || info.Mode()&os.ModeSymlink == 0 || !acornFoxLiveObservedOwner(s, info, principal) || (!two && acornFoxRepoNlink(info) != 1) || (two && acornFoxRepoNlink(info) != 1 && acornFoxRepoNlink(info) != 2) {
 		return false
 	}
 	got, e := root.Readlink(p)
 	return e == nil && got == target
 }
 func acornFoxRepoEnsurePointer(root *os.Root, s *TaskAcornFoxRepoStore, tx, p, target string, mark func()) error {
+	return acornFoxRepoEnsurePointerForLayout(root, s, s.layout, tx, p, target, mark)
+}
+func acornFoxRepoEnsurePointerForLayout(root *os.Root, s *TaskAcornFoxRepoStore, layout acornFoxInstallLayout, tx, p, target string, mark func()) error {
 	tmp := acornFoxRepoTemp(tx, p)
 	if info, e := root.Lstat(tmp); e == nil {
-		if !acornFoxRepoPointer(root, s, tmp, target, true) {
+		if !acornFoxRepoPointerForLayout(root, s, layout, tmp, target, true) {
 			return ErrAcornFoxRepoBootstrapConflict
 		}
 		if acornFoxRepoNlink(info) == 2 {
 			final, finalErr := root.Lstat(p)
-			if finalErr != nil || !os.SameFile(info, final) || !acornFoxRepoPointer(root, s, p, target, true) {
+			if finalErr != nil || !os.SameFile(info, final) || !acornFoxRepoPointerForLayout(root, s, layout, p, target, true) {
 				return ErrAcornFoxRepoBootstrapConflict
 			}
 			if acornFoxRepoBootstrapStep("pointer-temp-remove") != nil || root.Remove(tmp) != nil {
 				return ErrAcornFoxRepoBootstrapConflict
 			}
 			mark()
-			if acornFoxRepoBootstrapStep("pointer-post-remove-sync") != nil || acornFoxLiveSyncDir(root, parentDirectory(p)) != nil || !acornFoxRepoPointer(root, s, p, target, false) {
+			if acornFoxRepoBootstrapStep("pointer-post-remove-sync") != nil || acornFoxLiveSyncDir(root, parentDirectory(p)) != nil || !acornFoxRepoPointerForLayout(root, s, layout, p, target, false) {
 				return ErrAcornFoxRepoBootstrapConflict
 			}
 			return nil
@@ -285,7 +306,7 @@ func acornFoxRepoEnsurePointer(root *os.Root, s *TaskAcornFoxRepoStore, tx, p, t
 		return e
 	}
 	if _, e := root.Lstat(p); e == nil {
-		if acornFoxRepoPointer(root, s, p, target, false) {
+		if acornFoxRepoPointerForLayout(root, s, layout, p, target, false) {
 			return nil
 		}
 		return ErrAcornFoxRepoBootstrapConflict
@@ -299,6 +320,13 @@ func acornFoxRepoEnsurePointer(root *os.Root, s *TaskAcornFoxRepoStore, tx, p, t
 		return e
 	}
 	mark()
+	principal, ok := layout.owner(AcornFoxLiveRootRole)
+	if !ok || s.ownership.lchown == nil || s.ownership.lchown(root, tmp, principal.uid, principal.gid) != nil {
+		return ErrAcornFoxRepoBootstrapConflict
+	}
+	if !acornFoxRepoPointerForLayout(root, s, layout, tmp, target, false) {
+		return ErrAcornFoxRepoBootstrapConflict
+	}
 	if acornFoxRepoBootstrapStep("pointer-link") != nil {
 		return ErrAcornFoxRepoBootstrapConflict
 	}
@@ -306,7 +334,7 @@ func acornFoxRepoEnsurePointer(root *os.Root, s *TaskAcornFoxRepoStore, tx, p, t
 		return e
 	}
 	mark()
-	if acornFoxRepoBootstrapStep("pointer-post-link") != nil || acornFoxRepoBootstrapStep("pointer-parent-sync") != nil || acornFoxLiveSyncDir(root, parentDirectory(p)) != nil || !acornFoxRepoPointer(root, s, p, target, true) {
+	if acornFoxRepoBootstrapStep("pointer-post-link") != nil || acornFoxRepoBootstrapStep("pointer-parent-sync") != nil || acornFoxLiveSyncDir(root, parentDirectory(p)) != nil || !acornFoxRepoPointerForLayout(root, s, layout, p, target, true) {
 		return ErrAcornFoxRepoBootstrapConflict
 	}
 	if acornFoxRepoBootstrapStep("pointer-readback") != nil {
@@ -316,7 +344,7 @@ func acornFoxRepoEnsurePointer(root *os.Root, s *TaskAcornFoxRepoStore, tx, p, t
 		return ErrAcornFoxRepoBootstrapConflict
 	}
 	mark()
-	if acornFoxRepoBootstrapStep("pointer-post-remove-sync") != nil || acornFoxLiveSyncDir(root, parentDirectory(p)) != nil || !acornFoxRepoPointer(root, s, p, target, false) {
+	if acornFoxRepoBootstrapStep("pointer-post-remove-sync") != nil || acornFoxLiveSyncDir(root, parentDirectory(p)) != nil || !acornFoxRepoPointerForLayout(root, s, layout, p, target, false) {
 		return ErrAcornFoxRepoBootstrapConflict
 	}
 	return nil
@@ -325,18 +353,21 @@ func acornFoxRepoEnsurePointer(root *os.Root, s *TaskAcornFoxRepoStore, tx, p, t
 // Recover only an authenticated no-replace symlink temporary. Any other
 // topology remains on disk for diagnosis and blocks progress.
 func acornFoxRepoRecoverPointerTemps(root *os.Root, s *TaskAcornFoxRepoStore, tx string, a AcornFoxRepoActivationV1, mark func()) error {
-	for _, v := range []struct{ path, target string }{{acornFoxRepoReleasePath(a.ActivationID), "../../releases/" + a.ReleaseID}, {acornFoxRepoActivePath(), "activations/" + a.ActivationID}, {acornFoxRepoCurrentPath(), "active/release"}} {
+	return acornFoxRepoRecoverPointerTempsForLayout(root, s, s.layout, tx, a, mark)
+}
+func acornFoxRepoRecoverPointerTempsForLayout(root *os.Root, s *TaskAcornFoxRepoStore, layout acornFoxInstallLayout, tx string, a AcornFoxRepoActivationV1, mark func()) error {
+	for _, v := range []struct{ path, target string }{{layout.activationReleasePath(a.ActivationID), "../../releases/" + a.ReleaseID}, {layout.activePath(), "activations/" + a.ActivationID}, {layout.currentPath(), "active/release"}} {
 		tmp := acornFoxRepoTemp(tx, v.path)
 		info, err := root.Lstat(tmp)
 		if errors.Is(err, os.ErrNotExist) {
 			continue
 		}
-		if err != nil || !acornFoxRepoPointer(root, s, tmp, v.target, true) {
+		if err != nil || !acornFoxRepoPointerForLayout(root, s, layout, tmp, v.target, true) {
 			return ErrAcornFoxRepoBootstrapConflict
 		}
 		if acornFoxRepoNlink(info) == 2 {
 			final, finalErr := root.Lstat(v.path)
-			if finalErr != nil || !os.SameFile(info, final) || !acornFoxRepoPointer(root, s, v.path, v.target, true) {
+			if finalErr != nil || !os.SameFile(info, final) || !acornFoxRepoPointerForLayout(root, s, layout, v.path, v.target, true) {
 				return ErrAcornFoxRepoBootstrapConflict
 			}
 		} else if acornFoxRepoNlink(info) != 1 {
@@ -349,7 +380,7 @@ func acornFoxRepoRecoverPointerTemps(root *os.Root, s *TaskAcornFoxRepoStore, tx
 		if acornFoxRepoBootstrapStep("pointer-post-remove-sync") != nil || acornFoxLiveSyncDir(root, parentDirectory(v.path)) != nil {
 			return ErrAcornFoxRepoBootstrapConflict
 		}
-		if _, finalErr := root.Lstat(v.path); finalErr == nil && !acornFoxRepoPointer(root, s, v.path, v.target, false) {
+		if _, finalErr := root.Lstat(v.path); finalErr == nil && !acornFoxRepoPointerForLayout(root, s, layout, v.path, v.target, false) {
 			return ErrAcornFoxRepoBootstrapConflict
 		}
 	}
@@ -413,6 +444,15 @@ const (
 )
 
 func acornFoxRepoPrefix(root *os.Root, s *TaskAcornFoxRepoStore, j AcornFoxRepoJournalV1, r AcornFoxLiveReceiptV1, sub *PublishedAcornFoxSubstrateV1, a AcornFoxRepoActivationV1, raw []byte) bool {
+	return acornFoxRepoPrefixForLayout(root, s, s.layout, j, r, sub, a, raw)
+}
+func acornFoxRepoPrefixForLayout(root *os.Root, s *TaskAcornFoxRepoStore, layout acornFoxInstallLayout, j AcornFoxRepoJournalV1, r AcornFoxLiveReceiptV1, sub *PublishedAcornFoxSubstrateV1, a AcornFoxRepoActivationV1, raw []byte) bool {
+	if layout.validate() != nil || a.LayoutSHA256 != layout.evidence() || r.LayoutSHA256 != layout.evidence() || j.LayoutSHA256 != layout.evidence() {
+		return false
+	}
+	if layout.mode == acornFoxInstallLayoutProduction {
+		return acornFoxRepoProductionPrefix(root, s, layout, j, r, sub, a, raw)
+	}
 	entries, e := acornFoxLiveExpectedEntries(sub)
 	if e != nil || !acornFoxRepoVerifyPinnedLive(root, s, entries, r) {
 		return false
@@ -423,6 +463,28 @@ func acornFoxRepoPrefix(root *os.Root, s *TaskAcornFoxRepoStore, j AcornFoxRepoJ
 	}
 	min, max := acornFoxRepoPrefixBounds(j.Phase, j.NeedsRecovery)
 	return state >= min && state <= max
+}
+
+func acornFoxRepoProductionPrefix(root *os.Root, s *TaskAcornFoxRepoStore, layout acornFoxInstallLayout, j AcornFoxRepoJournalV1, r AcornFoxLiveReceiptV1, sub *PublishedAcornFoxSubstrateV1, a AcornFoxRepoActivationV1, raw []byte) bool {
+	entries, err := acornFoxLiveExpectedEntriesForLayout(layout, sub)
+	if err != nil || !acornFoxRepoVerifyPinnedLiveForLayout(root, s, layout, entries, r) {
+		return false
+	}
+	state, ok := acornFoxRepoClassifyPrefixForLayout(root, s, layout, a, raw)
+	if !ok {
+		return false
+	}
+	min, max := acornFoxRepoPrefixBounds(j.Phase, j.NeedsRecovery)
+	if state < min || state > max {
+		return false
+	}
+	// Before any activation node exists, prove the complete fixed managed
+	// scope. Later pointer prefixes are checked explicitly below so unrelated
+	// host state is never walked or constrained.
+	if state == acornFoxRepoPrefixStatic && acornFoxValidateProductionManagedScope(root, s, entries) != nil {
+		return false
+	}
+	return true
 }
 func acornFoxRepoPrefixBounds(phase AcornFoxRepoPhase, recovery bool) (acornFoxRepoPrefixState, acornFoxRepoPrefixState) {
 	_ = recovery // Clean and failed journals admit the same exact next boundary.
@@ -438,8 +500,11 @@ func acornFoxRepoPrefixBounds(phase AcornFoxRepoPhase, recovery bool) (acornFoxR
 	}
 }
 func acornFoxRepoClassifyPrefix(root *os.Root, s *TaskAcornFoxRepoStore, a AcornFoxRepoActivationV1, raw []byte) (acornFoxRepoPrefixState, bool) {
+	return acornFoxRepoClassifyPrefixForLayout(root, s, s.layout, a, raw)
+}
+func acornFoxRepoClassifyPrefixForLayout(root *os.Root, s *TaskAcornFoxRepoStore, layout acornFoxInstallLayout, a AcornFoxRepoActivationV1, raw []byte) (acornFoxRepoPrefixState, bool) {
 	exists := func(path string) bool { _, err := root.Lstat(path); return err == nil }
-	parent, dir, jsonPath, release := acornFoxLiveDir+"/opt/acornfox/activations", acornFoxRepoActivationDir(a.ActivationID), acornFoxRepoActivationPath(a.ActivationID), acornFoxRepoReleasePath(a.ActivationID)
+	parent, dir, jsonPath, release := layout.livePath("opt/acornfox/activations"), layout.activationDir(a.ActivationID), layout.activationReceiptPath(a.ActivationID), layout.activationReleasePath(a.ActivationID)
 	if !exists(parent) {
 		return acornFoxRepoPrefixStatic, true
 	}
@@ -449,30 +514,34 @@ func acornFoxRepoClassifyPrefix(root *os.Root, s *TaskAcornFoxRepoStore, a Acorn
 	if !exists(jsonPath) {
 		return acornFoxRepoPrefixActivationDir, true
 	}
-	if !acornFoxLiveExactFile(root, s, jsonPath, raw, durableFileMode, false) {
+	rootPrincipal, rootOK := layout.owner(AcornFoxLiveRootRole)
+	if !rootOK || !acornFoxLiveExactFileOwned(root, s, jsonPath, raw, durableFileMode, rootPrincipal, false) {
 		return 0, false
 	}
-	if state, ok := acornFoxRepoPointerPrefix(root, s, a.TransactionID, release, "../../releases/"+a.ReleaseID, acornFoxRepoPrefixActivationJSON, acornFoxRepoPrefixReleaseTemp, acornFoxRepoPrefixRelease); !ok || state != acornFoxRepoPrefixRelease {
+	if state, ok := acornFoxRepoPointerPrefixForLayout(root, s, layout, a.TransactionID, release, "../../releases/"+a.ReleaseID, acornFoxRepoPrefixActivationJSON, acornFoxRepoPrefixReleaseTemp, acornFoxRepoPrefixRelease); !ok || state != acornFoxRepoPrefixRelease {
 		return state, ok
 	}
-	if state, ok := acornFoxRepoPointerPrefix(root, s, a.TransactionID, acornFoxRepoActivePath(), "activations/"+a.ActivationID, acornFoxRepoPrefixRelease, acornFoxRepoPrefixActiveTemp, acornFoxRepoPrefixActive); !ok || state != acornFoxRepoPrefixActive {
+	if state, ok := acornFoxRepoPointerPrefixForLayout(root, s, layout, a.TransactionID, layout.activePath(), "activations/"+a.ActivationID, acornFoxRepoPrefixRelease, acornFoxRepoPrefixActiveTemp, acornFoxRepoPrefixActive); !ok || state != acornFoxRepoPrefixActive {
 		return state, ok
 	}
-	if state, ok := acornFoxRepoPointerPrefix(root, s, a.TransactionID, acornFoxRepoCurrentPath(), "active/release", acornFoxRepoPrefixActive, acornFoxRepoPrefixCurrentTemp, acornFoxRepoPrefixCurrent); !ok || state != acornFoxRepoPrefixCurrent {
+	if state, ok := acornFoxRepoPointerPrefixForLayout(root, s, layout, a.TransactionID, layout.currentPath(), "active/release", acornFoxRepoPrefixActive, acornFoxRepoPrefixCurrentTemp, acornFoxRepoPrefixCurrent); !ok || state != acornFoxRepoPrefixCurrent {
 		return state, ok
 	}
 	return acornFoxRepoPrefixCurrent, true
 }
 func acornFoxRepoPointerPrefix(root *os.Root, s *TaskAcornFoxRepoStore, tx, path, target string, before, tempState, finalState acornFoxRepoPrefixState) (acornFoxRepoPrefixState, bool) {
+	return acornFoxRepoPointerPrefixForLayout(root, s, s.layout, tx, path, target, before, tempState, finalState)
+}
+func acornFoxRepoPointerPrefixForLayout(root *os.Root, s *TaskAcornFoxRepoStore, layout acornFoxInstallLayout, tx, path, target string, before, tempState, finalState acornFoxRepoPrefixState) (acornFoxRepoPrefixState, bool) {
 	temp := acornFoxRepoTemp(tx, path)
 	tempInfo, tempErr := root.Lstat(temp)
 	finalInfo, finalErr := root.Lstat(path)
 	if tempErr == nil {
-		if !acornFoxRepoPointer(root, s, temp, target, true) {
+		if !acornFoxRepoPointerForLayout(root, s, layout, temp, target, true) {
 			return 0, false
 		}
 		if finalErr == nil {
-			if !os.SameFile(tempInfo, finalInfo) || !acornFoxRepoPointer(root, s, path, target, true) {
+			if !os.SameFile(tempInfo, finalInfo) || !acornFoxRepoPointerForLayout(root, s, layout, path, target, true) {
 				return 0, false
 			}
 		} else if !errors.Is(finalErr, os.ErrNotExist) {
@@ -486,7 +555,7 @@ func acornFoxRepoPointerPrefix(root *os.Root, s *TaskAcornFoxRepoStore, tx, path
 	if errors.Is(finalErr, os.ErrNotExist) {
 		return before, true
 	}
-	if finalErr != nil || !acornFoxRepoPointer(root, s, path, target, false) {
+	if finalErr != nil || !acornFoxRepoPointerForLayout(root, s, layout, path, target, false) {
 		return 0, false
 	}
 	return finalState, true
@@ -582,23 +651,34 @@ func acornFoxRepoExactInventory(root *os.Root, s *TaskAcornFoxRepoStore, entries
 	return true
 }
 func acornFoxRepoVerifyLeaseInventory(root *os.Root, s *TaskAcornFoxRepoStore, j AcornFoxRepoJournalV1, r AcornFoxLiveReceiptV1, sub *PublishedAcornFoxSubstrateV1) bool {
-	a, raw, err := acornFoxRepoActivation(j, r, sub)
+	a, raw, err := acornFoxRepoActivationForLayout(s.layout, j, r, sub)
 	if err != nil {
 		return false
 	}
-	entries, err := acornFoxLiveExpectedEntries(sub)
-	if err != nil || !acornFoxRepoVerifyPinnedLive(root, s, entries, r) {
+	entries, err := acornFoxLiveExpectedEntriesForLayout(s.layout, sub)
+	if err != nil || !acornFoxRepoVerifyPinnedLiveForLayout(root, s, s.layout, entries, r) {
 		return false
 	}
-	state, ok := acornFoxRepoClassifyPrefix(root, s, a, raw)
+	state, ok := acornFoxRepoClassifyPrefixForLayout(root, s, s.layout, a, raw)
+	if s.layout.mode == acornFoxInstallLayoutProduction {
+		min, max := acornFoxRepoPrefixBounds(j.Phase, j.NeedsRecovery)
+		return ok && state >= min && state <= max
+	}
 	min, max := acornFoxRepoPrefixBounds(j.Phase, j.NeedsRecovery)
 	return ok && state >= min && state <= max && acornFoxRepoExactInventory(root, s, entries, a, raw, state)
 }
 func acornFoxRepoVerifyPinnedLive(root *os.Root, s *TaskAcornFoxRepoStore, entries []SubstrateEntry, r AcornFoxLiveReceiptV1) bool {
+	return acornFoxRepoVerifyPinnedLiveForLayout(root, s, s.layout, entries, r)
+}
+func acornFoxRepoVerifyPinnedLiveForLayout(root *os.Root, s *TaskAcornFoxRepoStore, layout acornFoxInstallLayout, entries []SubstrateEntry, r AcornFoxLiveReceiptV1) bool {
+	if layout.validate() != nil || r.LayoutSHA256 != layout.evidence() {
+		return false
+	}
 	for _, e := range entries {
-		p := acornFoxLivePath(e.Path)
+		p := layout.livePath(e.Path)
 		info, x := root.Lstat(p)
-		if x != nil || info.Mode()&os.ModeSymlink != 0 || verifyOwner(info, s.uid, s.gid) != nil || info.Mode().Perm() != os.FileMode(e.Mode) {
+		principal := acornFoxLivePrincipalForEntry(layout, e)
+		if x != nil || info.Mode()&os.ModeSymlink != 0 || !acornFoxLiveObservedOwner(s, info, principal) || info.Mode().Perm() != os.FileMode(e.Mode) {
 			return false
 		}
 		if e.Kind == SubstrateEntryDirectory {
@@ -619,10 +699,14 @@ func acornFoxRepoVerifyPinnedLive(root *os.Root, s *TaskAcornFoxRepoStore, entri
 		}
 	}
 	raw, e := MarshalAcornFoxLiveReceiptV1(r)
-	return e == nil && acornFoxLiveExactFile(root, s, acornFoxLiveReceipt, raw, durableFileMode, false)
+	rootPrincipal, ok := layout.owner(AcornFoxLiveRootRole)
+	return e == nil && ok && acornFoxLiveExactFileOwned(root, s, layout.receiptPath(), raw, durableFileMode, rootPrincipal, false)
 }
 func acornFoxRepoFinal(root *os.Root, s *TaskAcornFoxRepoStore, j AcornFoxRepoJournalV1, r AcornFoxLiveReceiptV1, sub *PublishedAcornFoxSubstrateV1, a AcornFoxRepoActivationV1, raw []byte) bool {
-	if !acornFoxRepoPrefix(root, s, j, r, sub, a, raw) {
+	return acornFoxRepoFinalForLayout(root, s, s.layout, j, r, sub, a, raw)
+}
+func acornFoxRepoFinalForLayout(root *os.Root, s *TaskAcornFoxRepoStore, layout acornFoxInstallLayout, j AcornFoxRepoJournalV1, r AcornFoxLiveReceiptV1, sub *PublishedAcornFoxSubstrateV1, a AcornFoxRepoActivationV1, raw []byte) bool {
+	if !acornFoxRepoPrefixForLayout(root, s, layout, j, r, sub, a, raw) {
 		return false
 	}
 	for _, role := range []string{"upgrade", "healthcheck"} {

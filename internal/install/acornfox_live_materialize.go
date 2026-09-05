@@ -79,12 +79,7 @@ func (m *acornFoxLiveMaterializer) Materialize(ctx context.Context) (result Acor
 		return AcornFoxLiveReceiptV1{}, err
 	}
 	defer target.Close()
-	// L2 proves the independent host-root routing but does not yet possess the
-	// L3 ownership/evidence contract needed to mutate a production layout.
-	if m.lease.store.layout.mode != acornFoxInstallLayoutTask {
-		return AcornFoxLiveReceiptV1{}, ErrAcornFoxLiveConflict
-	}
-	entries, err := acornFoxLiveExpectedEntries(m.lease.substrate)
+	entries, err := acornFoxLiveExpectedEntriesForLayout(m.lease.store.layout, m.lease.substrate)
 	if err != nil {
 		return AcornFoxLiveReceiptV1{}, fmt.Errorf("clean temps: %w", ErrAcornFoxLiveConflict)
 	}
@@ -95,17 +90,17 @@ func (m *acornFoxLiveMaterializer) Materialize(ctx context.Context) (result Acor
 			}
 		}
 	}
-	receipt, err := acornFoxLiveMakeReceipt(m.lease.journal, m.lease.substrate, entries)
+	receipt, err := acornFoxLiveMakeReceiptForLayout(m.lease.store.layout, m.lease.journal, m.lease.substrate, entries)
 	if err != nil {
 		return AcornFoxLiveReceiptV1{}, fmt.Errorf("validate existing: %w", ErrAcornFoxLiveConflict)
 	}
-	if err = acornFoxLiveEnsureRoot(target, m.lease.store, markEffect); err != nil {
+	if m.lease.store.layout.mode == acornFoxInstallLayoutTask && acornFoxLiveEnsureRoot(target, m.lease.store, markEffect) != nil {
 		return AcornFoxLiveReceiptV1{}, fmt.Errorf("ensure root: %w", ErrAcornFoxLiveConflict)
 	}
 	if err = acornFoxLiveCleanTemps(target, m.lease.store, m.lease.journal.TransactionID, source, m.lease.substrate, entries, markEffect); err != nil {
 		return AcornFoxLiveReceiptV1{}, fmt.Errorf("clean temps: %w", ErrAcornFoxLiveConflict)
 	}
-	if err = acornFoxLiveValidateExisting(target, m.lease.store, entries, receipt); err != nil {
+	if err = acornFoxLiveValidateExistingForLayout(target, m.lease.store, m.lease.store.layout, entries, receipt); err != nil {
 		return AcornFoxLiveReceiptV1{}, fmt.Errorf("validate existing: %w", ErrAcornFoxLiveConflict)
 	}
 	journal := m.lease.journal
@@ -138,7 +133,7 @@ func (m *acornFoxLiveMaterializer) Materialize(ctx context.Context) (result Acor
 	if err != nil || !rootOK || acornFoxLiveWriteFileOwned(target, m.lease.store, m.lease.journal.TransactionID, m.lease.store.layout.receiptPath(), raw, durableFileMode, rootPrincipal, markEffect) != nil {
 		return AcornFoxLiveReceiptV1{}, fmt.Errorf("write receipt: %w", ErrAcornFoxLiveConflict)
 	}
-	if err = acornFoxLiveVerifyTarget(target, m.lease.store, entries, receipt); err != nil {
+	if err = acornFoxLiveVerifyTargetForLayout(target, m.lease.store, m.lease.store.layout, entries, receipt); err != nil {
 		return AcornFoxLiveReceiptV1{}, fmt.Errorf("verify live target: %w", ErrAcornFoxLiveConflict)
 	}
 	if journal.Phase == AcornFoxRepoPrepared {
@@ -149,7 +144,7 @@ func (m *acornFoxLiveMaterializer) Materialize(ctx context.Context) (result Acor
 		journal, m.lease.journal = next, next
 	}
 	if journal.Phase == AcornFoxRepoLiveMaterialized {
-		if err = acornFoxLiveVerifyTarget(target, m.lease.store, entries, receipt); err != nil {
+		if err = acornFoxLiveVerifyTargetForLayout(target, m.lease.store, m.lease.store.layout, entries, receipt); err != nil {
 			return AcornFoxLiveReceiptV1{}, ErrAcornFoxLiveConflict
 		}
 		next, nextErr := acornFoxLiveAdvance(journal, AcornFoxRepoStaticVerified, receipt)
@@ -593,14 +588,15 @@ func acornFoxLiveCleanTemps(root *os.Root, store *TaskAcornFoxRepoStore, transac
 			if err != nil {
 				return err
 			}
-			temp := acornFoxLiveTemp(transactionID, acornFoxLivePath(entry.Path))
+			path := store.layout.livePath(entry.Path)
+			temp := acornFoxLiveTemp(transactionID, path)
 			if info, statErr := root.Lstat(temp); statErr == nil {
 				principal := acornFoxLivePrincipalForEntry(store.layout, entry)
 				if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != os.FileMode(entry.Mode) || !acornFoxLiveObservedOwner(store, info, principal) {
 					return ErrAcornFoxLiveConflict
 				}
 				if acornFoxRepoNlink(info) == 2 {
-					final := acornFoxLivePath(entry.Path)
+					final := path
 					finalInfo, finalErr := root.Lstat(final)
 					if finalErr != nil || !os.SameFile(info, finalInfo) || !acornFoxLiveExactFileOwned(root, store, final, raw, os.FileMode(entry.Mode), principal, true) {
 						return ErrAcornFoxLiveConflict
@@ -627,11 +623,24 @@ func acornFoxLiveCleanTemps(root *os.Root, store *TaskAcornFoxRepoStore, transac
 }
 
 func acornFoxLiveValidateExisting(root *os.Root, store *TaskAcornFoxRepoStore, entries []SubstrateEntry, receipt AcornFoxLiveReceiptV1) error {
+	return acornFoxLiveValidateExistingForLayout(root, store, store.layout, entries, receipt)
+}
+
+func acornFoxLiveValidateExistingForLayout(root *os.Root, store *TaskAcornFoxRepoStore, layout acornFoxInstallLayout, entries []SubstrateEntry, receipt AcornFoxLiveReceiptV1) error {
+	if layout.validate() != nil {
+		return ErrAcornFoxLiveConflict
+	}
+	if layout.mode == acornFoxInstallLayoutProduction {
+		// A complete production tree is checked by the fixed-scope verifier after
+		// materialization. Before first creation, individual no-replace writers
+		// own the collision boundary and never inspect the host root.
+		return nil
+	}
 	want := map[string]SubstrateEntry{}
 	for _, entry := range entries {
 		want[entry.Path] = entry
 	}
-	return acornFoxLiveWalk(root, acornFoxLiveDir, func(relative string, info os.FileInfo) error {
+	return acornFoxLiveWalk(root, layout.livePrefix, func(relative string, info os.FileInfo) error {
 		if relative == "receipt.json" {
 			return nil
 		}
@@ -644,13 +653,23 @@ func acornFoxLiveValidateExisting(root *os.Root, store *TaskAcornFoxRepoStore, e
 }
 
 func acornFoxLiveVerifyTarget(root *os.Root, store *TaskAcornFoxRepoStore, entries []SubstrateEntry, receipt AcornFoxLiveReceiptV1) error {
-	if err := acornFoxLiveValidateExisting(root, store, entries, receipt); err != nil {
+	return acornFoxLiveVerifyTargetForLayout(root, store, store.layout, entries, receipt)
+}
+
+func acornFoxLiveVerifyTargetForLayout(root *os.Root, store *TaskAcornFoxRepoStore, layout acornFoxInstallLayout, entries []SubstrateEntry, receipt AcornFoxLiveReceiptV1) error {
+	if layout.validate() != nil {
+		return ErrAcornFoxLiveConflict
+	}
+	if layout.mode == acornFoxInstallLayoutProduction {
+		return acornFoxValidateProductionManagedScope(root, store, entries)
+	}
+	if err := acornFoxLiveValidateExistingForLayout(root, store, layout, entries, receipt); err != nil {
 		return err
 	}
 	seen := map[string]bool{}
 	for _, entry := range entries {
 		seen[entry.Path] = true
-		path := acornFoxLivePath(entry.Path)
+		path := layout.livePath(entry.Path)
 		if entry.Kind == SubstrateEntryDirectory {
 			info, err := root.Lstat(path)
 			if err != nil || !info.IsDir() || info.Mode().Perm() != os.FileMode(entry.Mode) || !acornFoxLiveObservedOwner(store, info, acornFoxLivePrincipalForEntry(store.layout, entry)) {
@@ -675,39 +694,44 @@ func acornFoxLiveVerifyTarget(root *os.Root, store *TaskAcornFoxRepoStore, entri
 	}
 	raw, err := MarshalAcornFoxLiveReceiptV1(receipt)
 	rootPrincipal, ok := store.layout.owner(AcornFoxLiveRootRole)
-	if err != nil || !ok || !acornFoxLiveExactFileOwned(root, store, acornFoxLiveReceipt, raw, durableFileMode, rootPrincipal, false) {
+	if err != nil || !ok || !acornFoxLiveExactFileOwned(root, store, layout.receiptPath(), raw, durableFileMode, rootPrincipal, false) {
 		return ErrAcornFoxLiveConflict
 	}
 	return nil
 }
 
 func acornFoxLiveWalk(root *os.Root, directory string, visit func(string, os.FileInfo) error) error {
-	file, err := root.OpenFile(directory, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
-	if err != nil {
-		return err
-	}
-	children, readErr := file.ReadDir(-1)
-	closeErr := file.Close()
-	if readErr != nil || closeErr != nil {
-		return ErrAcornFoxLiveConflict
-	}
-	for _, child := range children {
-		path := filepath.ToSlash(filepath.Join(directory, child.Name()))
-		info, err := root.Lstat(path)
-		if err != nil || info.Mode()&os.ModeSymlink != 0 || (!info.IsDir() && !info.Mode().IsRegular()) {
-			return ErrAcornFoxLiveConflict
-		}
-		relative := strings.TrimPrefix(path, acornFoxLiveDir+"/")
-		if err = visit(relative, info); err != nil {
+	base := directory
+	var walk func(string) error
+	walk = func(current string) error {
+		file, err := root.OpenFile(current, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+		if err != nil {
 			return err
 		}
-		if info.IsDir() {
-			if err = acornFoxLiveWalk(root, path, visit); err != nil {
+		children, readErr := file.ReadDir(-1)
+		closeErr := file.Close()
+		if readErr != nil || closeErr != nil {
+			return ErrAcornFoxLiveConflict
+		}
+		for _, child := range children {
+			path := filepath.ToSlash(filepath.Join(current, child.Name()))
+			info, err := root.Lstat(path)
+			if err != nil || info.Mode()&os.ModeSymlink != 0 || (!info.IsDir() && !info.Mode().IsRegular()) {
+				return ErrAcornFoxLiveConflict
+			}
+			relative := strings.TrimPrefix(path, base+"/")
+			if err = visit(relative, info); err != nil {
 				return err
 			}
+			if info.IsDir() {
+				if err = walk(path); err != nil {
+					return err
+				}
+			}
 		}
+		return nil
 	}
-	return nil
+	return walk(directory)
 }
 
 func acornFoxLiveAdvance(old AcornFoxRepoJournalV1, phase AcornFoxRepoPhase, receipt AcornFoxLiveReceiptV1) (AcornFoxRepoJournalV1, error) {

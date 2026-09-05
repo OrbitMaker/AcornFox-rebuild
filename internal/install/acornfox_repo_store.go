@@ -45,12 +45,14 @@ type TaskAcornFoxRepoStore struct {
 // it can apply ownership to a just-opened descriptor and observe an inode.
 type acornFoxOwnershipEdge struct {
 	chown   func(acornFoxRepoFile, int, int) error
+	lchown  func(*os.Root, string, int, int) error
 	observe func(os.FileInfo) (acornFoxInstallPrincipal, bool)
 }
 
 func newAcornFoxRealOwnershipEdge() acornFoxOwnershipEdge {
 	return acornFoxOwnershipEdge{
-		chown: func(file acornFoxRepoFile, uid, gid int) error { return file.Chown(uid, gid) },
+		chown:  func(file acornFoxRepoFile, uid, gid int) error { return file.Chown(uid, gid) },
+		lchown: func(root *os.Root, path string, uid, gid int) error { return root.Lchown(path, uid, gid) },
 		observe: func(info os.FileInfo) (acornFoxInstallPrincipal, bool) {
 			stat, ok := info.Sys().(*syscall.Stat_t)
 			return acornFoxInstallPrincipal{uid: int(stat.Uid), gid: int(stat.Gid)}, ok
@@ -328,16 +330,16 @@ func (s *TaskAcornFoxRepoStore) mintLiveVerifiedLease(ctx context.Context, subst
 	if err != nil || receipt.BindingSHA256 != bindingSHA256 || receipt.SubstrateReceiptSHA256 != prepared.journal.SubstrateReceiptSHA256 || receipt.ReleaseID != substrate.receipt.CandidateReceipt.ReleaseID || receipt.LiveTreeSHA256 != prepared.journal.LiveTreeSHA256 || receipt.OwnershipPlanSHA256 != prepared.journal.OwnershipPlanSHA256 || receipt.StaticSetSHA256 != prepared.journal.StaticSetSHA256 {
 		return fail()
 	}
-	entries, err := acornFoxLiveExpectedEntries(substrate)
+	entries, err := acornFoxLiveExpectedEntriesForLayout(s.layout, substrate)
 	// Every handoff verifies the pinned base tree and receipt before accepting a
 	// pointer prefix. The original 04B full-tree verifier remains the first
 	// authority for a clean static journal; the 04C exact-inventory verifier is
 	// its narrow fallback once a legitimate activation prefix exists.
-	if err != nil || !acornFoxRepoVerifyPinnedLive(root, s, entries, receipt) {
+	if err != nil || !acornFoxRepoVerifyPinnedLiveForLayout(root, s, s.layout, entries, receipt) {
 		return fail()
 	}
 	if prepared.journal.Phase == AcornFoxRepoStaticVerified && !prepared.journal.NeedsRecovery {
-		if acornFoxLiveVerifyTarget(root, s, entries, receipt) != nil && !acornFoxRepoVerifyLeaseInventory(root, s, prepared.journal, receipt, substrate) {
+		if acornFoxLiveVerifyTargetForLayout(root, s, s.layout, entries, receipt) != nil && !acornFoxRepoVerifyLeaseInventory(root, s, prepared.journal, receipt, substrate) {
 			return fail()
 		}
 	} else if !acornFoxRepoVerifyLeaseInventory(root, s, prepared.journal, receipt, substrate) {
@@ -349,7 +351,8 @@ func (s *TaskAcornFoxRepoStore) mintLiveVerifiedLease(ctx context.Context, subst
 func (s *TaskAcornFoxRepoStore) readExactLiveReceipt(root *os.Root) ([]byte, error) {
 	path := s.layout.receiptPath()
 	before, err := s.fs.lstat(root, path)
-	if err != nil || !safeAcornFoxRepoFile(before, s.uid, s.gid) || before.Size() < 1 || before.Size() > acornFoxRepoMaxJournalSize {
+	rootPrincipal, ownerOK := s.layout.owner(AcornFoxLiveRootRole)
+	if err != nil || !ownerOK || !before.Mode().IsRegular() || before.Mode().Perm() != durableFileMode || acornFoxRepoNlink(before) != 1 || !acornFoxLiveObservedOwner(s, before, rootPrincipal) || before.Size() < 1 || before.Size() > acornFoxRepoMaxJournalSize {
 		return nil, ErrAcornFoxRepoConflict
 	}
 	file, err := s.fs.openFile(root, path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
@@ -360,7 +363,7 @@ func (s *TaskAcornFoxRepoStore) readExactLiveReceipt(root *os.Root) ([]byte, err
 	raw, readErr := io.ReadAll(io.LimitReader(file, acornFoxRepoMaxJournalSize+1))
 	closeErr := file.Close()
 	after, afterErr := s.fs.lstat(root, path)
-	if statErr != nil || readErr != nil || closeErr != nil || afterErr != nil || !safeAcornFoxRepoFile(opened, s.uid, s.gid) || !safeAcornFoxRepoFile(after, s.uid, s.gid) || !os.SameFile(before, opened) || !os.SameFile(before, after) || len(raw) < 1 || len(raw) > acornFoxRepoMaxJournalSize {
+	if statErr != nil || readErr != nil || closeErr != nil || afterErr != nil || !opened.Mode().IsRegular() || opened.Mode().Perm() != durableFileMode || acornFoxRepoNlink(opened) != 1 || !after.Mode().IsRegular() || after.Mode().Perm() != durableFileMode || acornFoxRepoNlink(after) != 1 || !acornFoxLiveObservedOwner(s, opened, rootPrincipal) || !acornFoxLiveObservedOwner(s, after, rootPrincipal) || !os.SameFile(before, opened) || !os.SameFile(before, after) || len(raw) < 1 || len(raw) > acornFoxRepoMaxJournalSize {
 		return nil, ErrAcornFoxRepoConflict
 	}
 	return raw, nil

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -254,11 +255,43 @@ func TestProductionTestLayoutSeparatesStateAndPinnedHostBeforeL3(t *testing.T) {
 	if err := hostHandle.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := materializeAcornFoxLive(context.Background(), store, published, receipt.BindingSHA256); !errors.Is(err, ErrAcornFoxLiveConflict) {
-		t.Fatalf("L2 production materialize=%v", err)
+	entries, err := acornFoxLiveExpectedEntriesForLayout(layout, published)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err := os.Lstat(filepath.Join(host, "opt")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("gated L2 materialization changed host live paths err=%v", err)
+	owners := acornFoxTestOwnershipRecorder(t)
+	for _, entry := range entries {
+		path := filepath.Join(host, filepath.FromSlash(entry.Path))
+		if info, statErr := os.Lstat(path); statErr == nil {
+			if entry.Kind == SubstrateEntryDirectory {
+				if err := os.Chmod(path, os.FileMode(entry.Mode)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			owners.set(info, acornFoxLivePrincipalForEntry(layout, entry))
+		}
+	}
+	store.ownership = owners.edge()
+	varInfo, varErr := os.Lstat(filepath.Join(host, "var"))
+	if varErr != nil || !acornFoxLiveObservedOwner(store, varInfo, acornFoxInstallPrincipal{}) {
+		t.Fatalf("seed var owner err=%v observed=%t", varErr, varErr == nil && acornFoxLiveObservedOwner(store, varInfo, acornFoxInstallPrincipal{}))
+	}
+	live, err := materializeAcornFoxLive(context.Background(), store, published, receipt.BindingSHA256)
+	if err != nil || live.Validate() != nil || live.State != "host_live_materialized" || live.LayoutSHA256 != layout.evidence() {
+		t.Fatalf("L3 production materialize receipt=%#v err=%v", live, err)
+	}
+	if _, err := os.Lstat(filepath.Join(host, "opt", "acornfox")); err != nil {
+		t.Fatalf("production live missing: %v", err)
+	}
+	if err := prepareAcornFoxRepository(context.Background(), store, published, receipt.BindingSHA256); err != nil {
+		t.Fatalf("production repository prepare=%v", err)
+	}
+	current := filepath.Join(host, "opt", "acornfox", "current")
+	if target, err := os.Readlink(current); err != nil || target != "active/release" {
+		t.Fatalf("production current target=%q err=%v", target, err)
+	}
+	if journal, err := store.Resume(context.Background()); err != nil || journal.Phase != AcornFoxRepoPreparedFinal || journal.LayoutSHA256 != layout.evidence() {
+		t.Fatalf("production journal=%#v err=%v", journal, err)
 	}
 	if err := os.Rename(host, host+"-old"); err != nil {
 		t.Fatal(err)
@@ -434,6 +467,47 @@ func acornFoxTestLayoutPrincipals() map[AcornFoxLiveRole]acornFoxInstallPrincipa
 		AcornFoxLiveCaddyRole:    {uid: 1004, gid: 1004},
 		AcornFoxLiveEdgeRole:     {uid: 1005, gid: 1005},
 	}
+}
+
+type acornFoxTestOwnerRecorder struct {
+	values map[[2]uint64]acornFoxInstallPrincipal
+}
+
+func acornFoxTestOwnershipRecorder(t *testing.T) *acornFoxTestOwnerRecorder {
+	t.Helper()
+	return &acornFoxTestOwnerRecorder{values: map[[2]uint64]acornFoxInstallPrincipal{}}
+}
+func (r *acornFoxTestOwnerRecorder) set(info os.FileInfo, principal acornFoxInstallPrincipal) {
+	r.values[acornFoxTestOwnerInfoKey(info)] = principal
+}
+func (r *acornFoxTestOwnerRecorder) edge() acornFoxOwnershipEdge {
+	return acornFoxOwnershipEdge{
+		chown: func(file acornFoxRepoFile, uid, gid int) error {
+			info, err := file.Stat()
+			if err == nil {
+				r.set(info, acornFoxInstallPrincipal{uid: uid, gid: gid})
+			}
+			return err
+		},
+		lchown: func(root *os.Root, path string, uid, gid int) error {
+			info, err := root.Lstat(path)
+			if err == nil {
+				r.set(info, acornFoxInstallPrincipal{uid: uid, gid: gid})
+			}
+			return err
+		},
+		observe: func(info os.FileInfo) (acornFoxInstallPrincipal, bool) {
+			value, ok := r.values[acornFoxTestOwnerInfoKey(info)]
+			return value, ok
+		},
+	}
+}
+func acornFoxTestOwnerInfoKey(info os.FileInfo) [2]uint64 {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		panic("missing stat")
+	}
+	return [2]uint64{uint64(stat.Dev), uint64(stat.Ino)}
 }
 
 func readAcornFoxLayoutRootFile(t *testing.T, root *os.Root, name string) []byte {
