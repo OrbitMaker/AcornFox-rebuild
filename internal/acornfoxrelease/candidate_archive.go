@@ -24,59 +24,61 @@ var ErrCandidateArtifacts = errors.New("acornfox synthetic artifacts are invalid
 // candidateBuildRecordV1 is intentionally private: a synthetic build record
 // documents private construction bytes, not an approval or publication claim.
 type candidateBuildRecordV1 struct {
-	SchemaVersion      int    `json:"schema_version"`
-	Product            string `json:"product"`
-	Version            string `json:"version"`
-	ReleaseID          string `json:"release_id"`
-	SourceRepository   string `json:"source_repository"`
-	SourceCommit       string `json:"source_commit"`
-	Architecture       string `json:"architecture"`
-	MigrationVersion   string `json:"migration_version"`
-	Synthetic          bool   `json:"synthetic"`
-	State              string `json:"state"`
-	ProductionAccepted bool   `json:"production_accepted"`
-	CandidateAccepted  bool   `json:"candidate_accepted"`
-	DecisionSHA256     string `json:"decision_sha256"`
-	SourcePolicySHA256 string `json:"source_policy_sha256"`
-	ToolchainSHA256    string `json:"toolchain_sha256"`
-	RuntimeInputSHA256 string `json:"runtime_input_sha256"`
-	LicenseInputSHA256 string `json:"license_input_sha256"`
-	TreeSHA256         string `json:"tree_sha256"`
-	ManifestSHA256     string `json:"manifest_sha256"`
-	ArchiveSHA256      string `json:"archive_sha256"`
-	BundleSHA256       string `json:"bundle_sha256"`
-	BindingSHA256      string `json:"binding_sha256"`
+	SchemaVersion            int    `json:"schema_version"`
+	Product                  string `json:"product"`
+	Version                  string `json:"version"`
+	ReleaseID                string `json:"release_id"`
+	SourceRepository         string `json:"source_repository"`
+	SourceCommit             string `json:"source_commit"`
+	Architecture             string `json:"architecture"`
+	MigrationVersion         string `json:"migration_version"`
+	Synthetic                bool   `json:"synthetic"`
+	State                    string `json:"state"`
+	ProductionAccepted       bool   `json:"production_accepted"`
+	CandidateAccepted        bool   `json:"candidate_accepted"`
+	DecisionSHA256           string `json:"decision_sha256"`
+	SourcePolicySHA256       string `json:"source_policy_sha256"`
+	ToolchainSHA256          string `json:"toolchain_sha256"`
+	RuntimeInputSHA256       string `json:"runtime_input_sha256"`
+	LicenseInputSHA256       string `json:"license_input_sha256"`
+	TreeSHA256               string `json:"tree_sha256"`
+	ManifestSHA256           string `json:"manifest_sha256"`
+	ArchiveSHA256            string `json:"archive_sha256"`
+	BundleSHA256             string `json:"bundle_sha256"`
+	BindingSHA256            string `json:"binding_sha256"`
+	PredecessorBindingSHA256 string `json:"predecessor_binding_sha256,omitempty"`
 }
 
 func (r candidateBuildRecordV1) ValidateAgainst(receipt CandidateArtifactReceiptV1, tree CandidateTreeReceiptV1) error {
-	if r.SchemaVersion != 1 || r.Product != Product || r.Version != receipt.Version || r.ReleaseID != receipt.ReleaseID || r.SourceRepository != receipt.SourceRepository || r.SourceCommit != receipt.SourceCommit || r.Architecture != Architecture || r.MigrationVersion != Migration || r.Synthetic != receipt.Synthetic || r.Synthetic != tree.Synthetic || r.State != "BUILT_UNAPPROVED" || r.ProductionAccepted || r.CandidateAccepted || r.DecisionSHA256 != tree.DecisionSHA256 || r.SourcePolicySHA256 != tree.SourcePolicySHA256 || r.ToolchainSHA256 != tree.ToolchainSHA256 || r.RuntimeInputSHA256 != tree.RuntimeInputSHA256 || r.LicenseInputSHA256 != tree.LicenseInputSHA256 || r.TreeSHA256 != tree.TreeSHA256 || r.ManifestSHA256 != receipt.ManifestSHA256 || r.ArchiveSHA256 != receipt.ArchiveSHA256 || r.BundleSHA256 != receipt.BundleSHA256 || r.BindingSHA256 != receipt.BindingSHA256 {
+	if r.SchemaVersion != 1 || r.Product != Product || r.Version != receipt.Version || r.ReleaseID != receipt.ReleaseID || r.SourceRepository != receipt.SourceRepository || r.SourceCommit != receipt.SourceCommit || r.Architecture != Architecture || r.MigrationVersion != Migration || r.Synthetic != receipt.Synthetic || r.Synthetic != tree.Synthetic || r.State != "BUILT_UNAPPROVED" || r.ProductionAccepted || r.CandidateAccepted || r.DecisionSHA256 != tree.DecisionSHA256 || r.SourcePolicySHA256 != tree.SourcePolicySHA256 || r.ToolchainSHA256 != tree.ToolchainSHA256 || r.RuntimeInputSHA256 != tree.RuntimeInputSHA256 || r.LicenseInputSHA256 != tree.LicenseInputSHA256 || r.TreeSHA256 != tree.TreeSHA256 || r.ManifestSHA256 != receipt.ManifestSHA256 || r.ArchiveSHA256 != receipt.ArchiveSHA256 || r.BundleSHA256 != receipt.BundleSHA256 || r.BindingSHA256 != receipt.BindingSHA256 || r.PredecessorBindingSHA256 != receipt.PredecessorBindingSHA256 {
 		return ErrCandidateArtifacts
 	}
 	return nil
 }
 
 type CandidateArtifactReceiptV1 struct {
-	SchemaVersion      int           `json:"schema_version"`
-	Synthetic          bool          `json:"synthetic"`
-	Product            string        `json:"product"`
-	Version            string        `json:"version"`
-	ReleaseID          string        `json:"release_id"`
-	SourceRepository   string        `json:"source_repository"`
-	SourceCommit       string        `json:"source_commit"`
-	Architecture       string        `json:"architecture"`
-	MigrationVersion   string        `json:"migration_version"`
-	DecisionSHA256     string        `json:"decision_sha256"`
-	SourcePolicySHA256 string        `json:"source_policy_sha256"`
-	ToolchainSHA256    string        `json:"toolchain_sha256"`
-	RuntimeInputSHA256 string        `json:"runtime_input_sha256"`
-	LicenseInputSHA256 string        `json:"license_input_sha256"`
-	TreeSHA256         string        `json:"tree_sha256"`
-	ManifestSHA256     string        `json:"manifest_sha256"`
-	ArchiveSHA256      string        `json:"archive_sha256"`
-	BundleSHA256       string        `json:"bundle_sha256"`
-	BindingSHA256      string        `json:"binding_sha256"`
-	BuildRecordSHA256  string        `json:"build_record_sha256"`
-	Files              []FileEntryV1 `json:"files"`
+	SchemaVersion            int           `json:"schema_version"`
+	Synthetic                bool          `json:"synthetic"`
+	Product                  string        `json:"product"`
+	Version                  string        `json:"version"`
+	ReleaseID                string        `json:"release_id"`
+	SourceRepository         string        `json:"source_repository"`
+	SourceCommit             string        `json:"source_commit"`
+	Architecture             string        `json:"architecture"`
+	MigrationVersion         string        `json:"migration_version"`
+	DecisionSHA256           string        `json:"decision_sha256"`
+	SourcePolicySHA256       string        `json:"source_policy_sha256"`
+	ToolchainSHA256          string        `json:"toolchain_sha256"`
+	RuntimeInputSHA256       string        `json:"runtime_input_sha256"`
+	LicenseInputSHA256       string        `json:"license_input_sha256"`
+	TreeSHA256               string        `json:"tree_sha256"`
+	ManifestSHA256           string        `json:"manifest_sha256"`
+	ArchiveSHA256            string        `json:"archive_sha256"`
+	BundleSHA256             string        `json:"bundle_sha256"`
+	BindingSHA256            string        `json:"binding_sha256"`
+	BuildRecordSHA256        string        `json:"build_record_sha256"`
+	PredecessorBindingSHA256 string        `json:"predecessor_binding_sha256,omitempty"`
+	Files                    []FileEntryV1 `json:"files"`
 }
 
 func (r CandidateArtifactReceiptV1) Validate() error {
@@ -87,6 +89,9 @@ func (r CandidateArtifactReceiptV1) Validate() error {
 		if !digestText.MatchString(value) {
 			return ErrCandidateArtifacts
 		}
+	}
+	if r.PredecessorBindingSHA256 != "" && (r.Synthetic || !digestText.MatchString(r.PredecessorBindingSHA256)) {
+		return ErrCandidateArtifacts
 	}
 	return validateArtifactFiles(r.Files, r)
 }
@@ -137,8 +142,25 @@ type CandidateArtifactStageV1 struct {
 }
 
 func SealCandidateArtifactsV1(tree *CandidateTreeStageV1, taskRoot string) (*CandidateArtifactStageV1, error) {
+	return sealCandidateArtifactsV1(tree, taskRoot, nil, "")
+}
+
+// SealSuccessorCandidateArtifactsV1 seals a real candidate against an exact,
+// caller-pinned predecessor binding. This grants no host upgrade acceptance.
+func SealSuccessorCandidateArtifactsV1(tree *CandidateTreeStageV1, taskRoot string, predecessorRaw []byte, predecessorSHA256 string) (*CandidateArtifactStageV1, error) {
+	if _, _, err := candidatePredecessor(predecessorRaw, predecessorSHA256); err != nil || predecessorSHA256 == "" {
+		return nil, ErrCandidateArtifacts
+	}
+	return sealCandidateArtifactsV1(tree, taskRoot, predecessorRaw, predecessorSHA256)
+}
+
+func sealCandidateArtifactsV1(tree *CandidateTreeStageV1, taskRoot string, predecessorRaw []byte, predecessorSHA256 string) (*CandidateArtifactStageV1, error) {
 	treeReceipt, err := tree.Receipt()
 	if err != nil {
+		return nil, ErrCandidateArtifacts
+	}
+	nMinusOne, manifestPredecessor, err := candidatePredecessor(predecessorRaw, predecessorSHA256)
+	if err != nil || nMinusOne != nil && treeReceipt.Synthetic {
 		return nil, ErrCandidateArtifacts
 	}
 	parent, parentPin, err := pinCandidateParent(taskRoot)
@@ -171,6 +193,11 @@ func SealCandidateArtifactsV1(tree *CandidateTreeStageV1, taskRoot string) (*Can
 		return fail()
 	}
 	defer root.Close()
+	if nMinusOne != nil {
+		if err := writeRootFile(root, predecessorBindingFile, predecessorRaw, 0o644); err != nil {
+			return failWith("predecessor binding")
+		}
+	}
 	if err := root.Mkdir("payload", 0o700); err != nil {
 		return fail()
 	}
@@ -189,7 +216,7 @@ func SealCandidateArtifactsV1(tree *CandidateTreeStageV1, taskRoot string) (*Can
 			return failWith("copy tree")
 		}
 	}
-	manifest := install.Manifest{SchemaVersion: install.ManifestSchemaVersion, Product: Product, Version: treeReceipt.Version, ReleaseID: treeReceipt.ReleaseID, Architecture: Architecture, MigrationVersion: Migration, SourceCommit: treeReceipt.SourceCommit, Protocol: install.AgentProtocolVersion, ConfigDir: install.AcornFoxV1ConfigDir, DataDir: install.AcornFoxV1DataDir, Compatibility: install.Compatibility{MinDataVersion: install.AcornFoxV1DataVersion, MaxDataVersion: install.AcornFoxV1DataVersion, MinAgentProtocol: install.PreviousAgentProtocol, MaxAgentProtocol: install.AgentProtocolVersion}, Files: entries}
+	manifest := install.Manifest{SchemaVersion: install.ManifestSchemaVersion, Product: Product, Version: treeReceipt.Version, ReleaseID: treeReceipt.ReleaseID, Architecture: Architecture, MigrationVersion: Migration, SourceCommit: treeReceipt.SourceCommit, Protocol: install.AgentProtocolVersion, ConfigDir: install.AcornFoxV1ConfigDir, DataDir: install.AcornFoxV1DataDir, Compatibility: install.Compatibility{MinDataVersion: install.AcornFoxV1DataVersion, MaxDataVersion: install.AcornFoxV1DataVersion, MinAgentProtocol: install.PreviousAgentProtocol, MaxAgentProtocol: install.AgentProtocolVersion}, Files: entries, NMinusOne: manifestPredecessor}
 	manifestRaw, err := json.Marshal(manifest)
 	if err != nil {
 		return fail()
@@ -203,12 +230,12 @@ func SealCandidateArtifactsV1(tree *CandidateTreeStageV1, taskRoot string) (*Can
 		return failWith("archive")
 	}
 	bundle := []byte(archiveSHA + "  " + archiveName + "\n" + sha256Text(manifestRaw) + "  release/manifest.json\n")
-	binding := install.AcornFoxCandidateBindingV1{SchemaVersion: install.AcornFoxCandidateBindingV1Schema, Product: Product, Version: treeReceipt.Version, ReleaseID: treeReceipt.ReleaseID, SourceRepository: treeReceipt.SourceRepository, SourceCommit: treeReceipt.SourceCommit, Architecture: Architecture, MigrationVersion: Migration, ManifestSHA256: sha256Text(manifestRaw), ArchiveSHA256: archiveSHA, BundleManifestSHA256: sha256Text(bundle)}
+	binding := install.AcornFoxCandidateBindingV1{SchemaVersion: install.AcornFoxCandidateBindingV1Schema, Product: Product, Version: treeReceipt.Version, ReleaseID: treeReceipt.ReleaseID, SourceRepository: treeReceipt.SourceRepository, SourceCommit: treeReceipt.SourceCommit, Architecture: Architecture, MigrationVersion: Migration, ManifestSHA256: sha256Text(manifestRaw), ArchiveSHA256: archiveSHA, BundleManifestSHA256: sha256Text(bundle), NMinusOne: nMinusOne}
 	bindingRaw, err := json.Marshal(binding)
 	if err != nil {
 		return fail()
 	}
-	recordRaw, err := json.Marshal(candidateBuildRecordV1{SchemaVersion: 1, Product: Product, Version: treeReceipt.Version, ReleaseID: treeReceipt.ReleaseID, SourceRepository: treeReceipt.SourceRepository, SourceCommit: treeReceipt.SourceCommit, Architecture: Architecture, MigrationVersion: Migration, Synthetic: treeReceipt.Synthetic, State: "BUILT_UNAPPROVED", ProductionAccepted: false, CandidateAccepted: false, DecisionSHA256: treeReceipt.DecisionSHA256, SourcePolicySHA256: treeReceipt.SourcePolicySHA256, ToolchainSHA256: treeReceipt.ToolchainSHA256, RuntimeInputSHA256: treeReceipt.RuntimeInputSHA256, LicenseInputSHA256: treeReceipt.LicenseInputSHA256, TreeSHA256: treeReceipt.TreeSHA256, ManifestSHA256: sha256Text(manifestRaw), ArchiveSHA256: archiveSHA, BundleSHA256: sha256Text(bundle), BindingSHA256: sha256Text(bindingRaw)})
+	recordRaw, err := json.Marshal(candidateBuildRecordV1{SchemaVersion: 1, Product: Product, Version: treeReceipt.Version, ReleaseID: treeReceipt.ReleaseID, SourceRepository: treeReceipt.SourceRepository, SourceCommit: treeReceipt.SourceCommit, Architecture: Architecture, MigrationVersion: Migration, Synthetic: treeReceipt.Synthetic, State: "BUILT_UNAPPROVED", ProductionAccepted: false, CandidateAccepted: false, DecisionSHA256: treeReceipt.DecisionSHA256, SourcePolicySHA256: treeReceipt.SourcePolicySHA256, ToolchainSHA256: treeReceipt.ToolchainSHA256, RuntimeInputSHA256: treeReceipt.RuntimeInputSHA256, LicenseInputSHA256: treeReceipt.LicenseInputSHA256, TreeSHA256: treeReceipt.TreeSHA256, ManifestSHA256: sha256Text(manifestRaw), ArchiveSHA256: archiveSHA, BundleSHA256: sha256Text(bundle), BindingSHA256: sha256Text(bindingRaw), PredecessorBindingSHA256: predecessorSHA256})
 	if err != nil {
 		return fail()
 	}
@@ -222,7 +249,7 @@ func SealCandidateArtifactsV1(tree *CandidateTreeStageV1, taskRoot string) (*Can
 	if err != nil {
 		return failWith("artifact inspection")
 	}
-	stage.receipt = CandidateArtifactReceiptV1{SchemaVersion: 1, Synthetic: treeReceipt.Synthetic, Product: Product, Version: treeReceipt.Version, ReleaseID: treeReceipt.ReleaseID, SourceRepository: treeReceipt.SourceRepository, SourceCommit: treeReceipt.SourceCommit, Architecture: Architecture, MigrationVersion: Migration, DecisionSHA256: treeReceipt.DecisionSHA256, SourcePolicySHA256: treeReceipt.SourcePolicySHA256, ToolchainSHA256: treeReceipt.ToolchainSHA256, RuntimeInputSHA256: treeReceipt.RuntimeInputSHA256, LicenseInputSHA256: treeReceipt.LicenseInputSHA256, TreeSHA256: treeReceipt.TreeSHA256, ManifestSHA256: sha256Text(manifestRaw), ArchiveSHA256: archiveSHA, BundleSHA256: sha256Text(bundle), BindingSHA256: sha256Text(bindingRaw), BuildRecordSHA256: sha256Text(recordRaw), Files: files}
+	stage.receipt = CandidateArtifactReceiptV1{SchemaVersion: 1, Synthetic: treeReceipt.Synthetic, Product: Product, Version: treeReceipt.Version, ReleaseID: treeReceipt.ReleaseID, SourceRepository: treeReceipt.SourceRepository, SourceCommit: treeReceipt.SourceCommit, Architecture: Architecture, MigrationVersion: Migration, DecisionSHA256: treeReceipt.DecisionSHA256, SourcePolicySHA256: treeReceipt.SourcePolicySHA256, ToolchainSHA256: treeReceipt.ToolchainSHA256, RuntimeInputSHA256: treeReceipt.RuntimeInputSHA256, LicenseInputSHA256: treeReceipt.LicenseInputSHA256, TreeSHA256: treeReceipt.TreeSHA256, ManifestSHA256: sha256Text(manifestRaw), ArchiveSHA256: archiveSHA, BundleSHA256: sha256Text(bundle), BindingSHA256: sha256Text(bindingRaw), BuildRecordSHA256: sha256Text(recordRaw), Files: files, PredecessorBindingSHA256: predecessorSHA256}
 	if stage.receipt.Validate() != nil || !stage.validOwned() {
 		return failWith("receipt")
 	}
@@ -450,10 +477,17 @@ func verifyArtifactRoot(root string, receipt CandidateArtifactReceiptV1) bool {
 	}
 	children, readErr := dir.ReadDir(-1)
 	closeErr := dir.Close()
-	if readErr != nil || closeErr != nil || len(children) != len(receipt.Files)+1 {
+	expectedChildren := len(receipt.Files) + 1
+	if receipt.PredecessorBindingSHA256 != "" {
+		expectedChildren++
+	}
+	if readErr != nil || closeErr != nil || len(children) != expectedChildren {
 		return false
 	}
 	want := map[string]bool{"payload": true}
+	if receipt.PredecessorBindingSHA256 != "" {
+		want[predecessorBindingFile] = true
+	}
 	for _, name := range candidateArtifactNames(receipt.Version) {
 		want[name] = true
 	}
@@ -587,7 +621,7 @@ func verifyPayloadTree(root string, tree CandidateTreeReceiptV1, receipt Candida
 
 func verifyManifest(raw []byte, tree CandidateTreeReceiptV1, receipt CandidateArtifactReceiptV1) bool {
 	var manifest install.Manifest
-	if strictCandidateJSON(raw, &manifest) != nil || manifest.SchemaVersion != install.ManifestSchemaVersion || manifest.Product != Product || manifest.Version != receipt.Version || manifest.ReleaseID != receipt.ReleaseID || manifest.Architecture != Architecture || manifest.MigrationVersion != Migration || manifest.SourceCommit != receipt.SourceCommit || manifest.Protocol != install.AgentProtocolVersion || manifest.ConfigDir != install.AcornFoxV1ConfigDir || manifest.DataDir != install.AcornFoxV1DataDir || manifest.NMinusOne != nil || manifest.Compatibility.MinDataVersion != install.AcornFoxV1DataVersion || manifest.Compatibility.MaxDataVersion != install.AcornFoxV1DataVersion || manifest.Compatibility.MinAgentProtocol != install.PreviousAgentProtocol || manifest.Compatibility.MaxAgentProtocol != install.AgentProtocolVersion || len(manifest.Files) != len(tree.Files) {
+	if strictCandidateJSON(raw, &manifest) != nil || manifest.SchemaVersion != install.ManifestSchemaVersion || manifest.Product != Product || manifest.Version != receipt.Version || manifest.ReleaseID != receipt.ReleaseID || manifest.Architecture != Architecture || manifest.MigrationVersion != Migration || manifest.SourceCommit != receipt.SourceCommit || manifest.Protocol != install.AgentProtocolVersion || manifest.ConfigDir != install.AcornFoxV1ConfigDir || manifest.DataDir != install.AcornFoxV1DataDir || (manifest.NMinusOne != nil) != (receipt.PredecessorBindingSHA256 != "") || manifest.Compatibility.MinDataVersion != install.AcornFoxV1DataVersion || manifest.Compatibility.MaxDataVersion != install.AcornFoxV1DataVersion || manifest.Compatibility.MinAgentProtocol != install.PreviousAgentProtocol || manifest.Compatibility.MaxAgentProtocol != install.AgentProtocolVersion || len(manifest.Files) != len(tree.Files) {
 		return false
 	}
 	return sameInstallFileEntries(manifest.Files, tree.Files)
@@ -610,7 +644,16 @@ func verifyArtifactSemantics(root string, manifest []byte, receipt CandidateArti
 		return false
 	}
 	var binding install.AcornFoxCandidateBindingV1
-	if strictCandidateJSON(bindingRaw, &binding) != nil || binding.SchemaVersion != install.AcornFoxCandidateBindingV1Schema || binding.Product != Product || binding.Version != receipt.Version || binding.ReleaseID != receipt.ReleaseID || binding.SourceRepository != receipt.SourceRepository || binding.SourceCommit != receipt.SourceCommit || binding.Architecture != Architecture || binding.MigrationVersion != Migration || binding.ManifestSHA256 != receipt.ManifestSHA256 || binding.ArchiveSHA256 != receipt.ArchiveSHA256 || binding.BundleManifestSHA256 != receipt.BundleSHA256 || binding.NMinusOne != nil {
+	if strictCandidateJSON(bindingRaw, &binding) != nil || binding.SchemaVersion != install.AcornFoxCandidateBindingV1Schema || binding.Product != Product || binding.Version != receipt.Version || binding.ReleaseID != receipt.ReleaseID || binding.SourceRepository != receipt.SourceRepository || binding.SourceCommit != receipt.SourceCommit || binding.Architecture != Architecture || binding.MigrationVersion != Migration || binding.ManifestSHA256 != receipt.ManifestSHA256 || binding.ArchiveSHA256 != receipt.ArchiveSHA256 || binding.BundleManifestSHA256 != receipt.BundleSHA256 || (binding.NMinusOne != nil) != (receipt.PredecessorBindingSHA256 != "") {
+		return false
+	}
+	predecessorRaw, err := readCandidatePredecessor(root, receipt)
+	if err != nil {
+		return false
+	}
+	nMinusOne, manifestPredecessor, err := candidatePredecessor(predecessorRaw, receipt.PredecessorBindingSHA256)
+	var decodedManifest install.Manifest
+	if err != nil || strictCandidateJSON(manifest, &decodedManifest) != nil || !sameCandidatePredecessor(binding.NMinusOne, nMinusOne) || !sameManifestPredecessor(decodedManifest.NMinusOne, manifestPredecessor) {
 		return false
 	}
 	bindingDigest, ok := read("candidate-binding.sha256")

@@ -16,9 +16,11 @@ import (
 	"syscall"
 
 	"github.com/open-card/open-card/internal/acornfoxrelease"
+	"github.com/open-card/open-card/internal/install"
 )
 
 type options struct {
+	predecessorBinding, predecessorSHA                                             string
 	source, decision, decisionSHA, policy, toolchain, runtimeInputs, licenseInputs string
 	runtimeRoot, licenseRoot, cache, npmCache, npmCLI, scratch, output             string
 }
@@ -34,7 +36,7 @@ func main() {
 
 func run(ctx context.Context, args []string, out, diagnostic io.Writer) error {
 	if len(args) == 0 || args[0] != "build" {
-		return errors.New("usage: acornfox-release build --source DIR --decision FILE --decision-sha256 SHA --source-policy FILE --toolchain FILE --runtime-inputs FILE --license-inputs FILE --runtime-root DIR --license-root DIR --cache DIR --npm-cache DIR --scratch DIR --output DIR")
+		return errors.New("usage: acornfox-release build --source DIR --decision FILE --decision-sha256 SHA --source-policy FILE --toolchain FILE --runtime-inputs FILE --license-inputs FILE --runtime-root DIR --license-root DIR --cache DIR --npm-cache DIR --scratch DIR --output DIR [--predecessor-binding FILE --predecessor-sha256 SHA]")
 	}
 	var o options
 	fs := flag.NewFlagSet("build", flag.ContinueOnError)
@@ -42,7 +44,7 @@ func run(ctx context.Context, args []string, out, diagnostic io.Writer) error {
 	for _, item := range []struct {
 		name  string
 		value *string
-	}{{"source", &o.source}, {"decision", &o.decision}, {"decision-sha256", &o.decisionSHA}, {"source-policy", &o.policy}, {"toolchain", &o.toolchain}, {"runtime-inputs", &o.runtimeInputs}, {"license-inputs", &o.licenseInputs}, {"runtime-root", &o.runtimeRoot}, {"license-root", &o.licenseRoot}, {"cache", &o.cache}, {"npm-cache", &o.npmCache}, {"npm-cli", &o.npmCLI}, {"scratch", &o.scratch}, {"output", &o.output}} {
+	}{{"source", &o.source}, {"decision", &o.decision}, {"decision-sha256", &o.decisionSHA}, {"source-policy", &o.policy}, {"toolchain", &o.toolchain}, {"runtime-inputs", &o.runtimeInputs}, {"license-inputs", &o.licenseInputs}, {"runtime-root", &o.runtimeRoot}, {"license-root", &o.licenseRoot}, {"cache", &o.cache}, {"npm-cache", &o.npmCache}, {"npm-cli", &o.npmCLI}, {"scratch", &o.scratch}, {"output", &o.output}, {"predecessor-binding", &o.predecessorBinding}, {"predecessor-sha256", &o.predecessorSHA}} {
 		fs.StringVar(item.value, item.name, "", item.name)
 	}
 	if err := fs.Parse(args[1:]); err != nil {
@@ -50,6 +52,36 @@ func run(ctx context.Context, args []string, out, diagnostic io.Writer) error {
 	}
 	if fs.NArg() != 0 {
 		return errors.New("unexpected positional arguments")
+	}
+	if (o.predecessorBinding == "") != (o.predecessorSHA == "") {
+		return errors.New("predecessor-binding and predecessor-sha256 must be provided together")
+	}
+	read := func(path string) ([]byte, error) {
+		file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+		if err != nil {
+			return nil, err
+		}
+		defer file.Close()
+		info, err := file.Stat()
+		if err != nil || !info.Mode().IsRegular() || info.Size() > 1<<20 {
+			return nil, errors.New("invalid release input file")
+		}
+		raw, err := io.ReadAll(io.LimitReader(file, (1<<20)+1))
+		if err != nil || len(raw) > 1<<20 {
+			return nil, errors.New("invalid release input bytes")
+		}
+		return raw, nil
+	}
+	var predecessorRaw []byte
+	if o.predecessorBinding != "" {
+		var err error
+		predecessorRaw, err = read(o.predecessorBinding)
+		if err != nil {
+			return fmt.Errorf("read predecessor binding: %w", err)
+		}
+		if _, err := install.ParseAcornFoxCandidateBindingV1(predecessorRaw, o.predecessorSHA); err != nil {
+			return fmt.Errorf("verify predecessor binding: %w", err)
+		}
 	}
 	for _, v := range []string{o.source, o.decision, o.decisionSHA, o.policy, o.toolchain, o.runtimeInputs, o.licenseInputs, o.runtimeRoot, o.licenseRoot, o.cache, o.npmCache, o.scratch, o.output} {
 		if v == "" {
@@ -94,22 +126,6 @@ func run(ctx context.Context, args []string, out, diagnostic io.Writer) error {
 		if err != nil {
 			return err
 		}
-	}
-	read := func(path string) ([]byte, error) {
-		file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
-		if err != nil {
-			return nil, err
-		}
-		defer file.Close()
-		info, err := file.Stat()
-		if err != nil || !info.Mode().IsRegular() || info.Size() > 1<<20 {
-			return nil, errors.New("invalid release input file")
-		}
-		raw, err := io.ReadAll(io.LimitReader(file, (1<<20)+1))
-		if err != nil || len(raw) > 1<<20 {
-			return nil, errors.New("invalid release input bytes")
-		}
-		return raw, nil
 	}
 	raw, err := read(o.decision)
 	if err != nil {
@@ -201,7 +217,12 @@ func run(ctx context.Context, args []string, out, diagnostic io.Writer) error {
 	if err != nil {
 		return err
 	}
-	artifacts, err := acornfoxrelease.SealCandidateArtifactsV1(tree, path)
+	var artifacts *acornfoxrelease.CandidateArtifactStageV1
+	if o.predecessorBinding == "" {
+		artifacts, err = acornfoxrelease.SealCandidateArtifactsV1(tree, path)
+	} else {
+		artifacts, err = acornfoxrelease.SealSuccessorCandidateArtifactsV1(tree, path, predecessorRaw, o.predecessorSHA)
+	}
 	if err != nil {
 		return fmt.Errorf("seal candidate: %w", err)
 	}

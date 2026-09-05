@@ -24,6 +24,10 @@ func ExportVerifiedCandidateV1(stage *VerifiedCandidateStageV1, output string) (
 	if err != nil || receipt.Synthetic || !filepath.IsAbs(output) || filepath.Clean(output) != output || !githubPart.MatchString(filepath.Base(output)) {
 		return VerifiedCandidateReceiptV1{}, ErrCandidateExport
 	}
+	predecessor, err := readCandidatePredecessor(stage.stage.root, receipt.Artifact)
+	if err != nil {
+		return VerifiedCandidateReceiptV1{}, ErrCandidateExport
+	}
 	parent := filepath.Dir(output)
 	clean, err := cleanExistingDirectory(parent)
 	if err != nil || clean != parent {
@@ -78,7 +82,7 @@ func ExportVerifiedCandidateV1(stage *VerifiedCandidateStageV1, output string) (
 			return VerifiedCandidateReceiptV1{}, ErrCandidateExport
 		}
 	}
-	if verifyFlatCandidateRoot(temporary, receipt.Artifact) != nil || tempPin.file.Sync() != nil || !parentPin.validAt(parent) || !tempPin.validAt(temporary) {
+	if verifyFlatCandidateRoot(temporary, receipt.Artifact, predecessor) != nil || tempPin.file.Sync() != nil || !parentPin.validAt(parent) || !tempPin.validAt(temporary) {
 		return VerifiedCandidateReceiptV1{}, ErrCandidateExport
 	}
 	if err := renameDirectoryNoReplace(parentPin.file, filepath.Base(temporary), parentPin.file, filepath.Base(output)); err != nil {
@@ -92,14 +96,15 @@ func ExportVerifiedCandidateV1(stage *VerifiedCandidateStageV1, output string) (
 	defer outputPin.close()
 	before, err := tempPin.file.Stat()
 	after, afterErr := outputPin.file.Stat()
-	if err != nil || afterErr != nil || !os.SameFile(before, after) || verifyFlatCandidateRoot(output, receipt.Artifact) != nil || !parentPin.validAt(parent) || parentPin.file.Sync() != nil {
+	if err != nil || afterErr != nil || !os.SameFile(before, after) || verifyFlatCandidateRoot(output, receipt.Artifact, predecessor) != nil || !parentPin.validAt(parent) || parentPin.file.Sync() != nil {
 		return VerifiedCandidateReceiptV1{}, ErrCandidateExportUnknown
 	}
 	return receipt, nil
 }
 
-func verifyFlatCandidateRoot(path string, receipt CandidateArtifactReceiptV1) error {
-	if receipt.Validate() != nil {
+func verifyFlatCandidateRoot(path string, receipt CandidateArtifactReceiptV1, predecessor []byte) error {
+	_, _, predecessorErr := candidatePredecessor(predecessor, receipt.PredecessorBindingSHA256)
+	if receipt.Validate() != nil || predecessorErr != nil {
 		return ErrCandidateExport
 	}
 	root, err := os.OpenRoot(path)
@@ -154,6 +159,6 @@ func verifyFlatCandidateRoot(path string, receipt CandidateArtifactReceiptV1) er
 	if archive == nil || !bytes.Equal(controls["candidate-binding.sha256"], []byte(receipt.BindingSHA256+"\n")) {
 		return ErrCandidateExport
 	}
-	_, err = install.VerifyAcornFoxCandidateArtifactsV1(install.VerifyAcornFoxCandidateArtifactsV1Input{Binding: controls["candidate-binding.json"], BindingSHA256: receipt.BindingSHA256, Manifest: controls["release-manifest.json"], BundleManifest: controls["bundle-manifest.sha256"], Archive: io.NewSectionReader(archive, 0, archiveSize), ArchiveSize: archiveSize})
+	_, err = install.VerifyAcornFoxCandidateArtifactsV1(install.VerifyAcornFoxCandidateArtifactsV1Input{Binding: controls["candidate-binding.json"], BindingSHA256: receipt.BindingSHA256, Manifest: controls["release-manifest.json"], BundleManifest: controls["bundle-manifest.sha256"], Archive: io.NewSectionReader(archive, 0, archiveSize), ArchiveSize: archiveSize, PredecessorBinding: predecessor})
 	return err
 }

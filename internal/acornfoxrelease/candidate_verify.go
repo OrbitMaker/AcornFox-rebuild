@@ -102,6 +102,10 @@ func verifyCandidateV1(stage *CandidateArtifactStageV1) (*VerifiedCandidateStage
 	if err != nil {
 		return nil, ErrVerifiedCandidate
 	}
+	predecessor, err := readCandidatePredecessor(stage.root, stage.receipt)
+	if err != nil {
+		return nil, ErrVerifiedCandidate
+	}
 	root, archive, before, err := openCandidateArchive(stage)
 	if err != nil {
 		return nil, ErrVerifiedCandidate
@@ -109,7 +113,7 @@ func verifyCandidateV1(stage *CandidateArtifactStageV1) (*VerifiedCandidateStage
 	verifyErr := func() error {
 		_, err := install.VerifyAcornFoxCandidateArtifactsV1(install.VerifyAcornFoxCandidateArtifactsV1Input{
 			Binding: binding, BindingSHA256: stage.receipt.BindingSHA256, Manifest: manifest, BundleManifest: bundle,
-			Archive: io.NewSectionReader(archive, 0, before.Size()), ArchiveSize: before.Size(), PredecessorBinding: nil,
+			Archive: io.NewSectionReader(archive, 0, before.Size()), ArchiveSize: before.Size(), PredecessorBinding: predecessor,
 		})
 		return err
 	}()
@@ -200,7 +204,7 @@ func (stage *VerifiedCandidateStageV1) Close() error {
 }
 
 func sameArtifactReceipt(left, right CandidateArtifactReceiptV1) bool {
-	if left.SchemaVersion != right.SchemaVersion || left.Synthetic != right.Synthetic || left.Product != right.Product || left.Version != right.Version || left.ReleaseID != right.ReleaseID || left.SourceRepository != right.SourceRepository || left.SourceCommit != right.SourceCommit || left.Architecture != right.Architecture || left.MigrationVersion != right.MigrationVersion || left.DecisionSHA256 != right.DecisionSHA256 || left.SourcePolicySHA256 != right.SourcePolicySHA256 || left.ToolchainSHA256 != right.ToolchainSHA256 || left.RuntimeInputSHA256 != right.RuntimeInputSHA256 || left.LicenseInputSHA256 != right.LicenseInputSHA256 || left.TreeSHA256 != right.TreeSHA256 || left.ManifestSHA256 != right.ManifestSHA256 || left.ArchiveSHA256 != right.ArchiveSHA256 || left.BundleSHA256 != right.BundleSHA256 || left.BindingSHA256 != right.BindingSHA256 || left.BuildRecordSHA256 != right.BuildRecordSHA256 {
+	if left.SchemaVersion != right.SchemaVersion || left.Synthetic != right.Synthetic || left.Product != right.Product || left.Version != right.Version || left.ReleaseID != right.ReleaseID || left.SourceRepository != right.SourceRepository || left.SourceCommit != right.SourceCommit || left.Architecture != right.Architecture || left.MigrationVersion != right.MigrationVersion || left.DecisionSHA256 != right.DecisionSHA256 || left.SourcePolicySHA256 != right.SourcePolicySHA256 || left.ToolchainSHA256 != right.ToolchainSHA256 || left.RuntimeInputSHA256 != right.RuntimeInputSHA256 || left.LicenseInputSHA256 != right.LicenseInputSHA256 || left.TreeSHA256 != right.TreeSHA256 || left.ManifestSHA256 != right.ManifestSHA256 || left.ArchiveSHA256 != right.ArchiveSHA256 || left.BundleSHA256 != right.BundleSHA256 || left.BindingSHA256 != right.BindingSHA256 || left.BuildRecordSHA256 != right.BuildRecordSHA256 || left.PredecessorBindingSHA256 != right.PredecessorBindingSHA256 {
 		return false
 	}
 	return sameFileEntries(left.Files, right.Files)

@@ -13,7 +13,18 @@ import (
 // not host acceptance of those fixture executables.
 func releaseArtifactFixture(t *testing.T) *CandidateArtifactStageV1 {
 	t.Helper()
-	plan, goStage, webStage, runtimeRoot, runtime, licenseRoot, license := candidateTreeFixture(t, releaseLicenseFixture)
+	tree := releaseTreeFixture(t, "")
+	stage, err := SealCandidateArtifactsV1(tree, buildTaskRoot(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = stage.Close() })
+	return stage
+}
+
+func releaseTreeFixture(t *testing.T, version string) *CandidateTreeStageV1 {
+	t.Helper()
+	plan, goStage, webStage, runtimeRoot, runtime, licenseRoot, license := candidateTreeVersionFixture(t, version, releaseLicenseFixture)
 	t.Cleanup(func() { _ = goStage.Close(); _ = webStage.Close() })
 	tree, err := BuildReleaseCandidateTreeV1(plan, goStage, webStage, runtimeRoot, runtime, licenseRoot, license, buildTaskRoot(t))
 	if err != nil {
@@ -39,12 +50,7 @@ func releaseArtifactFixture(t *testing.T) *CandidateArtifactStageV1 {
 	if json.Unmarshal(raw, &sbom) != nil || len(sbom.Extracted) != 1 || sbom.Extracted[0].ID != "LicenseRef-"+sha256Text([]byte(sbom.Extracted[0].Text)) {
 		t.Fatal("upstream license reference lost its exact text")
 	}
-	stage, err := SealCandidateArtifactsV1(tree, buildTaskRoot(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = stage.Close() })
-	return stage
+	return tree
 }
 
 func releaseLicenseFixture(t *testing.T, paths []string) (string, LicenseInputsV1) {

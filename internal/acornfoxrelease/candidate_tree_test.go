@@ -209,6 +209,11 @@ func TestBuildCandidateTreeV1OverridesRestrictiveUmask(t *testing.T) {
 
 func candidateTreeFixture(t *testing.T, licenseBuilders ...func(*testing.T, []string) (string, LicenseInputsV1)) (GoBuildPlanV1, *GoBinaryStageV1, *WebAssetStageV1, string, RuntimeInputsV1, string, LicenseInputsV1) {
 	t.Helper()
+	return candidateTreeVersionFixture(t, "", licenseBuilders...)
+}
+
+func candidateTreeVersionFixture(t *testing.T, version string, licenseBuilders ...func(*testing.T, []string) (string, LicenseInputsV1)) (GoBuildPlanV1, *GoBinaryStageV1, *WebAssetStageV1, string, RuntimeInputsV1, string, LicenseInputsV1) {
+	t.Helper()
 	root, cache, _, _, toolchain := syntheticGoReleaseRepository(t)
 	for _, required := range install.AcornFoxV1RequiredFiles() {
 		source, ok := staticSourcePath(required.Path)
@@ -240,6 +245,10 @@ func candidateTreeFixture(t *testing.T, licenseBuilders ...func(*testing.T, []st
 	commit := gitRun(t, root, "rev-parse", "HEAD")
 	witness := witnessForInputs(t, policy, toolchain, runtime, license)
 	witness.decision.SourceCommit = commit
+	if version != "" {
+		witness.decision.Version = version
+		witness.decision.ReleaseID = "release-" + version
+	}
 	raw, err := CanonicalDecisionV1(witness.decision)
 	if err != nil {
 		t.Fatal(err)
