@@ -478,10 +478,10 @@ func acornFoxRepoProductionPrefix(root *os.Root, s *TaskAcornFoxRepoStore, layou
 	if state < min || state > max {
 		return false
 	}
-	// Before any activation node exists, prove the complete fixed managed
-	// scope. Later pointer prefixes are checked explicitly below so unrelated
-	// host state is never walked or constrained.
-	if state == acornFoxRepoPrefixStatic && acornFoxValidateProductionManagedScope(root, s, entries) != nil {
+	// Audit the complete owned scope at every activation boundary. The narrow
+	// validator adds only journal-bound activation paths; it never broadens
+	// into a host-root walk.
+	if acornFoxValidateProductionManagedScopePrefix(root, s, entries, a, raw, state) != nil {
 		return false
 	}
 	return true

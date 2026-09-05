@@ -463,6 +463,279 @@ func TestProductionLayoutPureReceiptAndFakeOwnershipEdge(t *testing.T) {
 	}
 }
 
+// TestProductionLayoutFreshCrashPrefixesRecover keeps the production bridge
+// honest: every repository preparation fault is recovered by freshly opened
+// layout/store/publisher objects, never by the objects that observed the
+// fault. The test host remains a temporary, fake-ownership model.
+func TestProductionLayoutFreshCrashPrefixesRecover(t *testing.T) {
+	steps := []struct {
+		name  string
+		step  string
+		count int
+	}{
+		{"journal-activation", "journal-activation", 1},
+		{"journal-active", "journal-active", 1},
+		{"journal-current", "journal-current", 1},
+	}
+	for _, pointerStep := range []string{"pointer-temp", "pointer-link", "pointer-post-link", "pointer-parent-sync", "pointer-readback", "pointer-temp-remove", "pointer-post-remove-sync"} {
+		for count := 1; count <= 3; count++ {
+			steps = append(steps, struct {
+				name  string
+				step  string
+				count int
+			}{pointerStep + "-" + string(rune('0'+count)), pointerStep, count})
+		}
+	}
+	for _, test := range steps {
+		t.Run(test.name, func(t *testing.T) {
+			f := newAcornFoxProductionPreparedFixture(t)
+			old := acornFoxRepoBootstrapFaultStep
+			t.Cleanup(func() { acornFoxRepoBootstrapFaultStep = old })
+			seen := 0
+			acornFoxRepoBootstrapFaultStep = func(step string) error {
+				if step == test.step {
+					seen++
+					if seen == test.count {
+						return errors.New("fault")
+					}
+				}
+				return nil
+			}
+			err := prepareAcornFoxRepository(context.Background(), f.store, f.published, f.binding)
+			acornFoxRepoBootstrapFaultStep = old
+			if !errors.Is(err, ErrAcornFoxRepoBootstrapConflict) {
+				t.Fatalf("fault=%v", err)
+			}
+			if journal, resumeErr := f.store.Resume(context.Background()); resumeErr != nil || !journal.NeedsRecovery {
+				t.Fatalf("fault journal=%#v err=%v", journal, resumeErr)
+			}
+			if err := f.store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			freshLayout, err := newTestProductionAcornFoxLayout(f.state, f.host, os.Getuid(), os.Getgid(), acornFoxTestLayoutPrincipals())
+			if err != nil {
+				t.Fatal(err)
+			}
+			publisher, err := newAcornFoxSubstratePublisherForLayout(freshLayout)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer publisher.Close()
+			published, err := publisher.Reopen(f.binding)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer published.Close()
+			store, err := newAcornFoxRepoStoreForLayout(freshLayout)
+			if err != nil {
+				t.Fatal(err)
+			}
+			store.ownership = f.owners.edge()
+			defer store.Close()
+			if err := prepareAcornFoxRepository(context.Background(), store, published, f.binding); err != nil {
+				t.Fatalf("fresh recover=%v", err)
+			}
+			if journal, err := store.Resume(context.Background()); err != nil || journal.Phase != AcornFoxRepoPreparedFinal || journal.NeedsRecovery {
+				t.Fatalf("final journal=%#v err=%v", journal, err)
+			}
+			f.assertExternalSentinel(t)
+		})
+	}
+}
+
+func TestProductionLayoutRejectsPostActivationScopeAndOwnershipDrift(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*testing.T, acornFoxProductionPreparedFixture)
+	}{
+		{"foreign-managed-entry", func(t *testing.T, f acornFoxProductionPreparedFixture) {
+			if err := os.WriteFile(filepath.Join(f.host, "opt", "acornfox", "foreign"), []byte("foreign"), durableFileMode); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"ownership-record", func(t *testing.T, f acornFoxProductionPreparedFixture) {
+			delete(f.owners.values, acornFoxTestInodeKey(t, filepath.Join(f.host, "opt", "acornfox", "current")))
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newAcornFoxProductionPreparedFixture(t)
+			if err := prepareAcornFoxRepository(context.Background(), f.store, f.published, f.binding); err != nil {
+				t.Fatal(err)
+			}
+			test.mutate(t, f)
+			if err := f.store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			fresh, err := newAcornFoxRepoStoreForLayout(f.layout)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fresh.ownership = f.owners.edge()
+			defer fresh.Close()
+			if err := prepareAcornFoxRepository(context.Background(), fresh, f.published, f.binding); !errors.Is(err, ErrAcornFoxRepoBootstrapConflict) && !errors.Is(err, ErrAcornFoxRepoConflict) {
+				t.Fatalf("drift accepted=%v", err)
+			}
+			f.assertExternalSentinel(t)
+		})
+	}
+}
+
+func TestProductionLayoutRejectsPinnedRootAndLayoutDrift(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		run  func(*testing.T, acornFoxProductionPreparedFixture)
+	}{
+		{"state-root-replaced", func(t *testing.T, f acornFoxProductionPreparedFixture) {
+			if err := os.Rename(f.state, f.state+"-old"); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(f.state, durableDirMode); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.store.Resume(context.Background()); !errors.Is(err, ErrAcornFoxRepoConflict) {
+				t.Fatalf("replaced state resume=%v", err)
+			}
+		}},
+		{"host-root-replaced", func(t *testing.T, f acornFoxProductionPreparedFixture) {
+			if err := os.Rename(f.host, f.host+"-old"); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(f.host, durableDirMode); err != nil {
+				t.Fatal(err)
+			}
+			if err := prepareAcornFoxRepository(context.Background(), f.store, f.published, f.binding); !errors.Is(err, ErrAcornFoxRepoConflict) {
+				t.Fatalf("replaced host prepare=%v", err)
+			}
+			if files, err := os.ReadDir(f.host); err != nil || len(files) != 0 {
+				t.Fatalf("replaced host effects files=%v err=%v", files, err)
+			}
+		}},
+		{"principal-map-layout-digest", func(t *testing.T, f acornFoxProductionPreparedFixture) {
+			mutated := f.layout
+			mutated.principals = make(map[AcornFoxLiveRole]acornFoxInstallPrincipal, len(f.layout.principals))
+			for role, principal := range f.layout.principals {
+				mutated.principals[role] = principal
+			}
+			mutated.principals[AcornFoxLiveAgentRole] = acornFoxInstallPrincipal{uid: 2002, gid: 2002}
+			if _, err := newAcornFoxRepoStoreForLayout(mutated); err == nil {
+				t.Fatal("layout digest drift accepted")
+			}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newAcornFoxProductionPreparedFixture(t)
+			if err := prepareAcornFoxRepository(context.Background(), f.store, f.published, f.binding); err != nil {
+				t.Fatal(err)
+			}
+			test.run(t, f)
+			f.assertExternalSentinel(t)
+		})
+	}
+}
+
+type acornFoxProductionPreparedFixture struct {
+	parent    string
+	host      string
+	state     string
+	layout    acornFoxInstallLayout
+	store     *TaskAcornFoxRepoStore
+	published *PublishedAcornFoxSubstrateV1
+	binding   string
+	owners    *acornFoxTestOwnerRecorder
+	sentinel  string
+	raw       []byte
+}
+
+func newAcornFoxProductionPreparedFixture(t *testing.T) acornFoxProductionPreparedFixture {
+	t.Helper()
+	parent := t.TempDir()
+	host := filepath.Join(parent, "host")
+	state := filepath.Join(host, "var", "lib", "acornfox", "install")
+	if err := os.Mkdir(host, durableDirMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(state, durableDirMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(state, durableDirMode); err != nil {
+		t.Fatal(err)
+	}
+	layout, err := newTestProductionAcornFoxLayout(state, host, os.Getuid(), os.Getgid(), acornFoxTestLayoutPrincipals())
+	if err != nil {
+		t.Fatal(err)
+	}
+	stager, err := newAcornFoxStagerForLayout(layout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stager.Close()
+	stage, receipt, err := stager.Stage(newAcornFoxFixture(t, "1.2.3-test.1", nil).input(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	publisher, err := newAcornFoxSubstratePublisherForLayout(layout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer publisher.Close()
+	if _, err := publisher.Publish(context.Background(), &stage, receipt.BindingSHA256); err != nil {
+		t.Fatal(err)
+	}
+	published, err := publisher.Reopen(receipt.BindingSHA256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = published.Close() })
+	store, err := newAcornFoxRepoStoreForLayout(layout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	acornFoxLayoutCreatePreparedJournal(t, store, published.receipt)
+	entries, err := acornFoxLiveExpectedEntriesForLayout(layout, published)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owners := acornFoxTestOwnershipRecorder(t)
+	for _, entry := range entries {
+		path := filepath.Join(host, filepath.FromSlash(entry.Path))
+		if info, statErr := os.Lstat(path); statErr == nil {
+			if entry.Kind == SubstrateEntryDirectory {
+				if err := os.Chmod(path, os.FileMode(entry.Mode)); err != nil {
+					t.Fatal(err)
+				}
+				info, statErr = os.Lstat(path)
+				if statErr != nil {
+					t.Fatal(statErr)
+				}
+			}
+			owners.set(info, acornFoxLivePrincipalForEntry(layout, entry))
+		}
+	}
+	store.ownership = owners.edge()
+	if _, err := materializeAcornFoxLive(context.Background(), store, published, receipt.BindingSHA256); err != nil {
+		t.Fatalf("materialize=%v", err)
+	}
+	sentinel := filepath.Join(parent, "outside-managed-sentinel")
+	raw := []byte("stable")
+	if err := os.WriteFile(sentinel, raw, durableFileMode); err != nil {
+		t.Fatal(err)
+	}
+	return acornFoxProductionPreparedFixture{parent: parent, host: host, state: state, layout: layout, store: store, published: published, binding: receipt.BindingSHA256, owners: owners, sentinel: sentinel, raw: raw}
+}
+
+func (f acornFoxProductionPreparedFixture) assertExternalSentinel(t *testing.T) {
+	t.Helper()
+	info, err := os.Lstat(f.sentinel)
+	if err != nil || !info.Mode().IsRegular() {
+		t.Fatalf("sentinel info=%#v err=%v", info, err)
+	}
+	raw, err := os.ReadFile(f.sentinel)
+	if err != nil || !bytes.Equal(raw, f.raw) {
+		t.Fatalf("sentinel raw=%q err=%v", raw, err)
+	}
+}
+
 func mustMarshalInactiveSubstrateReceipt(t *testing.T, receipt InactiveSubstrateReceiptV1) []byte {
 	t.Helper()
 	raw, err := MarshalInactiveSubstrateReceiptV1(receipt)
