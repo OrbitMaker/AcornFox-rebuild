@@ -102,18 +102,21 @@ func (m acornFoxControlPlaneMigrations) valid() bool {
 // acornFoxControlPlane is package-private so tests can model the exact
 // production layout while production has no configurable root/DSN/tool seam.
 type acornFoxControlPlane struct {
-	layout          acornFoxInstallLayout
-	bridge          acornFoxHostBridge
-	random          io.Reader
-	provisioner     acornFoxControlPlaneProvisioner
-	open            func([]byte) (BootstrapMigrationControl, error)
-	writeActivation func(*DurableWriter, []byte) error
-	writeReceipt    func(*DurableWriter, []byte) error
+	layout           acornFoxInstallLayout
+	bridge           acornFoxHostBridge
+	random           io.Reader
+	provisioner      acornFoxControlPlaneProvisioner
+	open             func([]byte) (BootstrapMigrationControl, error)
+	writeActivation  func(*DurableWriter, []byte) error
+	writeReceipt     func(*DurableWriter, []byte) error
+	expectedIdentity AcornFoxBuildIdentityV1
 }
 
 // MigrateAcornFoxControlPlaneV1 is the sole production entrypoint.  It has no
 // caller-controlled root, database, role, DSN, migration directory or command.
-func MigrateAcornFoxControlPlaneV1(ctx context.Context) (AcornFoxControlPlaneMigrationReceiptV1, error) {
+// expected is the already-validated identity compiled into the detached helper,
+// never a CLI-provided deployment authority.
+func MigrateAcornFoxControlPlaneV1(ctx context.Context, expected AcornFoxBuildIdentityV1) (AcornFoxControlPlaneMigrationReceiptV1, error) {
 	layout, err := newProductionAcornFoxLayout()
 	if err != nil {
 		return AcornFoxControlPlaneMigrationReceiptV1{}, ErrAcornFoxControlPlaneUnknown
@@ -122,7 +125,7 @@ func MigrateAcornFoxControlPlaneV1(ctx context.Context) (AcornFoxControlPlaneMig
 	if err != nil {
 		return AcornFoxControlPlaneMigrationReceiptV1{}, ErrAcornFoxControlPlaneUnknown
 	}
-	return service.migrate(ctx)
+	return service.migrateWithIdentity(ctx, expected)
 }
 
 // newTaskAcornFoxControlPlane is the only test constructor.  Its layout is an
@@ -143,8 +146,18 @@ func newAcornFoxControlPlane(layout acornFoxInstallLayout, bridge acornFoxHostBr
 	}}, nil
 }
 
+// migrate is package-private task-only compatibility for the fixed temporary
+// fixture. Production enters only through MigrateAcornFoxControlPlaneV1,
+// which receives the helper identity from the closed CLI dispatcher.
 func (s *acornFoxControlPlane) migrate(ctx context.Context) (AcornFoxControlPlaneMigrationReceiptV1, error) {
-	if s == nil || ctx == nil || ctx.Err() != nil || s.writeActivation == nil || s.writeReceipt == nil {
+	if s == nil {
+		return AcornFoxControlPlaneMigrationReceiptV1{}, ErrAcornFoxControlPlaneUnknown
+	}
+	return s.migrateWithIdentity(ctx, s.expectedIdentity)
+}
+
+func (s *acornFoxControlPlane) migrateWithIdentity(ctx context.Context, expected AcornFoxBuildIdentityV1) (AcornFoxControlPlaneMigrationReceiptV1, error) {
+	if s == nil || ctx == nil || ctx.Err() != nil || s.writeActivation == nil || s.writeReceipt == nil || !validAcornFoxControlPlaneHelperIdentity(expected) {
 		return AcornFoxControlPlaneMigrationReceiptV1{}, ErrAcornFoxControlPlaneUnknown
 	}
 	// The prepared-state verifier is deliberately retained ahead of the
@@ -171,7 +184,7 @@ func (s *acornFoxControlPlane) migrate(ctx context.Context) (AcornFoxControlPlan
 		return AcornFoxControlPlaneMigrationReceiptV1{}, ErrAcornFoxControlPlaneConflict
 	}
 	defer lock.Release()
-	authority, migrations, err := s.authorityForStore(ctx, store)
+	authority, migrations, err := s.authorityForStore(ctx, store, expected)
 	if err != nil {
 		return AcornFoxControlPlaneMigrationReceiptV1{}, err
 	}
@@ -269,6 +282,9 @@ type acornFoxControlPlaneAuthority struct {
 }
 
 func (s *acornFoxControlPlane) authority(ctx context.Context) (acornFoxControlPlaneAuthority, acornFoxControlPlaneMigrations, error) {
+	if s == nil || !validAcornFoxControlPlaneHelperIdentity(s.expectedIdentity) {
+		return acornFoxControlPlaneAuthority{}, acornFoxControlPlaneMigrations{}, ErrAcornFoxControlPlaneUnknown
+	}
 	if _, err := s.bridge.verifyPrepared(ctx); err != nil {
 		if errors.Is(err, ErrAcornFoxRepoLocked) {
 			return acornFoxControlPlaneAuthority{}, acornFoxControlPlaneMigrations{}, ErrAcornFoxRepoLocked
@@ -289,15 +305,15 @@ func (s *acornFoxControlPlane) authority(ctx context.Context) (acornFoxControlPl
 		return acornFoxControlPlaneAuthority{}, acornFoxControlPlaneMigrations{}, ErrAcornFoxControlPlaneConflict
 	}
 	defer lock.Release()
-	return s.authorityForStore(ctx, store)
+	return s.authorityForStore(ctx, store, s.expectedIdentity)
 }
 
 // authorityForStore consumes the store descriptor that migrate has already
 // locked. It must not acquire a second lock: the migration's authority,
 // environment, provisioning, SQL ledger and receipt are one serialized C1
 // transition.
-func (s *acornFoxControlPlane) authorityForStore(ctx context.Context, store *TaskAcornFoxRepoStore) (acornFoxControlPlaneAuthority, acornFoxControlPlaneMigrations, error) {
-	if s == nil || store == nil || !store.ownsLock() {
+func (s *acornFoxControlPlane) authorityForStore(ctx context.Context, store *TaskAcornFoxRepoStore, expected AcornFoxBuildIdentityV1) (acornFoxControlPlaneAuthority, acornFoxControlPlaneMigrations, error) {
+	if s == nil || store == nil || !store.ownsLock() || !validAcornFoxControlPlaneHelperIdentity(expected) {
 		return acornFoxControlPlaneAuthority{}, acornFoxControlPlaneMigrations{}, ErrAcornFoxControlPlaneConflict
 	}
 	journal, err := store.Resume(ctx)
@@ -309,7 +325,7 @@ func (s *acornFoxControlPlane) authorityForStore(ctx context.Context, store *Tas
 		return acornFoxControlPlaneAuthority{}, acornFoxControlPlaneMigrations{}, ErrAcornFoxControlPlaneConflict
 	}
 	binding, err := ParseAcornFoxCandidateBindingV1(rawBinding, journal.BindingSHA256)
-	if err != nil || binding.binding.ReleaseID == "" || binding.binding.SourceCommit == "" {
+	if err != nil || binding.binding.ReleaseID == "" || binding.binding.SourceCommit == "" || binding.binding.ReleaseID != expected.ReleaseID || binding.binding.SourceCommit != expected.SourceCommit {
 		return acornFoxControlPlaneAuthority{}, acornFoxControlPlaneMigrations{}, ErrAcornFoxControlPlaneConflict
 	}
 	activationID, err := AcornFoxRepoActivationID(journal.BindingSHA256)
@@ -321,6 +337,10 @@ func (s *acornFoxControlPlane) authorityForStore(ctx context.Context, store *Tas
 		return acornFoxControlPlaneAuthority{}, acornFoxControlPlaneMigrations{}, ErrAcornFoxControlPlaneConflict
 	}
 	return acornFoxControlPlaneAuthority{binding: journal.BindingSHA256, releaseID: binding.binding.ReleaseID, sourceCommit: binding.binding.SourceCommit, activationID: activationID}, migrations, nil
+}
+
+func validAcornFoxControlPlaneHelperIdentity(expected AcornFoxBuildIdentityV1) bool {
+	return expected.Validate() == nil && expected.Product == AcornFoxV1Product && expected.LayoutVersion == AcornFoxSubstrateLayoutV1 && expected.Role == "upgrade"
 }
 
 func (s *acornFoxControlPlane) writers(activationID string) (*DurableWriter, *DurableWriter, error) {

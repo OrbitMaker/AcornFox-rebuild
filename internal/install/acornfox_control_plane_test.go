@@ -71,6 +71,7 @@ func newAcornFoxControlPlanePrepared(t *testing.T, ledger *acornFoxControlPlaneL
 	if err != nil {
 		t.Fatal(err)
 	}
+	service.expectedIdentity = AcornFoxBuildIdentityV1{SchemaVersion: AcornFoxHelperContractV1Schema, Product: AcornFoxV1Product, LayoutVersion: AcornFoxSubstrateLayoutV1, Role: "upgrade", Version: prepared.published.receipt.CandidateReceipt.Version, ReleaseID: prepared.published.receipt.CandidateReceipt.ReleaseID, SourceCommit: prepared.published.receipt.CandidateReceipt.SourceCommit}
 	service.bridge.ownership = prepared.owners.edge()
 	return service, prepared
 }
@@ -188,6 +189,7 @@ func TestAcornFoxControlPlaneMigrationSerializesFixedRepositoryLock(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
+	other.expectedIdentity = service.expectedIdentity
 	other.bridge.ownership = prepared.owners.edge()
 	if _, err := other.migrate(context.Background()); !errors.Is(err, ErrAcornFoxRepoLocked) {
 		t.Fatalf("concurrent migration err=%v", err)
@@ -229,6 +231,61 @@ func TestAcornFoxControlPlaneMigrationReleasesLockAfterFailure(t *testing.T) {
 	}
 	if err := lock.Release(); err != nil {
 		t.Fatal(err)
+	}
+	prepared.assertExternalSentinel(t)
+}
+
+func TestAcornFoxControlPlaneRejectsHelperIdentityBeforeEffectsAndAllowsCurrentBinding(t *testing.T) {
+	ledger, runner := &acornFoxControlPlaneLedgerFake{}, &acornFoxControlPlaneProvisionerFake{}
+	service, prepared := newAcornFoxControlPlanePrepared(t, ledger, runner)
+	openCalls := 0
+	service.open = func([]byte) (BootstrapMigrationControl, error) {
+		openCalls++
+		return ledger, nil
+	}
+	wrong := service.expectedIdentity
+	wrong.Version = "1.2.4-test.1"
+	wrong.ReleaseID = "release-1.2.4-test.1"
+	if _, err := service.migrateWithIdentity(context.Background(), wrong); !errors.Is(err, ErrAcornFoxControlPlaneConflict) {
+		t.Fatalf("mismatched helper identity err=%v", err)
+	}
+	activation, err := AcornFoxRepoActivationID(prepared.binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{
+		filepath.Join(prepared.state, acornFoxControlPlaneStateEnv),
+		filepath.Join(prepared.state, acornFoxControlPlaneReceipt),
+		filepath.Join(prepared.host, "opt", "acornfox", "activations", activation, acornFoxControlPlaneActivationEnv),
+	} {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("identity mismatch wrote %s: %v", path, err)
+		}
+	}
+	if len(runner.argv) != 0 || openCalls != 0 || len(ledger.rows) != 0 {
+		t.Fatalf("identity mismatch effects argv=%q open=%d rows=%d", runner.argv, openCalls, len(ledger.rows))
+	}
+	if _, err := service.migrate(context.Background()); err != nil {
+		t.Fatalf("current locked binding should migrate: %v", err)
+	}
+	prepared.assertExternalSentinel(t)
+}
+
+func TestAcornFoxControlPlaneRejectsInvalidHelperIdentityBeforePreparedVerification(t *testing.T) {
+	ledger, runner := &acornFoxControlPlaneLedgerFake{}, &acornFoxControlPlaneProvisionerFake{}
+	service, prepared := newAcornFoxControlPlanePrepared(t, ledger, runner)
+	openCalls := 0
+	service.open = func([]byte) (BootstrapMigrationControl, error) {
+		openCalls++
+		return ledger, nil
+	}
+	invalid := service.expectedIdentity
+	invalid.Role = "healthcheck"
+	if _, err := service.migrateWithIdentity(context.Background(), invalid); !errors.Is(err, ErrAcornFoxControlPlaneUnknown) {
+		t.Fatalf("invalid helper identity err=%v", err)
+	}
+	if len(runner.argv) != 0 || openCalls != 0 || len(ledger.rows) != 0 {
+		t.Fatalf("invalid helper identity effects argv=%q open=%d rows=%d", runner.argv, openCalls, len(ledger.rows))
 	}
 	prepared.assertExternalSentinel(t)
 }

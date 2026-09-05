@@ -122,7 +122,7 @@ type acornFoxCleanDependencies struct {
 	bootstrap           func(context.Context, install.AcornFoxCandidateSetRequestV1) (install.AcornFoxHostBootstrapReceiptV1, error)
 	recover             func(context.Context) (install.AcornFoxHostBootstrapReceiptV1, error)
 	verifyPrepared      func(context.Context) (install.AcornFoxHostBootstrapReceiptV1, error)
-	migrateControlPlane func(context.Context) (install.AcornFoxControlPlaneMigrationReceiptV1, error)
+	migrateControlPlane func(context.Context, install.AcornFoxBuildIdentityV1) (install.AcornFoxControlPlaneMigrationReceiptV1, error)
 }
 
 type productionBootstrapRuntimeDependencies struct {
@@ -348,7 +348,7 @@ func runAcornFoxClean(ctx context.Context, args []string, stdout io.Writer, role
 		if deps.migrateControlPlane == nil {
 			return writeAcornFoxCleanError(stdout, exitIneligible, "control_plane_ineligible")
 		}
-		receipt, migrateErr := deps.migrateControlPlane(ctx)
+		receipt, migrateErr := deps.migrateControlPlane(ctx, identity)
 		if migrateErr != nil || receipt.Validate() != nil {
 			return writeAcornFoxCleanControlPlaneError(stdout, migrateErr)
 		}

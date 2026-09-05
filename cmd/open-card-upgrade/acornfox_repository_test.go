@@ -94,8 +94,11 @@ func TestAcornFoxCleanDispatchesOnlyOneInjectedBridgeOperation(t *testing.T) {
 					calls["finalize"]++
 					return cleanReceipt(), nil
 				},
-				migrateControlPlane: func(context.Context) (install.AcornFoxControlPlaneMigrationReceiptV1, error) {
+				migrateControlPlane: func(_ context.Context, identity install.AcornFoxBuildIdentityV1) (install.AcornFoxControlPlaneMigrationReceiptV1, error) {
 					calls["migrate"]++
+					if identity.Validate() != nil || identity.Role != "upgrade" || identity.ReleaseID != "release-1.2.3-test.1" || identity.SourceCommit != "0123456789abcdef0123456789abcdef01234567" {
+						t.Fatalf("identity=%#v", identity)
+					}
 					return cleanControlPlaneReceipt(), nil
 				},
 			}}
@@ -122,7 +125,7 @@ func TestAcornFoxCleanMigrateControlPlaneOrderingReceiptAndErrors(t *testing.T) 
 		var stdout bytes.Buffer
 		code := runAcornFoxClean(context.Background(), []string{"migrate-control-plane", "--pending"}, &stdout, helperRole, acornFoxCleanDependencies{
 			euid: func() int { calls++; return 0 },
-			migrateControlPlane: func(context.Context) (install.AcornFoxControlPlaneMigrationReceiptV1, error) {
+			migrateControlPlane: func(context.Context, install.AcornFoxBuildIdentityV1) (install.AcornFoxControlPlaneMigrationReceiptV1, error) {
 				calls++
 				return cleanControlPlaneReceipt(), nil
 			},
@@ -137,7 +140,7 @@ func TestAcornFoxCleanMigrateControlPlaneOrderingReceiptAndErrors(t *testing.T) 
 		var stdout bytes.Buffer
 		code := runAcornFoxClean(context.Background(), []string{"migrate-control-plane", "--pending"}, &stdout, helperRole, acornFoxCleanDependencies{
 			euid: func() int { return 501 },
-			migrateControlPlane: func(context.Context) (install.AcornFoxControlPlaneMigrationReceiptV1, error) {
+			migrateControlPlane: func(context.Context, install.AcornFoxBuildIdentityV1) (install.AcornFoxControlPlaneMigrationReceiptV1, error) {
 				called = true
 				return cleanControlPlaneReceipt(), nil
 			},
@@ -185,7 +188,7 @@ func TestAcornFoxCleanMigrateControlPlaneOrderingReceiptAndErrors(t *testing.T) 
 				var stdout, stderr bytes.Buffer
 				code := runWithDependencies(context.Background(), []string{"migrate-control-plane", "--pending"}, &stdout, &stderr, upgradeDependencies{acornFoxClean: acornFoxCleanDependencies{
 					euid: func() int { return 0 },
-					migrateControlPlane: func(context.Context) (install.AcornFoxControlPlaneMigrationReceiptV1, error) {
+					migrateControlPlane: func(context.Context, install.AcornFoxBuildIdentityV1) (install.AcornFoxControlPlaneMigrationReceiptV1, error) {
 						calls++
 						return test.receipt, test.err
 					},
