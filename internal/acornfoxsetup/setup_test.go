@@ -69,12 +69,18 @@ func TestGenerateRuntimeContract(t *testing.T) {
 	if len(b.Files) != 7 {
 		t.Fatal("file closure changed")
 	}
+	if ServerEnvironment != "/etc/acornfox/runtime/server.env" || AgentEnvironment != "/etc/acornfox/runtime/agent.env" {
+		t.Fatal("environment files must share the atomic runtime directory")
+	}
 	for _, f := range b.Files {
+		if !strings.HasPrefix(f.Path, RuntimeDirectory+"/") {
+			t.Fatal("bundle escapes the atomic runtime directory")
+		}
 		if f.Owner != Root {
 			t.Fatal("owner")
 		}
 		if strings.HasSuffix(f.Path, ".key") {
-			if f.Mode != 0640 || (f.Group != Server && f.Group != Agent) {
+			if f.Mode != 0600 || f.Group != Root {
 				t.Fatal("private key access")
 			}
 		} else if f.Mode != 0644 || f.Group != Root {
@@ -96,6 +102,9 @@ func TestGenerateRuntimeContract(t *testing.T) {
 			}
 		}
 		if item.process == acornfoxenv.ProcessServer {
+			if e.Get(acornfoxenv.ServerAgentTLSKey) != "/run/credentials/acornfox-server.service/server.key" {
+				t.Fatal("server key must use the server credential directory")
+			}
 			if e.Get(acornfoxenv.AuthOrigin) != inputs().Origin || e.Get(acornfoxenv.M1Enabled) != "true" || e.Get(acornfoxenv.AgentGatewayAddr) != "127.0.0.1:8092" {
 				t.Fatal("server contract")
 			}
@@ -124,6 +133,9 @@ func TestGenerateRuntimeContract(t *testing.T) {
 				t.Fatalf("source configuration: %v", err)
 			}
 		} else {
+			if e.Get(acornfoxenv.AgentTLSKey) != "/run/credentials/acornfox-agent.service/agent.key" {
+				t.Fatal("agent key must use the agent credential directory")
+			}
 			if e.Get(acornfoxenv.ControlPlaneServerName) != GatewayName || e.Get(acornfoxenv.ControlPlaneURL) != "https://127.0.0.1:8092" || e.Get(acornfoxenv.InstanceID) != InstanceID || e.Get(acornfoxenv.NodeID) != NodeID || e.Get(acornfoxenv.AgentVersion) != inputs().Version || e.Get(acornfoxenv.RuntimeEnabled) != "true" {
 				t.Fatal("agent contract")
 			}
@@ -200,11 +212,24 @@ func TestRejectBundleMutation(t *testing.T) {
 		"extra": func(b *Bundle) {
 			b.Files = append(b.Files, File{Path: RuntimeDirectory + "/ca.key", Data: []byte("extra")})
 		},
-		"duplicate":  func(b *Bundle) { b.Files[6] = b.Files[5] },
-		"path":       func(b *Bundle) { b.Files[4].Path = "/tmp/server.key" },
-		"mode":       func(b *Bundle) { b.Files[4].Mode = 0644 },
-		"owner":      func(b *Bundle) { b.Files[4].Owner = Server },
-		"group":      func(b *Bundle) { b.Files[4].Group = Agent },
+		"duplicate":               func(b *Bundle) { b.Files[6] = b.Files[5] },
+		"path":                    func(b *Bundle) { b.Files[4].Path = "/tmp/server.key" },
+		"old-server-env-path":     func(b *Bundle) { b.Files[0].Path = "/etc/acornfox/server.env" },
+		"old-agent-env-path":      func(b *Bundle) { b.Files[1].Path = "/etc/acornfox/agent.env" },
+		"mode":                    func(b *Bundle) { b.Files[4].Mode = 0644 },
+		"owner":                   func(b *Bundle) { b.Files[4].Owner = Server },
+		"group":                   func(b *Bundle) { b.Files[4].Group = Agent },
+		"server-shared-group-key": func(b *Bundle) { b.Files[4].Mode = 0640; b.Files[4].Group = Server },
+		"agent-group-key":         func(b *Bundle) { b.Files[6].Mode = 0640; b.Files[6].Group = Agent },
+		"server-source-key-path": func(b *Bundle) {
+			b.Files[0].Data = bytes.ReplaceAll(b.Files[0].Data, []byte("/run/credentials/acornfox-server.service/server.key"), []byte(RuntimeDirectory+"/server.key"))
+		},
+		"agent-source-key-path": func(b *Bundle) {
+			b.Files[1].Data = bytes.ReplaceAll(b.Files[1].Data, []byte("/run/credentials/acornfox-agent.service/agent.key"), []byte(RuntimeDirectory+"/agent.key"))
+		},
+		"agent-server-credential": func(b *Bundle) {
+			b.Files[1].Data = bytes.ReplaceAll(b.Files[1].Data, []byte("/run/credentials/acornfox-agent.service/agent.key"), []byte("/run/credentials/acornfox-server.service/server.key"))
+		},
 		"nil":        func(b *Bundle) { b.Files[4].Data = nil },
 		"wrong-key":  func(b *Bundle) { b.Files[4].Data = other.Files[4].Data },
 		"wrong-ca":   func(b *Bundle) { b.Files[2].Data = other.Files[2].Data },

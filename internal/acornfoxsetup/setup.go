@@ -4,6 +4,8 @@
 // files, and create /etc/acornfox/runtime as root:root 0755. Certificate renewal
 // is a separate lifecycle: certificates expire 365 days after Inputs.Now and
 // the CA private key is deliberately not retained.
+// Both private key sources are root:root 0600. Callers must provision systemd
+// LoadCredential entries so each service receives only its own private key.
 package acornfoxsetup
 
 import (
@@ -34,8 +36,8 @@ const (
 	Server            Role = "server" // acornfox group
 	Agent             Role = "agent"  // acornfox-agent group
 	RuntimeDirectory       = "/etc/acornfox/runtime"
-	ServerEnvironment      = "/etc/acornfox/server.env"
-	AgentEnvironment       = "/etc/acornfox/agent.env"
+	ServerEnvironment      = RuntimeDirectory + "/server.env"
+	AgentEnvironment       = RuntimeDirectory + "/agent.env"
 	GatewayName            = "acornfox-agent-gateway"
 	InstanceID             = "acornfox-local"
 	NodeID                 = "acornfox-node"
@@ -111,9 +113,9 @@ func fileSpecs() []File {
 		{Path: AgentEnvironment, Mode: 0644, Owner: Root, Group: Root},
 		{Path: RuntimeDirectory + "/ca.crt", Mode: 0644, Owner: Root, Group: Root},
 		{Path: RuntimeDirectory + "/server.crt", Mode: 0644, Owner: Root, Group: Root},
-		{Path: RuntimeDirectory + "/server.key", Mode: 0640, Owner: Root, Group: Server},
+		{Path: RuntimeDirectory + "/server.key", Mode: 0600, Owner: Root, Group: Root},
 		{Path: RuntimeDirectory + "/agent.crt", Mode: 0644, Owner: Root, Group: Root},
-		{Path: RuntimeDirectory + "/agent.key", Mode: 0640, Owner: Root, Group: Agent},
+		{Path: RuntimeDirectory + "/agent.key", Mode: 0600, Owner: Root, Group: Root},
 	}
 }
 
@@ -356,7 +358,7 @@ func environment(values map[string]string) []byte {
 func serverEnv(in Inputs, serial string) []byte {
 	return environment(map[string]string{
 		"RUNTIME_MODE": "clean", "M1_ENABLED": "true", "AUTH_ORIGIN": in.Origin, "AGENT_GATEWAY_ADDR": "127.0.0.1:8092",
-		"SERVER_AGENT_TLS_CA": RuntimeDirectory + "/ca.crt", "SERVER_AGENT_TLS_CERT": RuntimeDirectory + "/server.crt", "SERVER_AGENT_TLS_KEY": RuntimeDirectory + "/server.key",
+		"SERVER_AGENT_TLS_CA": RuntimeDirectory + "/ca.crt", "SERVER_AGENT_TLS_CERT": RuntimeDirectory + "/server.crt", "SERVER_AGENT_TLS_KEY": "/run/credentials/acornfox-server.service/server.key",
 		"AGENT_IDENTITIES_JSON":      `[{"certificate_id":"` + serial + `","instance_id":"` + InstanceID + `","node_id":"` + NodeID + `"}]`,
 		"AGENT_DISPATCH_INSTANCE_ID": InstanceID, "AGENT_DISPATCH_NODE_ID": NodeID,
 		"SOURCE_UPLOAD_ROOT": "/var/lib/acornfox/uploads", "SOURCE_WORKSPACE_ROOT": "/var/lib/acornfox/workspaces", "BUILD_WORK_ROOT": "/var/lib/acornfox/build-work", "LOG_ROOT": "/var/log/acornfox/server", "OCI_STORE_ROOT": "/var/lib/acornfox/oci", "SECRET_ROOT": "/var/lib/acornfox/secrets", "SECRET_MATERIAL_ROOT": "/var/lib/acornfox/secret-materials", "SECRET_MASTER_KEY": "/var/lib/acornfox/secrets/master.key", "SOURCE_GIT_RESOLVERS": strings.Join(in.ResolverEndpoints, ","),
@@ -366,7 +368,7 @@ func serverEnv(in Inputs, serial string) []byte {
 func agentEnv(in Inputs) []byte {
 	return environment(map[string]string{
 		"RUNTIME_MODE": "clean", "CONTROL_PLANE_URL": "https://127.0.0.1:8092", "CONTROL_PLANE_SERVER_NAME": GatewayName,
-		"AGENT_TLS_CA": RuntimeDirectory + "/ca.crt", "AGENT_TLS_CERT": RuntimeDirectory + "/agent.crt", "AGENT_TLS_KEY": RuntimeDirectory + "/agent.key",
+		"AGENT_TLS_CA": RuntimeDirectory + "/ca.crt", "AGENT_TLS_CERT": RuntimeDirectory + "/agent.crt", "AGENT_TLS_KEY": "/run/credentials/acornfox-agent.service/agent.key",
 		"INSTANCE_ID": InstanceID, "NODE_ID": NodeID, "AGENT_VERSION": in.Version,
 		"RUNTIME_ENABLED": "true", "WORKER_NETWORK_ISOLATED": "true", "OCI_STORE_ROOT": "/var/lib/acornfox/oci", "RUNTIME_WORK_ROOT": "/var/lib/acornfox/agent", "RUNTIME_TASK_PREFIX": "acornfox", "RUNTIME_NETWORK": "acornfox-network",
 	})
