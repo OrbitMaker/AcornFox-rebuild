@@ -152,6 +152,5 @@ for unit in acornfox-upgrade-safe.target acornfox-buildkit.service acornfox-cadd
   clean_output /usr/bin/systemctl is-enabled --quiet "$unit" || fail
   clean_output /usr/bin/systemctl is-active --quiet "$unit" || fail
 done
-clean_output /usr/bin/systemctl is-active --quiet acornfox-healthcheck.service || fail
 
 printf '{"code":"installed","ok":true,"schema_version":1}\n'

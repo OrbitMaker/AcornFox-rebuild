@@ -88,6 +88,8 @@ class AcornFoxInstallScriptsTest(unittest.TestCase):
         self.assertEqual(positions, sorted(positions))
         self.assertIn("ACORNFOX_INSTALL_CONFIRMATION", text)
         self.assertIn("ACORNFOX_DEDICATED_HOST_CONFIRMATION", text)
+        self.assertIn("/usr/bin/systemctl start acornfox-healthcheck.service", text)
+        self.assertNotIn("is-active --quiet acornfox-healthcheck.service", text)
         for forbidden in ("rm -", "docker rm", "docker system prune", "rollback", "downgrade", "backup", "restore"):
             self.assertNotIn(forbidden, text)
 
