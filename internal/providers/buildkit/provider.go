@@ -23,6 +23,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/open-card/open-card/internal/acornfoxrelease"
 	"github.com/open-card/open-card/internal/contracts"
 	"github.com/open-card/open-card/internal/domain"
 	"github.com/open-card/open-card/internal/foundation"
@@ -71,6 +72,25 @@ type WorkerPolicyAttestationReceipt struct {
 	RequestFingerprint string
 }
 
+// controlledEgressAuthority is deliberately opaque outside this package. It
+// can only be sealed from AcornFox's canonical P0 input and policy files.
+type controlledEgressAuthority struct {
+	policyDigest string
+	sealed       bool
+}
+
+func sealControlledEgressAuthority(inputsRaw, policyRaw []byte) (controlledEgressAuthority, error) {
+	inputs, _, err := acornfoxrelease.ParseProductBuildInputsV1(inputsRaw, policyRaw)
+	if err != nil {
+		return controlledEgressAuthority{}, err
+	}
+	return controlledEgressAuthority{policyDigest: inputs.ControlledEgressPolicySHA, sealed: true}, nil
+}
+
+func (a controlledEgressAuthority) matches(digest string) bool {
+	return a.sealed && contracts.IsSHA256Digest(a.policyDigest) && a.policyDigest == digest
+}
+
 func (r WorkerPolicyAttestationReceipt) matches(request WorkerPolicyAttestationRequest) bool {
 	return r.SchemaVersion == 1 && request.SchemaVersion == 1 && contracts.IsSHA256Digest(r.PolicyDigest) && r.PolicyDigest == request.PolicyDigest && r.RequestFingerprint != "" && r.RequestFingerprint == request.RequestFingerprint
 }
@@ -79,6 +99,11 @@ type execRunner struct{}
 
 func (execRunner) Run(ctx context.Context, command string, args []string, stdout, stderr io.Writer) error {
 	cmd := exec.CommandContext(ctx, command, args...)
+	// Never inherit the controller process environment: proxy, cloud, registry,
+	// database, and ambient credential variables have no place at buildctl's
+	// process boundary. Commands are absolute in production configuration; the
+	// fixed PATH exists only for standard helper lookup.
+	cmd.Env = []string{"PATH=/usr/bin:/bin", "LANG=C", "LC_ALL=C"}
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	return cmd.Run()
@@ -100,15 +125,18 @@ type Config struct {
 	SecretResolver     contracts.BuildSecretResolver
 	Runner             CommandRunner
 	LogSink            BuildLogSink
-	// ControlledEgressPolicyDigest is one reviewed policy identity. It is not
-	// a caller-selected network rule and it has no effect unless the live
-	// worker returns a matching typed receipt.
-	ControlledEgressPolicyDigest string
-	WorkerPolicyAttestor         WorkerPolicyAttestor
+	// ControlledEgressInputsRaw and ControlledEgressPolicyRaw must be the two
+	// canonical P0 files. New parses them into an opaque authority, then clears
+	// the raw bytes; callers never provide a free-form policy digest.
+	ControlledEgressInputsRaw []byte
+	ControlledEgressPolicyRaw []byte
+	WorkerPolicyAttestor      WorkerPolicyAttestor
 	// RequireLogSink keeps legacy BuildKit composition optional while allowing
 	// a composition root to require durable logs for every build it serves.
 	// AcornFox-bound plans require a sink regardless of this switch.
 	RequireLogSink bool
+
+	controlledEgress controlledEgressAuthority
 }
 
 func (c Config) normalized() (Config, error) {
@@ -161,8 +189,19 @@ func (c Config) normalized() (Config, error) {
 	if c.RequireLogSink && c.LogSink == nil {
 		return Config{}, fmt.Errorf("buildkit durable log sink is required")
 	}
-	if (c.ControlledEgressPolicyDigest == "") != (c.WorkerPolicyAttestor == nil) || c.ControlledEgressPolicyDigest != "" && !contracts.IsSHA256Digest(c.ControlledEgressPolicyDigest) {
+	hasInputs := len(c.ControlledEgressInputsRaw) != 0
+	hasPolicy := len(c.ControlledEgressPolicyRaw) != 0
+	if hasInputs != hasPolicy || hasInputs != (c.WorkerPolicyAttestor != nil) {
 		return Config{}, fmt.Errorf("buildkit controlled egress requires one canonical policy digest and live worker attestor")
+	}
+	if hasInputs {
+		authority, err := sealControlledEgressAuthority(c.ControlledEgressInputsRaw, c.ControlledEgressPolicyRaw)
+		if err != nil {
+			return Config{}, fmt.Errorf("buildkit controlled egress policy is invalid")
+		}
+		c.controlledEgress = authority
+		c.ControlledEgressInputsRaw = nil
+		c.ControlledEgressPolicyRaw = nil
 	}
 	return c, nil
 }
@@ -420,7 +459,7 @@ func (p *Provider) validateNetwork(plan domain.BuildPlan, network contracts.Netw
 		if !requiresDurableLog(plan) || plan.Kind != domain.BuildDockerfile || plan.ContextPath != "." || plan.DockerfilePath != "Dockerfile" {
 			return errors.New("controlled egress requires an AcornFox root Dockerfile plan")
 		}
-		if p.config.WorkerPolicyAttestor == nil || p.config.ControlledEgressPolicyDigest == "" || p.config.ControlledEgressPolicyDigest != network.WorkerPolicyDigest {
+		if p.config.WorkerPolicyAttestor == nil || !p.config.controlledEgress.matches(network.WorkerPolicyDigest) {
 			return errors.New("controlled egress worker policy is unavailable")
 		}
 	}

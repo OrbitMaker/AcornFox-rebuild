@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/open-card/open-card/internal/acornfoxrelease"
 	"github.com/open-card/open-card/internal/contracts"
 	"github.com/open-card/open-card/internal/domain"
 	"github.com/open-card/open-card/internal/foundation"
@@ -130,6 +131,49 @@ func (r *fakeRunner) callCount() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return len(r.calls)
+}
+
+func TestExecRunnerUsesMinimalChildEnvironment(t *testing.T) {
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(self)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := filepath.Join(t.TempDir(), "buildctl-probe")
+	if err := os.WriteFile(command, body, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	capture := filepath.Join(t.TempDir(), "environment")
+	for key, value := range map[string]string{
+		"HTTP_PROXY": "http://proxy.invalid", "HTTPS_PROXY": "https://proxy.invalid", "ALL_PROXY": "socks5://proxy.invalid", "NO_PROXY": "localhost",
+		"REGISTRY_TOKEN": "registry-secret", "ALIBABA_CLOUD_ACCESS_KEY_ID": "aliyun-secret", "TENCENTCLOUD_SECRET_KEY": "tencent-secret", "VOLCENGINE_ACCESS_KEY": "volc-secret", "DATABASE_URL": "postgres://secret",
+	} {
+		t.Setenv(key, value)
+	}
+	if err := (execRunner{}).Run(context.Background(), command, []string{"-test.run=^TestExecRunnerEnvironmentHelper$", "--", "--acornfox-capture-env", capture}, io.Discard, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(capture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(raw), "PATH=/usr/bin:/bin\x00LANG=C\x00LC_ALL=C\x00"; got != want {
+		t.Fatalf("buildctl child inherited ambient environment: got %q want %q", got, want)
+	}
+}
+
+func TestExecRunnerEnvironmentHelper(t *testing.T) {
+	for index, arg := range os.Args {
+		if arg == "--acornfox-capture-env" && index+1 < len(os.Args) {
+			if err := os.WriteFile(os.Args[index+1], []byte(strings.Join(os.Environ(), "\x00")+"\x00"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			os.Exit(0)
+		}
+	}
 }
 
 func writingRunner(t *testing.T, output string) *fakeRunner {
@@ -284,9 +328,41 @@ func controlledRequest(t *testing.T, key string, source domain.SourceRevision, p
 	return request
 }
 
-func enableControlledEgress(provider *Provider, policyDigest string, attestor WorkerPolicyAttestor) {
-	provider.config.ControlledEgressPolicyDigest = policyDigest
-	provider.config.WorkerPolicyAttestor = attestor
+func controlledEgressRaw(t *testing.T) ([]byte, []byte) {
+	t.Helper()
+	inputs, err := os.ReadFile(filepath.Join("..", "..", "..", "release", "acornfox-product-build-inputs-v1.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, err := os.ReadFile(filepath.Join("..", "..", "..", "release", "acornfox-controlled-egress-policy-v1.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return inputs, policy
+}
+
+func controlledEgressDigest(t *testing.T) string {
+	t.Helper()
+	inputsRaw, policyRaw := controlledEgressRaw(t)
+	inputs, _, err := acornfoxrelease.ParseProductBuildInputsV1(inputsRaw, policyRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return inputs.ControlledEgressPolicySHA
+}
+
+func configuredControlledProvider(t *testing.T, provider *Provider, attestor WorkerPolicyAttestor) *Provider {
+	t.Helper()
+	inputs, policy := controlledEgressRaw(t)
+	config := provider.config
+	config.ControlledEgressInputsRaw = inputs
+	config.ControlledEgressPolicyRaw = policy
+	config.WorkerPolicyAttestor = attestor
+	configured, err := New(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return configured
 }
 
 func testRequest(key string, source domain.SourceRevision) contracts.BuildRequest {
@@ -531,14 +607,14 @@ func TestControlledEgressChangesFingerprintWithoutExecuting(t *testing.T) {
 }
 
 func TestControlledEgressAdmitsOnlyExactAttestedAcornFoxBuild(t *testing.T) {
-	const policyDigest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	policyDigest := controlledEgressDigest(t)
 	runner := writingRunner(t, "controlled build output\n")
 	provider, root, source := testProvider(t, runner)
 	events := []string{}
 	attestor := &fakeWorkerPolicyAttestor{events: &events}
 	capacity := &countingCapacity{events: &events}
 	provider.config.Capacity = capacity
-	enableControlledEgress(provider, policyDigest, attestor)
+	provider = configuredControlledProvider(t, provider, attestor)
 	request := controlledRequest(t, "controlled-success", source, policyDigest)
 	result, err := provider.Build(context.Background(), request)
 	if err != nil || result.Artifact == nil || attestor.callCount() != 1 || runner.callCount() != 1 || capacity.activations != 1 {
@@ -574,16 +650,18 @@ func TestControlledEgressAdmitsOnlyExactAttestedAcornFoxBuild(t *testing.T) {
 }
 
 func TestControlledEgressConfigAndOfflineBuildStayBounded(t *testing.T) {
-	const policyDigest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	runner := writingRunner(t, "")
 	provider, _, source := testProvider(t, runner)
 	base := provider.config
+	inputs, policy := controlledEgressRaw(t)
 	for name, configure := range map[string]func(*Config){
-		"digest without attestor": func(c *Config) { c.ControlledEgressPolicyDigest = policyDigest },
+		"inputs without attestor": func(c *Config) { c.ControlledEgressInputsRaw, c.ControlledEgressPolicyRaw = inputs, policy },
 		"attestor without digest": func(c *Config) { c.WorkerPolicyAttestor = &fakeWorkerPolicyAttestor{} },
-		"uppercase digest": func(c *Config) {
-			c.ControlledEgressPolicyDigest = "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-			c.WorkerPolicyAttestor = &fakeWorkerPolicyAttestor{}
+		"malformed P0 inputs": func(c *Config) {
+			c.ControlledEgressInputsRaw, c.ControlledEgressPolicyRaw, c.WorkerPolicyAttestor = []byte("{}\n"), policy, &fakeWorkerPolicyAttestor{}
+		},
+		"drifted P0 policy": func(c *Config) {
+			c.ControlledEgressInputsRaw, c.ControlledEgressPolicyRaw, c.WorkerPolicyAttestor = inputs, append(append([]byte(nil), policy[:len(policy)-1]...), ' '), &fakeWorkerPolicyAttestor{}
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -595,7 +673,7 @@ func TestControlledEgressConfigAndOfflineBuildStayBounded(t *testing.T) {
 		})
 	}
 	attestor := &fakeWorkerPolicyAttestor{}
-	enableControlledEgress(provider, policyDigest, attestor)
+	provider = configuredControlledProvider(t, provider, attestor)
 	if _, err := provider.Build(context.Background(), testRequest("offline-with-attestor", source)); err != nil {
 		t.Fatal(err)
 	}
@@ -605,44 +683,50 @@ func TestControlledEgressConfigAndOfflineBuildStayBounded(t *testing.T) {
 }
 
 func TestControlledEgressFailsClosedBeforeBuildPreparation(t *testing.T) {
-	const policyDigest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	policyDigest := controlledEgressDigest(t)
 	tests := []struct {
 		name      string
-		configure func(*Provider, *fakeWorkerPolicyAttestor)
+		configure func(*testing.T, *Provider, *fakeWorkerPolicyAttestor) *Provider
 		mutate    func(*contracts.BuildRequest)
 		want      contracts.ErrorCode
 	}{
-		{"missing authority", func(_ *Provider, _ *fakeWorkerPolicyAttestor) {}, func(_ *contracts.BuildRequest) {}, contracts.ErrForbidden},
-		{"configured digest mismatch", func(p *Provider, a *fakeWorkerPolicyAttestor) {
-			enableControlledEgress(p, "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", a)
-		}, func(_ *contracts.BuildRequest) {}, contracts.ErrForbidden},
-		{"missing attestor", func(p *Provider, _ *fakeWorkerPolicyAttestor) { p.config.ControlledEgressPolicyDigest = policyDigest }, func(_ *contracts.BuildRequest) {}, contracts.ErrForbidden},
-		{"plan digest mismatch", func(p *Provider, a *fakeWorkerPolicyAttestor) { enableControlledEgress(p, policyDigest, a) }, func(r *contracts.BuildRequest) {
+		{"missing authority", func(_ *testing.T, p *Provider, _ *fakeWorkerPolicyAttestor) *Provider { return p }, func(_ *contracts.BuildRequest) {}, contracts.ErrForbidden},
+		{"configured digest mismatch", func(t *testing.T, p *Provider, a *fakeWorkerPolicyAttestor) *Provider {
+			return configuredControlledProvider(t, p, a)
+		}, func(r *contracts.BuildRequest) {
+			r.Network.WorkerPolicyDigest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+			r.Plan.AcornFoxWorkerPolicyDigest = r.Network.WorkerPolicyDigest
+		}, contracts.ErrForbidden},
+		{"plan digest mismatch", func(t *testing.T, p *Provider, a *fakeWorkerPolicyAttestor) *Provider {
+			return configuredControlledProvider(t, p, a)
+		}, func(r *contracts.BuildRequest) {
 			r.Plan.AcornFoxWorkerPolicyDigest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 		}, contracts.ErrForbidden},
-		{"attestor error", func(p *Provider, a *fakeWorkerPolicyAttestor) {
+		{"attestor error", func(t *testing.T, p *Provider, a *fakeWorkerPolicyAttestor) *Provider {
 			a.err = errors.New("private attestor failure")
-			enableControlledEgress(p, policyDigest, a)
+			return configuredControlledProvider(t, p, a)
 		}, func(_ *contracts.BuildRequest) {}, contracts.ErrUnavailable},
-		{"malformed receipt", func(p *Provider, a *fakeWorkerPolicyAttestor) {
+		{"malformed receipt", func(t *testing.T, p *Provider, a *fakeWorkerPolicyAttestor) *Provider {
 			a.receipt = func(WorkerPolicyAttestationRequest) WorkerPolicyAttestationReceipt {
 				return WorkerPolicyAttestationReceipt{}
 			}
-			enableControlledEgress(p, policyDigest, a)
+			return configuredControlledProvider(t, p, a)
 		}, func(_ *contracts.BuildRequest) {}, contracts.ErrForbidden},
-		{"receipt digest drift", func(p *Provider, a *fakeWorkerPolicyAttestor) {
+		{"receipt digest drift", func(t *testing.T, p *Provider, a *fakeWorkerPolicyAttestor) *Provider {
 			a.receipt = func(r WorkerPolicyAttestationRequest) WorkerPolicyAttestationReceipt {
 				return WorkerPolicyAttestationReceipt{SchemaVersion: 1, PolicyDigest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", RequestFingerprint: r.RequestFingerprint}
 			}
-			enableControlledEgress(p, policyDigest, a)
+			return configuredControlledProvider(t, p, a)
 		}, func(_ *contracts.BuildRequest) {}, contracts.ErrForbidden},
-		{"receipt fingerprint drift", func(p *Provider, a *fakeWorkerPolicyAttestor) {
+		{"receipt fingerprint drift", func(t *testing.T, p *Provider, a *fakeWorkerPolicyAttestor) *Provider {
 			a.receipt = func(r WorkerPolicyAttestationRequest) WorkerPolicyAttestationReceipt {
 				return WorkerPolicyAttestationReceipt{SchemaVersion: 1, PolicyDigest: r.PolicyDigest, RequestFingerprint: "other"}
 			}
-			enableControlledEgress(p, policyDigest, a)
+			return configuredControlledProvider(t, p, a)
 		}, func(_ *contracts.BuildRequest) {}, contracts.ErrForbidden},
-		{"static plan", func(p *Provider, a *fakeWorkerPolicyAttestor) { enableControlledEgress(p, policyDigest, a) }, func(r *contracts.BuildRequest) {
+		{"static plan", func(t *testing.T, p *Provider, a *fakeWorkerPolicyAttestor) *Provider {
+			return configuredControlledProvider(t, p, a)
+		}, func(r *contracts.BuildRequest) {
 			r.Plan.Kind = domain.BuildStatic
 			r.Plan.DockerfilePath = ""
 			r.Plan.StaticRuntimeDigest = testDigest
@@ -665,7 +749,7 @@ func TestControlledEgressFailsClosedBeforeBuildPreparation(t *testing.T) {
 			}
 			provider.config.LogSink, provider.config.ImageStore, provider.config.Capacity, provider.config.SecretResolver = logs, store, capacity, secrets
 			attestor := &fakeWorkerPolicyAttestor{}
-			tc.configure(provider, attestor)
+			provider = tc.configure(t, provider, attestor)
 			request := controlledRequest(t, "controlled-reject-"+strings.ReplaceAll(tc.name, " ", "-"), source, policyDigest)
 			tc.mutate(&request)
 			err := mustBuild(provider, request)
@@ -681,12 +765,12 @@ func TestControlledEgressFailsClosedBeforeBuildPreparation(t *testing.T) {
 }
 
 func TestControlledEgressAttestsBeforeSourcePreparationAndPreservesFailures(t *testing.T) {
-	const policyDigest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	policyDigest := controlledEgressDigest(t)
 	t.Run("attests before source preparation", func(t *testing.T) {
 		runner := writingRunner(t, "")
 		provider, _, source := testProvider(t, runner)
 		attestor := &fakeWorkerPolicyAttestor{}
-		enableControlledEgress(provider, policyDigest, attestor)
+		provider = configuredControlledProvider(t, provider, attestor)
 		request := controlledRequest(t, "controlled-source-drift", source, policyDigest)
 		request.Source.ContentDigest = "sha256:" + strings.Repeat("b", 64)
 		request.Plan.SourceDigest = request.Source.ContentDigest
@@ -699,7 +783,7 @@ func TestControlledEgressAttestsBeforeSourcePreparationAndPreservesFailures(t *t
 		runner := writingRunner(t, "")
 		provider, _, source := testProvider(t, runner)
 		attestor := &fakeWorkerPolicyAttestor{}
-		enableControlledEgress(provider, policyDigest, attestor)
+		provider = configuredControlledProvider(t, provider, attestor)
 		logs := &fakeBuildLogSink{err: errors.New("durable log unavailable")}
 		store := &countingImageStore{ImageStore: contracts.NewFakeImageStore(true)}
 		provider.config.LogSink, provider.config.ImageStore = logs, store
@@ -712,7 +796,7 @@ func TestControlledEgressAttestsBeforeSourcePreparationAndPreservesFailures(t *t
 		runner := writingRunner(t, "")
 		provider, _, source := testProvider(t, runner)
 		attestor := &fakeWorkerPolicyAttestor{}
-		enableControlledEgress(provider, policyDigest, attestor)
+		provider = configuredControlledProvider(t, provider, attestor)
 		logs := &fakeBuildLogSink{ref: "memory://build-log/controlled-retained"}
 		store := &countingImageStore{ImageStore: contracts.NewFakeImageStore(true), err: errors.New("OCI store unavailable")}
 		provider.config.LogSink, provider.config.ImageStore = logs, store
@@ -727,7 +811,7 @@ func TestControlledEgressAttestsBeforeSourcePreparationAndPreservesFailures(t *t
 		runner := writingRunner(t, "")
 		provider, _, source := testProvider(t, runner)
 		attestor := &fakeWorkerPolicyAttestor{}
-		enableControlledEgress(provider, policyDigest, attestor)
+		provider = configuredControlledProvider(t, provider, attestor)
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		assertProviderCode(t, mustBuild(provider, controlledRequest(t, "controlled-cancelled", source, policyDigest), ctx), contracts.ErrCancelled)
