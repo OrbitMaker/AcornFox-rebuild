@@ -332,6 +332,15 @@ func acornFoxLivePrincipalForEntry(layout acornFoxInstallLayout, entry Substrate
 	if !ok {
 		return acornFoxInstallPrincipal{uid: -1, gid: -1}
 	}
+	groupRole, ok := acornFoxLiveRoleForOwner(OwnerRole(entry.Group))
+	if !ok {
+		return acornFoxInstallPrincipal{uid: -1, gid: -1}
+	}
+	group, ok := layout.owner(groupRole)
+	if !ok {
+		return acornFoxInstallPrincipal{uid: -1, gid: -1}
+	}
+	principal.gid = group.gid
 	return principal
 }
 
