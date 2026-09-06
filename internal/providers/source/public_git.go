@@ -18,7 +18,7 @@ import (
 const (
 	minimumGitResolvers = 2
 	gitResolverTimeout  = 2 * time.Second
-	defaultGitTimeout   = 30 * time.Second
+	defaultGitTimeout   = 2 * time.Minute
 )
 
 var (

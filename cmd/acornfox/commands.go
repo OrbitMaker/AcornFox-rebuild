@@ -217,7 +217,7 @@ func (c *cli) apps(args []string) error {
 		return err
 	}
 	body := map[string]any{"name": values["--name"], "source": map[string]string{"type": "public_git", "repository_url": repository, "ref": ref}}
-	return c.callCommand(http.MethodPost, "/apps", body, true, key, 45*time.Second, shapeCreateApp)
+	return c.callCommand(http.MethodPost, "/apps", body, true, key, 3*time.Minute, shapeCreateApp)
 }
 func (c *cli) sources(args []string) error {
 	if len(args) >= 2 && args[0] == "list" {
