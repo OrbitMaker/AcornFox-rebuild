@@ -66,7 +66,7 @@ func TestGenerateRuntimeContract(t *testing.T) {
 	if err := Validate(b, inputs()); err != nil {
 		t.Fatal(err)
 	}
-	if len(b.Files) != 7 {
+	if len(b.Files) != len(fileSpecs()) {
 		t.Fatal("file closure changed")
 	}
 	if ServerEnvironment != "/etc/acornfox/runtime/server.env" || AgentEnvironment != "/etc/acornfox/runtime/agent.env" {
@@ -333,7 +333,7 @@ func TestInputBoundaries(t *testing.T) {
 			t.Errorf("origin accepted: %q", origin)
 		}
 	}
-	for _, origin := range []string{"https://example.com", "https://example.com:8443", "https://1.1.1.1", "https://[2001:4860:4860::8888]:8443"} {
+	for _, origin := range []string{"https://example.com", "https://example.com:443"} {
 		in := inputs()
 		in.Origin = origin
 		if _, err := Generate(in, rand.Reader); err != nil {

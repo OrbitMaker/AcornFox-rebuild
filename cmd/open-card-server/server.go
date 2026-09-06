@@ -116,6 +116,7 @@ type Server struct {
 	acornFoxDeliveryCommand    acornFoxDeliveryCommand
 	acornFoxLogs               *AcornFoxLogsHTTPHandler
 	acornFoxPublicAccess       *AcornFoxPublicAccessHTTPHandler
+	acornFoxTLSAllow           *acornFoxTLSAllowHandler
 	broker                     *eventBroker
 	agentGateway               *agenttransport.Gateway
 	repositoryHealth           interface {
@@ -209,6 +210,9 @@ func (s *Server) HTTPServer(addr string) *http.Server {
 }
 
 func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
+	if s.handleAcornFoxHTTPSBoundary(writer, request) {
+		return
+	}
 	if s.tlsAllow != nil && s.tlsAllow.Handle(writer, request) {
 		return
 	}

@@ -15,8 +15,10 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+
 	"errors"
 	"fmt"
+	"github.com/open-card/open-card/internal/providers/acornfoxroute"
 	"io"
 	"math/big"
 	"net"
@@ -38,6 +40,7 @@ const (
 	RuntimeDirectory       = "/etc/acornfox/runtime"
 	ServerEnvironment      = RuntimeDirectory + "/server.env"
 	AgentEnvironment       = RuntimeDirectory + "/agent.env"
+	EdgeConfiguration      = RuntimeDirectory + "/edge.json"
 	GatewayName            = "acornfox-agent-gateway"
 	InstanceID             = "acornfox-local"
 	NodeID                 = "acornfox-node"
@@ -104,6 +107,10 @@ func Generate(input Inputs, randomness io.Reader) (Bundle, error) {
 	bundle.Files[4].Data = privatePEM(serverKey)
 	bundle.Files[5].Data = certificatePEM(agent)
 	bundle.Files[6].Data = privatePEM(agentKey)
+	bundle.Files[7].Data, err = acornfoxroute.InitialConfig(input.Origin, input.ResolverEndpoints)
+	if err != nil {
+		return Bundle{}, errInvalid
+	}
 	if err := Validate(bundle, input); err != nil {
 		return Bundle{}, err
 	}
@@ -119,6 +126,7 @@ func fileSpecs() []File {
 		{Path: RuntimeDirectory + "/server.key", Mode: 0600, Owner: Root, Group: Root},
 		{Path: RuntimeDirectory + "/agent.crt", Mode: 0644, Owner: Root, Group: Root},
 		{Path: RuntimeDirectory + "/agent.key", Mode: 0600, Owner: Root, Group: Root},
+		{Path: EdgeConfiguration, Mode: 0644, Owner: Root, Group: Root},
 	}
 }
 
@@ -176,6 +184,10 @@ func Validate(bundle Bundle, input Inputs) error {
 		return errInvalid
 	}
 	if !bytes.Equal(files[ServerEnvironment], serverEnv(input, agent.SerialNumber.String())) || !bytes.Equal(files[AgentEnvironment], agentEnv(input)) {
+		return errInvalid
+	}
+	edge, err := acornfoxroute.InitialConfig(input.Origin, input.ResolverEndpoints)
+	if err != nil || !bytes.Equal(files[EdgeConfiguration], edge) {
 		return errInvalid
 	}
 	return nil
@@ -277,6 +289,9 @@ var dnsLabel = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
 var forbiddenNetworks = []string{"0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24", "192.88.99.0/24", "192.168.0.0/16", "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4", "2001::/23", "2001:db8::/32", "2002::/16", "2620:4f:8000::/48", "3fff::/20", "5f00::/16"}
 
 func validateInputs(in Inputs) error {
+	if _, err := acornfoxroute.AuthorizedRoot(in.Origin); err != nil {
+		return errors.New("AcornFox public HTTPS requires a DNS hostname on port 443")
+	}
 	if in.Now.IsZero() || in.Now.Year() < 2000 || in.Now.Year() > 9998 || !safeVersion.MatchString(in.Version) {
 		return errors.New("invalid AcornFox setup version or generation time")
 	}
@@ -359,8 +374,9 @@ func environment(values map[string]string) []byte {
 	return []byte(out.String())
 }
 func serverEnv(in Inputs, serial string) []byte {
+	root, _ := acornfoxroute.AuthorizedRoot(in.Origin)
 	return environment(map[string]string{
-		"RUNTIME_MODE": "clean", "M1_ENABLED": "true", "AUTH_ORIGIN": in.Origin, "AGENT_GATEWAY_ADDR": "127.0.0.1:8092",
+		"RUNTIME_MODE": "clean", "M1_ENABLED": "true", "AUTH_ORIGIN": in.Origin, "PUBLIC_ROOT": root, "AGENT_GATEWAY_ADDR": "127.0.0.1:8092",
 		"SERVER_AGENT_TLS_CA": RuntimeDirectory + "/ca.crt", "SERVER_AGENT_TLS_CERT": RuntimeDirectory + "/server.crt", "SERVER_AGENT_TLS_KEY": "/run/credentials/acornfox-server.service/server.key",
 		"AGENT_IDENTITIES_JSON":      `[{"certificate_id":"` + serial + `","instance_id":"` + InstanceID + `","node_id":"` + NodeID + `"}]`,
 		"AGENT_DISPATCH_INSTANCE_ID": InstanceID, "AGENT_DISPATCH_NODE_ID": NodeID,

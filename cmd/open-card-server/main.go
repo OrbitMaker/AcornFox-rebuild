@@ -57,6 +57,9 @@ func main() {
 		return
 	}
 	getenv := environment.Get
+	if _, err := cleanPublicAccessEnabled(environment.Clean(), getenv(acornfoxenv.M1Enabled) == "true", getenv(acornfoxenv.M3Enabled) == "true", getenv(acornfoxenv.AuthOrigin), getenv(acornfoxenv.PublicRoot)); err != nil {
+		log.Fatal("clean public access configuration conflicts")
+	}
 	address, addressErr := resolveServerListenerAddress(environment)
 	if addressErr != nil {
 		log.Fatal(addressErr)
@@ -233,6 +236,14 @@ func main() {
 				Tasks: acornFoxStore, Runtime: acornFoxStore, Observer: acornFoxStore, Builder: buildProvider, Capacity: capacityProvider,
 				Config: application.AcornFoxDeliveryConfig{TargetRepository: "acornfox.local/apps", StorageKeyPrefix: "acornfox-builds", BuildNetwork: buildNetwork},
 			}})
+
+			if environment.Clean() {
+				stopPublic, publicErr := server.configureCleanPublicAccess(lifecycleContext, store, getenv(acornfoxenv.AuthOrigin), getenv(acornfoxenv.PublicRoot), true, getenv(acornfoxenv.M3Enabled) == "true")
+				if publicErr != nil {
+					log.Fatal("clean public access configuration conflicts")
+				}
+				defer stopPublic()
+			}
 			if getenv(acornfoxenv.M2Enabled) == "true" {
 				registryTemp := buildWorkRoot + "/registry-config"
 				if err := stdio.MkdirAll(registryTemp, 0o700); err != nil {
@@ -325,7 +336,7 @@ func main() {
 				// local RouteProvider with M3. A second Caddy adapter/cache would be a
 				// second route projection and could overwrite routes on restart.
 				// DNS/TLS remain absent from this composition.
-				if authorizedRoot := strings.TrimSpace(getenv(acornfoxenv.PublicRoot)); authorizedRoot != "" {
+				if authorizedRoot := strings.TrimSpace(getenv(acornfoxenv.PublicRoot)); authorizedRoot != "" && !environment.Clean() {
 					if m3RouteProvider == nil {
 						log.Print("AcornFox public access is unavailable: an authorized root requires the configured M3 RouteProvider")
 					} else {

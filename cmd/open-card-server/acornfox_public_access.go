@@ -149,7 +149,7 @@ func acornFoxPublicAccessRouteError(err error) error {
 
 // reconcileAcornFoxPublicAccess resumes bounded commands left between durable
 // M3 intent and Caddy projection. It only reads canonical M3 route state.
-func reconcileAcornFoxPublicAccess(ctx context.Context, store *postgres.Store, root string, router acornFoxPublicAccessRouteAdapter, limit int) error {
+func reconcileAcornFoxPublicAccess(ctx context.Context, store *postgres.Store, root string, router application.AcornFoxPublicAccessRouter, limit int) error {
 	items, err := store.ClaimAcornFoxPublicAccessRecoveryCommands(ctx, limit, time.Now().UTC())
 	if err != nil {
 		return err
