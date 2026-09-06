@@ -140,8 +140,8 @@ type dockerNetwork struct {
 	ID                                        string `json:"Id"`
 	Driver, Scope                             string
 	EnableIPv4                                *bool
-	EnableIPv6, Internal, Attachable, Ingress bool
-	ConfigOnly                                bool
+	EnableIPv6, Internal, Attachable, Ingress *bool
+	ConfigOnly                                *bool
 	ConfigFrom                                struct{ Network string }
 	Options, Labels                           map[string]string
 	IPAM                                      struct {
@@ -160,7 +160,16 @@ func inspectNetwork(raw []byte, owner, expectedID string) (string, error) {
 		return "", ErrConflict
 	}
 	n := items[0]
-	if n.Name != Network || !digestOK(n.ID) || (expectedID != "" && n.ID != expectedID) || n.Driver != "bridge" || n.Scope != "local" || n.EnableIPv6 || n.Internal || n.Attachable || n.Ingress || n.ConfigOnly || n.ConfigFrom.Network != "" || (n.EnableIPv4 != nil && !*n.EnableIPv4) || !reflect.DeepEqual(n.Options, dockerOptions()) || !reflect.DeepEqual(n.Labels, dockerLabels(owner)) || n.IPAM.Driver != "default" || len(n.IPAM.Options) != 0 || len(n.IPAM.Config) != 1 {
+	// These safety flags must be explicitly false. Missing or null is not
+	// evidence that Docker disabled the corresponding network capability.
+	for _, flag := range []*bool{n.EnableIPv6, n.Internal, n.Attachable, n.Ingress, n.ConfigOnly} {
+		if flag == nil || *flag {
+			return "", ErrConflict
+		}
+	}
+	// EnableIPv4 was added by newer Docker releases. Older inspect responses
+	// omit it, so preserve absence compatibility while rejecting explicit false.
+	if n.Name != Network || !digestOK(n.ID) || (expectedID != "" && n.ID != expectedID) || n.Driver != "bridge" || n.Scope != "local" || n.ConfigFrom.Network != "" || (n.EnableIPv4 != nil && !*n.EnableIPv4) || !reflect.DeepEqual(n.Options, dockerOptions()) || !reflect.DeepEqual(n.Labels, dockerLabels(owner)) || n.IPAM.Driver != "default" || len(n.IPAM.Options) != 0 || len(n.IPAM.Config) != 1 {
 		return "", ErrConflict
 	}
 	ipam := n.IPAM.Config[0]

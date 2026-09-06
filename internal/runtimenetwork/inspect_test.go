@@ -217,3 +217,60 @@ func TestScopedRulesPreserveRepliesAndRejectRuntimeEscape(t *testing.T) {
 		})
 	}
 }
+
+func TestDockerInspectorRequiresExplicitFalseSafetyFlags(t *testing.T) {
+	owner := strings.Repeat("b", 64)
+	for _, field := range []string{"EnableIPv6", "Internal", "Attachable", "Ingress", "ConfigOnly"} {
+		for _, state := range []string{"missing", "null", "false", "true"} {
+			t.Run(field+"/"+state, func(t *testing.T) {
+				var networks []map[string]any
+				if err := json.Unmarshal(networkFixture(owner), &networks); err != nil {
+					t.Fatal(err)
+				}
+				switch state {
+				case "missing":
+					delete(networks[0], field)
+				case "null":
+					networks[0][field] = nil
+				case "false":
+					networks[0][field] = false
+				case "true":
+					networks[0][field] = true
+				}
+				raw := mustJSON(t, networks)
+				_, err := inspectNetwork(raw, owner, "")
+				if (err == nil) != (state == "false") {
+					t.Fatalf("inspect accepted=%t for %s", err == nil, state)
+				}
+				if err := ValidateApplicationTopology(raw); (err == nil) != (state == "false") {
+					t.Fatalf("application validator accepted=%t", err == nil)
+				}
+			})
+		}
+	}
+}
+
+func TestDockerInspectorPreservesOptionalIPv4Compatibility(t *testing.T) {
+	owner := strings.Repeat("b", 64)
+	for _, state := range []string{"missing", "null", "true", "false"} {
+		t.Run(state, func(t *testing.T) {
+			var networks []map[string]any
+			if err := json.Unmarshal(networkFixture(owner), &networks); err != nil {
+				t.Fatal(err)
+			}
+			switch state {
+			case "missing":
+				delete(networks[0], "EnableIPv4")
+			case "null":
+				networks[0]["EnableIPv4"] = nil
+			case "true":
+				networks[0]["EnableIPv4"] = true
+			case "false":
+				networks[0]["EnableIPv4"] = false
+			}
+			if _, err := inspectNetwork(mustJSON(t, networks), owner, ""); (err == nil) != (state != "false") {
+				t.Fatalf("unexpected IPv4 compatibility: %v", err)
+			}
+		})
+	}
+}

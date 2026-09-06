@@ -159,7 +159,7 @@ func (f *fakeHost) run(_ context.Context, path string, args []string, input []by
 }
 func networkFixture(owner string) []byte {
 	raw, _ := json.Marshal([]object{{
-		"Name": Network, "Id": strings.Repeat("a", 64), "Created": "2026-09-06T01:02:03Z", "Scope": "local", "Driver": "bridge", "EnableIPv6": false, "Internal": false, "Attachable": false, "Ingress": false,
+		"Name": Network, "Id": strings.Repeat("a", 64), "Created": "2026-09-06T01:02:03Z", "Scope": "local", "Driver": "bridge", "EnableIPv6": false, "Internal": false, "Attachable": false, "Ingress": false, "ConfigOnly": false,
 		"IPAM":    object{"Driver": "default", "Options": nil, "Config": []object{{"Subnet": Subnet, "Gateway": Gateway}}},
 		"Options": dockerOptions(), "Labels": dockerLabels(owner), "Containers": object{},
 	}})
