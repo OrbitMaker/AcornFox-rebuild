@@ -183,13 +183,13 @@ chmod 0600 "$password_file"
 
 网页中导入仓库，选择源码版本、指定应用监听端口并部署。项目中的应用需要监听容器内 `0.0.0.0`，不能仅监听容器自己的回环地址。
 
-也可以使用已安装的 CLI。下面的仓库和端口仅为示例，请替换成自己的公开仓库、Git ref 和实际端口：
+也可以使用已安装的 CLI。下面的公开示例监听 8000 端口，构建时无需下载外部基础镜像；部署自己的项目时替换仓库、分支或标签及端口：
 
 ```bash
 acornfox=/opt/acornfox/current/bin/acornfox
 "$acornfox" login --server https://console.example.com
 "$acornfox" apps create --name hello \
-  --repository https://github.com/OWNER/REPOSITORY.git --ref main
+  --repository https://github.com/EleJiuDeiChi/acornfox.git --ref codex/mvp-smoke-demo
 ```
 
 命令返回应用和源码信息。将返回值填入后续命令，不要使用名称代替 ID：
@@ -197,7 +197,7 @@ acornfox=/opt/acornfox/current/bin/acornfox
 ```bash
 read -r -p '应用 ID: ' app_id
 read -r -p '源码 ID: ' source_id
-"$acornfox" deploy "$app_id" --source "$source_id" --port 8080
+"$acornfox" deploy "$app_id" --source "$source_id" --port 8000
 read -r -p '部署 ID: ' deployment_id
 "$acornfox" status "$app_id" "$deployment_id"
 "$acornfox" logs "$app_id" "$deployment_id" --source build
