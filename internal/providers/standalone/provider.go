@@ -297,7 +297,11 @@ func (p *Provider) deployOperation(ctx context.Context, request contracts.Deploy
 				p.mu.Lock()
 				state := p.states[previous.deployment.ID]
 				destroyed := state != nil && state.destroyed
+				replacing := state != nil && state.phase == "replacing"
 				p.mu.Unlock()
+				if replacing {
+					return domain.Deployment{}, p.replacementFailure(request.Operation, "deployment has an unfinished replacement task")
+				}
 				if destroyed {
 					return domain.Deployment{}, p.failure(request.Operation, contracts.CapabilityRuntimeDeploy, "deploy", contracts.ErrConflict, "destroyed runtime rejects replay of its prior deploy operation", contracts.RetryNever, false, nil)
 				}
@@ -325,9 +329,9 @@ func (p *Provider) deployOperation(ctx context.Context, request contracts.Deploy
 	return deployment, err
 }
 
-// Recreate is the standalone-only linear replacement operation. It never
-// keeps an older container: a replay either returns its durable success or
-// resumes from the persisted destroyed state with the same immutable spec.
+// Recreate replaces one immutable deployment. Installed AcornFox retains its
+// capacity and published port through a durable replacing phase. Legacy callers
+// preserve their existing destroyed-then-deploy replacement behavior.
 func (p *Provider) Recreate(ctx context.Context, request contracts.DeployRequest) (domain.Deployment, error) {
 	unlock := p.lockDeployment(request.DeploymentID)
 	defer unlock()
@@ -337,6 +341,13 @@ func (p *Provider) Recreate(ctx context.Context, request contracts.DeployRequest
 	if request.DeploymentID.Empty() || p.validateSpec(request.Spec, request.Operation) != nil {
 		return domain.Deployment{}, p.failure(request.Operation, contracts.CapabilityRuntimeDeploy, "recreate", contracts.ErrInvalidArgument, "runtime deployment and immutable spec are invalid", contracts.RetryNever, false, nil)
 	}
+	if p.config.RestoreActiveGuard != nil {
+		return p.recreateRetainingCapacity(ctx, request)
+	}
+	return p.recreateLegacy(ctx, request)
+}
+
+func (p *Provider) recreateLegacy(ctx context.Context, request contracts.DeployRequest) (domain.Deployment, error) {
 	actionHash := actionIdentity("recreate", request.Operation.IdempotencyKey)
 	if state, err := p.ensureState(ctx, request.DeploymentID, request.Operation, contracts.CapabilityRuntimeDeploy, "recreate"); err == nil {
 		p.mu.Lock()
@@ -418,6 +429,9 @@ func (p *Provider) deploy(ctx context.Context, request contracts.DeployRequest, 
 	} else if found {
 		if snapshot.Fingerprint != fingerprint {
 			return domain.Deployment{}, nil, p.failure(request.Operation, contracts.CapabilityRuntimeDeploy, "deploy", contracts.ErrConflict, "durable runtime state does not match the immutable deployment", contracts.RetryNever, false, nil)
+		}
+		if snapshot.Phase == "replacing" {
+			return domain.Deployment{}, nil, p.replacementFailure(request.Operation, "deployment has an unfinished replacement task")
 		}
 		if snapshot.Phase == "active" {
 			state, stateErr := p.stateFromDurable(ctx, snapshot, request.Operation, contracts.CapabilityRuntimeDeploy, "deploy")
@@ -777,6 +791,9 @@ func (p *Provider) Restart(ctx context.Context, request contracts.RestartRequest
 	if err != nil {
 		return err
 	}
+	if state.phase == "replacing" {
+		return p.replacementFailure(request.Operation, "replacement must finish or be cancelled before restart")
+	}
 	if request.ServiceName != "" && request.ServiceName != state.service {
 		return p.failure(request.Operation, contracts.CapabilityRuntimeRestart, "restart", contracts.ErrValidation, "runtime service does not match deployment", contracts.RetryNever, false, nil)
 	}
@@ -843,6 +860,11 @@ func (p *Provider) destroyOperation(ctx context.Context, request contracts.Destr
 	state, err := p.stateLocked(request.DeploymentID, request.Operation, contracts.CapabilityRuntimeDestroy, "destroy")
 	if err != nil {
 		return err
+	}
+	if state.phase == "replacing" {
+		if err := p.cancelReplacement(ctx, state, request); err != nil {
+			return err
+		}
 	}
 	actionHash := actionIdentity("destroy", request.Operation.IdempotencyKey)
 	if action, ok := state.actions[actionHash]; ok && action.action == "destroy" && action.fingerprint == state.fingerprint && action.status == "succeeded" && state.destroyed && state.capacity == nil {

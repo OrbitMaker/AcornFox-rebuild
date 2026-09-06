@@ -174,7 +174,7 @@ func (p *Provider) readDurableState(id domain.ID) (durableRuntimeState, bool, er
 }
 
 func validateDurableRuntimeState(snapshot durableRuntimeState, config Config) error {
-	if snapshot.SchemaVersion != durableRuntimeStateSchema || snapshot.Phase != "pending" && snapshot.Phase != "active" && snapshot.Phase != "destroying" && snapshot.Phase != "destroyed" {
+	if snapshot.SchemaVersion != durableRuntimeStateSchema || snapshot.Phase != "pending" && snapshot.Phase != "active" && snapshot.Phase != "destroying" && snapshot.Phase != "destroyed" && snapshot.Phase != "replacing" {
 		return errors.New("standalone state schema or phase is unsupported")
 	}
 	if err := snapshot.Deployment.Validate(); err != nil {
@@ -191,13 +191,24 @@ func validateDurableRuntimeState(snapshot durableRuntimeState, config Config) er
 	}
 	seen := map[string]struct{}{}
 	for _, action := range snapshot.Actions {
-		if action.IdentityHash == "" || !validRuntimeActionName(action.Action) || action.Fingerprint != snapshot.Fingerprint || (action.Status != "started" && action.Status != "succeeded") || action.At.IsZero() {
+		if action.IdentityHash == "" || !validRuntimeActionName(action.Action) || action.Fingerprint != snapshot.Fingerprint || (action.Status != "started" && action.Status != "succeeded" && action.Status != "cancelled") || action.At.IsZero() {
 			return errors.New("standalone state action is invalid")
+		}
+		if action.Status == "cancelled" && action.Action != "recreate" {
+			return errors.New("standalone cancelled action is invalid")
 		}
 		if _, ok := seen[action.IdentityHash]; ok {
 			return errors.New("standalone state action is duplicated")
 		}
 		seen[action.IdentityHash] = struct{}{}
+	}
+	if snapshot.Phase == "replacing" {
+		if snapshot.Capacity == nil || !validContainerID(snapshot.ContainerID) {
+			return errors.New("replacement lease or original identity is missing")
+		}
+		if action, ok := replacementAction(snapshot.Actions, snapshot.ContainerID); !ok || action.PreviousContainerID != snapshot.ContainerID {
+			return errors.New("replacement action is missing, ambiguous or unbound")
+		}
 	}
 	return nil
 }
@@ -206,6 +217,9 @@ func (p *Provider) stateFromDurable(ctx context.Context, snapshot durableRuntime
 	state := &runtimeState{deployment: snapshot.Deployment, service: snapshot.Spec.ServiceName, image: snapshot.Spec.Image, container: snapshot.Container, containerID: snapshot.ContainerID, containerPort: snapshot.Spec.Port, fingerprint: snapshot.Fingerprint, phase: snapshot.Phase, capacity: snapshot.Capacity, leaseGeneration: snapshot.LeaseGeneration, resources: snapshot.Spec.Resources, createdAt: snapshot.CreatedAt, updatedAt: snapshot.UpdatedAt, actions: map[string]runtimeAction{}}
 	for _, persisted := range snapshot.Actions {
 		state.actions[persisted.IdentityHash] = runtimeAction{identityHash: persisted.IdentityHash, action: persisted.Action, fingerprint: persisted.Fingerprint, status: persisted.Status, previousContainerID: persisted.PreviousContainerID, previousStartedAt: persisted.PreviousStartedAt, releaseAttempt: persisted.ReleaseAttempt, at: persisted.At}
+	}
+	if state.phase == "replacing" {
+		return p.reconcileReplacement(ctx, snapshot, state, operation)
 	}
 	if state.phase == "destroyed" {
 		state.destroyed = true
