@@ -60,7 +60,7 @@ func policyObjects(owner string) []object {
 	}
 	ingress := func() object { return match(meta("iifname"), "==", Bridge) }
 	states := func() object {
-		return match(object{"ct": object{"key": "state"}}, "in", object{"set": []string{"established", "related"}})
+		return match(object{"ct": object{"key": "state"}}, "==", object{"set": []string{"established", "related"}})
 	}
 	rule := func(chain, name, verdict string, expr ...object) {
 		values := make([]object, 0, len(expr)+2)
@@ -68,10 +68,11 @@ func policyObjects(owner string) []object {
 		values = append(values, object{"counter": nil}, object{verdict: nil})
 		objects = append(objects, object{"rule": object{"family": "inet", "table": Table, "chain": chain, "expr": values, "comment": "acornfox-runtime-v1:" + owner + ":" + name}})
 	}
+	// nft lists chain definitions before rules, even when commands interleave.
 	chain("input")
+	chain("forward")
 	rule("input", "host_return", "accept", ingress(), states())
 	rule("input", "host_denied", "drop", ingress())
-	chain("forward")
 	rule("forward", "ipv6_denied", "drop", ingress(), match(meta("nfproto"), "==", "ipv6"))
 	rule("forward", "spoof_denied", "drop", ingress(), match(payload("ip", "saddr"), "!=", prefix(Subnet)))
 	rule("forward", "return_allowed", "accept", ingress(), states())
