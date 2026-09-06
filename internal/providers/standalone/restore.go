@@ -18,18 +18,20 @@ func (p *Provider) restoreActive(ctx context.Context, snapshot durableRuntimeSta
 	fail := func(message string) error {
 		return p.failure(operation, contracts.CapabilityRuntimeRestart, "restore", contracts.ErrConflict, message, contracts.RetryAfterReconnect, true, nil)
 	}
-	// Never take over an interrupted explicit lifecycle mutation.
-	for _, action := range snapshot.Actions {
-		if action.Status == "started" {
-			return fail("active runtime has an unfinished lifecycle action")
-		}
-	}
 	ctx, cancel := context.WithTimeout(ctx, p.config.Timeout)
 	defer cancel()
 	facts, err := p.inspectFacts(ctx, state.container)
 	port, matches := facts.matchesConfiguration(p.config, snapshot.Deployment, snapshot.Spec)
 	if err != nil || !matches || !validContainerID(snapshot.ContainerID) || facts.ID != snapshot.ContainerID || snapshot.Capacity == nil || port != snapshot.Capacity.HostPort {
 		return fail("runtime identity or configuration changed before restoration")
+	}
+	// Leave interrupted explicit mutations to their original idempotent task.
+	// Observation must remain available so that task can reconnect and settle;
+	// startup recovery neither takes it over nor claims it succeeded.
+	for _, action := range snapshot.Actions {
+		if action.Status == "started" {
+			return nil
+		}
 	}
 	if facts.State.Running {
 		return nil

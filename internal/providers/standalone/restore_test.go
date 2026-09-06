@@ -8,6 +8,8 @@ import (
 	"os"
 	"reflect"
 	"testing"
+
+	"github.com/open-card/open-card/internal/contracts"
 )
 
 func TestInstalledReconcileResumesOnlyVerifiedActiveContainers(t *testing.T) {
@@ -36,7 +38,7 @@ func TestInstalledReconcileResumesOnlyVerifiedActiveContainers(t *testing.T) {
 		{name: "configuration changes after start", postStartDrift: true, wantStarts: 1, wantError: true},
 		{name: "guard not ready", guardError: true, wantError: true},
 		{name: "network changed", networkError: true, wantError: true},
-		{name: "unfinished mutation", unfinished: true, wantError: true},
+		{name: "unfinished mutation", unfinished: true},
 		{name: "start fails", startError: true, wantStarts: 1, wantError: true},
 		{name: "start reports success but remains stopped", staysStopped: true, wantStarts: 1, wantError: true},
 	} {
@@ -197,5 +199,104 @@ func TestInstalledRestoreFailureCanRetryWithoutNewContainer(t *testing.T) {
 	}
 	if starts != 2 || ports.allocated != 1 || mustDurableSnapshot(t, fresh, deployment.ID).ContainerID != snapshot.ContainerID {
 		t.Fatal("retry replaced immutable deployment")
+	}
+}
+
+func TestInstalledReconcileLeavesInterruptedRestartForOriginalTask(t *testing.T) {
+	for _, running := range []bool{true, false} {
+		name := "exited before restart"
+		if running {
+			name = "running after restart"
+		}
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			runner := dockerHappyRunner(t)
+			ports := &fixedPorts{port: 39124}
+			first := testProviderAt(t, root, runner, ports)
+			deployment, err := first.Deploy(context.Background(), testRequest("restore-explicit-restart"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			snapshot := mustDurableSnapshot(t, first, deployment.ID)
+			key := "original-interrupted-restart"
+			identity := actionIdentity("restart", key)
+			snapshot.Actions = append(snapshot.Actions, durableRuntimeAction{IdentityHash: identity, Action: "restart", Fingerprint: snapshot.Fingerprint, Status: "started", PreviousContainerID: snapshot.ContainerID, PreviousStartedAt: "before", At: snapshot.UpdatedAt})
+			writeDurableSnapshot(t, first, snapshot)
+			before, err := os.ReadFile(first.durableStatePath(deployment.ID))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var facts inspectFacts
+			if err := json.Unmarshal([]byte(ownedContainerInspect(testRequest("restore"), testDigest)), &facts); err != nil {
+				t.Fatal(err)
+			}
+			facts.HostConfig.PortBindings["8080/tcp"][0].HostPort = "39124"
+			facts.State.Running = running
+			facts.State.Status = "exited"
+			facts.State.StartedAt = "before"
+			if running {
+				facts.State.Status = "running"
+				facts.State.StartedAt = "after"
+			}
+			starts, restarts := 0, 0
+			runner.run = func(args []string, out io.Writer) error {
+				switch args[0] {
+				case "container":
+					raw, _ := json.Marshal(facts)
+					_, err := out.Write(raw)
+					return err
+				case "start":
+					starts++
+					return errors.New("automatic start is forbidden while restart is pending")
+				case "restart":
+					restarts++
+					facts.State.Running = true
+					facts.State.Status = "running"
+					facts.State.StartedAt = "after"
+					return nil
+				}
+				return errors.New("unexpected command")
+			}
+			fresh := testProviderAt(t, root, runner, ports)
+			fresh.config.RestoreActiveGuard = func(context.Context) error { t.Fatal("automatic restore guard reached for pending task"); return nil }
+			fresh.config.ExistingNetworkValidator = func([]byte) error { return nil }
+			if err := fresh.Reconcile(context.Background()); err != nil {
+				t.Fatalf("original task cannot reconnect: %v", err)
+			}
+			after, err := os.ReadFile(first.durableStatePath(deployment.ID))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if starts != 0 || restarts != 0 || !reflect.DeepEqual(before, after) {
+				t.Fatal("reconcile mutated or completed the interrupted task")
+			}
+			request := contracts.RestartRequest{DeploymentID: deployment.ID, ServiceName: "web", Operation: contracts.OperationContext{IdempotencyKey: key}}
+			if err := fresh.Restart(context.Background(), request); err != nil {
+				t.Fatal(err)
+			}
+			wantRestarts := 1
+			if running {
+				wantRestarts = 0
+			}
+			if err := fresh.Restart(context.Background(), request); err != nil {
+				t.Fatal(err)
+			}
+			if starts != 0 || restarts != wantRestarts {
+				t.Fatalf("replay repeated or invented effect: starts=%d restarts=%d", starts, restarts)
+			}
+			settled := mustDurableSnapshot(t, fresh, deployment.ID)
+			found := false
+			for _, action := range settled.Actions {
+				if action.IdentityHash == identity {
+					found = true
+					if action.Status != "succeeded" {
+						t.Fatalf("original task did not settle: %s", action.Status)
+					}
+				}
+			}
+			if !found {
+				t.Fatal("original task identity was lost")
+			}
+		})
 	}
 }
