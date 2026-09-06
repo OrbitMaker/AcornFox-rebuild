@@ -7,10 +7,19 @@ import (
 	"io"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/open-card/open-card/internal/contracts"
 )
+
+const restoreNetworkFixture = `[{"Id":"1111111111111111111111111111111111111111111111111111111111111111"}]`
+
+func setRestoreNetworkFixture(facts *inspectFacts) {
+	facts.NetworkSettings.Networks = map[string]struct {
+		NetworkID string `json:"NetworkID"`
+	}{"opencard-m1-network": {NetworkID: strings.Repeat("1", 64)}}
+}
 
 func TestInstalledReconcileResumesOnlyVerifiedActiveContainers(t *testing.T) {
 	for _, tc := range []struct {
@@ -18,7 +27,7 @@ func TestInstalledReconcileResumesOnlyVerifiedActiveContainers(t *testing.T) {
 		phase                                                                  string
 		mutate                                                                 func(*inspectFacts)
 		guardError, networkError, startError, staysStopped, unfinished, legacy bool
-		missingID, missingTopology, postStartDrift                             bool
+		missingID, missingTopology, postStartDrift, postStartNetworkDrift      bool
 		wantStarts                                                             int
 		wantError                                                              bool
 	}{
@@ -32,9 +41,26 @@ func TestInstalledReconcileResumesOnlyVerifiedActiveContainers(t *testing.T) {
 		{name: "replacement same labels", mutate: func(f *inspectFacts) { f.ID = "1111111111111111111111111111111111111111111111111111111111111111" }, wantError: true},
 		{name: "resource drift", mutate: func(f *inspectFacts) { f.HostConfig.Memory++ }, wantError: true},
 		{name: "lease port drift", mutate: func(f *inspectFacts) { f.HostConfig.PortBindings["8080/tcp"][0].HostPort = "39125" }, wantError: true},
+		{name: "missing actual attachment", mutate: func(f *inspectFacts) { f.NetworkSettings.Networks = nil }, wantError: true},
+		{name: "second unguarded attachment", mutate: func(f *inspectFacts) {
+			f.NetworkSettings.Networks["foreign-network"] = struct {
+				NetworkID string `json:"NetworkID"`
+			}{NetworkID: strings.Repeat("2", 64)}
+		}, wantError: true},
+		{name: "actual attachment identity changed", mutate: func(f *inspectFacts) {
+			f.NetworkSettings.Networks["opencard-m1-network"] = struct {
+				NetworkID string `json:"NetworkID"`
+			}{NetworkID: strings.Repeat("2", 64)}
+		}, wantError: true},
+		{name: "wrong network attached", mutate: func(f *inspectFacts) {
+			n := f.NetworkSettings.Networks["opencard-m1-network"]
+			delete(f.NetworkSettings.Networks, "opencard-m1-network")
+			f.NetworkSettings.Networks["foreign-network"] = n
+		}, wantError: true},
 		{name: "unknown docker state", mutate: func(f *inspectFacts) { f.State.Status = "dead" }, wantError: true},
 		{name: "missing persisted identity", missingID: true, wantError: true},
 		{name: "missing topology validator", missingTopology: true, wantError: true},
+		{name: "attachment changes after start", postStartNetworkDrift: true, wantStarts: 1, wantError: true},
 		{name: "configuration changes after start", postStartDrift: true, wantStarts: 1, wantError: true},
 		{name: "guard not ready", guardError: true, wantError: true},
 		{name: "network changed", networkError: true, wantError: true},
@@ -70,6 +96,7 @@ func TestInstalledReconcileResumesOnlyVerifiedActiveContainers(t *testing.T) {
 			if err := json.Unmarshal([]byte(ownedContainerInspect(testRequest("restore"), testDigest)), &facts); err != nil {
 				t.Fatal(err)
 			}
+			setRestoreNetworkFixture(&facts)
 			facts.HostConfig.PortBindings["8080/tcp"][0].HostPort = "39124"
 			facts.State.Running = false
 			facts.State.Status = "exited"
@@ -89,7 +116,7 @@ func TestInstalledReconcileResumesOnlyVerifiedActiveContainers(t *testing.T) {
 						t.Fatal("topology checked without successful root guard readiness")
 					}
 					networks++
-					_, err := io.WriteString(out, "fixed-topology")
+					_, err := io.WriteString(out, restoreNetworkFixture)
 					return err
 				}
 				if args[0] == "start" {
@@ -99,6 +126,9 @@ func TestInstalledReconcileResumesOnlyVerifiedActiveContainers(t *testing.T) {
 					}
 					if tc.startError {
 						return errors.New("start failed")
+					}
+					if tc.postStartNetworkDrift {
+						facts.NetworkSettings.Networks["foreign-network"] = facts.NetworkSettings.Networks["opencard-m1-network"]
 					}
 					if tc.postStartDrift {
 						facts.HostConfig.Privileged = true
@@ -121,7 +151,7 @@ func TestInstalledReconcileResumesOnlyVerifiedActiveContainers(t *testing.T) {
 					return nil
 				}
 				fresh.config.ExistingNetworkValidator = func(raw []byte) error {
-					if string(raw) != "fixed-topology" || tc.networkError {
+					if string(raw) != restoreNetworkFixture || tc.networkError {
 						return errors.New("drift")
 					}
 					return nil
@@ -168,6 +198,7 @@ func TestInstalledRestoreFailureCanRetryWithoutNewContainer(t *testing.T) {
 	snapshot := mustDurableSnapshot(t, first, deployment.ID)
 	var facts inspectFacts
 	_ = json.Unmarshal([]byte(ownedContainerInspect(testRequest("restore"), testDigest)), &facts)
+	setRestoreNetworkFixture(&facts)
 	facts.HostConfig.PortBindings["8080/tcp"][0].HostPort = "39124"
 	facts.State.Running = false
 	facts.State.Status = "exited"
@@ -180,6 +211,10 @@ func TestInstalledRestoreFailureCanRetryWithoutNewContainer(t *testing.T) {
 			}
 			facts.State.Running = true
 			return nil
+		}
+		if args[0] == "network" {
+			_, err := io.WriteString(out, restoreNetworkFixture)
+			return err
 		}
 		if args[0] == "container" {
 			raw, _ := json.Marshal(facts)
@@ -230,6 +265,7 @@ func TestInstalledReconcileLeavesInterruptedRestartForOriginalTask(t *testing.T)
 			if err := json.Unmarshal([]byte(ownedContainerInspect(testRequest("restore"), testDigest)), &facts); err != nil {
 				t.Fatal(err)
 			}
+			setRestoreNetworkFixture(&facts)
 			facts.HostConfig.PortBindings["8080/tcp"][0].HostPort = "39124"
 			facts.State.Running = running
 			facts.State.Status = "exited"

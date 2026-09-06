@@ -374,6 +374,11 @@ type inspectFacts struct {
 		Status    string `json:"Status"`
 		StartedAt string `json:"StartedAt"`
 	} `json:"State"`
+	NetworkSettings struct {
+		Networks map[string]struct {
+			NetworkID string `json:"NetworkID"`
+		} `json:"Networks"`
+	} `json:"NetworkSettings"`
 	HostConfig struct {
 		NetworkMode   string   `json:"NetworkMode"`
 		Privileged    bool     `json:"Privileged"`

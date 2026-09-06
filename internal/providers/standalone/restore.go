@@ -2,6 +2,7 @@ package standalone
 
 import (
 	"context"
+	"encoding/json"
 
 	"github.com/open-card/open-card/internal/contracts"
 )
@@ -42,9 +43,15 @@ func (p *Provider) restoreActive(ctx context.Context, snapshot durableRuntimeSta
 	if p.config.ExistingNetworkValidator == nil || p.config.RestoreActiveGuard(ctx) != nil {
 		return fail("runtime network guard is not ready for restoration")
 	}
-	// This validation path cannot create a missing network.
-	if err := p.ensureNetwork(ctx, operation); err != nil {
-		return err
+	// Read the validated network identity, not only the container's original
+	// NetworkMode: Docker can attach a second unguarded network afterward.
+	// This path cannot create a missing network.
+	rawNetwork, err := p.output(ctx, []string{"network", "inspect", p.config.Network})
+	var networks []struct {
+		ID string `json:"Id"`
+	}
+	if err != nil || p.config.ExistingNetworkValidator([]byte(rawNetwork)) != nil || json.Unmarshal([]byte(rawNetwork), &networks) != nil || len(networks) != 1 || !validContainerID(networks[0].ID) || !facts.matchesRestoreNetwork(p.config.Network, networks[0].ID) {
+		return fail("runtime network attachments are missing or changed")
 	}
 	// Address the immutable ID, never an adoptable name, across the start boundary.
 	if err := p.run(ctx, []string{"start", snapshot.ContainerID}); err != nil {
@@ -52,10 +59,15 @@ func (p *Provider) restoreActive(ctx context.Context, snapshot durableRuntimeSta
 	}
 	facts, err = p.inspectFacts(ctx, snapshot.ContainerID)
 	port, matches = facts.matchesRunning(p.config, snapshot.Deployment, snapshot.Spec)
-	if err != nil || !matches || facts.ID != snapshot.ContainerID || port != snapshot.Capacity.HostPort {
+	if err != nil || !matches || facts.ID != snapshot.ContainerID || port != snapshot.Capacity.HostPort || !facts.matchesRestoreNetwork(p.config.Network, networks[0].ID) {
 		return fail("restored runtime is not verified running")
 	}
 	// No lifecycle or health success is fabricated in the durable record. Normal
 	// observation/probing must still read Docker and the application afterward.
 	return nil
+}
+
+func (facts inspectFacts) matchesRestoreNetwork(name, id string) bool {
+	attachment, exists := facts.NetworkSettings.Networks[name]
+	return exists && len(facts.NetworkSettings.Networks) == 1 && attachment.NetworkID == id
 }
