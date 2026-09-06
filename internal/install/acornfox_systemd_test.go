@@ -207,7 +207,7 @@ func TestAcornFoxSystemdNamesPathsAndEnvironmentContract(t *testing.T) {
 	}{
 		{"acornfox-agent.service", "acornfox-agent", "/opt/acornfox/current/bin/acornfox-agent"},
 		{"acornfox-caddy.service", "acornfox-caddy", "/opt/acornfox/current/bin/caddy run --environ --config /etc/acornfox/Caddyfile --adapter caddyfile"},
-		{"acornfox-edge.service", "acornfox-edge", "/opt/acornfox/current/bin/caddy run --environ --config /etc/acornfox/acornfox-edge.Caddyfile --adapter caddyfile"},
+		{"acornfox-edge.service", "acornfox-edge", "/opt/acornfox/current/bin/caddy run --config /etc/acornfox/runtime/edge.json"},
 	} {
 		_, sections := readAcornFoxUnit(t, check.unit)
 		requireAcornFoxDirective(t, sections, "Service", "User", check.user)
@@ -238,7 +238,7 @@ func TestAcornFoxSystemdNamesPathsAndEnvironmentContract(t *testing.T) {
 	for key, values := range edge["Service"] {
 		if strings.HasPrefix(key, "Exec") {
 			for _, value := range values {
-				if !strings.Contains(value, "/etc/acornfox/acornfox-edge.Caddyfile") {
+				if !strings.Contains(value, "/etc/acornfox/runtime/edge.json") {
 					t.Fatalf("edge %s uses a config outside its fixed path: %q", key, value)
 				}
 			}
@@ -252,8 +252,8 @@ func TestAcornFoxSystemdBootDagAndHardening(t *testing.T) {
 	_, finalizeUnit := readAcornFoxUnit(t, "acornfox-upgrade-finalize.service")
 	_, edgeMarker := readAcornFoxUnit(t, "acornfox-edge.service.d/10-upgrade-marker.conf")
 	requireAcornFoxDirectiveContains(t, recoverUnit, "Unit", "Before", "acornfox-upgrade-safe.target")
-	requireAcornFoxDirective(t, recoverUnit, "Service", "CapabilityBoundingSet", "CAP_DAC_READ_SEARCH")
-	requireAcornFoxDirective(t, finalizeUnit, "Service", "CapabilityBoundingSet", "CAP_DAC_READ_SEARCH")
+	requireAcornFoxDirective(t, recoverUnit, "Service", "CapabilityBoundingSet", "CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_SYS_PTRACE")
+	requireAcornFoxDirective(t, finalizeUnit, "Service", "CapabilityBoundingSet", "CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_SYS_PTRACE")
 	requireAcornFoxDirective(t, safeTarget, "Unit", "Requires", "acornfox-upgrade-recover.service")
 	requireAcornFoxDirectiveContains(t, safeTarget, "Unit", "After", "acornfox-upgrade-recover.service")
 	for _, unit := range []string{"acornfox-buildkit.service", "acornfox-caddy.service", "acornfox-server.service", "acornfox-agent.service", "acornfox-edge.service"} {
@@ -280,6 +280,9 @@ func TestAcornFoxSystemdBootDagAndHardening(t *testing.T) {
 			"SystemCallArchitectures": "native",
 			"SystemCallFilter":        "@system-service",
 		} {
+			if unit == "acornfox-edge.service" && (key == "CapabilityBoundingSet" || key == "AmbientCapabilities") {
+				want = "CAP_NET_BIND_SERVICE"
+			}
 			requireAcornFoxDirective(t, sections, "Service", key, want)
 		}
 	}
@@ -324,11 +327,21 @@ func TestAcornFoxWritablePathOwnershipMatrix(t *testing.T) {
 		}
 	}
 	for _, unit := range []string{"acornfox-upgrade-recover.service", "acornfox-upgrade-finalize.service"} {
-		raw, sections := readAcornFoxUnit(t, unit)
-		requireAcornFoxDirectiveContains(t, sections, "Service", "ReadWritePaths", "/opt/acornfox /var/lib/acornfox /run/lock /etc/acornfox /etc/systemd/system")
-		if !strings.Contains(raw, "03/04 must implement contract-check and bind the helper digest before enabling this unit") {
-			t.Fatalf("%s lacks the future-activation boundary", unit)
+		_, sections := readAcornFoxUnit(t, unit)
+		// These helpers check the initial host namespace and enforce a pinned
+		// write scope in code. Mount sandbox directives would prevent recovery.
+		for _, key := range []string{"PrivateTmp", "PrivateDevices", "ProtectSystem", "ProtectHome", "ProtectKernelTunables", "ProtectKernelModules", "ProtectControlGroups", "ProtectClock", "ProtectProc", "ReadWritePaths", "ExecStartPre"} {
+			if len(sections["Service"][key]) != 0 {
+				t.Fatalf("%s reintroduced incompatible recovery sandbox/guard %s", unit, key)
+			}
 		}
+		requireAcornFoxDirective(t, sections, "Service", "NoNewPrivileges", "yes")
+		requireAcornFoxDirective(t, sections, "Service", "RestrictNamespaces", "yes")
+		command := "recover-prepare"
+		if unit == "acornfox-upgrade-finalize.service" {
+			command = "recover-finalize"
+		}
+		requireAcornFoxDirective(t, sections, "Service", "ExecStart", "/opt/acornfox/upgrade-tools/acornfox-upgrade "+command+" --pending")
 	}
 	_, server := readAcornFoxUnit(t, "acornfox-server.service")
 	for _, value := range server["Service"]["ReadWritePaths"] {
@@ -374,9 +387,7 @@ func TestAcornFoxListenerParityAndCollisionBoundary(t *testing.T) {
 
 func TestAcornFoxDeferredHelperGuardsFailClosed(t *testing.T) {
 	guarded := map[string]string{
-		"acornfox-upgrade-recover.service":  "/opt/acornfox/upgrade-tools/acornfox-upgrade contract-check --product acornfox --layout-schema 1",
-		"acornfox-upgrade-finalize.service": "/opt/acornfox/upgrade-tools/acornfox-upgrade contract-check --product acornfox --layout-schema 1",
-		"acornfox-healthcheck.service":      "/opt/acornfox/current/bin/acornfox-healthcheck contract-check --product acornfox --layout-schema 1",
+		"acornfox-healthcheck.service": "/opt/acornfox/current/bin/acornfox-healthcheck contract-check --product acornfox --layout-schema 1",
 	}
 	for unit, guard := range guarded {
 		raw, sections := readAcornFoxUnit(t, unit)

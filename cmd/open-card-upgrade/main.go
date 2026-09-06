@@ -59,20 +59,21 @@ var productionBootUnitFiles = []struct {
 }
 
 type upgradeCommandConfig struct {
-	command        string
-	transactionID  string
-	releaseID      string
-	manifestSHA256 string
-	backupID       string
-	reason         string
-	expectLegacy   bool
-	pending        bool
-	confirmation   string
-	candidateDir   string
-	bindingSHA256  string
-	selfSHA256     string
-	publicOrigin   string
-	gitResolvers   string
+	command              string
+	transactionID        string
+	releaseID            string
+	manifestSHA256       string
+	backupID             string
+	reason               string
+	expectLegacy         bool
+	pending              bool
+	confirmation         string
+	candidateDir         string
+	bindingSHA256        string
+	currentBindingSHA256 string
+	selfSHA256           string
+	publicOrigin         string
+	gitResolvers         string
 }
 
 type upgradeRuntime struct {
@@ -120,19 +121,22 @@ type upgradeDependencies struct {
 }
 
 // acornFoxCleanDependencies is intentionally separate from the legacy
-// runtime providers. Its five functions are the complete clean-mode effect
+// runtime providers. These functions are the complete clean-mode effect
 // surface and are injected directly by focused command tests.
 type acornFoxCleanDependencies struct {
-	euid                  func() int
-	bootstrap             func(context.Context, install.AcornFoxCandidateSetRequestV1) (install.AcornFoxHostBootstrapReceiptV1, error)
-	recover               func(context.Context) (install.AcornFoxHostBootstrapReceiptV1, error)
-	verifyPrepared        func(context.Context) (install.AcornFoxHostBootstrapReceiptV1, error)
-	migrateControlPlane   func(context.Context, install.AcornFoxBuildIdentityV1) (install.AcornFoxControlPlaneMigrationReceiptV1, error)
-	configureRuntime      func(context.Context, install.AcornFoxBuildIdentityV1, string, []string) (install.AcornFoxRuntimeConfigReceiptV1, error)
-	recoverRuntime        func(context.Context, install.AcornFoxBuildIdentityV1) error
-	verifyHelper          func(install.AcornFoxBuildIdentityV1) bool
-	prepareRuntimeNetwork func(context.Context) (runtimenetwork.Receipt, error)
-	verifyRuntimeNetwork  func(context.Context) error
+	euid                    func() int
+	bootstrap               func(context.Context, install.AcornFoxCandidateSetRequestV1) (install.AcornFoxHostBootstrapReceiptV1, error)
+	recover                 func(context.Context) (install.AcornFoxHostBootstrapReceiptV1, error)
+	verifyPrepared          func(context.Context) (install.AcornFoxHostBootstrapReceiptV1, error)
+	migrateControlPlane     func(context.Context, install.AcornFoxBuildIdentityV1) (install.AcornFoxControlPlaneMigrationReceiptV1, error)
+	configureRuntime        func(context.Context, install.AcornFoxBuildIdentityV1, string, []string) (install.AcornFoxRuntimeConfigReceiptV1, error)
+	recoverRuntime          func(context.Context, install.AcornFoxBuildIdentityV1) error
+	upgrade                 func(context.Context, install.AcornFoxUpgradeRequestV1) (install.AcornFoxUpgradeReceiptV1, error)
+	prepareUpgradeRecovery  func(context.Context, install.AcornFoxBuildIdentityV1) (install.AcornFoxUpgradeReceiptV1, bool, error)
+	finalizeUpgradeRecovery func(context.Context, install.AcornFoxBuildIdentityV1) (install.AcornFoxUpgradeReceiptV1, bool, error)
+	verifyHelper            func(install.AcornFoxBuildIdentityV1) bool
+	prepareRuntimeNetwork   func(context.Context) (runtimenetwork.Receipt, error)
+	verifyRuntimeNetwork    func(context.Context) error
 }
 
 type productionBootstrapRuntimeDependencies struct {
@@ -248,13 +252,16 @@ func productionUpgradeDependencies() upgradeDependencies {
 			return install.NewProductionInstallationIdentityStore()
 		},
 		acornFoxClean: acornFoxCleanDependencies{
-			euid:                os.Geteuid,
-			bootstrap:           install.BootstrapAcornFoxHostV1,
-			recover:             install.RecoverAcornFoxHostV1,
-			verifyPrepared:      install.VerifyPreparedAcornFoxHostV1,
-			migrateControlPlane: install.MigrateAcornFoxControlPlaneV1,
-			configureRuntime:    install.ConfigureAcornFoxRuntimeV1,
-			recoverRuntime:      install.RecoverAcornFoxRuntimeV1,
+			euid:                    os.Geteuid,
+			bootstrap:               install.BootstrapAcornFoxHostV1,
+			recover:                 install.RecoverAcornFoxHostV1,
+			verifyPrepared:          install.VerifyPreparedAcornFoxHostV1,
+			migrateControlPlane:     install.MigrateAcornFoxControlPlaneV1,
+			configureRuntime:        install.ConfigureAcornFoxRuntimeV1,
+			recoverRuntime:          install.RecoverAcornFoxRuntimeV1,
+			upgrade:                 install.UpgradeAcornFoxHostV1,
+			prepareUpgradeRecovery:  install.PrepareAcornFoxUpgradeRecoveryV1,
+			finalizeUpgradeRecovery: install.FinalizeAcornFoxUpgradeRecoveryV1,
 			verifyHelper: func(identity install.AcornFoxBuildIdentityV1) bool {
 				return install.VerifyProductionAcornFoxHelperContract(identity).OK
 			},
@@ -417,6 +424,42 @@ func runAcornFoxClean(ctx context.Context, args []string, stdout io.Writer, role
 		}
 		return writeUpgradeJSON(stdout, exitOK, map[string]any{"ok": true, "code": "runtime_network_prepared", "receipt": r})
 	}
+	if config.command == "repository-upgrade" {
+		if deps.upgrade == nil {
+			return writeAcornFoxCleanError(stdout, exitIneligible, "upgrade_ineligible")
+		}
+		receipt, err := deps.upgrade(ctx, install.AcornFoxUpgradeRequestV1{Directory: config.candidateDir, BindingSHA256: config.bindingSHA256, CurrentBindingSHA256: config.currentBindingSHA256, SelfSHA256: config.selfSHA256})
+		if (err == nil || errors.Is(err, install.ErrAcornFoxUpgradeRolledBack)) && receipt.Validate() == nil && receipt.State == "ROLLED_BACK" && receipt.BindingSHA256 == config.currentBindingSHA256 && receipt.PreviousBindingSHA256 == config.currentBindingSHA256 {
+			return writeUpgradeJSON(stdout, exitRecovery, map[string]any{"ok": false, "code": "upgrade_rolled_back", "receipt": receipt})
+		}
+		if err != nil {
+			return writeAcornFoxCleanUpgradeError(stdout, err)
+		}
+		if receipt.Validate() != nil || receipt.State != "UPGRADED" || receipt.BindingSHA256 != config.bindingSHA256 || receipt.PreviousBindingSHA256 != config.currentBindingSHA256 || receipt.ReleaseID != identity.ReleaseID || receipt.SourceCommit != identity.SourceCommit {
+			return writeAcornFoxCleanError(stdout, exitRecovery, "upgrade_outcome_unknown")
+		}
+		return writeUpgradeJSON(stdout, exitOK, map[string]any{"ok": true, "command": config.command, "receipt": receipt})
+	}
+	var upgradeRecovery func(context.Context, install.AcornFoxBuildIdentityV1) (install.AcornFoxUpgradeReceiptV1, bool, error)
+	if config.command == "recover-prepare" {
+		upgradeRecovery = deps.prepareUpgradeRecovery
+	} else if config.command == "recover-finalize" {
+		upgradeRecovery = deps.finalizeUpgradeRecovery
+	}
+	if upgradeRecovery != nil {
+		receipt, handled, err := upgradeRecovery(ctx, identity)
+		if err != nil {
+			return writeAcornFoxCleanUpgradeError(stdout, err)
+		}
+		if handled {
+			// Recovery verifies the executing old/new helper at entry. A next
+			// helper may legitimately finish by restoring the previous version.
+			if receipt.Validate() != nil || (config.command == "recover-finalize" && receipt.State == "RECOVERY_PREPARED") {
+				return writeAcornFoxCleanError(stdout, exitRecovery, "upgrade_outcome_unknown")
+			}
+			return writeUpgradeJSON(stdout, exitOK, map[string]any{"ok": true, "command": config.command, "receipt": receipt})
+		}
+	}
 	if config.command == "recover-prepare" && deps.recoverRuntime != nil {
 		if err := deps.recoverRuntime(ctx, identity); err != nil {
 			return writeAcornFoxCleanError(stdout, exitRecovery, "runtime_configuration_recovery_required")
@@ -486,8 +529,12 @@ func parseAcornFoxCleanArgs(args []string) (upgradeCommandConfig, error) {
 	}
 	config := upgradeCommandConfig{command: args[0]}
 	switch config.command {
-	case "repository-bootstrap":
-		if len(args) != 7 {
+	case "repository-bootstrap", "repository-upgrade":
+		flags := []string{"--candidate-dir", "--binding-sha256", "--self-sha256"}
+		if config.command == "repository-upgrade" {
+			flags = append(flags, "--current-binding-sha256")
+		}
+		if len(args) != 1+2*len(flags) || !containsExactly(args[1:], flags...) {
 			return upgradeCommandConfig{}, errors.New("invalid repository bootstrap")
 		}
 		for index := 1; index < len(args); index += 2 {
@@ -499,12 +546,17 @@ func parseAcornFoxCleanArgs(args []string) (upgradeCommandConfig, error) {
 				config.bindingSHA256 = value
 			case "--self-sha256":
 				config.selfSHA256 = value
+			case "--current-binding-sha256":
+				config.currentBindingSHA256 = value
 			default:
 				return upgradeCommandConfig{}, errors.New("unsupported flag")
 			}
 		}
-		if !filepath.IsAbs(config.candidateDir) || filepath.Clean(config.candidateDir) == string(filepath.Separator) || !validCLISHA(config.bindingSHA256) || !validCLISHA(config.selfSHA256) || !containsExactly(args[1:], "--candidate-dir", "--binding-sha256", "--self-sha256") {
+		if !filepath.IsAbs(config.candidateDir) || filepath.Clean(config.candidateDir) == string(filepath.Separator) || !validCLISHA(config.bindingSHA256) || !validCLISHA(config.selfSHA256) {
 			return upgradeCommandConfig{}, errors.New("invalid repository bootstrap")
+		}
+		if config.command == "repository-upgrade" && (!validCLISHA(config.currentBindingSHA256) || config.currentBindingSHA256 == config.bindingSHA256) {
+			return upgradeCommandConfig{}, errors.New("invalid repository predecessor")
 		}
 	case "validate-runtime-inputs", "configure-runtime":
 		if len(args) != 5 || !containsExactly(args[1:], "--public-origin", "--git-resolvers") {
@@ -572,6 +624,19 @@ func writeAcornFoxCleanBridgeError(stdout io.Writer, err error) int {
 
 func writeAcornFoxCleanError(stdout io.Writer, code int, message string) int {
 	return writeUpgradeError(stdout, code, message)
+}
+
+func writeAcornFoxCleanUpgradeError(stdout io.Writer, err error) int {
+	switch {
+	case errors.Is(err, install.ErrAcornFoxRepoLocked):
+		return writeAcornFoxCleanError(stdout, exitLocked, "repository_locked")
+	case errors.Is(err, install.ErrAcornFoxUpgradeRetentionFull):
+		return writeAcornFoxCleanError(stdout, exitConflict, "upgrade_retention_full")
+	case errors.Is(err, install.ErrAcornFoxUpgradeConflict):
+		return writeAcornFoxCleanError(stdout, exitConflict, "upgrade_conflict")
+	default:
+		return writeAcornFoxCleanError(stdout, exitRecovery, "upgrade_outcome_unknown")
+	}
 }
 
 func runAcornFoxContractCheck(args []string, stdout io.Writer, role string) int {

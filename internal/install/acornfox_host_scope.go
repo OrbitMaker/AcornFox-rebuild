@@ -35,6 +35,11 @@ func acornFoxValidateProductionManagedScopePrefix(root *os.Root, store *TaskAcor
 			return ErrAcornFoxLiveConflict
 		}
 	}
+	if state == acornFoxRepoPrefixCurrent {
+		if handled, err := acornFoxUpgradeRetainedScope(root, store, activation); handled || err != nil {
+			return err
+		}
+	}
 	want := make(map[string]SubstrateEntry, len(entries))
 	for _, entry := range entries {
 		if validateRelativePath(entry.Path) != nil || entry.Kind != SubstrateEntryFile && entry.Kind != SubstrateEntryDirectory {
