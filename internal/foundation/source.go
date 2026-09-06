@@ -136,7 +136,7 @@ func NormalizeGitLocator(locator string) (string, GitScheme, error) {
 // only a provider that talks to Git can turn it into an immutable commit.
 func NormalizeGitRef(ref string) (string, error) {
 	value := strings.TrimSpace(ref)
-	if value == "" || containsControl(value) || strings.ContainsAny(value, " \\~^:?*[\x00-\x1f\x7f") {
+	if value == "" || strings.HasPrefix(value, "-") || containsControl(value) || strings.ContainsAny(value, " \\~^:?*[") {
 		return "", fmt.Errorf("%w: invalid characters", ErrInvalidGitRef)
 	}
 	if strings.HasPrefix(value, "/") || strings.HasSuffix(value, "/") || strings.HasSuffix(value, ".") || strings.Contains(value, "..") || strings.Contains(value, "@{") || strings.Contains(value, "//") {
