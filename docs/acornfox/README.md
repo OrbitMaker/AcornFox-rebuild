@@ -10,6 +10,8 @@ AcornFox 把含根目录 `Dockerfile` 的公开 Git 仓库部署到你自己的�
 
 发布包及其校验值见 [GitHub Releases](https://github.com/EleJiuDeiChi/acornfox/releases)。安装需要一组完整的发布文件；请先核对该版本发布说明中的 binding SHA-256，再运行包内安装程序。仓库中的源码和一个通过编译的二进制，不能替代完整安装包。
 
+需要检查或修改程序时，参阅[对应源码构建指南](https://github.com/EleJiuDeiChi/acornfox/blob/v0.1.0-beta.1/docs/acornfox/build.md)。运行中的登录页和控制台也提供指向实际构建提交的源码链接。
+
 安装后的基本流程：
 
 1. 登录控制台，导入一个公开 Git 仓库并指定分支或提交。

@@ -131,6 +131,11 @@ export default defineConfig(({ command, mode }) => {
   }
 
   return {
+    define: {
+      __ACORNFOX_RELEASE_SOURCE__: JSON.stringify(
+        release ? { version: release.version, url: `${release.sourceRepository}/tree/${release.sourceCommit}` } : null,
+      ),
+    },
     plugins: command === "build" ? [buildAttestationPlugin(contract, release)] : [],
     build: {
       emptyOutDir: true,

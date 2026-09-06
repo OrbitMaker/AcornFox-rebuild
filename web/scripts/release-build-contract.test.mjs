@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
@@ -39,6 +39,12 @@ test("release mode emits exact release metadata", async () => {
     sourceRepository: source.ACORNFOX_SOURCE_REPOSITORY,
     version: source.ACORNFOX_RELEASE_VERSION,
   });
+  const assets = join(webRoot, "dist", "assets");
+  const javascript = (await Promise.all((await readdir(assets))
+    .filter((name) => name.endsWith(".js"))
+    .map((name) => readFile(join(assets, name), "utf8")))).join("\n");
+  assert.ok(javascript.includes(`${source.ACORNFOX_SOURCE_REPOSITORY}/tree/${source.ACORNFOX_SOURCE_COMMIT}`));
+  assert.ok(javascript.includes("对应源码"));
 });
 
 for (const overrides of [

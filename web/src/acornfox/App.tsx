@@ -25,6 +25,16 @@ type Region<T> = {
   message?: string;
 };
 
+function ReleaseSourceLink() {
+  const release = typeof __ACORNFOX_RELEASE_SOURCE__ === "undefined" ? null : __ACORNFOX_RELEASE_SOURCE__;
+  if (!release) return null;
+  return (
+    <a className="af-source-link" href={release.url} target="_blank" rel="noopener noreferrer">
+      v{release.version} · 对应源码
+    </a>
+  );
+}
+
 function failure(error: unknown): Region<never> {
   const request = error instanceof AcornFoxRequestError ? error : undefined;
   return {
@@ -108,6 +118,7 @@ export function Login({
             {busy ? "正在登录…" : "登录"}
           </button>
         </form>
+        <ReleaseSourceLink />
       </section>
     </main>
   );
@@ -1070,6 +1081,7 @@ export default function AcornFoxApp({
         <a className="af-brand" href="/">
           AcornFox
         </a>
+        <ReleaseSourceLink />
         <PasswordPanel
           api={api}
           onLogout={() => {

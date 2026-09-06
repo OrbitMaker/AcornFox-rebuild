@@ -16,6 +16,15 @@ body {
   min-width: 360px;
   background: #f4f6f1;
 }
+.af-source-link {
+  display: inline-block;
+  color: #2f7057;
+  font-size: 13px;
+  text-underline-offset: 3px;
+}
+.af-login__card > .af-source-link {
+  margin-top: 18px;
+}
 button,
 input {
   font: inherit;
