@@ -17,6 +17,10 @@ import (
 
 const acornFoxDeliveryTaskAttempts = 3
 
+// Failure facts outlive the cancelled HTTP request, but may not wait forever
+// for PostgreSQL. This budget applies only to terminal failure persistence.
+const acornFoxDeliveryFailureTimeout = 5 * time.Second
+
 // AcornFoxDockerfileImporter reads the root Dockerfile projection from an
 // already accepted immutable source. It deliberately accepts no client
 // workspace path or Dockerfile contents.
@@ -457,7 +461,11 @@ func (service *AcornFoxDeliveryService) failBuild(ctx context.Context, buildID d
 	if cause == nil {
 		return nil
 	}
-	_, _ = service.Builds.FailBuild(ctx, buildID, cause.Error(), service.now())
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), acornFoxDeliveryFailureTimeout)
+	defer cancel()
+	if _, err := service.Builds.FailBuild(persistCtx, buildID, acornFoxDeliveryFailureReason(cause), service.now()); err != nil {
+		return domain.WrapError(domain.ErrUnknownState, "AcornFox build outcome could not be recorded", err)
+	}
 	return cause
 }
 
@@ -468,10 +476,40 @@ func (service *AcornFoxDeliveryService) failDelivery(ctx context.Context, key, d
 	if cause == nil {
 		return nil
 	}
-	if err := service.Idempotency.FailAcornFoxDelivery(ctx, key, digest, cause.Error(), service.now()); err != nil {
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), acornFoxDeliveryFailureTimeout)
+	defer cancel()
+	if err := service.Idempotency.FailAcornFoxDelivery(persistCtx, key, digest, acornFoxDeliveryFailureReason(cause), service.now()); err != nil {
 		return domain.WrapError(domain.ErrUnknownState, "AcornFox delivery outcome could not be recorded", err)
 	}
 	return cause
+}
+
+// Persist stable facts, never a provider log, raw URL, or database error.
+func acornFoxDeliveryFailureReason(cause error) string {
+	if contracts.IsProviderOutcomeUnknown(cause) || domain.IsCode(cause, domain.ErrUnknownState) {
+		return "AcornFox operation outcome is unknown"
+	}
+	var provider *contracts.ProviderError
+	_ = errors.As(cause, &provider)
+	if errors.Is(cause, context.DeadlineExceeded) || domain.IsCode(cause, domain.ErrTimeout) || provider != nil && provider.Code == contracts.ErrTimeout {
+		return "AcornFox operation timed out"
+	}
+	if errors.Is(cause, context.Canceled) || domain.IsCode(cause, domain.ErrCancelled) || provider != nil && provider.Code == contracts.ErrCancelled {
+		return "AcornFox operation was cancelled"
+	}
+	if provider != nil {
+		switch provider.Code {
+		case contracts.ErrCapacity:
+			return "AcornFox capacity limit was exceeded (capacity_exceeded)"
+		case contracts.ErrForbidden:
+			return "AcornFox operation was forbidden (forbidden)"
+		case contracts.ErrValidation:
+			return "AcornFox operation failed validation (validation_failed)"
+		case contracts.ErrUnsupportedCapability:
+			return "AcornFox requested capability is unsupported (unsupported_capability)"
+		}
+	}
+	return "AcornFox operation failed"
 }
 
 func (service *AcornFoxDeliveryService) readyForCreate() error {

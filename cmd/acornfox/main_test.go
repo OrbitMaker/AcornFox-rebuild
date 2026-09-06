@@ -875,3 +875,31 @@ func cookieRequest(request *http.Request, name string) string {
 	}
 	return ""
 }
+
+func TestRequestUsesPerOperationBudgetWithoutExpandingOrdinaryCalls(t *testing.T) {
+	const ordinaryBudget = 5 * time.Millisecond
+	const longBudget = time.Second
+	transport := roundTripper(func(r *http.Request) (*http.Response, error) {
+		select {
+		case <-r.Context().Done():
+			return nil, r.Context().Err()
+		case <-time.After(20 * time.Millisecond):
+			return &http.Response{StatusCode: 204, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(""))}, nil
+		}
+	})
+	original := &http.Client{Timeout: ordinaryBudget, Transport: transport}
+	c := &cli{client: original}
+	state := sessionState{Origin: "https://console.example.test"}
+	response, err := c.request(context.Background(), state, http.MethodPost, "/apps/app/deliveries", nil, false, "", longBudget)
+	if err != nil {
+		t.Fatal("long operation inherited the ordinary client's short timeout", err)
+	}
+	response.Body.Close()
+	if response, err = c.request(context.Background(), state, http.MethodGet, "/apps", nil, false, "", ordinaryBudget); err == nil {
+		response.Body.Close()
+		t.Fatal("ordinary API call inherited the long-operation budget")
+	}
+	if original.Timeout != ordinaryBudget {
+		t.Fatal("per-operation client copy mutated the shared client's timeout")
+	}
+}
