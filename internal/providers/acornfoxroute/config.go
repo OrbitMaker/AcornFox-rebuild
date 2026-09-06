@@ -63,7 +63,12 @@ func InitialConfig(origin string, resolvers []string) ([]byte, error) {
 	unavailable := func(match object) object {
 		return object{"match": []object{match}, "handle": []object{{"handler": "static_response", "status_code": 404}}, "terminal": true}
 	}
-	console := object{"match": []object{{"host": []string{host}}}, "handle": []object{proxy("127.0.0.1:8080")}, "terminal": true}
+	consoleProxy := proxy("127.0.0.1:8080")
+	// The internal Caddy site matches Host 127.0.0.1. Preserving the public
+	// console Host would miss that site and return Caddy's empty default 200.
+	// Only this hop overrides Host; Origin, CSRF and application Hosts remain.
+	consoleProxy["headers"].(object)["request"].(object)["set"] = object{"Host": []string{"127.0.0.1"}}
+	console := object{"match": []object{{"host": []string{host}}}, "handle": []object{consoleProxy}, "terminal": true}
 	appRoutes := object{"handle": []object{emptySubtree()}}
 	config := object{
 		"admin":   object{"listen": "127.0.0.1:2020", "config": object{"persist": false}},
