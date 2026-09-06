@@ -108,7 +108,7 @@ func expectedSuccessStatus(method, rawPath string, shape responseShape) (int, bo
 			return http.StatusCreated, true
 		case hasApp && len(segments) == 3 && segments[2] == "deliveries" && noQuery && shape == shapeCommand:
 			return http.StatusAccepted, true
-		case hasApp && len(segments) == 5 && segments[2] == "deliveries" && (segments[4] == "restart" || segments[4] == "redeploy") && noQuery && shape == shapeCommand:
+		case hasApp && len(segments) == 5 && segments[2] == "deliveries" && (segments[4] == "restart" || segments[4] == "redeploy" || segments[4] == "probes") && noQuery && shape == shapeCommand:
 			return http.StatusAccepted, true
 		}
 	case http.MethodPut:

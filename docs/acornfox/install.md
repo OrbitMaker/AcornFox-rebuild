@@ -202,6 +202,20 @@ read -r -p '部署 ID: ' deployment_id
 "$acornfox" status "$app_id" "$deployment_id"
 "$acornfox" logs "$app_id" "$deployment_id" --source build
 "$acornfox" logs "$app_id" "$deployment_id" --source runtime
+```
+
+先等运行状态为 `running`，再检查应用响应：
+
+```bash
+"$acornfox" probe "$app_id" "$deployment_id"
+"$acornfox" status "$app_id" "$deployment_id"
+```
+
+`probe` 对应用根路径 `/` 发起 HTTP 请求，返回 `accepted` 只代表检查任务已接受。继续执行 `status`，确认 `response.outcome` 为 `responded`，并检查 HTTP 状态码符合应用预期；尚无新记录时刷新，失败时查看日志后重新检查。重启或重新部署后，需要再次检查。网页中对应的操作是“检查应用响应”。
+
+有了当前部署的响应记录，再启用公网：
+
+```bash
 "$acornfox" public-access enable "$app_id" "$deployment_id"
 "$acornfox" public-access get "$app_id" "$deployment_id"
 ```

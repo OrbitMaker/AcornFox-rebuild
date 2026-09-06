@@ -258,6 +258,7 @@ func TestRequestProofMatrix(t *testing.T) {
 		{"read logs", "GET", "/apps/app/deliveries/dep/logs?source=runtime", false, "", true, false, false, false},
 		{"create app", "POST", "/apps", true, "key-app", true, true, true, true},
 		{"deploy", "POST", "/apps/app/deliveries", true, "key-deploy", true, true, true, true},
+		{"probe", "POST", "/apps/app/deliveries/dep/probes", true, "key-probe", true, true, true, true},
 		{"restart", "POST", "/apps/app/deliveries/dep/restart", true, "key-restart", true, true, true, true},
 		{"redeploy", "POST", "/apps/app/deliveries/dep/redeploy", true, "key-redeploy", true, true, true, true},
 		{"public", "PUT", "/apps/app/deliveries/dep/public-access", true, "key-public", true, true, true, true},
@@ -300,6 +301,7 @@ func TestExpectedSuccessStatusCoversEveryCLICommandRouteClass(t *testing.T) {
 		{http.MethodGet, "/apps", shapeApps, http.StatusOK}, {http.MethodPost, "/apps", shapeCreateApp, http.StatusCreated}, {http.MethodGet, "/apps/app", shapeApplication, http.StatusOK},
 		{http.MethodGet, "/apps/app/sources", shapeSourceList, http.StatusOK}, {http.MethodGet, "/apps/app/sources/source", shapeSource, http.StatusOK}, {http.MethodGet, "/apps/app/deliveries", shapeDeploymentList, http.StatusOK},
 		{http.MethodPost, "/apps/app/deliveries", shapeCommand, http.StatusAccepted}, {http.MethodGet, "/apps/app/deliveries/deployment", shapeStatus, http.StatusOK}, {http.MethodGet, "/apps/app/deliveries/deployment/logs?source=runtime", shapeLogs, http.StatusOK},
+		{http.MethodPost, "/apps/app/deliveries/deployment/probes", shapeCommand, http.StatusAccepted},
 		{http.MethodPost, "/apps/app/deliveries/deployment/restart", shapeCommand, http.StatusAccepted}, {http.MethodPost, "/apps/app/deliveries/deployment/redeploy", shapeCommand, http.StatusAccepted}, {http.MethodGet, "/apps/app/deliveries/deployment/public-access", shapePublicAccess, http.StatusOK}, {http.MethodPut, "/apps/app/deliveries/deployment/public-access", shapePublicAccess, http.StatusOK},
 	} {
 		got, known := expectedSuccessStatus(tc.method, tc.path, tc.shape)
@@ -315,7 +317,7 @@ func TestExpectedSuccessStatusCoversEveryCLICommandRouteClass(t *testing.T) {
 		shape        responseShape
 	}{
 		{http.MethodGet, "/unknown", shapeApps}, {http.MethodGet, "/apps/app/", shapeApplication}, {http.MethodGet, "/apps?limit=1", shapeApps}, {http.MethodGet, "/apps/app/sources/source?cursor=opaque", shapeSource},
-		{http.MethodPost, "/apps/app/deliveries/deployment/probes", shapeCommand}, {http.MethodPost, "/apps/app/deliveries/deployment/restart/extra", shapeCommand}, {http.MethodPost, "/anything", shapeCommand}, {http.MethodPut, "/apps/app/deliveries/deployment/public-access?x=1", shapePublicAccess},
+		{http.MethodPost, "/apps/app/deliveries/deployment/probes?x=1", shapeCommand}, {http.MethodGet, "/apps/app/deliveries/deployment/probes", shapeCommand}, {http.MethodPost, "/apps/app/deliveries/deployment/probes/extra", shapeCommand}, {http.MethodPost, "/apps/app/deliveries/deployment/restart/extra", shapeCommand}, {http.MethodPost, "/anything", shapeCommand}, {http.MethodPut, "/apps/app/deliveries/deployment/public-access?x=1", shapePublicAccess},
 	} {
 		if _, known := expectedSuccessStatus(tc.method, tc.path, tc.shape); known {
 			t.Fatalf("unexpected known route: %s %s", tc.method, tc.path)
@@ -365,7 +367,7 @@ func TestUnexpectedSuccessStatusesAreContractFailuresWithoutStateMutation(t *tes
 		shape        responseShape
 		status       int
 	}{
-		{"session 201", http.MethodGet, "/auth/session", shapeSession, http.StatusCreated}, {"deploy 200", http.MethodPost, "/apps/app/deliveries", shapeCommand, http.StatusOK}, {"logout 200", http.MethodPost, "/auth/logout", shapeSession, http.StatusOK}, {"password 200", http.MethodPost, "/auth/password", shapeSession, http.StatusOK}, {"read 204", http.MethodGet, "/apps", shapeApps, http.StatusNoContent},
+		{"session 201", http.MethodGet, "/auth/session", shapeSession, http.StatusCreated}, {"deploy 200", http.MethodPost, "/apps/app/deliveries", shapeCommand, http.StatusOK}, {"probe 200", http.MethodPost, "/apps/app/deliveries/deployment/probes", shapeCommand, http.StatusOK}, {"logout 200", http.MethodPost, "/auth/logout", shapeSession, http.StatusOK}, {"password 200", http.MethodPost, "/auth/password", shapeSession, http.StatusOK}, {"read 204", http.MethodGet, "/apps", shapeApps, http.StatusNoContent},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			root := t.TempDir()
@@ -796,6 +798,9 @@ func TestAllCommandFamiliesUseTheirDeclaredRouteAndProof(t *testing.T) {
 			if r.URL.Path == apiBase+"/apps/app/deliveries" && (body["source_revision_id"] != "source" || body["container_port"] != float64(8080)) {
 				t.Errorf("deploy body=%v", body)
 			}
+			if r.URL.Path == apiBase+"/apps/app/deliveries/deployment/probes" && (len(body) != 2 || body["protocol"] != "http" || body["path"] != "/") {
+				t.Errorf("probe body=%v", body)
+			}
 			if r.URL.Path == apiBase+"/apps/app/deliveries/deployment/public-access" {
 				if _, ok := body["enabled"].(bool); !ok {
 					t.Errorf("public body=%v", body)
@@ -834,6 +839,9 @@ func TestAllCommandFamiliesUseTheirDeclaredRouteAndProof(t *testing.T) {
 				t.Errorf("logs query=%q", r.URL.RawQuery)
 			}
 			response = `{"source":"runtime","availability":"available","items":[],"next_cursor":null,"retention_limited":false}`
+		case apiBase + "/apps/app/deliveries/deployment/probes":
+			status = http.StatusAccepted
+			response = `{"deployment_id":"deployment","operation_id":"operation","task_id":"task","status":"accepted"}`
 		case apiBase + "/apps/app/deliveries/deployment/restart", apiBase + "/apps/app/deliveries/deployment/redeploy":
 			status = http.StatusAccepted
 			response = `{"deployment_id":"deployment","operation_id":"operation","task_id":"task","status":"accepted"}`
@@ -858,7 +866,7 @@ func TestAllCommandFamiliesUseTheirDeclaredRouteAndProof(t *testing.T) {
 		{"apps", "list"}, {"apps", "get", "app"}, {"apps", "create", "--name", "demo", "--repository", "https://github.com/example/repo.git", "--ref", "main"},
 		{"sources", "list", "app", "--limit", "2", "--cursor", "opaque"}, {"sources", "get", "app", "source"}, {"deployments", "list", "app", "--limit", "2", "--cursor", "opaque"},
 		{"deploy", "app", "--source", "source", "--port", "8080"}, {"status", "app", "deployment"}, {"logs", "app", "deployment", "--source", "runtime", "--limit", "2", "--cursor", "opaque"},
-		{"restart", "app", "deployment"}, {"redeploy", "app", "deployment"}, {"public-access", "get", "app", "deployment"}, {"public-access", "enable", "app", "deployment"}, {"public-access", "disable", "app", "deployment"},
+		{"probe", "app", "deployment"}, {"restart", "app", "deployment"}, {"redeploy", "app", "deployment"}, {"public-access", "get", "app", "deployment"}, {"public-access", "enable", "app", "deployment"}, {"public-access", "disable", "app", "deployment"},
 	}
 	for _, args := range commands {
 		if err := c.command(args); err != nil {

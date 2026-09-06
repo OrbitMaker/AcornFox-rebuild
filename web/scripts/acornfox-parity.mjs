@@ -67,16 +67,13 @@ try {
       if (!operation) continue;
       if (typeof operation.operationId !== "string" || operation.operationId.length === 0)
         fail(`${method.toUpperCase()} ${pathTemplate} has no operationId`);
-      const intentionallyExcluded = method === "post" && pathTemplate.endsWith("/probes");
-      if (intentionallyExcluded && operation.operationId !== "probeAcornFoxDeliveryOnce")
-        fail(`only probeAcornFoxDeliveryOnce may be excluded from the first-version clients`);
       operations.push({
         operationId: operation.operationId,
         method: method.toUpperCase(),
         pathTemplate,
         successStatus: successStatus(operation, operation.operationId),
         proof: proofClass(document, pathItem, operation, method, operation.operationId),
-        visible: !intentionallyExcluded,
+        visible: true,
       });
     }
   }
@@ -107,7 +104,7 @@ try {
     env: environment,
     stdio: "inherit",
   });
-  console.log(`AcornFox parity passed: ${operations.length - 1} visible operations in CLI and Web; probe excluded.`);
+  console.log(`AcornFox parity passed: ${operations.length} visible operations in CLI and Web.`);
 } finally {
   rmSync(matrixDirectory, { recursive: true, force: true });
 }

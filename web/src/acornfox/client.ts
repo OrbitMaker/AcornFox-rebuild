@@ -25,7 +25,7 @@ export function expectedSuccessStatus(path: string, method = "GET"): number {
   const normalized = method.toUpperCase();
   if (path === "/auth/logout" || path === "/auth/password") return 204;
   if (path === "/apps" && normalized === "POST") return 201;
-  if (path.endsWith("/restart") || path.endsWith("/redeploy")) return 202;
+  if (path.endsWith("/restart") || path.endsWith("/redeploy") || path.endsWith("/probes")) return 202;
   if (/\/apps\/[^/]+\/deliveries$/.test(path) && normalized === "POST")
     return 202;
   return 200;
@@ -85,6 +85,7 @@ export interface AcornFoxClient {
     source: "build" | "runtime",
     cursor?: string,
   ): Promise<LogsPage>;
+  probe(applicationId: string, deploymentId: string): Promise<Command>;
   restart(applicationId: string, deploymentId: string): Promise<Command>;
   redeploy(applicationId: string, deploymentId: string): Promise<Command>;
   publicAccess(
@@ -769,6 +770,13 @@ export function createAcornFoxClient(
             retention_limited: page.retention_limited,
           };
         },
+      ),
+    probe: (id, deploymentId) =>
+      request(
+        `/apps/${pathPart(id)}/deliveries/${pathPart(deploymentId)}/probes`,
+        command,
+        { method: "POST", body: json({ protocol: "http", path: "/" }) },
+        write,
       ),
     restart: (id, deploymentId) =>
       request(

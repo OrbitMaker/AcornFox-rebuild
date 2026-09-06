@@ -72,6 +72,7 @@ func TestAcornFoxOpenAPIParity(t *testing.T) {
 		{"createAcornFoxDelivery", http.MethodPost, "/apps/app/deliveries", shapeCommand, map[string]string{"source_revision_id": "source"}},
 		{"getAcornFoxDeliveryStatus", http.MethodGet, "/apps/app/deliveries/deployment", shapeStatus, nil},
 		{"listAcornFoxDeliveryLogs", http.MethodGet, "/apps/app/deliveries/deployment/logs?source=runtime", shapeLogs, nil},
+		{"probeAcornFoxDeliveryOnce", http.MethodPost, "/apps/app/deliveries/deployment/probes", shapeCommand, map[string]string{"protocol": "http", "path": "/"}},
 		{"restartAcornFoxDelivery", http.MethodPost, "/apps/app/deliveries/deployment/restart", shapeCommand, map[string]any{}},
 		{"redeployAcornFoxDelivery", http.MethodPost, "/apps/app/deliveries/deployment/redeploy", shapeCommand, map[string]any{}},
 		{"getAcornFoxDeliveryPublicAccess", http.MethodGet, "/apps/app/deliveries/deployment/public-access", shapePublicAccess, nil},
@@ -84,10 +85,7 @@ func TestAcornFoxOpenAPIParity(t *testing.T) {
 	if len(byID) != len(matrix.Operations) {
 		t.Fatal("OpenAPI matrix contains duplicate operation IDs")
 	}
-	if excluded, ok := byID["probeAcornFoxDeliveryOnce"]; !ok || excluded.Visible {
-		t.Fatalf("probe exclusion=%+v found=%t", excluded, ok)
-	}
-	if len(operations) != len(matrix.Operations)-1 {
+	if len(operations) != len(matrix.Operations) {
 		t.Fatalf("CLI visible routes=%d OpenAPI operations=%d", len(operations), len(matrix.Operations))
 	}
 

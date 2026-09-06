@@ -34,7 +34,7 @@ func (c *cli) command(args []string) error {
 		return c.status(args[1:])
 	case "logs":
 		return c.logs(args[1:])
-	case "restart", "redeploy":
+	case "restart", "redeploy", "probe":
 		return c.deliveryAction(args[0], args[1:])
 	case "public-access":
 		return c.publicAccess(args[1:])
@@ -349,7 +349,7 @@ func (c *cli) logs(args []string) error {
 }
 func (c *cli) deliveryAction(action string, args []string) error {
 	if len(args) < 2 {
-		return errors.New("usage: acornfox restart|redeploy APP_ID DEPLOYMENT_ID")
+		return errors.New("usage: acornfox restart|redeploy|probe APP_ID DEPLOYMENT_ID")
 	}
 	app, err := requireID(args[0], "application ID")
 	if err != nil {
@@ -364,13 +364,18 @@ func (c *cli) deliveryAction(action string, args []string) error {
 		return err
 	}
 	if len(p) != 0 {
-		return errors.New("usage: acornfox restart|redeploy APP_ID DEPLOYMENT_ID")
+		return errors.New("usage: acornfox restart|redeploy|probe APP_ID DEPLOYMENT_ID")
 	}
 	key, err := idempotencyKey(values)
 	if err != nil {
 		return err
 	}
-	return c.callCommand(http.MethodPost, "/apps/"+pathID(app)+"/deliveries/"+pathID(deployment)+"/"+action, map[string]any{}, true, key, 30*time.Second, shapeCommand)
+	body := map[string]any{}
+	if action == "probe" {
+		action = "probes"
+		body = map[string]any{"protocol": "http", "path": "/"}
+	}
+	return c.callCommand(http.MethodPost, "/apps/"+pathID(app)+"/deliveries/"+pathID(deployment)+"/"+action, body, true, key, 30*time.Second, shapeCommand)
 }
 func (c *cli) publicAccess(args []string) error {
 	if len(args) < 3 {

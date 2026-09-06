@@ -1,5 +1,5 @@
 import { renderToStaticMarkup } from "react-dom/server";
-import AcornFoxApp, { Login } from "./App";
+import AcornFoxApp, { DeliveryWorkspace, Login } from "./App";
 import type { AcornFoxClient } from "./client";
 
 const api: AcornFoxClient = {
@@ -45,6 +45,9 @@ const api: AcornFoxClient = {
   logs: async () => {
     throw new Error("unused");
   },
+  probe: async () => ({
+    deployment_id: "d", operation_id: "o", task_id: "t", status: "accepted",
+  }),
   restart: async () => ({
     deployment_id: "d",
     operation_id: "o",
@@ -66,6 +69,15 @@ const api: AcornFoxClient = {
 };
 
 describe("AcornFox clean entry", () => {
+  it("offers an explicit response check without presenting running as responsive", () => {
+    const html = renderToStaticMarkup(<DeliveryWorkspace api={api}
+      application={{ id: "a", name: "A", created_at: "", updated_at: "" }}
+      deployment={{ id: "d", application_id: "a", environment_id: "e", release_id: "r", stage: "starting", created_at: "", updated_at: "" }} />);
+    expect(html).toContain("检查应用响应</button>");
+    expect(html).toContain("确认响应记录为 responded");
+    expect(html).toContain("运行中不等于能响应请求");
+    expect(html).not.toContain("HTTP 200");
+  });
   it("renders the login as a labelled, password-only entry", () => {
     const html = renderToStaticMarkup(
       <Login api={api} onReady={() => undefined} />,

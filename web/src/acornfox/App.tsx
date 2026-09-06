@@ -730,7 +730,7 @@ export function DeliveryWorkspace({
     state: "loading",
   });
   const [message, setMessage] = useState<string>();
-  const [action, setAction] = useState<"restart" | "redeploy" | "access">();
+  const [action, setAction] = useState<"restart" | "redeploy" | "probe" | "access">();
   const actionScope = useRef(new ActionScope());
   const statusRequest = useRef(new LatestRequest());
   const accessRequest = useRef(new LatestRequest());
@@ -770,7 +770,7 @@ export function DeliveryWorkspace({
       actionScope.current.invalidate();
     };
   }, [application.id, deployment.id]);
-  async function command(action: "restart" | "redeploy" | "access") {
+  async function command(action: "restart" | "redeploy" | "probe" | "access") {
     const ticket = actionScope.current.begin();
     if (!ticket) return;
     const scope = {
@@ -784,6 +784,8 @@ export function DeliveryWorkspace({
         await api.restart(scope.applicationId, scope.deploymentId);
       else if (action === "redeploy")
         await api.redeploy(scope.applicationId, scope.deploymentId);
+      else if (action === "probe")
+        await api.probe(scope.applicationId, scope.deploymentId);
       else
         await api.setPublicAccess(
           scope.applicationId,
@@ -794,7 +796,9 @@ export function DeliveryWorkspace({
       setMessage(
         action === "access"
           ? "公网访问设置已接受，正在读取服务器记录。"
-          : "操作已接受，正在读取服务器记录。",
+          : action === "probe"
+            ? "响应检查已接受，不代表检查完成。请查看响应记录；尚未更新时点击刷新。"
+            : "操作已接受，正在读取服务器记录。",
       );
       await refetchAfterAccepted(
         action === "access" ? refreshAccess : refreshStatus,
@@ -849,6 +853,12 @@ export function DeliveryWorkspace({
         <div className="af-actions">
           <button
             disabled={action !== undefined}
+            onClick={() => void command("probe")}
+          >
+            {action === "probe" ? "正在提交…" : "检查应用响应"}
+          </button>
+          <button
+            disabled={action !== undefined}
             onClick={() => void command("restart")}
           >
             {action === "restart" ? "正在提交…" : "重启"}
@@ -876,6 +886,10 @@ export function DeliveryWorkspace({
             刷新
           </button>
         </header>
+        <p className="af-note">
+          应用运行后，先点击“检查应用响应”，确认响应记录为 responded，再开启公网访问。
+          重启或重新部署后需要重新检查；运行中不等于能响应请求。
+        </p>
         <RegionNote region={access} empty="尚无公网访问设置。" />
         {access.value && (
           <div className="af-access">

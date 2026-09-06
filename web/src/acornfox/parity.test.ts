@@ -72,6 +72,7 @@ function payload(operationId: string, sourceRevisionKind: string): unknown {
     case "listAcornFoxDeliveries":
       return { items: [], next_cursor: null };
     case "createAcornFoxDelivery":
+    case "probeAcornFoxDeliveryOnce":
     case "restartAcornFoxDelivery":
     case "redeployAcornFoxDelivery":
       return command;
@@ -108,6 +109,7 @@ const webOperations: WebOperation[] = [
   { operationId: "createAcornFoxDelivery", method: "POST", pathTemplate: "/api/v1/acornfox/apps/{applicationId}/deliveries", invoke: (api) => api.deploy("app", "source") },
   { operationId: "getAcornFoxDeliveryStatus", method: "GET", pathTemplate: "/api/v1/acornfox/apps/{applicationId}/deliveries/{deploymentId}", invoke: (api) => api.status("app", "deployment") },
   { operationId: "listAcornFoxDeliveryLogs", method: "GET", pathTemplate: "/api/v1/acornfox/apps/{applicationId}/deliveries/{deploymentId}/logs", invoke: (api) => api.logs("app", "deployment", "runtime") },
+  { operationId: "probeAcornFoxDeliveryOnce", method: "POST", pathTemplate: "/api/v1/acornfox/apps/{applicationId}/deliveries/{deploymentId}/probes", invoke: (api) => api.probe("app", "deployment") },
   { operationId: "restartAcornFoxDelivery", method: "POST", pathTemplate: "/api/v1/acornfox/apps/{applicationId}/deliveries/{deploymentId}/restart", invoke: (api) => api.restart("app", "deployment") },
   { operationId: "redeployAcornFoxDelivery", method: "POST", pathTemplate: "/api/v1/acornfox/apps/{applicationId}/deliveries/{deploymentId}/redeploy", invoke: (api) => api.redeploy("app", "deployment") },
   { operationId: "getAcornFoxDeliveryPublicAccess", method: "GET", pathTemplate: "/api/v1/acornfox/apps/{applicationId}/deliveries/{deploymentId}/public-access", invoke: (api) => api.publicAccess("app", "deployment") },
@@ -128,9 +130,7 @@ describe("AcornFox OpenAPI parity", () => {
     expect(contract.sourceRequestType).toBe("public_git");
     expect(contract.sourceRevisionKind).toBe("git_https");
     const visible = contract.operations.filter((operation) => operation.visible);
-    expect(contract.operations.filter((operation) => !operation.visible)).toEqual([
-      expect.objectContaining({ operationId: "probeAcornFoxDeliveryOnce" }),
-    ]);
+    expect(contract.operations.every((operation) => operation.visible)).toBe(true);
     expect(webOperations).toHaveLength(visible.length);
     const contractByID = new Map(visible.map((operation) => [operation.operationId, operation]));
 

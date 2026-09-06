@@ -4,6 +4,8 @@ import {
   expectedSuccessStatus,
 } from "./client";
 
+import { refetchAfterAccepted } from "./state";
+
 type Seen = { url: string; init: RequestInit };
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), {
@@ -68,7 +70,7 @@ describe("AcornFox API client", () => {
         },
         202,
       );
-    if (url.endsWith("/restart") || url.endsWith("/redeploy"))
+    if (url.endsWith("/restart") || url.endsWith("/redeploy") || url.endsWith("/probes"))
       return json(
         {
           deployment_id: "d",
@@ -167,7 +169,10 @@ describe("AcornFox API client", () => {
     await api.redeploy("a b", "d c");
     await api.publicAccess("a b", "d c");
     await api.setPublicAccess("a b", "d c", true);
-    expect(seen).toHaveLength(17);
+    const accepted = await api.probe("a b", "d c");
+    expect(accepted.status).toBe("accepted");
+    expect(accepted).not.toHaveProperty("response");
+    expect(seen).toHaveLength(18);
     expect(seen.every((item) => item.url.startsWith("/api/v1/acornfox/"))).toBe(
       true,
     );
@@ -183,6 +188,9 @@ describe("AcornFox API client", () => {
     const create = seen[6]!;
     const deploy = seen[10]!;
     const access = seen[16]!;
+    const probe = seen[17]!;
+    expect(probe.url).toBe("/api/v1/acornfox/apps/a%20b/deliveries/d%20c/probes");
+    expect(JSON.parse(String(probe.init.body))).toEqual({ protocol: "http", path: "/" });
     expect(login.init.method).toBe("POST");
     expect(login.init.redirect).toBe("error");
     expect(new Headers(login.init.headers).get("X-AcornFox-CSRF")).toBeNull();
@@ -194,7 +202,7 @@ describe("AcornFox API client", () => {
       "token 1",
     );
     expect(new Headers(logout.init.headers).get("Idempotency-Key")).toBeNull();
-    for (const item of [create, deploy, access]) {
+    for (const item of [create, deploy, access, probe]) {
       expect(new Headers(item.init.headers).get("X-AcornFox-CSRF")).toBe(
         "token 1",
       );
@@ -215,6 +223,18 @@ describe("AcornFox API client", () => {
       container_port: 8080,
     });
     expect(JSON.parse(String(access.init.body))).toEqual({ enabled: true });
+  });
+
+  it("keeps a response pending when the accepted probe has no recorded result", async () => {
+    const api = createAcornFoxClient(fetcher);
+    const accepted = await api.probe("a", "d");
+    expect(accepted.status).toBe("accepted");
+    const facts = await refetchAfterAccepted(() => api.status("a", "d"));
+    expect(facts.response).toBeNull();
+    expect(seen.map(({ url, init }) => [url, init.method ?? "GET"])).toEqual([
+      ["/api/v1/acornfox/apps/a/deliveries/d/probes", "POST"],
+      ["/api/v1/acornfox/apps/a/deliveries/d", "GET"],
+    ]);
   });
 
   it("maps server and transport failures without accepting malformed data", async () => {
@@ -414,6 +434,7 @@ describe("AcornFox API client", () => {
       ["/apps/a/deliveries", "POST", 202],
       ["/apps/a/deliveries/d", "GET", 200],
       ["/apps/a/deliveries/d/logs", "GET", 200],
+      ["/apps/a/deliveries/d/probes", "POST", 202],
       ["/apps/a/deliveries/d/restart", "POST", 202],
       ["/apps/a/deliveries/d/redeploy", "POST", 202],
       ["/apps/a/deliveries/d/public-access", "GET", 200],
@@ -444,6 +465,9 @@ describe("AcornFox API client", () => {
         200,
       ),
     );
+    await expect(wrongCommand.probe("a", "d")).rejects.toMatchObject({
+      code: "invalid_response",
+    });
     await expect(wrongCommand.deploy("a", "s")).rejects.toMatchObject({
       code: "invalid_response",
     });
