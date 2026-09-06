@@ -34,10 +34,7 @@ func (p *Provider) restoreActive(ctx context.Context, snapshot durableRuntimeSta
 			return nil
 		}
 	}
-	if facts.State.Running {
-		return nil
-	}
-	if facts.State.Status != "exited" {
+	if !facts.State.Running && facts.State.Status != "exited" {
 		return fail("runtime state is not eligible for restoration")
 	}
 	if p.config.ExistingNetworkValidator == nil || p.config.RestoreActiveGuard(ctx) != nil {
@@ -52,6 +49,9 @@ func (p *Provider) restoreActive(ctx context.Context, snapshot durableRuntimeSta
 	}
 	if err != nil || p.config.ExistingNetworkValidator([]byte(rawNetwork)) != nil || json.Unmarshal([]byte(rawNetwork), &networks) != nil || len(networks) != 1 || !validContainerID(networks[0].ID) || !facts.matchesRestoreNetwork(p.config.Network, networks[0].ID) {
 		return fail("runtime network attachments are missing or changed")
+	}
+	if facts.State.Running {
+		return nil
 	}
 	// Address the immutable ID, never an adoptable name, across the start boundary.
 	if err := p.run(ctx, []string{"start", snapshot.ContainerID}); err != nil {

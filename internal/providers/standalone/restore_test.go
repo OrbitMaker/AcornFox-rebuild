@@ -179,6 +179,11 @@ func TestInstalledReconcileResumesOnlyVerifiedActiveContainers(t *testing.T) {
 					t.Fatalf("new allocation during restore: %d", ports.allocated)
 				}
 			}
+			if tc.postStartNetworkDrift {
+				if retryErr := fresh.Reconcile(context.Background()); retryErr == nil || starts != 1 {
+					t.Fatalf("retry adopted refused running multi-network container: err=%v starts=%d", retryErr, starts)
+				}
+			}
 			if tc.wantError && fresh.states[deployment.ID] != nil {
 				t.Fatal("failed recovery published runtime as ready")
 			}
