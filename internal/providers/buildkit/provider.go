@@ -21,6 +21,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/open-card/open-card/internal/acornfoxrelease"
@@ -751,6 +752,10 @@ func within(root, path string) bool {
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
+// The random runRoot is private (0700), while the context it contains uses
+// conventional Docker COPY modes so image users can traverse/read the tree.
+// As in foundation.DigestTree, only the regular file's executable boolean is
+// retained; uploaded write and special permission bits never propagate.
 func copyTree(source, destination string) error {
 	return filepath.WalkDir(source, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
@@ -769,25 +774,44 @@ func copyTree(source, destination string) error {
 			return err
 		}
 		if info.IsDir() {
-			return os.MkdirAll(target, 0o700)
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				return err
+			}
+			targetInfo, err := os.Lstat(target)
+			if err != nil || !targetInfo.IsDir() || targetInfo.Mode()&os.ModeSymlink != 0 {
+				return errors.New("build-context directory is not regular")
+			}
+			return os.Chmod(target, 0o755)
 		}
-		if !info.Mode().IsRegular() {
-			return fmt.Errorf("non-regular build-context file: %s", rel)
+		if !singleLinkedContextFile(info) {
+			return fmt.Errorf("non-regular or linked build-context file: %s", rel)
 		}
-		in, err := os.Open(path)
+		in, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 		if err != nil {
 			return err
 		}
-		mode := fs.FileMode(0o600)
-		if info.Mode().Perm()&0o111 != 0 {
-			mode = 0o700
+		opened, err := in.Stat()
+		if err != nil || !singleLinkedContextFile(opened) || !os.SameFile(info, opened) || info.Size() != opened.Size() || (info.Mode().Perm()&0o111 != 0) != (opened.Mode().Perm()&0o111 != 0) {
+			in.Close()
+			return errors.New("build-context source changed")
 		}
-		out, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
+		mode := fs.FileMode(0o644)
+		if opened.Mode().Perm()&0o111 != 0 {
+			mode = 0o755
+		}
+		out, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 		if err != nil {
 			in.Close()
 			return err
 		}
-		_, copyErr := io.Copy(out, in)
+		copied, copyErr := io.Copy(out, io.LimitReader(in, opened.Size()+1))
+		after, statErr := in.Stat()
+		if copyErr == nil && (copied != opened.Size() || statErr != nil || !singleLinkedContextFile(after) || after.Size() != opened.Size() || (after.Mode().Perm()&0o111 != 0) != (opened.Mode().Perm()&0o111 != 0)) {
+			copyErr = errors.New("build-context source changed")
+		}
+		if copyErr == nil {
+			copyErr = out.Chmod(mode)
+		}
 		closeErr := out.Close()
 		closeInputErr := in.Close()
 		if copyErr != nil {
@@ -798,6 +822,13 @@ func copyTree(source, destination string) error {
 		}
 		return closeInputErr
 	})
+}
+func singleLinkedContextFile(info fs.FileInfo) bool {
+	if info == nil || !info.Mode().IsRegular() || info.Size() < 0 {
+		return false
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	return ok && stat.Nlink == 1
 }
 
 func (p *Provider) mountSecrets(ctx context.Context, references []domain.SecretReference, operation contracts.OperationContext) ([]string, []contracts.BuildSecretMaterial, error) {

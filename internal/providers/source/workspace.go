@@ -115,16 +115,16 @@ func copyDirectory(source, destination string, limits foundation.ArchiveLimits) 
 }
 
 func copyLocalFile(source, destination, relative string, expected fs.FileInfo, max int64) error {
-	input, err := os.Open(source)
+	input, err := os.OpenFile(source, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return errUploadRejected
 	}
 	defer input.Close()
 	actual, err := input.Stat()
-	if err != nil || !sourceSingleLinkedRegular(actual) || !os.SameFile(expected, actual) || actual.Size() != expected.Size() {
+	if err != nil || !sourceSingleLinkedRegular(actual) || !os.SameFile(expected, actual) || actual.Size() != expected.Size() || (actual.Mode().Perm()&0o111 != 0) != (expected.Mode().Perm()&0o111 != 0) {
 		return errUploadRejected
 	}
-	output, err := createDestinationFile(destination, relative)
+	output, err := createDestinationFile(destination, relative, actual.Mode())
 	if err != nil {
 		return err
 	}
@@ -200,7 +200,7 @@ func extractZIP(source, destination string, limits foundation.ArchiveLimits) err
 		if err != nil {
 			return errUploadRejected
 		}
-		output, err := createDestinationFile(destination, normalized)
+		output, err := createDestinationFile(destination, normalized, file.Mode())
 		if err == nil {
 			_, err = copyExact(output, input, int64(file.UncompressedSize64), limits.MaxUnpackedBytes-bytes)
 		}
@@ -291,7 +291,7 @@ func extractTar(reader *tar.Reader, destination string, limits foundation.Archiv
 		if files > limits.MaxFiles || header.Size < 0 || header.Size > limits.MaxUnpackedBytes-bytes {
 			return fmt.Errorf("archive entry exceeds limits: %w", errUploadRejected)
 		}
-		output, err := createDestinationFile(destination, decision.NormalizedPath)
+		output, err := createDestinationFile(destination, decision.NormalizedPath, fs.FileMode(header.Mode))
 		if err != nil {
 			return err
 		}
@@ -383,7 +383,10 @@ func makeDestinationDir(destination, relative string) error {
 	return os.MkdirAll(path, 0o700)
 }
 
-func createDestinationFile(destination, relative string) (*os.File, error) {
+// Only the executable boolean is source identity (foundation.DigestTree).
+// All incoming write, set-id and sticky bits are discarded. The writable
+// staging copy remains private until publication makes it immutable.
+func createDestinationFile(destination, relative string, sourceMode fs.FileMode) (*os.File, error) {
 	path, err := destinationPath(destination, relative)
 	if err != nil {
 		return nil, err
@@ -393,6 +396,14 @@ func createDestinationFile(destination, relative string) (*os.File, error) {
 	}
 	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
+		return nil, errUploadRejected
+	}
+	mode := fs.FileMode(0o600)
+	if sourceMode.Perm()&0o111 != 0 {
+		mode = 0o700
+	}
+	if err := file.Chmod(mode); err != nil {
+		_ = file.Close()
 		return nil, errUploadRejected
 	}
 	return file, nil
@@ -438,10 +449,14 @@ func makeReadOnly(root string) error {
 			return os.Chmod(path, 0o555)
 		}
 		info, err := entry.Info()
-		if err != nil || !info.Mode().IsRegular() {
+		if err != nil || !sourceSingleLinkedRegular(info) {
 			return errUploadRejected
 		}
-		return os.Chmod(path, 0o444)
+		mode := fs.FileMode(0o444)
+		if info.Mode().Perm()&0o111 != 0 {
+			mode = 0o555
+		}
+		return os.Chmod(path, mode)
 	})
 }
 
