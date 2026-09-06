@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/open-card/open-card/internal/application"
 	"github.com/open-card/open-card/internal/contracts"
 	"github.com/open-card/open-card/internal/domain"
 	"net"
@@ -537,8 +538,17 @@ func (s *Store) GetAcornFoxRoutableEndpoint(ctx context.Context, a, d domain.ID)
 		return contracts.AcornFoxRoutableEndpoint{}, e
 	}
 	p, e := s.GetLatestAcornFoxProbeObservation(ctx, a, d)
-	if e != nil || p.Outcome != contracts.AcornFoxProbeOutcomeResponded || p.ObservedAt.Before(r.ObservedAt) {
-		return contracts.AcornFoxRoutableEndpoint{}, ErrNotFound
+	// Runtime lookup above has already bound the application and deployment.
+	// A missing or outdated response is an unmet readiness precondition, not a
+	// missing resource. Preserve actual database failures and ownership errors.
+	if errors.Is(e, ErrNotFound) {
+		return contracts.AcornFoxRoutableEndpoint{}, application.ErrAcornFoxInternalEndpointNotReady
+	}
+	if e != nil {
+		return contracts.AcornFoxRoutableEndpoint{}, e
+	}
+	if p.Outcome != contracts.AcornFoxProbeOutcomeResponded || p.ObservedAt.Before(r.ObservedAt) {
+		return contracts.AcornFoxRoutableEndpoint{}, application.ErrAcornFoxInternalEndpointNotReady
 	}
 	h, ps, e := net.SplitHostPort(r.InternalAddress)
 	if e != nil || !net.ParseIP(h).IsLoopback() {

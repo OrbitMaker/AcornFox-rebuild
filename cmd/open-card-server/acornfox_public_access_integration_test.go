@@ -9,6 +9,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -358,6 +360,10 @@ func (r *dns10Router) RemoveAcornFoxPublicRoute(context.Context, contracts.Acorn
 }
 
 func seedAcornFoxDNS10Fixture(t *testing.T, ctx context.Context, db *sql.DB) dns10Fixture {
+	return seedAcornFoxDNS10FixtureWithProbe(t, ctx, db, true, 0)
+}
+
+func seedAcornFoxDNS10FixtureWithProbe(t *testing.T, ctx context.Context, db *sql.DB, includeProbe bool, probeAge time.Duration) dns10Fixture {
 	t.Helper()
 	now := time.Unix(1_700_010_000, 0).UTC()
 	f := dns10Fixture{app: "app_dns10", env: "env_dns10", release: "release_dns10", operation: "op_dns10", task: "task_dns10", now: now}
@@ -386,6 +392,12 @@ func seedAcornFoxDNS10Fixture(t *testing.T, ctx context.Context, db *sql.DB) dns
 		{`INSERT INTO acornfox_probe_observations(id,sample_id,task_id,agent_sequence,application_id,environment_id,release_id,deployment_id,service_name,protocol,target_class,outcome,http_status,latency_ms,observed_at,created_at,fact_digest) VALUES('probe_dns10','sample_dns10','task_probe_dns10',1,$1,$2,$3,$4,'web','http','loopback','responded',200,1,$5,$5,'sha256:` + strings.Repeat("e", 64) + `')`, []any{f.app, f.env, f.release, dep, now}},
 	}
 	for _, s := range stmts {
+		if strings.HasPrefix(s.q, "INSERT INTO acornfox_probe_observations") {
+			if !includeProbe {
+				continue
+			}
+			s.a[len(s.a)-1] = now.Add(-probeAge)
+		}
 		if _, err := db.ExecContext(ctx, s.q, s.a...); err != nil {
 			t.Fatalf("seed: %v", err)
 		}
@@ -453,5 +465,72 @@ func applyAcornFoxDNS10Migrations(t *testing.T, ctx context.Context, db *sql.DB)
 		if _, err = db.ExecContext(ctx, string(b)); err != nil {
 			t.Fatalf("migration %s: %v", n, err)
 		}
+	}
+}
+
+// The first installed enable attempt had an owned running runtime but no probe.
+// Exercise the real SQL -> service -> HTTP chain, including foreign ownership,
+// so a readiness error cannot be mistaken for an absent application.
+func TestAcornFoxPublicAccessProbeReadinessClassification(t *testing.T) {
+	dsn := strings.TrimSpace(os.Getenv("OPEN_CARD_AFB_DNS10_TEST_DATABASE_URL"))
+	if dsn == "" {
+		t.Skip("OPEN_CARD_AFB_DNS10_TEST_DATABASE_URL is required")
+	}
+	validateAcornFoxDNS10DSN(t, dsn)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for _, tc := range []struct {
+		name    string
+		probe   bool
+		age     time.Duration
+		foreign bool
+		status  int
+		code    string
+	}{
+		{name: "missing probe", status: 409, code: "internal_endpoint_not_ready"},
+		{name: "probe predates runtime", probe: true, age: time.Second, status: 409, code: "internal_endpoint_not_ready"},
+		{name: "foreign deployment without probe", foreign: true, status: 404, code: "not_found"},
+		{name: "foreign deployment with probe", foreign: true, probe: true, status: 404, code: "not_found"},
+		{name: "accepted current probe", probe: true, status: 200},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := db.ExecContext(ctx, `DROP SCHEMA public CASCADE; CREATE SCHEMA public`); err != nil {
+				t.Fatal(err)
+			}
+			applyAcornFoxDNS10Migrations(t, ctx, db)
+			f := seedAcornFoxDNS10FixtureWithProbe(t, ctx, db, tc.probe, tc.age)
+			app := f.app
+			if tc.foreign {
+				app = "other_app"
+			}
+			router := &dns10Router{}
+			service := &application.AcornFoxPublicAccessService{Store: postgres.NewStore(db), Router: acornFoxPublicAccessRouteAdapter{Routes: router}, Config: application.AcornFoxPublicAccessConfig{AuthorizedRoot: "example.test"}}
+			handler := &AcornFoxPublicAccessHTTPHandler{Service: service}
+			req := httptest.NewRequest(http.MethodPut, "/public-access", strings.NewReader(`{"enabled":true}`)).WithContext(ctx)
+			req.Header.Set("Idempotency-Key", "probe-readiness-enable")
+			recorder := httptest.NewRecorder()
+			handler.Handle(recorder, req, app, f.dep)
+			var body map[string]any
+			if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			if recorder.Code != tc.status || (tc.code != "" && body["code"] != tc.code) {
+				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+			if tc.status != 200 {
+				var commands int
+				if err := db.QueryRowContext(ctx, `SELECT count(*) FROM acornfox_public_access_commands`).Scan(&commands); err != nil {
+					t.Fatal(err)
+				}
+				if commands != 0 || router.apply != 0 || router.remove != 0 {
+					t.Fatalf("failed precondition mutated commands=%d apply=%d remove=%d", commands, router.apply, router.remove)
+				}
+			}
+		})
 	}
 }
