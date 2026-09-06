@@ -20,7 +20,7 @@ func TestCleanAgentRequiresPreparedNetworkAndExplicitDNS(t *testing.T) {
 	}
 	config := standalone.Config{}
 	bindInstalledRuntimeNetwork(&config, environment)
-	if config.ExistingNetworkValidator == nil || !reflect.DeepEqual(config.DNS, []string{"223.5.5.5", "223.6.6.6"}) {
+	if config.RestoreActiveGuard == nil || config.ExistingNetworkValidator == nil || !reflect.DeepEqual(config.DNS, []string{"223.5.5.5", "223.6.6.6"}) {
 		t.Fatal("clean runtime can fall back to an unguarded/default-DNS network")
 	}
 	if config.ExistingNetworkValidator([]byte(`[]`)) == nil {
@@ -32,7 +32,18 @@ func TestCleanAgentRequiresPreparedNetworkAndExplicitDNS(t *testing.T) {
 	}
 	config = standalone.Config{}
 	bindInstalledRuntimeNetwork(&config, legacy)
-	if config.ExistingNetworkValidator != nil || config.DNS != nil {
+	if config.RestoreActiveGuard != nil || config.ExistingNetworkValidator != nil || config.DNS != nil {
 		t.Fatal("legacy behavior changed")
+	}
+}
+
+func TestRuntimeGuardReadinessRequiresExactSuccessfulOneshot(t *testing.T) {
+	for _, raw := range []string{"", "ActiveState=active\nSubState=running\nResult=success\n", "ActiveState=inactive\nSubState=dead\nResult=success\n", "ActiveState=active\nSubState=exited\nResult=exit-code\n", "ActiveState=active\nSubState=exited\n", "ActiveState=active\nSubState=exited\nResult=success\nResult=success\n"} {
+		if successfulRuntimeGuardState(raw) {
+			t.Fatalf("unsafe guard accepted: %q", raw)
+		}
+	}
+	if !successfulRuntimeGuardState("Result=success\nSubState=exited\nActiveState=active\n") {
+		t.Fatal("successful guard rejected")
 	}
 }

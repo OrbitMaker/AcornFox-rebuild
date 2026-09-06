@@ -313,7 +313,8 @@ func (p *Provider) confirmContainerAbsent(ctx context.Context, container string)
 }
 
 // Reconcile restores every owned durable runtime state without allocating a
-// port or creating a container. Any unsafe state stops reconciliation.
+// port or creating a container. Installed hosts may resume stopped active
+// containers only through RestoreActiveGuard. Any unsafe state stops reconciliation.
 func (p *Provider) Reconcile(ctx context.Context) error {
 	entries, err := filepath.Glob(filepath.Join(p.config.WorkRoot, ".standalone-state-*.json"))
 	if err != nil {
@@ -346,6 +347,9 @@ func (p *Provider) Reconcile(ctx context.Context) error {
 		}
 		state, err := p.stateFromDurable(ctx, snapshot, contracts.OperationContext{IdempotencyKey: "runtime-reconcile-" + hash(snapshot.Deployment.ID.String())[:24]}, contracts.CapabilityRuntimeObserve, "reconcile")
 		if err != nil {
+			return err
+		}
+		if err := p.restoreActive(ctx, snapshot, state); err != nil {
 			return err
 		}
 		p.mu.Lock()

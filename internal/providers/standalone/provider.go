@@ -96,6 +96,10 @@ type Config struct {
 	// networks fail closed; this provider must never recreate an unguarded bridge.
 	ExistingNetworkValidator func([]byte) error
 	DNS                      []string
+	// RestoreActiveGuard opts the installed host into startup recovery. The
+	// caller must verify that the root-owned network guard started successfully.
+	// Nil preserves observation-only reconciliation for other integrations.
+	RestoreActiveGuard func(context.Context) error
 }
 
 func (c Config) normalized() (Config, error) {
