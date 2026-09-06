@@ -522,7 +522,7 @@ func acornFoxRuntimeInspectDirectory(root *os.Root, store *TaskAcornFoxRepoStore
 		return nil, ErrAcornFoxRuntimeConfigConflict
 	}
 	entries := []SubstrateEntry{{Path: path, Kind: SubstrateEntryDirectory, Mode: uint32(info.Mode().Perm()), Role: OwnerRoleRoot, Group: GroupRoleRoot}}
-	if len(children) > 7 || (final || info.Mode().Perm() == 0755) && len(children) != 7 {
+	if len(children) > len(i.Files) || (final || info.Mode().Perm() == 0755) && len(children) != len(i.Files) {
 		return nil, ErrAcornFoxRuntimeConfigConflict
 	}
 	for _, child := range children {
