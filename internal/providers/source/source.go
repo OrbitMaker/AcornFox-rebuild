@@ -471,17 +471,55 @@ func (p *Provider) resolveCommit(ctx context.Context, git foundation.GitSource, 
 func (p *Provider) extractGitArchive(ctx context.Context, gitDir, commit, stage string) error {
 	command := exec.CommandContext(ctx, p.gitBinary, "-C", gitDir, "-c", "core.hooksPath=/dev/null", "archive", "--format=tar", commit)
 	command.Env = gitEnvironment()
+	// A canceled archive must close inherited stdout writers too, otherwise
+	// draining the pipe could outlive the Git parent and its deadline.
+	startGitProcessGroup(command)
+	command.Cancel = func() error { stopGitProcessGroup(command); return nil }
 	stdout, err := command.StdoutPipe()
 	if err != nil {
 		return errGitUnavailable
 	}
 	if err := command.Start(); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		return errGitUnavailable
 	}
 	copyErr := extractTar(tar.NewReader(stdout), stage, p.limits)
+	if copyErr == nil {
+		// tar.Reader stops at its logical EOF, before Git's zero record padding.
+		// Drain that bounded padding before Wait so a full stdout pipe cannot
+		// prevent the archive producer from exiting. A second archive is not padding.
+		const maxGitArchivePadding = 1 << 20
+		tail := &io.LimitedReader{R: stdout, N: maxGitArchivePadding + 1}
+		buffer := make([]byte, 32<<10)
+		for {
+			n, readErr := tail.Read(buffer)
+			if n > 0 {
+				if tail.N == 0 {
+					copyErr = errGitTooLarge
+					break
+				}
+				if len(bytes.Trim(buffer[:n], "\x00")) != 0 {
+					copyErr = errUploadRejected
+					break
+				}
+			}
+			if readErr == io.EOF {
+				break
+			}
+			if readErr != nil || n == 0 {
+				copyErr = errGitUnavailable
+				break
+			}
+		}
+	}
 	if copyErr != nil {
-		_ = command.Process.Kill()
+		stopGitProcessGroup(command)
 		_ = command.Wait()
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		return copyErr
 	}
 	waitErr := command.Wait()
