@@ -4,7 +4,9 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 )
@@ -28,6 +30,11 @@ func acornFoxValidateProductionManagedScopePrefix(root *os.Root, store *TaskAcor
 	if err := acornFoxValidatePinnedProductionState(root, store); err != nil {
 		return err
 	}
+	for _, parent := range []string{"opt", "etc", "var", "var/lib", "var/log", "etc/systemd", "etc/systemd/system"} {
+		if !acornFoxSharedParentSafe(root, store, parent) {
+			return ErrAcornFoxLiveConflict
+		}
+	}
 	want := make(map[string]SubstrateEntry, len(entries))
 	for _, entry := range entries {
 		if validateRelativePath(entry.Path) != nil || entry.Kind != SubstrateEntryFile && entry.Kind != SubstrateEntryDirectory {
@@ -38,6 +45,18 @@ func acornFoxValidateProductionManagedScopePrefix(root *os.Root, store *TaskAcor
 		}
 		want[entry.Path] = entry
 	}
+	if state == acornFoxRepoPrefixCurrent {
+		configuration, err := acornFoxRuntimeConfigScope(root, store, activation)
+		if err != nil {
+			return ErrAcornFoxLiveConflict
+		}
+		for _, entry := range configuration {
+			if _, exists := want[entry.Path]; exists {
+				return ErrAcornFoxLiveConflict
+			}
+			want[entry.Path] = entry
+		}
+	}
 	seen := make(map[string]bool, len(want))
 	for _, managed := range acornFoxProductionManagedRoots() {
 		if managed == "opt/acornfox" {
@@ -46,11 +65,11 @@ func acornFoxValidateProductionManagedScopePrefix(root *os.Root, store *TaskAcor
 			}
 			continue
 		}
-		if err := acornFoxValidateProductionTree(root, store, managed, want, seen); err != nil {
+		if err := acornFoxValidateProductionTreeWithRuntime(root, store, managed, want, seen, state == acornFoxRepoPrefixCurrent); err != nil {
 			return err
 		}
 	}
-	if err := acornFoxValidateProductionSystemd(root, store, want, seen); err != nil {
+	if err := acornFoxValidateProductionSystemdWithBootLinks(root, store, want, seen, state == acornFoxRepoPrefixCurrent); err != nil {
 		return err
 	}
 	for path := range want {
@@ -155,7 +174,8 @@ func acornFoxValidateProductionAcornFoxTree(root *os.Root, store *TaskAcornFoxRe
 		} else {
 			info, err := root.Lstat(path)
 			principal, ok := store.layout.owner(AcornFoxLiveRootRole)
-			if err != nil || !ok || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != durableDirMode || !acornFoxLiveObservedOwner(store, info, principal) {
+			modeOK := err == nil && (info.Mode().Perm() == store.layout.activationDirectoryMode() || acornFoxPrivateActivationPrefix(root, store, store.layout, path, info))
+			if err != nil || !ok || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || !modeOK || !acornFoxLiveObservedOwner(store, info, principal) {
 				return ErrAcornFoxLiveConflict
 			}
 		}
@@ -245,6 +265,48 @@ func acornFoxProductionSharedParent(path string) bool {
 	}
 }
 
+func acornFoxSharedParentSafe(root *os.Root, store *TaskAcornFoxRepoStore, path string) bool {
+	if !acornFoxProductionSharedParent(path) {
+		return false
+	}
+	info, err := root.Lstat(path)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return false
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || int(stat.Uid) != store.uid {
+		return false
+	}
+	if path != "var/log" {
+		return info.Mode().Perm() == 0o755 && int(stat.Gid) == store.gid
+	}
+	if info.Mode().Perm() != 0o755 && info.Mode().Perm() != 0o775 {
+		return false
+	}
+	if int(stat.Gid) == store.gid {
+		return true
+	}
+	// Ubuntu owns /var/log as root:syslog 0775. This is an OS ancestor,
+	// not a directory whose ownership the product may take over.
+	if store.layout.hostRootPath != "/" || store.uid != 0 {
+		return false
+	}
+	group, err := user.LookupGroup("syslog")
+	if err != nil {
+		return false
+	}
+	gid, err := strconv.Atoi(group.Gid)
+	return err == nil && gid == int(stat.Gid)
+}
+
+func acornFoxServiceDataRoot(path string) bool {
+	switch path {
+	case "var/lib/acornfox/uploads", "var/lib/acornfox/workspaces", "var/lib/acornfox/build-work", "var/lib/acornfox/oci", "var/lib/acornfox/secrets", "var/lib/acornfox/secret-materials", "var/lib/acornfox/health-secret-materials", "var/lib/acornfox/agent", "var/lib/acornfox/buildkit", "var/lib/acornfox/caddy", "var/lib/acornfox/edge", "var/lib/acornfox/edge/home", "var/lib/acornfox/edge/data", "var/lib/acornfox/edge/config", "var/lib/acornfox/healthcheck", "var/log/acornfox/server", "var/log/acornfox/agent", "var/log/acornfox/caddy", "var/log/acornfox/edge":
+		return true
+	}
+	return false
+}
+
 func acornFoxProductionStateChild(path string) bool {
 	return strings.HasPrefix(path, "var/lib/acornfox/install/")
 }
@@ -319,6 +381,10 @@ func acornFoxValidateControlPlaneState(root *os.Root, store *TaskAcornFoxRepoSto
 }
 
 func acornFoxValidateProductionTree(root *os.Root, store *TaskAcornFoxRepoStore, path string, want map[string]SubstrateEntry, seen map[string]bool) error {
+	return acornFoxValidateProductionTreeWithRuntime(root, store, path, want, seen, false)
+}
+
+func acornFoxValidateProductionTreeWithRuntime(root *os.Root, store *TaskAcornFoxRepoStore, path string, want map[string]SubstrateEntry, seen map[string]bool, runtimeData bool) error {
 	entry, ok := want[path]
 	if !ok || entry.Kind != SubstrateEntryDirectory || !acornFoxProductionEntryMatches(root, store, path, entry) {
 		return ErrAcornFoxLiveConflict
@@ -326,6 +392,26 @@ func acornFoxValidateProductionTree(root *os.Root, store *TaskAcornFoxRepoStore,
 	seen[path] = true
 	if path == "var/lib/acornfox/install" {
 		return nil // exact, pinned state subtree is not a path-prefix exemption.
+	}
+	if runtimeData && acornFoxServiceDataRoot(path) {
+		// Check only fixed scaffolding (notably edge/home,data,config).
+		// Never enumerate an unbounded directory of service-created data.
+		for childPath, child := range want {
+			if parentDirectory(childPath) != path {
+				continue
+			}
+			if child.Kind == SubstrateEntryDirectory {
+				if err := acornFoxValidateProductionTreeWithRuntime(root, store, childPath, want, seen, true); err != nil {
+					return err
+				}
+			} else {
+				if !acornFoxProductionEntryMatches(root, store, childPath, child) {
+					return ErrAcornFoxLiveConflict
+				}
+				seen[childPath] = true
+			}
+		}
+		return nil
 	}
 	dir, err := root.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
@@ -343,7 +429,7 @@ func acornFoxValidateProductionTree(root *os.Root, store *TaskAcornFoxRepoStore,
 			return ErrAcornFoxLiveConflict
 		}
 		if entry.Kind == SubstrateEntryDirectory {
-			if err := acornFoxValidateProductionTree(root, store, childPath, want, seen); err != nil {
+			if err := acornFoxValidateProductionTreeWithRuntime(root, store, childPath, want, seen, runtimeData); err != nil {
 				return err
 			}
 			continue
@@ -357,6 +443,10 @@ func acornFoxValidateProductionTree(root *os.Root, store *TaskAcornFoxRepoStore,
 }
 
 func acornFoxValidateProductionSystemd(root *os.Root, store *TaskAcornFoxRepoStore, want map[string]SubstrateEntry, seen map[string]bool) error {
+	return acornFoxValidateProductionSystemdWithBootLinks(root, store, want, seen, false)
+}
+
+func acornFoxValidateProductionSystemdWithBootLinks(root *os.Root, store *TaskAcornFoxRepoStore, want map[string]SubstrateEntry, seen map[string]bool, bootLinks bool) error {
 	const systemdRoot = "etc/systemd/system"
 	dir, err := root.OpenFile(systemdRoot, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if errors.Is(err, os.ErrNotExist) {
@@ -382,6 +472,9 @@ func acornFoxValidateProductionSystemd(root *os.Root, store *TaskAcornFoxRepoSto
 		path := systemdRoot + "/" + child.Name()
 		entry, ok := want[path]
 		if !ok {
+			if bootLinks && acornFoxBootRequiresDirectory(root, store, path) {
+				continue
+			}
 			return ErrAcornFoxLiveConflict
 		}
 		if entry.Kind == SubstrateEntryDirectory {
@@ -396,6 +489,41 @@ func acornFoxValidateProductionSystemd(root *os.Root, store *TaskAcornFoxRepoSto
 		seen[path] = true
 	}
 	return nil
+}
+
+func acornFoxBootRequiresDirectory(root *os.Root, store *TaskAcornFoxRepoStore, path string) bool {
+	switch path {
+	case "etc/systemd/system/acornfox-buildkit.service.requires", "etc/systemd/system/acornfox-caddy.service.requires", "etc/systemd/system/acornfox-server.service.requires", "etc/systemd/system/acornfox-agent.service.requires", "etc/systemd/system/acornfox-edge.service.requires":
+	default:
+		return false
+	}
+	info, err := root.Lstat(path)
+	principal, ok := store.layout.owner(AcornFoxLiveRootRole)
+	if !ok || err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o755 || !acornFoxLiveObservedOwner(store, info, principal) {
+		return false
+	}
+	dir, err := root.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return false
+	}
+	children, readErr := dir.ReadDir(2)
+	closeErr := dir.Close()
+	if (readErr != nil && !errors.Is(readErr, io.EOF)) || closeErr != nil || len(children) > 1 {
+		return false
+	}
+	if len(children) == 0 {
+		return true
+	} // Interrupted enable may leave an empty fixed directory.
+	if children[0].Name() != "acornfox-upgrade-safe.target" {
+		return false
+	}
+	link := path + "/" + children[0].Name()
+	info, err = root.Lstat(link)
+	if err != nil || info.Mode()&os.ModeSymlink == 0 || acornFoxRepoNlink(info) != 1 || !acornFoxLiveObservedOwner(store, info, principal) {
+		return false
+	}
+	target, err := root.Readlink(link)
+	return err == nil && (target == "../acornfox-upgrade-safe.target" || target == "/etc/systemd/system/acornfox-upgrade-safe.target")
 }
 
 func acornFoxProductionEntryMatches(root *os.Root, store *TaskAcornFoxRepoStore, path string, entry SubstrateEntry) bool {

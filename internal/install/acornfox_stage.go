@@ -337,7 +337,7 @@ func NewTaskAcornFoxStager(taskRoot string, uid, gid int) (*TaskAcornFoxStager, 
 }
 
 func newAcornFoxStagerForLayout(layout acornFoxInstallLayout) (*TaskAcornFoxStager, error) {
-	if layout.validate() != nil || forbiddenAcornFoxStageRoot(layout.stateRootPath) {
+	if layout.validate() != nil || forbiddenAcornFoxLayoutStageRoot(layout) {
 		return nil, errors.New("AcornFox task root is unsafe")
 	}
 	root, err := os.OpenRoot(layout.stateRootPath)
@@ -539,6 +539,16 @@ func forbiddenAcornFoxStageRoot(path string) bool {
 		}
 	}
 	return false
+}
+
+// A validated production layout has one fixed state directory. Task-root
+// callers retain the production-path exclusion; the exception is not a
+// configurable production root or a filesystem authority by itself.
+func forbiddenAcornFoxLayoutStageRoot(layout acornFoxInstallLayout) bool {
+	if layout.mode == acornFoxInstallLayoutProduction && layout.hostRootPath == "/" && layout.stateRootPath == "/var/lib/acornfox/install" {
+		return false
+	}
+	return forbiddenAcornFoxStageRoot(layout.stateRootPath)
 }
 
 func (s *TaskAcornFoxStager) createStage(name string) (stage *os.Root, err error) {

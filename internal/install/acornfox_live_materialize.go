@@ -112,6 +112,19 @@ func (m *acornFoxLiveMaterializer) Materialize(ctx context.Context) (result Acor
 		journal, m.lease.journal = next, next
 	}
 	for _, entry := range entries {
+		if entry.Kind == SubstrateEntryDirectory && m.lease.store.layout.mode == acornFoxInstallLayoutProduction && acornFoxProductionSharedParent(entry.Path) {
+			// Private host fixtures may create their OS baseline. A real host's
+			// shared directories are never created, chmodded or chowned here.
+			if _, err := target.Lstat(entry.Path); errors.Is(err, os.ErrNotExist) && m.lease.store.layout.hostRootPath != "/" {
+				if err := acornFoxLiveEnsureDirOwned(target, m.lease.store, entry.Path, os.FileMode(entry.Mode), acornFoxLivePrincipalForEntry(m.lease.store.layout, entry), markEffect); err != nil {
+					return AcornFoxLiveReceiptV1{}, err
+				}
+			}
+			if !acornFoxSharedParentSafe(target, m.lease.store, entry.Path) {
+				return AcornFoxLiveReceiptV1{}, fmt.Errorf("shared directory %s: %w", entry.Path, ErrAcornFoxLiveConflict)
+			}
+			continue
+		}
 		if entry.Kind == SubstrateEntryDirectory && acornFoxLiveEnsureDirOwned(target, m.lease.store, m.lease.store.layout.livePath(entry.Path), os.FileMode(entry.Mode), acornFoxLivePrincipalForEntry(m.lease.store.layout, entry), markEffect) != nil {
 			return AcornFoxLiveReceiptV1{}, fmt.Errorf("ensure directory %s: %w", entry.Path, ErrAcornFoxLiveConflict)
 		}
@@ -205,6 +218,9 @@ func acornFoxLiveMakeReceipt(journal AcornFoxRepoJournalV1, substrate *Published
 func acornFoxLiveMakeReceiptForLayout(layout acornFoxInstallLayout, journal AcornFoxRepoJournalV1, substrate *PublishedAcornFoxSubstrateV1, source []SubstrateEntry) (AcornFoxLiveReceiptV1, error) {
 	entries := make([]AcornFoxLiveEntryV1, 0, len(source))
 	for _, entry := range source {
+		if layout.mode == acornFoxInstallLayoutProduction && acornFoxProductionSharedParent(entry.Path) {
+			continue
+		}
 		live, err := acornFoxLiveEntryForLayout(layout, entry)
 		if err != nil {
 			return AcornFoxLiveReceiptV1{}, err

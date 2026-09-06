@@ -89,7 +89,7 @@ func NewTaskAcornFoxSubstratePublisher(taskRoot string, uid, gid int) (*TaskAcor
 
 func newAcornFoxSubstratePublisherForLayout(layout acornFoxInstallLayout) (*TaskAcornFoxSubstratePublisher, error) {
 	fs := newAcornFoxSubstrateFS()
-	if layout.validate() != nil || forbiddenAcornFoxStageRoot(layout.stateRootPath) {
+	if layout.validate() != nil || forbiddenAcornFoxLayoutStageRoot(layout) {
 		return nil, errors.New("AcornFox task substrate root is unsafe")
 	}
 	info := layout.stateRootInfo

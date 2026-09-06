@@ -12,7 +12,8 @@ SupplementaryGroups=acornfox-buildkit
 WorkingDirectory=/opt/acornfox/current
 Environment=ACORNFOX_RUNTIME_MODE=clean
 Environment=ACORNFOX_SERVER_ADDR=127.0.0.1:18481
-EnvironmentFile=-/etc/acornfox/server.env
+EnvironmentFile=/etc/acornfox/runtime/server.env
+LoadCredential=server.key:/etc/acornfox/runtime/server.key
 EnvironmentFile=/opt/acornfox/active/database.env
 ExecStart=/opt/acornfox/current/bin/acornfox-server
 Restart=on-failure

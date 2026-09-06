@@ -42,6 +42,16 @@ type acornFoxInstallPrincipal struct {
 	gid int
 }
 
+// Service binaries follow current -> active/release. Production activation
+// directories permit traversal, while root-only 0600 metadata stays private.
+// Other users cannot list the activation directory or read its metadata.
+func (l acornFoxInstallLayout) activationDirectoryMode() os.FileMode {
+	if l.mode == acornFoxInstallLayoutProduction {
+		return 0o711
+	}
+	return durableDirMode
+}
+
 var acornFoxInstallLayoutRoles = []AcornFoxLiveRole{
 	AcornFoxLiveRootRole,
 	AcornFoxLiveServerRole,

@@ -138,14 +138,16 @@ func runOutboundAgent(controlPlaneURL, instanceID, nodeID, version string, envir
 		if capacityErr != nil {
 			log.Fatal(capacityErr)
 		}
-		standaloneRuntime, storeErr := standalone.New(standalone.Config{
+		runtimeConfig := standalone.Config{
 			TaskPrefix:            getenv(acornfoxenv.RuntimeTaskPrefix),
 			Network:               getenv(acornfoxenv.RuntimeNetwork),
 			WorkRoot:              getenv(acornfoxenv.RuntimeWorkRoot),
 			ImageStore:            store,
 			Capacity:              capacityProvider,
 			WorkerNetworkIsolated: true,
-		})
+		}
+		bindInstalledRuntimeNetwork(&runtimeConfig, environment)
+		standaloneRuntime, storeErr := standalone.New(runtimeConfig)
 		if storeErr != nil {
 			log.Fatal(storeErr)
 		}

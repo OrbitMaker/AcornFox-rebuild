@@ -143,7 +143,11 @@ func acornFoxLocalFixture(t *testing.T) (acornFoxLocalDependencies, *[]string) {
 			}
 			unit := args[len(args)-1]
 			*visited = append(*visited, unit)
-			return []byte("Id=" + unit + "\nLoadState=loaded\nActiveState=active\nSubState=running\n"), nil
+			substate := "running"
+			if unit == "acornfox-runtime-network.service" {
+				substate = "exited"
+			}
+			return []byte("Id=" + unit + "\nLoadState=loaded\nActiveState=active\nSubState=" + substate + "\n"), nil
 		},
 		client: &http.Client{Transport: acornFoxRoundTrip(func(r *http.Request) (*http.Response, error) {
 			*visited = append(*visited, r.URL.String())

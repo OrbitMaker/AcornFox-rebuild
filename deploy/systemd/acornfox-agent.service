@@ -1,8 +1,8 @@
 [Unit]
 Description=AcornFox node agent
 Wants=network-online.target
-Requires=docker.service acornfox-upgrade-safe.target
-After=network-online.target docker.service acornfox-upgrade-safe.target
+Requires=docker.service acornfox-upgrade-safe.target acornfox-runtime-network.service
+After=network-online.target docker.service acornfox-upgrade-safe.target acornfox-runtime-network.service
 
 [Service]
 Type=simple
@@ -12,7 +12,8 @@ SupplementaryGroups=docker acornfox
 WorkingDirectory=/opt/acornfox/current
 Environment=ACORNFOX_RUNTIME_MODE=clean
 Environment=ACORNFOX_DOCKER_SOCKET=/var/run/docker.sock
-EnvironmentFile=-/etc/acornfox/agent.env
+EnvironmentFile=/etc/acornfox/runtime/agent.env
+LoadCredential=agent.key:/etc/acornfox/runtime/agent.key
 ExecStart=/opt/acornfox/current/bin/acornfox-agent
 Restart=on-failure
 RestartSec=5s

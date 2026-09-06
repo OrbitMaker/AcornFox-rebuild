@@ -72,6 +72,9 @@ func (Bundle) Format(s fmt.State, _ rune) { _, _ = io.WriteString(s, "acornfoxse
 
 var errInvalid = errors.New("invalid AcornFox setup bundle")
 
+// ValidateInputs checks operator choices without generating or publishing keys.
+func ValidateInputs(input Inputs) error { return validateInputs(input) }
+
 // Generate uses only the caller's random source. Supply crypto/rand.Reader in
 // production. On any error it returns an empty bundle and no private material.
 func Generate(input Inputs, randomness io.Reader) (Bundle, error) {

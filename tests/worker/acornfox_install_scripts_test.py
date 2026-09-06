@@ -68,6 +68,7 @@ class AcornFoxInstallScriptsTest(unittest.TestCase):
             '"$PREFLIGHT" --phase post',
             '"$INSTALL" --candidate-dir "$candidate_dir"',
             '"$MIGRATE" --pending',
+            '/opt/acornfox/upgrade-tools/acornfox-upgrade configure-runtime',
             "/usr/bin/systemctl daemon-reload",
             "/usr/bin/systemctl enable acornfox-upgrade-safe.target",
             "/usr/bin/systemctl enable acornfox-buildkit.service",

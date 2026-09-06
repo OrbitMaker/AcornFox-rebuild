@@ -1,0 +1,40 @@
+[Unit]
+Description=AcornFox application network boundary
+Requires=docker.service acornfox-upgrade-safe.target
+After=docker.service acornfox-upgrade-safe.target
+Before=acornfox-agent.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=root
+Group=root
+Environment=ACORNFOX_RUNTIME_MODE=clean
+# The two fixed kernel prerequisites run before the restricted network helper.
+ExecStartPre=+/usr/sbin/modprobe br_netfilter
+ExecStartPre=+/usr/sbin/sysctl -w net.bridge.bridge-nf-call-iptables=1
+ExecStart=/opt/acornfox/current/bin/acornfox-upgrade runtime-network-prepare
+RuntimeDirectory=acornfox-runtime-network
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+TimeoutStartSec=60s
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectProc=invisible
+LockPersonality=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_PTRACE
+ReadWritePaths=/var/lib/acornfox/install /run/acornfox-runtime-network
+UMask=0077
+# No stop cleanup: a stopped Agent must not remove running apps' network guard.
+
+[Install]
+WantedBy=multi-user.target

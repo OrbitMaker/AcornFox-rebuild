@@ -39,7 +39,7 @@ TOKEN_COUNTS = {
     "/etc/os-release": 3,
     "/usr/bin/grep": 10,
     "/usr/bin/uname": 1,
-    "/usr/bin/systemctl": 26,
+    "/usr/bin/systemctl": 30,
     "/usr/bin/docker": 1,
     "/usr/bin/psql": 1,
     "/usr/lib/postgresql/16/bin/postgres": 1,
@@ -56,7 +56,7 @@ TOKEN_COUNTS = {
     "/usr/bin/install": 2,
     "/usr/bin/dirname": 1,
     "/usr/bin/sha256sum": 3,
-    "/opt/acornfox/upgrade-tools/acornfox-upgrade": 1,
+    "/opt/acornfox/upgrade-tools/acornfox-upgrade": 2,
 }
 
 FAKE_NAMES = {
@@ -197,10 +197,18 @@ def main():
     elif name == "postgres":
         print("postgres (PostgreSQL) 16.3")
     elif name == "bootstrap-helper":
+        if args[:1] == ["validate-runtime-inputs"]:
+            assert args == ["validate-runtime-inputs", "--public-origin", "https://console.example.org", "--git-resolvers", "223.5.5.5:53,223.6.6.6:53"]
+            print('{"code":"runtime_inputs_valid","ok":true}')
+            return
         if args[:1] != ["repository-bootstrap"]:
             raise SystemExit(2)
         print('{"command":"repository-bootstrap","ok":true,"receipt":{"binding_sha256":"' + SHA + '","final_evidence_sha256":"' + SHA + '","layout_sha256":"' + SHA + '","release_id":"release-1.2.3-test.1","schema_version":1,"source_commit":"0123456789abcdef0123456789abcdef01234567","state":"REPO_PREPARED","substrate_receipt_sha256":"' + SHA + '"}}')
     elif name == "current-helper":
+        if args[:1] == ["configure-runtime"]:
+            assert args == ["configure-runtime", "--public-origin", "https://console.example.org", "--git-resolvers", "223.5.5.5:53,223.6.6.6:53"]
+            print('{"command":"configure-runtime","ok":true,"test_only":true}')
+            return
         if args != ["migrate-control-plane", "--pending"]:
             raise SystemExit(2)
         print('{"command":"migrate-control-plane","ok":true,"receipt":{"binding_sha256":"' + SHA + '","database_env_sha256":"' + SHA + '","database_identity_sha256":"' + SHA + '","migration_rows_sha256":"' + SHA + '","migration_version":1,"release_id":"release-1.2.3-test.1","schema_version":1,"source_commit":"0123456789abcdef0123456789abcdef01234567","state":"CONTROL_PLANE_MIGRATED"}}')
@@ -297,7 +305,7 @@ class RewrittenHost:
             "DATABASE_URL": "postgresql://parent-secret.invalid/db",
         }
         if confirmations:
-            env.update({"ACORNFOX_INSTALL_CONFIRMATION": "ACORNFOX-INSTALL", "ACORNFOX_DEDICATED_HOST_CONFIRMATION": "ACORNFOX-DEDICATED-HOST"})
+            env.update({"ACORNFOX_INSTALL_CONFIRMATION": "ACORNFOX-INSTALL", "ACORNFOX_DEDICATED_HOST_CONFIRMATION": "ACORNFOX-DEDICATED-HOST", "ACORNFOX_PUBLIC_ORIGIN":"https://console.example.org", "ACORNFOX_GIT_RESOLVERS":"223.5.5.5:53,223.6.6.6:53"})
         return subprocess.run(["/bin/bash", str(self.scripts / script), *args], capture_output=True, text=True, env=env, check=False)
 
     def host_args(self) -> list[str]:
@@ -334,16 +342,21 @@ class AcornFoxInstallScriptIntegrationTest(unittest.TestCase):
         result = self.host.run("install-host.sh", self.host.host_args(), confirmations=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         receipts = [json.loads(line) for line in result.stdout.splitlines()]
-        self.assertEqual([receipt["code"] if "code" in receipt else receipt["command"] for receipt in receipts], ["ok", "ok", "repository-bootstrap", "migrate-control-plane", "installed"])
+        self.assertEqual([receipt["code"] if "code" in receipt else receipt["command"] for receipt in receipts], ["runtime_inputs_valid", "ok", "ok", "repository-bootstrap", "migrate-control-plane", "configure-runtime", "installed"])
         self.assertEqual(receipts[-1], {"code": "installed", "ok": True, "schema_version": 1})
-        names = [str(call["name"]) for call in self.host.calls() if call["name"] != "env"]
+        names = [str(call["name"]) for call in self.host.calls() if call["name"] != "env" and call["argv"][:1] != ["validate-runtime-inputs"]]
         major = [name for name in names if name in {"apt-get", "groupadd", "useradd", "usermod", "install", "bootstrap-helper", "current-helper", "systemctl"}]
+        calls = self.host.calls()
+        validation = next(i for i,c in enumerate(calls) if c["name"] == "bootstrap-helper" and c["argv"][:1] == ["validate-runtime-inputs"])
+        self.assertLess(validation, next(i for i,c in enumerate(calls) if c["name"] == "apt-get"))
         self.assertLess(major.index("apt-get"), major.index("groupadd"))
         self.assertLess(major.index("groupadd"), major.index("usermod"))
         self.assertLess(major.index("usermod"), major.index("install"))
         self.assertLess(major.index("install"), major.index("bootstrap-helper"))
         self.assertLess(major.index("bootstrap-helper"), major.index("current-helper"))
         systemctl = [call["argv"] for call in self.host.calls() if call["name"] == "systemctl"]
+        self.assertLess(systemctl.index(["start", "acornfox-build-network.service"]), systemctl.index(["start", "acornfox-buildkit.service"]))
+        self.assertLess(systemctl.index(["start", "acornfox-runtime-network.service"]), systemctl.index(["start", "acornfox-agent.service"]))
         self.assertIn(["start", "acornfox-healthcheck.timer"], systemctl)
         self.assertIn(["start", "acornfox-healthcheck.service"], systemctl)
         self.assertNotIn(["is-active", "--quiet", "acornfox-healthcheck.service"], systemctl)

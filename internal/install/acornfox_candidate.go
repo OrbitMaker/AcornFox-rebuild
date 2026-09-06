@@ -46,6 +46,7 @@ var (
 	}
 	acornFoxV1Units = []string{
 		"systemd/acornfox-build-network.service",
+		"systemd/acornfox-runtime-network.service",
 		"systemd/acornfox-server.service", "systemd/acornfox-agent.service", "systemd/acornfox-buildkit.service",
 		"systemd/acornfox-caddy.service", "systemd/acornfox-edge.service", "systemd/acornfox-healthcheck.service",
 		"systemd/acornfox-healthcheck.timer", "systemd/acornfox-upgrade-recover.service",

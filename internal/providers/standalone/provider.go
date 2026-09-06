@@ -92,6 +92,10 @@ type Config struct {
 	MaxOCIBytes           int64
 	Clock                 func() time.Time
 	WorkerNetworkIsolated bool
+	// When supplied, the caller owns network preparation. Missing or altered
+	// networks fail closed; this provider must never recreate an unguarded bridge.
+	ExistingNetworkValidator func([]byte) error
+	DNS                      []string
 }
 
 func (c Config) normalized() (Config, error) {
@@ -107,6 +111,18 @@ func (c Config) normalized() (Config, error) {
 	if !safeName.MatchString(c.Network) || !strings.HasPrefix(c.Network, c.TaskPrefix+"-") {
 		return Config{}, errors.New("standalone network must be a task-prefixed safe name")
 	}
+	if len(c.DNS) > 8 {
+		return Config{}, errors.New("standalone DNS configuration is invalid")
+	}
+	seenDNS := map[string]bool{}
+	for _, address := range c.DNS {
+		ip := net.ParseIP(address)
+		if ip == nil || ip.To4() == nil || ip.String() != address || seenDNS[address] {
+			return Config{}, errors.New("standalone DNS configuration is invalid")
+		}
+		seenDNS[address] = true
+	}
+	c.DNS = append([]string(nil), c.DNS...)
 	if c.ImageStore == nil {
 		return Config{}, errors.New("standalone image store is required")
 	}
@@ -892,6 +908,13 @@ func (p *Provider) validateSpec(spec contracts.RuntimeSpec, operation contracts.
 func (p *Provider) ensureNetwork(ctx context.Context, operation contracts.OperationContext) error {
 	p.networkMu.Lock()
 	defer p.networkMu.Unlock()
+	if p.config.ExistingNetworkValidator != nil {
+		raw, err := p.output(ctx, []string{"network", "inspect", p.config.Network})
+		if err != nil || p.config.ExistingNetworkValidator([]byte(raw)) != nil {
+			return p.failure(operation, contracts.CapabilityRuntimeDeploy, "deploy", contracts.ErrConflict, "required runtime network is unavailable or changed", contracts.RetryUserAction, false, nil)
+		}
+		return nil
+	}
 	if output, err := p.output(ctx, []string{"network", "inspect", "--format", "{{index .Labels \"open-card.managed\"}}|{{index .Labels \"open-card.task-prefix\"}}", p.config.Network}); err == nil {
 		if strings.TrimSpace(output) == "true|"+p.config.TaskPrefix {
 			return nil
@@ -951,6 +974,9 @@ func (p *Provider) runArgs(container string, deployment domain.Deployment, spec 
 	}
 	if port != 0 {
 		args = append(args, "--publish", fmt.Sprintf("127.0.0.1:%d:%d/tcp", port, spec.Port))
+	}
+	for _, resolver := range p.config.DNS {
+		args = append(args, "--dns", resolver)
 	}
 	return append(args, imageRef(spec.Image))
 }

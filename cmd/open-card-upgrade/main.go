@@ -19,8 +19,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/open-card/open-card/internal/acornfoxsetup"
 	"github.com/open-card/open-card/internal/buildnetwork"
 	"github.com/open-card/open-card/internal/install"
+	"github.com/open-card/open-card/internal/runtimenetwork"
 )
 
 const (
@@ -69,6 +71,8 @@ type upgradeCommandConfig struct {
 	candidateDir   string
 	bindingSHA256  string
 	selfSHA256     string
+	publicOrigin   string
+	gitResolvers   string
 }
 
 type upgradeRuntime struct {
@@ -119,11 +123,16 @@ type upgradeDependencies struct {
 // runtime providers. Its five functions are the complete clean-mode effect
 // surface and are injected directly by focused command tests.
 type acornFoxCleanDependencies struct {
-	euid                func() int
-	bootstrap           func(context.Context, install.AcornFoxCandidateSetRequestV1) (install.AcornFoxHostBootstrapReceiptV1, error)
-	recover             func(context.Context) (install.AcornFoxHostBootstrapReceiptV1, error)
-	verifyPrepared      func(context.Context) (install.AcornFoxHostBootstrapReceiptV1, error)
-	migrateControlPlane func(context.Context, install.AcornFoxBuildIdentityV1) (install.AcornFoxControlPlaneMigrationReceiptV1, error)
+	euid                  func() int
+	bootstrap             func(context.Context, install.AcornFoxCandidateSetRequestV1) (install.AcornFoxHostBootstrapReceiptV1, error)
+	recover               func(context.Context) (install.AcornFoxHostBootstrapReceiptV1, error)
+	verifyPrepared        func(context.Context) (install.AcornFoxHostBootstrapReceiptV1, error)
+	migrateControlPlane   func(context.Context, install.AcornFoxBuildIdentityV1) (install.AcornFoxControlPlaneMigrationReceiptV1, error)
+	configureRuntime      func(context.Context, install.AcornFoxBuildIdentityV1, string, []string) (install.AcornFoxRuntimeConfigReceiptV1, error)
+	recoverRuntime        func(context.Context, install.AcornFoxBuildIdentityV1) error
+	verifyHelper          func(install.AcornFoxBuildIdentityV1) bool
+	prepareRuntimeNetwork func(context.Context) (runtimenetwork.Receipt, error)
+	verifyRuntimeNetwork  func(context.Context) error
 }
 
 type productionBootstrapRuntimeDependencies struct {
@@ -244,6 +253,13 @@ func productionUpgradeDependencies() upgradeDependencies {
 			recover:             install.RecoverAcornFoxHostV1,
 			verifyPrepared:      install.VerifyPreparedAcornFoxHostV1,
 			migrateControlPlane: install.MigrateAcornFoxControlPlaneV1,
+			configureRuntime:    install.ConfigureAcornFoxRuntimeV1,
+			recoverRuntime:      install.RecoverAcornFoxRuntimeV1,
+			verifyHelper: func(identity install.AcornFoxBuildIdentityV1) bool {
+				return install.VerifyProductionAcornFoxHelperContract(identity).OK
+			},
+			prepareRuntimeNetwork: runtimenetwork.Ensure,
+			verifyRuntimeNetwork:  runtimenetwork.Verify,
 		},
 	}
 }
@@ -365,6 +381,47 @@ func runAcornFoxClean(ctx context.Context, args []string, stdout io.Writer, role
 	if deps.euid == nil || deps.euid() != 0 {
 		return writeAcornFoxCleanError(stdout, exitIneligible, "root_ineligible")
 	}
+	if config.command == "validate-runtime-inputs" || config.command == "configure-runtime" {
+		input := acornfoxsetup.Inputs{Origin: config.publicOrigin, Version: identity.Version, ResolverEndpoints: strings.Split(config.gitResolvers, ","), Now: time.Now().UTC()}
+		if acornfoxsetup.ValidateInputs(input) != nil {
+			return writeAcornFoxCleanError(stdout, exitArgs, "runtime_inputs_invalid")
+		}
+		if config.command == "validate-runtime-inputs" {
+			return writeUpgradeJSON(stdout, exitOK, map[string]any{"ok": true, "code": "runtime_inputs_valid"})
+		}
+		if deps.configureRuntime == nil {
+			return writeAcornFoxCleanError(stdout, exitIneligible, "runtime_configuration_ineligible")
+		}
+		receipt, err := deps.configureRuntime(ctx, identity, input.Origin, input.ResolverEndpoints)
+		if err != nil || receipt.Validate() != nil || receipt.ReleaseID != identity.ReleaseID || receipt.SourceCommit != identity.SourceCommit {
+			return writeAcornFoxCleanError(stdout, exitRecovery, "runtime_configuration_incomplete")
+		}
+		return writeUpgradeJSON(stdout, exitOK, map[string]any{"ok": true, "command": config.command, "receipt": receipt})
+	}
+	if config.command == "runtime-network-prepare" || config.command == "runtime-network-verify" {
+		if deps.verifyHelper == nil || !deps.verifyHelper(identity) {
+			return writeAcornFoxCleanError(stdout, exitIneligible, "helper_identity_ineligible")
+		}
+		if config.command == "runtime-network-verify" {
+			if deps.verifyRuntimeNetwork == nil || deps.verifyRuntimeNetwork(ctx) != nil {
+				return writeAcornFoxCleanError(stdout, exitIneligible, "runtime_network_unavailable")
+			}
+			return writeUpgradeJSON(stdout, exitOK, map[string]any{"ok": true, "code": "runtime_network_verified"})
+		}
+		if deps.prepareRuntimeNetwork == nil {
+			return writeAcornFoxCleanError(stdout, exitIneligible, "runtime_network_ineligible")
+		}
+		r, err := deps.prepareRuntimeNetwork(ctx)
+		if err != nil || r.SchemaVersion != 1 || !validCLISHA(r.PolicySHA256) || !validCLISHA(r.NetworkID) || !validCLISHA(r.FirewallSHA256) {
+			return writeAcornFoxCleanError(stdout, exitIneligible, "runtime_network_unavailable")
+		}
+		return writeUpgradeJSON(stdout, exitOK, map[string]any{"ok": true, "code": "runtime_network_prepared", "receipt": r})
+	}
+	if config.command == "recover-prepare" && deps.recoverRuntime != nil {
+		if err := deps.recoverRuntime(ctx, identity); err != nil {
+			return writeAcornFoxCleanError(stdout, exitRecovery, "runtime_configuration_recovery_required")
+		}
+	}
 	if config.command == "migrate-control-plane" {
 		if deps.migrateControlPlane == nil {
 			return writeAcornFoxCleanError(stdout, exitIneligible, "control_plane_ineligible")
@@ -448,6 +505,27 @@ func parseAcornFoxCleanArgs(args []string) (upgradeCommandConfig, error) {
 		}
 		if !filepath.IsAbs(config.candidateDir) || filepath.Clean(config.candidateDir) == string(filepath.Separator) || !validCLISHA(config.bindingSHA256) || !validCLISHA(config.selfSHA256) || !containsExactly(args[1:], "--candidate-dir", "--binding-sha256", "--self-sha256") {
 			return upgradeCommandConfig{}, errors.New("invalid repository bootstrap")
+		}
+	case "validate-runtime-inputs", "configure-runtime":
+		if len(args) != 5 || !containsExactly(args[1:], "--public-origin", "--git-resolvers") {
+			return upgradeCommandConfig{}, errors.New("invalid runtime configuration arguments")
+		}
+		for i := 1; i < len(args); i += 2 {
+			switch args[i] {
+			case "--public-origin":
+				config.publicOrigin = args[i+1]
+			case "--git-resolvers":
+				config.gitResolvers = args[i+1]
+			default:
+				return upgradeCommandConfig{}, errors.New("unsupported runtime flag")
+			}
+		}
+		if config.publicOrigin == "" || config.gitResolvers == "" {
+			return upgradeCommandConfig{}, errors.New("runtime configuration is required")
+		}
+	case "runtime-network-prepare", "runtime-network-verify":
+		if len(args) != 1 {
+			return upgradeCommandConfig{}, errors.New("invalid runtime network arguments")
 		}
 	case "recover-prepare", "recover-finalize", "migrate-control-plane":
 		if len(args) != 2 || args[1] != "--pending" {

@@ -39,6 +39,7 @@ type acornFoxCandidateSetRequest = AcornFoxCandidateSetRequestV1
 // a different archive stream after the manifest and binding were checked.
 type acornFoxCandidateSet struct {
 	bindingRaw, manifestRaw, bundleRaw, buildRecordRaw []byte
+	predecessorRaw                                     []byte
 	bindingSHA256                                      string
 	binding                                            VerifiedAcornFoxBindingV1
 	archive                                            *os.File
@@ -141,7 +142,7 @@ func loadAcornFoxCandidateSet(request acornFoxCandidateSetRequest, predecessor [
 	if err != nil || !safeAcornFoxCandidateSetFile(archiveAfter, acornFoxArchiveMaxBytes) || !os.SameFile(archiveInfo, archiveAfter) {
 		return fail()
 	}
-	return &acornFoxCandidateSet{bindingRaw: bindingRaw, manifestRaw: manifestRaw, bundleRaw: bundleRaw, buildRecordRaw: buildRecordRaw, bindingSHA256: request.BindingSHA256, binding: binding, archive: archive, archiveSize: opened.Size()}, nil
+	return &acornFoxCandidateSet{bindingRaw: bindingRaw, manifestRaw: manifestRaw, bundleRaw: bundleRaw, buildRecordRaw: buildRecordRaw, predecessorRaw: append([]byte(nil), predecessor...), bindingSHA256: request.BindingSHA256, binding: binding, archive: archive, archiveSize: opened.Size()}, nil
 }
 
 // stageInput returns a single pinned, rewound archive descriptor. The caller
@@ -153,7 +154,7 @@ func (s *acornFoxCandidateSet) stageInput() (VerifyAcornFoxCandidateArtifactsV1I
 	if _, err := s.archive.Seek(0, io.SeekStart); err != nil {
 		return VerifyAcornFoxCandidateArtifactsV1Input{}, errors.New("AcornFox candidate archive cannot rewind")
 	}
-	return VerifyAcornFoxCandidateArtifactsV1Input{Binding: s.bindingRaw, BindingSHA256: s.bindingSHA256, Manifest: s.manifestRaw, BundleManifest: s.bundleRaw, Archive: s.archive, ArchiveSize: s.archiveSize}, nil
+	return VerifyAcornFoxCandidateArtifactsV1Input{Binding: s.bindingRaw, BindingSHA256: s.bindingSHA256, Manifest: s.manifestRaw, BundleManifest: s.bundleRaw, Archive: s.archive, ArchiveSize: s.archiveSize, PredecessorBinding: append([]byte(nil), s.predecessorRaw...)}, nil
 }
 
 func validateAcornFoxCandidateSetNames(root *os.Root, archiveName string) error {

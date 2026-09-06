@@ -22,7 +22,7 @@ const acornFoxDataRoot = "/var/lib/acornfox"
 const acornFoxUpgradeMarker = acornFoxDataRoot + "/upgrade-in-progress"
 
 var acornFoxHealthUnits = []string{
-	"docker.service", "acornfox-build-network.service", "acornfox-buildkit.service",
+	"docker.service", "acornfox-build-network.service", "acornfox-buildkit.service", "acornfox-runtime-network.service",
 	"acornfox-caddy.service", "acornfox-server.service", "acornfox-agent.service", "acornfox-edge.service",
 }
 
@@ -219,7 +219,11 @@ func acornFoxUnitRunning(raw []byte, unit string) bool {
 		}
 		got[key] = value
 	}
-	return len(got) == 4 && got["Id"] == unit && got["LoadState"] == "loaded" && got["ActiveState"] == "active" && got["SubState"] == "running"
+	substate := "running"
+	if unit == "acornfox-runtime-network.service" {
+		substate = "exited"
+	} // successful RemainAfterExit oneshot
+	return len(got) == 4 && got["Id"] == unit && got["LoadState"] == "loaded" && got["ActiveState"] == "active" && got["SubState"] == substate
 }
 
 func acornFoxHTTPHealthy(ctx context.Context, client *http.Client, target string, control bool) bool {

@@ -13,6 +13,7 @@ type acornFoxUnitSections map[string]map[string][]string
 
 var acornFoxSystemdFiles = []string{
 	"acornfox-build-network.service",
+	"acornfox-runtime-network.service",
 	"acornfox-server.service",
 	"acornfox-agent.service",
 	"acornfox-buildkit.service",
@@ -147,6 +148,9 @@ func TestAcornFoxSystemdNamesPathsAndEnvironmentContract(t *testing.T) {
 			}
 		}
 		for _, value := range sections["Service"]["Environment"] {
+			if name == "acornfox-caddy.service" && (value == "HOME=/var/lib/acornfox/caddy" || value == "XDG_DATA_HOME=/var/lib/acornfox/caddy/data" || value == "XDG_CONFIG_HOME=/var/lib/acornfox/caddy/config") {
+				continue
+			}
 			if name == "acornfox-buildkit.service" && (value == "HOME=/var/lib/acornfox/buildkit" || value == "XDG_RUNTIME_DIR=/run/acornfox-buildkit" || value == "PATH=/opt/acornfox/current/bin:/usr/bin:/bin") {
 				continue
 			}
@@ -164,6 +168,9 @@ func TestAcornFoxSystemdNamesPathsAndEnvironmentContract(t *testing.T) {
 				continue
 			}
 			for _, value := range values {
+				if name == "acornfox-runtime-network.service" && key == "ExecStartPre" && (value == "+/usr/sbin/modprobe br_netfilter" || value == "+/usr/sbin/sysctl -w net.bridge.bridge-nf-call-iptables=1") {
+					continue
+				}
 				if name == "acornfox-build-network.service" && key == "ExecStartPost" && value == "/usr/bin/systemctl --no-block start acornfox-buildkit.service" {
 					continue
 				}
@@ -185,7 +192,8 @@ func TestAcornFoxSystemdNamesPathsAndEnvironmentContract(t *testing.T) {
 	requireAcornFoxDirective(t, server, "Service", "WorkingDirectory", "/opt/acornfox/current")
 	requireAcornFoxDirective(t, server, "Service", "Environment", "ACORNFOX_RUNTIME_MODE=clean")
 	requireAcornFoxDirective(t, server, "Service", "Environment", "ACORNFOX_SERVER_ADDR=127.0.0.1:18481")
-	requireAcornFoxDirective(t, server, "Service", "EnvironmentFile", "-/etc/acornfox/server.env")
+	requireAcornFoxDirective(t, server, "Service", "EnvironmentFile", "/etc/acornfox/runtime/server.env")
+	requireAcornFoxDirective(t, server, "Service", "LoadCredential", "server.key:/etc/acornfox/runtime/server.key")
 	requireAcornFoxDirective(t, server, "Service", "EnvironmentFile", "/opt/acornfox/active/database.env")
 	requireAcornFoxDirective(t, server, "Service", "ExecStart", "/opt/acornfox/current/bin/acornfox-server")
 	// The database environment stays outside the unit; this is the fixed key it
@@ -207,6 +215,9 @@ func TestAcornFoxSystemdNamesPathsAndEnvironmentContract(t *testing.T) {
 		requireAcornFoxDirective(t, sections, "Service", "ExecStart", check.execStart)
 	}
 	_, buildkit := readAcornFoxUnit(t, "acornfox-buildkit.service")
+	_, runtimeNetwork := readAcornFoxUnit(t, "acornfox-runtime-network.service")
+	requireAcornFoxDirective(t, runtimeNetwork, "Service", "ExecStartPre", "+/usr/sbin/modprobe br_netfilter")
+	requireAcornFoxDirective(t, runtimeNetwork, "Service", "ExecStartPre", "+/usr/sbin/sysctl -w net.bridge.bridge-nf-call-iptables=1")
 	requireAcornFoxDirectiveContains(t, buildkit, "Service", "ExecStart", "/opt/acornfox/current/bin/rootlesskit")
 	requireAcornFoxDirectiveContains(t, buildkit, "Service", "ExecStart", "/opt/acornfox/current/bin/buildkitd")
 	requireAcornFoxDirectiveContains(t, buildkit, "Service", "ExecStart", "--addr unix:///run/acornfox-buildkit/buildkitd.sock")
@@ -241,6 +252,8 @@ func TestAcornFoxSystemdBootDagAndHardening(t *testing.T) {
 	_, finalizeUnit := readAcornFoxUnit(t, "acornfox-upgrade-finalize.service")
 	_, edgeMarker := readAcornFoxUnit(t, "acornfox-edge.service.d/10-upgrade-marker.conf")
 	requireAcornFoxDirectiveContains(t, recoverUnit, "Unit", "Before", "acornfox-upgrade-safe.target")
+	requireAcornFoxDirective(t, recoverUnit, "Service", "CapabilityBoundingSet", "CAP_DAC_READ_SEARCH")
+	requireAcornFoxDirective(t, finalizeUnit, "Service", "CapabilityBoundingSet", "CAP_DAC_READ_SEARCH")
 	requireAcornFoxDirective(t, safeTarget, "Unit", "Requires", "acornfox-upgrade-recover.service")
 	requireAcornFoxDirectiveContains(t, safeTarget, "Unit", "After", "acornfox-upgrade-recover.service")
 	for _, unit := range []string{"acornfox-buildkit.service", "acornfox-caddy.service", "acornfox-server.service", "acornfox-agent.service", "acornfox-edge.service"} {
@@ -456,7 +469,11 @@ func TestAcornFoxCaddyPackageSourcesAreLoopbackOnly(t *testing.T) {
 				t.Fatalf("%s for future %s contains forbidden value %q", source, future, forbidden)
 			}
 		}
-		if !strings.Contains(text, "admin 127.0.0.1:2019") || !strings.Contains(text, "auto_https off") {
+		admin := "admin 127.0.0.1:2019"
+		if source == "acornfox-edge.Caddyfile.example" {
+			admin = "admin 127.0.0.1:2020"
+		}
+		if !strings.Contains(text, admin) || !strings.Contains(text, "auto_https off") {
 			t.Fatalf("%s is not an explicitly local Caddy source", source)
 		}
 	}
@@ -467,8 +484,16 @@ func TestAcornFoxCaddyPackageSourcesAreLoopbackOnly(t *testing.T) {
 	if !strings.Contains(string(internal), "http://127.0.0.1:8080") || !strings.Contains(string(internal), "reverse_proxy 127.0.0.1:18481") {
 		t.Fatalf("internal Caddy source is not the fixed local proxy: %s", internal)
 	}
+	for _, directive := range []string{"@backend path /api /api/* /healthz /readyz", "root * /opt/acornfox/current/web/dist", "try_files {path} /index.html", "file_server"} {
+		if !strings.Contains(string(internal), directive) {
+			t.Fatalf("console serving directive missing: %s", directive)
+		}
+	}
 	_, caddyUnit := readAcornFoxUnit(t, "acornfox-caddy.service")
 	requireAcornFoxDirective(t, caddyUnit, "Service", "ExecStart", "/opt/acornfox/current/bin/caddy run --environ --config /etc/acornfox/Caddyfile --adapter caddyfile")
+	requireAcornFoxDirective(t, caddyUnit, "Service", "Environment", "HOME=/var/lib/acornfox/caddy")
+	requireAcornFoxDirective(t, caddyUnit, "Service", "Environment", "XDG_DATA_HOME=/var/lib/acornfox/caddy/data")
+	requireAcornFoxDirective(t, caddyUnit, "Service", "Environment", "XDG_CONFIG_HOME=/var/lib/acornfox/caddy/config")
 	edge, err := os.ReadFile(filepath.Join(caddyRoot, "acornfox-edge.Caddyfile.example"))
 	if err != nil {
 		t.Fatal(err)

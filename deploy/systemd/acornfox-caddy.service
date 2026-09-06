@@ -10,6 +10,9 @@ User=acornfox-caddy
 Group=acornfox-caddy
 WorkingDirectory=/var/lib/acornfox/caddy
 Environment=ACORNFOX_RUNTIME_MODE=clean
+Environment=HOME=/var/lib/acornfox/caddy
+Environment=XDG_DATA_HOME=/var/lib/acornfox/caddy/data
+Environment=XDG_CONFIG_HOME=/var/lib/acornfox/caddy/config
 ExecStartPre=/usr/bin/test -r /etc/acornfox/Caddyfile
 ExecStartPre=/usr/bin/grep -Eq ^[[:space:]]*http://(127\\.0\\.0\\.1|localhost|\\[::1\\]):[0-9]+ /etc/acornfox/Caddyfile
 ExecStart=/opt/acornfox/current/bin/caddy run --environ --config /etc/acornfox/Caddyfile --adapter caddyfile

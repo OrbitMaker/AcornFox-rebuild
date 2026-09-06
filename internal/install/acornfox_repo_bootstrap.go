@@ -220,12 +220,33 @@ func acornFoxRepoDir(root *os.Root, s *TaskAcornFoxRepoStore, p string, mark fun
 	return acornFoxRepoDirForLayout(root, s, s.layout, p, mark)
 }
 func acornFoxRepoDirForLayout(root *os.Root, s *TaskAcornFoxRepoStore, layout acornFoxInstallLayout, p string, mark func()) error {
+	mode := layout.activationDirectoryMode()
 	info, e := root.Lstat(p)
+	if e == nil && acornFoxPrivateActivationPrefix(root, s, layout, p, info) {
+		file, err := root.OpenFile(p, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+		if err != nil {
+			return ErrAcornFoxRepoBootstrapConflict
+		}
+		opened, err := file.Stat()
+		if err != nil || !os.SameFile(info, opened) {
+			file.Close()
+			return ErrAcornFoxRepoBootstrapConflict
+		}
+		if err = file.Chmod(mode); err == nil {
+			mark()
+			err = file.Sync()
+		}
+		closeErr := file.Close()
+		if err != nil || closeErr != nil || acornFoxLiveSyncDir(root, parentDirectory(p)) != nil {
+			return ErrAcornFoxRepoBootstrapConflict
+		}
+		info, e = root.Lstat(p)
+	}
 	if errors.Is(e, os.ErrNotExist) {
 		if acornFoxRepoBootstrapStep("mkdir") != nil {
 			return ErrAcornFoxRepoBootstrapConflict
 		}
-		if e = root.Mkdir(p, durableDirMode); e != nil {
+		if e = root.Mkdir(p, mode); e != nil {
 			return e
 		}
 		mark()
@@ -238,6 +259,9 @@ func acornFoxRepoDirForLayout(root *os.Root, s *TaskAcornFoxRepoStore, layout ac
 		if ownerOK {
 			ownerErr = acornFoxLiveApplyOwner(s, file, rootPrincipal)
 		}
+		if ownerErr == nil {
+			ownerErr = file.Chmod(mode)
+		}
 		syncErr := file.Sync()
 		closeErr := file.Close()
 		if ownerErr != nil || syncErr != nil || closeErr != nil {
@@ -249,10 +273,39 @@ func acornFoxRepoDirForLayout(root *os.Root, s *TaskAcornFoxRepoStore, layout ac
 		info, e = root.Lstat(p)
 	}
 	principal, ok := layout.owner(AcornFoxLiveRootRole)
-	if e != nil || !ok || !info.IsDir() || info.Mode().Perm() != durableDirMode || !acornFoxLiveObservedOwner(s, info, principal) {
+	if e != nil || !ok || !info.IsDir() || info.Mode().Perm() != mode || !acornFoxLiveObservedOwner(s, info, principal) {
 		return ErrAcornFoxRepoBootstrapConflict
 	}
 	return nil
+}
+
+// A 0077 umask can leave a newly created activation directory at 0700 before
+// its chmod. Only the current, not-yet-published transaction's empty root-owned
+// directories qualify; revoking access on an active directory is never healed.
+func acornFoxPrivateActivationPrefix(root *os.Root, s *TaskAcornFoxRepoStore, layout acornFoxInstallLayout, path string, info os.FileInfo) bool {
+	if layout.mode != acornFoxInstallLayoutProduction || !s.ownsLock() || info == nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o700 {
+		return false
+	}
+	principal, ok := layout.owner(AcornFoxLiveRootRole)
+	if !ok || !acornFoxLiveObservedOwner(s, info, principal) {
+		return false
+	}
+	j, err := s.Resume(context.Background())
+	if err != nil || j.Phase != AcornFoxRepoStaticVerified {
+		return false
+	}
+	id, err := AcornFoxRepoActivationID(j.BindingSHA256)
+	if err != nil || (path != layout.livePath("opt/acornfox/activations") && path != layout.activationDir(id)) {
+		return false
+	}
+	dir, err := root.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return false
+	}
+	opened, statErr := dir.Stat()
+	children, readErr := dir.ReadDir(1)
+	closeErr := dir.Close()
+	return statErr == nil && os.SameFile(info, opened) && closeErr == nil && len(children) == 0 && errors.Is(readErr, io.EOF)
 }
 func acornFoxRepoTemp(tx, p string) string {
 	return filepath.ToSlash(filepath.Join(parentDirectory(p), ".acornfox-repo-link-"+sha256Hex([]byte(tx+"\x00"+p))))
@@ -572,10 +625,10 @@ func acornFoxRepoExactInventory(root *os.Root, s *TaskAcornFoxRepoStore, entries
 		want[entry.Path] = expectedNode{directory: entry.Kind == SubstrateEntryDirectory, mode: os.FileMode(entry.Mode)}
 	}
 	if state >= acornFoxRepoPrefixActivations {
-		want["opt/acornfox/activations"] = expectedNode{directory: true, mode: durableDirMode}
+		want["opt/acornfox/activations"] = expectedNode{directory: true, mode: s.layout.activationDirectoryMode()}
 	}
 	if state >= acornFoxRepoPrefixActivationDir {
-		want["opt/acornfox/activations/"+a.ActivationID] = expectedNode{directory: true, mode: durableDirMode}
+		want["opt/acornfox/activations/"+a.ActivationID] = expectedNode{directory: true, mode: s.layout.activationDirectoryMode()}
 	}
 	if state >= acornFoxRepoPrefixActivationJSON {
 		want["opt/acornfox/activations/"+a.ActivationID+"/repo-activation.json"] = expectedNode{mode: durableFileMode}
@@ -675,6 +728,12 @@ func acornFoxRepoVerifyPinnedLiveForLayout(root *os.Root, s *TaskAcornFoxRepoSto
 		return false
 	}
 	for _, e := range entries {
+		if layout.mode == acornFoxInstallLayoutProduction && acornFoxProductionSharedParent(e.Path) {
+			if !acornFoxSharedParentSafe(root, s, e.Path) {
+				return false
+			}
+			continue
+		}
 		p := layout.livePath(e.Path)
 		info, x := root.Lstat(p)
 		principal := acornFoxLivePrincipalForEntry(layout, e)
