@@ -1,16 +1,21 @@
-# Open Card RC license manifest
+# AcornFox dependency notices
 
-The M7 release bundle carries this directory unchanged and records its
-checksums in `licenses-manifest.json`. It is a source notice, not a grant of
-rights beyond the licenses of the individual components.
+AcornFox source is licensed under AGPL-3.0-only. The complete license text is
+`AGPL-3.0-only.txt`. Bundled dependencies retain their own terms.
 
-The Open Card source is released under the repository license. Go modules,
-frontend packages, Debian inputs, and pinned runtime assets retain their
-upstream licenses. The canonical bundle must include an explicit notice or a
-`NOASSERTION` entry for every copied dependency; an absent notice is a release
-failure.
+`licenses-manifest.json` contains the version, public source URL, complete
+upstream license/notice material, and its SHA-256 for each recorded component.
+`LicenseRef-<sha256>` preserves an exact upstream notice set without inferring a
+single license expression for mixed material. The same text is embedded in the
+release SPDX document's extracted licensing information.
 
-The M7 assembler never downloads license text, contacts a registry, or infers
-license terms from a package name. Supply-chain evidence is generated from the
-checked-in source, the fixed asset manifest, and the explicit Debian input
-manifest.
+`THIRD_PARTY_NOTICES.md` indexes those materials. The manifest covers Go and
+frontend dependencies and modules from the bundled BuildKit, RootlessKit,
+Caddy, and rebuilt runc binaries. An inventory entry is not an assertion that
+every source file in that module is present in the compiled output.
+
+The Ubuntu 24.04 runc build uses the host's shared libseccomp and libc. Those
+shared libraries are not copied into the AcornFox archive. Their package
+versions and the runc source/build recipe are documented in the source
+repository's `docs/acornfox/runtime-build.md`. Original static buildkit-runc is
+not included in this release payload.
