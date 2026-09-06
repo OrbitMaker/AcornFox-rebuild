@@ -29,10 +29,20 @@ This round had retained application records but no running application container
 - Source extraction discarded executable bits, and private build-context modes leaked into image COPY permissions. `b8c07add` preserves executable semantics, keeps snapshots read-only, strips special bits, and normalizes only the subtree beneath the private run root for Docker COPY. Existing bad snapshots are not rewritten.
 - Git archive parsing stopped at logical tar EOF before draining record padding. A real producer regression timed out after two seconds; `5dc807d5` drains only bounded zero padding before waiting and terminates the process group on errors/cancellation. This proven pipe defect is not asserted to explain every network timeout.
 
-The published repository currently contains only reviewed application-example branches. The platform source, beta tag and final release assets have not been published. The official static runc was replaced by an independently built dynamic candidate; 605 exact notices and native build/copyright materials are recorded in source.
+The published repository contains reviewed application-example branches and the exact earlier candidate source e54f981e on a candidate-only branch. No platform main, beta tag or final release assets have been published. The official static runc was replaced by an independently built dynamic candidate; 605 exact notices and native build/copyright materials are recorded in source.
 
 ## Verification scope
 
 The R3/R4 integrated Linux suite passed, including 120.631 seconds of targeted install/upgrade tests, frontend lint/typecheck, 177 Vitest tests and six Node release-build tests. Subsequent source/application/CLI integration tests and vet passed after the permission, cancellation and archive changes. Independent GPT-6 reviews approved the changes.
 
 An earlier full install suite reached its 900-second total budget while constructing an existing runtime-configuration fault fixture. It was not counted as a passing full suite, and the old matrix was not repeatedly rerun. Final package installation, running-app continuity, full public enable/disable/restart, final source URL readback and immutable beta publication remain separate gates.
+
+## Later exact beta1 application acceptance and new failures
+
+The e54f981e source bootstrap binding cc750c53c49ed6f31560b4708cd68668fe06b1a7ed0935143cd7f2c206d69dc4 installed normally. A temporary read-only HTTPS smart Git fixture on the same host supplied reviewed source f78b7df2922b7af805a398a3e108bed1828928ae. Product DNS/pinning/TLS/source bounds were unchanged. Import took 0.58 seconds, the real Dockerfile RUN/build 0.86 seconds, and the application returned internal HTTP200. Exact Caddy baseline was restored after import.
+
+A normal Agent HTTP probe then wrote a real responded200 observation; public application TLS, original Host, enable/disable404/re-enable and container restart passed. The missing probe prerequisite originally surfaced as a misleading404. The source now supplies an explicit UI/CLI response-check action and a409 readiness error while keeping foreign-resource404 and endpoint checks.
+
+Recreate produced a new running container but reallocated its loopback port37869to43267. The existing owned route retained the old port and returned502. This is an unresolved release gate until the same-deployment replacement preserves its port lease and passes real public readback.
+
+The exact beta1/privatebeta2 transaction was killed at persisted SWITCHED with the application still running and DB/key facts unchanged. After a real reboot (boot0c9c1a7d-af49-4774-baf0-bfeb7bf9c29d), recovery/finalize both succeeded and journal reached ROLLED_BACK; the original application container was stopped and its internal HTTP port refused connections. Guard-ordered restoration has since been implemented and independently reviewed, but only a newly built exact package and another real reboot can close that gate.
