@@ -1,6 +1,7 @@
 package acornfoxrelease
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"testing"
@@ -14,6 +15,10 @@ func TestRepositoryLicenseManifestIncludesPinnedPiMIT(t *testing.T) {
 	var manifest ReleaseLicenseManifestV1
 	if err := json.Unmarshal(raw, &manifest); err != nil || manifest.Validate() != nil {
 		t.Fatalf("license manifest invalid: %v", err)
+	}
+	canonical, err := json.Marshal(manifest)
+	if err != nil || !bytes.Equal(bytes.TrimSpace(raw), canonical) {
+		t.Fatal("checked-in license manifest must use the production loader's canonical JSON encoding")
 	}
 	for _, component := range manifest.Components {
 		if component.Name != "pi:@earendil-works/pi-coding-agent" || component.Version != "0.85.1" {

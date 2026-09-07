@@ -285,7 +285,7 @@ def main():
     inputs = {'source-policy': policy, 'toolchain': toolchain,
               'runtime-inputs': runtime_input, 'license-inputs': license_input}
     encoded = {name + '.json': canonical(value) for name, value in inputs.items()}
-    decision = dict(schema_version=1, product='acornfox', architecture='amd64', migration='0038', layout=1,
+    decision = dict(schema_version=1, product='acornfox', architecture='amd64', migration='0039', layout=1,
                     version=args.version, release_id='release-' + args.version,
                     source_repository=origin, source_commit=commit,
                     source_policy_sha256=sha(encoded['source-policy.json']),

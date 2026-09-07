@@ -2,6 +2,29 @@ import { createAcornFoxIntegrationClient } from "./integration-client";
 
 type Seen = { url: string; init?: RequestInit };
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
+const sha = (value: string) => `sha256:${value.repeat(64)}`;
+const observationFixture = {
+  availability: "available",
+  observation: {
+    observer: "administrator_client",
+    application_id: "app_1",
+    deployment_id: "dep_1",
+    hostname: "delivery-x.apps.example.test",
+    report_id: "access_report_0123456789abcdef0123456789abcdef",
+    observed_at: "2026-09-07T12:00:00Z",
+    dns: { state: "observed", addresses: ["1.1.1.1"] },
+    tls: { state: "observed", certificate_sha256: sha("a") },
+    https: {
+      state: "observed",
+      http_status: 200,
+      response_sample_sha256: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      response_sample_bytes: 0,
+      response_truncated: false,
+    },
+    received_at: "2030-01-01T00:00:00Z",
+    expires_at: "2030-01-01T00:05:00Z",
+  },
+} as const;
 
 describe("AcornFox integration client", () => {
   beforeEach(() => {
@@ -18,6 +41,7 @@ describe("AcornFox integration client", () => {
       if (url.endsWith("/sources") && init?.method === "POST") return json({ source_revision_id: "s-next", status: "imported" }, 201);
       if (url.endsWith("/metadata")) return json({ source_revision_id: "s", availability: "unavailable" });
       if (url.includes("/operations/")) return json({ operation_id: "o", operation_type: "probe", status: "verified", task_id: "t", deployment_id: "d", accepted_at: "2030-01-01T00:00:00Z", updated_at: "2030-01-01T00:00:01Z", evidence: { kind: "response_observation", verdict: "unhealthy", observed_at: "2030-01-01T00:00:01Z", http_status: 500 } });
+      if (url.endsWith("/access-observation")) return json(observationFixture);
       return json({ deployment_id: "d", availability: "available", source_revision_id: "s", commit: "abc", ref: "main" });
     });
     await expect(api.setupState()).resolves.toBe("uninitialized");
@@ -27,6 +51,28 @@ describe("AcornFox integration client", () => {
     await expect(api.sourceUpdate("app id", { baseSourceRevisionId: "s id", ref: "main" }, "same-request")).resolves.toEqual({ sourceRevisionId: "s-next", status: "imported" });
     await expect(api.deploymentSource("app id", "d id")).resolves.toMatchObject({ deploymentId: "d", commit: "abc" });
     await expect(api.operationResult("app id", "o id")).resolves.toMatchObject({ operationId: "o", status: "verified", evidence: { verdict: "unhealthy", httpStatus: 500 } });
+    await expect(api.accessObservation("app_1", "dep_1")).resolves.toEqual({
+      availability: "available",
+      observation: {
+        observer: "administrator_client",
+        applicationId: "app_1",
+        deploymentId: "dep_1",
+        hostname: "delivery-x.apps.example.test",
+        reportId: "access_report_0123456789abcdef0123456789abcdef",
+        observedAt: "2026-09-07T12:00:00Z",
+        dns: { state: "observed", addresses: ["1.1.1.1"] },
+        tls: { state: "observed", certificateSha256: sha("a") },
+        https: {
+          state: "observed",
+          httpStatus: 200,
+          responseSampleSha256: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          responseSampleBytes: 0,
+          responseTruncated: false,
+        },
+        receivedAt: "2030-01-01T00:00:00Z",
+        expiresAt: "2030-01-01T00:05:00Z",
+      },
+    });
     expect(seen.map((item) => item.url)).toEqual([
       "/api/v1/acornfox/setup",
       "/api/v1/acornfox/setup",
@@ -35,6 +81,7 @@ describe("AcornFox integration client", () => {
       "/api/v1/acornfox/apps/app%20id/sources",
       "/api/v1/acornfox/apps/app%20id/deliveries/d%20id/source",
       "/api/v1/acornfox/apps/app%20id/operations/o%20id",
+      "/api/v1/acornfox/apps/app_1/deliveries/dep_1/access-observation",
     ]);
     expect(new Headers(seen[1]?.init?.headers).get("X-AcornFox-CSRF")).toBe("csrf value");
     expect(new Headers(seen[1]?.init?.headers).get("Idempotency-Key")).toBeNull();
@@ -42,6 +89,8 @@ describe("AcornFox integration client", () => {
     expect(JSON.parse(String(seen[4]?.init?.body))).toEqual({ base_source_revision_id: "s id", ref: "main" });
     expect(seen[5]?.init?.method).toBeUndefined();
     expect(new Headers(seen[5]?.init?.headers).get("X-AcornFox-CSRF")).toBeNull();
+    expect(seen[7]?.init?.method).toBeUndefined();
+    expect(new Headers(seen[7]?.init?.headers).get("X-AcornFox-CSRF")).toBeNull();
   });
 
   it("does not turn malformed or unavailable added capabilities into success", async () => {
@@ -53,5 +102,96 @@ describe("AcornFox integration client", () => {
     const falseEvidence = createAcornFoxIntegrationClient(async () => json({ operation_id: "o", operation_type: "probe", status: "verified", accepted_at: "2030-01-01T00:00:00Z", updated_at: "2030-01-01T00:00:01Z", evidence: { kind: "runtime_observation", verdict: "unhealthy", observed_at: "2030-01-01T00:00:01Z" } }));
     await expect(falseEvidence.operationResult("a", "o")).rejects.toMatchObject({ code: "invalid_response" });
     await expect(unavailable.sourceUpdate("a", { baseSourceRevisionId: "s", ref: "main" }, "same-request")).rejects.toMatchObject({ status: 503 });
+  });
+
+  it("rejects an access observation bound to another scope", async () => {
+    const wrongScope = createAcornFoxIntegrationClient(async () => json({
+      ...observationFixture,
+      observation: { ...observationFixture.observation, deployment_id: "dep_other" },
+    }));
+    await expect(wrongScope.accessObservation("app_1", "dep_1")).rejects.toMatchObject({ code: "invalid_response" });
+  });
+
+  it("rejects unknown fields and state-dependent field leakage", async () => {
+    const unknownField = createAcornFoxIntegrationClient(async () => json({
+      ...observationFixture,
+      observation: {
+        ...observationFixture.observation,
+        https: { ...observationFixture.observation.https, leaked: true },
+      },
+    }));
+    await expect(unknownField.accessObservation("app_1", "dep_1")).rejects.toMatchObject({ code: "invalid_response" });
+
+    const failedWithObservedFields = createAcornFoxIntegrationClient(async () => json({
+      ...observationFixture,
+      observation: {
+        ...observationFixture.observation,
+        https: {
+          state: "failed",
+          failure_code: "https_timeout",
+          response_sample_bytes: 0,
+          response_truncated: false,
+        },
+      },
+    }));
+    await expect(failedWithObservedFields.accessObservation("app_1", "dep_1")).rejects.toMatchObject({ code: "invalid_response" });
+
+    const skippedWithObservedFields = createAcornFoxIntegrationClient(async () => json({
+      ...observationFixture,
+      observation: {
+        ...observationFixture.observation,
+        https: { state: "not_attempted", response_sample_bytes: 0, response_truncated: false },
+      },
+    }));
+    await expect(skippedWithObservedFields.accessObservation("app_1", "dep_1")).rejects.toMatchObject({ code: "invalid_response" });
+
+    for (const missing of ["response_sample_bytes", "response_truncated"] as const) {
+      const https = { ...observationFixture.observation.https } as Record<string, unknown>;
+      delete https[missing];
+      const missingObservedField = createAcornFoxIntegrationClient(async () => json({
+        ...observationFixture,
+        observation: { ...observationFixture.observation, https },
+      }));
+      await expect(missingObservedField.accessObservation("app_1", "dep_1")).rejects.toMatchObject({ code: "invalid_response" });
+    }
+
+    const invalidAddress = createAcornFoxIntegrationClient(async () => json({
+      ...observationFixture,
+      observation: {
+        ...observationFixture.observation,
+        dns: { state: "observed", addresses: ["not-an-address"] },
+      },
+    }));
+    await expect(invalidAddress.accessObservation("app_1", "dep_1")).rejects.toMatchObject({ code: "invalid_response" });
+  });
+
+  it("rejects inconsistent availability and layer states", async () => {
+    const missingAvailableObservation = createAcornFoxIntegrationClient(async () => json({ availability: "available" }));
+    await expect(missingAvailableObservation.accessObservation("app_1", "dep_1")).rejects.toMatchObject({ code: "invalid_response" });
+
+    const notObservedWithObservation = createAcornFoxIntegrationClient(async () => json({
+      availability: "not_observed",
+      observation: observationFixture.observation,
+    }));
+    await expect(notObservedWithObservation.accessObservation("app_1", "dep_1")).rejects.toMatchObject({ code: "invalid_response" });
+
+    const failedDNSStillAttemptsTLS = createAcornFoxIntegrationClient(async () => json({
+      ...observationFixture,
+      observation: {
+        ...observationFixture.observation,
+        dns: { state: "failed", failure_code: "dns_timeout" },
+      },
+    }));
+    await expect(failedDNSStillAttemptsTLS.accessObservation("app_1", "dep_1")).rejects.toMatchObject({ code: "invalid_response" });
+  });
+
+  it("accepts an expired observation and a clean not-observed response", async () => {
+    const expired = createAcornFoxIntegrationClient(async () => json({ ...observationFixture, availability: "expired" }));
+    await expect(expired.accessObservation("app_1", "dep_1")).resolves.toMatchObject({
+      availability: "expired",
+      observation: { reportId: "access_report_0123456789abcdef0123456789abcdef" },
+    });
+    const empty = createAcornFoxIntegrationClient(async () => json({ availability: "not_observed" }));
+    await expect(empty.accessObservation("app_1", "dep_1")).resolves.toEqual({ availability: "not_observed" });
   });
 });

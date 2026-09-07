@@ -103,7 +103,7 @@ func acornFoxAssistantCanonicalConfig() []byte {
 		TrustedExtensions: []string{"/opt/acornfox/current/pi/extensions/acornfox-tools.ts"},
 		EnabledTools: []string{
 			"acornfox_host_metrics", "acornfox_list_apps", "acornfox_app", "acornfox_sources", "acornfox_deliveries",
-			"acornfox_delivery_status", "acornfox_logs", "acornfox_operation_result", "acornfox_public_access", "acornfox_probe", "acornfox_propose_restart", "acornfox_propose_redeploy",
+			"acornfox_delivery_status", "acornfox_logs", "acornfox_operation_result", "acornfox_public_access", "acornfox_access_observation", "acornfox_probe", "acornfox_propose_restart", "acornfox_propose_redeploy",
 		},
 		ToolCallbackSocket:     "/run/acornfox-assistant/tools.sock",
 		HandshakeTimeoutSecond: 5, RunTimeoutSecond: 300, ShutdownTimeoutSecond: 10,

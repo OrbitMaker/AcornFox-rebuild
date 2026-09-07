@@ -13,7 +13,7 @@ const delivery = Type.Object({ application_id: appIdParameter, deployment_id: id
 const tools: Array<[string, unknown]> = [
   ["acornfox_host_metrics", empty], ["acornfox_list_apps", empty], ["acornfox_app", app], ["acornfox_sources", app], ["acornfox_deliveries", app],
   ["acornfox_delivery_status", delivery], ["acornfox_logs", delivery], ["acornfox_operation_result", Type.Object({ application_id: appIdParameter, operation_id: ids })],
-  ["acornfox_public_access", delivery], ["acornfox_probe", delivery],
+  ["acornfox_public_access", delivery], ["acornfox_access_observation", delivery], ["acornfox_probe", delivery],
   ["acornfox_propose_restart", delivery], ["acornfox_propose_redeploy", delivery],
 ];
 
@@ -64,6 +64,7 @@ function callback(tool: string, callId: string, arguments_: unknown, signal?: Ab
 }
 
 const descriptions: Record<string,string>={acornfox_host_metrics:"Read current sampled host CPU, memory, root disk, and default-route network facts.",acornfox_list_apps:"List applications visible to this grant.",acornfox_app:"Read one application.",acornfox_sources:"List an application's source revisions.",acornfox_deliveries:"List an application's deliveries.",acornfox_delivery_status:"Read one delivery status.",acornfox_logs:"Read bounded delivery logs.",acornfox_operation_result:"Read an operation result for one application.",acornfox_public_access:"Read public-access state for one delivery.",acornfox_probe:"Actively request a safe, deployment-derived HTTP root probe."};
+descriptions.acornfox_access_observation = "Read administrator-client DNS, TLS, and HTTPS observations for this exact deployment. Preserve expiry and reported-client provenance; this tool cannot submit observations or prove an independent observer location.";
 descriptions.acornfox_propose_restart = "Prepare a confirmation card to restart the exact deployment. This does not execute it; only the administrator can approve in the UI.";
 descriptions.acornfox_propose_redeploy = "Prepare a confirmation card to recreate the exact deployment from its accepted source. This does not execute it; only the administrator can approve in the UI.";
 export default function (pi: ExtensionAPI) {

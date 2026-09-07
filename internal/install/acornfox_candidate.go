@@ -17,8 +17,8 @@ import (
 const (
 	AcornFoxV1Product          = "acornfox"
 	AcornFoxV1Architecture     = "amd64"
-	AcornFoxV1MigrationVersion = "0038"
-	AcornFoxV1DataVersion      = 38
+	AcornFoxV1MigrationVersion = "0039"
+	AcornFoxV1DataVersion      = 39
 	AcornFoxV1InstallPrefix    = "/opt/acornfox"
 	AcornFoxV1ConfigDir        = "/etc/acornfox"
 	AcornFoxV1DataDir          = "/var/lib/acornfox"
@@ -76,7 +76,7 @@ var (
 		"0025_acornfox_build_plan_binding.sql", "0026_acornfox_build_network_policy.sql", "0027_acornfox_probe_observations.sql",
 		"0028_acornfox_log_metadata.sql", "0029_acornfox_log_provenance.sql", "0030_dns_change_provider_neutral.sql",
 		"0031_acornfox_public_access.sql", "0032_dns_change_execution.sql", "0033_acornfox_discovery_task_lookup.sql",
-		"0034_artifacts_per_build.sql", "0035_acornfox_source_metadata.sql", "0036_acornfox_source_updates.sql", "0037_acornfox_assistant.sql", "0038_acornfox_assistant_actions.sql",
+		"0034_artifacts_per_build.sql", "0035_acornfox_source_metadata.sql", "0036_acornfox_source_updates.sql", "0037_acornfox_assistant.sql", "0038_acornfox_assistant_actions.sql", "0039_acornfox_access_observations.sql",
 	}
 	acornFoxV1WebAssetName = regexp.MustCompile(`^[A-Za-z0-9_.-]+-[A-Za-z0-9_-]{8,}\.(?:(?:css|js)(?:\.map)?|map|png|jpe?g|svg|gif|webp|ico|woff2?|ttf)$`)
 	acornFoxGitHubPath     = regexp.MustCompile(`^/[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$`)

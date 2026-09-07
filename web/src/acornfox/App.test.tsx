@@ -1,6 +1,7 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import AcornFoxApp, { DeliveryWorkspace, hostIsFresh, Login, operationIsTerminal } from "./App";
 import type { AcornFoxClient } from "./client";
+import { createAcornFoxIntegrationClient } from "./integration-client";
 
 const api: AcornFoxClient = {
   login: async () => ({
@@ -70,7 +71,7 @@ const api: AcornFoxClient = {
 
 describe("AcornFox clean entry", () => {
   it("offers an explicit response check without presenting running as responsive", () => {
-    const html = renderToStaticMarkup(<DeliveryWorkspace api={api}
+    const html = renderToStaticMarkup(<DeliveryWorkspace api={api} integration={createAcornFoxIntegrationClient()}
       application={{ id: "a", name: "A", created_at: "", updated_at: "" }}
       deployment={{ id: "d", application_id: "a", environment_id: "e", release_id: "r", stage: "starting", created_at: "", updated_at: "" }} />);
     expect(html).toContain("检查应用响应</button>");

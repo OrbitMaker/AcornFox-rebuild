@@ -33,7 +33,7 @@ The unit loads root-controlled `/etc/acornfox/pi/worker.json` as systemd credent
   "model": "deepseek-v4-flash",
   "thinking": "off",
   "trusted_extensions": ["/opt/acornfox/current/pi/extensions/acornfox-tools.ts"],
-  "enabled_tools": ["acornfox_host_metrics", "acornfox_list_apps", "acornfox_app", "acornfox_sources", "acornfox_deliveries", "acornfox_delivery_status", "acornfox_logs", "acornfox_operation_result", "acornfox_public_access", "acornfox_probe"],
+  "enabled_tools": ["acornfox_host_metrics", "acornfox_list_apps", "acornfox_app", "acornfox_sources", "acornfox_deliveries", "acornfox_delivery_status", "acornfox_logs", "acornfox_operation_result", "acornfox_public_access", "acornfox_access_observation", "acornfox_probe", "acornfox_propose_restart", "acornfox_propose_redeploy"],
   "tool_callback_socket": "/run/acornfox-assistant/tools.sock",
   "handshake_timeout_seconds": 5,
   "run_timeout_seconds": 3600,

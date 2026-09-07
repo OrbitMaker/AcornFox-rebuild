@@ -45,3 +45,18 @@ func TestAssistantToolHTTPRejectsUnhandledRoute(t *testing.T) {
 		t.Fatal(got)
 	}
 }
+
+func TestAssistantExternalObservationToolIsReadOnlyAndScoped(t *testing.T) {
+	args := map[string]string{"application_id": "app_1", "deployment_id": "dep_1"}
+	if !assistantToolArguments("acornfox_access_observation", args) {
+		t.Fatal("valid exact scope rejected")
+	}
+	path, method := assistantToolPath("acornfox_access_observation", "app_1", "dep_1", "")
+	if method != http.MethodGet || path != "/api/v1/acornfox/apps/app_1/deliveries/dep_1/access-observation" {
+		t.Fatalf("unexpected route: %s %s", method, path)
+	}
+	args["report_id"] = "forged_report"
+	if assistantToolArguments("acornfox_access_observation", args) {
+		t.Fatal("observation submission argument accepted")
+	}
+}

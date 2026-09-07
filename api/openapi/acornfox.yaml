@@ -358,6 +358,32 @@ paths:
         '409': {$ref: '#/components/responses/PublicAccessConflict'}
         '422': {$ref: '#/components/responses/ValidationFailed'}
         '503': {$ref: '#/components/responses/PublicAccessUnavailable'}
+  /api/v1/acornfox/apps/{applicationId}/deliveries/{deploymentId}/access-observation:
+    parameters: [{$ref: '#/components/parameters/ApplicationId'}, {$ref: '#/components/parameters/DeploymentId'}]
+    get:
+      operationId: getAcornFoxExternalAccessObservation
+      x-acornfox-parity: integration_cli
+      security: [{AdministratorSession: []}]
+      responses:
+        '200': {description: Latest bounded administrator-client observation. available reports only this observation; it does not prove current public reachability., content: {application/json: {schema: {$ref: '#/components/schemas/ExternalAccessObservationReadResponse'}}}}
+        '401': {$ref: '#/components/responses/AuthenticationFailed'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/TemporarilyUnavailable'}
+    post:
+      operationId: reportAcornFoxExternalAccessObservation
+      x-acornfox-parity: cli_only
+      security: [{AdministratorSession: []}]
+      parameters: [{$ref: '#/components/parameters/CSRFToken'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/ExternalAccessObservationReportRequest'}}}}
+      responses:
+        '200': {description: Exact report_id replay; no second observation was stored., content: {application/json: {schema: {$ref: '#/components/schemas/ExternalAccessObservation'}}}}
+        '201': {description: New administrator-client external-access observation stored., content: {application/json: {schema: {$ref: '#/components/schemas/ExternalAccessObservation'}}}}
+        '400': {$ref: '#/components/responses/InvalidRequest'}
+        '401': {$ref: '#/components/responses/AuthenticationFailed'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/IdempotencyConflict'}
+        '422': {$ref: '#/components/responses/ValidationFailed'}
+        '503': {$ref: '#/components/responses/TemporarilyUnavailable'}
   /api/v1/acornfox/apps/{applicationId}/deliveries/{deploymentId}/probes:
     parameters: [{$ref: '#/components/parameters/ApplicationId'}, {$ref: '#/components/parameters/DeploymentId'}]
     post:
@@ -752,3 +778,51 @@ components:
         endpoint: {type: object, required: [deployment_id], additionalProperties: false, properties: {deployment_id: {type: string}}}
         components: {type: object, required: [internal_endpoint, local_route, dns, tls, external], additionalProperties: false, properties: {internal_endpoint: {type: string, enum: [accepted, not_observed]}, local_route: {type: string, enum: [desired, reconcile_required, configured, disabled]}, dns: {type: string, enum: [not_validated]}, tls: {type: string, enum: [not_validated]}, external: {type: string, enum: [not_validated]}}}
         status: {type: string, enum: [PUBLIC_DISABLED, PENDING_EXTERNAL_VALIDATION]}
+    ExternalAccessDNSObservation:
+      type: object
+      required: [state]
+      additionalProperties: false
+      properties: {state: {type: string, enum: [observed, failed]}, addresses: {type: array, items: {type: string}}, failure_code: {type: string, enum: [dns_no_answer, dns_timeout, dns_lookup_failed]}}
+    ExternalAccessTLSObservation:
+      oneOf:
+        - type: object
+          required: [state, certificate_sha256]
+          additionalProperties: false
+          properties: {state: {type: string, enum: [observed]}, certificate_sha256: {type: string, pattern: '^sha256:[0-9a-f]{64}$'}}
+        - type: object
+          required: [state, failure_code]
+          additionalProperties: false
+          properties: {state: {type: string, enum: [failed]}, failure_code: {type: string, enum: [tls_connect_failed, tls_name_mismatch, tls_certificate_invalid, tls_timeout]}}
+        - type: object
+          required: [state]
+          additionalProperties: false
+          properties: {state: {type: string, enum: [not_attempted]}}
+    ExternalAccessHTTPSObservation:
+      oneOf:
+        - type: object
+          required: [state, http_status, response_sample_sha256, response_sample_bytes, response_truncated]
+          additionalProperties: false
+          properties: {state: {type: string, enum: [observed]}, http_status: {type: integer, minimum: 100, maximum: 599}, response_sample_sha256: {type: string, pattern: '^sha256:[0-9a-f]{64}$'}, response_sample_bytes: {type: integer, minimum: 0, maximum: 65536}, response_truncated: {type: boolean}}
+        - type: object
+          required: [state, failure_code]
+          additionalProperties: false
+          properties: {state: {type: string, enum: [failed]}, failure_code: {type: string, enum: [https_timeout, https_transport_failed]}}
+        - type: object
+          required: [state]
+          additionalProperties: false
+          properties: {state: {type: string, enum: [not_attempted]}}
+    ExternalAccessObservation:
+      type: object
+      required: [observer, application_id, deployment_id, hostname, report_id, observed_at, received_at, expires_at, dns, tls, https]
+      additionalProperties: false
+      properties: {observer: {type: string, enum: [administrator_client]}, application_id: {type: string}, deployment_id: {type: string}, hostname: {type: string}, report_id: {type: string}, observed_at: {type: string, format: date-time}, received_at: {type: string, format: date-time}, expires_at: {type: string, format: date-time}, dns: {$ref: '#/components/schemas/ExternalAccessDNSObservation'}, tls: {$ref: '#/components/schemas/ExternalAccessTLSObservation'}, https: {$ref: '#/components/schemas/ExternalAccessHTTPSObservation'}}
+    ExternalAccessObservationReadResponse:
+      type: object
+      required: [availability]
+      additionalProperties: false
+      properties: {availability: {type: string, enum: [available, expired, not_observed]}, observation: {$ref: '#/components/schemas/ExternalAccessObservation'}}
+    ExternalAccessObservationReportRequest:
+      type: object
+      required: [report_id, observed_at, dns, tls, https]
+      additionalProperties: false
+      properties: {report_id: {type: string, minLength: 1}, observed_at: {type: string, format: date-time}, dns: {$ref: '#/components/schemas/ExternalAccessDNSObservation'}, tls: {$ref: '#/components/schemas/ExternalAccessTLSObservation'}, https: {$ref: '#/components/schemas/ExternalAccessHTTPSObservation'}}

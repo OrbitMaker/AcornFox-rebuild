@@ -122,6 +122,7 @@ type Server struct {
 	acornFoxAssistantActions   *AcornFoxAssistantActionsHTTPHandler
 	acornFoxWebSetup           *AcornFoxWebSetupHTTPHandler
 	acornFoxOperation          *AcornFoxOperationHTTPHandler
+	acornFoxAccessObservation  *AcornFoxAccessObservationHTTPHandler
 	acornFoxSourceUpdate       *AcornFoxSourceUpdateHTTPHandler
 	acornFoxSourceMetadata     *AcornFoxSourceMetadataHTTPHandler
 	acornFoxTLSAllow           *acornFoxTLSAllowHandler
@@ -218,6 +219,9 @@ func (s *Server) SetAcornFoxWebSetup(handler *AcornFoxWebSetupHTTPHandler) {
 }
 func (s *Server) SetAcornFoxOperation(handler *AcornFoxOperationHTTPHandler) {
 	s.acornFoxOperation = handler
+}
+func (s *Server) SetAcornFoxAccessObservation(handler *AcornFoxAccessObservationHTTPHandler) {
+	s.acornFoxAccessObservation = handler
 }
 func (s *Server) SetAcornFoxSourceUpdate(handler *AcornFoxSourceUpdateHTTPHandler) {
 	s.acornFoxSourceUpdate = handler

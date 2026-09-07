@@ -84,6 +84,8 @@ func TestAcornFoxOpenAPIParity(t *testing.T) {
 		{"redeployAcornFoxDelivery", http.MethodPost, "/apps/app/deliveries/deployment/redeploy", shapeCommand, map[string]any{}},
 		{"getAcornFoxDeliveryPublicAccess", http.MethodGet, "/apps/app/deliveries/deployment/public-access", shapePublicAccess, nil},
 		{"setAcornFoxDeliveryPublicAccess", http.MethodPut, "/apps/app/deliveries/deployment/public-access", shapePublicAccess, map[string]bool{"enabled": true}},
+		{"getAcornFoxExternalAccessObservation", http.MethodGet, "/apps/app/deliveries/deployment/access-observation", 0, nil},
+		{"reportAcornFoxExternalAccessObservation", http.MethodPost, "/apps/app/deliveries/deployment/access-observation", 0, map[string]any{"report_id": "access_report_0123456789abcdef0123456789abcdef", "observed_at": "2030-01-01T00:00:00Z", "dns": map[string]any{"state": "failed", "failure_code": "dns_no_answer"}, "tls": map[string]any{"state": "not_attempted"}, "https": map[string]any{"state": "not_attempted"}}},
 	}
 	byID := make(map[string]openAPIParityOperation, len(matrix.Operations))
 	for _, operation := range matrix.Operations {
@@ -137,14 +139,21 @@ func TestAcornFoxOpenAPIParity(t *testing.T) {
 				t.Fatalf("CLI route=%s %s OpenAPI=%s %s", declared.method, declared.path, operation.Method, operation.PathTemplate)
 			}
 			got, known := expectedSuccessStatus(declared.method, declared.path, declared.shape)
-			if !known || len(operation.SuccessStatuses) != 1 || got != operation.SuccessStatuses[0] {
+			if status, ok := map[string]int{"getAcornFoxExternalAccessObservation": http.StatusOK, "reportAcornFoxExternalAccessObservation": http.StatusCreated}[declared.operationID]; ok {
+				got, known = status, true
+			}
+			contains := false
+			for _, status := range operation.SuccessStatuses {
+				contains = contains || status == got
+			}
+			if !known || !contains {
 				t.Fatalf("CLI success status=%d known=%t OpenAPI=%v", got, known, operation.SuccessStatuses)
 			}
 			var captured *http.Request
 			client := &cli{client: &http.Client{Transport: roundTripper(func(request *http.Request) (*http.Response, error) {
 				captured = request.Clone(request.Context())
 				captured.Body = request.Body
-				return &http.Response{StatusCode: operation.SuccessStatuses[0], Header: make(http.Header), Body: io.NopCloser(strings.NewReader(""))}, nil
+				return &http.Response{StatusCode: got, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(""))}, nil
 			})}}
 			csrf, key := cliProof(operation.Proof)
 			requestState := state

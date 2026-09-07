@@ -270,6 +270,7 @@ button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,te
 .af-icon-button:hover {
   background:#f6f6f6}
 .af-note {
+  overflow-wrap:anywhere;
   margin:13px 0;
   color:#686868;
   font-size:12px;

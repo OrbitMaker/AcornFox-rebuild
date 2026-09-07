@@ -457,8 +457,17 @@ func (c *cli) deliveryAction(action string, args []string) error {
 	return c.callCommand(http.MethodPost, "/apps/"+pathID(app)+"/deliveries/"+pathID(deployment)+"/"+action, body, true, key, 30*time.Second, shapeCommand)
 }
 func (c *cli) publicAccess(args []string) error {
+	if len(args) > 0 {
+		switch args[0] {
+		case "check":
+			return c.publicAccessCheck(args[1:])
+		case "observation":
+			return c.publicAccessObservation(args[1:])
+		}
+	}
+
 	if len(args) < 3 {
-		return errors.New("usage: acornfox public-access get|enable|disable APP_ID DEPLOYMENT_ID")
+		return errors.New("usage: acornfox public-access get|enable|disable|check|observation APP_ID DEPLOYMENT_ID")
 	}
 	action, appRaw, deploymentRaw := args[0], args[1], args[2]
 	app, err := requireID(appRaw, "application ID")
@@ -477,7 +486,7 @@ func (c *cli) publicAccess(args []string) error {
 		return c.callCommand(http.MethodGet, path, nil, false, "", 30*time.Second, shapePublicAccess)
 	}
 	if action != "enable" && action != "disable" {
-		return errors.New("usage: acornfox public-access get|enable|disable APP_ID DEPLOYMENT_ID")
+		return errors.New("usage: acornfox public-access get|enable|disable|check|observation APP_ID DEPLOYMENT_ID")
 	}
 	p, values, err := parseFlags(args[3:], "--idempotency-key")
 	if err != nil {

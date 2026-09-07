@@ -97,6 +97,7 @@ func main() {
 		server.SetAcornFoxDeploymentStore(store)
 		server.SetAcornFoxSourceMetadata(newAcornFoxSourceMetadataHTTPHandler(store))
 		server.SetAcornFoxOperation(newAcornFoxOperationHTTPHandler(store))
+		server.SetAcornFoxAccessObservation(&AcornFoxAccessObservationHTTPHandler{Store: store})
 		controllerStore = store
 		server.SetSystemStatusStore(store)
 		server.SetApplicationProjectionStore(store)

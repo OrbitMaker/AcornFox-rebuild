@@ -448,6 +448,25 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/acornfox/apps/{applicationId}/deliveries/{deploymentId}/access-observation": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                applicationId: components["parameters"]["ApplicationId"];
+                deploymentId: components["parameters"]["DeploymentId"];
+            };
+            cookie?: never;
+        };
+        get: operations["getAcornFoxExternalAccessObservation"];
+        put?: never;
+        post: operations["reportAcornFoxExternalAccessObservation"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/acornfox/apps/{applicationId}/deliveries/{deploymentId}/probes": {
         parameters: {
             query?: never;
@@ -878,6 +897,72 @@ export interface components {
             };
             /** @enum {string} */
             status: "PUBLIC_DISABLED" | "PENDING_EXTERNAL_VALIDATION";
+        };
+        ExternalAccessDNSObservation: {
+            /** @enum {string} */
+            state: "observed" | "failed";
+            addresses?: string[];
+            /** @enum {string} */
+            failure_code?: "dns_no_answer" | "dns_timeout" | "dns_lookup_failed";
+        };
+        ExternalAccessTLSObservation: {
+            /** @enum {string} */
+            state: "observed";
+            certificate_sha256: string;
+        } | {
+            /** @enum {string} */
+            state: "failed";
+            /** @enum {string} */
+            failure_code: "tls_connect_failed" | "tls_name_mismatch" | "tls_certificate_invalid" | "tls_timeout";
+        } | {
+            /** @enum {string} */
+            state: "not_attempted";
+        };
+        ExternalAccessHTTPSObservation: {
+            /** @enum {string} */
+            state: "observed";
+            http_status: number;
+            response_sample_sha256: string;
+            response_sample_bytes: number;
+            response_truncated: boolean;
+        } | {
+            /** @enum {string} */
+            state: "failed";
+            /** @enum {string} */
+            failure_code: "https_timeout" | "https_transport_failed";
+        } | {
+            /** @enum {string} */
+            state: "not_attempted";
+        };
+        ExternalAccessObservation: {
+            /** @enum {string} */
+            observer: "administrator_client";
+            application_id: string;
+            deployment_id: string;
+            hostname: string;
+            report_id: string;
+            /** Format: date-time */
+            observed_at: string;
+            /** Format: date-time */
+            received_at: string;
+            /** Format: date-time */
+            expires_at: string;
+            dns: components["schemas"]["ExternalAccessDNSObservation"];
+            tls: components["schemas"]["ExternalAccessTLSObservation"];
+            https: components["schemas"]["ExternalAccessHTTPSObservation"];
+        };
+        ExternalAccessObservationReadResponse: {
+            /** @enum {string} */
+            availability: "available" | "expired" | "not_observed";
+            observation?: components["schemas"]["ExternalAccessObservation"];
+        };
+        ExternalAccessObservationReportRequest: {
+            report_id: string;
+            /** Format: date-time */
+            observed_at: string;
+            dns: components["schemas"]["ExternalAccessDNSObservation"];
+            tls: components["schemas"]["ExternalAccessTLSObservation"];
+            https: components["schemas"]["ExternalAccessHTTPSObservation"];
         };
     };
     responses: {
@@ -1939,6 +2024,77 @@ export interface operations {
             409: components["responses"]["PublicAccessConflict"];
             422: components["responses"]["ValidationFailed"];
             503: components["responses"]["PublicAccessUnavailable"];
+        };
+    };
+    getAcornFoxExternalAccessObservation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                applicationId: components["parameters"]["ApplicationId"];
+                deploymentId: components["parameters"]["DeploymentId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Latest bounded administrator-client observation. available reports only this observation; it does not prove current public reachability. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExternalAccessObservationReadResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationFailed"];
+            404: components["responses"]["NotFound"];
+            503: components["responses"]["TemporarilyUnavailable"];
+        };
+    };
+    reportAcornFoxExternalAccessObservation: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Must equal the non-HttpOnly __Host-acornfox_csrf cookie and use the allowed Origin. */
+                "X-AcornFox-CSRF": components["parameters"]["CSRFToken"];
+            };
+            path: {
+                applicationId: components["parameters"]["ApplicationId"];
+                deploymentId: components["parameters"]["DeploymentId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ExternalAccessObservationReportRequest"];
+            };
+        };
+        responses: {
+            /** @description Exact report_id replay; no second observation was stored. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExternalAccessObservation"];
+                };
+            };
+            /** @description New administrator-client external-access observation stored. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExternalAccessObservation"];
+                };
+            };
+            400: components["responses"]["InvalidRequest"];
+            401: components["responses"]["AuthenticationFailed"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["IdempotencyConflict"];
+            422: components["responses"]["ValidationFailed"];
+            503: components["responses"]["TemporarilyUnavailable"];
         };
     };
     probeAcornFoxDeliveryOnce: {

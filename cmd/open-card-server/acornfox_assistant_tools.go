@@ -91,7 +91,7 @@ func assistantToolArguments(tool string, args map[string]string) bool {
 	switch tool {
 	case "acornfox_app", "acornfox_sources", "acornfox_deliveries":
 		want["application_id"] = true
-	case "acornfox_delivery_status", "acornfox_logs", "acornfox_public_access", "acornfox_probe", "acornfox_propose_restart", "acornfox_propose_redeploy":
+	case "acornfox_delivery_status", "acornfox_logs", "acornfox_public_access", "acornfox_access_observation", "acornfox_probe", "acornfox_propose_restart", "acornfox_propose_redeploy":
 		want["application_id"], want["deployment_id"] = true, true
 	case "acornfox_operation_result":
 		want["application_id"], want["operation_id"] = true, true
@@ -126,6 +126,8 @@ func assistantToolPath(tool, app, deployment, operation string) (string, string)
 		return "/api/v1/acornfox/apps/" + e(app) + "/deliveries/" + e(deployment) + "/logs", http.MethodGet
 	case "acornfox_public_access":
 		return "/api/v1/acornfox/apps/" + e(app) + "/deliveries/" + e(deployment) + "/public-access", http.MethodGet
+	case "acornfox_access_observation":
+		return "/api/v1/acornfox/apps/" + e(app) + "/deliveries/" + e(deployment) + "/access-observation", http.MethodGet
 	case "acornfox_probe":
 		return "/api/v1/acornfox/apps/" + e(app) + "/deliveries/" + e(deployment) + "/probes", http.MethodPost
 	case "acornfox_operation_result":

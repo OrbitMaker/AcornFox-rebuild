@@ -39,6 +39,44 @@ export type DeploymentSource = {
 
 export type SourceUpdate = { sourceRevisionId: string; status: "imported" };
 
+export type AccessDNSObservation =
+  | { state: "observed"; addresses: string[] }
+  | { state: "failed"; failureCode: "dns_no_answer" | "dns_timeout" | "dns_lookup_failed" };
+
+export type AccessTLSObservation =
+  | { state: "observed"; certificateSha256: string }
+  | { state: "failed"; failureCode: "tls_connect_failed" | "tls_name_mismatch" | "tls_certificate_invalid" | "tls_timeout" }
+  | { state: "not_attempted" };
+
+export type AccessHTTPSObservation =
+  | {
+    state: "observed";
+    httpStatus: number;
+    responseSampleSha256: string;
+    responseSampleBytes: number;
+    responseTruncated: boolean;
+  }
+  | { state: "failed"; failureCode: "https_timeout" | "https_transport_failed" }
+  | { state: "not_attempted" };
+
+export type AccessObservationFact = {
+  observer: "administrator_client";
+  applicationId: string;
+  deploymentId: string;
+  hostname: string;
+  reportId: string;
+  observedAt: string;
+  dns: AccessDNSObservation;
+  tls: AccessTLSObservation;
+  https: AccessHTTPSObservation;
+  receivedAt: string;
+  expiresAt: string;
+};
+
+export type AccessObservation =
+  | { availability: "not_observed" }
+  | { availability: "available" | "expired"; observation: AccessObservationFact };
+
 export type AcornFoxOperationEvidence = {
   kind: "runtime_observation" | "response_observation";
   verdict: "observed" | "unhealthy";
@@ -65,6 +103,7 @@ export interface AcornFoxIntegrationClient {
   sourceUpdate(applicationId: string, input: { baseSourceRevisionId: string; ref: string }, idempotencyKey: string): Promise<SourceUpdate>;
   deploymentSource(applicationId: string, deploymentId: string): Promise<DeploymentSource>;
   operationResult(applicationId: string, operationId: string): Promise<AcornFoxOperationResult>;
+  accessObservation(applicationId: string, deploymentId: string): Promise<AccessObservation>;
 }
 
 function invalid(): never {
@@ -177,6 +216,134 @@ function sourceUpdate(value: unknown): SourceUpdate {
   const row = exact(value, ["source_revision_id", "status"]);
   return { sourceRevisionId: string(row.source_revision_id), status: enumValue(row.status, ["imported"]) };
 }
+function sha256(value: unknown): string {
+  const result = string(value);
+  return /^sha256:[0-9a-f]{64}$/.test(result) ? result : invalid();
+}
+function utcDate(value: unknown): string {
+  const result = date(value);
+  return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(result) ? result : invalid();
+}
+function bool(value: unknown): boolean {
+  return typeof value === "boolean" ? value : invalid();
+}
+function reportId(value: unknown): string {
+  const result = string(value);
+  return /^[A-Za-z0-9_-]{1,128}$/.test(result) ? result : invalid();
+}
+function ipv4(value: string): boolean {
+  const parts = value.split(".");
+  return parts.length === 4 && parts.every((part) => /^(?:0|[1-9]\d{0,2})$/.test(part) && Number(part) <= 255);
+}
+function ipv6(value: string): boolean {
+  if (!value.includes(":")) return false;
+  const compressed = value.split("::");
+  if (compressed.length > 2) return false;
+  const groups = (part: string) => part ? part.split(":") : [];
+  const left = groups(compressed[0]!);
+  const right = groups(compressed[1] ?? "");
+  const all = [...left, ...right];
+  const ipv4Index = all.findIndex((part) => part.includes("."));
+  if (ipv4Index >= 0 && (ipv4Index !== all.length - 1 || !ipv4(all[ipv4Index]!))) return false;
+  const count = all.length + (ipv4Index >= 0 ? 1 : 0);
+  if (compressed.length === 1 ? count !== 8 : count >= 8) return false;
+  return all.every((part, index) => index === ipv4Index || /^[0-9A-Fa-f]{1,4}$/.test(part));
+}
+function ipAddress(value: unknown): string {
+  const result = string(value);
+  return ipv4(result) || ipv6(result) ? result : invalid();
+}
+function dnsObservation(value: unknown): AccessDNSObservation {
+  const state = enumValue(record(value).state, ["observed", "failed"]);
+  if (state === "observed") {
+    const row = exact(value, ["state", "addresses"]);
+    if (!Array.isArray(row.addresses) || row.addresses.length < 1 || row.addresses.length > 8) invalid();
+    const addresses = row.addresses.map(ipAddress);
+    if (addresses.some((address, index) => index > 0 && address <= addresses[index - 1]!)) invalid();
+    return { state, addresses };
+  }
+  const row = exact(value, ["state", "failure_code"]);
+  return { state, failureCode: enumValue(row.failure_code, ["dns_no_answer", "dns_timeout", "dns_lookup_failed"]) };
+}
+function tlsObservation(value: unknown): AccessTLSObservation {
+  const state = enumValue(record(value).state, ["observed", "failed", "not_attempted"]);
+  if (state === "not_attempted") {
+    exact(value, ["state"]);
+    return { state };
+  }
+  if (state === "observed") {
+    const row = exact(value, ["state", "certificate_sha256"]);
+    return { state, certificateSha256: sha256(row.certificate_sha256) };
+  }
+  const row = exact(value, ["state", "failure_code"]);
+  return { state, failureCode: enumValue(row.failure_code, ["tls_connect_failed", "tls_name_mismatch", "tls_certificate_invalid", "tls_timeout"]) };
+}
+function httpsObservation(value: unknown): AccessHTTPSObservation {
+  const state = enumValue(record(value).state, ["observed", "failed", "not_attempted"]);
+  if (state === "not_attempted") {
+    exact(value, ["state"]);
+    return { state };
+  }
+  if (state === "failed") {
+    const row = exact(value, ["state", "failure_code"]);
+    return { state, failureCode: enumValue(row.failure_code, ["https_timeout", "https_transport_failed"]) };
+  }
+  const row = exact(value, [
+    "state", "http_status", "response_sample_sha256", "response_sample_bytes", "response_truncated",
+  ]);
+  const httpStatus = integer(row.http_status);
+  const responseSampleBytes = integer(row.response_sample_bytes);
+  if (httpStatus < 100 || httpStatus > 599 || responseSampleBytes < 0 || responseSampleBytes > 65_536) invalid();
+  return {
+    state,
+    httpStatus,
+    responseSampleSha256: sha256(row.response_sample_sha256),
+    responseSampleBytes,
+    responseTruncated: bool(row.response_truncated),
+  };
+}
+function accessObservation(value: unknown, applicationId: string, deploymentId: string): AccessObservation {
+  const root = exact(value, ["availability"], ["availability", "observation"]);
+  const availability = enumValue(root.availability, ["available", "expired", "not_observed"]);
+  if (availability === "not_observed") {
+    if (root.observation !== undefined) invalid();
+    return { availability };
+  }
+  if (root.observation === undefined) invalid();
+  const row = exact(root.observation, [
+    "observer", "application_id", "deployment_id", "hostname", "report_id", "observed_at", "dns", "tls", "https", "received_at", "expires_at",
+  ]);
+  if (row.observer !== "administrator_client") invalid();
+  const factApplicationId = reportId(row.application_id);
+  const factDeploymentId = reportId(row.deployment_id);
+  if (factApplicationId !== applicationId || factDeploymentId !== deploymentId) invalid();
+  const hostname = string(row.hostname);
+  if (!hostname) invalid();
+  const dns = dnsObservation(row.dns);
+  const tls = tlsObservation(row.tls);
+  const https = httpsObservation(row.https);
+  if ((dns.state === "failed" && (tls.state !== "not_attempted" || https.state !== "not_attempted")) ||
+      (tls.state === "failed" && https.state !== "not_attempted")) invalid();
+  const receivedAt = utcDate(row.received_at);
+  const expiresAt = utcDate(row.expires_at);
+  if (Date.parse(expiresAt) - Date.parse(receivedAt) !== 5 * 60 * 1000) invalid();
+  return {
+    availability,
+    observation: {
+      observer: "administrator_client",
+      applicationId: factApplicationId,
+      deploymentId: factDeploymentId,
+      hostname,
+      reportId: reportId(row.report_id),
+      observedAt: utcDate(row.observed_at),
+      dns,
+      tls,
+      https,
+      receivedAt,
+      expiresAt,
+    },
+  };
+}
 function deploymentSource(value: unknown): DeploymentSource {
   const row = exact(value, ["deployment_id", "availability"], ["deployment_id", "availability", "source_revision_id", "commit", "ref", "repository_url"]);
   const sourceRevisionId = optionalString(row.source_revision_id);
@@ -254,5 +421,9 @@ export function createAcornFoxIntegrationClient(fetcher: Fetcher = fetch): Acorn
     },
     deploymentSource: (applicationId, deploymentId) => request(`/apps/${pathPart(applicationId)}/deliveries/${pathPart(deploymentId)}/source`, deploymentSource),
     operationResult: (applicationId, operationId) => request(`/apps/${pathPart(applicationId)}/operations/${pathPart(operationId)}`, operation),
+    accessObservation: (applicationId, deploymentId) => request(
+      `/apps/${pathPart(applicationId)}/deliveries/${pathPart(deploymentId)}/access-observation`,
+      (value) => accessObservation(value, applicationId, deploymentId),
+    ),
   };
 }

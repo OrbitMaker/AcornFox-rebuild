@@ -132,6 +132,10 @@ func (s *Server) handleAcornFoxAPI(w http.ResponseWriter, r *http.Request) bool 
 			s.handleAcornFoxDeliveryLogs(w, r, domain.ID(parts[0]), domain.ID(parts[2]))
 			return true
 		}
+		if parts[3] == "access-observation" {
+			s.acornFoxAccessObservation.Handle(w, r, domain.ID(parts[0]), domain.ID(parts[2]))
+			return true
+		}
 		if parts[3] == "public-access" {
 			s.handleAcornFoxDeliveryPublicAccess(w, r, domain.ID(parts[0]), domain.ID(parts[2]))
 			return true
@@ -174,6 +178,8 @@ func acornFoxRouteAllow(path string) (string, bool) {
 			return "GET", true
 		case "public-access":
 			return "GET, PUT", true
+		case "access-observation":
+			return "GET, POST", true
 		}
 	}
 	return "", false

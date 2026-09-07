@@ -103,6 +103,8 @@ function payload(operationId: string, sourceRevisionKind: string): unknown {
       return { deployment_id: "deployment", availability: "unavailable" };
     case "getAcornFoxOperationResult":
       return { operation_id: "operation", operation_type: "observe", status: "verified", task_id: "task", deployment_id: "deployment", accepted_at: "2030-01-01T00:00:00Z", updated_at: "2030-01-01T00:00:01Z", evidence: { kind: "response_observation", verdict: "unhealthy", observed_at: "2030-01-01T00:00:01Z", http_status: 500 } };
+    case "getAcornFoxExternalAccessObservation":
+      return { availability: "not_observed" };
     case "listAcornFoxAssistantSessions":
       return { sessions: [] };
     case "createAcornFoxAssistantSession":
@@ -169,6 +171,7 @@ const integrationOperations: IntegrationOperation[] = [
   { operationId: "updateAcornFoxSourceRevision", method: "POST", pathTemplate: "/api/v1/acornfox/apps/{applicationId}/sources", invoke: (api) => api.sourceUpdate("app", { baseSourceRevisionId: "source", ref: "main" }, "retry-key") },
   { operationId: "getAcornFoxDeliverySource", method: "GET", pathTemplate: "/api/v1/acornfox/apps/{applicationId}/deliveries/{deploymentId}/source", invoke: (api) => api.deploymentSource("app", "deployment") },
   { operationId: "getAcornFoxOperationResult", method: "GET", pathTemplate: "/api/v1/acornfox/apps/{applicationId}/operations/{operationId}", invoke: (api) => api.operationResult("app", "operation") },
+  { operationId: "getAcornFoxExternalAccessObservation", method: "GET", pathTemplate: "/api/v1/acornfox/apps/{applicationId}/deliveries/{deploymentId}/access-observation", invoke: (api) => api.accessObservation("app", "deployment") },
 ];
 const assistantOperations: AssistantOperation[] = [
   { operationId: "listAcornFoxAssistantSessions", method: "GET", pathTemplate: "/api/v1/acornfox/assistant/sessions", invoke: (api) => api.sessions() },
@@ -239,10 +242,10 @@ describe("AcornFox OpenAPI parity", () => {
     const contract = matrix!;
     const integration = contract.operations.filter((operation) => operation.webClient === "integration");
     expect(integration.map((operation) => operation.operationId).sort()).toEqual([
-      "getAcornFoxDeliverySource", "getAcornFoxHostMetrics", "getAcornFoxOperationResult", "getAcornFoxSetupState", "getAcornFoxSourceMetadata", "initializeAcornFoxAdministrator", "updateAcornFoxSourceRevision",
+      "getAcornFoxDeliverySource", "getAcornFoxExternalAccessObservation", "getAcornFoxHostMetrics", "getAcornFoxOperationResult", "getAcornFoxSetupState", "getAcornFoxSourceMetadata", "initializeAcornFoxAdministrator", "updateAcornFoxSourceRevision",
     ]);
     expect(integrationOperations).toHaveLength(integration.length);
-    expect(contract.operations.filter((operation) => operation.webClient === "none")).toHaveLength(0);
+    expect(contract.operations.filter((operation) => operation.webClient === "none").map((operation) => operation.operationId)).toEqual(["reportAcornFoxExternalAccessObservation"]);
     const contractByID = new Map(integration.map((operation) => [operation.operationId, operation]));
 
     for (const declared of integrationOperations) {

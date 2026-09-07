@@ -30,7 +30,7 @@ See `assistant-operations.md` for root configuration commands.
 
 A revocable per-run capability grants access to the protected Unix tool socket.
 The trusted extension exposes factual host/application/source/deployment/log/operation
-reads and a controlled HTTP probe. It also prepares restart and redeploy proposals.
+reads and a controlled HTTP probe. A separate read-only tool returns administrator-client external-access observations, preserving their reported provenance and expiry. It also prepares restart and redeploy proposals.
 There is no generic shell tool and no model-accessible approval endpoint.
 
 A user confirms a proposal through the authenticated console. Go revalidates the exact
@@ -46,7 +46,7 @@ them. Completed replies replace their transient deltas in bounded event retentio
 ## Release boundary
 
 The candidate includes the complete pinned Pi resource tree, worker, trusted extension,
-and migrations 0035 through 0038. Fresh installations leave the optional worker disabled.
+and migrations 0035 through 0039. Fresh installations leave the optional worker disabled.
 Same-schema upgrade and rollback preserve its prior enabled state. A predecessor with
 a different database migration version is rejected before upgrade effects; cross-schema
 migration is not implemented by this path.
@@ -54,3 +54,21 @@ migration is not implemented by this path.
 Candidate/source checks, local tests, target-host installation, application public access,
 and public release acceptance are separate evidence layers. A manually staged console
 or successful model call does not establish full installed-release acceptance.
+
+## External access observations
+
+An administrator can run `acornfox public-access check APP_ID DEPLOYMENT_ID` on an
+external machine. The CLI reads the server-derived public URL, resolves public IPs,
+checks standard TLS for the exact hostname, then reads at most a 64 KiB HTTPS response
+sample. It follows no redirects and sends no session cookies to the application.
+The lookup and probe phase has a 30-second deadline; report submission has its own
+10-second deadline so a timeout result can still be recorded. `public-access observation` only
+reads the stored report.
+
+Reports record the administrator identity, exact deployment and hostname, observation
+and receipt times, a five-minute expiry, layer-specific outcomes, and prefixed SHA-256
+fingerprints. They report the administrator client's measurement, not proof of a
+third-party observer location. Identical report retries return the original timestamps;
+expired reports cannot refresh their own validity. A deployment that has not enabled
+public access returns no current observation. The old public-access DTO retains its
+local routing meaning.

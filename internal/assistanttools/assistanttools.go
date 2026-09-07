@@ -163,7 +163,7 @@ func stableCode(code string) bool {
 }
 
 var toolSchemas = map[string]bool{
-	"acornfox_host_metrics": true, "acornfox_list_apps": true, "acornfox_app": true, "acornfox_sources": true, "acornfox_deliveries": true, "acornfox_delivery_status": true, "acornfox_logs": true, "acornfox_operation_result": true, "acornfox_public_access": true, "acornfox_probe": true, "acornfox_propose_restart": true, "acornfox_propose_redeploy": true,
+	"acornfox_host_metrics": true, "acornfox_list_apps": true, "acornfox_app": true, "acornfox_sources": true, "acornfox_deliveries": true, "acornfox_delivery_status": true, "acornfox_logs": true, "acornfox_operation_result": true, "acornfox_public_access": true, "acornfox_access_observation": true, "acornfox_probe": true, "acornfox_propose_restart": true, "acornfox_propose_redeploy": true,
 }
 
 // Handler is suitable for http.Serve on a Unix-domain socket. No HTTP request
