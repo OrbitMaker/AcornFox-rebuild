@@ -1,7 +1,9 @@
 import { readFileSync } from "node:fs";
-import { createAcornFoxClient, type AcornFoxClient } from "./client";
+import { createAcornFoxClient, type AcornFoxClient, type AcornFoxSchemas } from "./client";
 import { createAcornFoxIntegrationClient, type AcornFoxIntegrationClient } from "./integration-client";
 import { createAcornFoxAssistantClient, type AcornFoxAssistantClient } from "./assistant-client";
+import { candidatePublishKey, createFixCandidateClient, type FixCandidateClient } from "./fix-candidate-client";
+import { candidateFixture } from "./fix-candidate.fixture";
 
 type Operation = {
   operationId: string;
@@ -15,9 +17,9 @@ type Operation = {
     | "session-read"
     | "csrf-session-mutation"
     | "csrf-idempotency-mutation";
-  parity: "legacy_cli" | "integration_cli" | "integration_ui" | "assistant_ui_only" | "cli_only";
+  parity: "legacy_cli" | "integration_cli" | "integration_ui" | "assistant_ui_only" | "candidate_cli" | "cli_only";
   cli: boolean;
-  webClient: "legacy" | "integration" | "assistant" | "none";
+  webClient: "legacy" | "integration" | "assistant" | "candidate" | "none";
 };
 type Matrix = {
   sourceRequestType: "public_git";
@@ -183,6 +185,26 @@ const assistantOperations: AssistantOperation[] = [
   { operationId: "decideAcornFoxAssistantAction", method: "POST", pathTemplate: "/api/v1/acornfox/assistant/sessions/{sessionId}/actions/{proposalId}/decision", invoke: (api) => api.decideAction("session", "proposal", true) },
 ];
 
+// These payloads also compile against the generated OpenAPI DTOs. Runtime
+// assertions below invoke the actual candidate client and inspect its decoding.
+const validatedCandidate = { ...candidateFixture, status: "validated" as const,
+  runtime: { ...candidateFixture.runtime, runtime_state: "stopped" as const, probe_outcome: "responded" as const, cleanup_confirmed: true as const },
+} satisfies AcornFoxSchemas["FixCandidateValidated"];
+const matchedCandidate = { ...validatedCandidate, status: "source_matched" as const, matched_source_revision_id: "source-next", matched_commit: "9".repeat(40) } satisfies AcornFoxSchemas["FixCandidateValidated"];
+const candidateID = candidateFixture.candidate_id, candidateApp = candidateFixture.application_id;
+const publishKey = candidatePublishKey(candidateApp, candidateID);
+const candidateRoot = "/api/v1/acornfox/apps/{applicationId}/fix-candidates";
+const candidateOperations: Array<{
+  operationId: string; method: string; pathTemplate: string; expectedURL: string;
+  response: unknown; decoded: unknown; body?: unknown;
+  invoke: (api: FixCandidateClient) => Promise<unknown>;
+}> = [
+  { operationId: "listAcornFoxFixCandidates", method: "GET", pathTemplate: candidateRoot, expectedURL: `/api/v1/acornfox/apps/${candidateApp}/fix-candidates`, response: { items: [validatedCandidate] } satisfies AcornFoxSchemas["FixCandidateList"], decoded: [validatedCandidate], invoke: (api) => api.list(candidateApp) },
+  { operationId: "getAcornFoxFixCandidate", method: "GET", pathTemplate: `${candidateRoot}/{candidateId}`, expectedURL: `/api/v1/acornfox/apps/${candidateApp}/fix-candidates/${candidateID}`, response: validatedCandidate, decoded: validatedCandidate, invoke: (api) => api.get(candidateApp, candidateID) },
+  { operationId: "matchAcornFoxFixCandidateSource", method: "POST", pathTemplate: `${candidateRoot}/{candidateId}/source-match`, expectedURL: `/api/v1/acornfox/apps/${candidateApp}/fix-candidates/${candidateID}/source-match`, response: matchedCandidate, decoded: matchedCandidate, body: { source_revision_id: "source-next" } satisfies AcornFoxSchemas["FixCandidateSourceMatchRequest"], invoke: (api) => api.match(candidateApp, candidateID, "source-next") },
+  { operationId: "publishAcornFoxFixCandidate", method: "POST", pathTemplate: `${candidateRoot}/{candidateId}/publish`, expectedURL: `/api/v1/acornfox/apps/${candidateApp}/fix-candidates/${candidateID}/publish`, response: command satisfies AcornFoxSchemas["DeliveryCommandResponse"], decoded: command, invoke: (api) => api.publish(candidateApp, candidateID, publishKey) },
+];
+
 function actualTemplate(url: string, expected: string): string {
   const pathname = new URL(url, "https://acornfox.invalid").pathname;
   const actual = pathname.split("/");
@@ -245,7 +267,7 @@ describe("AcornFox OpenAPI parity", () => {
       "getAcornFoxDeliverySource", "getAcornFoxExternalAccessObservation", "getAcornFoxHostMetrics", "getAcornFoxOperationResult", "getAcornFoxSetupState", "getAcornFoxSourceMetadata", "initializeAcornFoxAdministrator", "updateAcornFoxSourceRevision",
     ]);
     expect(integrationOperations).toHaveLength(integration.length);
-    expect(contract.operations.filter((operation) => operation.webClient === "none").map((operation) => operation.operationId)).toEqual(["createAcornFoxFixCandidate", "getAcornFoxFixCandidate", "listAcornFoxFixCandidates", "matchAcornFoxFixCandidateSource", "publishAcornFoxFixCandidate", "reportAcornFoxExternalAccessObservation"]);
+    expect(contract.operations.filter((operation) => operation.webClient === "none").map((operation) => operation.operationId)).toEqual(["createAcornFoxFixCandidate", "reportAcornFoxExternalAccessObservation"]);
     const contractByID = new Map(integration.map((operation) => [operation.operationId, operation]));
 
     for (const declared of integrationOperations) {
@@ -321,4 +343,66 @@ describe("AcornFox OpenAPI parity", () => {
       }[operation!.proof]).toBe(hasCSRF);
     }
   });
+
+  it.skipIf(!matrix)("derives candidate Web coverage and invokes the real client for method, DTO, CSRF and replay-key parity", async () => {
+    const declared = matrix!.operations.filter((operation) => operation.webClient === "candidate");
+    expect(declared.map((operation) => operation.operationId).sort()).toEqual(candidateOperations.map((operation) => operation.operationId).sort());
+    expect(matrix!.operations.filter((operation) => operation.webClient === "legacy")).toHaveLength(18);
+    expect(matrix!.operations.find((operation) => operation.operationId === "createAcornFoxFixCandidate")).toMatchObject({ parity: "cli_only", cli: true, webClient: "none" });
+    for (const route of candidateOperations) {
+      const operation = declared.find((item) => item.operationId === route.operationId)!;
+      expect(operation).toMatchObject({ parity: "candidate_cli", cli: true, method: route.method, pathTemplate: route.pathTemplate });
+      Object.defineProperty(globalThis, "document", { configurable: true, value: { cookie: "__Host-acornfox_csrf=csrf" } });
+      for (const status of operation.successStatuses) {
+        const seen: Array<{ url: string; init: RequestInit }> = [];
+        const api = createFixCandidateClient(async (url, init) => { seen.push({ url: String(url), init: init ?? {} }); return new Response(JSON.stringify(route.response), { status, headers: { "Content-Type": "application/json" } }); });
+        await expect(route.invoke(api)).resolves.toEqual(route.decoded);
+        expect(seen).toHaveLength(1);
+        const request = seen[0]!;
+        expect(request.url).toBe(route.expectedURL); expect(actualTemplate(request.url, route.pathTemplate)).toBe(operation.pathTemplate);
+        expect(request.init.method ?? "GET").toBe(operation.method); expect(request.init).toMatchObject({ credentials: "include", redirect: "error" });
+        const headers = new Headers(request.init.headers);
+        expect({ "session-read": [false, false], "csrf-session-mutation": [true, false], "csrf-idempotency-mutation": [true, true] }[operation.proof as "session-read" | "csrf-session-mutation" | "csrf-idempotency-mutation"]).toEqual([headers.get("X-AcornFox-CSRF") === "csrf", headers.has("Idempotency-Key")]);
+        expect(request.init.body === undefined ? undefined : JSON.parse(String(request.init.body))).toEqual(route.body);
+        if (operation.operationId === "publishAcornFoxFixCandidate") expect(headers.get("Idempotency-Key")).toBe(publishKey);
+      }
+    }
+  });
+
+  it.skipIf(!matrix)("rejects wrong candidate response statuses and malformed DTOs instead of passing on route names alone", async () => {
+    Object.defineProperty(globalThis, "document", { configurable: true, value: { cookie: "__Host-acornfox_csrf=csrf" } });
+    for (const route of candidateOperations) {
+      const operation = matrix!.operations.find((item) => item.operationId === route.operationId)!;
+      const wrongStatus = operation.successStatuses.includes(200) ? 202 : 200;
+      const wrongHTTP = createFixCandidateClient(async () => new Response(JSON.stringify(route.response), { status: wrongStatus, headers: { "Content-Type": "application/json" } }));
+      await expect(route.invoke(wrongHTTP)).rejects.toMatchObject({ status: wrongStatus });
+      const malformed = createFixCandidateClient(async () => new Response(JSON.stringify({ status: "validated" }), { status: operation.successStatuses[0], headers: { "Content-Type": "application/json" } }));
+      await expect(route.invoke(malformed)).rejects.toMatchObject({ code: "invalid_response" });
+      if (route.method === "POST") {
+        Object.defineProperty(globalThis, "document", { configurable: true, value: { cookie: "" } });
+        let calls = 0;
+        const noSessionProof = createFixCandidateClient(async () => { calls += 1; return new Response(JSON.stringify(route.response), { status: operation.successStatuses[0] }); });
+        await expect(route.invoke(noSessionProof)).rejects.toMatchObject({ code: "csrf_missing" }); expect(calls).toBe(0);
+        Object.defineProperty(globalThis, "document", { configurable: true, value: { cookie: "__Host-acornfox_csrf=csrf" } });
+      }
+    }
+  });
+
+  it.skipIf(!matrix)("keeps the publication receipt key when a real candidate-client request loses its response", async () => {
+    const operation = matrix!.operations.find((item) => item.operationId === "publishAcornFoxFixCandidate")!;
+    expect(operation.proof).toBe("csrf-idempotency-mutation");
+    Object.defineProperty(globalThis, "document", { configurable: true, value: { cookie: "__Host-acornfox_csrf=csrf" } });
+    const seen: RequestInit[] = [];
+    const fetcher = async (_url: RequestInfo | URL, init?: RequestInit) => {
+      seen.push(init ?? {});
+      if (seen.length === 1) throw new Error("accepted response was lost");
+      return new Response(JSON.stringify(command), { status: operation.successStatuses[0], headers: { "Content-Type": "application/json" } });
+    };
+    await expect(createFixCandidateClient(fetcher).publish(candidateApp, candidateID, candidatePublishKey(candidateApp, candidateID))).rejects.toMatchObject({ code: "network_error" });
+    await expect(createFixCandidateClient(fetcher).publish(candidateApp, candidateID, candidatePublishKey(candidateApp, candidateID))).resolves.toEqual(command);
+    expect(seen).toHaveLength(2);
+    expect(seen.map((request) => new Headers(request.headers).get("Idempotency-Key"))).toEqual([publishKey, publishKey]);
+    expect(seen.map((request) => request.body)).toEqual([undefined, undefined]);
+  });
+
 });

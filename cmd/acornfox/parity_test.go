@@ -137,7 +137,7 @@ func TestAcornFoxOpenAPIParity(t *testing.T) {
 	for _, declared := range operations {
 		t.Run(declared.operationID, func(t *testing.T) {
 			operation, ok := byID[declared.operationID]
-			if !ok || !operation.CLI || !(operation.Parity == "legacy_cli" || operation.Parity == "integration_cli" || operation.Parity == "cli_only") {
+			if !ok || !operation.CLI || !(operation.Parity == "legacy_cli" || operation.Parity == "integration_cli" || operation.Parity == "candidate_cli" || operation.Parity == "cli_only") {
 				t.Fatalf("not a CLI OpenAPI operation: %+v", operation)
 			}
 			if operation.Method != declared.method || !sameAcornFoxRoute(operation.PathTemplate, apiBase+declared.path) {

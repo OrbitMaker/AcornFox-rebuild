@@ -59,7 +59,7 @@ function successStatuses(operation, operationId) {
 
 function parityScope(operation, operationId) {
   const scope = operation["x-acornfox-parity"] ?? "legacy_cli";
-  if (!["legacy_cli", "integration_cli", "integration_ui", "assistant_ui_only", "cli_only"].includes(scope))
+  if (!["legacy_cli", "integration_cli", "integration_ui", "assistant_ui_only", "candidate_cli", "cli_only"].includes(scope))
     fail(`${operationId} has invalid x-acornfox-parity ${JSON.stringify(scope)}`);
   return scope;
 }
@@ -83,7 +83,7 @@ try {
         proof: proofClass(document, pathItem, operation, method, operation.operationId),
         parity: parityScope(operation, operation.operationId),
         cli: parityScope(operation, operation.operationId) !== "integration_ui" && parityScope(operation, operation.operationId) !== "assistant_ui_only",
-        webClient: parityScope(operation, operation.operationId) === "legacy_cli" ? "legacy" : parityScope(operation, operation.operationId) === "cli_only" ? "none" : parityScope(operation, operation.operationId) === "assistant_ui_only" ? "assistant" : "integration",
+        webClient: parityScope(operation, operation.operationId) === "legacy_cli" ? "legacy" : parityScope(operation, operation.operationId) === "candidate_cli" ? "candidate" : parityScope(operation, operation.operationId) === "cli_only" ? "none" : parityScope(operation, operation.operationId) === "assistant_ui_only" ? "assistant" : "integration",
       });
     }
   }
@@ -118,8 +118,9 @@ try {
   const legacyWebOperations = operations.filter((operation) => operation.webClient === "legacy").length;
   const integrationWebOperations = operations.filter((operation) => operation.webClient === "integration").length;
   const assistantWebOperations = operations.filter((operation) => operation.webClient === "assistant").length;
+  const candidateWebOperations = operations.filter((operation) => operation.webClient === "candidate").length;
   const cliOnlyOperations = operations.filter((operation) => operation.webClient === "none").length;
-  console.log(`AcornFox parity passed: ${cliOperations} CLI, ${legacyWebOperations} legacy-Web, ${integrationWebOperations} integration-Web, ${assistantWebOperations} assistant-Web, ${cliOnlyOperations} CLI-only, and ${operations.length} declared operations.`);
+  console.log(`AcornFox parity passed: ${cliOperations} CLI, ${legacyWebOperations} legacy-Web, ${integrationWebOperations} integration-Web, ${assistantWebOperations} assistant-Web, ${candidateWebOperations} candidate-Web, ${cliOnlyOperations} CLI-only, and ${operations.length} declared operations.`);
 } finally {
   rmSync(matrixDirectory, { recursive: true, force: true });
 }

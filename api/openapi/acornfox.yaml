@@ -254,7 +254,7 @@ paths:
     parameters: [{$ref: '#/components/parameters/ApplicationId'}]
     get:
       operationId: listAcornFoxFixCandidates
-      x-acornfox-parity: cli_only
+      x-acornfox-parity: candidate_cli
       security: [{AdministratorSession: []}]
       responses:
         '200': {description: Latest 50 owner-scoped candidate lifecycle facts., content: {application/json: {schema: {$ref: '#/components/schemas/FixCandidateList'}}}}
@@ -279,7 +279,7 @@ paths:
     parameters: [{$ref: '#/components/parameters/ApplicationId'}, {$ref: '#/components/parameters/CandidateId'}]
     get:
       operationId: getAcornFoxFixCandidate
-      x-acornfox-parity: cli_only
+      x-acornfox-parity: candidate_cli
       security: [{AdministratorSession: []}]
       responses:
         '200': {description: Owner-scoped canonical diff and isolated validation evidence., content: {application/json: {schema: {$ref: '#/components/schemas/FixCandidate'}}}}
@@ -290,7 +290,7 @@ paths:
     parameters: [{$ref: '#/components/parameters/ApplicationId'}, {$ref: '#/components/parameters/CandidateId'}]
     post:
       operationId: matchAcornFoxFixCandidateSource
-      x-acornfox-parity: cli_only
+      x-acornfox-parity: candidate_cli
       security: [{AdministratorSession: []}]
       parameters: [{$ref: '#/components/parameters/CSRFToken'}]
       requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/FixCandidateSourceMatchRequest'}}}}
@@ -305,7 +305,7 @@ paths:
     parameters: [{$ref: '#/components/parameters/ApplicationId'}, {$ref: '#/components/parameters/CandidateId'}]
     post:
       operationId: publishAcornFoxFixCandidate
-      x-acornfox-parity: cli_only
+      x-acornfox-parity: candidate_cli
       security: [{AdministratorSession: []}]
       parameters: [{$ref: '#/components/parameters/IdempotencyKey'}, {$ref: '#/components/parameters/CSRFToken'}]
       responses:
