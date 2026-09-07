@@ -372,6 +372,9 @@ func TestAcornFoxListenerParityAndCollisionBoundary(t *testing.T) {
 	if !strings.Contains(string(internal), "http://127.0.0.1:8080 {") || !strings.Contains(string(internal), "reverse_proxy 127.0.0.1:18481") {
 		t.Fatalf("internal Caddy listener/upstream parity is invalid: %s", internal)
 	}
+	if !strings.Contains(string(internal), "trusted_proxies 127.0.0.1/32") || strings.Contains(string(internal), "trusted_proxies private_ranges") {
+		t.Fatal("the internal proxy must preserve the Edge scheme only from its exact loopback peer")
+	}
 	edge, err := os.ReadFile(filepath.Join(acornFoxDeployRoot(t), "caddy", "acornfox-edge.Caddyfile.example"))
 	if err != nil {
 		t.Fatal(err)

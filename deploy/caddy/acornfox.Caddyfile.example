@@ -8,7 +8,11 @@
 http://127.0.0.1:8080 {
 	@backend path /api /api/* /healthz /readyz
 	handle @backend {
-		reverse_proxy 127.0.0.1:18481
+		reverse_proxy 127.0.0.1:18481 {
+			# Preserve the HTTPS scheme established by the loopback Edge hop.
+			# Public clients never connect directly to this listener.
+			trusted_proxies 127.0.0.1/32
+		}
 	}
 	handle {
 		root * /opt/acornfox/current/web/dist
