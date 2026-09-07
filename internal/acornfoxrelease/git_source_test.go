@@ -1,13 +1,17 @@
 package acornfoxrelease
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestVerifyGitSourceV1RejectsCheckoutAndRemoteDrift(t *testing.T) {
@@ -185,4 +189,143 @@ func TestGitIndexMatchesRejectsMalformedIndexEntries(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPlanGitIndexMatchSupportsSHA1AndSHA256AndDeduplicates(t *testing.T) {
+	for _, length := range []int{40, 64} {
+		t.Run(fmt.Sprintf("oid-%d", length), func(t *testing.T) {
+			objectID := strings.Repeat("a", length)
+			files := []FileEntryV1{
+				{Path: "a.txt", SHA256: strings.Repeat("b", 64), Mode: 0o644},
+				{Path: "bin/tool", SHA256: strings.Repeat("b", 64), Mode: 0o755},
+			}
+			index := []byte("100644 " + objectID + " 0\ta.txt\x00100755 " + objectID + " 0\tbin/tool\x00")
+			tree := []byte("100644 blob " + objectID + "\ta.txt\x00100755 blob " + objectID + "\tbin/tool\x00")
+			plan, ok := planGitIndexMatch(index, tree, files)
+			if !ok || len(plan.objectIDs) != 1 || plan.objectIDs[0] != objectID || len(plan.index) != 2 {
+				t.Fatalf("plan = %#v, ok=%v", plan, ok)
+			}
+		})
+	}
+	for _, length := range []int{39, 41, 63, 65} {
+		objectID := strings.Repeat("a", length)
+		entry := FileEntryV1{Path: "a", SHA256: strings.Repeat("b", 64), Mode: 0o644}
+		index := []byte("100644 " + objectID + " 0\ta\x00")
+		tree := []byte("100644 blob " + objectID + "\ta\x00")
+		if _, ok := planGitIndexMatch(index, tree, []FileEntryV1{entry}); ok {
+			t.Fatalf("accepted %d-character object id", length)
+		}
+	}
+}
+
+func TestParseGitBlobBatchHandlesBinaryBodiesAndRejectsProtocolDrift(t *testing.T) {
+	id := strings.Repeat("a", 40)
+	body := []byte{'a', 0, '\n', 'b'}
+	valid := func() []byte {
+		var output bytes.Buffer
+		fmt.Fprintf(&output, "%s blob %d\n", id, len(body))
+		output.Write(body)
+		output.WriteByte('\n')
+		return output.Bytes()
+	}
+	digests, err := parseGitBlobBatch(bufio.NewReader(bytes.NewReader(valid())), []string{id})
+	if err != nil || digests[id] != sha256Text(body) {
+		t.Fatalf("binary batch = %#v, %v", digests, err)
+	}
+	for name, mutate := range map[string]func([]byte) []byte{
+		"wrong id":       func(raw []byte) []byte { return bytes.Replace(raw, []byte(id), []byte(strings.Repeat("b", 40)), 1) },
+		"wrong type":     func(raw []byte) []byte { return bytes.Replace(raw, []byte(" blob "), []byte(" tree "), 1) },
+		"bad size":       func(raw []byte) []byte { return bytes.Replace(raw, []byte(" blob 4\n"), []byte(" blob -1\n"), 1) },
+		"truncated":      func(raw []byte) []byte { return raw[:len(raw)-2] },
+		"bad terminator": func(raw []byte) []byte { raw[len(raw)-1] = 0; return raw },
+		"extra output":   func(raw []byte) []byte { return append(raw, 'x') },
+	} {
+		t.Run(name, func(t *testing.T) {
+			raw := mutate(append([]byte(nil), valid()...))
+			if _, err := parseGitBlobBatch(bufio.NewReader(bytes.NewReader(raw)), []string{id}); err == nil {
+				t.Fatal("accepted malformed batch output")
+			}
+		})
+	}
+}
+
+func TestVerifyGitSourceUsesOnePrivateBatchInsteadOfPerBlobRunnerCalls(t *testing.T) {
+	root, _, witness, policy, toolchain := syntheticGoReleaseRepository(t)
+	hashCalls, commandCalls, legacyCatFileCalls := 0, 0, 0
+	err := verifyGitSourceWithDependencies(context.Background(), root, witness, policy, toolchain, func(ctx context.Context, name string, args []string, dir string, env []string) ([]byte, error) {
+		commandCalls++
+		for _, arg := range args {
+			if arg == "cat-file" {
+				legacyCatFileCalls++
+			}
+		}
+		return localCommand(ctx, name, args, dir, env)
+	}, exec.LookPath, func(path string) (string, error) {
+		hashCalls++
+		return hashTrustedExecutable(path)
+	})
+	if err != nil {
+		t.Fatalf("verifyGitSourceWithDependencies() error = %v", err)
+	}
+	if legacyCatFileCalls != 0 || commandCalls > 16 || hashCalls > 36 {
+		t.Fatalf("legacy work remained: commands=%d hash=%d cat-file=%d", commandCalls, hashCalls, legacyCatFileCalls)
+	}
+}
+
+func TestReadGitBlobBatchRechecksExecutableAndHonorsCancellation(t *testing.T) {
+	t.Run("hermetic exact-object command", func(t *testing.T) {
+		root := t.TempDir()
+		script := filepath.Join(root, "fake-git")
+		body := "#!/bin/sh\n" +
+			"test \"$1\" = -c && test \"$2\" = core.fsmonitor=false && test \"$3\" = -c && test \"$4\" = core.untrackedCache=false || exit 2\n" +
+			"test \"$5\" = cat-file && test \"$6\" = '--batch=%(objectname) %(objecttype) %(objectsize)' || exit 3\n" +
+			"test \"$GIT_CONFIG_NOSYSTEM\" = 1 && test \"$GIT_CONFIG_GLOBAL\" = /dev/null && test \"$GIT_NO_REPLACE_OBJECTS\" = 1 || exit 4\n" +
+			"IFS= read -r oid || exit 5\nprintf '%s blob 1\\nx\\n' \"$oid\"\n"
+		if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		digest := strings.Repeat("a", 64)
+		git := boundExecutable{path: script, digest: digest, hash: func(string) (string, error) { return digest, nil }}
+		objectID := strings.Repeat("c", 40)
+		digests, err := readGitBlobBatch(context.Background(), root, git, []string{objectID})
+		if err != nil || digests[objectID] != sha256Text([]byte("x")) {
+			t.Fatalf("hermetic batch = %#v, %v", digests, err)
+		}
+	})
+
+	t.Run("executable drift", func(t *testing.T) {
+		root := t.TempDir()
+		script := filepath.Join(root, "fake-git")
+		if err := os.WriteFile(script, []byte("#!/bin/sh\nIFS= read -r oid || exit 1\nprintf '%s blob 1\\nx\\n' \"$oid\"\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		digest := strings.Repeat("a", 64)
+		hashCalls := 0
+		git := boundExecutable{path: script, digest: digest, hash: func(string) (string, error) {
+			hashCalls++
+			if hashCalls == 2 {
+				return strings.Repeat("b", 64), nil
+			}
+			return digest, nil
+		}}
+		if _, err := readGitBlobBatch(context.Background(), root, git, []string{strings.Repeat("c", 40)}); err == nil || hashCalls != 2 {
+			t.Fatalf("drift error/hash calls = %v/%d", err, hashCalls)
+		}
+	})
+
+	t.Run("context cancellation", func(t *testing.T) {
+		root := t.TempDir()
+		script := filepath.Join(root, "fake-git")
+		if err := os.WriteFile(script, []byte("#!/bin/sh\n/bin/sleep 30\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		digest := strings.Repeat("a", 64)
+		git := boundExecutable{path: script, digest: digest, hash: func(string) (string, error) { return digest, nil }}
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+		started := time.Now()
+		if _, err := readGitBlobBatch(ctx, root, git, []string{strings.Repeat("c", 40)}); err == nil || time.Since(started) > 2*time.Second {
+			t.Fatalf("cancellation error/duration = %v/%s", err, time.Since(started))
+		}
+	})
 }

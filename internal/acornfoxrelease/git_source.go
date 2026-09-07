@@ -1,14 +1,18 @@
 package acornfoxrelease
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -162,64 +166,189 @@ func onlyExpectedRemoteURL(raw, expected string) bool {
 }
 
 func gitIndexMatches(raw, tree []byte, files []FileEntryV1, ctx context.Context, root string, git boundExecutable) bool {
+	plan, ok := planGitIndexMatch(raw, tree, files)
+	if !ok {
+		return false
+	}
+	digests, err := readGitBlobBatch(ctx, root, git, plan.objectIDs)
+	if err != nil || len(digests) != len(plan.objectIDs) {
+		return false
+	}
+	for path, object := range plan.index {
+		if digests[object.id] != plan.expected[path].SHA256 {
+			return false
+		}
+	}
+	return true
+}
+
+type gitIndexMatchPlan struct {
+	expected  map[string]FileEntryV1
+	index     map[string]gitObject
+	objectIDs []string
+}
+
+func planGitIndexMatch(raw, tree []byte, files []FileEntryV1) (gitIndexMatchPlan, bool) {
 	expected := map[string]FileEntryV1{}
 	for _, f := range files {
 		expected[f.Path] = f
 	}
 	index := map[string]gitObject{}
+	objectIDLength := 0
 	for _, record := range bytes.Split(raw, []byte{0}) {
 		if len(record) == 0 {
 			continue
 		}
 		parts := bytes.SplitN(record, []byte{'\t'}, 2)
 		if len(parts) != 2 {
-			return false
+			return gitIndexMatchPlan{}, false
 		}
 		meta := strings.Fields(string(parts[0]))
 		if len(meta) != 3 || meta[2] != "0" || !gitObjectID.MatchString(meta[1]) {
-			return false
+			return gitIndexMatchPlan{}, false
+		}
+		if objectIDLength == 0 {
+			objectIDLength = len(meta[1])
+		} else if len(meta[1]) != objectIDLength {
+			return gitIndexMatchPlan{}, false
 		}
 		path := string(parts[1])
 		entry, ok := expected[path]
 		if !ok || index[path].id != "" || !gitModeMatches(meta[0], entry.Mode) {
-			return false
+			return gitIndexMatchPlan{}, false
 		}
 		index[path] = gitObject{mode: meta[0], id: meta[1]}
 	}
 	if len(index) != len(expected) {
-		return false
+		return gitIndexMatchPlan{}, false
 	}
 	treeSeen := map[string]bool{}
+	objectSeen := map[string]bool{}
+	objectIDs := make([]string, 0, len(index))
 	for _, record := range bytes.Split(tree, []byte{0}) {
 		if len(record) == 0 {
 			continue
 		}
 		parts := bytes.SplitN(record, []byte{'\t'}, 2)
 		if len(parts) != 2 {
-			return false
+			return gitIndexMatchPlan{}, false
 		}
 		meta := strings.Fields(string(parts[0]))
 		if len(meta) != 3 || meta[1] != "blob" || !gitObjectID.MatchString(meta[2]) {
-			return false
+			return gitIndexMatchPlan{}, false
 		}
 		object, ok := index[string(parts[1])]
 		if !ok || object.mode != meta[0] || object.id != meta[2] {
-			return false
+			return gitIndexMatchPlan{}, false
 		}
-		entry := expected[string(parts[1])]
 		if treeSeen[string(parts[1])] {
-			return false
+			return gitIndexMatchPlan{}, false
 		}
 		treeSeen[string(parts[1])] = true
-		body, err := git.Run(ctx, gitReadArgs("cat-file", "blob", object.id), root, gitReadEnv())
-		if err != nil || sha256Text(body) != entry.SHA256 {
-			return false
+		if !objectSeen[object.id] {
+			objectSeen[object.id] = true
+			objectIDs = append(objectIDs, object.id)
 		}
 	}
-	return len(treeSeen) == len(expected)
+	if len(treeSeen) != len(expected) || len(objectIDs) == 0 {
+		return gitIndexMatchPlan{}, false
+	}
+	return gitIndexMatchPlan{expected: expected, index: index, objectIDs: objectIDs}, true
 }
 
-var gitObjectID = regexp.MustCompile(`^[0-9a-f]{40,64}$`)
+func readGitBlobBatch(ctx context.Context, root string, git boundExecutable, objectIDs []string) (map[string]string, error) {
+	if ctx == nil || ctx.Err() != nil || git.path == "" || git.hash == nil || !digestText.MatchString(git.digest) || len(objectIDs) == 0 || len(objectIDs) > 4096 {
+		return nil, ErrGitSource
+	}
+	var request strings.Builder
+	for _, objectID := range objectIDs {
+		if !gitObjectID.MatchString(objectID) {
+			return nil, ErrGitSource
+		}
+		request.WriteString(objectID)
+		request.WriteByte('\n')
+	}
+	if request.Len() > int(maxGoListBytes) {
+		return nil, ErrGitSource
+	}
+	before, err := git.hash(git.path)
+	if err != nil || before != git.digest {
+		return nil, ErrGitSource
+	}
+	command := exec.CommandContext(ctx, git.path, gitReadArgs("cat-file", "--batch=%(objectname) %(objecttype) %(objectsize)")...)
+	command.Dir = root
+	command.Env = []string{
+		"PATH=" + os.Getenv("PATH"), "LANG=" + os.Getenv("LANG"),
+		"GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0",
+		"GIT_OPTIONAL_LOCKS=0", "GIT_NO_REPLACE_OBJECTS=1",
+	}
+	command.Stdin = strings.NewReader(request.String())
+	command.Stderr = io.Discard
+	stdout, err := command.StdoutPipe()
+	if err != nil {
+		return nil, ErrGitSource
+	}
+	if err = command.Start(); err != nil {
+		return nil, ErrGitSource
+	}
+	digests, parseErr := parseGitBlobBatch(bufio.NewReaderSize(stdout, 64<<10), objectIDs)
+	if parseErr != nil && command.Process != nil {
+		_ = command.Process.Kill()
+	}
+	waitErr := command.Wait()
+	after, hashErr := git.hash(git.path)
+	if parseErr != nil || waitErr != nil || hashErr != nil || after != git.digest {
+		return nil, ErrGitSource
+	}
+	return digests, nil
+}
+
+func parseGitBlobBatch(reader *bufio.Reader, objectIDs []string) (map[string]string, error) {
+	digests := make(map[string]string, len(objectIDs))
+	var total int64
+	for _, expectedID := range objectIDs {
+		header, err := readGitBatchHeader(reader)
+		if err != nil {
+			return nil, ErrGitSource
+		}
+		fields := strings.Fields(header)
+		if len(fields) != 3 || fields[0] != expectedID || fields[1] != "blob" {
+			return nil, ErrGitSource
+		}
+		size, err := strconv.ParseInt(fields[2], 10, 64)
+		if err != nil || size < 0 || size > sourceFileBytes || total > sourceTreeBytes-size {
+			return nil, ErrGitSource
+		}
+		hash := sha256.New()
+		written, err := io.CopyN(hash, reader, size)
+		if err != nil || written != size {
+			return nil, ErrGitSource
+		}
+		terminator, err := reader.ReadByte()
+		if err != nil || terminator != '\n' {
+			return nil, ErrGitSource
+		}
+		if _, duplicate := digests[expectedID]; duplicate {
+			return nil, ErrGitSource
+		}
+		digests[expectedID] = hex.EncodeToString(hash.Sum(nil))
+		total += size
+	}
+	if _, err := reader.ReadByte(); !errors.Is(err, io.EOF) {
+		return nil, ErrGitSource
+	}
+	return digests, nil
+}
+
+func readGitBatchHeader(reader *bufio.Reader) (string, error) {
+	line, err := reader.ReadSlice('\n')
+	if err != nil || len(line) < 2 || len(line) > 256 {
+		return "", ErrGitSource
+	}
+	return string(line[:len(line)-1]), nil
+}
+
+var gitObjectID = regexp.MustCompile(`^(?:[0-9a-f]{40}|[0-9a-f]{64})$`)
 
 type gitObject struct{ mode, id string }
 
