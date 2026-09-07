@@ -98,7 +98,11 @@ func (u *acornFoxUpgrade) atomicFile(s *TaskAcornFoxRepoStore, root *os.Root, pa
 	return u.atomicFileOwned(s, root, path, old, next, mode, acornFoxInstallPrincipal{})
 }
 func (u *acornFoxUpgrade) atomicFileOwned(s *TaskAcornFoxRepoStore, root *os.Root, path string, old, next []byte, mode os.FileMode, principal acornFoxInstallPrincipal) error {
-	if !s.ownsLock() || validateRelativePath(path) != nil || next == nil {
+	return u.atomicFileOwnedAtTemp(s, root, path, old, next, mode, principal, acornFoxUpgradeTemp(path))
+}
+
+func (u *acornFoxUpgrade) atomicFileOwnedAtTemp(s *TaskAcornFoxRepoStore, root *os.Root, path string, old, next []byte, mode os.FileMode, principal acornFoxInstallPrincipal, temp string) error {
+	if !s.ownsLock() || validateRelativePath(path) != nil || validateRelativePath(temp) != nil || next == nil {
 		return ErrAcornFoxUpgradeConflict
 	}
 	current, e := u.readPrincipal(root, path, mode, acornFoxArchiveMaxBytes, principal)
@@ -110,7 +114,6 @@ func (u *acornFoxUpgrade) atomicFileOwned(s *TaskAcornFoxRepoStore, root *os.Roo
 	} else if e != nil || !bytes.Equal(current, old) && !bytes.Equal(current, next) {
 		return ErrAcornFoxUpgradeConflict
 	}
-	temp := acornFoxUpgradeTemp(path)
 	if partial, pe := u.read(root, temp, 0600, acornFoxArchiveMaxBytes); pe == nil {
 		safe := bytes.HasPrefix(next, partial) || old != nil && bytes.HasPrefix(old, partial)
 		if !safe && path == acornFoxUpgradeJournalPath {
@@ -128,7 +131,7 @@ func (u *acornFoxUpgrade) atomicFileOwned(s *TaskAcornFoxRepoStore, root *os.Roo
 		if !safe {
 			return ErrAcornFoxUpgradeConflict
 		}
-		if root.Remove(temp) != nil || acornFoxLiveSyncDir(root, acornFoxUpgradeParent(path)) != nil {
+		if root.Remove(temp) != nil || acornFoxLiveSyncDir(root, acornFoxUpgradeParent(temp)) != nil {
 			return ErrAcornFoxUpgradeUnknown
 		}
 	} else if !errors.Is(pe, os.ErrNotExist) {
@@ -140,7 +143,7 @@ func (u *acornFoxUpgrade) atomicFileOwned(s *TaskAcornFoxRepoStore, root *os.Roo
 		if fe != nil || !bytes.Equal(full, next) && !bytes.Equal(full, old) {
 			return ErrAcornFoxUpgradeConflict
 		}
-		if root.Remove(temp) != nil || acornFoxLiveSyncDir(root, acornFoxUpgradeParent(path)) != nil {
+		if root.Remove(temp) != nil || acornFoxLiveSyncDir(root, acornFoxUpgradeParent(temp)) != nil {
 			return ErrAcornFoxUpgradeUnknown
 		}
 	}
@@ -194,6 +197,11 @@ func (u *acornFoxUpgrade) atomicFileOwned(s *TaskAcornFoxRepoStore, root *os.Roo
 	if e != nil || ce != nil {
 		return ErrAcornFoxUpgradeUnknown
 	}
+	if path == acornFoxUpgradeJournalPath && temp != acornFoxUpgradeTemp(path) {
+		if e := u.fault("legacy-0039-journal-staged"); e != nil {
+			return e
+		}
+	}
 	// Re-read before replacement. Foreign bytes or inode metadata cannot become
 	// overwrite authority just because the transaction holds its own flock.
 	again, ae := u.readPrincipal(root, path, mode, acornFoxArchiveMaxBytes, principal)
@@ -209,6 +217,11 @@ func (u *acornFoxUpgrade) atomicFileOwned(s *TaskAcornFoxRepoStore, root *os.Roo
 	}
 	if e := acornFoxLiveSyncDir(root, acornFoxUpgradeParent(path)); e != nil {
 		return e
+	}
+	if acornFoxUpgradeParent(temp) != acornFoxUpgradeParent(path) {
+		if e := acornFoxLiveSyncDir(root, acornFoxUpgradeParent(temp)); e != nil {
+			return e
+		}
 	}
 	if root == s.hostRoot && path != acornFoxUpgradeMarkerPath {
 		return u.fault("host-file-renamed")
@@ -421,6 +434,9 @@ func (u *acornFoxUpgrade) imageManifest(s *TaskAcornFoxRepoStore, j acornFoxUpgr
 }
 
 func (u *acornFoxUpgrade) copyNextSubstrate(s *TaskAcornFoxRepoStore, j acornFoxUpgradeJournal) error {
+	if e := u.retire0039Stash(s, j); e != nil {
+		return e
+	}
 	if root, e := s.root.OpenRoot("."); e == nil {
 		if h, e := u.openSubstrate(root, j.Next); e == nil {
 			h.Close()

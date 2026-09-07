@@ -1,6 +1,8 @@
 package install
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -298,4 +300,58 @@ func TestAcornFoxRecent0039HostEvidenceBindsBothReleases(t *testing.T) {
 	if _, err := acornFoxRecent0039HostEvidenceSHA(old, old, prepared.layout); err == nil {
 		t.Fatal("same-release host evidence accepted")
 	}
+}
+
+// DatabaseEnv is the additional host-scope input carried by every cross-schema
+// image. Exercise its verification independently of retired upgrade history.
+func TestAcornFoxCrossSchemaBoundStateFileDoesNotRequireInstallTreeWalk(t *testing.T) {
+	u, p, request, _ := upgradeFixture(t)
+	if _, err := u.upgrade(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	s, err := u.openStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	lock, err := s.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Release()
+	j, err := u.load(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(p.state, acornFoxControlPlaneStateEnv)
+	env, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j.Next.DatabaseEnv = bytes.Clone(env)
+	if j.Retired0039 != nil {
+		t.Fatal("test unexpectedly depends on retired history")
+	}
+	if err := u.verifyRetainedScope(s, j, j.Next); err != nil {
+		t.Fatal("bound state file not verified", err)
+	}
+	if err := os.Chmod(path, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := u.verifyRetainedScope(s, j, j.Next); err == nil {
+		t.Fatal("unsafe database environment mode accepted")
+	}
+	if err := os.Chmod(path, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, append(bytes.Clone(env), 'x'), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := u.verifyRetainedScope(s, j, j.Next); err == nil {
+		t.Fatal("changed database environment accepted")
+	}
+	if err := os.WriteFile(path, env, 0600); err != nil {
+		t.Fatal(err)
+	}
+	p.assertExternalSentinel(t)
 }

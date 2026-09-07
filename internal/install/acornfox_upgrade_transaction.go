@@ -164,7 +164,7 @@ func (u *acornFoxUpgrade) captureRecent0039(ctx context.Context, s *TaskAcornFox
 	if err := validateAcornFoxRecent0039UpgradeImage(image, u.layout); err != nil {
 		return acornFoxUpgradeImage{}, err
 	}
-	if err := u.verifyRecent0039HostScope(s, image); err != nil {
+	if err := u.verifyRecent0039CapturedScope(s, image); err != nil {
 		return acornFoxUpgradeImage{}, err
 	}
 	return image, nil
@@ -475,6 +475,9 @@ func (u *acornFoxUpgrade) unblock(ctx context.Context, s *TaskAcornFoxRepoStore,
 	return u.services.EdgeHealthy(ctx)
 }
 func (u *acornFoxUpgrade) forward(ctx context.Context, s *TaskAcornFoxRepoStore, j *acornFoxUpgradeJournal) error {
+	if e := u.retire0039Stash(s, *j); e != nil {
+		return e
+	}
 	if e := u.marker(s, *j, true); e != nil {
 		return e
 	}
@@ -670,7 +673,13 @@ func (u *acornFoxUpgrade) rollback(ctx context.Context, s *TaskAcornFoxRepoStore
 			_ = u.services.Run(context.WithoutCancel(ctx), "stop", "acornfox-edge.service")
 		}
 	}()
-	if err = u.restore(ctx, s, j); err != nil {
+	if j.CrossSchema != nil && j.Phase == "RECOVERY_PREPARED" {
+		// Prepare already restored the exact previous image. Finalize must
+		// follow RECOVERY_PREPARED -> ROLLED_BACK, never rewind the journal.
+		if err = u.verifyImage(s, *j, false); err != nil {
+			return err
+		}
+	} else if err = u.restore(ctx, s, j); err != nil {
 		return err
 	}
 	if err = u.start(ctx, j.PIEnabled); err != nil {
@@ -686,6 +695,11 @@ func (u *acornFoxUpgrade) rollback(ctx context.Context, s *TaskAcornFoxRepoStore
 }
 
 func (u *acornFoxUpgrade) verifyImage(s *TaskAcornFoxRepoStore, j acornFoxUpgradeJournal, next bool) error {
+	if j.CrossSchema == nil && j.Next.ControlPlane.MigrationVersion == acornFoxRecentPredecessorMigration {
+		if err := u.verifyCompleted0039Manifests(s, j); err != nil {
+			return err
+		}
+	}
 	image := j.Old
 	if next {
 		image = j.Next
@@ -727,7 +741,7 @@ func (u *acornFoxUpgrade) verifyImage(s *TaskAcornFoxRepoStore, j acornFoxUpgrad
 	// Observe every role and file at its real production path; the task artifact
 	// is never accepted as a substitute for host materialization.
 	entries, e := acornFoxLiveExpectedEntriesForLayout(u.layout, sub)
-	if j.CrossSchema != nil && !next {
+	if image.Substrate.CandidateReceipt.MigrationVersion != AcornFoxV1MigrationVersion {
 		switch image.Substrate.CandidateReceipt.MigrationVersion {
 		case AcornFoxLegacyPredecessorMigration:
 			entries, e = acornFoxLegacy0034ExpectedEntries(u.layout, image.Substrate)
@@ -794,7 +808,16 @@ func (u *acornFoxUpgrade) verifyRetainedScope(s *TaskAcornFoxRepoStore, j acornF
 	pointers := map[string]string{}
 	// Shared paths use the selected image. Only versioned immutable material from
 	// the other image extends the inventory.
-	for _, image := range []acornFoxUpgradeImage{j.Old, j.Next} {
+	images := []acornFoxUpgradeImage{j.Old, j.Next}
+	if j.Retired0039 != nil {
+		prior, err := j.Retired0039.decode(j, u.layout)
+		if err != nil {
+			return err
+		}
+		prior.Old.DatabaseEnv = bytes.Clone(j.Old.DatabaseEnv)
+		images = append(images, prior.Old)
+	}
+	for _, image := range images {
 		prefix := "opt/acornfox/releases/" + image.Activation.ReleaseID
 		for _, entry := range image.Substrate.Entries {
 			if entry.Path == prefix || strings.HasPrefix(entry.Path, prefix+"/") || image.Repo.BindingSHA256 == current.Repo.BindingSHA256 {
@@ -854,7 +877,7 @@ func (u *acornFoxUpgrade) verifyRetainedScope(s *TaskAcornFoxRepoStore, j acornF
 		modes["var/lib/acornfox/install/"+acornFoxControlPlaneStateEnv] = 0600
 	}
 	assistant, e := acornFoxAssistantConfigScope(s.hostRoot, s)
-	if j.CrossSchema != nil && current.Repo.BindingSHA256 == j.Old.Repo.BindingSHA256 && j.CrossSchema.OldMigrationVersion == acornFoxRecentPredecessorMigration {
+	if current.ControlPlane.MigrationVersion == acornFoxRecentPredecessorMigration {
 		assistant, e = acornFoxAssistantConfigScopeExpected(s.hostRoot, s, acornFoxAssistantLegacy0039Config())
 	}
 	if e != nil {
@@ -948,7 +971,17 @@ func (u *acornFoxUpgrade) verifyRetainedScope(s *TaskAcornFoxRepoStore, j acornF
 			return ErrAcornFoxUpgradeConflict
 		}
 	}
-	for path := range files {
+	for path, expected := range files {
+		// The private install root is deliberately not walked as a host tree.
+		// Cross-schema snapshots additionally bind its one active database
+		// environment; verify that fixed computed file explicitly.
+		if acornFoxProductionStateChild(path) {
+			actual, err := u.read(s.hostRoot, path, modes[path], acornFoxArchiveMaxBytes)
+			if err != nil || !bytes.Equal(actual, expected) {
+				return ErrAcornFoxUpgradeConflict
+			}
+			continue
+		}
 		if !seen[path] {
 			return ErrAcornFoxUpgradeConflict
 		}
@@ -978,11 +1011,14 @@ func (u *acornFoxUpgrade) verifyPrivateStore(s *TaskAcornFoxRepoStore, j acornFo
 	if j.CrossSchema != nil && current.Repo.BindingSHA256 == j.Next.Repo.BindingSHA256 {
 		wantChildren = 4
 	}
+	if j.Retired0039 != nil {
+		wantChildren++
+	}
 	if len(children) != wantChildren {
 		return ErrAcornFoxUpgradeConflict
 	}
 	for _, child := range children {
-		if child.Name() != "journal.json" && child.Name() != "old-state" && child.Name() != "new-state" && !(wantChildren == 4 && child.Name() == acornFoxUpgradeDatabaseRoot) {
+		if child.Name() != "journal.json" && child.Name() != "old-state" && child.Name() != "new-state" && !(j.CrossSchema != nil && current.Repo.BindingSHA256 == j.Next.Repo.BindingSHA256 && child.Name() == acornFoxUpgradeDatabaseRoot) && !(j.Retired0039 != nil && child.Name() == acornFoxRetired0039StashName) {
 			return ErrAcornFoxUpgradeConflict
 		}
 	}
@@ -1021,6 +1057,16 @@ func (u *acornFoxUpgrade) verifyPrivateStore(s *TaskAcornFoxRepoStore, j acornFo
 			return e
 		}
 		h.Close()
+		if j.CrossSchema == nil && j.Next.ControlPlane.MigrationVersion == acornFoxRecentPredecessorMigration {
+			if err := u.retired0039SubstrateAt(s, item.path, item.image); err != nil {
+				return err
+			}
+		}
+	}
+	if j.Retired0039 != nil {
+		if err := u.verifyRetired0039Stash(s, j); err != nil {
+			return err
+		}
 	}
 	if j.CrossSchema == nil || current.Repo.BindingSHA256 == j.Old.Repo.BindingSHA256 {
 		return nil
