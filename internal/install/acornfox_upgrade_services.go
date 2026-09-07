@@ -19,6 +19,7 @@ type acornFoxUpgradeServices interface {
 type acornFoxRealUpgradeServices struct{}
 
 var _ acornFoxUpgradePIState = acornFoxRealUpgradeServices{}
+var _ acornFoxUpgradeRecoveryHelperHealth = acornFoxRealUpgradeServices{}
 var _ acornFoxUpgradeLegacyPIState = acornFoxRealUpgradeServices{}
 
 func (acornFoxRealUpgradeServices) PILegacyAbsent(ctx context.Context) (bool, error) {
@@ -135,13 +136,17 @@ func (acornFoxRealUpgradeServices) Run(ctx context.Context, verb, unit string) e
 	_, e := acornFoxUpgradeCommand(ctx, "/usr/bin/systemctl", verb, unit)
 	return e
 }
-func (acornFoxRealUpgradeServices) Healthy(ctx context.Context, image acornFoxUpgradeImage) error {
+func (services acornFoxRealUpgradeServices) Healthy(ctx context.Context, image acornFoxUpgradeImage) error {
+	return services.HealthyWithRecoveryHelper(ctx, image, image)
+}
+
+func (acornFoxRealUpgradeServices) HealthyWithRecoveryHelper(ctx context.Context, image, recovery acornFoxUpgradeImage) error {
 	raw, e := acornFoxUpgradeCommand(ctx, "/"+AcornFoxUpgradeHelperPath, "contract-check", "--product", "acornfox", "--layout-schema", "1")
 	if e != nil {
 		return e
 	}
 	var result AcornFoxHelperContractResultV1
-	if json.Unmarshal(raw, &result) != nil || !result.OK || result.Identity == nil || *result.Identity != image.identity() || result.BindingSHA256 != image.Repo.BindingSHA256 || result.ExecutableSHA256 != image.Substrate.UpgradeHelperSHA256 {
+	if json.Unmarshal(raw, &result) != nil || !result.OK || result.Identity == nil || *result.Identity != recovery.identity() || result.BindingSHA256 != recovery.Repo.BindingSHA256 || result.ExecutableSHA256 != recovery.Substrate.UpgradeHelperSHA256 {
 		return ErrAcornFoxUpgradeUnknown
 	}
 	units, unitErr := acornFoxUpgradeHealthyUnits(image)

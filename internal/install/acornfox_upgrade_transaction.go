@@ -569,7 +569,7 @@ func (u *acornFoxUpgrade) forward(ctx context.Context, s *TaskAcornFoxRepoStore,
 	if e := u.start(ctx, j.PIEnabled); e != nil {
 		return e
 	}
-	if e := u.services.Healthy(ctx, j.Next); e != nil {
+	if e := u.healthy(ctx, *j, true); e != nil {
 		return e
 	}
 	if e := u.fault("healthy"); e != nil {
@@ -685,7 +685,7 @@ func (u *acornFoxUpgrade) rollback(ctx context.Context, s *TaskAcornFoxRepoStore
 	if err = u.start(ctx, j.PIEnabled); err != nil {
 		return err
 	}
-	if err = u.services.Healthy(ctx, j.Old); err != nil {
+	if err = u.healthy(ctx, *j, false); err != nil {
 		return err
 	}
 	if err = u.unblock(ctx, s, *j); err != nil {
@@ -711,6 +711,16 @@ func (u *acornFoxUpgrade) verifyImage(s *TaskAcornFoxRepoStore, j acornFoxUpgrad
 	files, modes, e := u.imageFiles(s, j, image)
 	if e != nil {
 		return e
+	}
+	var recoveryHelper *SubstrateEntry
+	if j.CrossSchema != nil && !next {
+		entry, raw, err := u.crossSchemaRecoveryHelper(s, j)
+		if err != nil {
+			return err
+		}
+		recoveryHelper = &entry
+		files[entry.Path] = raw
+		modes[entry.Path] = os.FileMode(entry.Mode)
 	}
 	principals := map[string]acornFoxInstallPrincipal{}
 	for _, entry := range image.Substrate.Entries {
@@ -755,6 +765,9 @@ func (u *acornFoxUpgrade) verifyImage(s *TaskAcornFoxRepoStore, j acornFoxUpgrad
 		return e
 	}
 	for _, entry := range entries {
+		if recoveryHelper != nil && entry.Path == AcornFoxUpgradeHelperPath {
+			entry = *recoveryHelper
+		}
 		if acornFoxProductionSharedParent(entry.Path) {
 			continue
 		}
@@ -858,6 +871,13 @@ func (u *acornFoxUpgrade) verifyRetainedScope(s *TaskAcornFoxRepoStore, j acornF
 				entries[entry.Path] = entry
 			}
 		}
+	}
+	if j.CrossSchema != nil && current.Repo.BindingSHA256 == j.Old.Repo.BindingSHA256 {
+		entry, err := acornFoxCrossSchemaRecoveryHelperEntry(j, u.layout)
+		if err != nil {
+			return err
+		}
+		entries[entry.Path] = entry
 	}
 	pointers[u.layout.activePath()] = "activations/" + current.Activation.ActivationID
 	pointers[u.layout.currentPath()] = "active/release"

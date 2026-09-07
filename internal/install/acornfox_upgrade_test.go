@@ -43,6 +43,16 @@ func (f *acornFoxUpgradeServiceFake) Healthy(_ context.Context, i acornFoxUpgrad
 	}
 	return nil
 }
+func (f *acornFoxUpgradeServiceFake) HealthyWithRecoveryHelper(ctx context.Context, image, recovery acornFoxUpgradeImage) error {
+	if image.Repo.BindingSHA256 != recovery.Repo.BindingSHA256 {
+		binding, err := verifiedAcornFoxUpgradePredecessor(recovery.Binding, recovery.Repo.BindingSHA256)
+		if err != nil || binding.binding.NMinusOne == nil || binding.binding.NMinusOne.BindingSHA256 != image.Repo.BindingSHA256 {
+			return ErrAcornFoxUpgradeConflict
+		}
+	}
+	return f.Healthy(ctx, image)
+}
+
 func (f *acornFoxUpgradeServiceFake) EdgeHealthy(context.Context) error {
 	f.calls = append(f.calls, "edge healthy")
 	return nil

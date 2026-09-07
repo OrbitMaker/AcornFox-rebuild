@@ -661,7 +661,7 @@ func (u *acornFoxUpgrade) applyImage(s *TaskAcornFoxRepoStore, j acornFoxUpgrade
 	for _, p := range keys {
 		wanted := new[p]
 		mode := nm[p]
-		if !next && old[p] != nil {
+		if !next && old[p] != nil && !(j.CrossSchema != nil && p == AcornFoxUpgradeHelperPath) {
 			wanted = old[p]
 			mode = om[p]
 		}

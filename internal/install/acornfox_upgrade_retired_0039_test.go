@@ -376,7 +376,11 @@ func TestAcornFoxRetired0039DetachedSuccessorRecoveryAfterJournalAndRename(t *te
 			predecessor.bindingRaw = next.Binding
 			predecessor.bindingSHA = next.Repo.BindingSHA256
 			candidate := newAcornFoxFixture(t, "1.2.5-test.1", &predecessor)
+			recoveryHelper := changeAcornFoxRecoveryHelperFixture(t, &candidate)
 			directory, self, selfSHA := writeAcornFoxBridgeCandidate(t, t.TempDir(), candidate)
+			if err := os.WriteFile(self, recoveryHelper, 0755); err != nil {
+				t.Fatal(err)
+			}
 			u.self.path = self
 			u.hostProvisionSHA256, err = acornFoxRecent0039HostEvidenceSHA(next.Repo.BindingSHA256, candidate.bindingSHA, u.layout)
 			if err != nil {
@@ -468,6 +472,41 @@ func TestAcornFoxRetired0039DetachedSuccessorRecoveryAfterJournalAndRename(t *te
 			if err != nil {
 				t.Fatal(err)
 			}
+			// The normal fixed systemd recovery entrypoint is now the exact
+			// successor executable, while the application identity stays old.
+			fixedHelper := filepath.Join(p.host, AcornFoxUpgradeHelperPath)
+			fixedBytes, err := os.ReadFile(fixedHelper)
+			if err != nil || !bytes.Equal(fixedBytes, recoveryHelper) {
+				t.Fatal("fixed recovery helper rolled back")
+			}
+			oldReleaseHelper := filepath.Join(p.host, "opt/acornfox/releases", recovered.Old.Activation.ReleaseID, "bin/acornfox-upgrade")
+			oldBytes, err := os.ReadFile(oldReleaseHelper)
+			if err != nil || bytes.Equal(oldBytes, recoveryHelper) || sha256Hex(oldBytes) != recovered.Old.Substrate.UpgradeHelperSHA256 {
+				t.Fatal("old immutable release helper changed")
+			}
+			if !bytes.Equal(acornFoxUpgradeJSON(journal.Old), acornFoxUpgradeJSON(recovered.Old)) {
+				t.Fatal("old snapshot rewritten")
+			}
+			if point == "prepared" {
+				if err := os.WriteFile(fixedHelper, oldBytes, 0755); err != nil {
+					t.Fatal(err)
+				}
+				checkLock, err := s.Acquire(context.Background())
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := u.verifyImage(s, recovered, false); err == nil {
+					t.Fatal("old executable accepted at successor recovery entrypoint")
+				}
+				checkLock.Release()
+				if err := os.WriteFile(fixedHelper, recoveryHelper, 0755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, prepare := range []bool{true, false} {
+				runRetired0039RecoveryProcess(t, p, fixedHelper, journal.Next.identity(), prepare, "ROLLED_BACK")
+			}
+
 			if err := u.verifyRetired0039Stash(s, recovered); err != nil {
 				t.Fatal("retained history after rollback", err)
 			}
