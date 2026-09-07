@@ -57,3 +57,21 @@ func TestBuildRejectsInvalidPredecessorBeforeProducingOutput(t *testing.T) {
 		})
 	}
 }
+
+func TestBuildAcceptsPinned0039PredecessorBeforeRequiringBuildInputs(t *testing.T) {
+	binding := install.AcornFoxCandidateBindingV1{SchemaVersion: 1, Product: "acornfox", Version: "1.2.3", ReleaseID: "release-1.2.3", SourceRepository: "https://github.com/acme/acornfox", SourceCommit: strings.Repeat("a", 40), Architecture: "amd64", MigrationVersion: "0039", ManifestSHA256: strings.Repeat("a", 64), ArchiveSHA256: strings.Repeat("b", 64), BundleManifestSHA256: strings.Repeat("c", 64)}
+	raw, err := json.Marshal(binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(raw)
+	input := filepath.Join(t.TempDir(), "old-binding.json")
+	if err = os.WriteFile(input, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	var out, diagnostic bytes.Buffer
+	err = run(context.Background(), []string{"build", "--predecessor-binding", input, "--predecessor-sha256", hex.EncodeToString(sum[:])}, &out, &diagnostic)
+	if err == nil || !strings.Contains(err.Error(), "all build input") {
+		t.Fatalf("historical binding did not reach normal build-input validation: %v", err)
+	}
+}

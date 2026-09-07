@@ -609,3 +609,34 @@ func TestAcornFoxCandidateBindingRejectsGitHubAliases(t *testing.T) {
 		}
 	}
 }
+
+func TestAcornFoxRecent0039BindingIsPinnedPredecessorOnly(t *testing.T) {
+	old := newAcornFoxFixture(t, "1.2.3-test.1", nil)
+	old.binding.MigrationVersion = "0039"
+	old.binding.NMinusOne = &AcornFoxNMinusOneV1{Version: "1.2.2-test.1", MigrationVersion: "0039", SourceCommit: strings.Repeat("a", 40), ReleaseManifestSHA256: strings.Repeat("b", 64), ArchiveSHA256: strings.Repeat("c", 64), BundleManifestSHA256: strings.Repeat("d", 64), BindingSHA256: strings.Repeat("e", 64)}
+	refreshAcornFoxBinding(t, &old)
+	if err := ParseAcornFoxPredecessorBindingV1(old.bindingRaw, old.bindingSHA); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ParseAcornFoxCandidateBindingV1(old.bindingRaw, old.bindingSHA); err == nil {
+		t.Fatal("old binding accepted as current candidate")
+	}
+	if err := ParseAcornFoxPredecessorBindingV1(old.bindingRaw, strings.Repeat("0", 64)); err == nil {
+		t.Fatal("unpinned old binding accepted")
+	}
+	next := newAcornFoxFixture(t, "1.2.4-test.1", &old)
+	if _, err := VerifyAcornFoxCandidateArtifactsV1(next.input(old.bindingRaw)); err != nil {
+		t.Fatalf("successor artifacts rejected frozen predecessor: %v", err)
+	}
+	old.binding.NMinusOne.MigrationVersion = "0040"
+	refreshAcornFoxBinding(t, &old)
+	if err := ParseAcornFoxPredecessorBindingV1(old.bindingRaw, old.bindingSHA); err == nil {
+		t.Fatal("old binding accepted a future predecessor schema")
+	}
+	old.binding.MigrationVersion = "0038"
+	old.binding.NMinusOne = nil
+	refreshAcornFoxBinding(t, &old)
+	if err := ParseAcornFoxPredecessorBindingV1(old.bindingRaw, old.bindingSHA); err == nil {
+		t.Fatal("unlisted predecessor schema accepted")
+	}
+}

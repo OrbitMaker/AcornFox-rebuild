@@ -214,6 +214,9 @@ func parseAcornFoxPredecessorBindingV1(data []byte, expectedSHA256 string) (Acor
 	if err := validateAcornFoxBinding(binding); err == nil {
 		return binding, nil
 	}
+	if err := validateAcornFoxRecent0039Binding(binding); err == nil {
+		return binding, nil
+	}
 	if err := validateAcornFoxLegacyPredecessorBinding(binding); err != nil {
 		return AcornFoxCandidateBindingV1{}, err
 	}

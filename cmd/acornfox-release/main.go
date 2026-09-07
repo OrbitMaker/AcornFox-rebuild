@@ -79,7 +79,7 @@ func run(ctx context.Context, args []string, out, diagnostic io.Writer) error {
 		if err != nil {
 			return fmt.Errorf("read predecessor binding: %w", err)
 		}
-		if _, err := install.ParseAcornFoxCandidateBindingV1(predecessorRaw, o.predecessorSHA); err != nil {
+		if err := install.ParseAcornFoxPredecessorBindingV1(predecessorRaw, o.predecessorSHA); err != nil {
 			return fmt.Errorf("verify predecessor binding: %w", err)
 		}
 	}
