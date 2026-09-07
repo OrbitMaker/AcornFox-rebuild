@@ -34,6 +34,8 @@ const (
 	shapeDeliverySource
 	shapeOperationResult
 	shapeSourceUpdate
+	shapeFixCandidate
+	shapeFixCandidateList
 )
 
 func (c *cli) callCommand(method, path string, body any, csrf bool, key string, timeout time.Duration, shape responseShape) error {
@@ -113,6 +115,12 @@ func expectedSuccessStatus(method, rawPath string, shape responseShape) (int, bo
 			return http.StatusCreated, true
 		case hasApp && len(segments) == 3 && segments[2] == "sources" && noQuery && shape == shapeSourceUpdate:
 			return http.StatusCreated, true
+		case hasApp && len(segments) == 3 && segments[2] == "fix-candidates" && noQuery && shape == shapeFixCandidate:
+			return http.StatusAccepted, true
+		case hasApp && len(segments) == 5 && segments[2] == "fix-candidates" && segments[4] == "source-match" && noQuery && shape == shapeFixCandidate:
+			return http.StatusOK, true
+		case hasApp && len(segments) == 5 && segments[2] == "fix-candidates" && segments[4] == "publish" && noQuery && shape == shapeCommand:
+			return http.StatusAccepted, true
 		case hasApp && len(segments) == 3 && segments[2] == "deliveries" && noQuery && shape == shapeCommand:
 			return http.StatusAccepted, true
 		case hasApp && len(segments) == 5 && segments[2] == "deliveries" && (segments[4] == "restart" || segments[4] == "redeploy" || segments[4] == "probes") && noQuery && shape == shapeCommand:
@@ -139,6 +147,10 @@ func expectedSuccessStatus(method, rawPath string, shape responseShape) (int, bo
 		case hasApp && len(segments) == 4 && segments[2] == "sources" && noQuery && shape == shapeSource:
 			return http.StatusOK, true
 		case hasApp && len(segments) == 5 && segments[2] == "sources" && segments[4] == "metadata" && noQuery && shape == shapeSourceMetadata:
+			return http.StatusOK, true
+		case hasApp && len(segments) == 4 && segments[2] == "fix-candidates" && noQuery && shape == shapeFixCandidate:
+			return http.StatusOK, true
+		case hasApp && len(segments) == 3 && segments[2] == "fix-candidates" && noQuery && shape == shapeFixCandidateList:
 			return http.StatusOK, true
 		case hasApp && len(segments) == 3 && segments[2] == "deliveries" && validListQuery(parsed.RawQuery) && shape == shapeDeploymentList:
 			return http.StatusOK, true

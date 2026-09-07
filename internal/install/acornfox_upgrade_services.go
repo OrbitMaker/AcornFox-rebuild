@@ -19,6 +19,22 @@ type acornFoxUpgradeServices interface {
 type acornFoxRealUpgradeServices struct{}
 
 var _ acornFoxUpgradePIState = acornFoxRealUpgradeServices{}
+var _ acornFoxUpgradeLegacyPIState = acornFoxRealUpgradeServices{}
+
+func (acornFoxRealUpgradeServices) PILegacyAbsent(ctx context.Context) (bool, error) {
+	raw, err := acornFoxUpgradeCommand(ctx, "/usr/bin/systemctl", "show", "acornfox-pi-worker.service", "--property=LoadState", "--value")
+	if err != nil {
+		return false, ErrAcornFoxUpgradeUnknown
+	}
+	state := strings.TrimSpace(string(raw))
+	if state == "not-found" {
+		return true, nil
+	}
+	if state == "loaded" {
+		return false, nil
+	}
+	return false, ErrAcornFoxUpgradeUnknown
+}
 
 func (acornFoxRealUpgradeServices) PIEnabled(ctx context.Context) (bool, error) {
 	enabled, err := acornFoxUpgradePIUnitEnabled(ctx)
@@ -104,6 +120,10 @@ func (acornFoxRealUpgradeServices) Run(ctx context.Context, verb, unit string) e
 		_, e := acornFoxUpgradeCommand(ctx, "/usr/bin/systemctl", verb)
 		return e
 	case "start", "stop":
+	case "disable":
+		if unit != "acornfox-pi-worker.service" {
+			return ErrAcornFoxUpgradeConflict
+		}
 	default:
 		return ErrAcornFoxUpgradeConflict
 	}
@@ -124,12 +144,28 @@ func (acornFoxRealUpgradeServices) Healthy(ctx context.Context, image acornFoxUp
 	if json.Unmarshal(raw, &result) != nil || !result.OK || result.Identity == nil || *result.Identity != image.identity() || result.BindingSHA256 != image.Repo.BindingSHA256 || result.ExecutableSHA256 != image.Substrate.UpgradeHelperSHA256 {
 		return ErrAcornFoxUpgradeUnknown
 	}
-	for _, unit := range []string{"docker.service", "acornfox-runtime-network.service", "acornfox-build-network.service", "acornfox-buildkit.service", "acornfox-caddy.service", "acornfox-server.service", "acornfox-agent.service"} {
+	units, unitErr := acornFoxUpgradeHealthyUnits(image)
+	if unitErr != nil {
+		return unitErr
+	}
+	for _, unit := range units {
 		if e := acornFoxUpgradeServiceActive(ctx, unit); e != nil {
 			return e
 		}
 	}
 	return acornFoxUpgradeHTTP(ctx, []string{"http://127.0.0.1:18481/healthz", "http://127.0.0.1:18481/readyz"})
+}
+
+func acornFoxUpgradeHealthyUnits(image acornFoxUpgradeImage) ([]string, error) {
+	units := []string{"docker.service", "acornfox-build-network.service", "acornfox-buildkit.service", "acornfox-caddy.service", "acornfox-server.service", "acornfox-agent.service"}
+	switch image.Substrate.CandidateReceipt.MigrationVersion {
+	case AcornFoxLegacyPredecessorMigration:
+		return units, nil
+	case acornFoxRecentPredecessorMigration, AcornFoxV1MigrationVersion:
+		return []string{"docker.service", "acornfox-runtime-network.service", "acornfox-build-network.service", "acornfox-buildkit.service", "acornfox-caddy.service", "acornfox-server.service", "acornfox-agent.service"}, nil
+	default:
+		return nil, ErrAcornFoxUpgradeConflict
+	}
 }
 func (acornFoxRealUpgradeServices) EdgeHealthy(ctx context.Context) error {
 	if e := acornFoxUpgradeServiceActive(ctx, "acornfox-edge.service"); e != nil {

@@ -149,9 +149,9 @@ func acornFoxDiscoveryScanLimit(limit int) int {
 	return scanLimit
 }
 
-// provenAcornFoxPublicSourceIDs checks the only current durable public-Git
-// writer: the atomic application.create task. It is one bounded query rather
-// than one task scan per source revision.
+// provenAcornFoxPublicSourceIDs accepts the historical application.create
+// proof and the explicit provenance written atomically by current public-Git
+// imports. Both reads are bounded batches, never one query per revision.
 func (s *Store) provenAcornFoxPublicSourceIDs(ctx context.Context, applicationID domain.ID, candidates []domain.SourceRevision) (map[domain.ID]bool, error) {
 	proven := make(map[domain.ID]bool)
 	if len(candidates) == 0 {
@@ -203,6 +203,32 @@ func (s *Store) provenAcornFoxPublicSourceIDs(ctx context.Context, applicationID
 		if json.Unmarshal(item.payload, &payload) == nil && payload.Kind == createApplicationTaskTag && payload.ApplicationID == applicationID && payload.ApplicationID == item.applicationID && payload.OperationID == item.operationID {
 			proven[payload.SourceRevisionID] = true
 		}
+	}
+	placeholders := make([]string, 0, len(candidates))
+	metadataArgs := []any{applicationID.String()}
+	for index, candidate := range candidates {
+		placeholders = append(placeholders, "$"+fmt.Sprint(index+2))
+		metadataArgs = append(metadataArgs, candidate.ID.String())
+	}
+	metadataRows, err := s.db.QueryContext(ctx, `
+		SELECT source.id FROM source_revisions source
+		JOIN acornfox_source_metadata metadata ON metadata.source_revision_id=source.id
+		WHERE source.application_id=$1 AND source.source_kind='git_https'
+		  AND source.immutable=true AND metadata.repository_url=source.locator
+		  AND source.id IN (`+strings.Join(placeholders, ",")+`)`, metadataArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("list AcornFox explicit source provenance: %w", err)
+	}
+	defer metadataRows.Close()
+	for metadataRows.Next() {
+		var id domain.ID
+		if err := metadataRows.Scan(&id); err != nil {
+			return nil, err
+		}
+		proven[id] = true
+	}
+	if err := metadataRows.Err(); err != nil {
+		return nil, err
 	}
 	return proven, nil
 }

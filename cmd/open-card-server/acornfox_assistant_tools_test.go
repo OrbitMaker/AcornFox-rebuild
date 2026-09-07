@@ -60,3 +60,34 @@ func TestAssistantExternalObservationToolIsReadOnlyAndScoped(t *testing.T) {
 		t.Fatal("observation submission argument accepted")
 	}
 }
+
+func TestAssistantLogsSelectsBoundedCollection(t *testing.T) {
+	args := map[string]string{"application_id": "app_1", "deployment_id": "dep_1"}
+	if !assistantToolArguments("acornfox_logs", args) {
+		t.Fatal("default runtime log request rejected")
+	}
+	for _, source := range []string{"build", "runtime"} {
+		args["source"] = source
+		if !assistantToolArguments("acornfox_logs", args) {
+			t.Fatal("valid source rejected")
+		}
+	}
+	for _, source := range []string{"", "all", "runtime&path=/etc/passwd"} {
+		args["source"] = source
+		if assistantToolArguments("acornfox_logs", args) {
+			t.Fatal("unsupported log collection accepted")
+		}
+	}
+	path, method := assistantToolPath("acornfox_logs", "app_1", "dep_1", "")
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("source") != "runtime" || r.URL.Query().Get("limit") != "1" {
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			return
+		}
+		w.Write([]byte(`{"source":"runtime","availability":"not_collected","items":[]}`))
+	})
+	got := assistantToolHTTP(context.Background(), assistanttools.Grant{Actor: "admin_1"}, assistanttools.Call{}, handler, path, method)
+	if !got.OK {
+		t.Fatal("required log source omitted", got)
+	}
+}

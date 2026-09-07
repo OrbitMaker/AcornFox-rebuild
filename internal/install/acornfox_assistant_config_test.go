@@ -3,6 +3,7 @@ package install
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -11,6 +12,82 @@ import (
 	"strings"
 	"testing"
 )
+
+func TestAcornFoxAssistantCanonicalToolsIncludeFixCandidateLane(t *testing.T) {
+	var config acornFoxAssistantWorkerConfig
+	if err := json.Unmarshal(acornFoxAssistantCanonicalConfig(), &config); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"acornfox_host_metrics", "acornfox_list_apps", "acornfox_app", "acornfox_sources", "acornfox_deliveries",
+		"acornfox_delivery_status", "acornfox_logs", "acornfox_operation_result", "acornfox_public_access", "acornfox_access_observation", "acornfox_probe", "acornfox_propose_restart", "acornfox_propose_redeploy",
+		"acornfox_read_fix_source", "acornfox_create_fix_candidate",
+	}
+	if !reflect.DeepEqual(config.EnabledTools, want) {
+		t.Fatalf("enabled tools=%q", config.EnabledTools)
+	}
+	if config.HandshakeTimeoutSecond != 5 || config.RunTimeoutSecond != 300 || config.ShutdownTimeoutSecond != 10 {
+		t.Fatalf("assistant timeouts=%d/%d/%d", config.HandshakeTimeoutSecond, config.RunTimeoutSecond, config.ShutdownTimeoutSecond)
+	}
+}
+
+func TestAcornFoxAssistantLegacy0039ConfigRemainsClosedAndAccepted(t *testing.T) {
+	var legacy acornFoxAssistantWorkerConfig
+	if err := json.Unmarshal(acornFoxAssistantLegacy0039Config(), &legacy); err != nil || len(legacy.EnabledTools) != 13 || legacy.RunTimeoutSecond != 300 || legacy.ShutdownTimeoutSecond != 10 {
+		t.Fatalf("legacy=%#v err=%v", legacy, err)
+	}
+	var current acornFoxAssistantWorkerConfig
+	if err := json.Unmarshal(acornFoxAssistantCanonicalConfig(), &current); err != nil || reflect.DeepEqual(current.EnabledTools, legacy.EnabledTools) {
+		t.Fatalf("current=%#v err=%v", current, err)
+	}
+	f := newAcornFoxProductionPreparedFixture(t)
+	root, err := f.store.openHostRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	principal, ok := f.layout.owner(AcornFoxLiveRootRole)
+	if !ok || acornFoxAssistantPrepareDirectory(root, f.store, principal) != nil {
+		t.Fatal("assistant directory unavailable")
+	}
+	key := []byte("sk-legacy-0039-0123456789abcdefghijkl")
+	if acornFoxAssistantStage(root, f.store, acornFoxAssistantConfig, acornFoxAssistantLegacy0039Config(), principal) != nil || acornFoxAssistantStage(root, f.store, acornFoxAssistantKey, key, principal) != nil {
+		t.Fatal("legacy assistant config was not staged")
+	}
+	if _, err := acornFoxAssistantConfigScope(root, f.store); !errors.Is(err, ErrAcornFoxAssistantConfigConflict) {
+		t.Fatalf("ordinary 0040 scope accepted legacy config: %v", err)
+	}
+	entries, err := acornFoxAssistantConfigScopeExpected(root, f.store, acornFoxAssistantLegacy0039Config())
+	if err != nil || len(entries) != 3 || entries[1].SHA256 != sha256Hex(acornFoxAssistantLegacy0039Config()) {
+		t.Fatalf("entries=%#v err=%v", entries, err)
+	}
+}
+
+func TestAcornFoxConfigureAssistantExplicitlyUpgradesLegacy0039Config(t *testing.T) {
+	f, configurator, _ := assistantConfigFixture(t)
+	root, err := f.store.openHostRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal, ok := f.layout.owner(AcornFoxLiveRootRole)
+	if !ok || acornFoxAssistantPrepareDirectory(root, f.store, principal) != nil {
+		t.Fatal("assistant directory unavailable")
+	}
+	oldKey := []byte("sk-legacy-reconfigure-0123456789abcdefgh")
+	if acornFoxAssistantStage(root, f.store, acornFoxAssistantConfig, acornFoxAssistantLegacy0039Config(), principal) != nil || acornFoxAssistantStage(root, f.store, acornFoxAssistantKey, oldKey, principal) != nil {
+		t.Fatal("legacy configuration unavailable")
+	}
+	if err := root.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if receipt, err := configurator.configure(context.Background(), "/root/deepseek-key"); err != nil || receipt.State != "ASSISTANT_ENABLED" {
+		t.Fatalf("receipt=%#v err=%v", receipt, err)
+	}
+	raw, err := os.ReadFile(filepath.Join(f.host, acornFoxAssistantConfig))
+	if err != nil || !bytes.Equal(raw, acornFoxAssistantCanonicalConfig()) {
+		t.Fatalf("canonical config err=%v", err)
+	}
+}
 
 func assistantConfigFixture(t *testing.T) (acornFoxProductionPreparedFixture, *acornFoxAssistantConfigurator, *[]string) {
 	t.Helper()

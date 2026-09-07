@@ -1,6 +1,6 @@
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { applyAssistantEvents, BasicMarkdown, scopeKey, sessionLabel } from "./Assistant";
+import { applyAssistantEvents, expireAssistantTranscript, BasicMarkdown, scopeKey, sessionLabel } from "./Assistant";
 
 describe("assistant transcript state", () => {
   it("keeps per-page scope pointers distinct and drops duplicate event cursors", () => {
@@ -35,4 +35,15 @@ describe("assistant transcript state", () => {
     expect(html).toContain("&lt;p&gt;不会作为 HTML&lt;/p&gt;");
     expect(html).not.toContain("<script>");
   });
+});
+
+it("does not keep an evicted run active after cursor expiry", () => {
+  const expired = expireAssistantTranscript({ cursor: 1, incomplete: false, messages: [], runStates: { old: "running", finished: "completed" } }, 10);
+  expect(expired.runStates).toEqual({ old: "unknown", finished: "completed" });
+  const resumed = applyAssistantEvents(expired, [{ cursor: 11, runId: "new", type: "assistant.delta", occurredAt: "2030-01-01T00:00:00Z", text: "继续" }]);
+  expect(resumed.runStates.new).toBe("running");
+  expect(resumed.runStates.old).toBe("unknown");
+  const late = applyAssistantEvents(resumed, [{ cursor: 12, runId: "old", type: "assistant.delta", occurredAt: "2030-01-01T00:00:01Z", text: "迟到片段" }]);
+  expect(late.runStates.old).toBe("unknown");
+  expect(resumed.incomplete).toBe(true);
 });

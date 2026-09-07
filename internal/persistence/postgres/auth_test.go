@@ -45,7 +45,7 @@ func TestAdminAuthMigrationIsAdditiveAndExcludesRawCredentialFields(t *testing.T
 	}
 }
 
-func TestControlPlaneMigrationSequenceIsContinuousTo0039(t *testing.T) {
+func TestControlPlaneMigrationSequenceIsContinuousTo0040(t *testing.T) {
 	entries, err := os.ReadDir("../../../migrations/control-plane")
 	if err != nil {
 		t.Fatal(err)
@@ -58,8 +58,8 @@ func TestControlPlaneMigrationSequenceIsContinuousTo0039(t *testing.T) {
 		versions = append(versions, entry.Name()[:4])
 	}
 	sort.Strings(versions)
-	if len(versions) != 39 || versions[0] != "0001" || versions[len(versions)-1] != "0039" {
-		t.Fatalf("migration range = %v, want 0001 through 0039", versions)
+	if len(versions) != 40 || versions[0] != "0001" || versions[len(versions)-1] != "0040" {
+		t.Fatalf("migration range = %v, want 0001 through 0040", versions)
 	}
 	for index, version := range versions {
 		want := fmt.Sprintf("%04d", index+1)

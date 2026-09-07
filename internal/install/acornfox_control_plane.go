@@ -54,7 +54,11 @@ type AcornFoxControlPlaneMigrationReceiptV1 struct {
 }
 
 func (r AcornFoxControlPlaneMigrationReceiptV1) Validate() error {
-	if r.SchemaVersion != 1 || r.State != "CONTROL_PLANE_MIGRATED" || !validSHA(r.BindingSHA256) || !validID(r.ReleaseID) || !acornFoxHostSourceCommit.MatchString(r.SourceCommit) || r.MigrationVersion != AcornFoxV1MigrationVersion || !validSHA(r.MigrationRowsSHA256) || !validSHA(r.DatabaseEnvSHA256) || !validSHA(r.DatabaseIdentitySHA256) {
+	return r.validateMigration(AcornFoxV1MigrationVersion)
+}
+
+func (r AcornFoxControlPlaneMigrationReceiptV1) validateMigration(migration string) error {
+	if r.SchemaVersion != 1 || r.State != "CONTROL_PLANE_MIGRATED" || !validSHA(r.BindingSHA256) || !validID(r.ReleaseID) || !acornFoxHostSourceCommit.MatchString(r.SourceCommit) || r.MigrationVersion != migration || (migration != AcornFoxV1MigrationVersion && migration != acornFoxRecentPredecessorMigration && migration != AcornFoxLegacyPredecessorMigration) || !validSHA(r.MigrationRowsSHA256) || !validSHA(r.DatabaseEnvSHA256) || !validSHA(r.DatabaseIdentitySHA256) {
 		return ErrAcornFoxControlPlaneConflict
 	}
 	return nil
@@ -73,6 +77,14 @@ func ParseAcornFoxControlPlaneMigrationReceiptV1(raw []byte) (AcornFoxControlPla
 		return result, ErrAcornFoxControlPlaneConflict
 	}
 	return result, result.Validate()
+}
+
+func parseAcornFoxControlPlaneMigrationReceiptForUpgrade(raw []byte, migration string) (AcornFoxControlPlaneMigrationReceiptV1, error) {
+	var result AcornFoxControlPlaneMigrationReceiptV1
+	if strictCanonicalJSON(raw, &result, "AcornFox control plane migration receipt") != nil || result.validateMigration(migration) != nil {
+		return result, ErrAcornFoxControlPlaneConflict
+	}
+	return result, nil
 }
 
 // acornFoxControlPlaneProvisioner is deliberately smaller than PostgresRunner:
@@ -381,6 +393,10 @@ func (s *acornFoxControlPlane) newEnvironment() ([]byte, error) {
 }
 
 func validAcornFoxControlPlaneEnvironment(raw []byte) bool {
+	return validAcornFoxControlPlaneEnvironmentForDatabase(raw, acornFoxControlPlaneDatabase)
+}
+
+func validAcornFoxControlPlaneEnvironmentForDatabase(raw []byte, database string) bool {
 	value, err := parseAcornFoxControlPlaneEnvironment(raw)
 	if err != nil {
 		return false
@@ -390,11 +406,55 @@ func validAcornFoxControlPlaneEnvironment(raw []byte) bool {
 		return false
 	}
 	password, ok := u.User.Password()
-	if !ok || len(password) != base64.RawURLEncoding.EncodedLen(32) || (u.Scheme != "postgres" && u.Scheme != "postgresql") || u.User.Username() != acornFoxControlPlaneRole || u.Hostname() != "127.0.0.1" || u.Port() != "5432" || u.Path != "/"+acornFoxControlPlaneDatabase || u.RawPath != "" || u.RawQuery != "sslmode=disable" || u.Fragment != "" || u.User.String() != acornFoxControlPlaneRole+":"+password {
+	if !ok || !postgresRoleName.MatchString(database) || len(password) != base64.RawURLEncoding.EncodedLen(32) || (u.Scheme != "postgres" && u.Scheme != "postgresql") || u.User.Username() != acornFoxControlPlaneRole || u.Hostname() != "127.0.0.1" || u.Port() != "5432" || u.Path != "/"+database || u.RawPath != "" || u.RawQuery != "sslmode=disable" || u.Fragment != "" || u.User.String() != acornFoxControlPlaneRole+":"+password {
 		return false
 	}
 	_, err = base64.RawURLEncoding.DecodeString(password)
 	return err == nil
+}
+
+func acornFoxControlPlaneDatabaseName(raw []byte) (string, error) {
+	value, err := parseAcornFoxControlPlaneEnvironment(raw)
+	if err != nil {
+		return "", ErrAcornFoxControlPlaneConflict
+	}
+	u, err := url.Parse(value)
+	if err != nil || u.Path == "" || strings.Count(u.Path, "/") != 1 {
+		return "", ErrAcornFoxControlPlaneConflict
+	}
+	return strings.TrimPrefix(u.Path, "/"), nil
+}
+
+func validAcornFoxBoundControlPlaneEnvironment(raw []byte, receipt AcornFoxControlPlaneMigrationReceiptV1, expectedDatabase string) bool {
+	if receipt.validateMigration(receipt.MigrationVersion) != nil || sha256Bytes(raw) != receipt.DatabaseEnvSHA256 || receipt.DatabaseIdentitySHA256 != acornFoxControlPlaneIdentitySHA256ForDatabase(expectedDatabase) {
+		return false
+	}
+	database, err := acornFoxControlPlaneDatabaseName(raw)
+	if err != nil || database != expectedDatabase || (database != acornFoxControlPlaneDatabase && !acornFoxUpgradeShadowName.MatchString(database)) {
+		return false
+	}
+	return validAcornFoxControlPlaneEnvironmentForDatabase(raw, database)
+}
+
+func acornFoxControlPlaneEnvironmentForDatabase(raw []byte, database string) ([]byte, error) {
+	if !validAcornFoxControlPlaneEnvironment(raw) || !acornFoxUpgradeShadowName.MatchString(database) {
+		return nil, ErrAcornFoxControlPlaneConflict
+	}
+	value, err := parseAcornFoxControlPlaneEnvironment(raw)
+	if err != nil {
+		return nil, ErrAcornFoxControlPlaneConflict
+	}
+	u, err := url.Parse(value)
+	if err != nil {
+		return nil, ErrAcornFoxControlPlaneConflict
+	}
+	u.Path = "/" + database
+	u.RawPath = ""
+	result := []byte("ACORNFOX_DATABASE_URL=" + u.String() + "\n")
+	if !validAcornFoxControlPlaneEnvironmentForDatabase(result, database) {
+		return nil, ErrAcornFoxControlPlaneConflict
+	}
+	return result, nil
 }
 
 func parseAcornFoxControlPlaneEnvironment(raw []byte) (string, error) {
@@ -437,7 +497,14 @@ func (s *acornFoxControlPlane) provision(ctx context.Context, env []byte) error 
 }
 
 func acornFoxControlPlaneIdentitySHA256() string {
-	return sha256Bytes([]byte("acornfox-control-plane-postgres-v1\x00acornfox\x00127.0.0.1\x005432\x00disable"))
+	return acornFoxControlPlaneIdentitySHA256ForDatabase(acornFoxControlPlaneDatabase)
+}
+
+func acornFoxControlPlaneIdentitySHA256ForDatabase(database string) string {
+	if database != acornFoxControlPlaneDatabase && !acornFoxUpgradeShadowName.MatchString(database) {
+		return ""
+	}
+	return sha256Bytes([]byte("acornfox-control-plane-postgres-v1\x00" + database + "\x00127.0.0.1\x005432\x00disable"))
 }
 
 func ensureAcornFoxControlPlaneLedger(ctx context.Context, control BootstrapMigrationControl, migrations acornFoxControlPlaneMigrations) error {

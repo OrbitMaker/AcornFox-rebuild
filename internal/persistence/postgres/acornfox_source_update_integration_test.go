@@ -15,6 +15,7 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/open-card/open-card/internal/application"
+	"github.com/open-card/open-card/internal/domain"
 )
 
 func TestAcornFoxSourceUpdateSessionFenceAndDeadWriterRecovery(t *testing.T) {
@@ -73,7 +74,34 @@ func TestAcornFoxSourceUpdateSessionFenceAndDeadWriterRecovery(t *testing.T) {
 	if err != nil || fresh == nil {
 		t.Fatalf("new key after recovery lease=%v err=%v", fresh, err)
 	}
+	revision := domain.SourceRevision{
+		ID: "src_updated_public", ApplicationID: "app_update", Kind: domain.SourceGitHTTPS,
+		Locator: "https://github.com/acme/update.git", Ref: "main", Commit: strings.Repeat("c", 40),
+		ContentDigest: "sha256:" + strings.Repeat("d", 64), WorkspaceRef: "/private/update/new",
+		Immutable: true, CreatedAt: now.Add(4 * time.Second),
+	}
+	if _, err := storeTwo.CompleteAcornFoxSourceUpdate(ctx, fresh, second, sourceUpdateTestDigest(second), revision, now.Add(4*time.Second)); err != nil {
+		t.Fatal(err)
+	}
 	storeTwo.ReleaseAcornFoxSourceUpdate(ctx, fresh)
+	page, err := storeTwo.ListAcornFoxSourceRevisions(ctx, "app_update", nil, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	visible := false
+	for _, source := range page.Items {
+		visible = visible || source.ID == revision.ID
+	}
+	if !visible {
+		t.Fatal("completed public source update is missing from normal source discovery")
+	}
+	loaded, err := storeTwo.GetAcornFoxSourceRevision(ctx, "app_update", revision.ID)
+	if err != nil || loaded.Commit != revision.Commit {
+		t.Fatalf("updated source cannot be read for deployment: %v", err)
+	}
+	if _, err := storeTwo.GetAcornFoxSourceRevision(ctx, "app_foreign", revision.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("foreign application source read: %v", err)
+	}
 }
 func sourceUpdateTestDigest(r application.AcornFoxSourceUpdateRequest) string {
 	sum := sha256.Sum256([]byte(r.ApplicationID.String() + "\x00" + r.BaseSourceRevisionID.String() + "\x00" + r.Ref))

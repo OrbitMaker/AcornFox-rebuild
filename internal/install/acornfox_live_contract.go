@@ -107,6 +107,15 @@ func validAcornFoxLiveRole(role AcornFoxLiveRole) bool {
 	}
 }
 
+func validAcornFoxLegacy0034LiveRole(role AcornFoxLiveRole) bool {
+	switch role {
+	case AcornFoxLiveRootRole, AcornFoxLiveServerRole, AcornFoxLiveAgentRole, AcornFoxLiveBuildKitRole, AcornFoxLiveCaddyRole, AcornFoxLiveEdgeRole:
+		return true
+	default:
+		return false
+	}
+}
+
 func acornFoxLiveEntryFor(entry SubstrateEntry) (AcornFoxLiveEntryV1, error) {
 	return acornFoxLiveEntryForLayout(acornFoxInstallLayout{mode: acornFoxInstallLayoutTask}, entry)
 }
@@ -250,6 +259,63 @@ func (r AcornFoxLiveReceiptV1) Validate() error {
 	}
 	if static, err := acornFoxLiveStaticDigest(r.Entries); err != nil || static != r.StaticSetSHA256 {
 		return errors.New("AcornFox live receipt static set is invalid")
+	}
+	return nil
+}
+
+func validateAcornFoxLegacy0034LiveReceipt(r AcornFoxLiveReceiptV1) error {
+	if r.SchemaVersion != AcornFoxLiveReceiptV1Schema || r.State != "host_live_materialized" || !validSHA(r.BindingSHA256) || !validSHA(r.SubstrateReceiptSHA256) || !validID(r.ReleaseID) || !validSHA(r.LiveTreeSHA256) || !validSHA(r.OwnershipPlanSHA256) || !validSHA(r.StaticSetSHA256) || !validSHA(r.LayoutSHA256) || r.OwnershipEvidence != "host_uid_gid_verified" {
+		return errors.New("AcornFox legacy 0034 live receipt identity is invalid")
+	}
+	if err := validateAcornFoxLiveEntries(r.Entries); err != nil {
+		return err
+	}
+	for _, entry := range r.Entries {
+		if !validAcornFoxLegacy0034LiveRole(entry.Role) || !validAcornFoxLegacy0034LiveRole(entry.Group) {
+			return errors.New("AcornFox legacy 0034 live role is invalid")
+		}
+	}
+	if !acornFoxLiveReleaseEntriesMatch(r.ReleaseID, r.Entries) {
+		return errors.New("AcornFox legacy 0034 live release entries are invalid")
+	}
+	if tree, err := acornFoxLiveDigest(r.Entries); err != nil || tree != r.LiveTreeSHA256 {
+		return errors.New("AcornFox legacy 0034 live tree digest is invalid")
+	}
+	if plan, err := acornFoxLiveOwnershipDigest(r.Entries); err != nil || plan != r.OwnershipPlanSHA256 {
+		return errors.New("AcornFox legacy 0034 live ownership digest is invalid")
+	}
+	if static, err := acornFoxLiveStaticDigest(r.Entries); err != nil || static != r.StaticSetSHA256 {
+		return errors.New("AcornFox legacy 0034 live static digest is invalid")
+	}
+	return nil
+}
+
+func validateAcornFoxLegacy0034LiveReceiptForLayout(layout acornFoxInstallLayout, substrate InactiveSubstrateReceiptV1, old AcornFoxCandidateBindingV1, oldSHA256 string, live AcornFoxLiveReceiptV1) error {
+	if layout.validateLegacy0034() != nil || validateAcornFoxLegacy0034SubstrateReceipt(substrate, old, oldSHA256) != nil || validateAcornFoxLegacy0034LiveReceipt(live) != nil {
+		return errors.New("AcornFox legacy 0034 live evidence is invalid")
+	}
+	substrateRaw, err := json.Marshal(substrate)
+	if err != nil || live.BindingSHA256 != oldSHA256 || live.SubstrateReceiptSHA256 != sha256Hex(substrateRaw) || live.ReleaseID != old.ReleaseID || live.LayoutSHA256 != layout.evidence() {
+		return errors.New("AcornFox legacy 0034 live evidence is not identity-bound")
+	}
+	source := append([]SubstrateEntry(nil), substrate.Entries...)
+	source = append(source, SubstrateEntry{Path: "var/lib/acornfox/install/releases/" + old.ReleaseID + ".json", Kind: SubstrateEntryFile, Mode: durableFileMode, Role: OwnerRoleRoot, Group: GroupRoleRoot, Size: int64(len(substrateRaw)), SHA256: sha256Hex(substrateRaw)})
+	sort.Slice(source, func(i, j int) bool { return source[i].Path < source[j].Path })
+	want := make([]AcornFoxLiveEntryV1, 0, len(source))
+	for _, entry := range source {
+		if acornFoxProductionSharedParent(entry.Path) {
+			continue
+		}
+		converted, convertErr := acornFoxLiveEntryForLayout(layout, entry)
+		if convertErr != nil {
+			return convertErr
+		}
+		want = append(want, converted)
+	}
+	wantRaw, err := json.Marshal(want)
+	gotRaw, gotErr := json.Marshal(live.Entries)
+	if err != nil || gotErr != nil || string(wantRaw) != string(gotRaw) {
+		return errors.New("AcornFox legacy 0034 live entries are not exact")
 	}
 	return nil
 }

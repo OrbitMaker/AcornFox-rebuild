@@ -149,7 +149,8 @@ func acornFoxValidateProductionAcornFoxTree(root *os.Root, store *TaskAcornFoxRe
 				return ErrAcornFoxLiveConflict
 			}
 			if envOK {
-				if !validAcornFoxControlPlaneEnvironment(envRaw) {
+				database, databaseErr := acornFoxControlPlaneDatabaseName(envRaw)
+				if databaseErr != nil || !validAcornFoxControlPlaneEnvironmentForDatabase(envRaw, database) || (database != acornFoxControlPlaneDatabase && !acornFoxUpgradeShadowName.MatchString(database)) {
 					return ErrAcornFoxLiveConflict
 				}
 				controlPlaneFiles[envPath] = envRaw
@@ -394,12 +395,17 @@ func acornFoxValidateControlPlaneState(root *os.Root, store *TaskAcornFoxRepoSto
 	if err != nil {
 		return err
 	}
-	if envOK && !validAcornFoxControlPlaneEnvironment(env) || receiptOK && !envOK {
+	if receiptOK && !envOK {
 		return ErrAcornFoxLiveConflict
 	}
 	if receiptOK {
 		receipt, parseErr := ParseAcornFoxControlPlaneMigrationReceiptV1(receiptRaw)
-		if parseErr != nil || receipt.DatabaseEnvSHA256 != sha256Bytes(env) || receipt.DatabaseIdentitySHA256 != acornFoxControlPlaneIdentitySHA256() {
+		expectedDatabase := acornFoxControlPlaneDatabase
+		observedDatabase, databaseErr := acornFoxControlPlaneDatabaseName(env)
+		if databaseErr == nil && observedDatabase != acornFoxControlPlaneDatabase {
+			expectedDatabase, databaseErr = acornFoxExpectedCurrentDatabase(store, receipt.BindingSHA256)
+		}
+		if parseErr != nil || databaseErr != nil || observedDatabase != expectedDatabase || !validAcornFoxBoundControlPlaneEnvironment(env, receipt, expectedDatabase) {
 			return ErrAcornFoxLiveConflict
 		}
 	}

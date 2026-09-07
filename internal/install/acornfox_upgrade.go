@@ -52,6 +52,7 @@ type acornFoxUpgradeImage struct {
 	Live         AcornFoxLiveReceiptV1                  `json:"live"`
 	Activation   AcornFoxRepoActivationV1               `json:"activation"`
 	ControlPlane AcornFoxControlPlaneMigrationReceiptV1 `json:"control_plane"`
+	DatabaseEnv  []byte                                 `json:"database_env,omitempty"`
 	Runtime      acornFoxRuntimeIntent                  `json:"runtime"`
 }
 
@@ -60,12 +61,13 @@ func (acornFoxUpgradeImage) Format(s fmt.State, _ rune) {
 }
 
 type acornFoxUpgradeJournal struct {
-	SchemaVersion int                  `json:"schema_version"`
-	Phase         string               `json:"phase"`
-	LayoutSHA256  string               `json:"layout_sha256"`
-	PIEnabled     bool                 `json:"pi_enabled,omitempty"`
-	Old           acornFoxUpgradeImage `json:"old"`
-	Next          acornFoxUpgradeImage `json:"next"`
+	SchemaVersion int                           `json:"schema_version"`
+	Phase         string                        `json:"phase"`
+	LayoutSHA256  string                        `json:"layout_sha256"`
+	PIEnabled     bool                          `json:"pi_enabled,omitempty"`
+	CrossSchema   *acornFoxCrossSchemaUpgradeV1 `json:"cross_schema,omitempty"`
+	Old           acornFoxUpgradeImage          `json:"old"`
+	Next          acornFoxUpgradeImage          `json:"next"`
 }
 
 func (acornFoxUpgradeJournal) Format(s fmt.State, _ rune) {
@@ -78,8 +80,14 @@ func (i acornFoxUpgradeImage) identity() AcornFoxBuildIdentityV1 {
 }
 func (i acornFoxUpgradeImage) validate(layout acornFoxInstallLayout, requireSetupToken bool) error {
 	b, e := ParseAcornFoxCandidateBindingV1(i.Binding, i.Repo.BindingSHA256)
-	if e != nil || i.Substrate.Validate() != nil || i.Repo.Validate() != nil || i.Live.Validate() != nil || i.Activation.Validate() != nil || i.ControlPlane.Validate() != nil || (requireSetupToken && i.Runtime.validate() != nil) || (!requireSetupToken && i.Runtime.validateForUpgrade() != nil) {
+	if e != nil || i.Substrate.Validate() != nil || i.Repo.Validate() != nil || i.Live.Validate() != nil || i.Activation.Validate() != nil || i.ControlPlane.validateMigration(b.binding.MigrationVersion) != nil || (requireSetupToken && i.Runtime.validate() != nil) || (!requireSetupToken && i.Runtime.validateForUpgrade() != nil) {
 		return ErrAcornFoxUpgradeConflict
+	}
+	if len(i.DatabaseEnv) != 0 {
+		database, err := acornFoxControlPlaneDatabaseName(i.DatabaseEnv)
+		if err != nil || !validAcornFoxBoundControlPlaneEnvironment(i.DatabaseEnv, i.ControlPlane, database) {
+			return ErrAcornFoxUpgradeConflict
+		}
 	}
 	c := i.Substrate.CandidateReceipt
 	if i.Repo.Phase != AcornFoxRepoPreparedFinal || i.Repo.NeedsRecovery || i.Repo.LayoutSHA256 != layout.evidence() || i.Repo.BindingSHA256 != c.BindingSHA256 || c.ReleaseID != b.binding.ReleaseID || c.SourceCommit != b.binding.SourceCommit || i.Repo.SubstrateReceiptSHA256 != sha256Hex(acornFoxUpgradeJSON(i.Substrate)) || i.Live.BindingSHA256 != c.BindingSHA256 || i.Live.LayoutSHA256 != layout.evidence() || i.Live.OwnershipEvidence != "host_uid_gid_verified" || i.Live.SubstrateReceiptSHA256 != i.Repo.SubstrateReceiptSHA256 || i.Live.LiveTreeSHA256 != i.Repo.LiveTreeSHA256 || i.Live.StaticSetSHA256 != i.Repo.StaticSetSHA256 || i.Live.OwnershipPlanSHA256 != i.Repo.OwnershipPlanSHA256 || i.Repo.ActivationSHA256 != sha256Hex(acornFoxUpgradeJSON(i.Activation)) {
@@ -102,13 +110,24 @@ func (i acornFoxUpgradeImage) validate(layout acornFoxInstallLayout, requireSetu
 func (j acornFoxUpgradeJournal) validate(layout acornFoxInstallLayout) error {
 	switch j.Phase {
 	case "PREPARED", "BLOCKED", "PUBLISHED", "SWITCHED", "UPGRADED", "ROLLING_BACK", "RECOVERY_PREPARED", "ROLLED_BACK":
+	case "QUIESCED", "SNAPSHOT_CREATED", "MIGRATED", "VALIDATED":
+		if j.CrossSchema == nil {
+			return ErrAcornFoxUpgradeConflict
+		}
 	default:
 		return ErrAcornFoxUpgradeConflict
 	}
-	if j.SchemaVersion != 1 || j.LayoutSHA256 != layout.evidence() || j.Old.validate(layout, false) != nil || j.Next.validate(layout, true) != nil {
+	if j.SchemaVersion != 1 || j.LayoutSHA256 != layout.evidence() || j.Next.validate(layout, true) != nil {
 		return ErrAcornFoxUpgradeConflict
 	}
-	old, e := ParseAcornFoxCandidateBindingV1(j.Old.Binding, j.Old.Repo.BindingSHA256)
+	if j.CrossSchema == nil {
+		if j.Old.validate(layout, false) != nil {
+			return ErrAcornFoxUpgradeConflict
+		}
+	} else if validateAcornFoxPreviousUpgradeImage(j.Old, layout) != nil || j.CrossSchema.validate(j) != nil {
+		return ErrAcornFoxUpgradeConflict
+	}
+	old, e := verifiedAcornFoxUpgradePredecessor(j.Old.Binding, j.Old.Repo.BindingSHA256)
 	if e != nil {
 		return ErrAcornFoxUpgradeConflict
 	}
@@ -120,7 +139,10 @@ func (j acornFoxUpgradeJournal) validate(layout acornFoxInstallLayout) error {
 		return ErrAcornFoxUpgradeConflict
 	}
 	n := next.binding.NMinusOne
-	if n == nil || n.BindingSHA256 != old.digest || verifyAcornFoxPredecessor(j.Old.Binding, next.binding, &NMinusOne{Version: n.Version, MigrationVersion: n.MigrationVersion, SourceCommit: n.SourceCommit, ReleaseManifestSHA256: n.ReleaseManifestSHA256, ArchiveSHA256: n.ArchiveSHA256, BundleManifestSHA256: n.BundleManifestSHA256}) != nil || !acornFoxUpgradeVersionAfter(next.binding.Version, old.binding.Version) || j.Old.ControlPlane.MigrationRowsSHA256 != j.Next.ControlPlane.MigrationRowsSHA256 || j.Old.ControlPlane.DatabaseEnvSHA256 != j.Next.ControlPlane.DatabaseEnvSHA256 {
+	if n == nil || n.BindingSHA256 != old.digest || verifyAcornFoxPredecessor(j.Old.Binding, next.binding, &NMinusOne{Version: n.Version, MigrationVersion: n.MigrationVersion, SourceCommit: n.SourceCommit, ReleaseManifestSHA256: n.ReleaseManifestSHA256, ArchiveSHA256: n.ArchiveSHA256, BundleManifestSHA256: n.BundleManifestSHA256}) != nil || !acornFoxUpgradeVersionAfter(next.binding.Version, old.binding.Version) {
+		return ErrAcornFoxUpgradeConflict
+	}
+	if j.CrossSchema == nil && (j.Old.ControlPlane.MigrationRowsSHA256 != j.Next.ControlPlane.MigrationRowsSHA256 || j.Old.ControlPlane.DatabaseEnvSHA256 != j.Next.ControlPlane.DatabaseEnvSHA256) {
 		return ErrAcornFoxUpgradeConflict
 	}
 	rebound, e := acornFoxUpgradeRebind(j.Old.Runtime, next.binding, next.digest, j.Next.Runtime.SetupToken)
@@ -152,36 +174,106 @@ func acornFoxUpgradeRebind(old acornFoxRuntimeIntent, next AcornFoxCandidateBind
 }
 
 type acornFoxUpgrade struct {
-	layout    acornFoxInstallLayout
-	self      acornFoxSelfVerifier
-	ownership acornFoxOwnershipEdge
-	services  acornFoxUpgradeServices
-	random    io.Reader
-	step      func(string) error
+	layout              acornFoxInstallLayout
+	self                acornFoxSelfVerifier
+	ownership           acornFoxOwnershipEdge
+	services            acornFoxUpgradeServices
+	database            acornFoxCrossSchemaDatabaseFactory
+	activeDatabase      acornFoxCrossSchemaDatabase
+	candidateHealth     func(context.Context, *TaskAcornFoxRepoStore, acornFoxUpgradeImage) error
+	hostProvisionSHA256 string
+	random              io.Reader
+	step                func(string) error
 }
 
 func newAcornFoxUpgrade(layout acornFoxInstallLayout) *acornFoxUpgrade {
-	return &acornFoxUpgrade{layout: layout, self: newAcornFoxProductionSelfVerifier(), ownership: newAcornFoxRealOwnershipEdge(), services: acornFoxRealUpgradeServices{}, random: rand.Reader, step: func(string) error { return nil }}
+	return &acornFoxUpgrade{layout: layout, self: newAcornFoxProductionSelfVerifier(), ownership: newAcornFoxRealOwnershipEdge(), services: acornFoxRealUpgradeServices{}, database: func(layout acornFoxInstallLayout, transactionID, oldBinding, nextBinding string, activeEnv []byte, migrations acornFoxControlPlaneMigrations, sourceDataVersion int) (acornFoxCrossSchemaDatabase, error) {
+		return newProductionAcornFoxUpgradeDatabase(layout, transactionID, oldBinding, nextBinding, activeEnv, migrations, sourceDataVersion)
+	}, candidateHealth: validateProductionAcornFoxCandidateHealth, random: rand.Reader, step: func(string) error { return nil }}
 }
 func UpgradeAcornFoxHostV1(ctx context.Context, request AcornFoxUpgradeRequestV1) (AcornFoxUpgradeReceiptV1, error) {
 	if acornFoxUpgradeInitialHost() != nil {
 		return AcornFoxUpgradeReceiptV1{}, ErrAcornFoxUpgradeConflict
 	}
-	layout, e := newProductionAcornFoxLayout()
+	layout, hostProvision, e := prepareProductionAcornFoxUpgradeLayout(ctx, request)
 	if e != nil {
 		return AcornFoxUpgradeReceiptV1{}, e
 	}
-	return newAcornFoxUpgrade(layout).upgrade(ctx, request)
+	upgrade := newAcornFoxUpgrade(layout)
+	upgrade.hostProvisionSHA256 = hostProvision
+	return upgrade.upgrade(ctx, request)
+}
+
+func prepareProductionAcornFoxUpgradeLayout(ctx context.Context, request AcornFoxUpgradeRequestV1) (acornFoxInstallLayout, string, error) {
+	if ctx == nil || ctx.Err() != nil || !validSHA(request.CurrentBindingSHA256) {
+		return acornFoxInstallLayout{}, "", ErrAcornFoxUpgradeConflict
+	}
+	state, err := os.OpenRoot("/var/lib/acornfox/install")
+	if err != nil {
+		return acornFoxInstallLayout{}, "", ErrAcornFoxUpgradeConflict
+	}
+	oldRaw, err := readAcornFoxLegacyEvidence(state, "bindings/"+request.CurrentBindingSHA256+".json", acornFoxInstallPrincipal{}, acornFoxCandidateBindingMaxBytes)
+	_ = state.Close()
+	if err != nil {
+		return acornFoxInstallLayout{}, "", ErrAcornFoxUpgradeConflict
+	}
+	set, err := loadAcornFoxCandidateSet(AcornFoxCandidateSetRequestV1{Directory: request.Directory, BindingSHA256: request.BindingSHA256, SelfSHA256: request.SelfSHA256}, oldRaw, newAcornFoxProductionSelfVerifier())
+	if err != nil {
+		return acornFoxInstallLayout{}, "", ErrAcornFoxUpgradeConflict
+	}
+	defer set.Close()
+	old, err := verifiedAcornFoxUpgradePredecessor(oldRaw, request.CurrentBindingSHA256)
+	if err != nil {
+		return acornFoxInstallLayout{}, "", ErrAcornFoxUpgradeConflict
+	}
+	if old.binding.MigrationVersion != AcornFoxLegacyPredecessorMigration {
+		layout, err := newProductionAcornFoxLayout()
+		if err != nil {
+			return acornFoxInstallLayout{}, "", err
+		}
+		if old.binding.MigrationVersion == acornFoxRecentPredecessorMigration && AcornFoxV1MigrationVersion != acornFoxRecentPredecessorMigration {
+			evidence, evidenceErr := acornFoxRecent0039HostEvidenceSHA(old.digest, set.binding.digest, layout)
+			return layout, evidence, evidenceErr
+		}
+		return layout, "", nil
+	}
+	layout, evidence, err := ensureAcornFoxLegacyUpgradeHost(ctx, oldRaw, request.CurrentBindingSHA256, set.binding)
+	if err != nil {
+		return acornFoxInstallLayout{}, "", err
+	}
+	raw, err := json.Marshal(evidence)
+	if err != nil {
+		return acornFoxInstallLayout{}, "", ErrAcornFoxUpgradeConflict
+	}
+	return layout, sha256Hex(raw), nil
 }
 func RecoverAcornFoxUpgradeV1(ctx context.Context, expected AcornFoxBuildIdentityV1) (AcornFoxUpgradeReceiptV1, bool, error) {
 	if acornFoxUpgradeInitialHost() != nil {
 		return AcornFoxUpgradeReceiptV1{}, false, ErrAcornFoxUpgradeConflict
 	}
-	layout, e := newProductionAcornFoxLayout()
+	layout, provisionSHA, e := productionAcornFoxRecoveryLayout(ctx)
 	if e != nil {
 		return AcornFoxUpgradeReceiptV1{}, false, e
 	}
-	return newAcornFoxUpgrade(layout).recover(ctx, expected)
+	upgrade := newAcornFoxUpgrade(layout)
+	upgrade.hostProvisionSHA256 = provisionSHA
+	return upgrade.recover(ctx, expected)
+}
+
+func productionAcornFoxRecoveryLayout(ctx context.Context) (acornFoxInstallLayout, string, error) {
+	layout, evidence, handled, err := recoverAcornFoxLegacyUpgradeHost(ctx)
+	if err != nil {
+		return acornFoxInstallLayout{}, "", err
+	}
+	if handled {
+		raw, marshalErr := json.Marshal(evidence)
+		if marshalErr != nil {
+			return acornFoxInstallLayout{}, "", ErrAcornFoxUpgradeConflict
+		}
+		return layout, sha256Hex(raw), nil
+	}
+	layout, err = newProductionAcornFoxLayout()
+	return layout, "", err
 }
 func (u *acornFoxUpgrade) openStore() (*TaskAcornFoxRepoStore, error) {
 	s, e := newAcornFoxRepoStoreForLayout(u.layout)
@@ -212,13 +304,20 @@ func (u *acornFoxUpgrade) upgrade(ctx context.Context, request AcornFoxUpgradeRe
 		return empty, ErrAcornFoxUpgradeConflict
 	}
 	defer set.Close()
-	old, e := ParseAcornFoxCandidateBindingV1(oldRaw, request.CurrentBindingSHA256)
+	old, e := verifiedAcornFoxUpgradePredecessor(oldRaw, request.CurrentBindingSHA256)
 	if e != nil || !acornFoxUpgradeVersionAfter(set.binding.binding.Version, old.binding.Version) {
 		return empty, ErrAcornFoxUpgradeConflict
 	}
 	oldManifest, e := u.read(s.hostRoot, "opt/acornfox/releases/"+old.binding.ReleaseID+"/manifest.json", 0644, acornFoxManifestMaxBytes)
-	if e != nil || sha256Hex(oldManifest) != old.binding.ManifestSHA256 || acornFoxUpgradeSameMigrations(oldManifest, set.manifestRaw) != nil {
+	if e != nil || sha256Hex(oldManifest) != old.binding.ManifestSHA256 {
 		return empty, ErrAcornFoxUpgradeConflict
+	}
+	crossSchema := false
+	if acornFoxUpgradeSameMigrations(oldManifest, set.manifestRaw) != nil {
+		_, _, crossSchema = acornFoxCrossSchemaManifests(oldManifest, set.manifestRaw, old.binding, set.binding.binding)
+		if !crossSchema || !validSHA(u.hostProvisionSHA256) {
+			return empty, ErrAcornFoxUpgradeConflict
+		}
 	}
 	lock, e := s.Acquire(ctx)
 	if e != nil {
@@ -231,6 +330,9 @@ func (u *acornFoxUpgrade) upgrade(ctx context.Context, request AcornFoxUpgradeRe
 				return empty, e
 			}
 			if j.Phase == "ROLLED_BACK" {
+				if j.CrossSchema != nil {
+					return j.receipt(), ErrAcornFoxUpgradeRolledBack
+				}
 				if request.CurrentBindingSHA256 != j.Old.Repo.BindingSHA256 {
 					return empty, ErrAcornFoxUpgradeConflict
 				}
@@ -256,20 +358,59 @@ func (u *acornFoxUpgrade) upgrade(ctx context.Context, request AcornFoxUpgradeRe
 	if prior.Repo.BindingSHA256 != request.CurrentBindingSHA256 {
 		return empty, ErrAcornFoxUpgradeConflict
 	}
-	piEnabled, e := u.capturePIEnabled(ctx, s)
+	piEnabled, e := u.capturePIEnabled(ctx, s, old.binding.MigrationVersion)
 	if e != nil {
 		return empty, e
+	}
+	var assistant *acornFoxUpgradeAssistantConfig
+	if crossSchema && old.binding.MigrationVersion == acornFoxRecentPredecessorMigration {
+		assistant, e = captureAcornFoxUpgradeAssistantConfig(s)
+		if e != nil {
+			return empty, e
+		}
 	}
 	nextSub, e := u.stage(ctx, s, set)
 	if e != nil {
 		return empty, e
 	}
 	defer nextSub.Close()
-	next, e := u.nextImage(prior, set, nextSub)
+	var databasePrivate *acornFoxUpgradeDatabasePrivate
+	var migrations acornFoxControlPlaneMigrations
+	if crossSchema {
+		if u.database == nil || len(prior.DatabaseEnv) == 0 {
+			return empty, ErrAcornFoxUpgradeConflict
+		}
+		migrations, e = loadAcornFoxUpgradeMigrations(nextSub, set.bindingSHA256)
+		if e != nil {
+			return empty, e
+		}
+		transactionID := "acornfox-layout-" + set.bindingSHA256[:12]
+		sourceDataVersion, sourceOK := acornFoxCrossSchemaSourceDataVersion(prior.ControlPlane.MigrationVersion)
+		if !sourceOK {
+			return empty, ErrAcornFoxUpgradeConflict
+		}
+		database, openErr := u.database(u.layout, transactionID, prior.Repo.BindingSHA256, set.bindingSHA256, prior.DatabaseEnv, migrations, sourceDataVersion)
+		if openErr != nil || database == nil {
+			return empty, ErrAcornFoxUpgradeUnknown
+		}
+		defer database.Close()
+		u.activeDatabase = database
+		planned, planErr := database.Plan()
+		prefix, prefixErr := database.InspectPrefix(ctx)
+		if planErr != nil || prefixErr != nil || !sameAcornFoxUpgradeDatabaseIdentity(planned.Evidence, prefix) {
+			return empty, ErrAcornFoxUpgradeConflict
+		}
+		planned.Evidence = prefix
+		databasePrivate = &planned
+	}
+	next, e := u.nextImage(prior, set, nextSub, databasePrivate, migrations)
 	if e != nil {
 		return empty, e
 	}
 	j := acornFoxUpgradeJournal{SchemaVersion: 1, Phase: "PREPARED", LayoutSHA256: u.layout.evidence(), PIEnabled: piEnabled, Old: prior, Next: next}
+	if databasePrivate != nil {
+		j.CrossSchema = &acornFoxCrossSchemaUpgradeV1{SchemaVersion: 1, HostProvisionSHA256: u.hostProvisionSHA256, OldMigrationVersion: prior.ControlPlane.MigrationVersion, NextMigrationVersion: AcornFoxV1MigrationVersion, TargetRowsSHA256: acornFoxMigrationRowsSHA256(migrations.rows), Database: databasePrivate.Evidence, Assistant: assistant}
+	}
 	if j.validate(u.layout) != nil {
 		return empty, ErrAcornFoxUpgradeConflict
 	}
@@ -311,11 +452,13 @@ func PrepareAcornFoxUpgradeRecoveryV1(ctx context.Context, expected AcornFoxBuil
 	if acornFoxUpgradeInitialHost() != nil {
 		return AcornFoxUpgradeReceiptV1{}, false, ErrAcornFoxUpgradeConflict
 	}
-	layout, e := newProductionAcornFoxLayout()
+	layout, provisionSHA, e := productionAcornFoxRecoveryLayout(ctx)
 	if e != nil {
 		return AcornFoxUpgradeReceiptV1{}, false, e
 	}
-	return newAcornFoxUpgrade(layout).recoverMode(ctx, expected, true)
+	upgrade := newAcornFoxUpgrade(layout)
+	upgrade.hostProvisionSHA256 = provisionSHA
+	return upgrade.recoverMode(ctx, expected, true)
 }
 func FinalizeAcornFoxUpgradeRecoveryV1(ctx context.Context, expected AcornFoxBuildIdentityV1) (AcornFoxUpgradeReceiptV1, bool, error) {
 	return RecoverAcornFoxUpgradeV1(ctx, expected)
@@ -336,6 +479,15 @@ func (u *acornFoxUpgrade) recoverMode(ctx context.Context, expected AcornFoxBuil
 	}
 	if e != nil {
 		return empty, true, e
+	}
+	if j.CrossSchema != nil {
+		hostEvidence := u.hostProvisionSHA256
+		if j.CrossSchema.OldMigrationVersion == acornFoxRecentPredecessorMigration {
+			hostEvidence, e = acornFoxRecent0039HostEvidenceSHA(j.Old.Repo.BindingSHA256, j.Next.Repo.BindingSHA256, u.layout)
+		}
+		if e != nil || j.CrossSchema.HostProvisionSHA256 != hostEvidence {
+			return empty, true, ErrAcornFoxUpgradeConflict
+		}
 	}
 	image := j.Next
 	if expected == j.Old.identity() {

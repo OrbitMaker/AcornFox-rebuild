@@ -78,6 +78,10 @@ const (
 	// AgentCapabilityAcornFoxLogs permits only bounded, redacted collection
 	// from an immutable single-service runtime fact.
 	AgentCapabilityAcornFoxLogs = "acornfox.logs.v1"
+	// AgentCapabilityAcornFoxCandidateValidation permits one isolated
+	// deploy-observe-probe-destroy cycle for a digest-bound fix candidate. It
+	// does not grant authority over normal releases, deployments or routes.
+	AgentCapabilityAcornFoxCandidateValidation = "acornfox.candidate_validation.v1"
 )
 
 func (t TaskKind) RequiredCapability() string {
@@ -95,6 +99,12 @@ func (t TaskKind) RequiredCapability() string {
 // restart/rollback/redeploy merely because it supports a single-container
 // task with the same wire kind.
 func RequiredCapabilityForTaskRequest(task TaskRequest) string {
+	if marker, present := acornFoxCandidatePayloadMarker(task.Parameters); present {
+		if marker == "acornfox_candidate_validation_v1" {
+			return AgentCapabilityAcornFoxCandidateValidation
+		}
+		return "acornfox_candidate.unknown_payload"
+	}
 	if marker, present := acornFoxLogsPayloadMarker(task.Parameters); present {
 		if marker == "logs" {
 			return AgentCapabilityAcornFoxLogs
@@ -144,6 +154,22 @@ func RequiredCapabilityForTaskRequest(task TaskRequest) string {
 	default:
 		return task.Kind.RequiredCapability()
 	}
+}
+
+func acornFoxCandidatePayloadMarker(data json.RawMessage) (string, bool) {
+	var object map[string]json.RawMessage
+	if json.NewDecoder(bytes.NewReader(data)).Decode(&object) != nil {
+		return "", false
+	}
+	raw, present := object["acornfox_candidate_payload_type"]
+	if !present {
+		return "", false
+	}
+	var marker string
+	if json.Unmarshal(raw, &marker) != nil || strings.TrimSpace(marker) == "" {
+		return "", true
+	}
+	return marker, true
 }
 
 func acornFoxLogsPayloadMarker(data json.RawMessage) (string, bool) {

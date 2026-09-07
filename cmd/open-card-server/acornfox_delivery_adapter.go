@@ -35,6 +35,18 @@ func (a acornFoxPostgresAdapter) BeginAcornFoxDelivery(ctx context.Context, key,
 	return result, true, nil
 }
 
+func (a acornFoxPostgresAdapter) ReplayAcornFoxDelivery(ctx context.Context, key, digest string) (application.AcornFoxDeliveryResult, bool, error) {
+	raw, found, err := a.store.ReplayPublish(ctx, strings.TrimSpace(key), "sha256:"+strings.TrimPrefix(digest, "sha256:"))
+	if err != nil || !found {
+		return application.AcornFoxDeliveryResult{}, found, acornFoxDeliveryBeginError(err)
+	}
+	var result application.AcornFoxDeliveryResult
+	if err := json.Unmarshal(raw, &result); err != nil || result.DeploymentID.Empty() || result.OperationID.Empty() || result.TaskID.Empty() {
+		return application.AcornFoxDeliveryResult{}, false, errors.New("AcornFox durable replay is invalid")
+	}
+	return result, true, nil
+}
+
 func acornFoxDeliveryBeginError(err error) error {
 	if errors.Is(err, postgres.ErrAcornFoxPublishAbandoned) {
 		return domain.WrapError(domain.ErrUnknownState, "AcornFox delivery command was abandoned; retry with a new idempotency key after inspection", err)

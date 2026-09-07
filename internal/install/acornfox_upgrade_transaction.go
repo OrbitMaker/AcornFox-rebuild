@@ -5,18 +5,31 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
+	"syscall"
 
 	"github.com/open-card/open-card/internal/acornfoxsetup"
 )
 
 func (u *acornFoxUpgrade) capture(ctx context.Context, s *TaskAcornFoxRepoStore, binding []byte) (acornFoxUpgradeImage, error) {
 	var image acornFoxUpgradeImage
-	a, _, e := acornFoxRuntimeAuthority(ctx, s, s.hostRoot)
+	j, e := s.Load(ctx)
 	if e != nil {
 		return image, e
 	}
-	j, e := s.Load(ctx)
+	installed, e := verifiedAcornFoxUpgradePredecessor(binding, j.BindingSHA256)
+	if e != nil {
+		return image, ErrAcornFoxUpgradeConflict
+	}
+	if installed.binding.MigrationVersion == AcornFoxLegacyPredecessorMigration {
+		return u.captureLegacy0034(ctx, s, binding, installed.binding, j)
+	}
+	if installed.binding.MigrationVersion == acornFoxRecentPredecessorMigration && AcornFoxV1MigrationVersion != acornFoxRecentPredecessorMigration {
+		return u.captureRecent0039(ctx, s, binding, installed.binding, j)
+	}
+	a, _, e := acornFoxRuntimeAuthority(ctx, s, s.hostRoot)
 	if e != nil {
 		return image, e
 	}
@@ -49,9 +62,13 @@ func (u *acornFoxUpgrade) capture(ctx context.Context, s *TaskAcornFoxRepoStore,
 	if e != nil {
 		return image, e
 	}
-	cp, e := ParseAcornFoxControlPlaneMigrationReceiptV1(raw)
+	cp, e := parseAcornFoxControlPlaneMigrationReceiptForUpgrade(raw, installed.binding.MigrationVersion)
 	if e != nil {
 		return image, e
+	}
+	databaseEnv, e := u.read(s.root, acornFoxControlPlaneStateEnv, 0600, acornFoxUpgradeMaxJournal)
+	if e != nil || !validAcornFoxBoundControlPlaneEnvironment(databaseEnv, cp, acornFoxControlPlaneDatabase) {
+		return image, ErrAcornFoxUpgradeConflict
 	}
 	raw, e = u.read(s.root, acornFoxRuntimeIntentName, 0600, acornFoxRuntimeMaxIntent)
 	if e != nil {
@@ -62,8 +79,7 @@ func (u *acornFoxUpgrade) capture(ctx context.Context, s *TaskAcornFoxRepoStore,
 		return image, e
 	}
 	if len(runtime.SetupToken) == 0 {
-		installed, parseErr := ParseAcornFoxCandidateBindingV1(binding, j.BindingSHA256)
-		if parseErr != nil || installed.binding.MigrationVersion != "0034" {
+		if installed.binding.MigrationVersion != "0034" {
 			return image, ErrAcornFoxUpgradeConflict
 		}
 	}
@@ -75,10 +91,208 @@ func (u *acornFoxUpgrade) capture(ctx context.Context, s *TaskAcornFoxRepoStore,
 	if e != nil || receipt != runtime.receipt(acornFoxUpgradeJSON(runtime)) {
 		return image, ErrAcornFoxUpgradeConflict
 	}
-	image = acornFoxUpgradeImage{Binding: append([]byte(nil), binding...), Substrate: sub.receipt, Repo: j, Live: live, Activation: a, ControlPlane: cp, Runtime: runtime}
+	var privateDatabaseEnv []byte
+	if installed.binding.MigrationVersion == AcornFoxLegacyPredecessorMigration {
+		privateDatabaseEnv = bytes.Clone(databaseEnv)
+	}
+	image = acornFoxUpgradeImage{Binding: append([]byte(nil), binding...), Substrate: sub.receipt, Repo: j, Live: live, Activation: a, ControlPlane: cp, DatabaseEnv: privateDatabaseEnv, Runtime: runtime}
 	return image, image.validate(u.layout, false)
 }
-func (u *acornFoxUpgrade) nextImage(old acornFoxUpgradeImage, set *acornFoxCandidateSet, sub *PublishedAcornFoxSubstrateV1) (acornFoxUpgradeImage, error) {
+
+func (u *acornFoxUpgrade) captureRecent0039(ctx context.Context, s *TaskAcornFoxRepoStore, binding []byte, installed AcornFoxCandidateBindingV1, repo AcornFoxRepoJournalV1) (acornFoxUpgradeImage, error) {
+	var image acornFoxUpgradeImage
+	if ctx == nil || ctx.Err() != nil || !validSHA(u.hostProvisionSHA256) || validateAcornFoxRecent0039Binding(installed) != nil || u.layout.validate() != nil {
+		return image, ErrAcornFoxUpgradeConflict
+	}
+	substrateRaw, err := u.read(s.root, acornFoxSubstrateReceipt, 0600, acornFoxUpgradeMaxJournal)
+	if err != nil {
+		return image, err
+	}
+	substrate, err := parseAcornFoxRecent0039SubstrateReceipt(substrateRaw, installed, repo.BindingSHA256)
+	if err != nil {
+		return image, ErrAcornFoxUpgradeConflict
+	}
+	liveRaw, err := u.read(s.root, "live-receipt.json", 0600, acornFoxUpgradeMaxJournal)
+	if err != nil {
+		return image, err
+	}
+	var live AcornFoxLiveReceiptV1
+	if strictCanonicalJSON(liveRaw, &live, "AcornFox 0039 live receipt") != nil || validateAcornFoxRecent0039LiveReceiptForLayout(u.layout, substrate, installed, repo.BindingSHA256, live) != nil {
+		return image, ErrAcornFoxUpgradeConflict
+	}
+	activationID, err := AcornFoxRepoActivationID(repo.BindingSHA256)
+	if err != nil {
+		return image, ErrAcornFoxUpgradeConflict
+	}
+	activationRaw, err := u.read(s.hostRoot, u.layout.activationReceiptPath(activationID), 0600, acornFoxUpgradeMaxJournal)
+	if err != nil {
+		return image, err
+	}
+	activation, err := ParseAcornFoxRepoActivationV1(activationRaw)
+	if err != nil {
+		return image, ErrAcornFoxUpgradeConflict
+	}
+	controlRaw, err := u.read(s.root, acornFoxControlPlaneReceipt, 0600, acornFoxUpgradeMaxJournal)
+	if err != nil {
+		return image, err
+	}
+	control, err := parseAcornFoxControlPlaneMigrationReceiptForUpgrade(controlRaw, acornFoxRecentPredecessorMigration)
+	if err != nil {
+		return image, err
+	}
+	databaseEnv, err := u.read(s.root, acornFoxControlPlaneStateEnv, 0600, acornFoxUpgradeMaxJournal)
+	if err != nil || !validAcornFoxBoundControlPlaneEnvironment(databaseEnv, control, acornFoxControlPlaneDatabase) {
+		return image, ErrAcornFoxUpgradeConflict
+	}
+	runtimeRaw, err := u.read(s.root, acornFoxRuntimeIntentName, 0600, acornFoxRuntimeMaxIntent)
+	if err != nil {
+		return image, err
+	}
+	runtime, err := parseAcornFoxRuntimeIntentForUpgrade(runtimeRaw)
+	if err != nil || runtime.validate() != nil {
+		return image, ErrAcornFoxUpgradeConflict
+	}
+	receiptRaw, err := u.read(s.root, acornFoxRuntimeReceiptName, 0600, acornFoxRuntimeMaxIntent)
+	if err != nil {
+		return image, err
+	}
+	receipt, err := ParseAcornFoxRuntimeConfigReceiptV1(receiptRaw)
+	if err != nil || receipt != runtime.receipt(acornFoxUpgradeJSON(runtime)) {
+		return image, ErrAcornFoxUpgradeConflict
+	}
+	image = acornFoxUpgradeImage{Binding: bytes.Clone(binding), Substrate: substrate, Repo: repo, Live: live, Activation: activation, ControlPlane: control, DatabaseEnv: bytes.Clone(databaseEnv), Runtime: runtime}
+	if err := validateAcornFoxRecent0039UpgradeImage(image, u.layout); err != nil {
+		return acornFoxUpgradeImage{}, err
+	}
+	if err := u.verifyRecent0039HostScope(s, image); err != nil {
+		return acornFoxUpgradeImage{}, err
+	}
+	return image, nil
+}
+
+func (u *acornFoxUpgrade) verifyRecent0039HostScope(s *TaskAcornFoxRepoStore, image acornFoxUpgradeImage) error {
+	if s == nil || !s.ownsLock() || validateAcornFoxRecent0039UpgradeImage(image, u.layout) != nil {
+		return ErrAcornFoxUpgradeConflict
+	}
+	entries, err := acornFoxRecent0039ExpectedEntries(u.layout, image.Substrate)
+	if err != nil {
+		return err
+	}
+	runtimeEntries, err := acornFoxRuntimeInspectWithTokenPolicy(s.hostRoot, s, image.Runtime, acornFoxUpgradeJSON(image.Runtime), true, true)
+	if err != nil {
+		return ErrAcornFoxUpgradeConflict
+	}
+	entries = append(entries, runtimeEntries...)
+	assistantEntries, err := acornFoxAssistantConfigScopeExpected(s.hostRoot, s, acornFoxAssistantLegacy0039Config())
+	if err != nil {
+		return ErrAcornFoxUpgradeConflict
+	}
+	entries = append(entries, assistantEntries...)
+	want := make(map[string]SubstrateEntry, len(entries))
+	for _, entry := range entries {
+		if _, exists := want[entry.Path]; exists {
+			return ErrAcornFoxUpgradeConflict
+		}
+		want[entry.Path] = entry
+	}
+	for _, parent := range []string{"opt", "etc", "var", "var/lib", "var/log", "etc/systemd", "etc/systemd/system"} {
+		if !acornFoxSharedParentSafe(s.hostRoot, s, parent) {
+			return ErrAcornFoxUpgradeConflict
+		}
+	}
+	seen := make(map[string]bool, len(want))
+	activationRaw := acornFoxUpgradeJSON(image.Activation)
+	for _, managed := range acornFoxProductionManagedRoots() {
+		if managed == "opt/acornfox" {
+			if err := acornFoxValidateProductionAcornFoxTree(s.hostRoot, s, want, seen, image.Activation, activationRaw, acornFoxRepoPrefixCurrent); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := acornFoxValidateProductionTreeWithRuntime(s.hostRoot, s, managed, want, seen, true); err != nil {
+			return err
+		}
+	}
+	if err := acornFoxValidateProductionSystemdWithBootLinks(s.hostRoot, s, want, seen, true); err != nil {
+		return err
+	}
+	for path := range want {
+		if acornFoxProductionStateChild(path) || acornFoxProductionSharedParent(path) {
+			continue
+		}
+		if !seen[path] {
+			return ErrAcornFoxUpgradeConflict
+		}
+	}
+	return nil
+}
+
+func (u *acornFoxUpgrade) captureLegacy0034(ctx context.Context, s *TaskAcornFoxRepoStore, binding []byte, installed AcornFoxCandidateBindingV1, repo AcornFoxRepoJournalV1) (acornFoxUpgradeImage, error) {
+	var image acornFoxUpgradeImage
+	if ctx == nil || ctx.Err() != nil || !validSHA(u.hostProvisionSHA256) || validateAcornFoxLegacyPredecessorBinding(installed) != nil {
+		return image, ErrAcornFoxUpgradeConflict
+	}
+	substrateRaw, err := u.read(s.root, acornFoxSubstrateReceipt, 0600, acornFoxUpgradeMaxJournal)
+	if err != nil {
+		return image, err
+	}
+	substrate, err := parseAcornFoxLegacy0034SubstrateReceipt(substrateRaw, installed, repo.BindingSHA256)
+	if err != nil {
+		return image, ErrAcornFoxUpgradeConflict
+	}
+	liveRaw, err := u.read(s.root, "live-receipt.json", 0600, acornFoxUpgradeMaxJournal)
+	if err != nil {
+		return image, err
+	}
+	var live AcornFoxLiveReceiptV1
+	legacyLayout, layoutErr := acornFoxLegacy0034LayoutFromCurrent(u.layout)
+	if strictCanonicalJSON(liveRaw, &live, "AcornFox legacy 0034 live receipt") != nil || layoutErr != nil || validateAcornFoxLegacy0034LiveReceiptForLayout(legacyLayout, substrate, installed, repo.BindingSHA256, live) != nil {
+		return image, ErrAcornFoxUpgradeConflict
+	}
+	activationID, err := AcornFoxRepoActivationID(repo.BindingSHA256)
+	if err != nil {
+		return image, ErrAcornFoxUpgradeConflict
+	}
+	activationRaw, err := u.read(s.hostRoot, u.layout.activationReceiptPath(activationID), 0600, acornFoxUpgradeMaxJournal)
+	if err != nil {
+		return image, err
+	}
+	activation, err := ParseAcornFoxRepoActivationV1(activationRaw)
+	if err != nil {
+		return image, ErrAcornFoxUpgradeConflict
+	}
+	controlRaw, err := u.read(s.root, acornFoxControlPlaneReceipt, 0600, acornFoxUpgradeMaxJournal)
+	if err != nil {
+		return image, err
+	}
+	control, err := parseAcornFoxControlPlaneMigrationReceiptForUpgrade(controlRaw, AcornFoxLegacyPredecessorMigration)
+	if err != nil {
+		return image, err
+	}
+	databaseEnv, err := u.read(s.root, acornFoxControlPlaneStateEnv, 0600, acornFoxUpgradeMaxJournal)
+	if err != nil || !validAcornFoxBoundControlPlaneEnvironment(databaseEnv, control, acornFoxControlPlaneDatabase) {
+		return image, ErrAcornFoxUpgradeConflict
+	}
+	runtimeRaw, err := u.read(s.root, acornFoxRuntimeIntentName, 0600, acornFoxRuntimeMaxIntent)
+	if err != nil {
+		return image, err
+	}
+	runtime, err := parseAcornFoxRuntimeIntentForUpgrade(runtimeRaw)
+	if err != nil || len(runtime.SetupToken) != 0 {
+		return image, ErrAcornFoxUpgradeConflict
+	}
+	receiptRaw, err := u.read(s.root, acornFoxRuntimeReceiptName, 0600, acornFoxRuntimeMaxIntent)
+	if err != nil {
+		return image, err
+	}
+	receipt, err := ParseAcornFoxRuntimeConfigReceiptV1(receiptRaw)
+	if err != nil || receipt != runtime.receipt(acornFoxUpgradeJSON(runtime)) {
+		return image, ErrAcornFoxUpgradeConflict
+	}
+	image = acornFoxUpgradeImage{Binding: bytes.Clone(binding), Substrate: substrate, Repo: repo, Live: live, Activation: activation, ControlPlane: control, DatabaseEnv: bytes.Clone(databaseEnv), Runtime: runtime}
+	return image, validateAcornFoxLegacy0034UpgradeImage(image, u.layout)
+}
+func (u *acornFoxUpgrade) nextImage(old acornFoxUpgradeImage, set *acornFoxCandidateSet, sub *PublishedAcornFoxSubstrateV1, database *acornFoxUpgradeDatabasePrivate, migrations acornFoxControlPlaneMigrations) (acornFoxUpgradeImage, error) {
 	var i acornFoxUpgradeImage
 	j, e := newAcornFoxRepoJournalForLayout(u.layout, set.bindingSHA256, sha256Hex(acornFoxUpgradeJSON(sub.receipt)))
 	if e != nil {
@@ -125,6 +339,17 @@ func (u *acornFoxUpgrade) nextImage(old acornFoxUpgradeImage, set *acornFoxCandi
 	}
 	cp := old.ControlPlane
 	cp.BindingSHA256, cp.ReleaseID, cp.SourceCommit = set.bindingSHA256, set.binding.binding.ReleaseID, set.binding.binding.SourceCommit
+	var databaseEnv []byte
+	if database != nil {
+		if database.Evidence.validate() != nil || !migrations.valid() || database.Evidence.State != acornFoxUpgradeDatabasePrefixVerified {
+			return i, ErrAcornFoxUpgradeConflict
+		}
+		databaseEnv = database.candidateEnvironmentBytes()
+		cp.MigrationVersion = AcornFoxV1MigrationVersion
+		cp.MigrationRowsSHA256 = acornFoxMigrationRowsSHA256(migrations.rows)
+		cp.DatabaseEnvSHA256 = sha256Bytes(databaseEnv)
+		cp.DatabaseIdentitySHA256 = acornFoxControlPlaneIdentitySHA256ForDatabase(database.Evidence.ShadowDatabase)
+	}
 	setupToken := old.Runtime.SetupToken
 	if len(setupToken) == 0 {
 		if u.random == nil {
@@ -139,10 +364,13 @@ func (u *acornFoxUpgrade) nextImage(old acornFoxUpgradeImage, set *acornFoxCandi
 	if e != nil {
 		return i, e
 	}
-	i = acornFoxUpgradeImage{Binding: append([]byte(nil), set.bindingRaw...), Substrate: sub.receipt, Repo: j, Live: live, Activation: a, ControlPlane: cp, Runtime: runtime}
+	i = acornFoxUpgradeImage{Binding: append([]byte(nil), set.bindingRaw...), Substrate: sub.receipt, Repo: j, Live: live, Activation: a, ControlPlane: cp, DatabaseEnv: databaseEnv, Runtime: runtime}
 	return i, i.validate(u.layout, true)
 }
 func (u *acornFoxUpgrade) phase(s *TaskAcornFoxRepoStore, j *acornFoxUpgradeJournal, phase string) error {
+	if j.CrossSchema != nil && !validAcornFoxCrossSchemaPhaseTransition(j.Phase, phase) {
+		return ErrAcornFoxUpgradeConflict
+	}
 	j.Phase = phase
 	if e := u.save(s, *j, false); e != nil {
 		return e
@@ -154,7 +382,32 @@ type acornFoxUpgradePIState interface {
 	PIEnabled(context.Context) (bool, error)
 }
 
-func (u *acornFoxUpgrade) capturePIEnabled(ctx context.Context, store *TaskAcornFoxRepoStore) (bool, error) {
+type acornFoxUpgradeLegacyPIState interface {
+	PILegacyAbsent(context.Context) (bool, error)
+}
+
+func (u *acornFoxUpgrade) capturePIEnabled(ctx context.Context, store *TaskAcornFoxRepoStore, migration string) (bool, error) {
+	if migration == AcornFoxLegacyPredecessorMigration {
+		configured, err := acornFoxAssistantConfigurationState(store.hostRoot, store)
+		if err != nil || configured {
+			return false, ErrAcornFoxUpgradeConflict
+		}
+		services, ok := u.services.(acornFoxUpgradeLegacyPIState)
+		if !ok {
+			return false, nil
+		}
+		absent, err := services.PILegacyAbsent(ctx)
+		if err != nil {
+			return false, err
+		}
+		if !absent {
+			return false, ErrAcornFoxUpgradeConflict
+		}
+		return false, nil
+	}
+	if migration != acornFoxRecentPredecessorMigration && migration != AcornFoxV1MigrationVersion {
+		return false, ErrAcornFoxUpgradeConflict
+	}
 	services, ok := u.services.(acornFoxUpgradePIState)
 	if !ok {
 		// Package-local test fakes written before optional PI support remain
@@ -166,6 +419,9 @@ func (u *acornFoxUpgrade) capturePIEnabled(ctx context.Context, store *TaskAcorn
 		return false, err
 	}
 	configured, err := acornFoxAssistantConfigurationState(store.hostRoot, store)
+	if migration == acornFoxRecentPredecessorMigration {
+		configured, err = acornFoxAssistantLegacy0039ConfigurationState(store.hostRoot, store)
+	}
 	if err != nil {
 		return false, ErrAcornFoxUpgradeConflict
 	}
@@ -231,6 +487,41 @@ func (u *acornFoxUpgrade) forward(ctx context.Context, s *TaskAcornFoxRepoStore,
 	if e := u.fault("services-stopped"); e != nil {
 		return e
 	}
+	if j.CrossSchema != nil {
+		if u.activeDatabase == nil {
+			return ErrAcornFoxUpgradeUnknown
+		}
+		if e := u.phase(s, j, "QUIESCED"); e != nil {
+			return e
+		}
+		snapshot, e := u.activeDatabase.Snapshot(ctx, &j.CrossSchema.Database)
+		if e != nil {
+			return e
+		}
+		j.CrossSchema.Database = snapshot
+		if e := u.phase(s, j, "SNAPSHOT_CREATED"); e != nil {
+			return e
+		}
+		migrated, e := u.activeDatabase.RestoreMigrate(ctx, snapshot)
+		if e != nil {
+			return e
+		}
+		if !bytes.Equal(migrated.candidateEnvironmentBytes(), j.Next.DatabaseEnv) {
+			return ErrAcornFoxUpgradeConflict
+		}
+		j.CrossSchema.Database = migrated.Evidence
+		if e := u.phase(s, j, "MIGRATED"); e != nil {
+			return e
+		}
+		validated, e := u.activeDatabase.Validate(ctx, migrated)
+		if e != nil {
+			return e
+		}
+		j.CrossSchema.Database = validated.Evidence
+		if e := u.phase(s, j, "VALIDATED"); e != nil {
+			return e
+		}
+	}
 	if e := u.copyNextSubstrate(s, *j); e != nil {
 		return e
 	}
@@ -239,6 +530,20 @@ func (u *acornFoxUpgrade) forward(ctx context.Context, s *TaskAcornFoxRepoStore,
 	}
 	if e := u.applySetupCredential(s, *j, true); e != nil {
 		return e
+	}
+	if e := applyAcornFoxUpgradeAssistantConfig(s, *j, true); e != nil {
+		return e
+	}
+	if e := u.ensureLegacyPIDisabled(ctx, *j); e != nil {
+		return e
+	}
+	if j.CrossSchema != nil {
+		if u.candidateHealth == nil || u.candidateHealth(ctx, s, j.Next) != nil {
+			return ErrAcornFoxUpgradeUnknown
+		}
+		if e := u.fault("candidate-healthy"); e != nil {
+			return e
+		}
 	}
 	if e := u.fault("setup-credential-published"); e != nil {
 		return e
@@ -297,6 +602,15 @@ func (u *acornFoxUpgrade) restore(ctx context.Context, s *TaskAcornFoxRepoStore,
 	if err = u.applySetupCredential(s, *j, false); err != nil {
 		return err
 	}
+	if err = applyAcornFoxUpgradeAssistantConfig(s, *j, false); err != nil {
+		return err
+	}
+	if err = u.ensureLegacyPIDisabled(ctx, *j); err != nil {
+		return err
+	}
+	if err = u.removeCrossSchemaDatabaseArtifacts(s, *j); err != nil {
+		return err
+	}
 	if err = u.switchSubstrate(s, *j, false); err != nil {
 		return err
 	}
@@ -304,6 +618,30 @@ func (u *acornFoxUpgrade) restore(ctx context.Context, s *TaskAcornFoxRepoStore,
 		return err
 	}
 	return u.verifyImage(s, *j, false)
+}
+
+func (u *acornFoxUpgrade) ensureLegacyPIDisabled(ctx context.Context, journal acornFoxUpgradeJournal) error {
+	if journal.CrossSchema == nil || journal.CrossSchema.OldMigrationVersion != AcornFoxLegacyPredecessorMigration {
+		return nil
+	}
+	if err := u.services.Run(ctx, "daemon-reload", ""); err != nil {
+		return err
+	}
+	if err := u.services.Run(ctx, "disable", "acornfox-pi-worker.service"); err != nil {
+		return err
+	}
+	state, ok := u.services.(acornFoxUpgradePIState)
+	if !ok {
+		return ErrAcornFoxUpgradeConflict
+	}
+	enabled, err := state.PIEnabled(ctx)
+	if err != nil {
+		return err
+	}
+	if enabled {
+		return ErrAcornFoxUpgradeConflict
+	}
+	return nil
 }
 
 func (u *acornFoxUpgrade) applySetupCredential(s *TaskAcornFoxRepoStore, j acornFoxUpgradeJournal, next bool) error {
@@ -389,6 +727,16 @@ func (u *acornFoxUpgrade) verifyImage(s *TaskAcornFoxRepoStore, j acornFoxUpgrad
 	// Observe every role and file at its real production path; the task artifact
 	// is never accepted as a substitute for host materialization.
 	entries, e := acornFoxLiveExpectedEntriesForLayout(u.layout, sub)
+	if j.CrossSchema != nil && !next {
+		switch image.Substrate.CandidateReceipt.MigrationVersion {
+		case AcornFoxLegacyPredecessorMigration:
+			entries, e = acornFoxLegacy0034ExpectedEntries(u.layout, image.Substrate)
+		case acornFoxRecentPredecessorMigration:
+			entries, e = acornFoxRecent0039ExpectedEntries(u.layout, image.Substrate)
+		default:
+			return ErrAcornFoxUpgradeConflict
+		}
+	}
 	if e != nil {
 		return e
 	}
@@ -400,7 +748,10 @@ func (u *acornFoxUpgrade) verifyImage(s *TaskAcornFoxRepoStore, j acornFoxUpgrad
 			return ErrAcornFoxUpgradeConflict
 		}
 	}
-	return u.verifyRetainedScope(s, j, image)
+	if err := u.verifyRetainedScope(s, j, image); err != nil {
+		return err
+	}
+	return verifyAcornFoxUpgradeAssistantConfig(s, j, next)
 }
 
 // acornFoxUpgradeRetainedScope is the Current-scope integration point. It
@@ -459,13 +810,31 @@ func (u *acornFoxUpgrade) verifyRetainedScope(s *TaskAcornFoxRepoStore, j acornF
 		path := u.layout.activationReceiptPath(image.Activation.ActivationID)
 		files[path] = acornFoxUpgradeJSON(image.Activation)
 		modes[path] = 0600
-		env, e := u.read(s.root, acornFoxControlPlaneStateEnv, 0600, 16384)
-		if e != nil || sha256Hex(env) != image.ControlPlane.DatabaseEnvSHA256 {
+		env := bytes.Clone(image.DatabaseEnv)
+		if len(env) == 0 {
+			var readErr error
+			env, readErr = u.read(s.root, acornFoxControlPlaneStateEnv, 0600, 16384)
+			if readErr != nil {
+				return ErrAcornFoxUpgradeConflict
+			}
+		}
+		database, databaseErr := acornFoxControlPlaneDatabaseName(env)
+		if databaseErr != nil || !validAcornFoxBoundControlPlaneEnvironment(env, image.ControlPlane, database) {
 			return ErrAcornFoxUpgradeConflict
 		}
 		files[dir+"/database.env"] = env
 		modes[dir+"/database.env"] = 0600
 		pointers[u.layout.activationReleasePath(image.Activation.ActivationID)] = "../../releases/" + image.Activation.ReleaseID
+	}
+	if j.CrossSchema != nil && current.Repo.BindingSHA256 == j.Old.Repo.BindingSHA256 {
+		// Cross-schema host provisioning and candidate publication intentionally
+		// retain only exact candidate additions (PI/runtime units and data roots)
+		// after rollback. Existing predecessor paths keep predecessor bytes.
+		for _, entry := range j.Next.Substrate.Entries {
+			if _, exists := entries[entry.Path]; !exists {
+				entries[entry.Path] = entry
+			}
+		}
 	}
 	pointers[u.layout.activePath()] = "activations/" + current.Activation.ActivationID
 	pointers[u.layout.currentPath()] = "active/release"
@@ -480,7 +849,14 @@ func (u *acornFoxUpgrade) verifyRetainedScope(s *TaskAcornFoxRepoStore, j acornF
 		files[acornFoxSetupCredentialPath] = current.Runtime.SetupToken
 		modes[acornFoxSetupCredentialPath] = 0600
 	}
+	if len(current.DatabaseEnv) != 0 {
+		files["var/lib/acornfox/install/"+acornFoxControlPlaneStateEnv] = current.DatabaseEnv
+		modes["var/lib/acornfox/install/"+acornFoxControlPlaneStateEnv] = 0600
+	}
 	assistant, e := acornFoxAssistantConfigScope(s.hostRoot, s)
+	if j.CrossSchema != nil && current.Repo.BindingSHA256 == j.Old.Repo.BindingSHA256 && j.CrossSchema.OldMigrationVersion == acornFoxRecentPredecessorMigration {
+		assistant, e = acornFoxAssistantConfigScopeExpected(s.hostRoot, s, acornFoxAssistantLegacy0039Config())
+	}
 	if e != nil {
 		return ErrAcornFoxUpgradeConflict
 	}
@@ -598,11 +974,15 @@ func (u *acornFoxUpgrade) verifyPrivateStore(s *TaskAcornFoxRepoStore, j acornFo
 	if e != nil {
 		return e
 	}
-	if len(children) != 3 {
+	wantChildren := 3
+	if j.CrossSchema != nil && current.Repo.BindingSHA256 == j.Next.Repo.BindingSHA256 {
+		wantChildren = 4
+	}
+	if len(children) != wantChildren {
 		return ErrAcornFoxUpgradeConflict
 	}
 	for _, child := range children {
-		if child.Name() != "journal.json" && child.Name() != "old-state" && child.Name() != "new-state" {
+		if child.Name() != "journal.json" && child.Name() != "old-state" && child.Name() != "new-state" && !(wantChildren == 4 && child.Name() == acornFoxUpgradeDatabaseRoot) {
 			return ErrAcornFoxUpgradeConflict
 		}
 	}
@@ -641,6 +1021,147 @@ func (u *acornFoxUpgrade) verifyPrivateStore(s *TaskAcornFoxRepoStore, j acornFo
 			return e
 		}
 		h.Close()
+	}
+	if j.CrossSchema == nil || current.Repo.BindingSHA256 == j.Old.Repo.BindingSHA256 {
+		return nil
+	}
+	return u.verifyCrossSchemaDatabaseArtifacts(s, *j.CrossSchema)
+}
+
+func acornFoxCrossSchemaArtifactID(c acornFoxCrossSchemaUpgradeV1) (string, error) {
+	if c.Database.validate() != nil || !validSHA(c.Database.RecoveryEvidenceSHA256) {
+		return "", ErrAcornFoxUpgradeConflict
+	}
+	return "cross-schema-" + c.Database.RecoveryEvidenceSHA256[:20], nil
+}
+
+var acornFoxUpgradeDatabaseDurableTemp = regexp.MustCompile(`^\.open-card-file-[a-f0-9]{32}$`)
+
+func (u *acornFoxUpgrade) verifyCrossSchemaDatabaseArtifacts(s *TaskAcornFoxRepoStore, cross acornFoxCrossSchemaUpgradeV1) error {
+	artifactID, err := acornFoxCrossSchemaArtifactID(cross)
+	if err != nil || cross.Database.State != acornFoxUpgradeDatabaseHealthValidated {
+		return ErrAcornFoxUpgradeConflict
+	}
+	base := acornFoxUpgradeDirectory + "/" + acornFoxUpgradeDatabaseRoot
+	artifact := base + "/" + artifactID
+	for _, path := range []string{base, artifact} {
+		info, statErr := s.root.Lstat(path)
+		if statErr != nil || !safeAcornFoxRepoDir(info, s.uid, s.gid) {
+			return ErrAcornFoxUpgradeConflict
+		}
+	}
+	baseDir, err := s.root.OpenFile(base, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return ErrAcornFoxUpgradeConflict
+	}
+	baseChildren, readErr := baseDir.ReadDir(-1)
+	closeErr := baseDir.Close()
+	if readErr != nil || closeErr != nil || len(baseChildren) != 1 || baseChildren[0].Name() != artifactID {
+		return ErrAcornFoxUpgradeConflict
+	}
+	artifactDir, err := s.root.OpenFile(artifact, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return ErrAcornFoxUpgradeConflict
+	}
+	children, readErr := artifactDir.ReadDir(-1)
+	closeErr = artifactDir.Close()
+	want := map[string]bool{acornFoxUpgradeDatabaseDump: true, acornFoxUpgradeDatabaseSnapshot: true, acornFoxUpgradeDatabaseShadowIntent: true, acornFoxUpgradeDatabaseMigrated: true, acornFoxUpgradeDatabaseValidated: true}
+	if readErr != nil || closeErr != nil || len(children) != len(want) {
+		return ErrAcornFoxUpgradeConflict
+	}
+	for _, child := range children {
+		if !want[child.Name()] {
+			return ErrAcornFoxUpgradeConflict
+		}
+	}
+	dump, err := snapshotEvidence(filepath.Join(s.layout.stateRootPath, artifact, acornFoxUpgradeDatabaseDump))
+	if err != nil || dump.SHA256 != cross.Database.SnapshotSHA256 || dump.Size != cross.Database.SnapshotSize {
+		return ErrAcornFoxUpgradeConflict
+	}
+	snapshot := cross.Database
+	snapshot.State = acornFoxUpgradeDatabaseSnapshotCreated
+	snapshot.CandidateRowsSHA256 = ""
+	migrated := cross.Database
+	migrated.State = acornFoxUpgradeDatabaseMigrationsDone
+	for name, expected := range map[string]acornFoxUpgradeDatabaseEvidence{acornFoxUpgradeDatabaseSnapshot: snapshot, acornFoxUpgradeDatabaseShadowIntent: snapshot, acornFoxUpgradeDatabaseMigrated: migrated, acornFoxUpgradeDatabaseValidated: cross.Database} {
+		raw, readErr := u.read(s.root, artifact+"/"+name, 0600, acornFoxUpgradeMaxJournal)
+		if readErr != nil || !bytes.Equal(raw, acornFoxUpgradeJSON(expected)) {
+			return ErrAcornFoxUpgradeConflict
+		}
+	}
+	return nil
+}
+
+func (u *acornFoxUpgrade) removeCrossSchemaDatabaseArtifacts(s *TaskAcornFoxRepoStore, j acornFoxUpgradeJournal) error {
+	if j.CrossSchema == nil {
+		return nil
+	}
+	artifactID, err := acornFoxCrossSchemaArtifactID(*j.CrossSchema)
+	if err != nil {
+		return err
+	}
+	base := acornFoxUpgradeDirectory + "/" + acornFoxUpgradeDatabaseRoot
+	baseInfo, err := s.root.Lstat(base)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil || !safeAcornFoxRepoDir(baseInfo, s.uid, s.gid) {
+		return ErrAcornFoxUpgradeConflict
+	}
+	baseDir, err := s.root.OpenFile(base, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return ErrAcornFoxUpgradeConflict
+	}
+	baseChildren, readErr := baseDir.ReadDir(-1)
+	closeErr := baseDir.Close()
+	if readErr != nil || closeErr != nil || len(baseChildren) > 1 || len(baseChildren) == 1 && baseChildren[0].Name() != artifactID {
+		return ErrAcornFoxUpgradeConflict
+	}
+	if len(baseChildren) == 1 {
+		artifact := base + "/" + artifactID
+		info, statErr := s.root.Lstat(artifact)
+		if statErr != nil || !safeAcornFoxRepoDir(info, s.uid, s.gid) {
+			return ErrAcornFoxUpgradeConflict
+		}
+		dir, openErr := s.root.OpenFile(artifact, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+		if openErr != nil {
+			return ErrAcornFoxUpgradeConflict
+		}
+		children, listErr := dir.ReadDir(-1)
+		closeErr = dir.Close()
+		allowed := map[string]bool{acornFoxUpgradeDatabaseDump: true, acornFoxUpgradeDatabaseSnapshot: true, acornFoxUpgradeDatabaseShadowIntent: true, acornFoxUpgradeDatabaseMigrated: true, acornFoxUpgradeDatabaseValidated: true}
+		if listErr != nil || closeErr != nil || len(children) > len(allowed)*2 {
+			return ErrAcornFoxUpgradeConflict
+		}
+		for _, child := range children {
+			if allowed[child.Name()] {
+				continue
+			}
+			if !acornFoxUpgradeDatabaseDurableTemp.MatchString(child.Name()) {
+				return ErrAcornFoxUpgradeConflict
+			}
+			childPath := artifact + "/" + child.Name()
+			childInfo, statErr := s.root.Lstat(childPath)
+			if statErr != nil || !childInfo.Mode().IsRegular() || childInfo.Mode().Perm() != 0600 || (acornFoxRepoNlink(childInfo) != 1 && acornFoxRepoNlink(childInfo) != 2) || verifyOwner(childInfo, s.uid, s.gid) != nil || s.root.Remove(childPath) != nil {
+				return ErrAcornFoxUpgradeConflict
+			}
+		}
+		for _, child := range children {
+			if !allowed[child.Name()] {
+				continue
+			}
+			childPath := artifact + "/" + child.Name()
+			childInfo, statErr := s.root.Lstat(childPath)
+			if statErr != nil || !childInfo.Mode().IsRegular() || childInfo.Mode().Perm()&0022 != 0 || acornFoxRepoNlink(childInfo) != 1 || verifyOwner(childInfo, s.uid, s.gid) != nil || s.root.Remove(childPath) != nil {
+				return ErrAcornFoxUpgradeConflict
+			}
+		}
+		if s.root.Remove(artifact) != nil {
+			return ErrAcornFoxUpgradeUnknown
+		}
+	}
+	if s.root.Remove(base) != nil || acornFoxLiveSyncDir(s.root, acornFoxUpgradeDirectory) != nil {
+		return ErrAcornFoxUpgradeUnknown
 	}
 	return nil
 }

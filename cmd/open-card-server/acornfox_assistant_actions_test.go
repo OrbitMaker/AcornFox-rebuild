@@ -147,3 +147,48 @@ func TestAssistantToolPreparesScopedCardWithoutExecuting(t *testing.T) {
 		t.Fatal("application diagnosis cannot read its host resource facts")
 	}
 }
+
+func TestAssistantCurrentActionFactsReplaceStaleProposalText(t *testing.T) {
+	actor := assistant.Actor{AdminID: "admin_http"}
+	executor := &actionHTTPExecutor{}
+	service, err := assistantactions.NewService(assistantactions.Config{Store: assistantactions.NewMemoryStore(), Resolver: actionHTTPResolver{assistantactions.Target{ApplicationID: "app_http", DeploymentID: "dep_http", ReleaseID: "release_http", ReleaseVersion: 1, ApplicationName: "HTTP App"}}, Executor: executor, Verifier: actionCurrentFactsVerifier{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, err := service.PrepareProposal(context.Background(), actor, "session_http", "run_http", assistantactions.PrepareInput{Action: assistantactions.ActionRestart, ApplicationID: "app_http", DeploymentID: "dep_http"}, "read-fresh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = service.Decide(context.Background(), actor, "session_http", original.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	grant := assistanttools.Grant{Actor: "admin_http", SessionID: "session_http", Scope: assistanttools.Scope{ApplicationID: "app_http"}}
+	got := assistantCurrentActionFacts(context.Background(), service, grant, "app_http")
+	if !got.OK || !strings.Contains(string(got.Result), `"state":"verified"`) || !strings.Contains(string(got.Result), `"operation_id":"operation_http"`) || executor.calls != 1 {
+		t.Fatalf("fresh facts=%s executions=%d", got.Result, executor.calls)
+	}
+	grant.SessionID = "other_session"
+	other := assistantCurrentActionFacts(context.Background(), service, grant, "app_http")
+	if other.OK && strings.Contains(string(other.Result), original.ID.String()) {
+		t.Fatal("other session leaked proposal")
+	}
+	grant.SessionID = "session_http"
+	grant.Actor = "other_admin"
+	other = assistantCurrentActionFacts(context.Background(), service, grant, "app_http")
+	if other.OK && strings.Contains(string(other.Result), original.ID.String()) {
+		t.Fatal("other administrator leaked proposal")
+	}
+	if assistantCurrentActionFacts(context.Background(), service, grant, "other_app").Code != "forbidden" {
+		t.Fatal("scope mismatch accepted")
+	}
+	if !assistantToolArguments("acornfox_operation_result", map[string]string{"application_id": "app_http"}) || assistantToolArguments("acornfox_operation_result", map[string]string{"application_id": "app_http", "operation_id": ""}) {
+		t.Fatal("optional exact operation validation is inconsistent")
+	}
+}
+
+type actionCurrentFactsVerifier struct{}
+
+func (actionCurrentFactsVerifier) Verify(context.Context, assistantactions.Action, assistantactions.Target, domain.ID) (assistantactions.Verification, error) {
+	now := time.Now().UTC()
+	return assistantactions.Verification{State: assistantactions.VerificationVerified, Verdict: "observed", ObservedAt: &now}, nil
+}

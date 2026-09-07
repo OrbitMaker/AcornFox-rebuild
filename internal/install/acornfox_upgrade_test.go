@@ -242,6 +242,20 @@ func TestParseAcornFoxPIServiceStateRejectsInconsistency(t *testing.T) {
 	}
 }
 
+func TestAcornFoxLegacyUpgradeExplicitlyDisablesPI(t *testing.T) {
+	journal := acornFoxUpgradeJournal{CrossSchema: &acornFoxCrossSchemaUpgradeV1{OldMigrationVersion: AcornFoxLegacyPredecessorMigration}}
+	base := &acornFoxUpgradeServiceFake{}
+	services := &acornFoxUpgradePIServiceFake{acornFoxUpgradeServiceFake: base}
+	u := &acornFoxUpgrade{services: services}
+	if err := u.ensureLegacyPIDisabled(context.Background(), journal); err != nil || services.queries != 1 || !reflect.DeepEqual(base.calls, []string{"daemon-reload ", "disable acornfox-pi-worker.service"}) {
+		t.Fatalf("err=%v queries=%d calls=%q", err, services.queries, base.calls)
+	}
+	services.enabled = true
+	if err := u.ensureLegacyPIDisabled(context.Background(), journal); !errors.Is(err, ErrAcornFoxUpgradeConflict) {
+		t.Fatalf("enabled PI err=%v", err)
+	}
+}
+
 // upgradeLegacyRuntimeFixture models the completed 0034 runtime state before
 // setup_token existed. It is intentionally constructed only in upgrade tests;
 // normal runtime parsing continues to reject this old schema.

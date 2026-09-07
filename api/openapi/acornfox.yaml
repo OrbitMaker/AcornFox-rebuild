@@ -250,6 +250,72 @@ paths:
         '401': {$ref: '#/components/responses/AuthenticationFailed'}
         '404': {$ref: '#/components/responses/NotFound'}
         '503': {$ref: '#/components/responses/TemporarilyUnavailable'}
+  /api/v1/acornfox/apps/{applicationId}/fix-candidates:
+    parameters: [{$ref: '#/components/parameters/ApplicationId'}]
+    get:
+      operationId: listAcornFoxFixCandidates
+      x-acornfox-parity: cli_only
+      security: [{AdministratorSession: []}]
+      responses:
+        '200': {description: Latest 50 owner-scoped candidate lifecycle facts., content: {application/json: {schema: {$ref: '#/components/schemas/FixCandidateList'}}}}
+        '400': {$ref: '#/components/responses/InvalidRequest'}
+        '401': {$ref: '#/components/responses/AuthenticationFailed'}
+        '503': {$ref: '#/components/responses/TemporarilyUnavailable'}
+    post:
+      operationId: createAcornFoxFixCandidate
+      x-acornfox-parity: cli_only
+      security: [{AdministratorSession: []}]
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}, {$ref: '#/components/parameters/CSRFToken'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/FixCandidateRequest'}}}}
+      responses:
+        '202': {description: Candidate work was durably accepted; poll the returned candidate identity., content: {application/json: {schema: {$ref: '#/components/schemas/FixCandidate'}}}}
+        '400': {$ref: '#/components/responses/InvalidRequest'}
+        '401': {$ref: '#/components/responses/AuthenticationFailed'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/IdempotencyConflict'}
+        '422': {$ref: '#/components/responses/ValidationFailed'}
+        '503': {$ref: '#/components/responses/TemporarilyUnavailable'}
+  /api/v1/acornfox/apps/{applicationId}/fix-candidates/{candidateId}:
+    parameters: [{$ref: '#/components/parameters/ApplicationId'}, {$ref: '#/components/parameters/CandidateId'}]
+    get:
+      operationId: getAcornFoxFixCandidate
+      x-acornfox-parity: cli_only
+      security: [{AdministratorSession: []}]
+      responses:
+        '200': {description: Owner-scoped canonical diff and isolated validation evidence., content: {application/json: {schema: {$ref: '#/components/schemas/FixCandidate'}}}}
+        '401': {$ref: '#/components/responses/AuthenticationFailed'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/TemporarilyUnavailable'}
+  /api/v1/acornfox/apps/{applicationId}/fix-candidates/{candidateId}/source-match:
+    parameters: [{$ref: '#/components/parameters/ApplicationId'}, {$ref: '#/components/parameters/CandidateId'}]
+    post:
+      operationId: matchAcornFoxFixCandidateSource
+      x-acornfox-parity: cli_only
+      security: [{AdministratorSession: []}]
+      parameters: [{$ref: '#/components/parameters/CSRFToken'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/FixCandidateSourceMatchRequest'}}}}
+      responses:
+        '200': {description: W05 imported source repository and tree match the candidate., content: {application/json: {schema: {$ref: '#/components/schemas/FixCandidate'}}}}
+        '400': {$ref: '#/components/responses/InvalidRequest'}
+        '401': {$ref: '#/components/responses/AuthenticationFailed'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/IdempotencyConflict'}
+        '503': {$ref: '#/components/responses/TemporarilyUnavailable'}
+  /api/v1/acornfox/apps/{applicationId}/fix-candidates/{candidateId}/publish:
+    parameters: [{$ref: '#/components/parameters/ApplicationId'}, {$ref: '#/components/parameters/CandidateId'}]
+    post:
+      operationId: publishAcornFoxFixCandidate
+      x-acornfox-parity: cli_only
+      security: [{AdministratorSession: []}]
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}, {$ref: '#/components/parameters/CSRFToken'}]
+      responses:
+        '202': {description: Matching W05 source entered normal delivery after release-time OCI digest equality., content: {application/json: {schema: {$ref: '#/components/schemas/DeliveryCommandResponse'}}}}
+        '400': {$ref: '#/components/responses/InvalidRequest'}
+        '401': {$ref: '#/components/responses/AuthenticationFailed'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/IdempotencyConflict'}
+        '422': {$ref: '#/components/responses/ValidationFailed'}
+        '503': {$ref: '#/components/responses/TemporarilyUnavailable'}
   /api/v1/acornfox/apps/{applicationId}/deliveries:
     parameters: [{$ref: '#/components/parameters/ApplicationId'}]
     get:
@@ -408,6 +474,7 @@ components:
   parameters:
     ApplicationId: {name: applicationId, in: path, required: true, schema: {type: string, minLength: 1}}
     SourceRevisionId: {name: sourceRevisionId, in: path, required: true, schema: {type: string, minLength: 1}}
+    CandidateId: {name: candidateId, in: path, required: true, schema: {type: string, pattern: '^candidate_[0-9a-f]{32}$'}}
     OperationId: {name: operationId, in: path, required: true, schema: {type: string, minLength: 1}}
     AssistantSessionId: {name: sessionId, in: path, required: true, schema: {type: string, minLength: 1}}
     AssistantProposalId: {name: proposalId, in: path, required: true, schema: {type: string, minLength: 1}}
@@ -602,6 +669,77 @@ components:
       required: [source_revision_id, status]
       additionalProperties: false
       properties: {source_revision_id: {type: string}, status: {type: string, enum: [imported]}}
+    FixCandidateRequest:
+      type: object
+      required: [base_source_revision_id, paths, unified_diff, container_port]
+      additionalProperties: false
+      properties:
+        base_source_revision_id: {type: string, minLength: 1}
+        paths: {type: array, minItems: 1, maxItems: 32, uniqueItems: true, items: {type: string, minLength: 1}}
+        unified_diff: {type: string, minLength: 1, maxLength: 131072}
+        container_port: {type: integer, minimum: 1, maximum: 65535}
+    FixCandidateSourceMatchRequest:
+      type: object
+      required: [source_revision_id]
+      additionalProperties: false
+      properties: {source_revision_id: {type: string, minLength: 1}}
+    FixCandidateRuntimeEvidence:
+      type: object
+      required: [task_id, image, runtime_state, probe_outcome, cleanup_confirmed, evidence_digest]
+      additionalProperties: false
+      properties:
+        task_id: {type: string}
+        image: {$ref: '#/components/schemas/ImageDigest'}
+        runtime_state: {type: string, enum: [stopped]}
+        probe_outcome: {type: string, enum: [responded]}
+        http_status: {type: integer, minimum: 100, maximum: 599}
+        cleanup_confirmed: {type: boolean, enum: [true]}
+        evidence_digest: {type: string, pattern: '^sha256:[0-9a-f]{64}$'}
+    FixCandidateLifecycle:
+      type: object
+      required: [candidate_id, application_id, base_source_revision_id, status, created_at]
+      additionalProperties: false
+      properties:
+        candidate_id: {type: string, pattern: '^candidate_[0-9a-f]{32}$'}
+        application_id: {type: string}
+        base_source_revision_id: {type: string}
+        status: {type: string, enum: [preparing, failed]}
+        created_at: {type: string, format: date-time}
+    FixCandidateValidated:
+      type: object
+      required: [candidate_id, application_id, base_source_revision_id, base_repository_url, base_commit, base_tree_digest, patch_digest, result_tree_digest, container_port, changed_paths, canonical_diff, validated_image, build_log_ref, build_evidence_digest, runtime, status, created_at, expires_at]
+      additionalProperties: false
+      properties:
+        candidate_id: {type: string, pattern: '^candidate_[0-9a-f]{32}$'}
+        application_id: {type: string}
+        base_source_revision_id: {type: string}
+        base_repository_url: {type: string, format: uri}
+        base_commit: {type: string, pattern: '^[0-9a-f]{40}([0-9a-f]{24})?$'}
+        base_tree_digest: {type: string, pattern: '^sha256:[0-9a-f]{64}$'}
+        patch_digest: {type: string, pattern: '^sha256:[0-9a-f]{64}$'}
+        result_tree_digest: {type: string, pattern: '^sha256:[0-9a-f]{64}$'}
+        container_port: {type: integer, minimum: 1, maximum: 65535}
+        changed_paths: {type: array, minItems: 1, maxItems: 32, uniqueItems: true, items: {type: string}}
+        canonical_diff: {type: string, minLength: 1, maxLength: 131072}
+        validated_image: {$ref: '#/components/schemas/ImageDigest'}
+        build_log_ref: {type: string}
+        build_evidence_digest: {type: string, pattern: '^sha256:[0-9a-f]{64}$'}
+        runtime: {$ref: '#/components/schemas/FixCandidateRuntimeEvidence'}
+        matched_source_revision_id: {type: string}
+        matched_commit: {type: string, pattern: '^[0-9a-f]{40}([0-9a-f]{24})?$'}
+        status: {type: string, enum: [validated, source_matched]}
+        created_at: {type: string, format: date-time}
+        expires_at: {type: string, format: date-time}
+    FixCandidate:
+      oneOf:
+        - {$ref: '#/components/schemas/FixCandidateLifecycle'}
+        - {$ref: '#/components/schemas/FixCandidateValidated'}
+    FixCandidateList:
+      type: object
+      required: [items]
+      additionalProperties: false
+      properties:
+        items: {type: array, maxItems: 50, items: {$ref: '#/components/schemas/FixCandidate'}}
     OperationEvidence:
       type: object
       required: [kind, verdict, observed_at]

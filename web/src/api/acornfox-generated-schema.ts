@@ -316,6 +316,81 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/acornfox/apps/{applicationId}/fix-candidates": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                applicationId: components["parameters"]["ApplicationId"];
+            };
+            cookie?: never;
+        };
+        get: operations["listAcornFoxFixCandidates"];
+        put?: never;
+        post: operations["createAcornFoxFixCandidate"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/acornfox/apps/{applicationId}/fix-candidates/{candidateId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                applicationId: components["parameters"]["ApplicationId"];
+                candidateId: components["parameters"]["CandidateId"];
+            };
+            cookie?: never;
+        };
+        get: operations["getAcornFoxFixCandidate"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/acornfox/apps/{applicationId}/fix-candidates/{candidateId}/source-match": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                applicationId: components["parameters"]["ApplicationId"];
+                candidateId: components["parameters"]["CandidateId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["matchAcornFoxFixCandidateSource"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/acornfox/apps/{applicationId}/fix-candidates/{candidateId}/publish": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                applicationId: components["parameters"]["ApplicationId"];
+                candidateId: components["parameters"]["CandidateId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["publishAcornFoxFixCandidate"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/acornfox/apps/{applicationId}/deliveries": {
         parameters: {
             query?: never;
@@ -673,6 +748,66 @@ export interface components {
             source_revision_id: string;
             /** @enum {string} */
             status: "imported";
+        };
+        FixCandidateRequest: {
+            base_source_revision_id: string;
+            paths: string[];
+            unified_diff: string;
+            container_port: number;
+        };
+        FixCandidateSourceMatchRequest: {
+            source_revision_id: string;
+        };
+        FixCandidateRuntimeEvidence: {
+            task_id: string;
+            image: components["schemas"]["ImageDigest"];
+            /** @enum {string} */
+            runtime_state: "stopped";
+            /** @enum {string} */
+            probe_outcome: "responded";
+            http_status?: number;
+            /** @enum {boolean} */
+            cleanup_confirmed: true;
+            evidence_digest: string;
+        };
+        FixCandidateLifecycle: {
+            candidate_id: string;
+            application_id: string;
+            base_source_revision_id: string;
+            /** @enum {string} */
+            status: "preparing" | "failed";
+            /** Format: date-time */
+            created_at: string;
+        };
+        FixCandidateValidated: {
+            candidate_id: string;
+            application_id: string;
+            base_source_revision_id: string;
+            /** Format: uri */
+            base_repository_url: string;
+            base_commit: string;
+            base_tree_digest: string;
+            patch_digest: string;
+            result_tree_digest: string;
+            container_port: number;
+            changed_paths: string[];
+            canonical_diff: string;
+            validated_image: components["schemas"]["ImageDigest"];
+            build_log_ref: string;
+            build_evidence_digest: string;
+            runtime: components["schemas"]["FixCandidateRuntimeEvidence"];
+            matched_source_revision_id?: string;
+            matched_commit?: string;
+            /** @enum {string} */
+            status: "validated" | "source_matched";
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            expires_at: string;
+        };
+        FixCandidate: components["schemas"]["FixCandidateLifecycle"] | components["schemas"]["FixCandidateValidated"];
+        FixCandidateList: {
+            items: components["schemas"]["FixCandidate"][];
         };
         OperationEvidence: {
             /** @enum {string} */
@@ -1087,6 +1222,7 @@ export interface components {
     parameters: {
         ApplicationId: string;
         SourceRevisionId: string;
+        CandidateId: string;
         OperationId: string;
         AssistantSessionId: string;
         AssistantProposalId: string;
@@ -1739,6 +1875,161 @@ export interface operations {
             };
             401: components["responses"]["AuthenticationFailed"];
             404: components["responses"]["NotFound"];
+            503: components["responses"]["TemporarilyUnavailable"];
+        };
+    };
+    listAcornFoxFixCandidates: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                applicationId: components["parameters"]["ApplicationId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Latest 50 owner-scoped candidate lifecycle facts. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FixCandidateList"];
+                };
+            };
+            400: components["responses"]["InvalidRequest"];
+            401: components["responses"]["AuthenticationFailed"];
+            503: components["responses"]["TemporarilyUnavailable"];
+        };
+    };
+    createAcornFoxFixCandidate: {
+        parameters: {
+            query?: never;
+            header: {
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+                /** @description Must equal the non-HttpOnly __Host-acornfox_csrf cookie and use the allowed Origin. */
+                "X-AcornFox-CSRF": components["parameters"]["CSRFToken"];
+            };
+            path: {
+                applicationId: components["parameters"]["ApplicationId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FixCandidateRequest"];
+            };
+        };
+        responses: {
+            /** @description Candidate work was durably accepted; poll the returned candidate identity. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FixCandidate"];
+                };
+            };
+            400: components["responses"]["InvalidRequest"];
+            401: components["responses"]["AuthenticationFailed"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["IdempotencyConflict"];
+            422: components["responses"]["ValidationFailed"];
+            503: components["responses"]["TemporarilyUnavailable"];
+        };
+    };
+    getAcornFoxFixCandidate: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                applicationId: components["parameters"]["ApplicationId"];
+                candidateId: components["parameters"]["CandidateId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Owner-scoped canonical diff and isolated validation evidence. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FixCandidate"];
+                };
+            };
+            401: components["responses"]["AuthenticationFailed"];
+            404: components["responses"]["NotFound"];
+            503: components["responses"]["TemporarilyUnavailable"];
+        };
+    };
+    matchAcornFoxFixCandidateSource: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Must equal the non-HttpOnly __Host-acornfox_csrf cookie and use the allowed Origin. */
+                "X-AcornFox-CSRF": components["parameters"]["CSRFToken"];
+            };
+            path: {
+                applicationId: components["parameters"]["ApplicationId"];
+                candidateId: components["parameters"]["CandidateId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FixCandidateSourceMatchRequest"];
+            };
+        };
+        responses: {
+            /** @description W05 imported source repository and tree match the candidate. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FixCandidate"];
+                };
+            };
+            400: components["responses"]["InvalidRequest"];
+            401: components["responses"]["AuthenticationFailed"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["IdempotencyConflict"];
+            503: components["responses"]["TemporarilyUnavailable"];
+        };
+    };
+    publishAcornFoxFixCandidate: {
+        parameters: {
+            query?: never;
+            header: {
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+                /** @description Must equal the non-HttpOnly __Host-acornfox_csrf cookie and use the allowed Origin. */
+                "X-AcornFox-CSRF": components["parameters"]["CSRFToken"];
+            };
+            path: {
+                applicationId: components["parameters"]["ApplicationId"];
+                candidateId: components["parameters"]["CandidateId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Matching W05 source entered normal delivery after release-time OCI digest equality. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeliveryCommandResponse"];
+                };
+            };
+            400: components["responses"]["InvalidRequest"];
+            401: components["responses"]["AuthenticationFailed"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["IdempotencyConflict"];
+            422: components["responses"]["ValidationFailed"];
             503: components["responses"]["TemporarilyUnavailable"];
         };
     };

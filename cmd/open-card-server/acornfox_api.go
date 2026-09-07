@@ -111,6 +111,30 @@ func (s *Server) handleAcornFoxAPI(w http.ResponseWriter, r *http.Request) bool 
 		}
 		return true
 	}
+	if len(parts) == 2 && parts[1] == "fix-candidates" {
+		if s.acornFoxFixCandidate == nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "fix_candidate_unavailable", "fix candidate is unavailable")
+		} else {
+			s.acornFoxFixCandidate.HandleCollection(w, r, domain.ID(parts[0]))
+		}
+		return true
+	}
+	if len(parts) == 3 && parts[1] == "fix-candidates" {
+		if s.acornFoxFixCandidate == nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "fix_candidate_unavailable", "fix candidate is unavailable")
+		} else {
+			s.acornFoxFixCandidate.HandleItem(w, r, domain.ID(parts[0]), domain.ID(parts[2]), "")
+		}
+		return true
+	}
+	if len(parts) == 4 && parts[1] == "fix-candidates" && (parts[3] == "source-match" || parts[3] == "publish") {
+		if s.acornFoxFixCandidate == nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "fix_candidate_unavailable", "fix candidate is unavailable")
+		} else {
+			s.acornFoxFixCandidate.HandleItem(w, r, domain.ID(parts[0]), domain.ID(parts[2]), parts[3])
+		}
+		return true
+	}
 	if len(parts) == 2 && parts[1] == "deliveries" {
 		if r.Method == http.MethodGet {
 			s.handleAcornFoxDeliveries(w, r, domain.ID(parts[0]))
@@ -163,6 +187,15 @@ func acornFoxRouteAllow(path string) (string, bool) {
 	}
 	if len(parts) == 2 && parts[0] != "" && parts[1] == "sources" {
 		return "GET, POST", true
+	}
+	if len(parts) == 2 && parts[0] != "" && parts[1] == "fix-candidates" {
+		return "POST", true
+	}
+	if len(parts) == 3 && parts[0] != "" && parts[1] == "fix-candidates" && parts[2] != "" {
+		return "GET", true
+	}
+	if len(parts) == 4 && parts[0] != "" && parts[1] == "fix-candidates" && parts[2] != "" && (parts[3] == "source-match" || parts[3] == "publish") {
+		return "POST", true
 	}
 	if len(parts) == 2 && parts[0] != "" && parts[1] == "deliveries" {
 		return "GET, POST", true

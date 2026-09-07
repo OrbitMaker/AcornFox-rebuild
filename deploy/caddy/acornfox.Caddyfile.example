@@ -6,6 +6,7 @@
 # This internal proxy is a package source for the future local config path.
 # It does not publish a DNS name, certificate, or public listener.
 http://127.0.0.1:8080 {
+	bind 127.0.0.1
 	@backend path /api /api/* /healthz /readyz
 	handle @backend {
 		reverse_proxy 127.0.0.1:18481 {

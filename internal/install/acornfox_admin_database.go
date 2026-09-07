@@ -133,7 +133,7 @@ func resolveAcornFoxAdminDatabase(ctx context.Context, store *TaskAcornFoxRepoSt
 		return fail()
 	}
 	env, err := read(host, l.activationDir(id)+"/database.env", 0o600)
-	if err != nil || !validAcornFoxControlPlaneEnvironment(env) {
+	if err != nil {
 		return fail()
 	}
 	stateEnv, err := read(state, acornFoxControlPlaneStateEnv, 0o600)
@@ -145,7 +145,14 @@ func resolveAcornFoxAdminDatabase(ctx context.Context, store *TaskAcornFoxRepoSt
 		return fail()
 	}
 	r, err := ParseAcornFoxControlPlaneMigrationReceiptV1(rRaw)
-	if err != nil || r.BindingSHA256 != a.BindingSHA256 || r.ReleaseID != a.ReleaseID || r.SourceCommit != commit || r.DatabaseEnvSHA256 != sha256Bytes(env) || r.DatabaseIdentitySHA256 != acornFoxControlPlaneIdentitySHA256() || r.MigrationRowsSHA256 != acornFoxMigrationRowsSHA256(migrations.rows) {
+	expectedDatabase := acornFoxControlPlaneDatabase
+	if observed, nameErr := acornFoxControlPlaneDatabaseName(env); nameErr == nil && observed != acornFoxControlPlaneDatabase {
+		expectedDatabase, nameErr = acornFoxExpectedCurrentDatabase(store, j.BindingSHA256)
+		if nameErr != nil || observed != expectedDatabase {
+			return fail()
+		}
+	}
+	if err != nil || r.BindingSHA256 != a.BindingSHA256 || r.ReleaseID != a.ReleaseID || r.SourceCommit != commit || !validAcornFoxBoundControlPlaneEnvironment(env, r, expectedDatabase) || r.MigrationRowsSHA256 != acornFoxMigrationRowsSHA256(migrations.rows) {
 		return fail()
 	}
 	for _, p := range []struct{ name, target string }{{l.activePath(), "activations/" + id}, {l.currentPath(), "active/release"}, {l.activationReleasePath(id), "../../releases/" + a.ReleaseID}} {

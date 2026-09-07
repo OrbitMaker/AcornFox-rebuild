@@ -125,6 +125,7 @@ type Server struct {
 	acornFoxAccessObservation  *AcornFoxAccessObservationHTTPHandler
 	acornFoxSourceUpdate       *AcornFoxSourceUpdateHTTPHandler
 	acornFoxSourceMetadata     *AcornFoxSourceMetadataHTTPHandler
+	acornFoxFixCandidate       *AcornFoxFixCandidateHTTPHandler
 	acornFoxTLSAllow           *acornFoxTLSAllowHandler
 	broker                     *eventBroker
 	agentGateway               *agenttransport.Gateway
@@ -225,6 +226,9 @@ func (s *Server) SetAcornFoxAccessObservation(handler *AcornFoxAccessObservation
 }
 func (s *Server) SetAcornFoxSourceUpdate(handler *AcornFoxSourceUpdateHTTPHandler) {
 	s.acornFoxSourceUpdate = handler
+}
+func (s *Server) SetAcornFoxFixCandidate(handler *AcornFoxFixCandidateHTTPHandler) {
+	s.acornFoxFixCandidate = handler
 }
 func (s *Server) SetAcornFoxHostMetrics(handler http.Handler) { s.acornFoxHostMetrics = handler }
 func (s *Server) SetLegacyRoutesEnabled(enabled bool)         { s.legacyRoutesEnabled = enabled }

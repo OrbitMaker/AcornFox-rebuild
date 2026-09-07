@@ -6,6 +6,19 @@ const run = { run_id: "run", session_id: "session", status: "accepted", created_
 describe("AcornFox assistant client", () => {
   beforeEach(() => Object.defineProperty(globalThis, "document", { configurable: true, value: { cookie: "__Host-acornfox_csrf=csrf%20value" } }));
 
+  it("passes the optional snapshot abort signal through to fetch", async () => {
+    const controller = new AbortController(); let received: AbortSignal | null | undefined;
+    const api = createAcornFoxAssistantClient(async (_input, init) => {
+      received = init?.signal;
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(new Error("fetch aborted")), { once: true });
+      });
+    });
+    const request = api.events("session", 7, controller.signal);
+    const rejected = expect(request).rejects.toMatchObject({ code: "network_error" });
+    expect(received).toBe(controller.signal); controller.abort(); await rejected;
+  });
+
   it("uses the real session routes, keeps a replay key, and protects abort with CSRF", async () => {
     const seen: Array<{ url: string; init?: RequestInit }> = [];
     const api = createAcornFoxAssistantClient(async (input, init) => {

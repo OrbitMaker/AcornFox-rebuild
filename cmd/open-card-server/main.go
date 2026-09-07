@@ -14,6 +14,7 @@ import (
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/open-card/open-card/internal/acornfoxcandidate"
 	"github.com/open-card/open-card/internal/acornfoxenv"
 	aicontext "github.com/open-card/open-card/internal/ai/context"
 	ailedger "github.com/open-card/open-card/internal/ai/ledger"
@@ -244,11 +245,83 @@ func main() {
 			server.SetReleaseController(releaseController)
 			server.SetApplicationPublisher(store, releaseController)
 			acornFoxStore := acornFoxPostgresAdapter{store: store}
-			server.SetAcornFoxDeliveryCommand(acornFoxHTTPCommand{service: &application.AcornFoxDeliveryService{
+			deliveryService := &application.AcornFoxDeliveryService{
 				Idempotency: acornFoxStore, Sources: acornFoxStore, Importer: dockerfile.New(), Builds: acornFoxStore,
 				Tasks: acornFoxStore, Runtime: acornFoxStore, Observer: acornFoxStore, Builder: buildProvider, Capacity: capacityProvider,
 				Config: application.AcornFoxDeliveryConfig{TargetRepository: "acornfox.local/apps", StorageKeyPrefix: "acornfox-builds", BuildNetwork: buildNetwork},
-			}})
+			}
+			server.SetAcornFoxDeliveryCommand(acornFoxHTTPCommand{service: deliveryService})
+			candidateHandler := &AcornFoxFixCandidateHTTPHandler{Store: store}
+			candidateLeader, candidateErr := store.AcquireAcornFoxFixCandidateLeader(lifecycleContext)
+			if errors.Is(candidateErr, postgres.ErrAcornFoxFixCandidateLeaderHeld) {
+				log.Printf("fix candidate execution is owned by another server; this instance serves read-only candidate facts")
+			} else if candidateErr != nil {
+				log.Fatal("fix candidate execution leader unavailable")
+			} else {
+				candidateLeaderContext, candidateLeaderCancel := context.WithCancel(lifecycleContext)
+				candidateLeaderMonitor := make(chan error, 1)
+				go func() {
+					err := candidateLeader.Monitor(candidateLeaderContext, acornFoxFixCandidateLeaderProbe)
+					if err != nil {
+						log.Printf("fix candidate execution leader lost: %v", err)
+						candidateLeaderCancel()
+					}
+					candidateLeaderMonitor <- err
+				}()
+				settle := time.NewTimer(acornFoxFixCandidateLeaderSettle)
+				select {
+				case <-settle.C:
+				case <-candidateLeaderContext.Done():
+					if !settle.Stop() {
+						select {
+						case <-settle.C:
+						default:
+						}
+					}
+					log.Fatal("fix candidate execution leader was lost during startup")
+				}
+				candidateWorkspace, candidateErr := acornfoxcandidate.NewManager(workspaceRoot)
+				if candidateErr != nil {
+					log.Fatal("fix candidate workspace unavailable")
+				}
+				candidateStore, candidateErr := postgres.NewAcornFoxFixCandidateFencedStore(store, candidateLeader)
+				if candidateErr != nil {
+					log.Fatal("fix candidate fenced store unavailable")
+				}
+				if candidateErr := candidateStore.RecoverAcornFoxFixCandidates(candidateLeaderContext, time.Now().UTC()); candidateErr != nil {
+					log.Fatal("fix candidate recovery unavailable")
+				}
+				candidateService := &application.AcornFoxFixCandidateService{
+					Store: candidateStore, Workspace: candidateWorkspace,
+					Builder: &application.AcornFoxFixCandidateBuilder{Builder: buildProvider, Capacity: capacityProvider, Network: buildNetwork, TargetRepository: "acornfox.local/apps", StorageKeyPrefix: "acornfox-candidate"},
+					Runtime: &acornFoxFixCandidateRuntimeDispatcher{store: store}, Publisher: deliveryService,
+				}
+				candidateCoordinator, candidateErr := newAcornFoxFixCandidateCoordinator(candidateLeaderContext, candidateService)
+				if candidateErr != nil {
+					log.Fatal("fix candidate coordinator unavailable")
+				}
+				candidateHandler.Service = candidateCoordinator
+				defer func() {
+					candidateLeaderCancel()
+					closeContext, closeCancel := context.WithTimeout(context.Background(), 30*time.Second)
+					closeErr := candidateCoordinator.Close(closeContext)
+					closeCancel()
+					monitorErr := <-candidateLeaderMonitor
+					if monitorErr != nil {
+						log.Printf("fix candidate execution leader monitor: %v", monitorErr)
+					}
+					if closeErr != nil {
+						log.Printf("fix candidate coordinator shutdown: %v", closeErr)
+						return
+					}
+					releaseContext, releaseCancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer releaseCancel()
+					if err := candidateLeader.Release(releaseContext); err != nil {
+						log.Printf("fix candidate execution leader release: %v", err)
+					}
+				}()
+			}
+			server.SetAcornFoxFixCandidate(candidateHandler)
 
 			if environment.Clean() {
 				stopPublic, publicErr := server.configureCleanPublicAccess(lifecycleContext, store, getenv(acornfoxenv.AuthOrigin), getenv(acornfoxenv.PublicRoot), true, getenv(acornfoxenv.M3Enabled) == "true")

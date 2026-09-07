@@ -62,6 +62,18 @@ var acornFoxInstallLayoutRoles = []AcornFoxLiveRole{
 	AcornFoxLivePIRole,
 }
 
+// acornFoxLegacy0034InstallLayoutRoles is the exact production account set
+// used by the 0034 installer at f329af37. It is used only while authenticating
+// an already-installed predecessor; current constructors remain seven-role.
+var acornFoxLegacy0034InstallLayoutRoles = []AcornFoxLiveRole{
+	AcornFoxLiveRootRole,
+	AcornFoxLiveServerRole,
+	AcornFoxLiveAgentRole,
+	AcornFoxLiveBuildKitRole,
+	AcornFoxLiveCaddyRole,
+	AcornFoxLiveEdgeRole,
+}
+
 // newTaskAcornFoxLayout records the existing task-root topology exactly.  All
 // symbolic roles map to the task owner; task receipts continue to expose only
 // that symbolic fact and never this uid/gid data.
@@ -116,6 +128,32 @@ func newTestProductionAcornFoxLayout(stateRoot, hostRoot string, stateUID, state
 	return layout, nil
 }
 
+func newTestProductionAcornFoxLegacy0034Layout(stateRoot, hostRoot string, stateUID, stateGID int, principals map[AcornFoxLiveRole]acornFoxInstallPrincipal) (acornFoxInstallLayout, error) {
+	if stateUID < 0 || stateGID < 0 || !safeAcornFoxTestRoot(stateRoot) || !safeAcornFoxTestRoot(hostRoot) || stateRoot != filepath.Join(hostRoot, "var", "lib", "acornfox", "install") {
+		return acornFoxInstallLayout{}, errors.New("AcornFox legacy production test layout roots are unsafe")
+	}
+	stateInfo, stateErr := os.Lstat(stateRoot)
+	hostInfo, hostErr := os.Lstat(hostRoot)
+	if stateErr != nil || hostErr != nil || !safeAcornFoxInstallRoot(stateInfo, stateUID, stateGID, true) || !safeAcornFoxHostRoot(hostInfo) {
+		return acornFoxInstallLayout{}, errors.New("AcornFox legacy production test layout roots are unsafe")
+	}
+	copyPrincipals := make(map[AcornFoxLiveRole]acornFoxInstallPrincipal, len(principals))
+	for role, principal := range principals {
+		copyPrincipals[role] = principal
+	}
+	layout := acornFoxInstallLayout{
+		mode: acornFoxInstallLayoutProduction, stateRootPath: stateRoot, hostRootPath: hostRoot,
+		liveReceiptPath: "var/lib/acornfox/install/live-receipt.json",
+		stateOwner:      acornFoxInstallPrincipal{uid: stateUID, gid: stateGID}, principals: copyPrincipals,
+		stateRootInfo: stateInfo, hostRootInfo: hostInfo,
+	}
+	if err := layout.validateLegacy0034(); err != nil {
+		return acornFoxInstallLayout{}, err
+	}
+	layout.evidenceSHA256 = layout.digestForRoles(acornFoxLegacy0034InstallLayoutRoles)
+	return layout, nil
+}
+
 // newProductionAcornFoxLayout has deliberately no configurable inputs. It is
 // the only production layout constructor and therefore cannot be redirected to
 // a caller-selected host root, account, or state directory.
@@ -149,6 +187,39 @@ func newProductionAcornFoxLayout() (acornFoxInstallLayout, error) {
 		return acornFoxInstallLayout{}, err
 	}
 	layout.evidenceSHA256 = layout.digest()
+	return layout, nil
+}
+
+func newProductionAcornFoxLegacy0034Layout() (acornFoxInstallLayout, error) {
+	if runtime.GOOS != "linux" || os.Geteuid() != 0 {
+		return acornFoxInstallLayout{}, errors.New("AcornFox legacy production layout requires Linux root")
+	}
+	stateRoot, hostRoot := "/var/lib/acornfox/install", "/"
+	stateInfo, stateErr := os.Lstat(stateRoot)
+	hostInfo, hostErr := os.Lstat(hostRoot)
+	if stateErr != nil || hostErr != nil || !safeAcornFoxInstallRoot(stateInfo, 0, 0, true) || !safeAcornFoxProductionHostRoot(hostInfo) {
+		return acornFoxInstallLayout{}, errors.New("AcornFox legacy production layout roots are unsafe")
+	}
+	principals := map[AcornFoxLiveRole]acornFoxInstallPrincipal{AcornFoxLiveRootRole: {}}
+	for role, name := range map[AcornFoxLiveRole]string{
+		AcornFoxLiveServerRole: "acornfox", AcornFoxLiveAgentRole: "acornfox-agent", AcornFoxLiveBuildKitRole: "acornfox-buildkit", AcornFoxLiveCaddyRole: "acornfox-caddy", AcornFoxLiveEdgeRole: "acornfox-edge",
+	} {
+		account, err := user.Lookup(name)
+		if err != nil {
+			return acornFoxInstallLayout{}, errors.New("AcornFox legacy production account is unavailable")
+		}
+		uid, uidErr := strconv.Atoi(account.Uid)
+		gid, gidErr := strconv.Atoi(account.Gid)
+		if uidErr != nil || gidErr != nil || uid <= 0 || gid <= 0 {
+			return acornFoxInstallLayout{}, errors.New("AcornFox legacy production account is invalid")
+		}
+		principals[role] = acornFoxInstallPrincipal{uid: uid, gid: gid}
+	}
+	layout := acornFoxInstallLayout{mode: acornFoxInstallLayoutProduction, stateRootPath: stateRoot, hostRootPath: hostRoot, liveReceiptPath: "var/lib/acornfox/install/live-receipt.json", stateOwner: acornFoxInstallPrincipal{}, principals: principals, stateRootInfo: stateInfo, hostRootInfo: hostInfo}
+	if err := layout.validateLegacy0034(); err != nil {
+		return acornFoxInstallLayout{}, err
+	}
+	layout.evidenceSHA256 = layout.digestForRoles(acornFoxLegacy0034InstallLayoutRoles)
 	return layout, nil
 }
 
@@ -215,7 +286,50 @@ func (l acornFoxInstallLayout) validate() error {
 	return nil
 }
 
+func (l acornFoxInstallLayout) validateLegacy0034() error {
+	if l.mode != acornFoxInstallLayoutProduction || !safeAbsoluteDurableRoot(l.stateRootPath) || (!safeAbsoluteDurableRoot(l.hostRootPath) && filepath.Clean(l.hostRootPath) != string(filepath.Separator)) || filepath.Clean(l.stateRootPath) == string(filepath.Separator) || l.stateOwner.uid < 0 || l.stateOwner.gid < 0 || l.stateRootInfo == nil || l.hostRootInfo == nil || len(l.principals) != len(acornFoxLegacy0034InstallLayoutRoles) {
+		return errors.New("AcornFox legacy 0034 install layout is invalid")
+	}
+	productionRoot := l.hostRootPath == "/" && l.stateRootPath == "/var/lib/acornfox/install" && l.stateOwner == (acornFoxInstallPrincipal{})
+	testRoot := l.stateRootPath != l.hostRootPath && safeAcornFoxTestRoot(l.stateRootPath) && safeAcornFoxTestRoot(l.hostRootPath) && l.stateRootPath == filepath.Join(l.hostRootPath, "var", "lib", "acornfox", "install")
+	if (!productionRoot && !testRoot) || l.livePrefix != "" || l.liveReceiptPath != "var/lib/acornfox/install/live-receipt.json" || !safeAcornFoxInstallRoot(l.stateRootInfo, l.stateOwner.uid, l.stateOwner.gid, true) || !safeAcornFoxHostRoot(l.hostRootInfo) || l.principals[AcornFoxLiveRootRole] != (acornFoxInstallPrincipal{}) || (l.evidenceSHA256 != "" && (!validSHA(l.evidenceSHA256) || l.evidenceSHA256 != l.digestForRoles(acornFoxLegacy0034InstallLayoutRoles))) {
+		return errors.New("AcornFox legacy 0034 production install layout is invalid")
+	}
+	seen := map[acornFoxInstallPrincipal]bool{}
+	for _, role := range acornFoxLegacy0034InstallLayoutRoles[1:] {
+		principal, ok := l.principals[role]
+		if !ok || principal.uid <= 0 || principal.gid <= 0 || seen[principal] {
+			return errors.New("AcornFox legacy 0034 production principal is invalid")
+		}
+		seen[principal] = true
+	}
+	return nil
+}
+
+func (l acornFoxInstallLayout) withProvisionedPI(principal acornFoxInstallPrincipal) (acornFoxInstallLayout, error) {
+	if l.validateLegacy0034() != nil || principal.uid <= 0 || principal.gid <= 0 {
+		return acornFoxInstallLayout{}, errors.New("AcornFox provisioned PI principal is invalid")
+	}
+	principals := make(map[AcornFoxLiveRole]acornFoxInstallPrincipal, len(acornFoxInstallLayoutRoles))
+	for role, value := range l.principals {
+		principals[role] = value
+	}
+	principals[AcornFoxLivePIRole] = principal
+	current := l
+	current.principals = principals
+	current.evidenceSHA256 = ""
+	if err := current.validate(); err != nil {
+		return acornFoxInstallLayout{}, err
+	}
+	current.evidenceSHA256 = current.digest()
+	return current, current.validate()
+}
+
 func (l acornFoxInstallLayout) digest() string {
+	return l.digestForRoles(acornFoxInstallLayoutRoles)
+}
+
+func (l acornFoxInstallLayout) digestForRoles(roles []AcornFoxLiveRole) string {
 	if l.mode != acornFoxInstallLayoutProduction {
 		return ""
 	}
@@ -224,8 +338,8 @@ func (l acornFoxInstallLayout) digest() string {
 		UID  int    `json:"uid"`
 		GID  int    `json:"gid"`
 	}
-	values := make([]rolePrincipal, 0, len(acornFoxInstallLayoutRoles))
-	for _, role := range acornFoxInstallLayoutRoles {
+	values := make([]rolePrincipal, 0, len(roles))
+	for _, role := range roles {
 		principal := l.principals[role]
 		values = append(values, rolePrincipal{Role: string(role), UID: principal.uid, GID: principal.gid})
 	}
@@ -303,6 +417,14 @@ func (l acornFoxInstallLayout) equivalent(other acornFoxInstallLayout) bool {
 
 func (l acornFoxInstallLayout) hostRootPinned() bool {
 	if l.validate() != nil {
+		return false
+	}
+	info, err := os.Lstat(l.hostRootPath)
+	return err == nil && os.SameFile(info, l.hostRootInfo) && safeAcornFoxHostRoot(info)
+}
+
+func (l acornFoxInstallLayout) legacy0034HostRootPinned() bool {
+	if l.validateLegacy0034() != nil {
 		return false
 	}
 	info, err := os.Lstat(l.hostRootPath)

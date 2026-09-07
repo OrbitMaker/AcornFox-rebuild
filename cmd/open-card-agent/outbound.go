@@ -24,20 +24,21 @@ import (
 )
 
 type OutboundHandler struct {
-	instanceID      string
-	nodeID          string
-	facts           DockerFactsReader
-	runtime         contracts.RuntimeDriver
-	groupRuntime    contracts.ServiceGroupRuntimeDriver
-	volumeRuntime   contracts.VolumeProvider
-	m4Runtime       *M4OutboundExecutor
-	acornFoxRuntime *AcornFoxOutboundExecutor
-	acornFoxProbe   *AcornFoxProbeOutboundExecutor
-	acornFoxLogs    *AcornFoxLogsOutboundExecutor
-	clock           func() time.Time
-	healthProbe     func(context.Context, int, time.Time) error
-	mu              sync.Mutex
-	results         map[string]outboundTaskResult
+	instanceID        string
+	nodeID            string
+	facts             DockerFactsReader
+	runtime           contracts.RuntimeDriver
+	groupRuntime      contracts.ServiceGroupRuntimeDriver
+	volumeRuntime     contracts.VolumeProvider
+	m4Runtime         *M4OutboundExecutor
+	acornFoxRuntime   *AcornFoxOutboundExecutor
+	acornFoxProbe     *AcornFoxProbeOutboundExecutor
+	acornFoxLogs      *AcornFoxLogsOutboundExecutor
+	acornFoxCandidate *AcornFoxCandidateOutboundExecutor
+	clock             func() time.Time
+	healthProbe       func(context.Context, int, time.Time) error
+	mu                sync.Mutex
+	results           map[string]outboundTaskResult
 }
 
 type outboundTaskResult struct {
@@ -93,6 +94,16 @@ func NewOutboundHandlerWithAcornFoxProbe(instanceID, nodeID string, facts Docker
 	}
 	if acornFoxRuntime != nil && prober != nil {
 		handler.acornFoxProbe = NewAcornFoxProbeOutboundExecutor(instanceID, nodeID, acornFoxRuntime, prober)
+	}
+	return handler
+}
+
+// WithAcornFoxCandidateRuntime adds the isolated candidate lane to an already
+// composed handler. Startup code can inject a dedicated provider without
+// widening any existing runtime constructor or changing legacy composition.
+func WithAcornFoxCandidateRuntime(handler *OutboundHandler, runtime AcornFoxCandidateRuntime) *OutboundHandler {
+	if handler != nil && runtime != nil {
+		handler.acornFoxCandidate = NewAcornFoxCandidateOutboundExecutor(handler.instanceID, handler.nodeID, runtime)
 	}
 	return handler
 }
@@ -169,6 +180,15 @@ func semanticTaskFingerprint(task v1.TaskRequest) ([32]byte, error) {
 
 func (h *OutboundHandler) executeTask(ctx context.Context, task v1.TaskRequest) ([]v1.Envelope, error) {
 	ack := v1.TaskAck{TaskID: task.TaskID, Status: v1.AckAccepted}
+	if acornFoxCandidatePayloadMarked(task.Parameters) {
+		var result acornFoxCandidateOutboundResult
+		if h.acornFoxCandidate == nil {
+			result = rejectedAcornFoxCandidate(task, "unsupported_capability", "AcornFox candidate validation capability is unavailable")
+		} else {
+			result = h.acornFoxCandidate.Execute(ctx, task)
+		}
+		return h.wrapAcornFoxCandidateTaskEvents(task, ack, result)
+	}
 	if acornFoxLogsPayloadMarked(task.Parameters) {
 		var result acornFoxLogsOutboundResult
 		if h.acornFoxLogs == nil {
@@ -247,6 +267,28 @@ func (h *OutboundHandler) executeTask(ctx context.Context, task v1.TaskRequest) 
 	log := &v1.LogChunk{TaskID: task.TaskID, Sequence: 1, Stream: v1.LogStreamStdout, Data: "read-only Docker node facts collected", Final: true}
 	result := v1.TaskResult{TaskID: task.TaskID, IdempotencyKey: task.IdempotencyKey, Succeeded: true, Status: v1.TaskResultSucceeded, EvidenceRefs: observation.EvidenceRefs}
 	return h.wrapTaskEvents(task, ack, log, *observation, result)
+}
+
+func (h *OutboundHandler) wrapAcornFoxCandidateTaskEvents(task v1.TaskRequest, ack v1.TaskAck, result acornFoxCandidateOutboundResult) ([]v1.Envelope, error) {
+	if !result.Result.Succeeded && (result.Result.ErrorCode == "invalid_argument" || result.Result.ErrorCode == "unsupported_capability") {
+		ack.Status = v1.AckRejected
+		ack.Reason = "AcornFox candidate validation task was rejected"
+	}
+	events := []v1.Envelope{h.envelope(v1.KindTaskAck, task.IdempotencyKey, ack)}
+	for _, log := range result.Logs {
+		events = append(events, h.envelope(v1.KindLogChunk, task.IdempotencyKey, log))
+	}
+	for _, observation := range result.Observations {
+		events = append(events, h.envelope(v1.KindObservation, task.IdempotencyKey, observation))
+	}
+	events = append(events, h.envelope(v1.KindTaskResult, task.IdempotencyKey, result.Result))
+	for index := range events {
+		events[index].AgentSequence = uint64(index + 1)
+		if err := v1.ValidateEnvelopePayload(events[index]); err != nil {
+			return nil, err
+		}
+	}
+	return events, nil
 }
 
 func (h *OutboundHandler) wrapAcornFoxLogsTaskEvents(task v1.TaskRequest, ack v1.TaskAck, result acornFoxLogsOutboundResult) ([]v1.Envelope, error) {

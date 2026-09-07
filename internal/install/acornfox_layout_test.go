@@ -768,6 +768,24 @@ func acornFoxTestLayoutPrincipals() map[AcornFoxLiveRole]acornFoxInstallPrincipa
 	}
 }
 
+func TestAcornFoxLegacy0034LayoutIsSixRoleOnly(t *testing.T) {
+	host := t.TempDir()
+	state := filepath.Join(host, "var", "lib", "acornfox", "install")
+	if err := os.MkdirAll(state, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	legacyPrincipals := acornFoxTestLayoutPrincipals()
+	delete(legacyPrincipals, AcornFoxLivePIRole)
+	legacy, err := newTestProductionAcornFoxLegacy0034Layout(state, host, os.Getuid(), os.Getgid(), legacyPrincipals)
+	if err != nil || legacy.validateLegacy0034() != nil || legacy.validate() == nil || !validSHA(legacy.evidence()) {
+		t.Fatalf("legacy=%#v err=%v", legacy, err)
+	}
+	current, err := legacy.withProvisionedPI(acornFoxInstallPrincipal{uid: 2006, gid: 2006})
+	if err != nil || current.validate() != nil || current.validateLegacy0034() == nil || current.evidence() == legacy.evidence() {
+		t.Fatalf("current=%#v err=%v", current, err)
+	}
+}
+
 type acornFoxTestOwnerRecorder struct {
 	values map[[2]uint64]acornFoxInstallPrincipal
 }

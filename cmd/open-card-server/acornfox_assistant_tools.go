@@ -5,16 +5,22 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"regexp"
 	"strings"
 
+	"github.com/open-card/open-card/internal/acornfoxcandidate"
+	aicontext "github.com/open-card/open-card/internal/ai/context"
+	"github.com/open-card/open-card/internal/application"
 	"github.com/open-card/open-card/internal/assistant"
 	"github.com/open-card/open-card/internal/assistantactions"
 	"github.com/open-card/open-card/internal/assistanttools"
 	"github.com/open-card/open-card/internal/domain"
+	"github.com/open-card/open-card/internal/persistence/postgres"
 )
 
 // newAcornFoxAssistantToolExecutor adapts existing server-authoritative DTOs.
@@ -24,6 +30,9 @@ func newAcornFoxAssistantToolExecutor(server *Server, metrics http.Handler) assi
 	return func(ctx context.Context, grant assistanttools.Grant, call assistanttools.Call) assistanttools.Response {
 		if server == nil {
 			return assistanttools.Response{Code: "unavailable"}
+		}
+		if call.Tool == "acornfox_read_fix_source" || call.Tool == "acornfox_create_fix_candidate" {
+			return assistantFixCandidateTool(ctx, server, grant, call)
 		}
 		var args map[string]string
 		if json.Unmarshal(call.Arguments, &args) != nil || args == nil {
@@ -51,6 +60,12 @@ func newAcornFoxAssistantToolExecutor(server *Server, metrics http.Handler) assi
 			}
 			return assistantToolHTTP(ctx, grant, call, metrics, "/api/v1/acornfox/host/metrics", http.MethodGet)
 		}
+		if call.Tool == "acornfox_operation_result" && args["operation_id"] == "" {
+			if server == nil || server.acornFoxAssistantActions == nil {
+				return assistanttools.Response{Code: "unavailable"}
+			}
+			return assistantCurrentActionFacts(ctx, server.acornFoxAssistantActions.Service, grant, app)
+		}
 		if call.Tool == "acornfox_propose_restart" || call.Tool == "acornfox_propose_redeploy" {
 			if server.acornFoxAssistantActions == nil || server.acornFoxAssistantActions.Service == nil {
 				return assistanttools.Response{Code: "unavailable"}
@@ -70,11 +85,80 @@ func newAcornFoxAssistantToolExecutor(server *Server, metrics http.Handler) assi
 			return assistanttools.Response{OK: true, Result: body}
 		}
 		path, method := assistantToolPath(call.Tool, app, args["deployment_id"], args["operation_id"])
+		if call.Tool == "acornfox_logs" && args["source"] == "build" {
+			path = strings.Replace(path, "?source=runtime&limit=1", "?source=build&limit=1", 1)
+		}
 		if path == "" {
 			return assistanttools.Response{Code: "invalid_request"}
 		}
 		return assistantToolHTTP(ctx, grant, call, assistantAcornFoxHandler{server}, path, method)
 	}
+}
+
+func assistantFixCandidateTool(ctx context.Context, server *Server, grant assistanttools.Grant, call assistanttools.Call) assistanttools.Response {
+	if server == nil || server.acornFoxFixCandidate == nil || server.acornFoxFixCandidate.Service == nil {
+		return assistanttools.Response{Code: "unavailable"}
+	}
+	type arguments struct {
+		ApplicationID        domain.ID `json:"application_id"`
+		BaseSourceRevisionID domain.ID `json:"base_source_revision_id,omitempty"`
+		SourceRevisionID     domain.ID `json:"source_revision_id,omitempty"`
+		Paths                []string  `json:"paths"`
+		UnifiedDiff          string    `json:"unified_diff,omitempty"`
+		ContainerPort        int       `json:"container_port,omitempty"`
+	}
+	var input arguments
+	decoder := json.NewDecoder(strings.NewReader(string(call.Arguments)))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&input) != nil || decoder.Decode(&struct{}{}) != io.EOF {
+		return assistanttools.Response{Code: "invalid_request"}
+	}
+	if input.ApplicationID.Empty() && !grant.Scope.Admin {
+		input.ApplicationID = domain.ID(grant.Scope.ApplicationID)
+	}
+	if input.ApplicationID.Empty() || (!grant.Scope.Admin && input.ApplicationID.String() != grant.Scope.ApplicationID) {
+		return assistanttools.Response{Code: "forbidden"}
+	}
+	var value any
+	var err error
+	switch call.Tool {
+	case "acornfox_read_fix_source":
+		if !input.BaseSourceRevisionID.Empty() || input.UnifiedDiff != "" || input.ContainerPort != 0 {
+			return assistanttools.Response{Code: "invalid_request"}
+		}
+		var read acornfoxcandidate.ReadResult
+		read, err = server.acornFoxFixCandidate.Service.ReadSourceForAI(ctx, input.ApplicationID, input.SourceRevisionID, input.Paths)
+		if err == nil {
+			files := make([]aicontext.SourceFile, 0, len(read.Files))
+			for _, file := range read.Files {
+				files = append(files, aicontext.SourceFile{ApplicationID: input.ApplicationID, Scope: aicontext.ScopeSourceFiles, Path: file.Path, Content: file.Content, Digest: file.Digest, Bytes: file.Bytes, Untrusted: true})
+			}
+			builder := aicontext.New(aicontext.Config{MaxBytes: aicontext.DefaultMaxBytes, MaxFileBytes: aicontext.DefaultMaxFileBytes, TemplateVersion: "fix-candidate-context-v1"})
+			value, err = builder.BuildPackage(aicontext.Input{ApplicationID: input.ApplicationID, TaskType: "source_fix_candidate", Profile: "local", AuthorizedScopes: []string{aicontext.ScopeSourceFiles, aicontext.ScopeObjectVersions}, SourceFiles: files, RelevantFiles: input.Paths, Objects: []aicontext.ObjectVersion{{ApplicationID: input.ApplicationID, Scope: aicontext.ScopeObjectVersions, Kind: "source_revision", ID: read.BaseSourceRevisionID.String(), Version: read.BaseTreeDigest}}, RelevantObjectIDs: []string{read.BaseSourceRevisionID.String()}, TemplateVersion: "fix-candidate-context-v1"})
+		}
+	case "acornfox_create_fix_candidate":
+		if !input.SourceRevisionID.Empty() || len(input.UnifiedDiff) == 0 || len(input.UnifiedDiff) > 48<<10 {
+			return assistanttools.Response{Code: "invalid_request"}
+		}
+		value, err = server.acornFoxFixCandidate.Service.Create(ctx, application.AcornFoxFixCandidateCreateRequest{ApplicationID: input.ApplicationID, BaseSourceRevisionID: input.BaseSourceRevisionID, Paths: input.Paths, UnifiedDiff: []byte(input.UnifiedDiff), ContainerPort: input.ContainerPort, IdempotencyKey: "assistant:" + grant.RunID + ":" + call.CallID, OwnerAdminID: domain.ID(grant.Actor)})
+	}
+	if err != nil {
+		if errors.Is(err, postgres.ErrNotFound) {
+			return assistanttools.Response{Code: "not_found"}
+		}
+		if errors.Is(err, postgres.ErrIdempotencyConflict) {
+			return assistanttools.Response{Code: "idempotency_conflict"}
+		}
+		if domain.IsCode(err, domain.ErrValidation) {
+			return assistanttools.Response{Code: "invalid_request"}
+		}
+		return assistanttools.Response{Code: "unavailable"}
+	}
+	raw, err := json.Marshal(value)
+	if err != nil || len(raw) > assistanttools.MaxResult {
+		return assistanttools.Response{Code: "result_too_large"}
+	}
+	return assistanttools.Response{OK: true, Result: raw}
 }
 
 type assistantAcornFoxHandler struct{ server *Server }
@@ -94,9 +178,18 @@ func assistantToolArguments(tool string, args map[string]string) bool {
 	case "acornfox_delivery_status", "acornfox_logs", "acornfox_public_access", "acornfox_access_observation", "acornfox_probe", "acornfox_propose_restart", "acornfox_propose_redeploy":
 		want["application_id"], want["deployment_id"] = true, true
 	case "acornfox_operation_result":
-		want["application_id"], want["operation_id"] = true, true
+		want["application_id"] = true
+		if _, present := args["operation_id"]; present {
+			want["operation_id"] = true
+		}
 	}
 	for key := range args {
+		if tool == "acornfox_logs" && key == "source" {
+			if args[key] != "build" && args[key] != "runtime" {
+				return false
+			}
+			continue
+		}
 		if !want[key] {
 			return false
 		}
@@ -107,6 +200,31 @@ func assistantToolArguments(tool string, args map[string]string) bool {
 		}
 	}
 	return true
+}
+
+// This read projects current decisions from the same actor and conversation.
+// Like the existing GET actions API, List may persist expiry or verification
+// derived from an already issued operation. It never approves or executes work.
+// Historical model messages are never used as approval or execution evidence.
+func assistantCurrentActionFacts(ctx context.Context, service *assistantactions.Service, grant assistanttools.Grant, app string) assistanttools.Response {
+	if service == nil || grant.SessionID == "" || grant.Actor == "" || !assistantToolID(app) || (!grant.Scope.Admin && grant.Scope.ApplicationID != app) {
+		return assistanttools.Response{Code: "forbidden"}
+	}
+	items, err := service.List(ctx, assistant.Actor{AdminID: domain.ID(grant.Actor)}, domain.ID(grant.SessionID))
+	if err != nil {
+		return assistanttools.Response{Code: "unavailable"}
+	}
+	selected := make([]assistantactions.Proposal, 0)
+	for _, item := range items {
+		if item.Target.ApplicationID.String() == app {
+			selected = append(selected, item)
+		}
+	}
+	raw, err := json.Marshal(map[string]any{"actions": selected})
+	if err != nil || len(raw) > assistanttools.MaxResult {
+		return assistanttools.Response{Code: "result_too_large"}
+	}
+	return assistanttools.Response{OK: true, Result: raw}
 }
 
 func assistantToolPath(tool, app, deployment, operation string) (string, string) {
@@ -123,7 +241,8 @@ func assistantToolPath(tool, app, deployment, operation string) (string, string)
 	case "acornfox_delivery_status":
 		return "/api/v1/acornfox/apps/" + e(app) + "/deliveries/" + e(deployment), http.MethodGet
 	case "acornfox_logs":
-		return "/api/v1/acornfox/apps/" + e(app) + "/deliveries/" + e(deployment) + "/logs", http.MethodGet
+		// One 8 KiB segment remains below the 64 KiB tool limit even after JSON escaping.
+		return "/api/v1/acornfox/apps/" + e(app) + "/deliveries/" + e(deployment) + "/logs?source=runtime&limit=1", http.MethodGet
 	case "acornfox_public_access":
 		return "/api/v1/acornfox/apps/" + e(app) + "/deliveries/" + e(deployment) + "/public-access", http.MethodGet
 	case "acornfox_access_observation":

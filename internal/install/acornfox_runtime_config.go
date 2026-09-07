@@ -378,7 +378,7 @@ func acornFoxRuntimeAuthority(ctx context.Context, store *TaskAcornFoxRepoStore,
 		return bad()
 	}
 	cp, err := ParseAcornFoxControlPlaneMigrationReceiptV1(cpRaw)
-	if err != nil || cp.BindingSHA256 != j.BindingSHA256 || cp.ReleaseID != id.ReleaseID || cp.SourceCommit != id.SourceCommit || cp.DatabaseIdentitySHA256 != acornFoxControlPlaneIdentitySHA256() {
+	if err != nil || cp.BindingSHA256 != j.BindingSHA256 || cp.ReleaseID != id.ReleaseID || cp.SourceCommit != id.SourceCommit {
 		return bad()
 	}
 	migrations, err := loadAcornFoxControlPlaneMigrations(store.layout, binding.binding)
@@ -386,7 +386,16 @@ func acornFoxRuntimeAuthority(ctx context.Context, store *TaskAcornFoxRepoStore,
 		return bad()
 	}
 	env, err := acornFoxRuntimeReadState(store, acornFoxControlPlaneStateEnv)
-	if err != nil || !validAcornFoxControlPlaneEnvironment(env) || sha256Hex(env) != cp.DatabaseEnvSHA256 {
+	expectedDatabase := acornFoxControlPlaneDatabase
+	if err == nil {
+		if observed, nameErr := acornFoxControlPlaneDatabaseName(env); nameErr == nil && observed != acornFoxControlPlaneDatabase {
+			expectedDatabase, nameErr = acornFoxExpectedCurrentDatabase(store, j.BindingSHA256)
+			if nameErr != nil || observed != expectedDatabase {
+				return bad()
+			}
+		}
+	}
+	if err != nil || !validAcornFoxBoundControlPlaneEnvironment(env, cp, expectedDatabase) {
 		return bad()
 	}
 	hostEnv, err := acornFoxRuntimeReadHost(root, store, store.layout.activationDir(a.ActivationID)+"/database.env", 0600, 16384)

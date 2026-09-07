@@ -94,19 +94,31 @@ type acornFoxAssistantWorkerConfig struct {
 }
 
 func acornFoxAssistantCanonicalConfig() []byte {
+	return acornFoxAssistantConfigJSON([]string{
+		"acornfox_host_metrics", "acornfox_list_apps", "acornfox_app", "acornfox_sources", "acornfox_deliveries",
+		"acornfox_delivery_status", "acornfox_logs", "acornfox_operation_result", "acornfox_public_access", "acornfox_access_observation", "acornfox_probe", "acornfox_propose_restart", "acornfox_propose_redeploy",
+		"acornfox_read_fix_source", "acornfox_create_fix_candidate",
+	}, 10)
+}
+
+func acornFoxAssistantLegacy0039Config() []byte {
+	return acornFoxAssistantConfigJSON([]string{
+		"acornfox_host_metrics", "acornfox_list_apps", "acornfox_app", "acornfox_sources", "acornfox_deliveries",
+		"acornfox_delivery_status", "acornfox_logs", "acornfox_operation_result", "acornfox_public_access", "acornfox_access_observation", "acornfox_probe", "acornfox_propose_restart", "acornfox_propose_redeploy",
+	}, 10)
+}
+
+func acornFoxAssistantConfigJSON(enabledTools []string, shutdownSeconds int) []byte {
 	raw, err := json.Marshal(acornFoxAssistantWorkerConfig{
 		SchemaVersion: 1, SocketPath: acornFoxAssistantSocket, SocketMode: "0660",
 		PiBinaryPath: "/opt/acornfox/current/pi/pi", WorkingDirectory: "/var/lib/acornfox/pi/work",
 		AgentDirectory: "/var/lib/acornfox/pi/agent", PersistSessions: true,
 		SessionRoot: "/var/lib/acornfox/pi/sessions", CredentialName: "deepseek_api_key",
 		Provider: "deepseek", Model: "deepseek-v4-flash", Thinking: "off",
-		TrustedExtensions: []string{"/opt/acornfox/current/pi/extensions/acornfox-tools.ts"},
-		EnabledTools: []string{
-			"acornfox_host_metrics", "acornfox_list_apps", "acornfox_app", "acornfox_sources", "acornfox_deliveries",
-			"acornfox_delivery_status", "acornfox_logs", "acornfox_operation_result", "acornfox_public_access", "acornfox_access_observation", "acornfox_probe", "acornfox_propose_restart", "acornfox_propose_redeploy",
-		},
+		TrustedExtensions:      []string{"/opt/acornfox/current/pi/extensions/acornfox-tools.ts"},
+		EnabledTools:           append([]string(nil), enabledTools...),
 		ToolCallbackSocket:     "/run/acornfox-assistant/tools.sock",
-		HandshakeTimeoutSecond: 5, RunTimeoutSecond: 300, ShutdownTimeoutSecond: 10,
+		HandshakeTimeoutSecond: 5, RunTimeoutSecond: 300, ShutdownTimeoutSecond: shutdownSeconds,
 	})
 	if err != nil {
 		panic("AcornFox assistant canonical config is not serializable")
@@ -308,11 +320,13 @@ func acornFoxAssistantValidateConfigurePrefix(root *os.Root, store *TaskAcornFox
 		}
 	}
 	config := acornFoxAssistantCanonicalConfig()
+	legacyConfig := acornFoxAssistantLegacy0039Config()
 	for _, pair := range []struct {
-		path string
-		raw  []byte
-	}{{acornFoxAssistantConfig, config}, {acornFoxAssistantConfigNew, config}, {acornFoxAssistantKeyNew, key}} {
-		if _, statErr := root.Lstat(pair.path); statErr == nil && !acornFoxLiveExactFileOwned(root, store, pair.path, pair.raw, 0600, principal, false) {
+		path      string
+		raw       []byte
+		alternate []byte
+	}{{acornFoxAssistantConfig, config, legacyConfig}, {acornFoxAssistantConfigNew, config, nil}, {acornFoxAssistantKeyNew, key, nil}} {
+		if _, statErr := root.Lstat(pair.path); statErr == nil && !acornFoxLiveExactFileOwned(root, store, pair.path, pair.raw, 0600, principal, false) && (len(pair.alternate) == 0 || !acornFoxLiveExactFileOwned(root, store, pair.path, pair.alternate, 0600, principal, false)) {
 			return ErrAcornFoxAssistantConfigConflict
 		} else if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
 			return ErrAcornFoxAssistantConfigConflict
@@ -388,10 +402,22 @@ func acornFoxAssistantConfigurationState(root *os.Root, store *TaskAcornFoxRepoS
 	return len(entries) != 0, nil
 }
 
+func acornFoxAssistantLegacy0039ConfigurationState(root *os.Root, store *TaskAcornFoxRepoStore) (bool, error) {
+	entries, err := acornFoxAssistantConfigScopeExpected(root, store, acornFoxAssistantLegacy0039Config())
+	if err != nil {
+		return false, err
+	}
+	return len(entries) != 0, nil
+}
+
 // acornFoxAssistantConfigScope is the only dynamic host-scope extension for
 // optional model configuration. Absence is valid; every present child is
 // closed-list validated and no prefix exemption is granted.
 func acornFoxAssistantConfigScope(root *os.Root, store *TaskAcornFoxRepoStore) ([]SubstrateEntry, error) {
+	return acornFoxAssistantConfigScopeExpected(root, store, acornFoxAssistantCanonicalConfig())
+}
+
+func acornFoxAssistantConfigScopeExpected(root *os.Root, store *TaskAcornFoxRepoStore, config []byte) ([]SubstrateEntry, error) {
 	principal, ok := store.layout.owner(AcornFoxLiveRootRole)
 	if !ok {
 		return nil, ErrAcornFoxAssistantConfigConflict
@@ -412,7 +438,6 @@ func acornFoxAssistantConfigScope(root *os.Root, store *TaskAcornFoxRepoStore) (
 	if readErr != nil || closeErr != nil || len(children) != 2 {
 		return nil, ErrAcornFoxAssistantConfigConflict
 	}
-	config := acornFoxAssistantCanonicalConfig()
 	if !acornFoxLiveExactFileOwned(root, store, acornFoxAssistantConfig, config, 0600, principal, false) {
 		return nil, ErrAcornFoxAssistantConfigConflict
 	}

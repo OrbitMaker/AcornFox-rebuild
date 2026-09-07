@@ -44,6 +44,8 @@ func (c *cli) command(args []string) error {
 		return c.publicAccess(args[1:])
 	case "delivery-source":
 		return c.deliverySource(args[1:])
+	case "fix-candidate":
+		return c.fixCandidate(args[1:])
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}

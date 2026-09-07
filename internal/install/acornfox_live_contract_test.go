@@ -5,6 +5,17 @@ import (
 	"testing"
 )
 
+func TestAcornFoxLegacy0034LiveRolesExcludePI(t *testing.T) {
+	for _, role := range acornFoxLegacy0034InstallLayoutRoles {
+		if !validAcornFoxLegacy0034LiveRole(role) {
+			t.Fatalf("legacy role rejected: %s", role)
+		}
+	}
+	if validAcornFoxLegacy0034LiveRole(AcornFoxLivePIRole) || !validAcornFoxLiveRole(AcornFoxLivePIRole) {
+		t.Fatal("legacy/current PI role boundary is not exact")
+	}
+}
+
 func TestAcornFoxLiveReceiptIsCanonicalAndSymbolic(t *testing.T) {
 	_, _, published, substrate := newAcornFox03CPublished(t)
 	entries, err := acornFoxLiveExpectedEntries(published)

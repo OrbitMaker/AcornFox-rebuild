@@ -6,6 +6,8 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"time"
 
@@ -109,6 +111,7 @@ func runOutboundAgent(controlPlaneURL, instanceID, nodeID, version string, envir
 	var volumeRuntime contracts.VolumeProvider
 	var acornFoxRuntime contracts.AcornFoxRuntimeDriver
 	var acornFoxProber acornFoxRuntimeProber
+	var acornFoxCandidateRuntime AcornFoxCandidateRuntime
 	capabilities := []string{"docker.read.facts"}
 	if getenv(acornfoxenv.RuntimeEnabled) == "true" {
 		if getenv(acornfoxenv.WorkerNetworkIsolated) != "true" {
@@ -159,6 +162,27 @@ func runOutboundAgent(controlPlaneURL, instanceID, nodeID, version string, envir
 			log.Fatal(storeErr)
 		}
 		capabilities = append(capabilities, runtimeCapabilities...)
+		candidateWorkRoot := filepath.Join(getenv(acornfoxenv.RuntimeWorkRoot), "candidates")
+		if err := os.MkdirAll(candidateWorkRoot, 0o700); err != nil {
+			log.Fatal("candidate runtime work root is unavailable")
+		}
+		candidateProvider, candidateErr := standalone.New(standalone.Config{TaskPrefix: getenv(acornfoxenv.RuntimeTaskPrefix) + "-candidate", WorkRoot: candidateWorkRoot, ImageStore: store, Capacity: capacityProvider, WorkerNetworkIsolated: false})
+		if candidateErr != nil || candidateProvider.Reconcile(context.Background()) != nil {
+			log.Fatal("candidate runtime is unavailable")
+		}
+		candidateProber, candidateErr := acornfoxprobe.New(acornfoxprobe.DefaultConfig(), time.Now)
+		if candidateErr != nil {
+			log.Fatal("candidate runtime probe is unavailable")
+		}
+		candidateInspector, candidateErr := newUnixAcornFoxCandidateContainerInspector(socketPath)
+		if candidateErr != nil {
+			log.Fatal("candidate runtime inspector is unavailable")
+		}
+		acornFoxCandidateRuntime, candidateErr = newAcornFoxCandidateRuntimeAdapter(candidateProvider, candidateProber, candidateInspector)
+		if candidateErr != nil {
+			log.Fatal("candidate runtime adapter is unavailable")
+		}
+		capabilities = append(capabilities, v1.AgentCapabilityAcornFoxCandidateValidation)
 		if getenv(acornfoxenv.M2Enabled) == "true" {
 			var metricsReader standalonegroup.RuntimeMetricsReader
 			if getenv(acornfoxenv.M4Enabled) == "true" {
@@ -184,6 +208,7 @@ func runOutboundAgent(controlPlaneURL, instanceID, nodeID, version string, envir
 		}
 	}
 	handler := NewOutboundHandlerWithAcornFoxProbe(instanceID, nodeID, facts, runtime, groupRuntime, volumeRuntime, acornFoxRuntime, acornFoxProber)
+	handler = WithAcornFoxCandidateRuntime(handler, acornFoxCandidateRuntime)
 	certificateID := ""
 	if len(tlsConfig.Certificates) == 1 && len(tlsConfig.Certificates[0].Certificate) > 0 {
 		certificate, parseErr := x509.ParseCertificate(tlsConfig.Certificates[0].Certificate[0])

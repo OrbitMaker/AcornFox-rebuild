@@ -74,6 +74,30 @@ func substrateReceiptFixture() InactiveSubstrateReceiptV1 {
 	return receipt
 }
 
+func TestAcornFoxLegacy0034SubstratePolicyIsFrozenBeforePI(t *testing.T) {
+	legacy := map[string]bool{}
+	for _, file := range acornFoxLegacy0034RequiredFiles() {
+		legacy[file.Path] = true
+	}
+	for _, absent := range []string{"bin/acornfox-pi-worker", "systemd/acornfox-pi-worker.service", "systemd/acornfox-runtime-network.service", "migrations/control-plane/0035_acornfox_source_metadata.sql", "pi/extensions/acornfox-tools.ts"} {
+		if legacy[absent] {
+			t.Fatalf("legacy 0034 policy accepted %s", absent)
+		}
+	}
+	for _, present := range []string{"bin/acornfox-server", "systemd/acornfox-upgrade-finalize.service", "migrations/control-plane/0034_artifacts_per_build.sql", "source-manifest.sha256"} {
+		if !legacy[present] {
+			t.Fatalf("legacy 0034 policy omitted %s", present)
+		}
+	}
+	candidate := substrateReceiptFixture().CandidateReceipt
+	fixed := acornFoxLegacy0034FixedSubstrateEntries(candidate)
+	for _, absent := range []string{"var/lib/acornfox/pi", "etc/systemd/system/acornfox-pi-worker.service", "etc/systemd/system/acornfox-runtime-network.service"} {
+		if _, ok := fixed[absent]; ok {
+			t.Fatalf("legacy 0034 fixed set accepted %s", absent)
+		}
+	}
+}
+
 func TestInactiveSubstrateReceiptV1CanonicalAndSecretFree(t *testing.T) {
 	receipt := substrateReceiptFixture()
 	raw, err := MarshalInactiveSubstrateReceiptV1(receipt)

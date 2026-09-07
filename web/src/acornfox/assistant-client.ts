@@ -19,7 +19,7 @@ export interface AcornFoxAssistantClient {
   sessions(): Promise<AssistantSession[]>;
   createSession(scope: AssistantScope): Promise<AssistantSession>;
   submitRun(sessionId: string, message: string, idempotencyKey: string): Promise<AssistantSubmitResult>;
-  events(sessionId: string, after: number): Promise<AssistantSnapshot>;
+  events(sessionId: string, after: number, signal?: AbortSignal): Promise<AssistantSnapshot>;
   streamEvents(sessionId: string, after: number, handlers: { onEvent: (event: AssistantEvent) => void; onStatus: (status: AssistantStreamStatus) => void; signal?: AbortSignal }): Promise<void>;
   abort(sessionId: string): Promise<{ aborted: number }>;
   actions(sessionId: string): Promise<AssistantProposal[]>;
@@ -62,7 +62,7 @@ export function createAcornFoxAssistantClient(fetcher: Fetcher = fetch): AcornFo
     sessions: () => request("/sessions", (value) => { const row = exact(value, ["sessions"]); return Array.isArray(row.sessions) ? row.sessions.map(session) : invalid(); }),
     createSession: (value) => request("/sessions", session, { method: "POST", body: JSON.stringify({ scope: value.kind === "host" ? { kind: "host" } : { kind: "app", app_id: value.appId } }) }, [201]),
     submitRun: (sessionId, message, idempotencyKey) => { if (!message.trim() || !idempotencyKey) throw new AcornFoxRequestError(422, "invalid_input", "消息和重试标识不能为空。"); return request(`/sessions/${escapePath(sessionId)}/runs`, submit, { method: "POST", body: JSON.stringify({ message: message.trim(), idempotency_key: idempotencyKey }) }, [200, 202]); },
-    events: (sessionId, after) => { if (!Number.isInteger(after) || after < 0) throw new AcornFoxRequestError(422, "invalid_input", "事件游标无效。"); return request(`/sessions/${escapePath(sessionId)}/events?after=${after}`, snapshot, {}, [200, 409]); },
+    events: (sessionId, after, signal) => { if (!Number.isInteger(after) || after < 0) throw new AcornFoxRequestError(422, "invalid_input", "事件游标无效。"); return request(`/sessions/${escapePath(sessionId)}/events?after=${after}`, snapshot, { signal }, [200, 409]); },
     streamEvents: async (sessionId, after, handlers) => {
       if (!Number.isInteger(after) || after < 0) throw new AcornFoxRequestError(422, "invalid_input", "事件游标无效。");
       let response: Response; try { response = await fetcher(`${base}/sessions/${escapePath(sessionId)}/events?after=${after}`, { headers: { Accept: "text/event-stream", "Last-Event-ID": String(after) }, credentials: "include", redirect: "error", signal: handlers.signal }); } catch { if (handlers.signal?.aborted) return; throw new AcornFoxRequestError(undefined, "network_error", "事件流已断开。"); }

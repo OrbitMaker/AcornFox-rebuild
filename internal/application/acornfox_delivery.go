@@ -33,6 +33,7 @@ type AcornFoxDockerfileImporter interface {
 // queues a second deployment.
 type AcornFoxDeliveryIdempotencyStore interface {
 	BeginAcornFoxDelivery(context.Context, string, string, time.Time) (AcornFoxDeliveryResult, bool, error)
+	ReplayAcornFoxDelivery(context.Context, string, string) (AcornFoxDeliveryResult, bool, error)
 	FailAcornFoxDelivery(context.Context, string, string, string, time.Time) error
 }
 
@@ -168,7 +169,7 @@ func (service *AcornFoxDeliveryService) Create(ctx context.Context, request Acor
 		return replay, nil
 	}
 
-	result, err := service.create(ctx, request, now, func(queued AcornFoxQueuedTask, result AcornFoxDeliveryResult) error {
+	result, err := service.create(ctx, request, nil, now, func(queued AcornFoxQueuedTask, result AcornFoxDeliveryResult) error {
 		return service.Tasks.CommitAcornFoxDeliveryTask(ctx, queued, request.IdempotencyKey, digest, result, service.now())
 	})
 	if err != nil {
@@ -177,7 +178,44 @@ func (service *AcornFoxDeliveryService) Create(ctx context.Context, request Acor
 	return result, nil
 }
 
-func (service *AcornFoxDeliveryService) create(ctx context.Context, request AcornFoxDeliveryCreateRequest, now time.Time, commit func(AcornFoxQueuedTask, AcornFoxDeliveryResult) error) (AcornFoxDeliveryResult, error) {
+// CreateVerifiedCandidate enters the normal release path only after W10 has
+// matched a W05-imported source. The release-time BuildKit result must equal
+// the OCI digest that passed isolated candidate runtime validation.
+func (service *AcornFoxDeliveryService) CreateVerifiedCandidate(ctx context.Context, request AcornFoxDeliveryCreateRequest, expectedImage domain.ImageDigest) (AcornFoxDeliveryResult, error) {
+	if err := service.readyForCreate(); err != nil {
+		return AcornFoxDeliveryResult{}, err
+	}
+	if err := validateAcornFoxDeliveryCreate(request); err != nil || expectedImage.Validate() != nil {
+		return AcornFoxDeliveryResult{}, domain.ValidationError("verified candidate delivery is invalid")
+	}
+	now := service.now()
+	digest := acornFoxDeliveryDigest("verified-candidate", request.ApplicationID.String(), request.SourceRevisionID.String(), fmt.Sprint(request.ContainerPort), expectedImage.Repository, expectedImage.Digest, strings.TrimSpace(service.Config.TargetRepository), strings.TrimSpace(service.Config.StorageKeyPrefix))
+	if replay, found, err := service.Idempotency.BeginAcornFoxDelivery(ctx, request.IdempotencyKey, digest, now); err != nil {
+		return AcornFoxDeliveryResult{}, err
+	} else if found {
+		return replay, nil
+	}
+	result, err := service.create(ctx, request, &expectedImage, now, func(queued AcornFoxQueuedTask, result AcornFoxDeliveryResult) error {
+		return service.Tasks.CommitAcornFoxDeliveryTask(ctx, queued, request.IdempotencyKey, digest, result, service.now())
+	})
+	if err != nil {
+		return AcornFoxDeliveryResult{}, service.failDelivery(ctx, request.IdempotencyKey, digest, err)
+	}
+	return result, nil
+}
+
+// ReplayVerifiedCandidate is read-only. It never reserves a publish key, so an
+// expired candidate can confirm a previously accepted delivery without
+// opening a path to new build or runtime work.
+func (service *AcornFoxDeliveryService) ReplayVerifiedCandidate(ctx context.Context, request AcornFoxDeliveryCreateRequest, expectedImage domain.ImageDigest) (AcornFoxDeliveryResult, bool, error) {
+	if err := validateAcornFoxDeliveryCreate(request); err != nil || expectedImage.Validate() != nil || service == nil || service.Idempotency == nil {
+		return AcornFoxDeliveryResult{}, false, domain.ValidationError("verified candidate delivery replay is invalid")
+	}
+	digest := acornFoxDeliveryDigest("verified-candidate", request.ApplicationID.String(), request.SourceRevisionID.String(), fmt.Sprint(request.ContainerPort), expectedImage.Repository, expectedImage.Digest, strings.TrimSpace(service.Config.TargetRepository), strings.TrimSpace(service.Config.StorageKeyPrefix))
+	return service.Idempotency.ReplayAcornFoxDelivery(ctx, request.IdempotencyKey, digest)
+}
+
+func (service *AcornFoxDeliveryService) create(ctx context.Context, request AcornFoxDeliveryCreateRequest, expectedImage *domain.ImageDigest, now time.Time, commit func(AcornFoxQueuedTask, AcornFoxDeliveryResult) error) (AcornFoxDeliveryResult, error) {
 	source, err := service.Sources.GetSourceRevision(ctx, request.SourceRevisionID)
 	if err != nil {
 		return AcornFoxDeliveryResult{}, err
@@ -260,6 +298,9 @@ func (service *AcornFoxDeliveryService) create(ctx context.Context, request Acor
 	}
 	if built.Artifact == nil || built.Build.ID != build.ID || built.Build.PlanID != plan.ID || built.Build.Status != domain.BuildSucceeded || built.Artifact.BuildID != build.ID {
 		return AcornFoxDeliveryResult{}, service.failBuild(ctx, build.ID, errors.New("AcornFox build provider returned an unbound or unsuccessful result"))
+	}
+	if expectedImage != nil && built.Artifact.Image != *expectedImage {
+		return AcornFoxDeliveryResult{}, service.failBuild(ctx, build.ID, ErrAcornFoxFixCandidateMismatch)
 	}
 	releaseVersion, err := service.Sources.NextAcornFoxReleaseVersion(ctx, request.ApplicationID)
 	if err != nil || releaseVersion < 1 {

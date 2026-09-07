@@ -116,7 +116,7 @@ func (u *acornFoxUpgrade) atomicFileOwned(s *TaskAcornFoxRepoStore, root *os.Roo
 		if !safe && path == acornFoxUpgradeJournalPath {
 			var j acornFoxUpgradeJournal
 			if json.Unmarshal(next, &j) == nil {
-				for _, phase := range []string{"PREPARED", "BLOCKED", "PUBLISHED", "SWITCHED", "UPGRADED", "ROLLING_BACK", "RECOVERY_PREPARED", "ROLLED_BACK"} {
+				for _, phase := range []string{"PREPARED", "BLOCKED", "QUIESCED", "SNAPSHOT_CREATED", "MIGRATED", "VALIDATED", "PUBLISHED", "SWITCHED", "UPGRADED", "ROLLING_BACK", "RECOVERY_PREPARED", "ROLLED_BACK"} {
 					j.Phase = phase
 					if bytes.HasPrefix(acornFoxUpgradeJSON(j), partial) {
 						safe = true
@@ -337,6 +337,38 @@ func (u *acornFoxUpgrade) stage(ctx context.Context, s *TaskAcornFoxRepoStore, s
 }
 func (u *acornFoxUpgrade) openSubstrate(root *os.Root, image acornFoxUpgradeImage) (*PublishedAcornFoxSubstrateV1, error) {
 	h := &PublishedAcornFoxSubstrateV1{root: root, receipt: image.Substrate, uid: u.layout.stateOwner.uid, gid: u.layout.stateOwner.gid, layout: u.layout, fs: newAcornFoxSubstrateFS()}
+	if image.Substrate.CandidateReceipt.MigrationVersion == AcornFoxLegacyPredecessorMigration {
+		binding, err := verifiedAcornFoxUpgradePredecessor(image.Binding, image.Repo.BindingSHA256)
+		if err != nil || validateAcornFoxLegacy0034SubstrateReceipt(image.Substrate, binding.binding, binding.digest) != nil {
+			root.Close()
+			return nil, ErrAcornFoxUpgradeConflict
+		}
+		for _, entry := range image.Substrate.Entries {
+			if entry.Kind == SubstrateEntryFile {
+				if _, err := acornFoxLiveReadSource(root, h, entry); err != nil {
+					root.Close()
+					return nil, ErrAcornFoxUpgradeConflict
+				}
+			}
+		}
+		return h, nil
+	}
+	if image.Substrate.CandidateReceipt.MigrationVersion == acornFoxRecentPredecessorMigration && AcornFoxV1MigrationVersion != acornFoxRecentPredecessorMigration {
+		binding, err := verifiedAcornFoxUpgradePredecessor(image.Binding, image.Repo.BindingSHA256)
+		if err != nil || validateAcornFoxRecent0039SubstrateReceipt(image.Substrate, binding.binding, binding.digest) != nil {
+			root.Close()
+			return nil, ErrAcornFoxUpgradeConflict
+		}
+		for _, entry := range image.Substrate.Entries {
+			if entry.Kind == SubstrateEntryFile {
+				if _, err := acornFoxLiveReadSource(root, h, entry); err != nil {
+					root.Close()
+					return nil, ErrAcornFoxUpgradeConflict
+				}
+			}
+		}
+		return h, nil
+	}
 	if e := h.Verify(); e != nil {
 		root.Close()
 		return nil, ErrAcornFoxUpgradeConflict
@@ -512,6 +544,11 @@ func (u *acornFoxUpgrade) imageFiles(s *TaskAcornFoxRepoStore, j acornFoxUpgrade
 	files := map[string][]byte{}
 	modes := map[string]os.FileMode{}
 	entries, e := acornFoxLiveExpectedEntriesForLayout(u.layout, h)
+	if image.Substrate.CandidateReceipt.MigrationVersion == AcornFoxLegacyPredecessorMigration {
+		entries, e = acornFoxLegacy0034ExpectedEntries(u.layout, image.Substrate)
+	} else if image.Substrate.CandidateReceipt.MigrationVersion == acornFoxRecentPredecessorMigration && AcornFoxV1MigrationVersion != acornFoxRecentPredecessorMigration {
+		entries, e = acornFoxRecent0039ExpectedEntries(u.layout, image.Substrate)
+	}
 	if e != nil {
 		return nil, nil, e
 	}
@@ -533,12 +570,23 @@ func (u *acornFoxUpgrade) imageFiles(s *TaskAcornFoxRepoStore, j acornFoxUpgrade
 	}
 	files[state+"bindings/"+image.Repo.BindingSHA256+".json"] = image.Binding
 	modes[state+"bindings/"+image.Repo.BindingSHA256+".json"] = 0600
-	env, e := u.read(s.root, acornFoxControlPlaneStateEnv, 0600, 16384)
-	if e != nil || sha256Hex(env) != image.ControlPlane.DatabaseEnvSHA256 {
+	env := bytes.Clone(image.DatabaseEnv)
+	if len(env) == 0 {
+		env, e = u.read(s.root, acornFoxControlPlaneStateEnv, 0600, 16384)
+		if e != nil {
+			return nil, nil, ErrAcornFoxUpgradeConflict
+		}
+	}
+	database, databaseErr := acornFoxControlPlaneDatabaseName(env)
+	if databaseErr != nil || !validAcornFoxBoundControlPlaneEnvironment(env, image.ControlPlane, database) {
 		return nil, nil, ErrAcornFoxUpgradeConflict
 	}
 	files[u.layout.activationDir(image.Activation.ActivationID)+"/database.env"] = env
 	modes[u.layout.activationDir(image.Activation.ActivationID)+"/database.env"] = 0600
+	if len(image.DatabaseEnv) != 0 {
+		files[state+acornFoxControlPlaneStateEnv] = env
+		modes[state+acornFoxControlPlaneStateEnv] = 0600
+	}
 	for _, f := range image.Runtime.Files {
 		p := strings.TrimPrefix(f.Path, "/")
 		files[p] = f.Data

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -214,6 +215,40 @@ type apiSourceUpdate struct {
 	SourceRevisionID string `json:"source_revision_id"`
 	Status           string `json:"status"`
 }
+type apiFixCandidateRuntime struct {
+	TaskID           string   `json:"task_id"`
+	Image            apiImage `json:"image"`
+	RuntimeState     string   `json:"runtime_state"`
+	ProbeOutcome     string   `json:"probe_outcome"`
+	HTTPStatus       *int     `json:"http_status,omitempty"`
+	CleanupConfirmed *bool    `json:"cleanup_confirmed"`
+	EvidenceDigest   string   `json:"evidence_digest"`
+}
+type apiFixCandidate struct {
+	CandidateID             string                 `json:"candidate_id"`
+	ApplicationID           string                 `json:"application_id"`
+	BaseSourceRevisionID    string                 `json:"base_source_revision_id"`
+	BaseRepositoryURL       string                 `json:"base_repository_url"`
+	BaseCommit              string                 `json:"base_commit"`
+	BaseTreeDigest          string                 `json:"base_tree_digest"`
+	PatchDigest             string                 `json:"patch_digest"`
+	ResultTreeDigest        string                 `json:"result_tree_digest"`
+	ContainerPort           int                    `json:"container_port"`
+	ChangedPaths            []string               `json:"changed_paths"`
+	CanonicalDiff           string                 `json:"canonical_diff"`
+	ValidatedImage          apiImage               `json:"validated_image"`
+	BuildLogRef             string                 `json:"build_log_ref"`
+	BuildEvidenceDigest     string                 `json:"build_evidence_digest"`
+	Runtime                 apiFixCandidateRuntime `json:"runtime"`
+	MatchedSourceRevisionID *string                `json:"matched_source_revision_id,omitempty"`
+	MatchedCommit           *string                `json:"matched_commit,omitempty"`
+	Status                  string                 `json:"status"`
+	CreatedAt               time.Time              `json:"created_at"`
+	ExpiresAt               time.Time              `json:"expires_at"`
+}
+type apiFixCandidates struct {
+	Items []apiFixCandidate `json:"items"`
+}
 
 func decodeResponse(body io.Reader, shape responseShape) (any, error) {
 	data, err := io.ReadAll(io.LimitReader(body, maxResponseBytes+1))
@@ -275,6 +310,12 @@ func decodeResponse(body io.Reader, shape responseShape) (any, error) {
 	case shapeSourceUpdate:
 		var v apiSourceUpdate
 		return decodeTyped(data, &v, validateSourceUpdate)
+	case shapeFixCandidate:
+		var v apiFixCandidate
+		return decodeTyped(data, &v, validateFixCandidate)
+	case shapeFixCandidateList:
+		var v apiFixCandidates
+		return decodeTyped(data, &v, validateFixCandidates)
 	}
 	return nil, invalidResponse("server response is invalid")
 }
@@ -327,6 +368,9 @@ func optionalNonNullableNull(data []byte, shape responseShape) bool {
 		}
 		var evidence map[string]json.RawMessage
 		return json.Unmarshal(raw, &evidence) != nil || nullField(evidence, "http_status")
+	}
+	if shape == shapeFixCandidate {
+		return nullField(object, "matched_source_revision_id", "matched_commit")
 	}
 	if shape == shapeHostMetrics {
 		if nullField(object, "observed_at", "cpu", "memory", "disk", "network") {
@@ -404,6 +448,28 @@ func requiredResponseFields(data []byte, shape responseShape) bool {
 		keys = []string{"operation_id", "operation_type", "status", "accepted_at", "updated_at"}
 	case shapeSourceUpdate:
 		keys = []string{"source_revision_id", "status"}
+	case shapeFixCandidate:
+		var status string
+		_ = json.Unmarshal(object["status"], &status)
+		if status == "preparing" || status == "failed" {
+			keys = []string{"candidate_id", "application_id", "base_source_revision_id", "status", "created_at"}
+			if len(object) != len(keys) {
+				return false
+			}
+		} else {
+			keys = []string{"candidate_id", "application_id", "base_source_revision_id", "base_repository_url", "base_commit", "base_tree_digest", "patch_digest", "result_tree_digest", "container_port", "changed_paths", "canonical_diff", "validated_image", "build_log_ref", "build_evidence_digest", "runtime", "status", "created_at", "expires_at"}
+		}
+	case shapeFixCandidateList:
+		keys = []string{"items"}
+		var items []json.RawMessage
+		if json.Unmarshal(object["items"], &items) != nil || len(items) > 50 {
+			return false
+		}
+		for _, item := range items {
+			if !requiredResponseFields(item, shapeFixCandidate) {
+				return false
+			}
+		}
 	}
 	for _, key := range keys {
 		raw, ok := object[key]
@@ -597,5 +663,64 @@ func validateOperationEvidence(v *apiOperationEvidence) bool {
 }
 func validateSourceUpdate(v *apiSourceUpdate) bool {
 	return nonempty(v.SourceRevisionID) && v.Status == "imported"
+}
+func validateFixCandidate(v *apiFixCandidate) bool {
+	if !validCandidateCLIIdentity(v.CandidateID) || !nonempty(v.ApplicationID, v.BaseSourceRevisionID) || !validTime(v.CreatedAt) {
+		return false
+	}
+	if v.Status == "preparing" || v.Status == "failed" {
+		return v.BaseRepositoryURL == "" && v.BaseCommit == "" && v.BaseTreeDigest == "" && v.PatchDigest == "" && v.ResultTreeDigest == "" && v.ContainerPort == 0 && len(v.ChangedPaths) == 0 && v.CanonicalDiff == "" && v.ValidatedImage == (apiImage{}) && v.BuildLogRef == "" && v.BuildEvidenceDigest == "" && v.Runtime == (apiFixCandidateRuntime{}) && v.MatchedSourceRevisionID == nil && v.MatchedCommit == nil && v.ExpiresAt.IsZero()
+	}
+	if !nonempty(v.BaseRepositoryURL, v.BaseCommit, v.CanonicalDiff, v.BuildLogRef, v.Runtime.TaskID) || v.ContainerPort < 1 || v.ContainerPort > 65535 || len(v.ChangedPaths) < 1 || len(v.ChangedPaths) > 32 || !v.ExpiresAt.After(v.CreatedAt) {
+		return false
+	}
+	parsed, err := url.Parse(v.BaseRepositoryURL)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || !validCLIHash(v.BaseTreeDigest) || !validCLIHash(v.PatchDigest) || !validCLIHash(v.ResultTreeDigest) || !validCLIHash(v.BuildEvidenceDigest) || !validCLIHash(v.Runtime.EvidenceDigest) || !validCLIHash(v.ValidatedImage.Digest) || v.Runtime.Image != v.ValidatedImage || v.Runtime.RuntimeState != "stopped" || v.Runtime.ProbeOutcome != "responded" || v.Runtime.CleanupConfirmed == nil || !*v.Runtime.CleanupConfirmed {
+		return false
+	}
+	seen := map[string]bool{}
+	for _, path := range v.ChangedPaths {
+		if path == "" || seen[path] {
+			return false
+		}
+		seen[path] = true
+	}
+	if v.Status == "validated" {
+		return v.MatchedSourceRevisionID == nil && v.MatchedCommit == nil
+	}
+	return v.Status == "source_matched" && v.MatchedSourceRevisionID != nil && *v.MatchedSourceRevisionID != "" && v.MatchedCommit != nil && *v.MatchedCommit != ""
+}
+func validateFixCandidates(v *apiFixCandidates) bool {
+	if v.Items == nil || len(v.Items) > 50 {
+		return false
+	}
+	for index := range v.Items {
+		if !validateFixCandidate(&v.Items[index]) {
+			return false
+		}
+	}
+	return true
+}
+func validCandidateCLIIdentity(value string) bool {
+	if len(value) != len("candidate_")+32 || !strings.HasPrefix(value, "candidate_") {
+		return false
+	}
+	for _, character := range value[len("candidate_"):] {
+		if !(character >= '0' && character <= '9' || character >= 'a' && character <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+func validCLIHash(value string) bool {
+	if len(value) != 71 || !strings.HasPrefix(value, "sha256:") {
+		return false
+	}
+	for _, character := range value[7:] {
+		if !(character >= '0' && character <= '9' || character >= 'a' && character <= 'f') {
+			return false
+		}
+	}
+	return true
 }
 func validTimePointer(value *time.Time) bool { return value != nil && validTime(*value) }

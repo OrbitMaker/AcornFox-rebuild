@@ -3,6 +3,7 @@ package install
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"os"
 	"path/filepath"
@@ -411,6 +412,41 @@ func TestAcornFoxControlPlaneEnvironmentRejectsKeyAndQueryDrift(t *testing.T) {
 	} {
 		if validAcornFoxControlPlaneEnvironment(raw) {
 			t.Fatalf("drift accepted: %q", raw)
+		}
+	}
+}
+
+func TestAcornFoxShadowEnvironmentRequiresExactReceiptIdentity(t *testing.T) {
+	password := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x42}, 32))
+	base := []byte("ACORNFOX_DATABASE_URL=postgresql://acornfox:" + password + "@127.0.0.1:5432/acornfox?sslmode=disable\n")
+	shadow := "acornfox_upg_0123456789abcdef0123"
+	environment, err := acornFoxControlPlaneEnvironmentForDatabase(base, shadow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := AcornFoxControlPlaneMigrationReceiptV1{
+		SchemaVersion: 1, State: "CONTROL_PLANE_MIGRATED", BindingSHA256: strings.Repeat("a", 64),
+		ReleaseID: "release-1.2.4", SourceCommit: strings.Repeat("b", 40), MigrationVersion: AcornFoxV1MigrationVersion,
+		MigrationRowsSHA256: strings.Repeat("c", 64), DatabaseEnvSHA256: sha256Bytes(environment),
+		DatabaseIdentitySHA256: acornFoxControlPlaneIdentitySHA256ForDatabase(shadow),
+	}
+	if !validAcornFoxBoundControlPlaneEnvironment(environment, receipt, shadow) {
+		t.Fatal("exact shadow receipt was rejected")
+	}
+	for _, mutate := range []func(*AcornFoxControlPlaneMigrationReceiptV1, *string){
+		func(r *AcornFoxControlPlaneMigrationReceiptV1, _ *string) {
+			r.DatabaseIdentitySHA256 = acornFoxControlPlaneIdentitySHA256()
+		},
+		func(r *AcornFoxControlPlaneMigrationReceiptV1, _ *string) { r.DatabaseEnvSHA256 = sha256Bytes(base) },
+		func(_ *AcornFoxControlPlaneMigrationReceiptV1, database *string) {
+			*database = "acornfox_upg_ffffffffffffffffffff"
+		},
+	} {
+		forged := receipt
+		expected := shadow
+		mutate(&forged, &expected)
+		if validAcornFoxBoundControlPlaneEnvironment(environment, forged, expected) {
+			t.Fatal("forged shadow receipt was accepted")
 		}
 	}
 }

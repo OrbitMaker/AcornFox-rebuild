@@ -55,6 +55,31 @@ func TestAcornFoxDeliveryUsesOnlyTrustedCompositionNetworkPolicy(t *testing.T) {
 	}
 }
 
+func TestAcornFoxVerifiedCandidateRequiresReleaseTimeImageIdentity(t *testing.T) {
+	fixture := newAcornFoxDeliveryFixture(t)
+	request := AcornFoxDeliveryCreateRequest{ApplicationID: fixture.source.ApplicationID, SourceRevisionID: fixture.source.ID, ContainerPort: 8080, IdempotencyKey: "candidate-publish", Actor: "admin"}
+	actual := domain.ImageDigest{Repository: "registry.example/acornfox/web", Digest: "sha256:" + strings.Repeat("d", 64)}
+	result, err := fixture.service.CreateVerifiedCandidate(context.Background(), request, actual)
+	if err != nil || result.Status != "accepted" || len(fixture.tasks) != 1 || fixture.completedBuilds != 1 {
+		t.Fatalf("matching result=%+v tasks=%d completed=%d err=%v", result, len(fixture.tasks), fixture.completedBuilds, err)
+	}
+	if replay, found, err := fixture.service.ReplayVerifiedCandidate(context.Background(), request, actual); err != nil || !found || replay != result || len(fixture.tasks) != 1 || fixture.buildProvider.calls != 1 {
+		t.Fatalf("replay=%+v found=%v tasks=%d builds=%d err=%v", replay, found, len(fixture.tasks), fixture.buildProvider.calls, err)
+	}
+	missing := request
+	missing.IdempotencyKey = "candidate-publish-missing"
+	requestsBefore := len(fixture.requests)
+	if replay, found, err := fixture.service.ReplayVerifiedCandidate(context.Background(), missing, actual); err != nil || found || replay != (AcornFoxDeliveryResult{}) || len(fixture.requests) != requestsBefore {
+		t.Fatalf("missing replay=%+v found=%v requests=%d err=%v", replay, found, len(fixture.requests), err)
+	}
+
+	fixture = newAcornFoxDeliveryFixture(t)
+	mismatch := domain.ImageDigest{Repository: actual.Repository, Digest: "sha256:" + strings.Repeat("e", 64)}
+	if _, err := fixture.service.CreateVerifiedCandidate(context.Background(), request, mismatch); err == nil || len(fixture.tasks) != 0 || fixture.completedBuilds != 0 || fixture.failedBuilds != 1 {
+		t.Fatalf("mismatch tasks=%d completed=%d failed=%d err=%v", len(fixture.tasks), fixture.completedBuilds, fixture.failedBuilds, err)
+	}
+}
+
 func TestAcornFoxDeliveryProviderFailureDoesNotQueueRuntimeTask(t *testing.T) {
 	fixture := newAcornFoxDeliveryFixture(t)
 	fixture.buildProvider.err = errors.New("build failed")
@@ -191,6 +216,20 @@ func (f *acornFoxDeliveryFixture) BeginAcornFoxDelivery(_ context.Context, key, 
 	}
 	f.requests[key] = acornFoxDeliveryCommandRecord{digest: digest, status: "pending"}
 	return AcornFoxDeliveryResult{}, false, nil
+}
+
+func (f *acornFoxDeliveryFixture) ReplayAcornFoxDelivery(_ context.Context, key, digest string) (AcornFoxDeliveryResult, bool, error) {
+	prior, ok := f.requests[key]
+	if !ok {
+		return AcornFoxDeliveryResult{}, false, nil
+	}
+	if prior.digest != digest {
+		return AcornFoxDeliveryResult{}, false, ErrIdempotencyConflict
+	}
+	if prior.status != "completed" {
+		return AcornFoxDeliveryResult{}, false, errors.New("previous command is not complete")
+	}
+	return prior.result, true, nil
 }
 
 func (f *acornFoxDeliveryFixture) FailAcornFoxDelivery(_ context.Context, key, digest, _ string, _ time.Time) error {

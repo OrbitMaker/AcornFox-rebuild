@@ -375,6 +375,9 @@ func TestAcornFoxListenerParityAndCollisionBoundary(t *testing.T) {
 	if !strings.Contains(string(internal), "trusted_proxies 127.0.0.1/32") || strings.Contains(string(internal), "trusted_proxies private_ranges") {
 		t.Fatal("the internal proxy must preserve the Edge scheme only from its exact loopback peer")
 	}
+	if !strings.Contains(string(internal), "\n\tbind 127.0.0.1\n") {
+		t.Fatal("the internal proxy must bind to loopback explicitly; a site hostname only restricts Host matching")
+	}
 	edge, err := os.ReadFile(filepath.Join(acornFoxDeployRoot(t), "caddy", "acornfox-edge.Caddyfile.example"))
 	if err != nil {
 		t.Fatal(err)

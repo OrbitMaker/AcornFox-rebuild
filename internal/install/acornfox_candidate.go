@@ -17,8 +17,8 @@ import (
 const (
 	AcornFoxV1Product          = "acornfox"
 	AcornFoxV1Architecture     = "amd64"
-	AcornFoxV1MigrationVersion = "0039"
-	AcornFoxV1DataVersion      = 39
+	AcornFoxV1MigrationVersion = "0040"
+	AcornFoxV1DataVersion      = 40
 	AcornFoxV1InstallPrefix    = "/opt/acornfox"
 	AcornFoxV1ConfigDir        = "/etc/acornfox"
 	AcornFoxV1DataDir          = "/var/lib/acornfox"
@@ -77,6 +77,7 @@ var (
 		"0028_acornfox_log_metadata.sql", "0029_acornfox_log_provenance.sql", "0030_dns_change_provider_neutral.sql",
 		"0031_acornfox_public_access.sql", "0032_dns_change_execution.sql", "0033_acornfox_discovery_task_lookup.sql",
 		"0034_artifacts_per_build.sql", "0035_acornfox_source_metadata.sql", "0036_acornfox_source_updates.sql", "0037_acornfox_assistant.sql", "0038_acornfox_assistant_actions.sql", "0039_acornfox_access_observations.sql",
+		"0040_acornfox_fix_candidates.sql",
 	}
 	acornFoxV1WebAssetName = regexp.MustCompile(`^[A-Za-z0-9_.-]+-[A-Za-z0-9_-]{8,}\.(?:(?:css|js)(?:\.map)?|map|png|jpe?g|svg|gif|webp|ico|woff2?|ttf)$`)
 	acornFoxGitHubPath     = regexp.MustCompile(`^/[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$`)
@@ -262,7 +263,7 @@ func validateAcornFoxNMinusOne(n AcornFoxNMinusOneV1) error {
 	if err := ParseVersion(n.Version); err != nil || strings.TrimSpace(n.Version) != n.Version {
 		return errors.New("version is invalid")
 	}
-	if (n.MigrationVersion != AcornFoxV1MigrationVersion && n.MigrationVersion != AcornFoxLegacyPredecessorMigration) || ValidateMigrationVersion(n.MigrationVersion) != nil {
+	if (n.MigrationVersion != AcornFoxV1MigrationVersion && n.MigrationVersion != acornFoxRecentPredecessorMigration && n.MigrationVersion != AcornFoxLegacyPredecessorMigration) || ValidateMigrationVersion(n.MigrationVersion) != nil {
 		return errors.New("migration_version is invalid")
 	}
 	if !regexp.MustCompile(`^[a-f0-9]{40}$`).MatchString(n.SourceCommit) {

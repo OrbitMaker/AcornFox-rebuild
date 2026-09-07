@@ -245,7 +245,7 @@ describe("AcornFox OpenAPI parity", () => {
       "getAcornFoxDeliverySource", "getAcornFoxExternalAccessObservation", "getAcornFoxHostMetrics", "getAcornFoxOperationResult", "getAcornFoxSetupState", "getAcornFoxSourceMetadata", "initializeAcornFoxAdministrator", "updateAcornFoxSourceRevision",
     ]);
     expect(integrationOperations).toHaveLength(integration.length);
-    expect(contract.operations.filter((operation) => operation.webClient === "none").map((operation) => operation.operationId)).toEqual(["reportAcornFoxExternalAccessObservation"]);
+    expect(contract.operations.filter((operation) => operation.webClient === "none").map((operation) => operation.operationId)).toEqual(["createAcornFoxFixCandidate", "getAcornFoxFixCandidate", "listAcornFoxFixCandidates", "matchAcornFoxFixCandidateSource", "publishAcornFoxFixCandidate", "reportAcornFoxExternalAccessObservation"]);
     const contractByID = new Map(integration.map((operation) => [operation.operationId, operation]));
 
     for (const declared of integrationOperations) {

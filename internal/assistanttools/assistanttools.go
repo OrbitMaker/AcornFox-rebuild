@@ -18,10 +18,11 @@ import (
 )
 
 const (
-	MaxCallsPerRun  = 64
-	MaxArguments    = 8 << 10
-	MaxResult       = 64 << 10
-	MaxActiveGrants = 64
+	MaxCallsPerRun        = 64
+	MaxArguments          = 8 << 10
+	MaxCandidateArguments = 64 << 10
+	MaxResult             = 64 << 10
+	MaxActiveGrants       = 64
 )
 
 var id = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`)
@@ -143,7 +144,11 @@ func (r *Registry) Execute(ctx context.Context, token string, call Call, executo
 }
 
 func validCall(call Call) bool {
-	return toolSchemas[call.Tool] && id.MatchString(call.CallID) && len(call.Arguments) > 1 && len(call.Arguments) <= MaxArguments && json.Valid(call.Arguments)
+	limit := MaxArguments
+	if call.Tool == "acornfox_create_fix_candidate" {
+		limit = MaxCandidateArguments
+	}
+	return toolSchemas[call.Tool] && id.MatchString(call.CallID) && len(call.Arguments) > 1 && len(call.Arguments) <= limit && json.Valid(call.Arguments)
 }
 func bounded(value Response) Response {
 	if value.OK && len(value.Result) > MaxResult {
@@ -164,6 +169,7 @@ func stableCode(code string) bool {
 
 var toolSchemas = map[string]bool{
 	"acornfox_host_metrics": true, "acornfox_list_apps": true, "acornfox_app": true, "acornfox_sources": true, "acornfox_deliveries": true, "acornfox_delivery_status": true, "acornfox_logs": true, "acornfox_operation_result": true, "acornfox_public_access": true, "acornfox_access_observation": true, "acornfox_probe": true, "acornfox_propose_restart": true, "acornfox_propose_redeploy": true,
+	"acornfox_read_fix_source": true, "acornfox_create_fix_candidate": true,
 }
 
 // Handler is suitable for http.Serve on a Unix-domain socket. No HTTP request
@@ -185,7 +191,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 	var call Call
-	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, MaxArguments+512))
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, MaxCandidateArguments+512))
 	decoder.DisallowUnknownFields()
 	if decoder.Decode(&call) != nil || decoder.Decode(&struct{}{}) != io.EOF {
 		write(w, http.StatusBadRequest, Response{Code: "invalid_request"})

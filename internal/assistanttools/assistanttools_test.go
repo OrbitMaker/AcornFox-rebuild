@@ -97,3 +97,13 @@ func TestRegistryRejectsUnknownAndBounds(t *testing.T) {
 		t.Fatal(got)
 	}
 }
+
+func TestCandidateToolHasDedicatedBoundWithoutWideningOtherTools(t *testing.T) {
+	large := json.RawMessage(`{"unified_diff":"` + strings.Repeat("x", MaxArguments) + `"}`)
+	if !validCall(Call{Tool: "acornfox_create_fix_candidate", CallID: "candidate", Arguments: large}) {
+		t.Fatal("bounded candidate tool arguments were rejected")
+	}
+	if validCall(Call{Tool: "acornfox_logs", CallID: "logs", Arguments: large}) {
+		t.Fatal("candidate argument allowance widened ordinary tools")
+	}
+}
