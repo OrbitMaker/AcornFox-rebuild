@@ -11,16 +11,22 @@ import shutil
 import stat
 import subprocess
 import sys
+import tarfile
 
 TARGETS = (
     'open-card-server', 'open-card-agent', 'open-card-static-server',
     'open-card-secretctl', 'open-card-security-probe', 'open-card-imagegc',
     'acornfox', 'open-card-admin', 'open-card-upgrade', 'open-card-healthcheck',
+    'acornfox-pi-worker',
 )
 MODULE = 'github.com/open-card/open-card'
 VERSION = re.compile(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
                      r'(-[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?(\+[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?')
 REPOSITORY = re.compile(r'https://github\.com/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}')
+PI_ARCHIVE_SHA256 = '494e498f47d74d21f40b3386f6a5e921a3d49531a169cab55bbdaca0ea1fe25a'
+PI_SHA256SUMS_SHA256 = '0b70b2e422339b7a1277c3addb3705e1239d21ca1c20a17741a7b1c06d7526b0'
+PI_MANIFEST_SHA256 = 'e8d788ebaab78af97ca959b91a1abfe9fc820de4a4c6aadcd870bb500679934d'
+PI_MANIFEST = pathlib.Path('internal/pibundle/assets-v0.85.1-linux-x64.json')
 
 
 def require(condition, message):
@@ -55,6 +61,93 @@ def clean_path(value, existing=True):
     if existing:
         require(path.is_dir(), 'input roots must be directories')
     return path
+
+
+def clean_file(value):
+    path = pathlib.Path(value)
+    require(path.is_absolute() and str(path) == value and path != pathlib.Path('/'),
+            'pi archive path must be absolute and normalized')
+    require(path.resolve(strict=True) == path, 'pi archive path must not traverse symlinks')
+    info = path.stat()
+    require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_size <= 512 << 20,
+            'pi archive must be a bounded single-link regular file')
+    return path
+
+
+def load_pi_manifest(source):
+    path = source / PI_MANIFEST
+    raw = path.read_bytes()
+    require(len(raw) <= 1 << 20 and sha(raw) == PI_MANIFEST_SHA256,
+            'pinned pi asset manifest digest mismatch')
+    value = json.loads(raw)
+    require(raw == canonical(value) + b'\n' and value.get('schema_version') == 1 and
+            value.get('version') == '0.85.1' and value.get('archive_sha256') == PI_ARCHIVE_SHA256 and
+            value.get('sha256sums_sha256') == PI_SHA256SUMS_SHA256,
+            'pinned pi asset manifest identity mismatch')
+    files = value.get('files')
+    require(isinstance(files, list) and len(files) == 218,
+            'pinned pi asset manifest file count mismatch')
+    previous = ''
+    for entry in files:
+        require(list(entry) == ['path', 'mode', 'size', 'sha256'] and
+                isinstance(entry['path'], str) and entry['path'].startswith('pi/') and
+                entry['path'] > previous and entry['mode'] in (0o644, 0o755) and
+                isinstance(entry['size'], int) and 0 <= entry['size'] <= 128 << 20 and
+                re.fullmatch('[0-9a-f]{64}', entry['sha256']),
+                'pinned pi asset manifest entry invalid')
+        previous = entry['path']
+    require(sum(entry['size'] for entry in files) == 113642165,
+            'pinned pi asset manifest size mismatch')
+    return value
+
+
+def verify_pi_archive(source, archive):
+    manifest = load_pi_manifest(source)
+    require(file_sha(archive) == PI_ARCHIVE_SHA256, 'pi archive sha256 mismatch')
+    expected = {entry['path']: entry for entry in manifest['files']}
+    expected_dirs = {'pi/'}
+    for name in expected:
+        parent = pathlib.PurePosixPath(name).parent
+        while str(parent) != '.':
+            expected_dirs.add(str(parent) + '/')
+            parent = parent.parent
+    seen, directories = {}, set()
+    with tarfile.open(archive, 'r:gz') as stream:
+        members = stream.getmembers()
+        require(len(members) <= 512, 'pi archive member count exceeds limit')
+        for member in members:
+            normalized = member.name.rstrip('/')
+            require(normalized == pathlib.PurePosixPath(normalized).as_posix() and
+                    (normalized == 'pi' or normalized.startswith('pi/')) and
+                    '..' not in pathlib.PurePosixPath(normalized).parts,
+                    'pi archive contains an unsafe path')
+            if member.isdir():
+                require(normalized + '/' not in directories, 'pi archive contains a duplicate directory')
+                directories.add(normalized + '/')
+                continue
+            require(member.isfile() and member.name in expected and member.name not in seen,
+                    'pi archive contains an unexpected member')
+            wanted = expected[member.name]
+            require(member.mode == wanted['mode'] and member.size == wanted['size'],
+                    'pi archive member metadata mismatch')
+            data = stream.extractfile(member).read(wanted['size'] + 1)
+            require(len(data) == wanted['size'] and sha(data) == wanted['sha256'],
+                    'pi archive member content mismatch')
+            seen[member.name] = True
+    require(set(seen) == set(expected) and directories == expected_dirs,
+            'pi archive inventory mismatch')
+    return manifest
+
+
+def verify_pi_runtime(runtime_root, runtime_files, manifest):
+    actual = {entry['path']: entry for entry in runtime_files if entry['path'].startswith('pi/')}
+    expected = {entry['path']: entry for entry in manifest['files']}
+    require(set(actual) == set(expected), 'runtime pi inventory mismatch')
+    for path, wanted in expected.items():
+        info = (runtime_root / path).stat()
+        got = actual[path]
+        require(got['mode'] == wanted['mode'] and got['sha256'] == wanted['sha256'] and
+                info.st_size == wanted['size'], 'runtime pi asset mismatch')
 
 
 def inventory(root, kind):
@@ -95,15 +188,19 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('source', 'runtime', 'license', 'control', 'version'):
         parser.add_argument(name)
+    parser.add_argument('--pi-archive', required=True)
     args = parser.parse_args()
     require(VERSION.fullmatch(args.version), 'invalid release version')
     source, runtime, licenses = [clean_path(value) for value in (args.source, args.runtime, args.license)]
+    pi_archive = clean_file(args.pi_archive)
     control = clean_path(args.control, existing=False)
     roots = [source, runtime, licenses, control]
     for index, root in enumerate(roots):
         for other in roots[index + 1:]:
             require(not root.is_relative_to(other) and not other.is_relative_to(root),
                     'source, runtime, license and control roots must be separate')
+    require(all(not pi_archive.is_relative_to(root) for root in roots),
+            'pi archive must be outside source, runtime, license and control roots')
     require(not control.exists(), 'control output already exists; use a new directory')
     parent = control.parent.stat()
     require(stat.S_ISDIR(parent.st_mode) and parent.st_uid == os.getuid() and
@@ -154,6 +251,7 @@ def main():
         return origin, commit
 
     origin, commit = git_identity()
+    pi_manifest = verify_pi_archive(source, pi_archive)
     before = inventory(source, 'source')
     require(output('go', 'list', '-m') == MODULE, 'unexpected project Go module')
     raw = output('go', 'list', '-deps', '-f', '{{if .Module}}{{if .Module.Main}}{{.ImportPath}}{{end}}{{end}}',
@@ -180,13 +278,14 @@ def main():
                     npm_version=npm_version, npm_cli_sha256=file_sha(paths['npm']),
                     build_policy=['build_id_empty', 'build_vcs_disabled', 'cgo_disabled', 'trimpath'])
     runtime_input = dict(schema_version=1, product='acornfox', architecture='amd64', files=inventory(runtime, 'runtime'))
+    verify_pi_runtime(runtime, runtime_input['files'], pi_manifest)
     license_input = dict(schema_version=1, product='acornfox', files=inventory(licenses, 'license'))
     require(before == inventory(source, 'source') and git_identity() == (origin, commit),
             'source changed during input inspection')
     inputs = {'source-policy': policy, 'toolchain': toolchain,
               'runtime-inputs': runtime_input, 'license-inputs': license_input}
     encoded = {name + '.json': canonical(value) for name, value in inputs.items()}
-    decision = dict(schema_version=1, product='acornfox', architecture='amd64', migration='0034', layout=1,
+    decision = dict(schema_version=1, product='acornfox', architecture='amd64', migration='0038', layout=1,
                     version=args.version, release_id='release-' + args.version,
                     source_repository=origin, source_commit=commit,
                     source_policy_sha256=sha(encoded['source-policy.json']),
@@ -215,7 +314,7 @@ def main():
 if __name__ == '__main__':
     try:
         main()
-    except (ValueError, OSError, subprocess.SubprocessError) as error:
+    except (ValueError, OSError, subprocess.SubprocessError, tarfile.TarError) as error:
         # Do not print command output, credentials, file contents or environment.
         print('prepare-release-inputs:', str(error) if isinstance(error, ValueError)
               else 'local input inspection or output write failed', file=sys.stderr)

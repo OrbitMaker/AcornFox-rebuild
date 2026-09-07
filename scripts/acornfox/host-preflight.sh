@@ -53,13 +53,19 @@ if [[ $phase == post ]]; then
   clean /usr/bin/systemctl is-enabled --quiet postgresql.service || fail
   clean /usr/bin/systemctl is-active --quiet postgresql.service || fail
 
-  for account in acornfox acornfox-agent acornfox-buildkit acornfox-caddy acornfox-edge; do
+  service_uids=" "
+  for account in acornfox acornfox-agent acornfox-buildkit acornfox-caddy acornfox-edge acornfox-pi; do
     record=$(clean /usr/bin/getent passwd "$account") || fail
     IFS=: read -r name _ uid gid _ home shell <<<"$record"
     [[ $name == "$account" && $uid =~ ^[0-9]+$ && $gid =~ ^[0-9]+$ && $home == /nonexistent && $shell == /usr/sbin/nologin ]] || fail
     group_record=$(clean /usr/bin/getent group "$account") || fail
     IFS=: read -r group_name _ group_gid group_members <<<"$group_record"
     [[ $group_name == "$account" && $group_gid == "$gid" && -z $group_members ]] || fail
+    if [[ $account == acornfox-pi ]]; then
+      [[ $service_uids != *" $uid "* ]] || fail
+    else
+      service_uids+="$uid "
+    fi
   done
   [[ $(clean /usr/bin/stat -c '%u:%g:%a:%F' /var/lib/acornfox/install) == '0:0:700:directory' ]] || fail
   clean /usr/bin/grep -qx 'acornfox-buildkit:231072:65536' /etc/subuid || fail

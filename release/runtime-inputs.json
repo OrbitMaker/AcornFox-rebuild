@@ -60,6 +60,19 @@
           "sha256": "52d42ae12b3462097e9868da6dfed3c9648ae12edd3b3638102312af84cb6904"
         }
       }
+    },
+    "pi": {
+      "version": "0.85.1",
+      "architectures": {
+        "amd64": {
+          "url": "https://github.com/earendil-works/pi/releases/download/v0.85.1/pi-linux-x64.tar.gz",
+          "filename": "pi-linux-x64.tar.gz",
+          "sha256": "494e498f47d74d21f40b3386f6a5e921a3d49531a169cab55bbdaca0ea1fe25a",
+          "sha256sums_url": "https://github.com/earendil-works/pi/releases/download/v0.85.1/SHA256SUMS",
+          "sha256sums_sha256": "0b70b2e422339b7a1277c3addb3705e1239d21ca1c20a17741a7b1c06d7526b0",
+          "asset_manifest_sha256": "e8d788ebaab78af97ca959b91a1abfe9fc820de4a4c6aadcd870bb500679934d"
+        }
+      }
     }
   }
 }

@@ -20,7 +20,7 @@ func TestSealCandidateArtifactsV1ProducesDeterministicPrivateArtifacts(t *testin
 	plan, goStage, webStage, runtimeRoot, runtime, licenseRoot, license := candidateTreeFixture(t)
 	defer goStage.Close()
 	defer webStage.Close()
-	tree, err := BuildCandidateTreeV1(plan, goStage, webStage, runtimeRoot, runtime, licenseRoot, license, buildTaskRoot(t))
+	tree, err := buildCandidateTreeForTest(plan, goStage, webStage, runtimeRoot, runtime, licenseRoot, license, buildTaskRoot(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +134,7 @@ func TestCandidateArtifactStageRejectsReplacement(t *testing.T) {
 	plan, goStage, webStage, runtimeRoot, runtime, licenseRoot, license := candidateTreeFixture(t)
 	defer goStage.Close()
 	defer webStage.Close()
-	tree, err := BuildCandidateTreeV1(plan, goStage, webStage, runtimeRoot, runtime, licenseRoot, license, buildTaskRoot(t))
+	tree, err := buildCandidateTreeForTest(plan, goStage, webStage, runtimeRoot, runtime, licenseRoot, license, buildTaskRoot(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -292,7 +292,7 @@ func candidateArtifactFixture(t *testing.T) *CandidateArtifactStageV1 {
 	plan, goStage, webStage, runtimeRoot, runtime, licenseRoot, license := candidateTreeFixture(t)
 	defer goStage.Close()
 	defer webStage.Close()
-	tree, err := BuildCandidateTreeV1(plan, goStage, webStage, runtimeRoot, runtime, licenseRoot, license, buildTaskRoot(t))
+	tree, err := buildCandidateTreeForTest(plan, goStage, webStage, runtimeRoot, runtime, licenseRoot, license, buildTaskRoot(t))
 	if err != nil {
 		t.Fatal(err)
 	}

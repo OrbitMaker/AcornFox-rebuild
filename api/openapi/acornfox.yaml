@@ -4,6 +4,25 @@ info:
   version: 1.0.0
   description: Clean-install single-service delivery API. Runtime and response observations are facts, not health or public-reachability claims.
 paths:
+  /api/v1/acornfox/setup:
+    get:
+      operationId: getAcornFoxSetupState
+      security: []
+      x-acornfox-parity: integration_ui
+      responses:
+        '200': {description: Browser setup availability only; this does not expose administrator credentials., content: {application/json: {schema: {$ref: '#/components/schemas/SetupStateResponse'}}}}
+        '503': {$ref: '#/components/responses/AuthenticationUnavailable'}
+    post:
+      operationId: initializeAcornFoxAdministrator
+      security: []
+      x-acornfox-parity: integration_ui
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/SetupRequest'}}}}
+      responses:
+        '201': {description: Administrator was durably initialized from a single-use operator-provisioned setup token., content: {application/json: {schema: {$ref: '#/components/schemas/SetupResponse'}}}}
+        '400': {$ref: '#/components/responses/InvalidRequest'}
+        '409': {$ref: '#/components/responses/IdempotencyConflict'}
+        '422': {$ref: '#/components/responses/ValidationFailed'}
+        '503': {$ref: '#/components/responses/AuthenticationUnavailable'}
   /api/v1/acornfox/auth/login:
     post:
       operationId: loginAcornFoxAdministrator
@@ -43,6 +62,107 @@ paths:
         '400': {$ref: '#/components/responses/InvalidRequest'}
         '401': {$ref: '#/components/responses/AuthenticationFailed'}
         '503': {$ref: '#/components/responses/AuthenticationUnavailable'}
+  /api/v1/acornfox/host/metrics:
+    get:
+      operationId: getAcornFoxHostMetrics
+      x-acornfox-parity: integration_cli
+      security: [{AdministratorSession: []}]
+      responses:
+        '200': {description: Read-only host telemetry snapshot. Missing optional metric groups are not zero values., content: {application/json: {schema: {$ref: '#/components/schemas/HostMetricsResponse'}}}}
+        '401': {$ref: '#/components/responses/AuthenticationFailed'}
+        '503': {$ref: '#/components/responses/TemporarilyUnavailable'}
+  /api/v1/acornfox/assistant/sessions:
+    get:
+      operationId: listAcornFoxAssistantSessions
+      x-acornfox-parity: assistant_ui_only
+      security: [{AdministratorSession: []}]
+      responses:
+        '200': {description: Administrator-owned assistant sessions only., content: {application/json: {schema: {$ref: '#/components/schemas/AssistantSessionListResponse'}}}}
+        '401': {$ref: '#/components/responses/AuthenticationFailed'}
+        '503': {$ref: '#/components/responses/TemporarilyUnavailable'}
+    post:
+      operationId: createAcornFoxAssistantSession
+      x-acornfox-parity: assistant_ui_only
+      security: [{AdministratorSession: []}]
+      parameters: [{$ref: '#/components/parameters/CSRFToken'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/AssistantSessionCreateRequest'}}}}
+      responses:
+        '201': {description: Assistant session created. This does not start an assistant run., content: {application/json: {schema: {$ref: '#/components/schemas/AssistantSession'}}}}
+        '400': {$ref: '#/components/responses/InvalidRequest'}
+        '401': {$ref: '#/components/responses/AuthenticationFailed'}
+        '429': {$ref: '#/components/responses/TemporarilyUnavailable'}
+        '503': {$ref: '#/components/responses/TemporarilyUnavailable'}
+  /api/v1/acornfox/assistant/sessions/{sessionId}/runs:
+    parameters: [{$ref: '#/components/parameters/AssistantSessionId'}]
+    post:
+      operationId: submitAcornFoxAssistantRun
+      x-acornfox-parity: assistant_ui_only
+      security: [{AdministratorSession: []}]
+      parameters: [{$ref: '#/components/parameters/CSRFToken'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/AssistantRunSubmitRequest'}}}}
+      responses:
+        '200': {description: Idempotent replay of the same accepted assistant run; no second run was submitted., content: {application/json: {schema: {$ref: '#/components/schemas/AssistantRunSubmitResponse'}}}}
+        '202': {description: Assistant run accepted. Completion is represented only by later run events and does not verify an application operation., content: {application/json: {schema: {$ref: '#/components/schemas/AssistantRunSubmitResponse'}}}}
+        '400': {$ref: '#/components/responses/InvalidRequest'}
+        '401': {$ref: '#/components/responses/AuthenticationFailed'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/IdempotencyConflict'}
+        '429': {$ref: '#/components/responses/TemporarilyUnavailable'}
+        '503': {$ref: '#/components/responses/TemporarilyUnavailable'}
+  /api/v1/acornfox/assistant/sessions/{sessionId}/events:
+    parameters: [{$ref: '#/components/parameters/AssistantSessionId'}]
+    get:
+      operationId: getAcornFoxAssistantEvents
+      x-acornfox-parity: assistant_ui_only
+      security: [{AdministratorSession: []}]
+      parameters: [{$ref: '#/components/parameters/AssistantAfter'}, {$ref: '#/components/parameters/LastEventID'}]
+      responses:
+        '200': {description: JSON event snapshot or a continuing SSE stream when Accept is text/event-stream., headers: {X-AcornFox-Assistant-Cursor-Status: {schema: {type: string, enum: [ok, slow_consumer, expired]}}}, content: {application/json: {schema: {$ref: '#/components/schemas/AssistantEventSnapshot'}}, text/event-stream: {schema: {type: string}}}}
+        '400': {$ref: '#/components/responses/InvalidRequest'}
+        '401': {$ref: '#/components/responses/AuthenticationFailed'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {description: Cursor expired. A JSON snapshot supplies the oldest and latest retained cursor for a bounded retry., content: {application/json: {schema: {$ref: '#/components/schemas/AssistantEventSnapshot'}}}}
+        '503': {$ref: '#/components/responses/TemporarilyUnavailable'}
+  /api/v1/acornfox/assistant/sessions/{sessionId}/abort:
+    parameters: [{$ref: '#/components/parameters/AssistantSessionId'}]
+    post:
+      operationId: abortAcornFoxAssistantSessionRuns
+      x-acornfox-parity: assistant_ui_only
+      security: [{AdministratorSession: []}]
+      parameters: [{$ref: '#/components/parameters/CSRFToken'}]
+      responses:
+        '200': {description: Abort was requested for this session's active and queued runs only., content: {application/json: {schema: {$ref: '#/components/schemas/AssistantAbortResponse'}}}}
+        '400': {$ref: '#/components/responses/InvalidRequest'}
+        '401': {$ref: '#/components/responses/AuthenticationFailed'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/TemporarilyUnavailable'}
+  /api/v1/acornfox/assistant/sessions/{sessionId}/actions:
+    parameters: [{$ref: '#/components/parameters/AssistantSessionId'}]
+    get:
+      operationId: listAcornFoxAssistantActions
+      x-acornfox-parity: assistant_ui_only
+      security: [{AdministratorSession: []}]
+      responses:
+        '200': {description: "Administrator-owned session-scoped action proposals. verified is action evidence only and does not claim application health or public reachability.", content: {application/json: {schema: {$ref: '#/components/schemas/AssistantActionListResponse'}}}}
+        '401': {$ref: '#/components/responses/AuthenticationFailed'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/TemporarilyUnavailable'}
+  /api/v1/acornfox/assistant/sessions/{sessionId}/actions/{proposalId}/decision:
+    parameters: [{$ref: '#/components/parameters/AssistantSessionId'}, {$ref: '#/components/parameters/AssistantProposalId'}]
+    post:
+      operationId: decideAcornFoxAssistantAction
+      x-acornfox-parity: assistant_ui_only
+      security: [{AdministratorSession: []}]
+      parameters: [{$ref: '#/components/parameters/CSRFToken'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/AssistantActionDecisionRequest'}}}}
+      responses:
+        '200': {description: Proposal was rejected or was already terminal; no new action was accepted., content: {application/json: {schema: {$ref: '#/components/schemas/AssistantActionProposal'}}}}
+        '202': {description: "Proposal action was accepted, is executing, or has an unknown execution acknowledgement. Completion remains separate action evidence.", content: {application/json: {schema: {$ref: '#/components/schemas/AssistantActionProposal'}}}}
+        '400': {$ref: '#/components/responses/InvalidRequest'}
+        '401': {$ref: '#/components/responses/AuthenticationFailed'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/IdempotencyConflict'}
+        '503': {$ref: '#/components/responses/TemporarilyUnavailable'}
   /api/v1/acornfox/apps:
     get:
       operationId: listAcornFoxApps
@@ -85,6 +205,30 @@ paths:
         '404': {$ref: '#/components/responses/NotFound'}
         '422': {$ref: '#/components/responses/InvalidDiscoveryQuery'}
         '503': {$ref: '#/components/responses/DiscoveryUnavailable'}
+    post:
+      operationId: updateAcornFoxSourceRevision
+      x-acornfox-parity: integration_cli
+      security: [{AdministratorSession: []}]
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}, {$ref: '#/components/parameters/CSRFToken'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/SourceUpdateRequest'}}}}
+      responses:
+        '201': {description: A new immutable source revision was imported; no build deployment or route changed., content: {application/json: {schema: {$ref: '#/components/schemas/SourceUpdateResponse'}}}}
+        '401': {$ref: '#/components/responses/AuthenticationFailed'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/IdempotencyConflict'}
+        '422': {$ref: '#/components/responses/ValidationFailed'}
+        '503': {$ref: '#/components/responses/TemporarilyUnavailable'}
+  /api/v1/acornfox/apps/{applicationId}/operations/{operationId}:
+    parameters: [{$ref: '#/components/parameters/ApplicationId'}, {$ref: '#/components/parameters/OperationId'}]
+    get:
+      operationId: getAcornFoxOperationResult
+      x-acornfox-parity: integration_cli
+      security: [{AdministratorSession: []}]
+      responses:
+        '200': {description: "Read-only application-scoped operation evidence. Verified means task-scoped evidence was persisted and does not claim application health or public reachability.", content: {application/json: {schema: {$ref: '#/components/schemas/OperationResultResponse'}}}}
+        '401': {$ref: '#/components/responses/AuthenticationFailed'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/TemporarilyUnavailable'}
   /api/v1/acornfox/apps/{applicationId}/sources/{sourceRevisionId}:
     parameters: [{$ref: '#/components/parameters/ApplicationId'}, {$ref: '#/components/parameters/SourceRevisionId'}]
     get:
@@ -92,6 +236,17 @@ paths:
       security: [{AdministratorSession: []}]
       responses:
         '200': {description: Redacted immutable input revision, content: {application/json: {schema: {$ref: '#/components/schemas/SourceRevision'}}}}
+        '401': {$ref: '#/components/responses/AuthenticationFailed'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/TemporarilyUnavailable'}
+  /api/v1/acornfox/apps/{applicationId}/sources/{sourceRevisionId}/metadata:
+    parameters: [{$ref: '#/components/parameters/ApplicationId'}, {$ref: '#/components/parameters/SourceRevisionId'}]
+    get:
+      operationId: getAcornFoxSourceMetadata
+      x-acornfox-parity: integration_cli
+      security: [{AdministratorSession: []}]
+      responses:
+        '200': {description: Public-source projection only. repository_url is absent unless public source provenance was explicitly proven., content: {application/json: {schema: {$ref: '#/components/schemas/SourceMetadataResponse'}}}}
         '401': {$ref: '#/components/responses/AuthenticationFailed'}
         '404': {$ref: '#/components/responses/NotFound'}
         '503': {$ref: '#/components/responses/TemporarilyUnavailable'}
@@ -126,6 +281,17 @@ paths:
       security: [{AdministratorSession: []}]
       responses:
         '200': {description: Desired runtime and response facts; null means no fact was persisted, content: {application/json: {schema: {$ref: '#/components/schemas/DeliveryStatusResponse'}}}}
+        '401': {$ref: '#/components/responses/AuthenticationFailed'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/TemporarilyUnavailable'}
+  /api/v1/acornfox/apps/{applicationId}/deliveries/{deploymentId}/source:
+    parameters: [{$ref: '#/components/parameters/ApplicationId'}, {$ref: '#/components/parameters/DeploymentId'}]
+    get:
+      operationId: getAcornFoxDeliverySource
+      x-acornfox-parity: integration_cli
+      security: [{AdministratorSession: []}]
+      responses:
+        '200': {description: Source proven for this exact deployment release. Fields are absent when release source history is unavailable., content: {application/json: {schema: {$ref: '#/components/schemas/DeliverySourceResponse'}}}}
         '401': {$ref: '#/components/responses/AuthenticationFailed'}
         '404': {$ref: '#/components/responses/NotFound'}
         '503': {$ref: '#/components/responses/TemporarilyUnavailable'}
@@ -216,6 +382,11 @@ components:
   parameters:
     ApplicationId: {name: applicationId, in: path, required: true, schema: {type: string, minLength: 1}}
     SourceRevisionId: {name: sourceRevisionId, in: path, required: true, schema: {type: string, minLength: 1}}
+    OperationId: {name: operationId, in: path, required: true, schema: {type: string, minLength: 1}}
+    AssistantSessionId: {name: sessionId, in: path, required: true, schema: {type: string, minLength: 1}}
+    AssistantProposalId: {name: proposalId, in: path, required: true, schema: {type: string, minLength: 1}}
+    AssistantAfter: {name: after, in: query, required: false, schema: {type: integer, minimum: 0}}
+    LastEventID: {name: Last-Event-ID, in: header, required: false, schema: {type: string, pattern: '^[0-9]+$'}}
     DeploymentId: {name: deploymentId, in: path, required: true, schema: {type: string, minLength: 1}}
     IdempotencyKey: {name: Idempotency-Key, in: header, required: true, schema: {type: string, minLength: 1}}
     LogSource: {name: source, in: query, required: true, schema: {type: string, enum: [build, runtime]}}
@@ -259,6 +430,96 @@ components:
       required: [current_password, new_password]
       additionalProperties: false
       properties: {current_password: {type: string, minLength: 1}, new_password: {type: string, minLength: 1}}
+    SetupStateResponse:
+      type: object
+      required: [state]
+      additionalProperties: false
+      properties: {state: {type: string, enum: [initialized, uninitialized, unavailable]}}
+    SetupRequest:
+      type: object
+      required: [setup_token, password]
+      additionalProperties: false
+      properties: {setup_token: {type: string, minLength: 1, maxLength: 4096}, password: {type: string, minLength: 1, maxLength: 4096}}
+    SetupResponse:
+      type: object
+      required: [initialized]
+      additionalProperties: false
+      properties: {initialized: {type: boolean, enum: [true]}}
+    AssistantScope:
+      type: object
+      required: [kind]
+      additionalProperties: false
+      properties: {kind: {type: string, enum: [host, app]}, app_id: {type: string}}
+    AssistantSession:
+      type: object
+      required: [session_id, scope, created_at, updated_at]
+      additionalProperties: false
+      properties: {session_id: {type: string}, scope: {$ref: '#/components/schemas/AssistantScope'}, created_at: {type: string, format: date-time}, updated_at: {type: string, format: date-time}}
+    AssistantSessionListResponse:
+      type: object
+      required: [sessions]
+      additionalProperties: false
+      properties: {sessions: {type: array, items: {$ref: '#/components/schemas/AssistantSession'}}}
+    AssistantSessionCreateRequest:
+      type: object
+      required: [scope]
+      additionalProperties: false
+      properties: {scope: {$ref: '#/components/schemas/AssistantScope'}}
+    AssistantRun:
+      type: object
+      required: [run_id, session_id, status, created_at, updated_at]
+      additionalProperties: false
+      properties: {run_id: {type: string}, session_id: {type: string}, status: {type: string, enum: [accepted, running, completed, failed, aborted, unknown]}, created_at: {type: string, format: date-time}, updated_at: {type: string, format: date-time}}
+    AssistantRunSubmitRequest:
+      type: object
+      required: [idempotency_key, message]
+      additionalProperties: false
+      properties: {idempotency_key: {type: string, minLength: 1, maxLength: 128}, message: {type: string, minLength: 1, maxLength: 65536}}
+    AssistantRunSubmitResponse:
+      type: object
+      required: [run, replay]
+      additionalProperties: false
+      properties: {run: {$ref: '#/components/schemas/AssistantRun'}, replay: {type: boolean}}
+    AssistantEvent:
+      type: object
+      required: [cursor, type, occurred_at]
+      additionalProperties: false
+      properties: {cursor: {type: integer, minimum: 1}, run_id: {type: string}, type: {type: string, enum: [run.accepted, run.started, assistant.delta, assistant.message, run.completed, run.failed, run.aborted, run.unknown]}, occurred_at: {type: string, format: date-time}, text: {type: string, maxLength: 65536}}
+    AssistantEventSnapshot:
+      type: object
+      required: [status, oldest_cursor, latest_cursor, events]
+      additionalProperties: false
+      properties: {status: {type: string, enum: [ok, slow_consumer, expired]}, oldest_cursor: {type: integer, minimum: 0}, latest_cursor: {type: integer, minimum: 0}, events: {type: array, items: {$ref: '#/components/schemas/AssistantEvent'}}}
+    AssistantAbortResponse:
+      type: object
+      required: [aborted]
+      additionalProperties: false
+      properties: {aborted: {type: integer, minimum: 0}}
+    AssistantActionTarget:
+      type: object
+      required: [application_id, deployment_id, target_release_id, target_release_version, application_name]
+      additionalProperties: false
+      properties: {application_id: {type: string}, deployment_id: {type: string}, target_release_id: {type: string}, target_release_version: {type: integer, format: int64, minimum: 1}, application_name: {type: string, maxLength: 128}}
+    AssistantActionVerification:
+      type: object
+      required: [state]
+      additionalProperties: false
+      properties: {state: {type: string, enum: [pending, verified, failed]}, verdict: {type: string, maxLength: 256}, observed_at: {type: string, format: date-time}}
+    AssistantActionProposal:
+      type: object
+      required: [proposal_id, session_id, run_id, action, target, state, expires_at, verification, created_at, updated_at]
+      additionalProperties: false
+      properties: {proposal_id: {type: string}, session_id: {type: string}, run_id: {type: string}, action: {type: string, enum: [restart, redeploy]}, target: {$ref: '#/components/schemas/AssistantActionTarget'}, state: {type: string, enum: [pending, rejected, expired, executing, accepted, unknown, verified, failed]}, expires_at: {type: string, format: date-time}, operation_id: {type: string}, verification: {$ref: '#/components/schemas/AssistantActionVerification'}, created_at: {type: string, format: date-time}, updated_at: {type: string, format: date-time}}
+    AssistantActionListResponse:
+      type: object
+      required: [actions]
+      additionalProperties: false
+      properties: {actions: {type: array, items: {$ref: '#/components/schemas/AssistantActionProposal'}}}
+    AssistantActionDecisionRequest:
+      type: object
+      required: [approve]
+      additionalProperties: false
+      properties: {approve: {type: boolean}}
     AuthSessionResponse:
       type: object
       required: [authenticated, idle_expires_at, absolute_expires_at]
@@ -295,11 +556,48 @@ components:
       required: [id, application_id, kind, locator_sha256, content_digest, created_at, immutable]
       additionalProperties: false
       properties: {id: {type: string}, application_id: {type: string}, kind: {type: string, enum: [git_https]}, locator_sha256: {type: string}, ref: {type: string}, commit: {type: string}, content_digest: {type: string}, created_at: {type: string, format: date-time}, immutable: {type: boolean}}
+    SourceMetadataResponse:
+      type: object
+      required: [source_revision_id, availability]
+      additionalProperties: false
+      properties: {source_revision_id: {type: string}, availability: {type: string, enum: [available, unavailable]}, repository_url: {type: string, format: uri}}
     SourceRevisionList:
       type: object
       required: [items, next_cursor]
       additionalProperties: false
       properties: {items: {type: array, items: {$ref: '#/components/schemas/SourceRevision'}}, next_cursor: {type: string, nullable: true}}
+    SourceUpdateRequest:
+      type: object
+      required: [base_source_revision_id, ref]
+      additionalProperties: false
+      properties: {base_source_revision_id: {type: string, minLength: 1}, ref: {type: string, minLength: 1}}
+    SourceUpdateResponse:
+      type: object
+      required: [source_revision_id, status]
+      additionalProperties: false
+      properties: {source_revision_id: {type: string}, status: {type: string, enum: [imported]}}
+    OperationEvidence:
+      type: object
+      required: [kind, verdict, observed_at]
+      additionalProperties: false
+      properties:
+        kind: {type: string, enum: [runtime_observation, response_observation]}
+        verdict: {type: string, enum: [observed, unhealthy]}
+        observed_at: {type: string, format: date-time}
+        http_status: {type: integer, minimum: 100, maximum: 599}
+    OperationResultResponse:
+      type: object
+      required: [operation_id, operation_type, status, accepted_at, updated_at]
+      additionalProperties: false
+      properties:
+        operation_id: {type: string}
+        operation_type: {type: string}
+        status: {type: string, enum: [accepted, running, verified, failed, unknown]}
+        task_id: {type: string}
+        deployment_id: {type: string}
+        accepted_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+        evidence: {$ref: '#/components/schemas/OperationEvidence'}
     CreateDeliveryRequest:
       type: object
       required: [source_revision_id]
@@ -372,6 +670,44 @@ components:
       required: [items, next_cursor]
       additionalProperties: false
       properties: {items: {type: array, items: {$ref: '#/components/schemas/DeploymentRuntimeState'}}, next_cursor: {type: string, nullable: true}}
+    DeliverySourceResponse:
+      type: object
+      required: [deployment_id, availability]
+      additionalProperties: false
+      properties: {deployment_id: {type: string}, availability: {type: string, enum: [available, unavailable]}, source_revision_id: {type: string}, commit: {type: string}, ref: {type: string}, repository_url: {type: string, format: uri}}
+    HostMetricsCPU:
+      type: object
+      required: [logical_cores]
+      additionalProperties: false
+      properties: {logical_cores: {type: integer, minimum: 1}, usage_percent: {type: number, minimum: 0, maximum: 100}}
+    HostMetricsMemory:
+      type: object
+      required: [total_bytes, available_bytes, used_bytes]
+      additionalProperties: false
+      properties: {total_bytes: {type: integer, format: int64, minimum: 0}, available_bytes: {type: integer, format: int64, minimum: 0}, used_bytes: {type: integer, format: int64, minimum: 0}}
+    HostMetricsDisk:
+      type: object
+      required: [mountpoint, total_bytes, free_bytes, used_bytes]
+      additionalProperties: false
+      properties: {mountpoint: {type: string, enum: ['/']}, total_bytes: {type: integer, format: int64, minimum: 0}, free_bytes: {type: integer, format: int64, minimum: 0}, used_bytes: {type: integer, format: int64, minimum: 0}}
+    HostMetricsNetwork:
+      type: object
+      required: [interface]
+      additionalProperties: false
+      properties: {interface: {type: string, minLength: 1}, rx_bytes_per_second: {type: number, minimum: 0}, tx_bytes_per_second: {type: number, minimum: 0}}
+    HostMetricsResponse:
+      type: object
+      required: [schema_version, availability, stale_after_seconds]
+      additionalProperties: false
+      properties:
+        schema_version: {type: integer, enum: [1]}
+        availability: {type: string, enum: [available, warming_up, unavailable, unsupported]}
+        observed_at: {type: string, format: date-time}
+        stale_after_seconds: {type: integer, minimum: 1}
+        cpu: {$ref: '#/components/schemas/HostMetricsCPU'}
+        memory: {$ref: '#/components/schemas/HostMetricsMemory'}
+        disk: {$ref: '#/components/schemas/HostMetricsDisk'}
+        network: {$ref: '#/components/schemas/HostMetricsNetwork'}
     ProbeDeliveryRequest:
       type: object
       required: [protocol]

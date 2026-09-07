@@ -35,15 +35,16 @@ type Event struct {
 }
 
 type CreateApplicationRecord struct {
-	Application    domain.Application
-	EnvironmentID  domain.ID
-	OperationID    domain.ID
-	TaskID         domain.ID
-	IdempotencyKey string
-	RequestDigest  string
-	Source         *CreateApplicationSource
-	PreparedSource *domain.SourceRevision
-	Event          Event
+	Application            domain.Application
+	EnvironmentID          domain.ID
+	OperationID            domain.ID
+	TaskID                 domain.ID
+	IdempotencyKey         string
+	RequestDigest          string
+	Source                 *CreateApplicationSource
+	PreparedSource         *domain.SourceRevision
+	PublicSourceProvenance *contracts.AcornFoxPublicSourceProvenance
+	Event                  Event
 }
 
 type CreateApplicationResult struct {
@@ -79,13 +80,17 @@ type CreateApplicationSource struct {
 	UploadID      domain.ID
 	RepositoryURL string
 	Ref           string
+	// PublicGit is set only by an explicit public_git transport command. Its
+	// false zero value preserves the historical "visibility unknown" meaning
+	// for all generic Git creation paths.
+	PublicGit bool
 }
 
 func (s CreateApplicationSource) Validate() error {
 	s.RepositoryURL, s.Ref = strings.TrimSpace(s.RepositoryURL), strings.TrimSpace(s.Ref)
 	switch s.Kind {
 	case CreateApplicationSourceUpload:
-		if err := domain.RequireID(s.UploadID, "source upload id"); err != nil || s.RepositoryURL != "" || s.Ref != "" {
+		if err := domain.RequireID(s.UploadID, "source upload id"); err != nil || s.RepositoryURL != "" || s.Ref != "" || s.PublicGit {
 			return domain.ValidationError("upload application source must contain only upload_id")
 		}
 	case CreateApplicationSourceGit:
@@ -227,6 +232,9 @@ func (c *Controller) CreateApplicationWithSource(ctx context.Context, name strin
 			Message:       "application accepted",
 		},
 	}
+	if source != nil && source.Kind == CreateApplicationSourceGit && source.PublicGit {
+		record.PublicSourceProvenance = &contracts.AcornFoxPublicSourceProvenance{SourceRevisionID: preparedSource.ID, RepositoryURL: preparedSource.Locator}
+	}
 	result, err := c.repository.CreateApplication(ctx, record)
 	if err == nil || preparedSource == nil {
 		return result, err
@@ -247,6 +255,24 @@ func PreparedSourceMatches(source CreateApplicationSource, revision domain.Sourc
 	default:
 		return false
 	}
+}
+
+// ValidatePublicSourceProvenance keeps explicit public-git evidence separate
+// from generic Git source creation, whose visibility remains unknown.
+func ValidatePublicSourceProvenance(source *CreateApplicationSource, prepared *domain.SourceRevision, provenance *contracts.AcornFoxPublicSourceProvenance) error {
+	if provenance == nil {
+		if source != nil && source.Kind == CreateApplicationSourceGit && source.PublicGit {
+			return domain.ValidationError("explicit public git source requires provenance")
+		}
+		return nil
+	}
+	if source == nil || source.Kind != CreateApplicationSourceGit || !source.PublicGit || prepared == nil || provenance.SourceRevisionID != prepared.ID || provenance.RepositoryURL != prepared.Locator {
+		return domain.ValidationError("public source provenance does not match prepared explicit public git source")
+	}
+	if err := provenance.Validate(); err != nil {
+		return domain.ValidationError("public source provenance is invalid")
+	}
+	return nil
 }
 
 // compensateFailedSourceCreate first resolves the durable outcome. A failed

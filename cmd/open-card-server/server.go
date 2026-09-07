@@ -15,6 +15,7 @@ import (
 
 	"github.com/open-card/open-card/internal/agenttransport"
 	"github.com/open-card/open-card/internal/application"
+	"github.com/open-card/open-card/internal/assistant"
 	"github.com/open-card/open-card/internal/contracts"
 	"github.com/open-card/open-card/internal/controllers"
 	"github.com/open-card/open-card/internal/domain"
@@ -116,6 +117,13 @@ type Server struct {
 	acornFoxDeliveryCommand    acornFoxDeliveryCommand
 	acornFoxLogs               *AcornFoxLogsHTTPHandler
 	acornFoxPublicAccess       *AcornFoxPublicAccessHTTPHandler
+	acornFoxHostMetrics        http.Handler
+	acornFoxAssistant          *assistant.Handler
+	acornFoxAssistantActions   *AcornFoxAssistantActionsHTTPHandler
+	acornFoxWebSetup           *AcornFoxWebSetupHTTPHandler
+	acornFoxOperation          *AcornFoxOperationHTTPHandler
+	acornFoxSourceUpdate       *AcornFoxSourceUpdateHTTPHandler
+	acornFoxSourceMetadata     *AcornFoxSourceMetadataHTTPHandler
 	acornFoxTLSAllow           *acornFoxTLSAllowHandler
 	broker                     *eventBroker
 	agentGateway               *agenttransport.Gateway
@@ -202,9 +210,22 @@ func (s *Server) SetAcornFoxLogs(handler *AcornFoxLogsHTTPHandler) { s.acornFoxL
 func (s *Server) SetAcornFoxPublicAccess(handler *AcornFoxPublicAccessHTTPHandler) {
 	s.acornFoxPublicAccess = handler
 }
-func (s *Server) SetLegacyRoutesEnabled(enabled bool)   { s.legacyRoutesEnabled = enabled }
-func (s *Server) Handler() http.Handler                 { return http.HandlerFunc(s.serveHTTP) }
-func (s *Server) AgentGateway() *agenttransport.Gateway { return s.agentGateway }
+func (s *Server) SetAcornFoxSourceMetadata(handler *AcornFoxSourceMetadataHTTPHandler) {
+	s.acornFoxSourceMetadata = handler
+}
+func (s *Server) SetAcornFoxWebSetup(handler *AcornFoxWebSetupHTTPHandler) {
+	s.acornFoxWebSetup = handler
+}
+func (s *Server) SetAcornFoxOperation(handler *AcornFoxOperationHTTPHandler) {
+	s.acornFoxOperation = handler
+}
+func (s *Server) SetAcornFoxSourceUpdate(handler *AcornFoxSourceUpdateHTTPHandler) {
+	s.acornFoxSourceUpdate = handler
+}
+func (s *Server) SetAcornFoxHostMetrics(handler http.Handler) { s.acornFoxHostMetrics = handler }
+func (s *Server) SetLegacyRoutesEnabled(enabled bool)         { s.legacyRoutesEnabled = enabled }
+func (s *Server) Handler() http.Handler                       { return http.HandlerFunc(s.serveHTTP) }
+func (s *Server) AgentGateway() *agenttransport.Gateway       { return s.agentGateway }
 func (s *Server) HTTPServer(addr string) *http.Server {
 	return &http.Server{Addr: addr, Handler: s.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 0, IdleTimeout: 60 * time.Second}
 }
@@ -260,6 +281,10 @@ func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
 		authHTTPError(writer, http.StatusServiceUnavailable, "authentication unavailable")
 		return
 	}
+	if request.URL.Path == acornFoxSetupPath {
+		s.acornFoxWebSetup.Handle(writer, request)
+		return
+	}
 	var authenticated bool
 	if strings.HasPrefix(request.URL.Path, "/api/v1/acornfox/") {
 		request, authenticated = s.authenticateAcornFoxControlPlane(writer, request)
@@ -280,6 +305,26 @@ func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
 			writer.Header().Set("Open-Card-Disabled-Capabilities", strings.Join(disabled, ","))
 		}
 		request = withAPIVersion(request, version)
+	}
+	if strings.HasPrefix(request.URL.Path, assistant.HTTPBasePath+"/") {
+		identity, _ := controlPlaneIdentityFromContext(request.Context())
+		request = request.WithContext(assistant.WithActor(request.Context(), assistant.Actor{AdminID: identity.AdminID}))
+		if s.acornFoxAssistantActions.Handle(writer, request) {
+			return
+		}
+		if s.acornFoxAssistant.Handle(writer, request) {
+			return
+		}
+		writeJSONError(writer, http.StatusNotFound, "not_found", "route not found")
+		return
+	}
+	if request.URL.Path == "/api/v1/acornfox/host/metrics" {
+		if s.acornFoxHostMetrics == nil {
+			writeJSONError(writer, http.StatusServiceUnavailable, "unavailable", "host metrics unavailable")
+		} else {
+			s.acornFoxHostMetrics.ServeHTTP(writer, request)
+		}
+		return
 	}
 	if s.handleAcornFoxAPI(writer, request) {
 		return

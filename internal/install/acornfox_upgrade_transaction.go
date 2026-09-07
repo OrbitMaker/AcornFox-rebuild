@@ -6,6 +6,8 @@ import (
 	"errors"
 	"os"
 	"strings"
+
+	"github.com/open-card/open-card/internal/acornfoxsetup"
 )
 
 func (u *acornFoxUpgrade) capture(ctx context.Context, s *TaskAcornFoxRepoStore, binding []byte) (acornFoxUpgradeImage, error) {
@@ -40,7 +42,7 @@ func (u *acornFoxUpgrade) capture(ctx context.Context, s *TaskAcornFoxRepoStore,
 	if e != nil {
 		return image, e
 	}
-	if e = acornFoxValidateProductionManagedScopePrefix(s.hostRoot, s, entries, a, acornFoxUpgradeJSON(a), acornFoxRepoPrefixCurrent); e != nil {
+	if e = acornFoxValidateProductionManagedScopePrefixForLegacyUpgrade(s.hostRoot, s, entries, a, acornFoxUpgradeJSON(a), acornFoxRepoPrefixCurrent); e != nil {
 		return image, e
 	}
 	raw, e = u.read(s.root, acornFoxControlPlaneReceipt, 0600, acornFoxUpgradeMaxJournal)
@@ -55,9 +57,15 @@ func (u *acornFoxUpgrade) capture(ctx context.Context, s *TaskAcornFoxRepoStore,
 	if e != nil {
 		return image, e
 	}
-	runtime, e := parseAcornFoxRuntimeIntent(raw)
+	runtime, e := parseAcornFoxRuntimeIntentForUpgrade(raw)
 	if e != nil {
 		return image, e
+	}
+	if len(runtime.SetupToken) == 0 {
+		installed, parseErr := ParseAcornFoxCandidateBindingV1(binding, j.BindingSHA256)
+		if parseErr != nil || installed.binding.MigrationVersion != "0034" {
+			return image, ErrAcornFoxUpgradeConflict
+		}
 	}
 	raw, e = u.read(s.root, acornFoxRuntimeReceiptName, 0600, acornFoxRuntimeMaxIntent)
 	if e != nil {
@@ -68,7 +76,7 @@ func (u *acornFoxUpgrade) capture(ctx context.Context, s *TaskAcornFoxRepoStore,
 		return image, ErrAcornFoxUpgradeConflict
 	}
 	image = acornFoxUpgradeImage{Binding: append([]byte(nil), binding...), Substrate: sub.receipt, Repo: j, Live: live, Activation: a, ControlPlane: cp, Runtime: runtime}
-	return image, image.validate(u.layout)
+	return image, image.validate(u.layout, false)
 }
 func (u *acornFoxUpgrade) nextImage(old acornFoxUpgradeImage, set *acornFoxCandidateSet, sub *PublishedAcornFoxSubstrateV1) (acornFoxUpgradeImage, error) {
 	var i acornFoxUpgradeImage
@@ -117,12 +125,22 @@ func (u *acornFoxUpgrade) nextImage(old acornFoxUpgradeImage, set *acornFoxCandi
 	}
 	cp := old.ControlPlane
 	cp.BindingSHA256, cp.ReleaseID, cp.SourceCommit = set.bindingSHA256, set.binding.binding.ReleaseID, set.binding.binding.SourceCommit
-	runtime, e := acornFoxUpgradeRebind(old.Runtime, set.binding.binding, set.bindingSHA256)
+	setupToken := old.Runtime.SetupToken
+	if len(setupToken) == 0 {
+		if u.random == nil {
+			return i, ErrAcornFoxUpgradeConflict
+		}
+		setupToken, e = acornfoxsetup.GenerateSetupToken(u.random)
+		if e != nil {
+			return i, ErrAcornFoxUpgradeConflict
+		}
+	}
+	runtime, e := acornFoxUpgradeRebind(old.Runtime, set.binding.binding, set.bindingSHA256, setupToken)
 	if e != nil {
 		return i, e
 	}
 	i = acornFoxUpgradeImage{Binding: append([]byte(nil), set.bindingRaw...), Substrate: sub.receipt, Repo: j, Live: live, Activation: a, ControlPlane: cp, Runtime: runtime}
-	return i, i.validate(u.layout)
+	return i, i.validate(u.layout, true)
 }
 func (u *acornFoxUpgrade) phase(s *TaskAcornFoxRepoStore, j *acornFoxUpgradeJournal, phase string) error {
 	j.Phase = phase
@@ -131,7 +149,38 @@ func (u *acornFoxUpgrade) phase(s *TaskAcornFoxRepoStore, j *acornFoxUpgradeJour
 	}
 	return u.fault(strings.ToLower(phase))
 }
-func (u *acornFoxUpgrade) stop(ctx context.Context) error {
+
+type acornFoxUpgradePIState interface {
+	PIEnabled(context.Context) (bool, error)
+}
+
+func (u *acornFoxUpgrade) capturePIEnabled(ctx context.Context, store *TaskAcornFoxRepoStore) (bool, error) {
+	services, ok := u.services.(acornFoxUpgradePIState)
+	if !ok {
+		// Package-local test fakes written before optional PI support remain
+		// compatible. The production adapter implements the capability below.
+		return false, nil
+	}
+	enabled, err := services.PIEnabled(ctx)
+	if err != nil {
+		return false, err
+	}
+	configured, err := acornFoxAssistantConfigurationState(store.hostRoot, store)
+	if err != nil {
+		return false, ErrAcornFoxUpgradeConflict
+	}
+	if enabled && !configured {
+		return false, ErrAcornFoxUpgradeConflict
+	}
+	return enabled, nil
+}
+
+func (u *acornFoxUpgrade) stop(ctx context.Context, piEnabled bool) error {
+	if piEnabled {
+		if e := u.services.Run(ctx, "stop", "acornfox-pi-worker.service"); e != nil {
+			return e
+		}
+	}
 	for _, unit := range []string{"acornfox-edge.service", "acornfox-agent.service", "acornfox-server.service", "acornfox-caddy.service", "acornfox-buildkit.service", "acornfox-build-network.service"} {
 		if e := u.services.Run(ctx, "stop", unit); e != nil {
 			return e
@@ -139,11 +188,16 @@ func (u *acornFoxUpgrade) stop(ctx context.Context) error {
 	}
 	return nil
 }
-func (u *acornFoxUpgrade) start(ctx context.Context) error {
+func (u *acornFoxUpgrade) start(ctx context.Context, piEnabled bool) error {
 	if e := u.services.Run(ctx, "daemon-reload", ""); e != nil {
 		return e
 	}
-	for _, unit := range []string{"acornfox-build-network.service", "acornfox-buildkit.service", "acornfox-caddy.service", "acornfox-server.service", "acornfox-agent.service"} {
+	units := []string{"acornfox-build-network.service", "acornfox-buildkit.service", "acornfox-caddy.service"}
+	if piEnabled {
+		units = append(units, "acornfox-pi-worker.service")
+	}
+	units = append(units, "acornfox-server.service", "acornfox-agent.service")
+	for _, unit := range units {
 		if e := u.services.Run(ctx, "start", unit); e != nil {
 			return e
 		}
@@ -171,7 +225,7 @@ func (u *acornFoxUpgrade) forward(ctx context.Context, s *TaskAcornFoxRepoStore,
 	if e := u.phase(s, j, "BLOCKED"); e != nil {
 		return e
 	}
-	if e := u.stop(ctx); e != nil {
+	if e := u.stop(ctx, j.PIEnabled); e != nil {
 		return e
 	}
 	if e := u.fault("services-stopped"); e != nil {
@@ -181,6 +235,12 @@ func (u *acornFoxUpgrade) forward(ctx context.Context, s *TaskAcornFoxRepoStore,
 		return e
 	}
 	if e := u.applyImage(s, *j, true); e != nil {
+		return e
+	}
+	if e := u.applySetupCredential(s, *j, true); e != nil {
+		return e
+	}
+	if e := u.fault("setup-credential-published"); e != nil {
 		return e
 	}
 	if e := u.phase(s, j, "PUBLISHED"); e != nil {
@@ -198,7 +258,7 @@ func (u *acornFoxUpgrade) forward(ctx context.Context, s *TaskAcornFoxRepoStore,
 	if e := u.verifyImage(s, *j, true); e != nil {
 		return e
 	}
-	if e := u.start(ctx); e != nil {
+	if e := u.start(ctx, j.PIEnabled); e != nil {
 		return e
 	}
 	if e := u.services.Healthy(ctx, j.Next); e != nil {
@@ -225,13 +285,16 @@ func (u *acornFoxUpgrade) restore(ctx context.Context, s *TaskAcornFoxRepoStore,
 	if err = u.phase(s, j, "ROLLING_BACK"); err != nil {
 		return err
 	}
-	if err = u.stop(ctx); err != nil {
+	if err = u.stop(ctx, j.PIEnabled); err != nil {
 		return err
 	}
 	if err = u.copyNextSubstrate(s, *j); err != nil {
 		return err
 	}
 	if err = u.applyImage(s, *j, false); err != nil {
+		return err
+	}
+	if err = u.applySetupCredential(s, *j, false); err != nil {
 		return err
 	}
 	if err = u.switchSubstrate(s, *j, false); err != nil {
@@ -241,6 +304,26 @@ func (u *acornFoxUpgrade) restore(ctx context.Context, s *TaskAcornFoxRepoStore,
 		return err
 	}
 	return u.verifyImage(s, *j, false)
+}
+
+func (u *acornFoxUpgrade) applySetupCredential(s *TaskAcornFoxRepoStore, j acornFoxUpgradeJournal, next bool) error {
+	image := j.Old
+	if next {
+		image = j.Next
+	}
+	var err error
+	if len(image.Runtime.SetupToken) == 0 {
+		err = acornFoxRuntimeRemoveSetupToken(s.hostRoot, s, j.Next.Runtime)
+	} else {
+		err = acornFoxRuntimePublishSetupToken(context.Background(), s.hostRoot, s, image.Runtime)
+	}
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, ErrAcornFoxRuntimeConfigConflict) {
+		return ErrAcornFoxUpgradeConflict
+	}
+	return ErrAcornFoxUpgradeUnknown
 }
 func (u *acornFoxUpgrade) rollback(ctx context.Context, s *TaskAcornFoxRepoStore, j *acornFoxUpgradeJournal) (err error) {
 	defer func() {
@@ -252,7 +335,7 @@ func (u *acornFoxUpgrade) rollback(ctx context.Context, s *TaskAcornFoxRepoStore
 	if err = u.restore(ctx, s, j); err != nil {
 		return err
 	}
-	if err = u.start(ctx); err != nil {
+	if err = u.start(ctx, j.PIEnabled); err != nil {
 		return err
 	}
 	if err = u.services.Healthy(ctx, j.Old); err != nil {
@@ -391,6 +474,21 @@ func (u *acornFoxUpgrade) verifyRetainedScope(s *TaskAcornFoxRepoStore, j acornF
 		path := strings.TrimPrefix(f.Path, "/")
 		files[path] = f.Data
 		modes[path] = os.FileMode(f.Mode)
+	}
+	if len(current.Runtime.SetupToken) != 0 {
+		entries[acornFoxSetupCredentialDirectory] = SubstrateEntry{Path: acornFoxSetupCredentialDirectory, Kind: SubstrateEntryDirectory, Mode: 0700, Role: OwnerRoleRoot, Group: GroupRoleRoot}
+		files[acornFoxSetupCredentialPath] = current.Runtime.SetupToken
+		modes[acornFoxSetupCredentialPath] = 0600
+	}
+	assistant, e := acornFoxAssistantConfigScope(s.hostRoot, s)
+	if e != nil {
+		return ErrAcornFoxUpgradeConflict
+	}
+	for _, entry := range assistant {
+		if _, exists := entries[entry.Path]; exists {
+			return ErrAcornFoxUpgradeConflict
+		}
+		entries[entry.Path] = entry
 	}
 	marker, me := u.read(s.hostRoot, acornFoxUpgradeMarkerPath, 0600, 256)
 	if me == nil {

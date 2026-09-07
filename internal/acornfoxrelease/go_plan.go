@@ -68,6 +68,7 @@ var fixedTargets = []struct{ name, path, identity string }{
 	{"acornfox-admin", "./cmd/open-card-admin", "acornfox"},
 	{"acornfox-upgrade", "./cmd/open-card-upgrade", "acornfox"},
 	{"acornfox-healthcheck", "./cmd/open-card-healthcheck", "acornfox"},
+	{"acornfox-pi-worker", "./cmd/acornfox-pi-worker", ""},
 }
 
 type goCommandRunner func(context.Context, string, []string, string, []string) ([]byte, error)

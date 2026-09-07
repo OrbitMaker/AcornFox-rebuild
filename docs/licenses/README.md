@@ -19,3 +19,8 @@ shared libraries are not copied into the AcornFox archive. Their package
 versions and the runc source/build recipe are documented in the source
 repository's `docs/acornfox/runtime-build.md`. Original static buildkit-runc is
 not included in this release payload.
+
+The Pi coding-agent entry records the pinned v0.85.1 upstream MIT license.
+Its standalone archive checksum and exact runtime file inventory are pinned
+separately by `internal/pibundle`. Bundled Pi dependencies still require their
+own applicable notice audit before RC-SUPPLY-001 can pass.

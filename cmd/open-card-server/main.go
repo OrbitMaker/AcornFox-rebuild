@@ -26,6 +26,7 @@ import (
 	"github.com/open-card/open-card/internal/buildnetwork"
 	"github.com/open-card/open-card/internal/contracts"
 	"github.com/open-card/open-card/internal/controllers"
+	"github.com/open-card/open-card/internal/hostmetrics"
 	"github.com/open-card/open-card/internal/importers/dockerfile"
 	"github.com/open-card/open-card/internal/observability"
 	"github.com/open-card/open-card/internal/persistence/postgres"
@@ -94,6 +95,8 @@ func main() {
 		server = NewAcornFoxServerWithRepository(store)
 		server.SetLegacyRoutesEnabled(compatibilityMode)
 		server.SetAcornFoxDeploymentStore(store)
+		server.SetAcornFoxSourceMetadata(newAcornFoxSourceMetadataHTTPHandler(store))
+		server.SetAcornFoxOperation(newAcornFoxOperationHTTPHandler(store))
 		controllerStore = store
 		server.SetSystemStatusStore(store)
 		server.SetApplicationProjectionStore(store)
@@ -105,6 +108,11 @@ func main() {
 				log.Fatal(authErr)
 			}
 			server.SetAuth(&AuthHTTPHandler{Service: authService})
+			setupHandler, setupErr := NewAcornFoxWebSetupHTTPHandler(store, authService, acornFoxSetupCredential(stdio.Getenv("CREDENTIALS_DIRECTORY")))
+			if setupErr != nil {
+				log.Fatal("administrator web setup configuration is invalid")
+			}
+			server.SetAcornFoxWebSetup(setupHandler)
 		} else {
 			log.Printf("administrator HTTP authentication is not activated; %s is unset", environment.Name(acornfoxenv.AuthOrigin))
 		}
@@ -208,6 +216,10 @@ func main() {
 				log.Fatal(err)
 			}
 			server.controller.SetSourcePreparer(sourceProvider)
+			if recoverErr := store.RecoverAcornFoxSourceUpdates(lifecycleContext, time.Now().UTC()); recoverErr != nil {
+				log.Fatal("source update recovery unavailable")
+			}
+			server.SetAcornFoxSourceUpdate(newAcornFoxSourceUpdateHTTPHandler(&application.AcornFoxSourceUpdateService{Store: store, Preparer: sourceProvider}))
 			buildConfig := buildkit.Config{Command: getenv(acornfoxenv.BuildkitCommand), Builder: getenv(acornfoxenv.BuildkitWorker), Address: getenv(acornfoxenv.BuildkitAddress), WorkspaceRoot: workspaceRoot, WorkRoot: buildWorkRoot, StaticServerBinary: getenv(acornfoxenv.StaticServerBinary), ImageStore: imageStore, Capacity: capacityProvider, SecretResolver: secretProvider, LogSink: buildLogSink, RequireLogSink: true}
 			buildNetwork := contracts.NetworkPolicy{}
 			if environment.Clean() {
@@ -536,6 +548,25 @@ func main() {
 	} else {
 		log.Printf("%s is unset; using the non-persistent development repository", environment.Name(acornfoxenv.DatabaseURL))
 	}
+	hostSampler := hostmetrics.NewSampler(hostmetrics.Config{})
+	hostSampler.Start(lifecycleContext)
+	server.SetAcornFoxHostMetrics(hostmetrics.NewHTTPHandler(hostSampler))
+	if getenv(acornfoxenv.AssistantEnabled) == "true" && controllerStore != nil {
+		workerSocket, toolSocket := getenv(acornfoxenv.AssistantWorkerSocket), getenv(acornfoxenv.AssistantToolsSocket)
+		if workerSocket == "" {
+			workerSocket = "/run/acornfox-pi/worker.sock"
+		}
+		if toolSocket == "" {
+			toolSocket = "/run/acornfox-assistant/tools.sock"
+		}
+		stopAssistant, assistantErr := server.configureAcornFoxAssistant(lifecycleContext, controllerStore.DB(), workerSocket, toolSocket)
+		if assistantErr != nil {
+			log.Print("assistant unavailable: verify its protected runtime configuration")
+		} else {
+			defer stopAssistant()
+		}
+	}
+
 	if gatewayAddress != "" {
 		var identities []struct {
 			CertificateID string `json:"certificate_id"`

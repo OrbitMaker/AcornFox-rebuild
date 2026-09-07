@@ -18,12 +18,14 @@ type openAPIParityMatrix struct {
 }
 
 type openAPIParityOperation struct {
-	OperationID   string `json:"operationId"`
-	Method        string `json:"method"`
-	PathTemplate  string `json:"pathTemplate"`
-	SuccessStatus int    `json:"successStatus"`
-	Proof         string `json:"proof"`
-	Visible       bool   `json:"visible"`
+	OperationID     string `json:"operationId"`
+	Method          string `json:"method"`
+	PathTemplate    string `json:"pathTemplate"`
+	SuccessStatuses []int  `json:"successStatuses"`
+	Proof           string `json:"proof"`
+	Parity          string `json:"parity"`
+	CLI             bool   `json:"cli"`
+	WebClient       string `json:"webClient"`
 }
 
 type cliParityOperation struct {
@@ -62,15 +64,20 @@ func TestAcornFoxOpenAPIParity(t *testing.T) {
 		{"loginAcornFoxAdministrator", http.MethodPost, "/auth/login", shapeSession, map[string]string{"password": "secret"}},
 		{"logoutAcornFoxAdministrator", http.MethodPost, "/auth/logout", shapeSession, nil},
 		{"getAcornFoxAdministratorSession", http.MethodGet, "/auth/session", shapeSession, nil},
+		{"getAcornFoxHostMetrics", http.MethodGet, "/host/metrics", shapeHostMetrics, nil},
 		{"rotateAcornFoxAdministratorPassword", http.MethodPost, "/auth/password", shapeSession, map[string]string{"current_password": "old", "new_password": "new"}},
 		{"listAcornFoxApps", http.MethodGet, "/apps", shapeApps, nil},
 		{"createAcornFoxApp", http.MethodPost, "/apps", shapeCreateApp, map[string]any{"name": "app", "source": map[string]string{"type": "public_git", "repository_url": "https://github.com/acme/app.git", "ref": "main"}}},
 		{"getAcornFoxApp", http.MethodGet, "/apps/app", shapeApplication, nil},
+		{"getAcornFoxOperationResult", http.MethodGet, "/apps/app/operations/operation", shapeOperationResult, nil},
 		{"listAcornFoxSourceRevisions", http.MethodGet, "/apps/app/sources", shapeSourceList, nil},
+		{"updateAcornFoxSourceRevision", http.MethodPost, "/apps/app/sources", shapeSourceUpdate, map[string]string{"base_source_revision_id": "source", "ref": "main"}},
 		{"getAcornFoxSourceRevision", http.MethodGet, "/apps/app/sources/source", shapeSource, nil},
+		{"getAcornFoxSourceMetadata", http.MethodGet, "/apps/app/sources/source/metadata", shapeSourceMetadata, nil},
 		{"listAcornFoxDeliveries", http.MethodGet, "/apps/app/deliveries", shapeDeploymentList, nil},
 		{"createAcornFoxDelivery", http.MethodPost, "/apps/app/deliveries", shapeCommand, map[string]string{"source_revision_id": "source"}},
 		{"getAcornFoxDeliveryStatus", http.MethodGet, "/apps/app/deliveries/deployment", shapeStatus, nil},
+		{"getAcornFoxDeliverySource", http.MethodGet, "/apps/app/deliveries/deployment/source", shapeDeliverySource, nil},
 		{"listAcornFoxDeliveryLogs", http.MethodGet, "/apps/app/deliveries/deployment/logs?source=runtime", shapeLogs, nil},
 		{"probeAcornFoxDeliveryOnce", http.MethodPost, "/apps/app/deliveries/deployment/probes", shapeCommand, map[string]string{"protocol": "http", "path": "/"}},
 		{"restartAcornFoxDelivery", http.MethodPost, "/apps/app/deliveries/deployment/restart", shapeCommand, map[string]any{}},
@@ -85,29 +92,59 @@ func TestAcornFoxOpenAPIParity(t *testing.T) {
 	if len(byID) != len(matrix.Operations) {
 		t.Fatal("OpenAPI matrix contains duplicate operation IDs")
 	}
-	if len(operations) != len(matrix.Operations) {
-		t.Fatalf("CLI visible routes=%d OpenAPI operations=%d", len(operations), len(matrix.Operations))
+	noCLI := map[string]string{
+		"getAcornFoxSetupState":             "integration_ui",
+		"initializeAcornFoxAdministrator":   "integration_ui",
+		"listAcornFoxAssistantSessions":     "assistant_ui_only",
+		"createAcornFoxAssistantSession":    "assistant_ui_only",
+		"submitAcornFoxAssistantRun":        "assistant_ui_only",
+		"getAcornFoxAssistantEvents":        "assistant_ui_only",
+		"abortAcornFoxAssistantSessionRuns": "assistant_ui_only",
+		"listAcornFoxAssistantActions":      "assistant_ui_only",
+		"decideAcornFoxAssistantAction":     "assistant_ui_only",
+	}
+	cliCount := 0
+	for _, operation := range matrix.Operations {
+		if operation.CLI {
+			cliCount++
+			continue
+		}
+		expectedParity, ok := noCLI[operation.OperationID]
+		expectedClient := "integration"
+		if expectedParity == "assistant_ui_only" {
+			expectedClient = "assistant"
+		}
+		if !ok || operation.Parity != expectedParity || operation.WebClient != expectedClient {
+			t.Fatalf("operation has no CLI parity classification: %+v", operation)
+		}
+		delete(noCLI, operation.OperationID)
+	}
+	if len(noCLI) != 0 {
+		t.Fatalf("missing UI-only OpenAPI operation classification: %v", noCLI)
+	}
+	if len(operations) != cliCount {
+		t.Fatalf("CLI routes=%d OpenAPI CLI operations=%d", len(operations), cliCount)
 	}
 
 	state := sessionState{Origin: "https://console.example.test", Session: "session", CSRF: "csrf", ExpiresAt: time.Now().Add(time.Hour)}
 	for _, declared := range operations {
 		t.Run(declared.operationID, func(t *testing.T) {
 			operation, ok := byID[declared.operationID]
-			if !ok || !operation.Visible {
-				t.Fatalf("not a visible OpenAPI operation: %+v", operation)
+			if !ok || !operation.CLI || !(operation.Parity == "legacy_cli" || operation.Parity == "integration_cli" || operation.Parity == "cli_only") {
+				t.Fatalf("not a CLI OpenAPI operation: %+v", operation)
 			}
 			if operation.Method != declared.method || !sameAcornFoxRoute(operation.PathTemplate, apiBase+declared.path) {
 				t.Fatalf("CLI route=%s %s OpenAPI=%s %s", declared.method, declared.path, operation.Method, operation.PathTemplate)
 			}
 			got, known := expectedSuccessStatus(declared.method, declared.path, declared.shape)
-			if !known || got != operation.SuccessStatus {
-				t.Fatalf("CLI success status=%d known=%t OpenAPI=%d", got, known, operation.SuccessStatus)
+			if !known || len(operation.SuccessStatuses) != 1 || got != operation.SuccessStatuses[0] {
+				t.Fatalf("CLI success status=%d known=%t OpenAPI=%v", got, known, operation.SuccessStatuses)
 			}
 			var captured *http.Request
 			client := &cli{client: &http.Client{Transport: roundTripper(func(request *http.Request) (*http.Response, error) {
 				captured = request.Clone(request.Context())
 				captured.Body = request.Body
-				return &http.Response{StatusCode: operation.SuccessStatus, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(""))}, nil
+				return &http.Response{StatusCode: operation.SuccessStatuses[0], Header: make(http.Header), Body: io.NopCloser(strings.NewReader(""))}, nil
 			})}}
 			csrf, key := cliProof(operation.Proof)
 			requestState := state

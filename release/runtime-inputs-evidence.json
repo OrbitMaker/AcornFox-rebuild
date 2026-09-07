@@ -4,7 +4,7 @@
     "tar_sha256": "f87e1c2cd2845b20c025968fd0e91bc0d61c0addd225311ea12c2e0a8b58804e",
     "member": "supply-chain.json"
   },
-  "runtime_inputs_sha256": "e06b81640a1225029ec0f548a22a05bb0d9957a8207f3347830a14c80973ef8a",
+  "runtime_inputs_sha256": "4928f3b2faac2d5360d3601311c61887c652ab13ccb602a40e4aa615fa58c852",
   "records": [
     {
       "tool": "buildkit",
@@ -77,6 +77,18 @@
       "filename": "caddy.tar.gz",
       "sha256": "52d42ae12b3462097e9868da6dfed3c9648ae12edd3b3638102312af84cb6904",
       "sha256_source": "assets.sha256"
+    },
+    {
+      "tool": "pi",
+      "architecture": "amd64",
+      "version": "0.85.1",
+      "url": "https://github.com/earendil-works/pi/releases/download/v0.85.1/pi-linux-x64.tar.gz",
+      "filename": "pi-linux-x64.tar.gz",
+      "sha256": "494e498f47d74d21f40b3386f6a5e921a3d49531a169cab55bbdaca0ea1fe25a",
+      "sha256_source": "SHA256SUMS",
+      "sha256sums_url": "https://github.com/earendil-works/pi/releases/download/v0.85.1/SHA256SUMS",
+      "sha256sums_sha256": "0b70b2e422339b7a1277c3addb3705e1239d21ca1c20a17741a7b1c06d7526b0",
+      "asset_manifest_sha256": "e8d788ebaab78af97ca959b91a1abfe9fc820de4a4c6aadcd870bb500679934d"
     }
   ]
 }

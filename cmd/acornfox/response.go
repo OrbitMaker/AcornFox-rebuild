@@ -151,6 +151,69 @@ type apiPublicAccess struct {
 	Components    apiComponents `json:"components"`
 	Status        string        `json:"status"`
 }
+type apiSourceMetadata struct {
+	SourceRevisionID string  `json:"source_revision_id"`
+	Availability     string  `json:"availability"`
+	RepositoryURL    *string `json:"repository_url,omitempty"`
+}
+type apiDeliverySource struct {
+	DeploymentID     string  `json:"deployment_id"`
+	Availability     string  `json:"availability"`
+	SourceRevisionID *string `json:"source_revision_id,omitempty"`
+	Commit           *string `json:"commit,omitempty"`
+	Ref              *string `json:"ref,omitempty"`
+	RepositoryURL    *string `json:"repository_url,omitempty"`
+}
+type apiHostCPU struct {
+	LogicalCores int      `json:"logical_cores"`
+	UsagePercent *float64 `json:"usage_percent,omitempty"`
+}
+type apiHostMemory struct {
+	TotalBytes     int64 `json:"total_bytes"`
+	AvailableBytes int64 `json:"available_bytes"`
+	UsedBytes      int64 `json:"used_bytes"`
+}
+type apiHostDisk struct {
+	Mountpoint string `json:"mountpoint"`
+	TotalBytes int64  `json:"total_bytes"`
+	FreeBytes  int64  `json:"free_bytes"`
+	UsedBytes  int64  `json:"used_bytes"`
+}
+type apiHostNetwork struct {
+	Interface        string   `json:"interface"`
+	RXBytesPerSecond *float64 `json:"rx_bytes_per_second,omitempty"`
+	TXBytesPerSecond *float64 `json:"tx_bytes_per_second,omitempty"`
+}
+type apiHostMetrics struct {
+	SchemaVersion     int             `json:"schema_version"`
+	Availability      string          `json:"availability"`
+	ObservedAt        *time.Time      `json:"observed_at,omitempty"`
+	StaleAfterSeconds int             `json:"stale_after_seconds"`
+	CPU               *apiHostCPU     `json:"cpu,omitempty"`
+	Memory            *apiHostMemory  `json:"memory,omitempty"`
+	Disk              *apiHostDisk    `json:"disk,omitempty"`
+	Network           *apiHostNetwork `json:"network,omitempty"`
+}
+type apiOperationEvidence struct {
+	Kind       string    `json:"kind"`
+	Verdict    string    `json:"verdict"`
+	ObservedAt time.Time `json:"observed_at"`
+	HTTPStatus *int      `json:"http_status,omitempty"`
+}
+type apiOperationResult struct {
+	OperationID   string                `json:"operation_id"`
+	OperationType string                `json:"operation_type"`
+	Status        string                `json:"status"`
+	TaskID        *string               `json:"task_id,omitempty"`
+	DeploymentID  *string               `json:"deployment_id,omitempty"`
+	AcceptedAt    time.Time             `json:"accepted_at"`
+	UpdatedAt     time.Time             `json:"updated_at"`
+	Evidence      *apiOperationEvidence `json:"evidence,omitempty"`
+}
+type apiSourceUpdate struct {
+	SourceRevisionID string `json:"source_revision_id"`
+	Status           string `json:"status"`
+}
 
 func decodeResponse(body io.Reader, shape responseShape) (any, error) {
 	data, err := io.ReadAll(io.LimitReader(body, maxResponseBytes+1))
@@ -197,6 +260,21 @@ func decodeResponse(body io.Reader, shape responseShape) (any, error) {
 	case shapePublicAccess:
 		var v apiPublicAccess
 		return decodeTyped(data, &v, validatePublicAccess)
+	case shapeHostMetrics:
+		var v apiHostMetrics
+		return decodeTyped(data, &v, validateHostMetrics)
+	case shapeSourceMetadata:
+		var v apiSourceMetadata
+		return decodeTyped(data, &v, validateSourceMetadata)
+	case shapeDeliverySource:
+		var v apiDeliverySource
+		return decodeTyped(data, &v, validateDeliverySource)
+	case shapeOperationResult:
+		var v apiOperationResult
+		return decodeTyped(data, &v, validateOperationResult)
+	case shapeSourceUpdate:
+		var v apiSourceUpdate
+		return decodeTyped(data, &v, validateSourceUpdate)
 	}
 	return nil, invalidResponse("server response is invalid")
 }
@@ -228,6 +306,42 @@ func optionalNonNullableNull(data []byte, shape responseShape) bool {
 		}
 		for _, item := range items {
 			if nullField(item, "ref", "commit") {
+				return true
+			}
+		}
+		return false
+	}
+	if shape == shapeSourceMetadata {
+		return nullField(object, "repository_url")
+	}
+	if shape == shapeDeliverySource {
+		return nullField(object, "source_revision_id", "commit", "ref", "repository_url")
+	}
+	if shape == shapeOperationResult {
+		if nullField(object, "task_id", "deployment_id", "evidence") {
+			return true
+		}
+		raw, present := object["evidence"]
+		if !present {
+			return false
+		}
+		var evidence map[string]json.RawMessage
+		return json.Unmarshal(raw, &evidence) != nil || nullField(evidence, "http_status")
+	}
+	if shape == shapeHostMetrics {
+		if nullField(object, "observed_at", "cpu", "memory", "disk", "network") {
+			return true
+		}
+		for _, name := range []string{"cpu", "network"} {
+			raw, ok := object[name]
+			if !ok {
+				continue
+			}
+			var nested map[string]json.RawMessage
+			if json.Unmarshal(raw, &nested) != nil {
+				return true
+			}
+			if name == "cpu" && nullField(nested, "usage_percent") || name == "network" && nullField(nested, "rx_bytes_per_second", "tx_bytes_per_second") {
 				return true
 			}
 		}
@@ -280,6 +394,16 @@ func requiredResponseFields(data []byte, shape responseShape) bool {
 		nullable["next_cursor"] = true
 	case shapePublicAccess:
 		keys = []string{"desired_public", "url", "endpoint", "components", "status"}
+	case shapeHostMetrics:
+		keys = []string{"schema_version", "availability", "stale_after_seconds"}
+	case shapeSourceMetadata:
+		keys = []string{"source_revision_id", "availability"}
+	case shapeDeliverySource:
+		keys = []string{"deployment_id", "availability"}
+	case shapeOperationResult:
+		keys = []string{"operation_id", "operation_type", "status", "accepted_at", "updated_at"}
+	case shapeSourceUpdate:
+		keys = []string{"source_revision_id", "status"}
 	}
 	for _, key := range keys {
 		raw, ok := object[key]
@@ -390,3 +514,88 @@ func validatePublicAccess(v *apiPublicAccess) bool {
 	}
 	return (v.Components.InternalEndpoint == "accepted" || v.Components.InternalEndpoint == "not_observed") && (v.Components.LocalRoute == "desired" || v.Components.LocalRoute == "reconcile_required" || v.Components.LocalRoute == "configured" || v.Components.LocalRoute == "disabled") && v.Components.DNS == "not_validated" && v.Components.TLS == "not_validated" && v.Components.External == "not_validated"
 }
+func validateSourceMetadata(v *apiSourceMetadata) bool {
+	if !nonempty(v.SourceRevisionID) || !(v.Availability == "available" || v.Availability == "unavailable") {
+		return false
+	}
+	if v.Availability == "unavailable" {
+		return v.RepositoryURL == nil
+	}
+	if v.RepositoryURL == nil {
+		return true
+	}
+	parsed, err := url.Parse(*v.RepositoryURL)
+	return err == nil && parsed.Scheme == "https" && parsed.Host != ""
+}
+func validateDeliverySource(v *apiDeliverySource) bool {
+	if !nonempty(v.DeploymentID) || !(v.Availability == "available" || v.Availability == "unavailable") {
+		return false
+	}
+	if v.Availability == "unavailable" {
+		return v.SourceRevisionID == nil && v.Commit == nil && v.Ref == nil && v.RepositoryURL == nil
+	}
+	if v.RepositoryURL != nil {
+		parsed, err := url.Parse(*v.RepositoryURL)
+		if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+			return false
+		}
+	}
+	return true
+}
+func validateHostMetrics(v *apiHostMetrics) bool {
+	if v.SchemaVersion != 1 || v.StaleAfterSeconds < 1 || !(v.Availability == "available" || v.Availability == "warming_up" || v.Availability == "unavailable" || v.Availability == "unsupported") {
+		return false
+	}
+	if v.Availability == "unavailable" || v.Availability == "unsupported" {
+		return v.CPU == nil && v.Memory == nil && v.Disk == nil && v.Network == nil
+	}
+	if !validTimePointer(v.ObservedAt) || v.CPU == nil || v.Memory == nil || v.Disk == nil {
+		return false
+	}
+	if v.CPU.LogicalCores < 1 || (v.CPU.UsagePercent != nil && (*v.CPU.UsagePercent < 0 || *v.CPU.UsagePercent > 100)) {
+		return false
+	}
+	if v.Memory.TotalBytes < 0 || v.Memory.AvailableBytes < 0 || v.Memory.UsedBytes < 0 || v.Memory.AvailableBytes > v.Memory.TotalBytes || v.Memory.UsedBytes > v.Memory.TotalBytes {
+		return false
+	}
+	if v.Disk.Mountpoint != "/" || v.Disk.TotalBytes < 0 || v.Disk.FreeBytes < 0 || v.Disk.UsedBytes < 0 || v.Disk.FreeBytes > v.Disk.TotalBytes || v.Disk.UsedBytes > v.Disk.TotalBytes {
+		return false
+	}
+	if v.Network == nil {
+		return true
+	}
+	return v.Network.Interface != "" && (v.Network.RXBytesPerSecond == nil || *v.Network.RXBytesPerSecond >= 0) && (v.Network.TXBytesPerSecond == nil || *v.Network.TXBytesPerSecond >= 0)
+}
+func validateOperationResult(v *apiOperationResult) bool {
+	if !nonempty(v.OperationID, v.OperationType) || !validTime(v.AcceptedAt) || !validTime(v.UpdatedAt) || v.UpdatedAt.Before(v.AcceptedAt) {
+		return false
+	}
+	if v.TaskID != nil && *v.TaskID == "" || v.DeploymentID != nil && *v.DeploymentID == "" {
+		return false
+	}
+	switch v.Status {
+	case "accepted", "running", "failed", "unknown":
+		return v.Evidence == nil
+	case "verified":
+		return v.Evidence != nil && validateOperationEvidence(v.Evidence)
+	default:
+		return false
+	}
+}
+func validateOperationEvidence(v *apiOperationEvidence) bool {
+	if v == nil || !validTime(v.ObservedAt) {
+		return false
+	}
+	switch v.Kind {
+	case "runtime_observation":
+		return v.Verdict == "observed" && v.HTTPStatus == nil
+	case "response_observation":
+		return (v.Verdict == "observed" || v.Verdict == "unhealthy") && (v.HTTPStatus == nil || (*v.HTTPStatus >= 100 && *v.HTTPStatus <= 599))
+	default:
+		return false
+	}
+}
+func validateSourceUpdate(v *apiSourceUpdate) bool {
+	return nonempty(v.SourceRevisionID) && v.Status == "imported"
+}
+func validTimePointer(value *time.Time) bool { return value != nil && validTime(*value) }

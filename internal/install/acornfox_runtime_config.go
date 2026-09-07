@@ -26,6 +26,8 @@ const acornFoxRuntimeIntentName = "runtime-config-intent.json"
 const acornFoxRuntimeReceiptName = "runtime-config.json"
 const acornFoxRuntimeParent = "etc/acornfox"
 const acornFoxRuntimeTarget = "etc/acornfox/runtime"
+const acornFoxSetupCredentialDirectory = "etc/acornfox/credentials"
+const acornFoxSetupCredentialPath = acornFoxSetupCredentialDirectory + "/setup-token"
 const acornFoxRuntimeMaxIntent = 1 << 20
 
 type AcornFoxRuntimeConfigReceiptV1 struct {
@@ -73,6 +75,7 @@ type acornFoxRuntimeIntent struct {
 	SourceCommit  string                    `json:"source_commit"`
 	Inputs        acornfoxsetup.Inputs      `json:"inputs"`
 	Files         []acornFoxRuntimeFileWire `json:"files"`
+	SetupToken    []byte                    `json:"setup_token"`
 }
 
 func (acornFoxRuntimeIntent) Format(s fmt.State, _ rune) {
@@ -89,7 +92,16 @@ func (i acornFoxRuntimeIntent) bundle() acornfoxsetup.Bundle {
 	return b
 }
 func (i acornFoxRuntimeIntent) validate() error {
-	if i.SchemaVersion != 1 || !validSHA(i.BindingSHA256) || !validID(i.ReleaseID) || !acornFoxHostSourceCommit.MatchString(i.SourceCommit) || i.ReleaseID != "release-"+i.Inputs.Version || acornfoxsetup.Validate(i.bundle(), i.Inputs) != nil {
+	return i.validateWithToken(true)
+}
+
+// validateForUpgrade accepts only the prior, tokenless intent format for an
+// explicit upgrade conversion. Runtime startup and ordinary recovery remain
+// strict and always require the setup token.
+func (i acornFoxRuntimeIntent) validateForUpgrade() error { return i.validateWithToken(false) }
+
+func (i acornFoxRuntimeIntent) validateWithToken(required bool) error {
+	if i.SchemaVersion != 1 || !validSHA(i.BindingSHA256) || !validID(i.ReleaseID) || !acornFoxHostSourceCommit.MatchString(i.SourceCommit) || i.ReleaseID != "release-"+i.Inputs.Version || acornfoxsetup.Validate(i.bundle(), i.Inputs) != nil || (required && acornfoxsetup.ValidateSetupToken(i.SetupToken) != nil) || (!required && len(i.SetupToken) != 0 && acornfoxsetup.ValidateSetupToken(i.SetupToken) != nil) {
 		return ErrAcornFoxRuntimeConfigConflict
 	}
 	return nil
@@ -97,6 +109,13 @@ func (i acornFoxRuntimeIntent) validate() error {
 func parseAcornFoxRuntimeIntent(raw []byte) (acornFoxRuntimeIntent, error) {
 	var i acornFoxRuntimeIntent
 	if len(raw) > acornFoxRuntimeMaxIntent || strictCanonicalJSON(raw, &i, "runtime intent") != nil || i.validate() != nil {
+		return acornFoxRuntimeIntent{}, ErrAcornFoxRuntimeConfigConflict
+	}
+	return i, nil
+}
+func parseAcornFoxRuntimeIntentForUpgrade(raw []byte) (acornFoxRuntimeIntent, error) {
+	var i acornFoxRuntimeIntent
+	if len(raw) > acornFoxRuntimeMaxIntent || strictCanonicalJSON(raw, &i, "runtime intent") != nil || i.validateForUpgrade() != nil {
 		return acornFoxRuntimeIntent{}, ErrAcornFoxRuntimeConfigConflict
 	}
 	return i, nil
@@ -198,7 +217,11 @@ func (s *acornFoxRuntimeConfig) run(ctx context.Context, expected AcornFoxBuildI
 		if gerr != nil {
 			return empty, ErrAcornFoxRuntimeConfigConflict
 		}
-		intent := acornFoxRuntimeIntent{SchemaVersion: 1, BindingSHA256: a.BindingSHA256, ReleaseID: identity.ReleaseID, SourceCommit: identity.SourceCommit, Inputs: input}
+		token, tokenErr := acornfoxsetup.GenerateSetupToken(s.random)
+		if tokenErr != nil {
+			return empty, ErrAcornFoxRuntimeConfigConflict
+		}
+		intent := acornFoxRuntimeIntent{SchemaVersion: 1, BindingSHA256: a.BindingSHA256, ReleaseID: identity.ReleaseID, SourceCommit: identity.SourceCommit, Inputs: input, SetupToken: token}
 		for _, f := range bundle.Files {
 			intent.Files = append(intent.Files, acornFoxRuntimeFileWire{f.Path, f.Mode, f.Owner, f.Group, f.Data})
 		}
@@ -422,6 +445,16 @@ func acornFoxRuntimeReadHost(root *os.Root, store *TaskAcornFoxRepoStore, path s
 // Scope is read-only and never authorizes arbitrary descendants. The caller
 // already owns the repository lock. No intent means no dynamic scope entries.
 func acornFoxRuntimeConfigScope(root *os.Root, store *TaskAcornFoxRepoStore, activation AcornFoxRepoActivationV1) ([]SubstrateEntry, error) {
+	return acornFoxRuntimeConfigScopeWithTokenPolicy(root, store, activation, true)
+}
+
+// acornFoxRuntimeConfigScopeForUpgrade is exclusively for capturing a
+// verified 0034 predecessor before its one-way upgrade conversion.
+func acornFoxRuntimeConfigScopeForUpgrade(root *os.Root, store *TaskAcornFoxRepoStore, activation AcornFoxRepoActivationV1) ([]SubstrateEntry, error) {
+	return acornFoxRuntimeConfigScopeWithTokenPolicy(root, store, activation, false)
+}
+
+func acornFoxRuntimeConfigScopeWithTokenPolicy(root *os.Root, store *TaskAcornFoxRepoStore, activation AcornFoxRepoActivationV1, requireToken bool) ([]SubstrateEntry, error) {
 	if root == nil || store == nil {
 		return nil, ErrAcornFoxRuntimeConfigConflict
 	}
@@ -436,6 +469,9 @@ func acornFoxRuntimeConfigScope(root *os.Root, store *TaskAcornFoxRepoStore, act
 		return nil, ErrAcornFoxRuntimeConfigConflict
 	}
 	i, err := parseAcornFoxRuntimeIntent(raw)
+	if !requireToken {
+		i, err = parseAcornFoxRuntimeIntentForUpgrade(raw)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -454,7 +490,7 @@ func acornFoxRuntimeConfigScope(root *os.Root, store *TaskAcornFoxRepoStore, act
 			return nil, ErrAcornFoxRuntimeConfigConflict
 		}
 	}
-	return acornFoxRuntimeInspect(root, store, i, raw, done)
+	return acornFoxRuntimeInspectWithTokenPolicy(root, store, i, raw, done, requireToken)
 }
 
 func acornFoxRuntimeCheckParent(root *os.Root, store *TaskAcornFoxRepoStore, temp string) error {
@@ -483,6 +519,10 @@ func acornFoxRuntimeCheckParent(root *os.Root, store *TaskAcornFoxRepoStore, tem
 }
 
 func acornFoxRuntimeInspect(root *os.Root, store *TaskAcornFoxRepoStore, i acornFoxRuntimeIntent, raw []byte, done bool) ([]SubstrateEntry, error) {
+	return acornFoxRuntimeInspectWithTokenPolicy(root, store, i, raw, done, true)
+}
+
+func acornFoxRuntimeInspectWithTokenPolicy(root *os.Root, store *TaskAcornFoxRepoStore, i acornFoxRuntimeIntent, raw []byte, done, requireToken bool) ([]SubstrateEntry, error) {
 	temp := acornFoxRuntimeTemporary(raw)
 	if err := acornFoxRuntimeCheckParent(root, store, temp); err != nil {
 		return nil, err
@@ -495,7 +535,24 @@ func acornFoxRuntimeInspect(root *os.Root, store *TaskAcornFoxRepoStore, i acorn
 		return nil, ErrAcornFoxRuntimeConfigConflict
 	}
 	if final {
-		return acornFoxRuntimeInspectDirectory(root, store, acornFoxRuntimeTarget, i, true)
+		entries, err := acornFoxRuntimeInspectDirectory(root, store, acornFoxRuntimeTarget, i, true)
+		if err != nil {
+			return nil, err
+		}
+		if len(i.SetupToken) == 0 && !requireToken {
+			if _, err := root.Lstat(acornFoxSetupCredentialDirectory); !errors.Is(err, os.ErrNotExist) {
+				return nil, ErrAcornFoxRuntimeConfigConflict
+			}
+			return entries, nil
+		}
+		credential, err := acornFoxRuntimeInspectSetupCredential(root, store, i, done)
+		if err != nil {
+			return nil, err
+		}
+		return append(entries, credential...), nil
+	}
+	if _, err := root.Lstat(acornFoxSetupCredentialDirectory); !errors.Is(err, os.ErrNotExist) {
+		return nil, ErrAcornFoxRuntimeConfigConflict
 	}
 	if temporary {
 		return acornFoxRuntimeInspectDirectory(root, store, temp, i, false)
@@ -559,7 +616,9 @@ func (s *acornFoxRuntimeConfig) publish(ctx context.Context, store *TaskAcornFox
 	temp := acornFoxRuntimeTemporary(raw)
 	p, _ := store.layout.owner(AcornFoxLiveRootRole)
 	if _, err := root.Lstat(acornFoxRuntimeTarget); err == nil {
-		return nil
+		return acornFoxRuntimePublishSetupToken(ctx, root, store, i)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return ErrAcornFoxRuntimeConfigConflict
 	}
 	if _, err := root.Lstat(temp); errors.Is(err, os.ErrNotExist) {
 		if root.Mkdir(temp, 0700) != nil {
@@ -674,5 +733,101 @@ func (s *acornFoxRuntimeConfig) publish(ctx context.Context, store *TaskAcornFox
 	if parent.Sync() != nil {
 		return ErrAcornFoxRuntimeConfigUnknown
 	}
+	return acornFoxRuntimePublishSetupToken(ctx, root, store, i)
+}
+
+func acornFoxRuntimePublishSetupToken(ctx context.Context, root *os.Root, store *TaskAcornFoxRepoStore, i acornFoxRuntimeIntent) error {
+	if ctx.Err() != nil || acornfoxsetup.ValidateSetupToken(i.SetupToken) != nil {
+		return ErrAcornFoxRuntimeConfigUnknown
+	}
+	principal, ok := store.layout.owner(AcornFoxLiveRootRole)
+	if !ok {
+		return ErrAcornFoxRuntimeConfigConflict
+	}
+	if err := acornFoxLiveEnsureDirOwned(root, store, acornFoxSetupCredentialDirectory, 0700, principal, func() {}); err != nil {
+		if errors.Is(err, ErrAcornFoxLiveConflict) {
+			return ErrAcornFoxRuntimeConfigConflict
+		}
+		return ErrAcornFoxRuntimeConfigUnknown
+	}
+	if err := acornFoxLiveWriteFileOwned(root, store, i.BindingSHA256, acornFoxSetupCredentialPath, i.SetupToken, 0600, principal, func() {}); err != nil {
+		if errors.Is(err, ErrAcornFoxLiveConflict) {
+			return ErrAcornFoxRuntimeConfigConflict
+		}
+		return ErrAcornFoxRuntimeConfigUnknown
+	}
+	_, err := acornFoxRuntimeInspectSetupCredential(root, store, i, true)
+	return err
+}
+
+// acornFoxRuntimeRemoveSetupToken is used only while restoring a verified
+// tokenless predecessor. It never removes a different inode or byte sequence.
+func acornFoxRuntimeRemoveSetupToken(root *os.Root, store *TaskAcornFoxRepoStore, i acornFoxRuntimeIntent) error {
+	if acornfoxsetup.ValidateSetupToken(i.SetupToken) != nil {
+		return ErrAcornFoxRuntimeConfigConflict
+	}
+	if _, err := acornFoxRuntimeInspectSetupCredential(root, store, i, true); err != nil {
+		return err
+	}
+	if err := root.Remove(acornFoxSetupCredentialPath); err != nil || acornFoxLiveSyncDir(root, acornFoxSetupCredentialDirectory) != nil {
+		return ErrAcornFoxRuntimeConfigUnknown
+	}
+	principal, ok := store.layout.owner(AcornFoxLiveRootRole)
+	if !ok {
+		return ErrAcornFoxRuntimeConfigConflict
+	}
+	info, err := root.Lstat(acornFoxSetupCredentialDirectory)
+	if err != nil || !info.IsDir() || info.Mode().Perm() != 0700 || !acornFoxLiveObservedOwner(store, info, principal) {
+		return ErrAcornFoxRuntimeConfigConflict
+	}
+	dir, err := root.OpenFile(acornFoxSetupCredentialDirectory, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return ErrAcornFoxRuntimeConfigConflict
+	}
+	children, readErr := dir.ReadDir(1)
+	closeErr := dir.Close()
+	if readErr != nil && !errors.Is(readErr, io.EOF) || closeErr != nil || len(children) != 0 {
+		return ErrAcornFoxRuntimeConfigConflict
+	}
+	if err := root.Remove(acornFoxSetupCredentialDirectory); err != nil || acornFoxLiveSyncDir(root, acornFoxRuntimeParent) != nil {
+		return ErrAcornFoxRuntimeConfigUnknown
+	}
 	return nil
+}
+
+func acornFoxRuntimeInspectSetupCredential(root *os.Root, store *TaskAcornFoxRepoStore, i acornFoxRuntimeIntent, required bool) ([]SubstrateEntry, error) {
+	principal, ok := store.layout.owner(AcornFoxLiveRootRole)
+	if !ok || acornfoxsetup.ValidateSetupToken(i.SetupToken) != nil {
+		return nil, ErrAcornFoxRuntimeConfigConflict
+	}
+	info, err := root.Lstat(acornFoxSetupCredentialDirectory)
+	if errors.Is(err, os.ErrNotExist) {
+		if required {
+			return nil, ErrAcornFoxRuntimeConfigConflict
+		}
+		return nil, nil
+	}
+	if err != nil || !info.IsDir() || info.Mode()&(os.ModeSymlink|os.ModeSetuid|os.ModeSetgid|os.ModeSticky) != 0 || info.Mode().Perm() != 0700 || !acornFoxLiveObservedOwner(store, info, principal) {
+		return nil, ErrAcornFoxRuntimeConfigConflict
+	}
+	dir, err := root.OpenFile(acornFoxSetupCredentialDirectory, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, ErrAcornFoxRuntimeConfigConflict
+	}
+	children, readErr := dir.ReadDir(-1)
+	closeErr := dir.Close()
+	if readErr != nil || closeErr != nil || len(children) > 1 || len(children) == 1 && children[0].Name() != "setup-token" {
+		return nil, ErrAcornFoxRuntimeConfigConflict
+	}
+	entries := []SubstrateEntry{{Path: acornFoxSetupCredentialDirectory, Kind: SubstrateEntryDirectory, Mode: 0700, Role: OwnerRoleRoot, Group: GroupRoleRoot}}
+	if len(children) == 0 {
+		if required {
+			return nil, ErrAcornFoxRuntimeConfigConflict
+		}
+		return entries, nil
+	}
+	if !acornFoxLiveExactFileOwned(root, store, acornFoxSetupCredentialPath, i.SetupToken, 0600, principal, false) {
+		return nil, ErrAcornFoxRuntimeConfigConflict
+	}
+	return append(entries, SubstrateEntry{Path: acornFoxSetupCredentialPath, Kind: SubstrateEntryFile, Mode: 0600, Role: OwnerRoleRoot, Group: GroupRoleRoot, Size: int64(len(i.SetupToken)), SHA256: sha256Hex(i.SetupToken)}), nil
 }

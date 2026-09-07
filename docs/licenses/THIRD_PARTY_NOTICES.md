@@ -241,6 +241,7 @@ Complete, unmodified notice texts and their digests are in `licenses-manifest.js
 | npm:vfile | 6.0.3 | MIT | https://www.npmjs.com/package/vfile/v/6.0.3 |
 | npm:w3c-keyname | 2.2.8 | MIT | https://www.npmjs.com/package/w3c-keyname/v/2.2.8 |
 | npm:zwitch | 2.0.4 | MIT | https://www.npmjs.com/package/zwitch/v/2.0.4 |
+| pi:@earendil-works/pi-coding-agent | 0.85.1 | MIT | https://github.com/earendil-works/pi/blob/v0.85.1/LICENSE |
 | runtime:cel.dev/expr | v0.25.1 | LicenseRef-64143a8f4bbd7ef054f6b183b4e864443105d76f1feedadf907143c959501aab | https://github.com/caddyserver/caddy/releases/download/v2.11.4/caddy_2.11.4_buildable-artifact.tar.gz#vendor/cel.dev/expr/LICENSE |
 | runtime:cloud.google.com/go/auth/oauth2adapt | v0.2.8 | LicenseRef-66b7a7d2cd5e83bb11de6cdaf13989b08619fbc3d4c58c5d1767831e1adcd605 | https://github.com/caddyserver/caddy/releases/download/v2.11.4/caddy_2.11.4_buildable-artifact.tar.gz#vendor/cloud.google.com/go/auth/oauth2adapt/LICENSE |
 | runtime:cloud.google.com/go/auth | v0.20.0 | LicenseRef-59469162676def9e83ff6204fbc4941513bc0f2f82d84c215397b04a6598c788 | https://github.com/caddyserver/caddy/releases/download/v2.11.4/caddy_2.11.4_buildable-artifact.tar.gz#vendor/cloud.google.com/go/auth/LICENSE |

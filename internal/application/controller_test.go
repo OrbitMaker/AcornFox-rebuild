@@ -64,6 +64,16 @@ type failingCreateRepository struct {
 	err error
 }
 
+type recordingCreateRepository struct {
+	*MemoryRepository
+	record CreateApplicationRecord
+}
+
+func (r *recordingCreateRepository) CreateApplication(ctx context.Context, record CreateApplicationRecord) (CreateApplicationResult, error) {
+	r.record = record
+	return r.MemoryRepository.CreateApplication(ctx, record)
+}
+
 func (r failingCreateRepository) CreateApplication(context.Context, CreateApplicationRecord) (CreateApplicationResult, error) {
 	return CreateApplicationResult{}, r.err
 }
@@ -164,6 +174,29 @@ func TestControllerCreateWithPublicGitReplaysPreparedRevision(t *testing.T) {
 	changed := &CreateApplicationSource{Kind: CreateApplicationSourceGit, RepositoryURL: source.RepositoryURL, Ref: "release"}
 	if _, err := controller.CreateApplicationWithSource(context.Background(), "git app", changed, "git-create"); !errors.Is(err, ErrIdempotencyConflict) {
 		t.Fatalf("changed Git source idempotency error=%v", err)
+	}
+}
+
+func TestControllerRecordsPublicGitProvenanceOnlyWhenExplicit(t *testing.T) {
+	for name, source := range map[string]*CreateApplicationSource{
+		"generic_git_is_unknown": {Kind: CreateApplicationSourceGit, RepositoryURL: "https://github.com/acme/generic.git", Ref: "main"},
+		"explicit_public_git":    {Kind: CreateApplicationSourceGit, RepositoryURL: "https://github.com/acme/public.git", Ref: "main", PublicGit: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			repository := &recordingCreateRepository{MemoryRepository: NewMemoryRepository()}
+			controller := NewController(repository)
+			controller.SetSourcePreparer(&testSourcePreparer{})
+			if _, err := controller.CreateApplicationWithSource(context.Background(), name, source, "provenance-"+name); err != nil {
+				t.Fatal(err)
+			}
+			if source.PublicGit {
+				if repository.record.PublicSourceProvenance == nil || repository.record.PublicSourceProvenance.SourceRevisionID != repository.record.PreparedSource.ID || repository.record.PublicSourceProvenance.RepositoryURL != repository.record.PreparedSource.Locator {
+					t.Fatalf("public provenance=%+v prepared=%+v", repository.record.PublicSourceProvenance, repository.record.PreparedSource)
+				}
+			} else if repository.record.PublicSourceProvenance != nil {
+				t.Fatalf("generic git gained public provenance: %+v", repository.record.PublicSourceProvenance)
+			}
+		})
 	}
 }
 
@@ -332,4 +365,34 @@ func TestControllerFailedPublicGitCreateDoesNotInvokeProviderRelease(t *testing.
 func testReadyUpload(id domain.ID, expiresAt time.Time) domain.SourceUploadRecord {
 	now := time.Now().UTC()
 	return domain.SourceUploadRecord{ID: id, Kind: domain.SourceUploadDirectory, Status: domain.SourceUploadReady, Digest: "sha256:" + strings.Repeat("a", 64), Bytes: 1, FileCount: 1, StorageRef: "upload://" + id.String(), ExpiresAt: expiresAt, IdempotencyKey: id.String(), RequestDigest: "sha256:" + strings.Repeat("a", 64), CreatedAt: now, UpdatedAt: now, Files: []domain.SourceUploadFile{{Path: "src/main.go", Bytes: 1, Digest: "sha256:" + strings.Repeat("b", 64)}}}
+}
+
+// PublicGit is server provenance, not a change to the historical user request.
+// Upgrading the public facade must replay old records without exposing them.
+func TestPublicFacadeReplaysHistoricalCreateWithoutBackfillingProvenance(t *testing.T) {
+	repository := &recordingCreateRepository{MemoryRepository: NewMemoryRepository()}
+	controller := NewController(repository)
+	preparer := &testSourcePreparer{}
+	controller.SetSourcePreparer(preparer)
+	source := &CreateApplicationSource{Kind: CreateApplicationSourceGit, RepositoryURL: "https://git.public.example/project/repo.git", Ref: "main"}
+	first, err := controller.CreateApplicationWithSource(context.Background(), "historical app", source, "historical-create")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repository.record.PublicSourceProvenance != nil {
+		t.Fatal("historical source unexpectedly public")
+	}
+	source.PublicGit = true
+	fresh := NewController(repository)
+	fresh.SetSourcePreparer(preparer)
+	replay, err := fresh.CreateApplicationWithSource(context.Background(), "historical app", source, "historical-create")
+	if err != nil || replay.Application.ID != first.Application.ID {
+		t.Fatalf("historical replay failed: %v", err)
+	}
+	if repository.record.PublicSourceProvenance != nil {
+		t.Fatal("replay changed public provenance")
+	}
+	if prepares, _ := preparer.counts(); prepares != 1 {
+		t.Fatal("replay fetched new source")
+	}
 }

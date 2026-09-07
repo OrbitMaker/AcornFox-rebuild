@@ -1,1164 +1,131 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { FormEvent } from "react";
-import {
-  createAcornFoxClient,
-  AcornFoxRequestError,
-  type AcornFoxClient,
-  type Application,
-  type DeliveryStatus,
-  type PublicAccess,
-  type SourceRevision,
-  type Deployment,
-  type LogsPage,
-} from "./client";
-import {
-  ActionScope,
-  LatestRequest,
-  appendServerPage,
-  keepsVisibleFacts,
-  refetchAfterAccepted,
-} from "./state";
+import type { FormEvent, ReactNode } from "react";
+import IconBox from "@douyinfe/semi-icons/lib/es/icons/IconBox";
+import IconChevronRightStroked from "@douyinfe/semi-icons/lib/es/icons/IconChevronRightStroked";
+import IconExit from "@douyinfe/semi-icons/lib/es/icons/IconExit";
+import IconHomeStroked from "@douyinfe/semi-icons/lib/es/icons/IconHomeStroked";
+import IconPlus from "@douyinfe/semi-icons/lib/es/icons/IconPlus";
+import IconRefresh from "@douyinfe/semi-icons/lib/es/icons/IconRefresh";
+import IconSettingStroked from "@douyinfe/semi-icons/lib/es/icons/IconSettingStroked";
+import { Assistant } from "./Assistant";
+import { AcornFoxRequestError, createAcornFoxClient, type AcornFoxClient, type Application, type Deployment, type LogsPage, type SourceRevision } from "./client";
+import { createAcornFoxIntegrationClient, newIntegrationIdempotencyKey, type AcornFoxIntegrationClient, type AcornFoxOperationResult, type DeploymentSource, type HostMetrics, type SourceMetadata } from "./integration-client";
+import { ActionScope, LatestRequest, appendServerPage, refetchAfterAccepted } from "./state";
 
-type Region<T> = {
-  state: "loading" | "ready" | "empty" | "unavailable" | "failed";
-  value?: T;
-  message?: string;
-};
+type Region<T> = { state: "loading" | "ready" | "empty" | "unavailable" | "failed"; value?: T; message?: string };
+type Page = "home" | "create" | "app" | "account";
+type Tab = "overview" | "deployments" | "logs" | "sources" | "access";
+const tabLabel: Record<Tab, string> = { overview: "概览", deployments: "部署记录", logs: "日志", sources: "源码版本", access: "公网访问" };
 
-function ReleaseSourceLink() {
-  const release = typeof __ACORNFOX_RELEASE_SOURCE__ === "undefined" ? null : __ACORNFOX_RELEASE_SOURCE__;
-  if (!release) return null;
-  return (
-    <a className="af-source-link" href={release.url} target="_blank" rel="noopener noreferrer">
-      v{release.version} · 对应源码
-    </a>
-  );
+function errorRegion(error: unknown): Region<never> { const request = error instanceof AcornFoxRequestError ? error : undefined; return { state: request?.kind === "unavailable" ? "unavailable" : "failed", message: request?.message ?? "请求未完成，请手动重试。" }; }
+function time(value?: string): string { return !value || Number.isNaN(Date.parse(value)) ? "—" : new Date(value).toLocaleString("zh-CN", { hour12: false }); }
+function compact(value?: string): string { return value ? `${value.slice(0, 8)}${value.length > 8 ? "…" : ""}` : "—"; }
+function bytes(value?: number): string { if (value === undefined) return "—"; const units = ["B", "KB", "MB", "GB", "TB"]; let index = 0, current = value; while (current >= 1024 && index < units.length - 1) { current /= 1024; index += 1; } return `${current >= 10 || index === 0 ? current.toFixed(0) : current.toFixed(1)}${units[index]}`; }
+function rate(value?: number): string { return value === undefined ? "—" : `${bytes(value)}/s`; }
+function percent(used?: number, total?: number): number | undefined { return used === undefined || !total || total <= 0 ? undefined : Math.max(0, Math.min(100, used / total * 100)); }
+export function hostIsFresh(metrics?: HostMetrics): boolean { if (!metrics || metrics.availability !== "available" || !metrics.observedAt) return false; const observed = Date.parse(metrics.observedAt); return !Number.isNaN(observed) && Date.now() <= observed + metrics.staleAfterSeconds * 1000; }
+function statusLabel(stage?: Deployment["stage"]): string { return ({ starting: "处理中", runtime_observed: "已记录运行状态", failed: "失败", unknown: "待确认" })[stage ?? "unknown"]; }
+function Note({ region, empty }: { region: Region<unknown>; empty: string }) { if (region.state === "loading") return <p className="af-note" role="status">正在读取…</p>; if (region.state === "empty") return <p className="af-note">{empty}</p>; if (region.state === "unavailable") return <p className="af-note af-note--warn">暂不可用：{region.message}</p>; if (region.state === "failed") return <p className="af-note af-note--error" role="alert">读取失败：{region.message}</p>; return null; }
+function ReleaseSourceLink() { const release = typeof __ACORNFOX_RELEASE_SOURCE__ === "undefined" ? null : __ACORNFOX_RELEASE_SOURCE__; return release ? <a className="af-source-link" href={release.url} target="_blank" rel="noopener noreferrer">v{release.version} · 对应源码</a> : null; }
+
+function useData<T>(load: () => Promise<T>, deps: readonly unknown[], empty?: (value: T) => boolean) {
+  const [region, setRegion] = useState<Region<T>>({ state: "loading" }); const request = useRef(new LatestRequest());
+  const refresh = async () => { const current = request.current.begin(); setRegion({ state: "loading" }); try { const value = await load(); if (current()) setRegion(empty?.(value) ? { state: "empty", value } : { state: "ready", value }); } catch (error) { if (current()) setRegion(errorRegion(error)); } };
+  useEffect(() => { void refresh(); return () => request.current.invalidate(); }, deps);
+  return { region, refresh };
+}
+function useHostMetrics(client: AcornFoxIntegrationClient, active: boolean) {
+  const [region, setRegion] = useState<Region<HostMetrics>>({ state: "loading" }); const request = useRef(new LatestRequest()), inflight = useRef<AbortController>(), staleTimer = useRef<number>();
+  const clearStale = () => { if (staleTimer.current !== undefined) { window.clearTimeout(staleTimer.current); staleTimer.current = undefined; } };
+  const scheduleStale = (metrics: HostMetrics) => { clearStale(); if (!metrics.observedAt) return; const observed = Date.parse(metrics.observedAt); if (Number.isNaN(observed)) return; const delay = Math.max(0, observed + metrics.staleAfterSeconds * 1000 - Date.now()); staleTimer.current = window.setTimeout(() => setRegion((previous) => previous.value === metrics ? { ...previous } : previous), delay); };
+  const refresh = async () => { if (inflight.current) return; const current = request.current.begin(), controller = new AbortController(); inflight.current = controller; const timeout = window.setTimeout(() => controller.abort(), 8000); try { const metrics = await client.hostMetrics(controller.signal); if (current()) { setRegion({ state: "ready", value: metrics }); scheduleStale(metrics); } } catch (error) { if (current()) setRegion(errorRegion(error)); } finally { window.clearTimeout(timeout); if (inflight.current === controller) inflight.current = undefined; } };
+  useEffect(() => { if (!active) return; const refreshWhenVisible = () => { if (document.visibilityState === "visible") void refresh(); }; void refresh(); const interval = window.setInterval(refreshWhenVisible, 5000); document.addEventListener("visibilitychange", refreshWhenVisible); return () => { window.clearInterval(interval); document.removeEventListener("visibilitychange", refreshWhenVisible); clearStale(); inflight.current?.abort(); inflight.current = undefined; request.current.invalidate(); }; }, [client, active]);
+  return { region, refresh };
+}
+export function operationIsTerminal(status: AcornFoxOperationResult["status"]): boolean { return status === "verified" || status === "failed" || status === "unknown"; }
+function operationStatusLabel(status: AcornFoxOperationResult["status"]): string { return ({ accepted: "已受理", running: "执行中", verified: "已验证", failed: "失败", unknown: "未知" })[status]; }
+function OperationEvidence({ integration, applicationId, operationId }: { integration: AcornFoxIntegrationClient; applicationId: string; operationId: string }) {
+  const [region, setRegion] = useState<Region<AcornFoxOperationResult>>({ state: "loading" }); const request = useRef(new LatestRequest()); const terminal = useRef(false); const interval = useRef<number>(); const [bounded, setBounded] = useState(false);
+  const stopPolling = () => { if (interval.current !== undefined) { window.clearInterval(interval.current); interval.current = undefined; } };
+  const refresh = async (manual = false) => { const current = request.current.begin(); if (manual) setRegion({ state: "loading" }); try { const result = await integration.operationResult(applicationId, operationId); if (current()) { terminal.current = operationIsTerminal(result.status); if (terminal.current) stopPolling(); setRegion({ state: "ready", value: result }); } } catch (error) { if (current()) setRegion(errorRegion(error)); } };
+  useEffect(() => { terminal.current = false; setBounded(false); let reads = 0; const poll = () => { if (document.visibilityState !== "visible" || terminal.current || reads >= 12) return; reads += 1; void refresh(); if (reads >= 12) { setBounded(true); stopPolling(); } }; void refresh(); interval.current = window.setInterval(poll, 5000); const visible = () => poll(); document.addEventListener("visibilitychange", visible); return () => { stopPolling(); document.removeEventListener("visibilitychange", visible); request.current.invalidate(); }; }, [integration, applicationId, operationId]);
+  const result = region.value; const evidence = result?.evidence;
+  return <section className="af-section af-operation" aria-label="本次操作证据" style={{ marginBottom: 18 }}><header><div><h2>本次操作</h2><span className="af-badge">{result ? operationStatusLabel(result.status) : "正在读取"}</span></div><button className="af-button--quiet" onClick={() => void refresh(true)}><IconRefresh /> 刷新事实</button></header><Note region={region} empty="" />{result && <><dl className="af-facts"><div><dt>操作</dt><dd>{result.operationType}</dd></div><div><dt>操作 ID</dt><dd>{result.operationId}</dd></div><div><dt>任务 ID</dt><dd>{result.taskId ?? "—"}</dd></div><div><dt>部署 ID</dt><dd>{result.deploymentId ?? "—"}</dd></div></dl>{result.status === "accepted" && <p className="af-note">操作已受理，尚无执行事实。</p>}{result.status === "running" && <p className="af-note">正在读取该操作的持久事实。</p>}{result.status === "failed" && <p className="af-note af-note--error">该操作已失败；未展示原始任务错误。</p>}{result.status === "unknown" && <p className="af-note af-note--warn">任务可能已完成，但尚无独立事实；本次操作结果未知。</p>}{evidence && <div className="af-note"><strong>{evidence.kind === "runtime_observation" ? "运行观测" : "响应观测"}</strong><span> · {time(evidence.observedAt)}</span>{evidence.verdict === "unhealthy" ? <p>请求响应为不健康{evidence.httpStatus ? `（HTTP ${evidence.httpStatus}）` : ""}；这不能推断应用整体健康。</p> : <p>已记录本次操作的独立观测；这不代表应用整体健康。</p>}</div>}</>}{bounded && !terminal.current && <p className="af-note af-note--warn">已停止自动读取；可手动刷新本次操作事实。</p>}</section>;
+}
+function ResourceLine({ name, value, fill, network }: { name: string; value: string; fill?: number; network?: boolean }) { return <div className="af-resource-line"><div><span>{name}</span><strong>{value}</strong></div>{network ? null : <i aria-label={`${name} 使用率`}><b style={{ width: `${fill ?? 0}%` }} /></i>}</div>; }
+function Resources({ region, compact: isCompact }: { region: Region<HostMetrics>; compact?: boolean }) {
+  const reported = region.value, metrics = hostIsFresh(reported) ? reported : undefined, memory = metrics?.memory, disk = metrics?.disk, network = metrics?.network, cpu = metrics?.cpu?.usagePercent;
+  const lines = <><ResourceLine name="CPU" value={cpu === undefined ? "—" : `${cpu.toFixed(0)}%`} fill={cpu} /><ResourceLine name="内存" value={memory ? `${bytes(memory.usedBytes)} / ${bytes(memory.totalBytes)}` : "—"} fill={percent(memory?.usedBytes, memory?.totalBytes)} /><ResourceLine name="磁盘" value={disk ? `${bytes(disk.usedBytes)} / ${bytes(disk.totalBytes)}` : "—"} fill={percent(disk?.usedBytes, disk?.totalBytes)} /><ResourceLine name="网络" value={`↓ ${rate(network?.rxBytesPerSecond)} / ↑ ${rate(network?.txBytesPerSecond)}`} network /></>;
+  if (isCompact) return <div className="af-mini-resources" aria-label="本机资源">{lines}</div>;
+  return <section className="af-resources" aria-label="本机资源概览"><header><span>本机资源</span><small>{metrics ? `观测于 ${time(metrics.observedAt)}` : reported ? "观测已过期" : "暂无可用观测"}</small></header><div className="af-resources__grid">{lines}</div>{region.state !== "ready" && <Note region={region} empty="" />}</section>;
 }
 
-function failure(error: unknown): Region<never> {
-  const request = error instanceof AcornFoxRequestError ? error : undefined;
-  return {
-    state: request?.kind === "unavailable" ? "unavailable" : "failed",
-    message: request?.message ?? "请求未完成，请手动重试。",
-  };
+export function Login({ api, onReady }: { api: AcornFoxClient; onReady: () => void }) {
+  const [password, setPassword] = useState(""), [busy, setBusy] = useState(false), [message, setMessage] = useState<string>();
+  async function submit(event: FormEvent) { event.preventDefault(); setBusy(true); setMessage(undefined); try { await api.login(password); setPassword(""); onReady(); } catch (error) { setMessage(errorRegion(error).message); } finally { setBusy(false); } }
+  return <main className="af-login"><section className="af-login__card" aria-labelledby="login-title"><a className="af-brand" href="/">AcornFox</a><p className="af-kicker">本机应用管理</p><h1 id="login-title">登录管理台</h1><form onSubmit={submit}><label>管理员密码<input autoFocus autoComplete="current-password" type="password" value={password} onChange={(event) => setPassword(event.target.value)} /></label>{message && <p className="af-note af-note--error" role="alert">{message}</p>}<button disabled={busy || !password}>{busy ? "正在登录…" : "登录"}</button></form><p className="af-recovery">忘记密码？请在服务器上运行 <code>acornfox-admin reset-password</code>。</p><ReleaseSourceLink /></section></main>;
 }
-function date(value?: string): string {
-  return value
-    ? new Date(value).toLocaleString("zh-CN", { hour12: false })
-    : "尚无记录";
-}
-function RegionNote({
-  region,
-  empty,
-}: {
-  region: Region<unknown>;
-  empty: string;
-}) {
-  if (region.state === "loading")
-    return (
-      <p className="af-note" role="status">
-        正在读取…
-      </p>
-    );
-  if (region.state === "empty") return <p className="af-note">{empty}</p>;
-  if (region.state === "unavailable")
-    return <p className="af-note af-note--warn">暂不可用：{region.message}</p>;
-  if (region.state === "failed")
-    return <p className="af-note af-note--error">读取失败：{region.message}</p>;
-  return null;
+function Setup({ integration, onReady }: { integration: AcornFoxIntegrationClient; onReady: () => void }) {
+  const [token, setToken] = useState(""), [password, setPassword] = useState(""), [confirm, setConfirm] = useState(""), [busy, setBusy] = useState(false), [message, setMessage] = useState<string>();
+  async function submit(event: FormEvent) { event.preventDefault(); if (password !== confirm) { setMessage("两次输入的管理员密码不一致。"); return; } setBusy(true); setMessage(undefined); try { await integration.setup({ setupToken: token, password }); onReady(); } catch (error) { setMessage(errorRegion(error).message); } finally { setBusy(false); } }
+  return <main className="af-login"><section className="af-login__card" aria-labelledby="setup-title"><a className="af-brand" href="/">AcornFox</a><p className="af-kicker">首次初始化</p><h1 id="setup-title">创建管理员</h1><p>请输入安装时生成的一次性凭据。</p><form onSubmit={submit}><label>安装凭据<input autoFocus autoComplete="off" value={token} onChange={(event) => setToken(event.target.value)} /></label><label>管理员密码<input autoComplete="new-password" type="password" value={password} onChange={(event) => setPassword(event.target.value)} /></label><label>确认管理员密码<input autoComplete="new-password" type="password" value={confirm} onChange={(event) => setConfirm(event.target.value)} /></label>{message && <p className="af-note af-note--error" role="alert">{message}</p>}<button disabled={busy || !token || !password || !confirm}>{busy ? "正在初始化…" : "完成初始化"}</button></form><p className="af-recovery">需要恢复访问时，请联系服务器管理员。</p></section></main>;
 }
 
-export function Login({
-  api,
-  onReady,
-}: {
-  api: AcornFoxClient;
-  onReady: () => void;
-}) {
-  const [password, setPassword] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [message, setMessage] = useState<string>();
-  async function submit(event: FormEvent) {
-    event.preventDefault();
-    setBusy(true);
-    setMessage(undefined);
-    try {
-      await api.login(password);
-      setPassword("");
-      onReady();
-    } catch (error) {
-      setMessage(failure(error).message);
-    } finally {
-      setBusy(false);
-    }
-  }
-  return (
-    <main className="af-login">
-      <section className="af-login__card" aria-labelledby="login-title">
-        <p className="af-kicker">ACORNFOX</p>
-        <h1 id="login-title">登录管理台</h1>
-        <p>用管理员密码管理此机器上的应用。</p>
-        <form onSubmit={submit}>
-          <label>
-            管理员密码
-            <input
-              autoFocus
-              autoComplete="current-password"
-              type="password"
-              value={password}
-              onChange={(event) => setPassword(event.target.value)}
-            />
-          </label>
-          {message && (
-            <p className="af-note af-note--error" role="alert">
-              {message}
-            </p>
-          )}
-          <button disabled={busy || password.length === 0}>
-            {busy ? "正在登录…" : "登录"}
-          </button>
-        </form>
-        <ReleaseSourceLink />
-      </section>
-    </main>
-  );
+function CreateApplication({ api, onCreated, onCancel }: { api: AcornFoxClient; onCreated: (result: { application: Application; operationId: string }) => void; onCancel: () => void }) {
+  const [name, setName] = useState(""), [repositoryUrl, setRepositoryUrl] = useState(""), [ref, setRef] = useState("main"), [busy, setBusy] = useState(false), [message, setMessage] = useState<string>();
+  async function submit(event: FormEvent) { event.preventDefault(); setBusy(true); setMessage(undefined); try { const result = await api.createApp({ name, repositoryUrl, ref }); onCreated({ application: result.application, operationId: result.operationId }); } catch (error) { setMessage(errorRegion(error).message); } finally { setBusy(false); } }
+  return <section className="af-form-page"><header><h2>导入公开 Git 仓库</h2><p>创建后服务端将固定源码版本；此处不保存凭据。</p></header><form className="af-form" onSubmit={submit}><label>应用名称<input value={name} onChange={(event) => setName(event.target.value)} required /></label><label>公开 HTTPS Git 地址<input type="url" placeholder="https://github.com/org/app.git" value={repositoryUrl} onChange={(event) => setRepositoryUrl(event.target.value)} required /></label><label>分支或标签<input value={ref} onChange={(event) => setRef(event.target.value)} required /></label>{message && <p className="af-note af-note--error" role="alert">{message}</p>}<footer><button type="button" className="af-button--quiet" onClick={onCancel}>取消</button><button disabled={busy}>{busy ? "正在提交…" : "创建并导入源码"}</button></footer></form><aside className="af-form-hint"><strong>首版范围</strong><p>公开 Git、根目录 Dockerfile、单应用单容器。</p><p>请求被接受不表示构建或部署已完成。</p></aside></section>;
+}
+function SourceUpdateForm({ integration, applicationId, source, metadata, onImported }: { integration: AcornFoxIntegrationClient; applicationId: string; source: SourceRevision; metadata: SourceMetadata; onImported: (sourceRevisionId: string) => Promise<void> }) {
+  const [ref, setRef] = useState(source.ref ?? "main"), [pending, setPending] = useState<{ ref: string; key: string }>(), [busy, setBusy] = useState(false), [message, setMessage] = useState<string>();
+  useEffect(() => { setRef(source.ref ?? "main"); setPending(undefined); setMessage(undefined); }, [source.id]);
+  const submit = async (retry = false) => { if (busy) return; if (pending && !retry) { setMessage("上一请求的结果未知，请先使用同一请求标识确认。 "); return; } const request = pending ?? { ref: ref.trim(), key: newIntegrationIdempotencyKey() }; if (!request.ref) return; setBusy(true); setMessage(undefined); try { const result = await integration.sourceUpdate(applicationId, { baseSourceRevisionId: source.id, ref: request.ref }, request.key); setPending(undefined); await onImported(result.sourceRevisionId); setMessage("新版本已导入，尚未部署。请另行选择该版本并开始部署。"); } catch (error) { const unknown = error instanceof AcornFoxRequestError && error.kind === "unavailable"; if (unknown) setPending(request); setMessage(unknown ? "导入结果未确认；请使用同一请求标识手动确认，现有来源与运行版本未改变。" : errorRegion(error).message); } finally { setBusy(false); } };
+  if (metadata.availability !== "available" || !metadata.repositoryUrl) return null;
+  return <section className="af-section" style={{ marginTop: 18 }}><header><h2>更新此来源</h2><span className="af-badge">已验证公开来源</span></header><p className="af-note">固定来源 URL：<code>{metadata.repositoryUrl}</code></p><p className="af-note">只导入指定引用，不修改远程仓库，也不会部署或替换当前运行版本。</p><div className="af-inline-form"><label>新引用<input value={ref} onChange={(event) => setRef(event.target.value)} disabled={busy || Boolean(pending)} /></label><button type="button" disabled={busy || !ref.trim() || Boolean(pending)} onClick={() => void submit()}>{busy ? "正在导入…" : "导入新版本"}</button></div>{pending && <button className="af-button--quiet" onClick={() => void submit(true)} disabled={busy}>使用同一请求标识确认</button>}{message && <p className="af-note" role="status">{message}</p>}</section>;
+}
+function Home({ apps, appRegion, reload, onCreate, onOpen, host }: { apps: Application[]; appRegion: Region<Application[]>; reload: () => void; onCreate: () => void; onOpen: (id: string) => void; host: ReturnType<typeof useHostMetrics> }) {
+  const [query, setQuery] = useState(""); const rows = apps.filter((app) => app.name.toLowerCase().includes(query.trim().toLowerCase()));
+  return <section className="af-home"><Resources region={host.region} /><div className="af-table-heading"><strong>应用 <small>({apps.length})</small></strong><input aria-label="搜索应用" placeholder="搜索应用" value={query} onChange={(event) => setQuery(event.target.value)} /><button className="af-button--quiet" onClick={reload}><IconRefresh /> 刷新</button><button onClick={onCreate}><IconPlus /> 创建应用</button></div><div className="af-table-wrap"><table className="af-table"><thead><tr><th>应用</th><th>创建状态</th><th>创建时间</th><th>更新</th><th /></tr></thead><tbody>{rows.map((app) => <tr key={app.id}><td><button className="af-link" onClick={() => onOpen(app.id)}>{app.name}</button><small className="af-id">{app.id}</small></td><td><span className="af-badge">已创建</span></td><td>{time(app.created_at)}</td><td>{time(app.updated_at)}</td><td><button className="af-icon-button" aria-label={`打开 ${app.name}`} onClick={() => onOpen(app.id)}><IconChevronRightStroked /></button></td></tr>)}</tbody></table>{appRegion.state !== "ready" && <Note region={appRegion} empty="还没有应用。创建一个公开 Git 应用开始。" />}</div><p className="af-footnote">运行情况请查看部署详情。</p></section>;
 }
 
-export function CreateApplication({
-  api,
-  onCreated,
-}: {
-  api: AcornFoxClient;
-  onCreated: (application: Application) => void;
-}) {
-  const [name, setName] = useState("");
-  const [repository, setRepository] = useState("");
-  const [ref, setRef] = useState("main");
-  const [message, setMessage] = useState<string>();
-  const [busy, setBusy] = useState(false);
-  async function submit(event: FormEvent) {
-    event.preventDefault();
-    setBusy(true);
-    setMessage(undefined);
-    try {
-      const result = await api.createApp({
-        name,
-        repositoryUrl: repository,
-        ref,
-      });
-      setMessage("应用创建已接受，正在读取服务器记录。");
-      onCreated(result.application);
-      setName("");
-      setRepository("");
-    } catch (error) {
-      setMessage(failure(error).message);
-    } finally {
-      setBusy(false);
-    }
-  }
-  return (
-    <form className="af-create" onSubmit={submit} aria-label="创建应用">
-      <label>
-        应用名称
-        <input value={name} onChange={(event) => setName(event.target.value)} />
-      </label>
-      <label>
-        公开 HTTPS Git 地址
-        <input
-          placeholder="https://github.com/org/project.git"
-          value={repository}
-          onChange={(event) => setRepository(event.target.value)}
-        />
-      </label>
-      <label>
-        版本引用
-        <input value={ref} onChange={(event) => setRef(event.target.value)} />
-      </label>
-      <button disabled={busy || !name || !repository || !ref}>
-        {busy ? "正在提交…" : "创建应用"}
-      </button>
-      {message && (
-        <p className="af-note" role="status">
-          {message}
-        </p>
-      )}
-    </form>
-  );
+function DeliveryWorkspace({ api, application, deployment, onOperationAccepted }: { api: AcornFoxClient; application: Application; deployment: Deployment; onOperationAccepted?: (operationId: string) => void }) {
+  const statusData = useData(() => api.status(application.id, deployment.id), [api, application.id, deployment.id]); const accessData = useData(() => api.publicAccess(application.id, deployment.id), [api, application.id, deployment.id]); const [action, setAction] = useState<string>(), [message, setMessage] = useState<string>(); const scope = useRef(new ActionScope());
+  async function command(kind: "probe" | "restart" | "redeploy" | "access") { const ticket = scope.current.begin(); if (!ticket) return; setAction(kind); setMessage(undefined); try { const accepted = kind === "probe" ? await api.probe(application.id, deployment.id) : kind === "restart" ? await api.restart(application.id, deployment.id) : kind === "redeploy" ? await api.redeploy(application.id, deployment.id) : undefined; if (kind === "access") await api.setPublicAccess(application.id, deployment.id, !accessData.region.value?.desired_public); if (!ticket.current()) return; if (accepted) onOperationAccepted?.(accepted.operation_id); setMessage(accepted ? "操作已受理，正在读取本次操作事实。" : "公网访问设置已接受，正在读取服务器记录。"); await refetchAfterAccepted(kind === "access" ? accessData.refresh : statusData.refresh); } catch (error) { if (ticket.current()) setMessage(errorRegion(error).message); } finally { if (ticket.finish()) setAction(undefined); } }
+  const status = statusData.region.value, access = accessData.region.value;
+  return <div className="af-stack"><section className="af-section"><header><h2>部署状态</h2><button className="af-button--quiet" onClick={statusData.refresh}><IconRefresh /> 刷新</button></header><Note region={statusData.region} empty="等待服务器写入部署记录。" />{status && <dl className="af-facts"><div><dt>部署阶段</dt><dd>{status.deployment.stage}</dd></div><div><dt>期望状态</dt><dd>{status.desired ? "已记录" : "等待配置"}</dd></div><div><dt>运行状态</dt><dd>{status.runtime?.runtime_state ?? "尚未观测"}</dd></div><div><dt>响应记录</dt><dd>{status.response ? `${status.response.outcome}${status.response.http_status ? ` · HTTP ${status.response.http_status}` : ""}` : "尚未观测"}</dd></div></dl>}<div className="af-actions"><button disabled={!!action} onClick={() => void command("probe")}>{action === "probe" ? "正在提交…" : "检查应用响应"}</button><button className="af-button--quiet" disabled={!!action} onClick={() => void command("restart")}>重启</button><button className="af-button--quiet" disabled={!!action} onClick={() => void command("redeploy")}>重新部署</button></div>{message && <p className="af-note" role="status">{message}</p>}</section><section className="af-section"><header><h2>公网访问</h2><button className="af-button--quiet" onClick={accessData.refresh}><IconRefresh /> 刷新</button></header><p className="af-note">先确认响应记录为 responded，再开启公网访问。运行中不等于能响应请求。</p><Note region={accessData.region} empty="尚无公网访问设置。" />{access && <div className="af-access"><span className="af-badge">{access.desired_public ? "已请求本机公网访问" : "未请求本机公网访问"}</span><a href={access.url} target="_blank" rel="noopener noreferrer">{access.url}</a><button disabled={!!action} onClick={() => void command("access")}>{access.desired_public ? "关闭公网访问" : "开启公网访问"}</button><small>DNS / 证书 / 外网：{access.components.dns} / {access.components.tls} / {access.components.external}</small></div>}</section></div>;
+}
+export { DeliveryWorkspace };
+function Logs({ api, applicationId, deploymentId }: { api: AcornFoxClient; applicationId: string; deploymentId: string }) {
+  const [source, setSource] = useState<"build" | "runtime">("build"), [region, setRegion] = useState<Region<LogsPage>>({ state: "loading" }), [cursor, setCursor] = useState<string>(); const request = useRef(new LatestRequest());
+  const refresh = async () => { const current = request.current.begin(); setRegion({ state: "loading" }); try { const page = await api.logs(applicationId, deploymentId, source); if (current()) { setRegion(page.items.length ? { state: "ready", value: page } : { state: "empty", value: page }); setCursor(page.nextCursor); } } catch (error) { if (current()) setRegion(errorRegion(error)); } };
+  useEffect(() => { void refresh(); return () => request.current.invalidate(); }, [api, applicationId, deploymentId, source]);
+  const more = async () => { if (!cursor || !region.value) return; const current = request.current.begin(); try { const page = await api.logs(applicationId, deploymentId, source, cursor); if (current()) { setRegion({ state: "ready", value: { ...page, items: appendServerPage(region.value.items, page.items) } }); setCursor(page.nextCursor); } } catch (error) { if (current()) setRegion(errorRegion(error)); } };
+  return <section className="af-section af-log-section"><header><h2>日志</h2><span className="af-tabs"><button className={source === "build" ? "is-active" : ""} onClick={() => setSource("build")}>构建</button><button className={source === "runtime" ? "is-active" : ""} onClick={() => setSource("runtime")}>运行</button><button className="af-icon-button" aria-label="刷新日志" onClick={refresh}><IconRefresh /></button></span></header><pre className="af-log">{region.value?.items.map((item, index) => <code key={`${item.recorded_at}-${index}`}><time>{time(item.recorded_at)}</time>{item.content}{item.truncation !== "complete" ? "  [日志已截断]" : ""}{"\n"}</code>)}</pre><Note region={region} empty="尚无已收集日志。" />{cursor && <button className="af-button--quiet" onClick={more}>加载更早</button>}<p className="af-footnote">日志保留策略可能清理更早记录；刷新只读取服务器已有记录。</p></section>;
 }
 
-export function Applications({
-  api,
-  selected,
-  onSelect,
-}: {
-  api: AcornFoxClient;
-  selected?: string;
-  onSelect: (value?: string) => void;
-}) {
-  const [region, setRegion] = useState<Region<Application[]>>({
-    state: "loading",
-  });
-  const request = useRef(new LatestRequest());
-  const refresh = async () => {
-    const current = request.current.begin();
-    setRegion({ state: "loading" });
-    try {
-      const values = await api.apps();
-      if (!current()) return;
-      setRegion(
-        values.length
-          ? { state: "ready", value: values }
-          : { state: "empty", value: values },
-      );
-    } catch (error) {
-      if (!current()) return;
-      setRegion(failure(error));
-    }
-  };
-  useEffect(() => {
-    void refresh();
-    return () => request.current.invalidate();
-  }, []);
-  const created = async (application: Application) => {
-    await refresh();
-    onSelect(application.id);
-  };
-  return (
-    <aside className="af-applications" aria-label="应用">
-      <header>
-        <div>
-          <p className="af-kicker">应用</p>
-          <h2>应用列表</h2>
-        </div>
-        <button className="af-text-button" onClick={() => void refresh()}>
-          刷新
-        </button>
-      </header>
-      <CreateApplication api={api} onCreated={created} />
-      <RegionNote
-        region={region}
-        empty="还没有应用。创建一个公开 Git 应用开始。"
-      />
-      {region.value?.map((application) => (
-        <button
-          className={`af-application ${selected === application.id ? "is-selected" : ""}`}
-          key={application.id}
-          onClick={() => onSelect(application.id)}
-        >
-          <strong>{application.name}</strong>
-          <span>{application.id}</span>
-          <small>更新于 {date(application.updated_at)}</small>
-        </button>
-      ))}
-    </aside>
-  );
+function AppWorkspace({ api, integration, app, initialOperationId, onOperation }: { api: AcornFoxClient; integration: AcornFoxIntegrationClient; app: Application; initialOperationId?: string; onOperation: (operationId: string) => void }) {
+  const [tab, setTab] = useState<Tab>("overview"), sources = useData(() => api.sources(app.id), [api, app.id], (value) => value.items.length === 0), deployments = useData(() => api.deployments(app.id), [api, app.id], (value) => value.items.length === 0); const [source, setSource] = useState<SourceRevision>(), [deployment, setDeployment] = useState<Deployment>(), [metadata, setMetadata] = useState<Region<SourceMetadata>>({ state: "empty" }), [deploymentSource, setDeploymentSource] = useState<Region<DeploymentSource>>({ state: "empty" }), [port, setPort] = useState(""), [deploying, setDeploying] = useState(false), [message, setMessage] = useState<string>(), [operationId, setOperationId] = useState<string | undefined>(initialOperationId);
+  useEffect(() => { setSource((current) => sources.region.value?.items.find((item) => item.id === current?.id) ?? sources.region.value?.items[0]); }, [sources.region.value]); useEffect(() => { setDeployment((current) => deployments.region.value?.items.find((item) => item.id === current?.id) ?? deployments.region.value?.items[0]); }, [deployments.region.value]); useEffect(() => { setOperationId(initialOperationId); }, [app.id, initialOperationId]);
+  useEffect(() => { if (!source) { setMetadata({ state: "empty" }); return; } let alive = true; setMetadata({ state: "loading" }); void integration.sourceMetadata(app.id, source.id).then((value) => alive && setMetadata({ state: "ready", value })).catch((error: unknown) => alive && setMetadata(errorRegion(error))); return () => { alive = false; }; }, [integration, app.id, source?.id]);
+  useEffect(() => { if (!deployment) { setDeploymentSource({ state: "empty" }); return; } let alive = true; setDeploymentSource({ state: "loading" }); void integration.deploymentSource(app.id, deployment.id).then((value) => alive && setDeploymentSource({ state: "ready", value })).catch((error: unknown) => alive && setDeploymentSource(errorRegion(error))); return () => { alive = false; }; }, [integration, app.id, deployment?.id]);
+  const captureOperation = (nextOperationId: string) => { setOperationId(nextOperationId); onOperation(nextOperationId); };
+  async function deploy(event: FormEvent) { event.preventDefault(); if (!source || deploying) return; setDeploying(true); setMessage(undefined); try { const accepted = await api.deploy(app.id, source.id, port ? Number(port) : undefined); captureOperation(accepted.operation_id); await refetchAfterAccepted(deployments.refresh); setMessage("部署已受理，正在读取本次操作事实。"); setTab("overview"); } catch (error) { setMessage(errorRegion(error).message); } finally { setDeploying(false); } }
+  const overview = deployment ? <DeliveryWorkspace api={api} application={app} deployment={deployment} onOperationAccepted={captureOperation} /> : <p className="af-note">选择或创建部署后可读取状态、日志和公网访问记录。</p>;
+  const sourceTab = <section className="af-section"><header><h2>源码版本</h2><button className="af-button--quiet" onClick={sources.refresh}><IconRefresh /> 刷新</button></header><Note region={sources.region} empty="服务器尚未发现可用源码版本。" />{sources.region.value?.items.map((item) => <button className={`af-select-row ${source?.id === item.id ? "is-selected" : ""}`} onClick={() => setSource(item)} key={item.id}><strong>{item.ref ?? "未记录引用"}</strong><span>{compact(item.commit ?? item.id)} · {item.immutable ? "不可变记录" : "等待配置"}</span></button>)}{source && <dl className="af-facts"><div><dt>内容摘要</dt><dd>{source.content_digest}</dd></div><div><dt>来源摘要</dt><dd>{source.locator_sha256}</dd></div><div><dt>仓库地址</dt><dd>{metadata.value?.availability === "available" ? metadata.value.repositoryUrl ?? "未提供公开来源投影" : "来源元数据不可用"}</dd></div></dl>}<Note region={metadata} empty="选择一个源码版本查看来源元数据。" />{source && metadata.value && <SourceUpdateForm integration={integration} applicationId={app.id} source={source} metadata={metadata.value} onImported={async () => { await sources.refresh(); }} />}</section>;
+  const deploymentTab = <><section className="af-section"><header><h2>部署记录</h2><button className="af-button--quiet" onClick={deployments.refresh}><IconRefresh /> 刷新</button></header><Note region={deployments.region} empty="尚无部署记录。" />{deployments.region.value?.items.map((item) => <button className={`af-select-row ${deployment?.id === item.id ? "is-selected" : ""}`} key={item.id} onClick={() => setDeployment(item)}><strong>{item.id}</strong><span>{statusLabel(item.stage)} · {time(item.updated_at)}</span></button>)}{deployment && <dl className="af-facts"><div><dt>对应源码</dt><dd>{deploymentSource.value?.availability === "available" ? compact(deploymentSource.value.commit ?? deploymentSource.value.sourceRevisionId) : "部署来源不可用"}</dd></div><div><dt>引用</dt><dd>{deploymentSource.value?.ref ?? "—"}</dd></div></dl>}<Note region={deploymentSource} empty="选择一个部署查看对应源码。" /></section><section className="af-section"><h2>部署源码</h2><form className="af-inline-form" onSubmit={deploy}><label>源码版本<select value={source?.id ?? ""} onChange={(event) => setSource(sources.region.value?.items.find((item) => item.id === event.target.value))}>{sources.region.value?.items.map((item) => <option key={item.id} value={item.id}>{item.ref ?? item.id} · {compact(item.commit)}</option>)}</select></label><label>容器端口（可选）<input inputMode="numeric" value={port} onChange={(event) => setPort(event.target.value)} /></label><button disabled={!source || deploying}>{deploying ? "正在提交…" : "开始部署"}</button></form>{message && <p className="af-note" role="status">{message}</p>}</section></>;
+  const content: Record<Tab, ReactNode> = { overview, deployments: deploymentTab, logs: deployment ? <Logs api={api} applicationId={app.id} deploymentId={deployment.id} /> : <p className="af-note">尚无部署，无法读取日志。</p>, sources: sourceTab, access: deployment ? <DeliveryWorkspace api={api} application={app} deployment={deployment} onOperationAccepted={captureOperation} /> : <p className="af-note">尚无部署，无法读取公网访问记录。</p> };
+  return <section className="af-app-workspace"><nav className="af-app-tabs" aria-label="应用功能">{(Object.keys(tabLabel) as Tab[]).map((item) => <button className={tab === item ? "is-active" : ""} key={item} onClick={() => setTab(item)}>{tabLabel[item]}</button>)}</nav><main className="af-app-content">{operationId && <OperationEvidence integration={integration} applicationId={app.id} operationId={operationId} />}{content[tab]}</main></section>;
 }
+function Account({ api, onLogout }: { api: AcornFoxClient; onLogout: () => void }) { const [current, setCurrent] = useState(""), [next, setNext] = useState(""), [confirm, setConfirm] = useState(""), [busy, setBusy] = useState(false), [message, setMessage] = useState<string>(); async function submit(event: FormEvent) { event.preventDefault(); if (next !== confirm) { setMessage("两次输入的新密码不一致。"); return; } setBusy(true); setMessage(undefined); try { await api.changePassword(current, next); onLogout(); } catch (error) { setMessage(errorRegion(error).message); } finally { setBusy(false); } } return <section className="af-form-page"><form className="af-form" onSubmit={submit}><label>当前密码<input autoComplete="current-password" type="password" value={current} onChange={(event) => setCurrent(event.target.value)} /></label><label>新密码<input autoComplete="new-password" type="password" value={next} onChange={(event) => setNext(event.target.value)} /></label><label>确认新密码<input autoComplete="new-password" type="password" value={confirm} onChange={(event) => setConfirm(event.target.value)} /></label>{message && <p className="af-note af-note--error" role="alert">{message}</p>}<button disabled={busy || !current || !next || !confirm}>{busy ? "正在提交…" : "修改密码"}</button></form></section>; }
 
-export function Sources({
-  api,
-  applicationId,
-  selectedId,
-  onSource,
-}: {
-  api: AcornFoxClient;
-  applicationId: string;
-  selectedId?: string;
-  onSource: (source?: SourceRevision) => void;
-}) {
-  const [region, setRegion] = useState<Region<SourceRevision[]>>({
-    state: "loading",
-  });
-  const [detail, setDetail] = useState<Region<SourceRevision>>({
-    state: "empty",
-  });
-  const [nextCursor, setNextCursor] = useState<string>();
-  const [more, setMore] = useState<Region<never> | undefined>();
-  const listRequest = useRef(new LatestRequest());
-  const detailRequest = useRef(new LatestRequest());
-  const chosenId = useRef<string | undefined>(selectedId);
-
-  const select = async (candidate?: SourceRevision) => {
-    chosenId.current = candidate?.id;
-    const current = detailRequest.current.begin();
-    onSource(undefined);
-    if (!candidate) {
-      if (current()) setDetail({ state: "empty" });
-      return;
-    }
-    setDetail({ state: "loading" });
-    try {
-      const authoritative = await api.source(applicationId, candidate.id);
-      if (!current()) return;
-      setDetail({ state: "ready", value: authoritative });
-      onSource(authoritative);
-    } catch (error) {
-      if (!current()) return;
-      setDetail(failure(error));
-    }
-  };
-  const refresh = async (
-    autoSelect: boolean,
-    explicit = false,
-  ): Promise<SourceRevision[] | undefined> => {
-    const current = listRequest.current.begin();
-    const preserve = keepsVisibleFacts(region.state, explicit);
-    if (preserve) setMore({ state: "loading" });
-    else setRegion({ state: "loading" });
-    try {
-      const page = await api.sources(applicationId);
-      const values = page.items;
-      if (!current()) return undefined;
-      setRegion(
-        values.length
-          ? { state: "ready", value: values }
-          : { state: "empty", value: values },
-      );
-      setNextCursor(page.nextCursor);
-      if (preserve) setMore(undefined);
-      if (autoSelect && chosenId.current === undefined) void select(values[0]);
-      return values;
-    } catch (error) {
-      if (!current()) return undefined;
-      if (preserve) setMore(failure(error));
-      else setRegion(failure(error));
-      if (autoSelect) void select(undefined);
-      return undefined;
-    }
-  };
-  useEffect(() => {
-    chosenId.current = undefined;
-    void refresh(true);
-    return () => {
-      listRequest.current.invalidate();
-      detailRequest.current.invalidate();
-    };
-  }, [applicationId]);
-  const loadMore = async () => {
-    if (!nextCursor || region.state !== "ready") return;
-    const current = listRequest.current.begin();
-    setMore({ state: "loading" });
-    try {
-      const page = await api.sources(applicationId, nextCursor);
-      if (!current()) return;
-      const items = [
-        ...(region.value ?? []),
-        ...page.items.filter(
-          (item) => !region.value?.some((existing) => existing.id === item.id),
-        ),
-      ];
-      setRegion({ state: "ready", value: items });
-      setNextCursor(page.nextCursor);
-      setMore(undefined);
-    } catch (error) {
-      if (current()) setMore(failure(error));
-    }
-  };
-  return (
-    <section className="af-section" aria-labelledby="sources-title">
-      <header>
-        <h2 id="sources-title">源码版本</h2>
-        <button
-          className="af-text-button"
-          onClick={() => {
-            setMore(undefined);
-            void refresh(false, true);
-          }}
-        >
-          刷新
-        </button>
-      </header>
-      <RegionNote region={region} empty="服务器尚未发现可用源码版本。" />
-      {region.value?.map((source) => (
-        <button
-          className={`af-row-button ${chosenId.current === source.id ? "is-selected" : ""}`}
-          key={source.id}
-          onClick={() => void select(source)}
-        >
-          <strong>{source.commit ?? source.id}</strong>
-          <span>
-            {source.ref ?? "未记录引用"} ·{" "}
-            {source.immutable ? "不可变记录" : "等待配置"}
-          </span>
-        </button>
-      ))}
-      <RegionNote region={detail} empty="选择一个源码版本查看服务器记录。" />
-      {detail.value && (
-        <dl className="af-facts">
-          <div>
-            <dt>版本</dt>
-            <dd>{detail.value.commit ?? detail.value.id}</dd>
-          </div>
-          <div>
-            <dt>内容摘要</dt>
-            <dd>{detail.value.content_digest}</dd>
-          </div>
-        </dl>
-      )}
-      {nextCursor && (
-        <button
-          className="af-text-button"
-          onClick={() => void loadMore()}
-          disabled={more?.state === "loading"}
-        >
-          {more?.state === "loading" ? "正在加载…" : "加载更多"}
-        </button>
-      )}
-      {more && <RegionNote region={more} empty="" />}
-    </section>
-  );
-}
-
-export function Deployments({
-  api,
-  applicationId,
-  source,
-  selected,
-  onSelect,
-}: {
-  api: AcornFoxClient;
-  applicationId: string;
-  source?: SourceRevision;
-  selected?: Deployment;
-  onSelect: (value?: Deployment) => void;
-}) {
-  const [region, setRegion] = useState<Region<Deployment[]>>({
-    state: "loading",
-  });
-  const [port, setPort] = useState("");
-  const [message, setMessage] = useState<string>();
-  const [busy, setBusy] = useState(false);
-  const [nextCursor, setNextCursor] = useState<string>();
-  const [more, setMore] = useState<Region<never> | undefined>();
-  const request = useRef(new LatestRequest());
-  const actionScope = useRef(new ActionScope());
-  const chosenId = useRef<string | undefined>(selected?.id);
-  const refresh = async (
-    autoSelect: boolean,
-    explicit = false,
-  ): Promise<Deployment[] | undefined> => {
-    const current = request.current.begin();
-    const preserve = keepsVisibleFacts(region.state, explicit);
-    if (preserve) setMore({ state: "loading" });
-    else setRegion({ state: "loading" });
-    try {
-      const page = await api.deployments(applicationId);
-      const values = page.items;
-      if (!current()) return undefined;
-      setRegion(
-        values.length
-          ? { state: "ready", value: values }
-          : { state: "empty", value: values },
-      );
-      setNextCursor(page.nextCursor);
-      if (preserve) setMore(undefined);
-      if (autoSelect && chosenId.current === undefined) {
-        const next = values[0];
-        chosenId.current = next?.id;
-        onSelect(next);
-      }
-      return values;
-    } catch (error) {
-      if (!current()) return undefined;
-      if (preserve) setMore(failure(error));
-      else setRegion(failure(error));
-      if (autoSelect) onSelect(undefined);
-      return undefined;
-    }
-  };
-  useEffect(() => {
-    chosenId.current = undefined;
-    setBusy(false);
-    setMessage(undefined);
-    setPort("");
-    setNextCursor(undefined);
-    setMore(undefined);
-    void refresh(true);
-    return () => {
-      request.current.invalidate();
-      actionScope.current.invalidate();
-    };
-  }, [applicationId]);
-  const loadMore = async () => {
-    if (!nextCursor || region.state !== "ready") return;
-    const current = request.current.begin();
-    setMore({ state: "loading" });
-    try {
-      const page = await api.deployments(applicationId, nextCursor);
-      if (!current()) return;
-      const items = [
-        ...(region.value ?? []),
-        ...page.items.filter(
-          (item) => !region.value?.some((existing) => existing.id === item.id),
-        ),
-      ];
-      setRegion({ state: "ready", value: items });
-      setNextCursor(page.nextCursor);
-      setMore(undefined);
-    } catch (error) {
-      if (current()) setMore(failure(error));
-    }
-  };
-  async function deploy(event: FormEvent) {
-    event.preventDefault();
-    if (!source || busy) return;
-    const ticket = actionScope.current.begin();
-    if (!ticket) return;
-    const scope = { applicationId, sourceId: source.id };
-    setBusy(true);
-    setMessage(undefined);
-    try {
-      const accepted = await api.deploy(
-        scope.applicationId,
-        scope.sourceId,
-        port ? Number(port) : undefined,
-      );
-      if (!ticket.current()) return;
-      const values = await refetchAfterAccepted(() => refresh(false, true));
-      if (!ticket.current()) return;
-      const created = values?.find(
-        (item) => item.id === accepted.deployment_id,
-      );
-      if (created) {
-        chosenId.current = created.id;
-        onSelect(created);
-        setMessage("部署已接受，正在读取服务器记录。");
-      } else {
-        setMessage("部署已接受，等待服务器发现部署记录。可稍后手动刷新。");
-      }
-    } catch (error) {
-      if (ticket.current()) setMessage(failure(error).message);
-    } finally {
-      if (ticket.finish()) setBusy(false);
-    }
-  }
-  return (
-    <section className="af-section" aria-labelledby="deployments-title">
-      <header>
-        <h2 id="deployments-title">部署</h2>
-        <button
-          className="af-text-button"
-          onClick={() => {
-            setMore(undefined);
-            void refresh(false, true);
-          }}
-        >
-          刷新
-        </button>
-      </header>
-      <form className="af-inline-form" onSubmit={deploy}>
-        <label>
-          容器端口（可选）
-          <input
-            inputMode="numeric"
-            value={port}
-            onChange={(event) => setPort(event.target.value)}
-          />
-        </label>
-        <button disabled={!source || busy}>
-          {busy ? "正在提交…" : "部署选中的源码"}
-        </button>
-      </form>
-      {!source && <p className="af-note">请先等待服务器发现源码版本。</p>}
-      {message && (
-        <p className="af-note" role="status">
-          {message}
-        </p>
-      )}
-      <RegionNote region={region} empty="尚无部署记录。" />
-      {region.value?.map((deployment) => (
-        <button
-          className={`af-row-button ${selected?.id === deployment.id ? "is-selected" : ""}`}
-          key={deployment.id}
-          onClick={() => {
-            chosenId.current = deployment.id;
-            onSelect(deployment);
-          }}
-        >
-          <strong>{deployment.id}</strong>
-          <span>
-            {deployment.stage} · {date(deployment.updated_at)}
-          </span>
-        </button>
-      ))}
-      {nextCursor && (
-        <button
-          className="af-text-button"
-          onClick={() => void loadMore()}
-          disabled={more?.state === "loading"}
-        >
-          {more?.state === "loading" ? "正在加载…" : "加载更多"}
-        </button>
-      )}
-      {more && <RegionNote region={more} empty="" />}
-    </section>
-  );
-}
-
-export function Logs({
-  api,
-  applicationId,
-  deploymentId,
-}: {
-  api: AcornFoxClient;
-  applicationId: string;
-  deploymentId: string;
-}) {
-  const [source, setSource] = useState<"build" | "runtime">("build");
-  const [region, setRegion] = useState<Region<LogsPage>>({
-    state: "loading",
-  });
-  const [nextCursor, setNextCursor] = useState<string>();
-  const [more, setMore] = useState<Region<never> | undefined>();
-  const request = useRef(new LatestRequest());
-  const refresh = async (replace: boolean) => {
-    const current = request.current.begin();
-    if (replace) setRegion({ state: "loading" });
-    else setMore({ state: "loading" });
-    try {
-      const result = await api.logs(applicationId, deploymentId, source);
-      if (!current()) return;
-      setRegion(
-        result.items.length
-          ? { state: "ready", value: result }
-          : { state: "empty", value: result },
-      );
-      setNextCursor(result.nextCursor);
-      if (!replace) setMore(undefined);
-    } catch (error) {
-      if (!current()) return;
-      if (replace) setRegion(failure(error));
-      else setMore(failure(error));
-    }
-  };
-  useEffect(() => {
-    setNextCursor(undefined);
-    setMore(undefined);
-    void refresh(true);
-    return () => request.current.invalidate();
-  }, [applicationId, deploymentId, source]);
-  const loadMore = async () => {
-    if (!nextCursor || region.state !== "ready") return;
-    const current = request.current.begin();
-    setMore({ state: "loading" });
-    try {
-      const page = await api.logs(
-        applicationId,
-        deploymentId,
-        source,
-        nextCursor,
-      );
-      if (!current()) return;
-      const items = appendServerPage(region.value?.items ?? [], page.items);
-      setRegion({ state: "ready", value: { ...page, items } });
-      setNextCursor(page.nextCursor);
-      setMore(undefined);
-    } catch (error) {
-      if (current()) setMore(failure(error));
-    }
-  };
-  return (
-    <section className="af-section" aria-labelledby="logs-title">
-      <header>
-        <h2 id="logs-title">日志</h2>
-        <span>
-          <button
-            className={source === "build" ? "is-selected" : ""}
-            onClick={() => setSource("build")}
-          >
-            构建
-          </button>
-          <button
-            className={source === "runtime" ? "is-selected" : ""}
-            onClick={() => setSource("runtime")}
-          >
-            运行
-          </button>
-          <button
-            className="af-text-button"
-            onClick={() => {
-              setMore(undefined);
-              void refresh(false);
-            }}
-          >
-            刷新
-          </button>
-        </span>
-      </header>
-      <RegionNote region={region} empty="尚未收集到日志。" />
-      {region.value && (
-        <>
-          <p className="af-note">
-            {region.value.availability === "available"
-              ? "已收集记录"
-              : "暂未收集"}
-            {region.value.retention_limited ? "；较早记录已不再保留。" : ""}
-          </p>
-          <pre className="af-log">
-            {region.value.items
-              .map((item) => `[${date(item.recorded_at)}] ${item.content}`)
-              .join("\n") || "—"}
-          </pre>
-        </>
-      )}
-      {nextCursor && (
-        <button
-          className="af-text-button"
-          onClick={() => void loadMore()}
-          disabled={more?.state === "loading"}
-        >
-          {more?.state === "loading" ? "正在加载…" : "加载更早"}
-        </button>
-      )}
-      {more && <RegionNote region={more} empty="" />}
-    </section>
-  );
-}
-
-export function DeliveryWorkspace({
-  api,
-  application,
-  deployment,
-}: {
-  api: AcornFoxClient;
-  application: Application;
-  deployment: Deployment;
-}) {
-  const [status, setStatus] = useState<Region<DeliveryStatus>>({
-    state: "loading",
-  });
-  const [access, setAccess] = useState<Region<PublicAccess>>({
-    state: "loading",
-  });
-  const [message, setMessage] = useState<string>();
-  const [action, setAction] = useState<"restart" | "redeploy" | "probe" | "access">();
-  const actionScope = useRef(new ActionScope());
-  const statusRequest = useRef(new LatestRequest());
-  const accessRequest = useRef(new LatestRequest());
-  const refreshStatus = async () => {
-    const current = statusRequest.current.begin();
-    setStatus({ state: "loading" });
-    try {
-      const value = await api.status(application.id, deployment.id);
-      if (current()) setStatus({ state: "ready", value });
-    } catch (error) {
-      if (current()) setStatus(failure(error));
-    }
-  };
-  const refreshAccess = async () => {
-    const current = accessRequest.current.begin();
-    setAccess({ state: "loading" });
-    try {
-      const value = await api.publicAccess(application.id, deployment.id);
-      if (current()) setAccess({ state: "ready", value });
-    } catch (error) {
-      if (current()) setAccess(failure(error));
-    }
-  };
-  const refreshAll = async () => {
-    await Promise.all([refreshStatus(), refreshAccess()]);
-  };
-  useEffect(() => {
-    actionScope.current.invalidate();
-    setAction(undefined);
-    setMessage(undefined);
-    setStatus({ state: "loading" });
-    setAccess({ state: "loading" });
-    void refreshAll();
-    return () => {
-      statusRequest.current.invalidate();
-      accessRequest.current.invalidate();
-      actionScope.current.invalidate();
-    };
-  }, [application.id, deployment.id]);
-  async function command(action: "restart" | "redeploy" | "probe" | "access") {
-    const ticket = actionScope.current.begin();
-    if (!ticket) return;
-    const scope = {
-      applicationId: application.id,
-      deploymentId: deployment.id,
-    };
-    setAction(action);
-    setMessage(undefined);
-    try {
-      if (action === "restart")
-        await api.restart(scope.applicationId, scope.deploymentId);
-      else if (action === "redeploy")
-        await api.redeploy(scope.applicationId, scope.deploymentId);
-      else if (action === "probe")
-        await api.probe(scope.applicationId, scope.deploymentId);
-      else
-        await api.setPublicAccess(
-          scope.applicationId,
-          scope.deploymentId,
-          !access.value?.desired_public,
-        );
-      if (!ticket.current()) return;
-      setMessage(
-        action === "access"
-          ? "公网访问设置已接受，正在读取服务器记录。"
-          : action === "probe"
-            ? "响应检查已接受，不代表检查完成。请查看响应记录；尚未更新时点击刷新。"
-            : "操作已接受，正在读取服务器记录。",
-      );
-      await refetchAfterAccepted(
-        action === "access" ? refreshAccess : refreshStatus,
-      );
-    } catch (error) {
-      if (ticket.current()) setMessage(failure(error).message);
-    } finally {
-      if (ticket.finish()) setAction(undefined);
-    }
-  }
-  const response = status.value?.response;
-  return (
-    <>
-      <section className="af-section" aria-labelledby="facts-title">
-        <header>
-          <h2 id="facts-title">部署状态</h2>
-          <button
-            className="af-text-button"
-            onClick={() => void refreshStatus()}
-          >
-            刷新
-          </button>
-        </header>
-        <RegionNote region={status} empty="等待服务器写入部署记录。" />
-        {status.value && (
-          <dl className="af-facts">
-            <div>
-              <dt>部署阶段</dt>
-              <dd>{status.value.deployment.stage}</dd>
-            </div>
-            <div>
-              <dt>期望状态</dt>
-              <dd>{status.value.desired ? "已记录" : "等待配置"}</dd>
-            </div>
-            <div>
-              <dt>运行状态</dt>
-              <dd>{status.value.runtime?.runtime_state ?? "尚未观测"}</dd>
-            </div>
-            <div>
-              <dt>响应记录</dt>
-              <dd>
-                {response
-                  ? `${response.outcome}${response.http_status ? ` · HTTP ${response.http_status}` : ""}`
-                  : "尚未观测"}
-              </dd>
-            </div>
-          </dl>
-        )}
-      </section>
-      <section className="af-section" aria-labelledby="actions-title">
-        <h2 id="actions-title">操作</h2>
-        <div className="af-actions">
-          <button
-            disabled={action !== undefined}
-            onClick={() => void command("probe")}
-          >
-            {action === "probe" ? "正在提交…" : "检查应用响应"}
-          </button>
-          <button
-            disabled={action !== undefined}
-            onClick={() => void command("restart")}
-          >
-            {action === "restart" ? "正在提交…" : "重启"}
-          </button>
-          <button
-            disabled={action !== undefined}
-            onClick={() => void command("redeploy")}
-          >
-            {action === "redeploy" ? "正在提交…" : "重新部署"}
-          </button>
-        </div>
-        {message && (
-          <p className="af-note" role="status">
-            {message}
-          </p>
-        )}
-      </section>
-      <section className="af-section" aria-labelledby="access-title">
-        <header>
-          <h2 id="access-title">公网访问</h2>
-          <button
-            className="af-text-button"
-            onClick={() => void refreshAccess()}
-          >
-            刷新
-          </button>
-        </header>
-        <p className="af-note">
-          应用运行后，先点击“检查应用响应”，确认响应记录为 responded，再开启公网访问。
-          重启或重新部署后需要重新检查；运行中不等于能响应请求。
-        </p>
-        <RegionNote region={access} empty="尚无公网访问设置。" />
-        {access.value && (
-          <div className="af-access">
-            <p>
-              <strong>
-                {access.value.desired_public
-                  ? "已请求本机公网访问"
-                  : "未请求本机公网访问"}
-              </strong>
-              <span>{access.value.url}</span>
-            </p>
-            <button
-              disabled={action !== undefined}
-              onClick={() => void command("access")}
-            >
-              {action === "access"
-                ? "正在提交…"
-                : access.value.desired_public
-                  ? "关闭公网访问"
-                  : "开启公网访问"}
-            </button>
-            <p className="af-note">
-              DNS、证书和外部可达性：{access.value.components.dns} /{" "}
-              {access.value.components.tls} / {access.value.components.external}
-              。这些是独立事实，不代表外网已可访问。
-            </p>
-          </div>
-        )}
-      </section>
-      <Logs
-        api={api}
-        applicationId={application.id}
-        deploymentId={deployment.id}
-      />
-    </>
-  );
-}
-
-function PasswordPanel({
-  api,
-  onLogout,
-}: {
-  api: AcornFoxClient;
-  onLogout: () => void;
-}) {
-  const [open, setOpen] = useState(false);
-  const [current, setCurrent] = useState("");
-  const [next, setNext] = useState("");
-  const [message, setMessage] = useState<string>();
-  const [changing, setChanging] = useState(false);
-  const [leaving, setLeaving] = useState(false);
-  async function change(event: FormEvent) {
-    event.preventDefault();
-    if (changing) return;
-    setChanging(true);
-    try {
-      await api.changePassword(current, next);
-      onLogout();
-    } catch (error) {
-      setMessage(failure(error).message);
-    } finally {
-      setChanging(false);
-    }
-  }
-  return (
-    <div className="af-account">
-      <button onClick={() => setOpen(!open)}>账户</button>
-      <button
-        disabled={leaving}
-        onClick={() =>
-          void (async () => {
-            if (leaving) return;
-            setLeaving(true);
-            try {
-              await api.logout();
-              onLogout();
-            } catch (error) {
-              setMessage(failure(error).message);
-            } finally {
-              setLeaving(false);
-            }
-          })()
-        }
-      >
-        {leaving ? "正在退出…" : "退出"}
-      </button>
-      {open && (
-        <form onSubmit={change}>
-          <label>
-            当前密码
-            <input
-              type="password"
-              value={current}
-              onChange={(event) => setCurrent(event.target.value)}
-            />
-          </label>
-          <label>
-            新密码
-            <input
-              type="password"
-              value={next}
-              onChange={(event) => setNext(event.target.value)}
-            />
-          </label>
-          <button disabled={changing}>
-            {changing ? "正在提交…" : "修改密码"}
-          </button>
-          {message && <p className="af-note af-note--error">{message}</p>}
-        </form>
-      )}
-    </div>
-  );
-}
-
-export default function AcornFoxApp({
-  api: suppliedApi,
-  initialAuthenticated,
-}: {
-  api?: AcornFoxClient;
-  initialAuthenticated?: boolean;
-}) {
-  const [authenticated, setAuthenticated] = useState<boolean | undefined>(
-    initialAuthenticated,
-  );
-  const [selectedApp, setSelectedApp] = useState<string>();
-  const [source, setSource] = useState<SourceRevision>();
-  const [deployment, setDeployment] = useState<Deployment>();
-  const [application, setApplication] = useState<Application>();
-  const [applicationProblem, setApplicationProblem] = useState<string>();
-  const authRequest = useRef(new LatestRequest());
-  const appRequest = useRef(new LatestRequest());
-  const clearProtected = () => {
-    appRequest.current.invalidate();
-    setSelectedApp(undefined);
-    setSource(undefined);
-    setDeployment(undefined);
-    setApplication(undefined);
-    setApplicationProblem(undefined);
-  };
-  const api = useMemo(
-    () =>
-      suppliedApi ??
-      createAcornFoxClient(fetch, () => {
-        authRequest.current.invalidate();
-        clearProtected();
-        setAuthenticated(false);
-      }),
-    [suppliedApi],
-  );
-  useEffect(() => {
-    const current = authRequest.current.begin();
-    void api
-      .session()
-      .then((session) => {
-        if (!current()) return;
-        if (!session.authenticated) clearProtected();
-        setAuthenticated(session.authenticated);
-      })
-      .catch(() => {
-        if (!current()) return;
-        clearProtected();
-        setAuthenticated(false);
-      });
-    return () => authRequest.current.invalidate();
-  }, [api]);
-  const appSelected = (id?: string) => {
-    const current = appRequest.current.begin();
-    setSelectedApp(id);
-    setSource(undefined);
-    setDeployment(undefined);
-    setApplication(undefined);
-    setApplicationProblem(undefined);
-    if (id)
-      void api
-        .app(id)
-        .then((value) => {
-          if (current()) setApplication(value);
-        })
-        .catch((error: unknown) => {
-          if (current()) setApplicationProblem(failure(error).message);
-        });
-  };
-  const heading = useMemo(() => application?.name ?? "选择应用", [application]);
-  if (authenticated === undefined)
-    return (
-      <main className="af-login">
-        <p role="status">正在检查登录状态…</p>
-      </main>
-    );
-  if (!authenticated)
-    return (
-      <Login
-        api={api}
-        onReady={() => {
-          clearProtected();
-          setAuthenticated(true);
-        }}
-      />
-    );
-  return (
-    <main className="af-shell">
-      <header className="af-topbar">
-        <a className="af-brand" href="/">
-          AcornFox
-        </a>
-        <ReleaseSourceLink />
-        <PasswordPanel
-          api={api}
-          onLogout={() => {
-            authRequest.current.invalidate();
-            clearProtected();
-            setAuthenticated(false);
-          }}
-        />
-      </header>
-      <div className="af-layout">
-        <Applications api={api} selected={selectedApp} onSelect={appSelected} />
-        <section className="af-workspace" aria-label="应用工作区">
-          <header className="af-workspace__header">
-            <p className="af-kicker">应用工作区</p>
-            <h1>{heading}</h1>
-            <p>
-              服务器记录决定这里显示的事实。操作被接受后只读取一次最新记录。
-            </p>
-          </header>
-          {!selectedApp && (
-            <div className="af-empty">
-              从左侧选择应用，或创建一个公开 HTTPS Git 应用。
-            </div>
-          )}
-          {selectedApp && !application && !applicationProblem && (
-            <p role="status">正在读取应用…</p>
-          )}
-          {applicationProblem && (
-            <p className="af-note af-note--error" role="alert">
-              读取应用失败：{applicationProblem}
-            </p>
-          )}
-          {application && (
-            <>
-              <Sources
-                api={api}
-                applicationId={application.id}
-                selectedId={source?.id}
-                onSource={setSource}
-              />
-              <Deployments
-                api={api}
-                applicationId={application.id}
-                source={source}
-                selected={deployment}
-                onSelect={setDeployment}
-              />
-              {deployment && (
-                <DeliveryWorkspace
-                  api={api}
-                  application={application}
-                  deployment={deployment}
-                />
-              )}
-              {!deployment && (
-                <div className="af-empty">
-                  选择部署后可以查看状态、日志和公网访问记录。
-                </div>
-              )}
-            </>
-          )}
-        </section>
-      </div>
-    </main>
-  );
+export default function AcornFoxApp({ api: suppliedApi, initialAuthenticated }: { api?: AcornFoxClient; initialAuthenticated?: boolean }) {
+  const [authenticated, setAuthenticated] = useState<boolean | undefined>(initialAuthenticated), [setup, setSetup] = useState<Region<"initialized" | "uninitialized" | "unavailable">>({ state: "loading" }), [page, setPage] = useState<Page>("home"), [selectedId, setSelectedId] = useState<string>(), [selectedApplication, setSelectedApplication] = useState<Application>(), [lastOperation, setLastOperation] = useState<{ applicationId: string; operationId: string }>(); const authRequest = useRef(new LatestRequest());
+  const api = useMemo(() => suppliedApi ?? createAcornFoxClient(fetch, () => setAuthenticated(false)), [suppliedApi]); const integration = useMemo(() => createAcornFoxIntegrationClient(), []); const appsData = useData(() => authenticated ? api.apps() : Promise.resolve([]), [api, authenticated], (value) => value.length === 0); const host = useHostMetrics(integration, authenticated === true);
+  useEffect(() => { const current = authRequest.current.begin(); void api.session().then((session) => { if (current()) setAuthenticated(session.authenticated); }).catch(() => { if (current()) setAuthenticated(false); }); return () => authRequest.current.invalidate(); }, [api]);
+  useEffect(() => { if (authenticated !== false) return; let active = true; void integration.setupState().then((state) => active && setSetup({ state: state === "unavailable" ? "unavailable" : "ready", value: state })).catch((error: unknown) => active && setSetup(errorRegion(error))); return () => { active = false; }; }, [authenticated, integration]);
+  const selected = appsData.region.value?.find((item) => item.id === selectedId) ?? (selectedApplication?.id === selectedId ? selectedApplication : undefined); if (authenticated === undefined) return <main className="af-login"><p role="status">正在检查登录状态…</p></main>; if (!authenticated) { if (setup.state === "loading") return <main className="af-login"><p role="status">正在读取初始化状态…</p></main>; return setup.value === "uninitialized" ? <Setup integration={integration} onReady={() => setSetup({ state: "ready", value: "initialized" })} /> : <Login api={api} onReady={() => setAuthenticated(true)} />; }
+  const logout = () => { authRequest.current.invalidate(); setSelectedId(undefined); setSelectedApplication(undefined); setLastOperation(undefined); setPage("home"); setAuthenticated(false); };
+  const assistantScope = page === "app" && selected ? { kind: "app" as const, appId: selected.id } : { kind: "host" as const };
+  const assistantAppNames = Object.fromEntries((appsData.region.value ?? []).map((app) => [app.id, app.name]));
+  return <main className="af-shell" data-page={page}><aside className="af-sidebar"><a className="af-brand" href="/">AcornFox</a><ReleaseSourceLink /><nav><button className={page === "home" ? "is-active" : ""} onClick={() => { setPage("home"); setSelectedId(undefined); setSelectedApplication(undefined); }}><IconHomeStroked /> 首页</button><button className={page === "create" ? "is-active" : ""} onClick={() => setPage("create")}><IconPlus /> 创建应用</button><small>应用</small>{appsData.region.value?.map((app) => <button className={selectedId === app.id ? "is-active" : ""} key={app.id} onClick={() => { setSelectedApplication(app); setSelectedId(app.id); setPage("app"); }}><IconBox /> {app.name}</button>)}</nav>{page !== "home" && <Resources region={host.region} compact />}<footer><button aria-label="账户设置" title="账户设置" onClick={() => setPage("account")}><IconSettingStroked /><span className="af-footer-label">账户设置</span></button><button aria-label="退出登录" title="退出登录" onClick={() => void api.logout().then(logout).catch(() => undefined)}><IconExit /><span className="af-footer-label">退出登录</span></button></footer></aside><section className="af-main"><header className="af-topbar"><div>{page === "home" ? <><strong>工作空间</strong><span>/</span><span>首页</span></> : page === "create" ? <><strong>工作空间</strong><span>/</span><span>创建应用</span></> : page === "account" ? <><strong>工作空间</strong><span>/</span><span>账户设置</span></> : selected ? <><strong>工作空间</strong><span>/</span><span>{selected.name}</span></> : null}</div><button className="af-icon-button" aria-label="刷新应用列表" onClick={appsData.refresh}><IconRefresh /></button></header>{page === "home" && <Home apps={appsData.region.value ?? []} appRegion={appsData.region} reload={appsData.refresh} onCreate={() => setPage("create")} onOpen={(id) => { setSelectedId(id); setPage("app"); }} host={host} />}{page === "create" && <CreateApplication api={api} onCancel={() => setPage("home")} onCreated={({ application, operationId }) => { void appsData.refresh(); setSelectedApplication(application); setLastOperation({ applicationId: application.id, operationId }); setSelectedId(application.id); setPage("app"); }} />}{page === "account" && <Account api={api} onLogout={logout} />}{page === "app" && (selected ? <AppWorkspace api={api} integration={integration} app={selected} initialOperationId={lastOperation?.applicationId === selected.id ? lastOperation.operationId : undefined} onOperation={(operationId) => setLastOperation({ applicationId: selected.id, operationId })} /> : <p className="af-note">正在读取应用列表，或应用已不可用。</p>)}</section><Assistant defaultScope={assistantScope} appNames={assistantAppNames} /></main>;
 }

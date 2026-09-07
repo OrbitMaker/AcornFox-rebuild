@@ -1,0 +1,61 @@
+[Unit]
+ConditionPathExists=/etc/acornfox/pi/worker.json
+ConditionPathExists=/etc/acornfox/pi/deepseek-api-key
+Description=AcornFox unprivileged Pi RPC worker
+Wants=network-online.target
+After=network-online.target
+Requires=acornfox-upgrade-safe.target
+After=acornfox-upgrade-safe.target
+
+[Service]
+Type=simple
+User=acornfox-pi
+Group=acornfox
+RuntimeDirectory=acornfox-pi
+RuntimeDirectoryMode=0750
+WorkingDirectory=/var/lib/acornfox/pi/work
+LoadCredential=pi-config:/etc/acornfox/pi/worker.json
+LoadCredential=deepseek_api_key:/etc/acornfox/pi/deepseek-api-key
+ExecStart=/opt/acornfox/current/bin/acornfox-pi-worker --config %d/pi-config
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=30s
+TimeoutStopSec=15s
+KillMode=control-group
+SendSIGKILL=yes
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+DevicePolicy=closed
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+LockPersonality=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RemoveIPC=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+# The pinned Pi executable embeds a JavaScript runtime and requires JIT memory.
+MemoryDenyWriteExecute=no
+ReadOnlyPaths=/opt/acornfox/current/pi
+ReadWritePaths=/var/lib/acornfox/pi /run/acornfox-pi
+MemoryMax=512M
+CPUQuota=100%
+TasksMax=64
+LimitNOFILE=256
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

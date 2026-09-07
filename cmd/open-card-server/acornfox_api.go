@@ -88,12 +88,27 @@ func (s *Server) handleAcornFoxAPI(w http.ResponseWriter, r *http.Request) bool 
 		s.handleAcornFoxApp(w, r, domain.ID(parts[0]))
 		return true
 	}
+	if len(parts) == 4 && parts[1] == "sources" && parts[3] == "metadata" {
+		s.acornFoxSourceMetadata.HandleSourceMetadata(w, r, domain.ID(parts[0]), domain.ID(parts[2]))
+		return true
+	}
+	if len(parts) == 3 && parts[1] == "operations" {
+		s.acornFoxOperation.Handle(w, r, domain.ID(parts[0]), domain.ID(parts[2]))
+		return true
+	}
 	if len(parts) == 3 && parts[1] == "sources" {
 		s.handleAcornFoxSource(w, r, domain.ID(parts[0]), domain.ID(parts[2]))
 		return true
 	}
 	if len(parts) == 2 && parts[1] == "sources" {
-		s.handleAcornFoxSources(w, r, domain.ID(parts[0]))
+		if r.Method == http.MethodPost {
+			s.acornFoxSourceUpdate.Handle(w, r, domain.ID(parts[0]))
+		} else if r.Method == http.MethodGet {
+			s.handleAcornFoxSources(w, r, domain.ID(parts[0]))
+		} else {
+			w.Header().Set("Allow", "GET, POST, OPTIONS")
+			writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+		}
 		return true
 	}
 	if len(parts) == 2 && parts[1] == "deliveries" {
@@ -109,6 +124,10 @@ func (s *Server) handleAcornFoxAPI(w http.ResponseWriter, r *http.Request) bool 
 		return true
 	}
 	if len(parts) == 4 && parts[1] == "deliveries" {
+		if parts[3] == "source" {
+			s.acornFoxSourceMetadata.HandleDeploymentSource(w, r, domain.ID(parts[0]), domain.ID(parts[2]))
+			return true
+		}
 		if parts[3] == "logs" {
 			s.handleAcornFoxDeliveryLogs(w, r, domain.ID(parts[0]), domain.ID(parts[2]))
 			return true
@@ -132,11 +151,14 @@ func acornFoxRouteAllow(path string) (string, bool) {
 	if len(parts) == 1 && parts[0] != "" {
 		return "GET", true
 	}
-	if len(parts) == 3 && parts[0] != "" && parts[1] == "sources" && parts[2] != "" {
+	if len(parts) == 4 && parts[0] != "" && parts[1] == "sources" && parts[2] != "" && parts[3] == "metadata" {
+		return "GET", true
+	}
+	if len(parts) == 3 && parts[0] != "" && (parts[1] == "sources" || parts[1] == "operations") && parts[2] != "" {
 		return "GET", true
 	}
 	if len(parts) == 2 && parts[0] != "" && parts[1] == "sources" {
-		return "GET", true
+		return "GET, POST", true
 	}
 	if len(parts) == 2 && parts[0] != "" && parts[1] == "deliveries" {
 		return "GET, POST", true
@@ -148,7 +170,7 @@ func acornFoxRouteAllow(path string) (string, bool) {
 		switch parts[3] {
 		case "restart", "redeploy", "probes":
 			return "POST", true
-		case "logs":
+		case "logs", "source":
 			return "GET", true
 		case "public-access":
 			return "GET, PUT", true
@@ -223,7 +245,7 @@ func (s *Server) handleAcornFoxApps(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusUnprocessableEntity, "validation_failed", "name, public_git source, and Idempotency-Key are required")
 			return
 		}
-		result, err := s.controller.CreateApplicationWithSource(r.Context(), input.Name, &application.CreateApplicationSource{Kind: application.CreateApplicationSourceGit, RepositoryURL: input.Source.RepositoryURL, Ref: input.Source.Ref}, key)
+		result, err := s.controller.CreateApplicationWithSource(r.Context(), input.Name, &application.CreateApplicationSource{Kind: application.CreateApplicationSourceGit, PublicGit: true, RepositoryURL: input.Source.RepositoryURL, Ref: input.Source.Ref}, key)
 		if err != nil {
 			writeAcornFoxError(w, err)
 			return

@@ -337,6 +337,11 @@ func (s *Store) CreateApplication(ctx context.Context, record application.Create
 			if _, err := tx.ExecContext(ctx, `INSERT INTO source_workspace_events(source_revision_id,sequence,workspace_ref,state,created_at) VALUES($1,1,$2,'prepared',$3)`, record.PreparedSource.ID.String(), record.PreparedSource.WorkspaceRef, createdAt); err != nil {
 				return rollback(fmt.Errorf("record public Git source preparation: %w", err))
 			}
+			if record.PublicSourceProvenance != nil {
+				if err := s.RecordAcornFoxPublicSourceProvenanceTx(ctx, tx, *record.PublicSourceProvenance); err != nil {
+					return rollback(fmt.Errorf("record public Git source provenance: %w", err))
+				}
+			}
 		default:
 			return rollback(domain.ValidationError("application source kind is unsupported"))
 		}
@@ -455,6 +460,9 @@ func validateCreateRecord(record application.CreateApplicationRecord) error {
 		}
 	} else if record.PreparedSource != nil {
 		return domain.ValidationError("source revision requires a source input")
+	}
+	if err := application.ValidatePublicSourceProvenance(record.Source, record.PreparedSource, record.PublicSourceProvenance); err != nil {
+		return err
 	}
 	if record.Event.OperationID != "" && record.Event.OperationID != record.OperationID.String() {
 		return domain.ValidationError("event operation does not match operation id")

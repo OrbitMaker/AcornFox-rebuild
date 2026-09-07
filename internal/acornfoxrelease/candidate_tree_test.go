@@ -22,12 +22,12 @@ func TestBuildCandidateTreeV1MaterializesDeterministicSyntheticTree(t *testing.T
 	if !plan.Valid() || VerifyRuntimeTree(runtimeRoot, runtime) != nil || VerifyLicenseTree(licenseRoot, license) != nil {
 		t.Fatal("fixture inputs invalid")
 	}
-	first, err := BuildCandidateTreeV1(plan, goStage, webStage, runtimeRoot, runtime, licenseRoot, license, buildTaskRoot(t))
+	first, err := buildCandidateTreeForTest(plan, goStage, webStage, runtimeRoot, runtime, licenseRoot, license, buildTaskRoot(t))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer first.Close()
-	second, err := BuildCandidateTreeV1(plan, goStage, webStage, runtimeRoot, runtime, licenseRoot, license, buildTaskRoot(t))
+	second, err := buildCandidateTreeForTest(plan, goStage, webStage, runtimeRoot, runtime, licenseRoot, license, buildTaskRoot(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,7 +136,7 @@ func TestBuildCandidateTreeV1FailsClosedOnMissingScriptAndStageTamper(t *testing
 	if err := os.Remove(script); err != nil {
 		t.Fatal(err)
 	}
-	if stage, err := BuildCandidateTreeV1(plan, goStage, webStage, runtimeRoot, runtime, licenseRoot, license, buildTaskRoot(t)); err == nil || stage != nil {
+	if stage, err := buildCandidateTreeForTest(plan, goStage, webStage, runtimeRoot, runtime, licenseRoot, license, buildTaskRoot(t)); err == nil || stage != nil {
 		t.Fatal("missing script accepted")
 	}
 
@@ -146,7 +146,7 @@ func TestBuildCandidateTreeV1FailsClosedOnMissingScriptAndStageTamper(t *testing
 	if err := os.WriteFile(filepath.Join(goStage.root, "bin", "acornfox-server"), []byte("changed"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if stage, err := BuildCandidateTreeV1(plan, goStage, webStage, runtimeRoot, runtime, licenseRoot, license, buildTaskRoot(t)); err == nil || stage != nil {
+	if stage, err := buildCandidateTreeForTest(plan, goStage, webStage, runtimeRoot, runtime, licenseRoot, license, buildTaskRoot(t)); err == nil || stage != nil {
 		t.Fatal("tampered Go stage accepted")
 	}
 }
@@ -155,7 +155,7 @@ func TestCandidateTreeStageRejectsReplacementAndCloseIsSafe(t *testing.T) {
 	plan, goStage, webStage, runtimeRoot, runtime, licenseRoot, license := candidateTreeFixture(t)
 	defer goStage.Close()
 	defer webStage.Close()
-	stage, err := BuildCandidateTreeV1(plan, goStage, webStage, runtimeRoot, runtime, licenseRoot, license, buildTaskRoot(t))
+	stage, err := buildCandidateTreeForTest(plan, goStage, webStage, runtimeRoot, runtime, licenseRoot, license, buildTaskRoot(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,12 +186,12 @@ func TestBuildCandidateTreeV1OverridesRestrictiveUmask(t *testing.T) {
 	defer webStage.Close()
 	old := syscall.Umask(0o077)
 	defer syscall.Umask(old)
-	stage, err := BuildCandidateTreeV1(plan, goStage, webStage, runtimeRoot, runtime, licenseRoot, license, buildTaskRoot(t))
+	stage, err := buildCandidateTreeForTest(plan, goStage, webStage, runtimeRoot, runtime, licenseRoot, license, buildTaskRoot(t))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer stage.Close()
-	second, err := BuildCandidateTreeV1(plan, goStage, webStage, runtimeRoot, runtime, licenseRoot, license, buildTaskRoot(t))
+	second, err := buildCandidateTreeForTest(plan, goStage, webStage, runtimeRoot, runtime, licenseRoot, license, buildTaskRoot(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -210,6 +210,25 @@ func TestBuildCandidateTreeV1OverridesRestrictiveUmask(t *testing.T) {
 func candidateTreeFixture(t *testing.T, licenseBuilders ...func(*testing.T, []string) (string, LicenseInputsV1)) (GoBuildPlanV1, *GoBinaryStageV1, *WebAssetStageV1, string, RuntimeInputsV1, string, LicenseInputsV1) {
 	t.Helper()
 	return candidateTreeVersionFixture(t, "", licenseBuilders...)
+}
+
+func buildCandidateTreeForTest(plan GoBuildPlanV1, goStage *GoBinaryStageV1, webStage *WebAssetStageV1, runtimeRoot string, runtime RuntimeInputsV1, licenseRoot string, license LicenseInputsV1, taskRoot string) (*CandidateTreeStageV1, error) {
+	return buildCandidateTreeV1(plan, goStage, webStage, runtimeRoot, runtime, licenseRoot, license, taskRoot, nil, false)
+}
+
+func buildReleaseCandidateTreeForTest(plan GoBuildPlanV1, goStage *GoBinaryStageV1, webStage *WebAssetStageV1, runtimeRoot string, runtime RuntimeInputsV1, licenseRoot string, license LicenseInputsV1, taskRoot string) (*CandidateTreeStageV1, error) {
+	metadata, err := readReleaseLicenseManifest(licenseRoot, license)
+	if err != nil {
+		return nil, err
+	}
+	return buildCandidateTreeV1(plan, goStage, webStage, runtimeRoot, runtime, licenseRoot, license, taskRoot, &metadata, false)
+}
+
+func TestPublicCandidateBuilderRequiresPinnedPiDigests(t *testing.T) {
+	plan, goStage, webStage, runtimeRoot, runtime, licenseRoot, license := candidateTreeFixture(t)
+	if stage, err := BuildCandidateTreeV1(plan, goStage, webStage, runtimeRoot, runtime, licenseRoot, license, buildTaskRoot(t)); err == nil || stage != nil {
+		t.Fatal("public candidate builder accepted synthetic Pi digests")
+	}
 }
 
 func candidateTreeVersionFixture(t *testing.T, version string, licenseBuilders ...func(*testing.T, []string) (string, LicenseInputsV1)) (GoBuildPlanV1, *GoBinaryStageV1, *WebAssetStageV1, string, RuntimeInputsV1, string, LicenseInputsV1) {
@@ -234,7 +253,7 @@ func candidateTreeVersionFixture(t *testing.T, version string, licenseBuilders .
 	gitRun(t, root, "add", ".")
 	gitRun(t, root, "commit", "-qm", "candidate-tree-inputs")
 	gitRun(t, root, "checkout", "-q", "--detach")
-	runtimeRoot, runtime := candidateInputRoot(t, candidateRuntimeFixturePaths(), 0o755)
+	runtimeRoot, runtime := candidateRuntimeInputRoot(t)
 	licensePaths := installerFixturePaths(func(path string) bool { return strings.HasPrefix(path, "docs/licenses/") })
 	licenseBuilder := candidateLicenseRoot
 	if len(licenseBuilders) == 1 {
@@ -270,7 +289,34 @@ func candidateRuntimeFixturePaths() []string {
 	for _, target := range fixedTargets {
 		goFiles["bin/"+target.name] = true
 	}
-	return installerFixturePaths(func(path string) bool { return strings.HasPrefix(path, "bin/") && !goFiles[path] })
+	return installerFixturePaths(func(path string) bool {
+		return strings.HasPrefix(path, "bin/") && !goFiles[path] || strings.HasPrefix(path, "pi/") && path != "pi/extensions/acornfox-tools.ts" && path != "pi/UPSTREAM-ASSETS.json"
+	})
+}
+
+func candidateRuntimeInputRoot(t *testing.T) (string, RuntimeInputsV1) {
+	t.Helper()
+	paths := candidateRuntimeFixturePaths()
+	modes := make(map[string]uint32, len(paths))
+	for _, required := range install.AcornFoxV1RequiredFiles() {
+		modes[required.Path] = required.Mode
+	}
+	root := buildTaskRoot(t)
+	files := make([]FileEntryV1, 0, len(paths))
+	for _, path := range paths {
+		body := []byte("input " + path + "\n")
+		full := filepath.Join(root, filepath.FromSlash(path))
+		if err := os.MkdirAll(filepath.Dir(full), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		mode := os.FileMode(modes[path])
+		if err := os.WriteFile(full, body, mode); err != nil {
+			t.Fatal(err)
+		}
+		files = append(files, FileEntryV1{Path: path, SHA256: sha256Text(body), Mode: uint32(mode)})
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
+	return root, RuntimeInputsV1{SchemaVersion: 1, Product: Product, Architecture: Architecture, Files: files}
 }
 
 func installerFixturePaths(match func(string) bool) []string {

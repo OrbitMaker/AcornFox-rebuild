@@ -108,11 +108,11 @@ func TestResolveRejectsIdentityModeMismatchAndUnknownCleanNames(t *testing.T) {
 }
 
 func TestKeySpecsAreCompleteAndNamesAreUnique(t *testing.T) {
-	if len(specs) != int(MigrationCompatibility) {
-		t.Fatalf("key specs=%d want=%d", len(specs), MigrationCompatibility)
+	if len(specs) != int(AssistantToolsSocket) {
+		t.Fatalf("key specs=%d want=%d", len(specs), AssistantToolsSocket)
 	}
 	names := map[string]Key{}
-	for key := RuntimeMode; key <= MigrationCompatibility; key++ {
+	for key := RuntimeMode; key <= AssistantToolsSocket; key++ {
 		spec := mustSpec(key)
 		if spec.canonical == "" {
 			t.Fatalf("key %d has no canonical name", key)
@@ -132,5 +132,5 @@ func TestKeySpecsAreCompleteAndNamesAreUnique(t *testing.T) {
 			t.Fatal("unknown key was accepted")
 		}
 	}()
-	_ = Environment{}.Get(MigrationCompatibility + 1)
+	_ = Environment{}.Get(AssistantToolsSocket + 1)
 }

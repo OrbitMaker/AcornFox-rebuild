@@ -59,6 +59,7 @@ var acornFoxInstallLayoutRoles = []AcornFoxLiveRole{
 	AcornFoxLiveBuildKitRole,
 	AcornFoxLiveCaddyRole,
 	AcornFoxLiveEdgeRole,
+	AcornFoxLivePIRole,
 }
 
 // newTaskAcornFoxLayout records the existing task-root topology exactly.  All
@@ -130,7 +131,7 @@ func newProductionAcornFoxLayout() (acornFoxInstallLayout, error) {
 	}
 	principals := map[AcornFoxLiveRole]acornFoxInstallPrincipal{AcornFoxLiveRootRole: {}}
 	for role, name := range map[AcornFoxLiveRole]string{
-		AcornFoxLiveServerRole: "acornfox", AcornFoxLiveAgentRole: "acornfox-agent", AcornFoxLiveBuildKitRole: "acornfox-buildkit", AcornFoxLiveCaddyRole: "acornfox-caddy", AcornFoxLiveEdgeRole: "acornfox-edge",
+		AcornFoxLiveServerRole: "acornfox", AcornFoxLiveAgentRole: "acornfox-agent", AcornFoxLiveBuildKitRole: "acornfox-buildkit", AcornFoxLiveCaddyRole: "acornfox-caddy", AcornFoxLiveEdgeRole: "acornfox-edge", AcornFoxLivePIRole: "acornfox-pi",
 	} {
 		account, err := user.Lookup(name)
 		if err != nil {
@@ -204,6 +205,12 @@ func (l acornFoxInstallLayout) validate() error {
 			return errors.New("AcornFox production install layout principal is invalid")
 		}
 		seen[principal] = true
+	}
+	pi := l.principals[AcornFoxLivePIRole]
+	for _, role := range acornFoxInstallLayoutRoles[1:] {
+		if role != AcornFoxLivePIRole && l.principals[role].uid == pi.uid {
+			return errors.New("AcornFox PI account uid is not isolated")
+		}
 	}
 	return nil
 }

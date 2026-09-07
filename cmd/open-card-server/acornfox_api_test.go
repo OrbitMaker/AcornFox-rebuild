@@ -172,7 +172,7 @@ func TestAcornFoxOptionsUsesExactRouteMethodParity(t *testing.T) {
 	for path, want := range map[string]string{
 		"/api/v1/acornfox/apps":                                 "GET, POST, OPTIONS",
 		"/api/v1/acornfox/apps/app_1":                           "GET, OPTIONS",
-		"/api/v1/acornfox/apps/app_1/sources":                   "GET, OPTIONS",
+		"/api/v1/acornfox/apps/app_1/sources":                   "GET, POST, OPTIONS",
 		"/api/v1/acornfox/apps/app_1/sources/src_1":             "GET, OPTIONS",
 		"/api/v1/acornfox/apps/app_1/deliveries":                "GET, POST, OPTIONS",
 		"/api/v1/acornfox/apps/app_1/deliveries/dep_1":          "GET, OPTIONS",

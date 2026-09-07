@@ -111,6 +111,9 @@ func (r *MemoryRepository) CreateApplication(_ context.Context, record CreateApp
 			return CreateApplicationResult{}, domain.ValidationError("application source kind is unsupported")
 		}
 	}
+	if err := ValidatePublicSourceProvenance(record.Source, record.PreparedSource, record.PublicSourceProvenance); err != nil {
+		return CreateApplicationResult{}, err
+	}
 	r.nextSequence++
 	record.Event.Sequence = r.nextSequence
 	record.Event.ID = eventID(record.Event.Sequence)

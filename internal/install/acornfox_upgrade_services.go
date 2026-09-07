@@ -3,6 +3,7 @@ package install
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"os/exec"
@@ -16,6 +17,72 @@ type acornFoxUpgradeServices interface {
 	EdgeHealthy(context.Context) error
 }
 type acornFoxRealUpgradeServices struct{}
+
+var _ acornFoxUpgradePIState = acornFoxRealUpgradeServices{}
+
+func (acornFoxRealUpgradeServices) PIEnabled(ctx context.Context) (bool, error) {
+	enabled, err := acornFoxUpgradePIUnitEnabled(ctx)
+	if err != nil {
+		return false, err
+	}
+	raw, err := acornFoxUpgradeCommand(ctx, "/usr/bin/systemctl", "show", "acornfox-pi-worker.service", "--property=Id,LoadState,UnitFileState,ActiveState,SubState")
+	if err != nil {
+		return false, ErrAcornFoxUpgradeUnknown
+	}
+	return parseAcornFoxPIServiceState(enabled, raw)
+}
+
+func acornFoxUpgradePIUnitEnabled(ctx context.Context) (bool, error) {
+	bounded, cancel := context.WithTimeout(ctx, 45*time.Second)
+	defer cancel()
+	command := exec.CommandContext(bounded, "/usr/bin/systemctl", "is-enabled", "acornfox-pi-worker.service")
+	command.Env = []string{"PATH=/usr/sbin:/usr/bin:/sbin:/bin", "LANG=C", "LC_ALL=C"}
+	raw, err := command.Output()
+	if len(raw) > 128 {
+		return false, ErrAcornFoxUpgradeUnknown
+	}
+	state := strings.TrimSpace(string(raw))
+	if err == nil && state == "enabled" {
+		return true, nil
+	}
+	var exit *exec.ExitError
+	if errors.As(err, &exit) && exit.ExitCode() == 1 && state == "disabled" {
+		return false, nil
+	}
+	return false, ErrAcornFoxUpgradeUnknown
+}
+
+func parseAcornFoxPIServiceState(enabled bool, raw []byte) (bool, error) {
+	if len(raw) == 0 || len(raw) > 4096 {
+		return false, ErrAcornFoxUpgradeUnknown
+	}
+	values := map[string]string{}
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			return false, ErrAcornFoxUpgradeUnknown
+		}
+		if _, exists := values[key]; exists {
+			return false, ErrAcornFoxUpgradeUnknown
+		}
+		values[key] = value
+	}
+	if len(values) != 5 || values["Id"] != "acornfox-pi-worker.service" || values["LoadState"] != "loaded" {
+		return false, ErrAcornFoxUpgradeUnknown
+	}
+	if enabled != (values["UnitFileState"] == "enabled") || !enabled && values["UnitFileState"] != "disabled" {
+		return false, ErrAcornFoxUpgradeConflict
+	}
+	running := values["ActiveState"] == "active" && values["SubState"] == "running"
+	inactive := values["ActiveState"] == "inactive" && values["SubState"] == "dead"
+	if enabled && running {
+		return true, nil
+	}
+	if !enabled && inactive {
+		return false, nil
+	}
+	return false, ErrAcornFoxUpgradeConflict
+}
 
 func acornFoxUpgradeCommand(ctx context.Context, path string, args ...string) ([]byte, error) {
 	bounded, cancel := context.WithTimeout(ctx, 45*time.Second)
@@ -41,7 +108,7 @@ func (acornFoxRealUpgradeServices) Run(ctx context.Context, verb, unit string) e
 		return ErrAcornFoxUpgradeConflict
 	}
 	switch unit {
-	case "acornfox-edge.service", "acornfox-agent.service", "acornfox-server.service", "acornfox-caddy.service", "acornfox-buildkit.service", "acornfox-build-network.service":
+	case "acornfox-edge.service", "acornfox-agent.service", "acornfox-server.service", "acornfox-caddy.service", "acornfox-buildkit.service", "acornfox-build-network.service", "acornfox-pi-worker.service":
 	default:
 		return ErrAcornFoxUpgradeConflict
 	}

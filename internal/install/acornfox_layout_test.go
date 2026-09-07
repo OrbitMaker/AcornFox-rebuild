@@ -65,6 +65,9 @@ func TestTestProductionAcornFoxLayoutRejectsHostileRootsAndPrincipals(t *testing
 		"duplicate-nonroot": func(values map[AcornFoxLiveRole]acornFoxInstallPrincipal) {
 			values[AcornFoxLiveAgentRole] = values[AcornFoxLiveServerRole]
 		},
+		"pi-same-uid-different-gid": func(values map[AcornFoxLiveRole]acornFoxInstallPrincipal) {
+			values[AcornFoxLivePIRole] = acornFoxInstallPrincipal{uid: values[AcornFoxLiveServerRole].uid, gid: values[AcornFoxLivePIRole].gid}
+		},
 		"zero-nonroot": func(values map[AcornFoxLiveRole]acornFoxInstallPrincipal) {
 			values[AcornFoxLiveAgentRole] = acornFoxInstallPrincipal{}
 		},
@@ -761,6 +764,7 @@ func acornFoxTestLayoutPrincipals() map[AcornFoxLiveRole]acornFoxInstallPrincipa
 		AcornFoxLiveBuildKitRole: {uid: 1003, gid: 1003},
 		AcornFoxLiveCaddyRole:    {uid: 1004, gid: 1004},
 		AcornFoxLiveEdgeRole:     {uid: 1005, gid: 1005},
+		AcornFoxLivePIRole:       {uid: 1006, gid: 1006},
 	}
 }
 

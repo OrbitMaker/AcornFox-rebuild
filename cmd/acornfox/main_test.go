@@ -298,9 +298,10 @@ func TestExpectedSuccessStatusCoversEveryCLICommandRouteClass(t *testing.T) {
 		want         int
 	}{
 		{http.MethodPost, "/auth/login", shapeSession, http.StatusOK}, {http.MethodGet, "/auth/session", shapeSession, http.StatusOK}, {http.MethodPost, "/auth/logout", shapeSession, http.StatusNoContent}, {http.MethodPost, "/auth/password", shapeSession, http.StatusNoContent},
-		{http.MethodGet, "/apps", shapeApps, http.StatusOK}, {http.MethodPost, "/apps", shapeCreateApp, http.StatusCreated}, {http.MethodGet, "/apps/app", shapeApplication, http.StatusOK},
-		{http.MethodGet, "/apps/app/sources", shapeSourceList, http.StatusOK}, {http.MethodGet, "/apps/app/sources/source", shapeSource, http.StatusOK}, {http.MethodGet, "/apps/app/deliveries", shapeDeploymentList, http.StatusOK},
-		{http.MethodPost, "/apps/app/deliveries", shapeCommand, http.StatusAccepted}, {http.MethodGet, "/apps/app/deliveries/deployment", shapeStatus, http.StatusOK}, {http.MethodGet, "/apps/app/deliveries/deployment/logs?source=runtime", shapeLogs, http.StatusOK},
+		{http.MethodGet, "/host/metrics", shapeHostMetrics, http.StatusOK},
+		{http.MethodGet, "/apps", shapeApps, http.StatusOK}, {http.MethodPost, "/apps", shapeCreateApp, http.StatusCreated}, {http.MethodGet, "/apps/app", shapeApplication, http.StatusOK}, {http.MethodGet, "/apps/app/operations/operation", shapeOperationResult, http.StatusOK},
+		{http.MethodGet, "/apps/app/sources", shapeSourceList, http.StatusOK}, {http.MethodPost, "/apps/app/sources", shapeSourceUpdate, http.StatusCreated}, {http.MethodGet, "/apps/app/sources/source", shapeSource, http.StatusOK}, {http.MethodGet, "/apps/app/sources/source/metadata", shapeSourceMetadata, http.StatusOK}, {http.MethodGet, "/apps/app/deliveries", shapeDeploymentList, http.StatusOK},
+		{http.MethodPost, "/apps/app/deliveries", shapeCommand, http.StatusAccepted}, {http.MethodGet, "/apps/app/deliveries/deployment", shapeStatus, http.StatusOK}, {http.MethodGet, "/apps/app/deliveries/deployment/source", shapeDeliverySource, http.StatusOK}, {http.MethodGet, "/apps/app/deliveries/deployment/logs?source=runtime", shapeLogs, http.StatusOK},
 		{http.MethodPost, "/apps/app/deliveries/deployment/probes", shapeCommand, http.StatusAccepted},
 		{http.MethodPost, "/apps/app/deliveries/deployment/restart", shapeCommand, http.StatusAccepted}, {http.MethodPost, "/apps/app/deliveries/deployment/redeploy", shapeCommand, http.StatusAccepted}, {http.MethodGet, "/apps/app/deliveries/deployment/public-access", shapePublicAccess, http.StatusOK}, {http.MethodPut, "/apps/app/deliveries/deployment/public-access", shapePublicAccess, http.StatusOK},
 	} {
@@ -316,7 +317,7 @@ func TestExpectedSuccessStatusCoversEveryCLICommandRouteClass(t *testing.T) {
 		method, path string
 		shape        responseShape
 	}{
-		{http.MethodGet, "/unknown", shapeApps}, {http.MethodGet, "/apps/app/", shapeApplication}, {http.MethodGet, "/apps?limit=1", shapeApps}, {http.MethodGet, "/apps/app/sources/source?cursor=opaque", shapeSource},
+		{http.MethodGet, "/unknown", shapeApps}, {http.MethodGet, "/apps/app/", shapeApplication}, {http.MethodGet, "/apps?limit=1", shapeApps}, {http.MethodGet, "/host/metrics?x=1", shapeHostMetrics}, {http.MethodGet, "/apps/app/operations/operation?x=1", shapeOperationResult}, {http.MethodPost, "/apps/app/sources?x=1", shapeSourceUpdate}, {http.MethodGet, "/apps/app/sources/source?cursor=opaque", shapeSource}, {http.MethodGet, "/apps/app/sources/source/metadata?cursor=opaque", shapeSourceMetadata}, {http.MethodGet, "/apps/app/deliveries/deployment/source?cursor=opaque", shapeDeliverySource},
 		{http.MethodPost, "/apps/app/deliveries/deployment/probes?x=1", shapeCommand}, {http.MethodGet, "/apps/app/deliveries/deployment/probes", shapeCommand}, {http.MethodPost, "/apps/app/deliveries/deployment/probes/extra", shapeCommand}, {http.MethodPost, "/apps/app/deliveries/deployment/restart/extra", shapeCommand}, {http.MethodPost, "/anything", shapeCommand}, {http.MethodPut, "/apps/app/deliveries/deployment/public-access?x=1", shapePublicAccess},
 	} {
 		if _, known := expectedSuccessStatus(tc.method, tc.path, tc.shape); known {
@@ -812,6 +813,8 @@ func TestAllCommandFamiliesUseTheirDeclaredRouteAndProof(t *testing.T) {
 		var response string
 		status := http.StatusOK
 		switch r.URL.Path {
+		case apiBase + "/host/metrics":
+			response = `{"schema_version":1,"availability":"warming_up","observed_at":"2030-01-01T00:00:00Z","stale_after_seconds":15,"cpu":{"logical_cores":4},"memory":{"total_bytes":4096,"available_bytes":1024,"used_bytes":3072},"disk":{"mountpoint":"/","total_bytes":8192,"free_bytes":4096,"used_bytes":4096}}`
 		case apiBase + "/apps":
 			if r.Method == http.MethodGet {
 				response = `{"items":[]}`
@@ -821,10 +824,19 @@ func TestAllCommandFamiliesUseTheirDeclaredRouteAndProof(t *testing.T) {
 			}
 		case apiBase + "/apps/app":
 			response = `{"id":"app","name":"demo","created_at":"2030-01-01T00:00:00Z","updated_at":"2030-01-01T00:00:00Z"}`
+		case apiBase + "/apps/app/operations/operation":
+			response = `{"operation_id":"operation","operation_type":"observe","status":"verified","task_id":"task","deployment_id":"deployment","accepted_at":"2030-01-01T00:00:00Z","updated_at":"2030-01-01T00:00:01Z","evidence":{"kind":"response_observation","verdict":"unhealthy","observed_at":"2030-01-01T00:00:01Z","http_status":500}}`
 		case apiBase + "/apps/app/sources":
-			response = `{"items":[],"next_cursor":null}`
+			if r.Method == http.MethodGet {
+				response = `{"items":[],"next_cursor":null}`
+			} else {
+				status = http.StatusCreated
+				response = `{"source_revision_id":"source-new","status":"imported"}`
+			}
 		case apiBase + "/apps/app/sources/source":
 			response = `{"id":"source","application_id":"app","kind":"git_https","locator_sha256":"digest","content_digest":"content","created_at":"2030-01-01T00:00:00Z","immutable":true}`
+		case apiBase + "/apps/app/sources/source/metadata":
+			response = `{"source_revision_id":"source","availability":"unavailable"}`
 		case apiBase + "/apps/app/deliveries":
 			if r.Method == http.MethodGet {
 				response = `{"items":[],"next_cursor":null}`
@@ -834,6 +846,8 @@ func TestAllCommandFamiliesUseTheirDeclaredRouteAndProof(t *testing.T) {
 			}
 		case apiBase + "/apps/app/deliveries/deployment":
 			response = `{"deployment":{"id":"deployment","application_id":"app","environment_id":"environment","release_id":"release","stage":"starting","created_at":"2030-01-01T00:00:00Z","updated_at":"2030-01-01T00:00:00Z"},"desired":null,"runtime":null,"response":null}`
+		case apiBase + "/apps/app/deliveries/deployment/source":
+			response = `{"deployment_id":"deployment","availability":"unavailable"}`
 		case apiBase + "/apps/app/deliveries/deployment/logs":
 			if r.URL.Query().Get("source") != "runtime" || r.URL.Query().Get("limit") != "2" || r.URL.Query().Get("cursor") != "opaque" {
 				t.Errorf("logs query=%q", r.URL.RawQuery)
@@ -863,9 +877,9 @@ func TestAllCommandFamiliesUseTheirDeclaredRouteAndProof(t *testing.T) {
 	}
 	c := &cli{in: strings.NewReader(""), out: io.Discard, err: io.Discard, env: env, client: server.Client(), json: true}
 	commands := [][]string{
-		{"apps", "list"}, {"apps", "get", "app"}, {"apps", "create", "--name", "demo", "--repository", "https://github.com/example/repo.git", "--ref", "main"},
-		{"sources", "list", "app", "--limit", "2", "--cursor", "opaque"}, {"sources", "get", "app", "source"}, {"deployments", "list", "app", "--limit", "2", "--cursor", "opaque"},
-		{"deploy", "app", "--source", "source", "--port", "8080"}, {"status", "app", "deployment"}, {"logs", "app", "deployment", "--source", "runtime", "--limit", "2", "--cursor", "opaque"},
+		{"host", "metrics"}, {"apps", "list"}, {"apps", "get", "app"}, {"operation", "app", "operation"}, {"apps", "create", "--name", "demo", "--repository", "https://github.com/example/repo.git", "--ref", "main"},
+		{"sources", "list", "app", "--limit", "2", "--cursor", "opaque"}, {"sources", "update", "app", "source", "main"}, {"sources", "get", "app", "source"}, {"sources", "metadata", "app", "source"}, {"deployments", "list", "app", "--limit", "2", "--cursor", "opaque"},
+		{"deploy", "app", "--source", "source", "--port", "8080"}, {"status", "app", "deployment"}, {"delivery-source", "app", "deployment"}, {"logs", "app", "deployment", "--source", "runtime", "--limit", "2", "--cursor", "opaque"},
 		{"probe", "app", "deployment"}, {"restart", "app", "deployment"}, {"redeploy", "app", "deployment"}, {"public-access", "get", "app", "deployment"}, {"public-access", "enable", "app", "deployment"}, {"public-access", "disable", "app", "deployment"},
 	}
 	for _, args := range commands {

@@ -24,6 +24,17 @@ func acornFoxValidateProductionManagedScope(root *os.Root, store *TaskAcornFoxRe
 // pointers are not an exception to the scope check: they are a small,
 // transaction-bound extension of the otherwise static inventory.
 func acornFoxValidateProductionManagedScopePrefix(root *os.Root, store *TaskAcornFoxRepoStore, entries []SubstrateEntry, activation AcornFoxRepoActivationV1, activationRaw []byte, state acornFoxRepoPrefixState) error {
+	return acornFoxValidateProductionManagedScopePrefixWithRuntimePolicy(root, store, entries, activation, activationRaw, state, true)
+}
+
+// acornFoxValidateProductionManagedScopePrefixForLegacyUpgrade admits only a
+// tokenless, otherwise fully verified predecessor while an upgrade journal is
+// being created. Ordinary host validation remains token-strict.
+func acornFoxValidateProductionManagedScopePrefixForLegacyUpgrade(root *os.Root, store *TaskAcornFoxRepoStore, entries []SubstrateEntry, activation AcornFoxRepoActivationV1, activationRaw []byte, state acornFoxRepoPrefixState) error {
+	return acornFoxValidateProductionManagedScopePrefixWithRuntimePolicy(root, store, entries, activation, activationRaw, state, false)
+}
+
+func acornFoxValidateProductionManagedScopePrefixWithRuntimePolicy(root *os.Root, store *TaskAcornFoxRepoStore, entries []SubstrateEntry, activation AcornFoxRepoActivationV1, activationRaw []byte, state acornFoxRepoPrefixState, requireSetupToken bool) error {
 	if root == nil || store == nil || store.layout.mode != acornFoxInstallLayoutProduction || store.layout.validate() != nil || !store.layout.hostRootPinned() {
 		return ErrAcornFoxLiveConflict
 	}
@@ -51,11 +62,21 @@ func acornFoxValidateProductionManagedScopePrefix(root *os.Root, store *TaskAcor
 		want[entry.Path] = entry
 	}
 	if state == acornFoxRepoPrefixCurrent {
-		configuration, err := acornFoxRuntimeConfigScope(root, store, activation)
+		configuration, err := acornFoxRuntimeConfigScopeWithTokenPolicy(root, store, activation, requireSetupToken)
 		if err != nil {
 			return ErrAcornFoxLiveConflict
 		}
 		for _, entry := range configuration {
+			if _, exists := want[entry.Path]; exists {
+				return ErrAcornFoxLiveConflict
+			}
+			want[entry.Path] = entry
+		}
+		assistant, err := acornFoxAssistantConfigScope(root, store)
+		if err != nil {
+			return ErrAcornFoxLiveConflict
+		}
+		for _, entry := range assistant {
 			if _, exists := want[entry.Path]; exists {
 				return ErrAcornFoxLiveConflict
 			}
@@ -306,7 +327,7 @@ func acornFoxSharedParentSafe(root *os.Root, store *TaskAcornFoxRepoStore, path 
 
 func acornFoxServiceDataRoot(path string) bool {
 	switch path {
-	case "var/lib/acornfox/uploads", "var/lib/acornfox/workspaces", "var/lib/acornfox/build-work", "var/lib/acornfox/oci", "var/lib/acornfox/secrets", "var/lib/acornfox/secret-materials", "var/lib/acornfox/health-secret-materials", "var/lib/acornfox/agent", "var/lib/acornfox/buildkit", "var/lib/acornfox/caddy", "var/lib/acornfox/edge", "var/lib/acornfox/edge/home", "var/lib/acornfox/edge/data", "var/lib/acornfox/edge/config", "var/lib/acornfox/healthcheck", "var/log/acornfox/server", "var/log/acornfox/agent", "var/log/acornfox/caddy", "var/log/acornfox/edge":
+	case "var/lib/acornfox/uploads", "var/lib/acornfox/workspaces", "var/lib/acornfox/build-work", "var/lib/acornfox/oci", "var/lib/acornfox/secrets", "var/lib/acornfox/secret-materials", "var/lib/acornfox/health-secret-materials", "var/lib/acornfox/agent", "var/lib/acornfox/buildkit", "var/lib/acornfox/pi", "var/lib/acornfox/pi/work", "var/lib/acornfox/pi/agent", "var/lib/acornfox/pi/sessions", "var/lib/acornfox/caddy", "var/lib/acornfox/edge", "var/lib/acornfox/edge/home", "var/lib/acornfox/edge/data", "var/lib/acornfox/edge/config", "var/lib/acornfox/healthcheck", "var/log/acornfox/server", "var/log/acornfox/agent", "var/log/acornfox/caddy", "var/log/acornfox/edge":
 		return true
 	}
 	return false

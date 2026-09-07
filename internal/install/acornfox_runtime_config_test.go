@@ -129,8 +129,15 @@ func TestAcornFoxRuntimeConfigReplayCrashPrefixes(t *testing.T) {
 				}
 			}
 			entries, err := runtimeScopeForTest(t, p)
-			if err != nil || len(entries) != 8 {
+			if err != nil || len(entries) != len(intent.Files)+3 {
 				t.Fatalf("final scope: %v count=%d", err, len(entries))
+			}
+			tokenPath := filepath.Join(p.host, acornFoxSetupCredentialPath)
+			if token, readErr := os.ReadFile(tokenPath); readErr != nil || !bytes.Equal(token, intent.SetupToken) {
+				t.Fatal("setup token was not replayed exactly")
+			}
+			if info, statErr := os.Lstat(tokenPath); statErr != nil || info.Mode().Perm() != 0600 {
+				t.Fatal("setup token does not remain root-only")
 			}
 			if _, err := os.Lstat(filepath.Join(p.host, acornFoxRuntimeTemporary(raw))); !errors.Is(err, os.ErrNotExist) {
 				t.Fatal("temporary survived publish")
@@ -353,7 +360,11 @@ func TestAcornFoxRuntimeIntentWireValidationAndRedaction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	i := acornFoxRuntimeIntent{SchemaVersion: 1, BindingSHA256: strings.Repeat("a", 64), ReleaseID: "release-1.2.3", SourceCommit: strings.Repeat("b", 40), Inputs: inputs}
+	token, err := acornfoxsetup.GenerateSetupToken(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	i := acornFoxRuntimeIntent{SchemaVersion: 1, BindingSHA256: strings.Repeat("a", 64), ReleaseID: "release-1.2.3", SourceCommit: strings.Repeat("b", 40), Inputs: inputs, SetupToken: token}
 	for _, f := range b.Files {
 		i.Files = append(i.Files, acornFoxRuntimeFileWire{f.Path, f.Mode, f.Owner, f.Group, f.Data})
 	}
@@ -362,7 +373,7 @@ func TestAcornFoxRuntimeIntentWireValidationAndRedaction(t *testing.T) {
 		t.Fatal(err)
 	}
 	parsed, err := parseAcornFoxRuntimeIntent(raw)
-	if err != nil || !bytes.Equal(parsed.Files[4].Data, i.Files[4].Data) {
+	if err != nil || !bytes.Equal(parsed.Files[4].Data, i.Files[4].Data) || !bytes.Equal(parsed.SetupToken, token) {
 		t.Fatal("private intent lost key bytes")
 	}
 	r := i.receipt(raw)
@@ -375,8 +386,8 @@ func TestAcornFoxRuntimeIntentWireValidationAndRedaction(t *testing.T) {
 	}
 	for _, v := range []any{i, i.Files, i.Files[4]} {
 		for _, verb := range []string{"%v", "%+v", "%#v", "%s"} {
-			if strings.Contains(fmt.Sprintf(verb, v), "PRIVATE KEY") {
-				t.Fatal("fmt leaked private key")
+			if rendered := fmt.Sprintf(verb, v); strings.Contains(rendered, "PRIVATE KEY") || strings.Contains(rendered, string(token)) {
+				t.Fatal("fmt leaked private setup material")
 			}
 		}
 	}

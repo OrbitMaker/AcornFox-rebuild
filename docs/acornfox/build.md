@@ -118,15 +118,17 @@ npm cache verify --cache "$build_root/npm-cache"
 
 ## 冻结输入
 
-冻结脚本的五个位置参数依次为：源码目录、运行时目录、许可目录、尚不存在的控制输入输出目录、版本号。它只做本地检查，不下载依赖，也不授予发布或安装权限。
+冻结脚本的五个位置参数依次为：源码目录、运行时目录、许可目录、尚不存在的控制输入输出目录、版本号；另外必须提供已经离线取得的官方 Pi v0.85.1 Linux x64 归档。脚本核对归档、固定资产清单和 `runtime_root/pi/**` 的逐文件摘要，不下载依赖，也不授予发布或安装权限。
 
 ```bash
 control="$build_root/inputs/control-beta1"
+pi_archive="$build_root/upstream/pi-linux-x64.tar.gz"
 python3 "$source_root/scripts/acornfox/prepare-release-inputs.py" \
-  "$source_root" "$runtime_root" "$license_root" "$control" 0.1.0-beta.1
+  "$source_root" "$runtime_root" "$license_root" "$control" 0.1.0-beta.1 \
+  --pi-archive "$pi_archive"
 ```
 
-脚本按 Linux amd64、禁用 CGO 的设置，对十个产品命令执行 `go list -deps`，记录项目模块的完整 Go 包闭包。它还记录源码、运行时和许可树的文件摘要与权限，以及实际 Go、Git、Node.js 二进制和 npm JavaScript 入口的摘要。
+脚本按 Linux amd64、禁用 CGO 的设置，对十一个产品命令执行 `go list -deps`，记录项目模块的完整 Go 包闭包。它还记录源码、运行时和许可树的文件摘要与权限，以及实际 Go、Git、Node.js 二进制和 npm JavaScript 入口的摘要。
 
 控制目录包含 `source-policy.json`、`toolchain.json`、`runtime-inputs.json`、`license-inputs.json`、`decision.json` 和 `decision.sha256`。JSON 字段顺序与 Go 类型一致，并保留 Go 的 HTML、U+2028/U+2029 转义规则；不要用其他格式化器改写后继续使用旧摘要。这里的 `decision.sha256` 是自己刚冻结输入的本地依据，不是官方发布的 binding 摘要。
 

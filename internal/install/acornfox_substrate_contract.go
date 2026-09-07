@@ -43,6 +43,7 @@ const (
 	OwnerRoleBuildKit OwnerRole = "buildkit"
 	OwnerRoleCaddy    OwnerRole = "caddy"
 	OwnerRoleEdge     OwnerRole = "edge"
+	OwnerRolePI       OwnerRole = "pi"
 )
 
 const (
@@ -52,6 +53,7 @@ const (
 	GroupRoleBuildKit GroupRole = "buildkit"
 	GroupRoleCaddy    GroupRole = "caddy"
 	GroupRoleEdge     GroupRole = "edge"
+	GroupRolePI       GroupRole = "pi"
 )
 
 type SubstrateEntryKind string
@@ -256,7 +258,7 @@ func validateAcornFoxSubstrateEntry(entry SubstrateEntry) error {
 
 func validAcornFoxGroupRole(role GroupRole) bool {
 	switch role {
-	case GroupRoleRoot, GroupRoleServer, GroupRoleAgent, GroupRoleBuildKit, GroupRoleCaddy, GroupRoleEdge:
+	case GroupRoleRoot, GroupRoleServer, GroupRoleAgent, GroupRoleBuildKit, GroupRoleCaddy, GroupRoleEdge, GroupRolePI:
 		return true
 	default:
 		return false
@@ -265,7 +267,7 @@ func validAcornFoxGroupRole(role GroupRole) bool {
 
 func validAcornFoxOwnerRole(role OwnerRole) bool {
 	switch role {
-	case OwnerRoleRoot, OwnerRoleServer, OwnerRoleAgent, OwnerRoleBuildKit, OwnerRoleCaddy, OwnerRoleEdge:
+	case OwnerRoleRoot, OwnerRoleServer, OwnerRoleAgent, OwnerRoleBuildKit, OwnerRoleCaddy, OwnerRoleEdge, OwnerRolePI:
 		return true
 	default:
 		return false
@@ -433,6 +435,9 @@ func acornFoxFixedSubstrateEntries(candidate AcornFoxStageReceiptV1) map[string]
 	entries["var/lib/acornfox/health-secret-materials"] = directory("var/lib/acornfox/health-secret-materials", 0o700, OwnerRoleRoot, GroupRoleRoot)
 	entries["var/lib/acornfox/agent"], entries["var/log/acornfox/agent"] = directory("var/lib/acornfox/agent", 0o750, OwnerRoleAgent, GroupRoleAgent), directory("var/log/acornfox/agent", 0o750, OwnerRoleAgent, GroupRoleAgent)
 	entries["var/lib/acornfox/buildkit"] = directory("var/lib/acornfox/buildkit", 0o700, OwnerRoleBuildKit, GroupRoleBuildKit)
+	for _, path := range []string{"var/lib/acornfox/pi", "var/lib/acornfox/pi/work", "var/lib/acornfox/pi/agent", "var/lib/acornfox/pi/sessions"} {
+		entries[path] = directory(path, 0o700, OwnerRolePI, GroupRolePI)
+	}
 	entries["var/lib/acornfox/caddy"], entries["var/log/acornfox/caddy"] = directory("var/lib/acornfox/caddy", 0o750, OwnerRoleCaddy, GroupRoleCaddy), directory("var/log/acornfox/caddy", 0o750, OwnerRoleCaddy, GroupRoleCaddy)
 	for _, path := range []string{"var/lib/acornfox/edge", "var/log/acornfox/edge"} {
 		entries[path] = directory(path, 0o750, OwnerRoleEdge, GroupRoleEdge)

@@ -1,17 +1,23 @@
 import { readFileSync } from "node:fs";
 import { createAcornFoxClient, type AcornFoxClient } from "./client";
+import { createAcornFoxIntegrationClient, type AcornFoxIntegrationClient } from "./integration-client";
+import { createAcornFoxAssistantClient, type AcornFoxAssistantClient } from "./assistant-client";
 
 type Operation = {
   operationId: string;
   method: string;
   pathTemplate: string;
-  successStatus: number;
+  successStatuses: number[];
   proof:
     | "anonymous-login"
+    | "anonymous-setup-read"
+    | "anonymous-setup-mutation"
     | "session-read"
     | "csrf-session-mutation"
     | "csrf-idempotency-mutation";
-  visible: boolean;
+  parity: "legacy_cli" | "integration_cli" | "integration_ui" | "assistant_ui_only" | "cli_only";
+  cli: boolean;
+  webClient: "legacy" | "integration" | "assistant" | "none";
 };
 type Matrix = {
   sourceRequestType: "public_git";
@@ -53,6 +59,10 @@ const deployment = {
 
 function payload(operationId: string, sourceRevisionKind: string): unknown {
   switch (operationId) {
+    case "getAcornFoxSetupState":
+      return { state: "uninitialized" };
+    case "initializeAcornFoxAdministrator":
+      return { initialized: true };
     case "loginAcornFoxAdministrator":
     case "getAcornFoxAdministratorSession":
       return session;
@@ -83,6 +93,30 @@ function payload(operationId: string, sourceRevisionKind: string): unknown {
     case "getAcornFoxDeliveryPublicAccess":
     case "setAcornFoxDeliveryPublicAccess":
       return { desired_public: true, url: "https://app.example.test", endpoint: { deployment_id: "deployment" }, components: { internal_endpoint: "accepted", local_route: "desired", dns: "not_validated", tls: "not_validated", external: "not_validated" }, status: "PENDING_EXTERNAL_VALIDATION" };
+    case "getAcornFoxHostMetrics":
+      return { schema_version: 1, availability: "warming_up", observed_at: "2030-01-01T00:00:00Z", stale_after_seconds: 15, cpu: { logical_cores: 4 }, memory: { total_bytes: 4096, available_bytes: 1024, used_bytes: 3072 }, disk: { mountpoint: "/", total_bytes: 8192, free_bytes: 4096, used_bytes: 4096 } };
+    case "getAcornFoxSourceMetadata":
+      return { source_revision_id: "source", availability: "unavailable" };
+    case "updateAcornFoxSourceRevision":
+      return { source_revision_id: "source-next", status: "imported" };
+    case "getAcornFoxDeliverySource":
+      return { deployment_id: "deployment", availability: "unavailable" };
+    case "getAcornFoxOperationResult":
+      return { operation_id: "operation", operation_type: "observe", status: "verified", task_id: "task", deployment_id: "deployment", accepted_at: "2030-01-01T00:00:00Z", updated_at: "2030-01-01T00:00:01Z", evidence: { kind: "response_observation", verdict: "unhealthy", observed_at: "2030-01-01T00:00:01Z", http_status: 500 } };
+    case "listAcornFoxAssistantSessions":
+      return { sessions: [] };
+    case "createAcornFoxAssistantSession":
+      return { session_id: "session", scope: { kind: "host" }, created_at: "2030-01-01T00:00:00Z", updated_at: "2030-01-01T00:00:00Z" };
+    case "submitAcornFoxAssistantRun":
+      return { run: { run_id: "run", session_id: "session", status: "accepted", created_at: "2030-01-01T00:00:00Z", updated_at: "2030-01-01T00:00:00Z" }, replay: false };
+    case "getAcornFoxAssistantEvents":
+      return { status: "ok", oldest_cursor: 0, latest_cursor: 0, events: [] };
+    case "abortAcornFoxAssistantSessionRuns":
+      return { aborted: 0 };
+    case "listAcornFoxAssistantActions":
+      return { actions: [] };
+    case "decideAcornFoxAssistantAction":
+      return { proposal_id: "proposal", session_id: "session", run_id: "run", action: "restart", target: { application_id: "app", deployment_id: "deployment", target_release_id: "release", target_release_version: 1, application_name: "App" }, state: "accepted", expires_at: "2030-01-01T00:10:00Z", operation_id: "operation", verification: { state: "pending" }, created_at: "2030-01-01T00:00:00Z", updated_at: "2030-01-01T00:00:01Z" };
     default:
       throw new Error(`missing test payload for ${operationId}`);
   }
@@ -93,6 +127,18 @@ type WebOperation = {
   method: string;
   pathTemplate: string;
   invoke: (api: AcornFoxClient) => Promise<unknown>;
+};
+type IntegrationOperation = {
+  operationId: string;
+  method: string;
+  pathTemplate: string;
+  invoke: (api: AcornFoxIntegrationClient) => Promise<unknown>;
+};
+type AssistantOperation = {
+  operationId: string;
+  method: string;
+  pathTemplate: string;
+  invoke: (api: AcornFoxAssistantClient) => Promise<unknown>;
 };
 
 const webOperations: WebOperation[] = [
@@ -115,6 +161,24 @@ const webOperations: WebOperation[] = [
   { operationId: "getAcornFoxDeliveryPublicAccess", method: "GET", pathTemplate: "/api/v1/acornfox/apps/{applicationId}/deliveries/{deploymentId}/public-access", invoke: (api) => api.publicAccess("app", "deployment") },
   { operationId: "setAcornFoxDeliveryPublicAccess", method: "PUT", pathTemplate: "/api/v1/acornfox/apps/{applicationId}/deliveries/{deploymentId}/public-access", invoke: (api) => api.setPublicAccess("app", "deployment", true) },
 ];
+const integrationOperations: IntegrationOperation[] = [
+  { operationId: "getAcornFoxSetupState", method: "GET", pathTemplate: "/api/v1/acornfox/setup", invoke: (api) => api.setupState() },
+  { operationId: "initializeAcornFoxAdministrator", method: "POST", pathTemplate: "/api/v1/acornfox/setup", invoke: (api) => api.setup({ setupToken: "single-use", password: "not-a-real-password" }) },
+  { operationId: "getAcornFoxHostMetrics", method: "GET", pathTemplate: "/api/v1/acornfox/host/metrics", invoke: (api) => api.hostMetrics() },
+  { operationId: "getAcornFoxSourceMetadata", method: "GET", pathTemplate: "/api/v1/acornfox/apps/{applicationId}/sources/{sourceRevisionId}/metadata", invoke: (api) => api.sourceMetadata("app", "source") },
+  { operationId: "updateAcornFoxSourceRevision", method: "POST", pathTemplate: "/api/v1/acornfox/apps/{applicationId}/sources", invoke: (api) => api.sourceUpdate("app", { baseSourceRevisionId: "source", ref: "main" }, "retry-key") },
+  { operationId: "getAcornFoxDeliverySource", method: "GET", pathTemplate: "/api/v1/acornfox/apps/{applicationId}/deliveries/{deploymentId}/source", invoke: (api) => api.deploymentSource("app", "deployment") },
+  { operationId: "getAcornFoxOperationResult", method: "GET", pathTemplate: "/api/v1/acornfox/apps/{applicationId}/operations/{operationId}", invoke: (api) => api.operationResult("app", "operation") },
+];
+const assistantOperations: AssistantOperation[] = [
+  { operationId: "listAcornFoxAssistantSessions", method: "GET", pathTemplate: "/api/v1/acornfox/assistant/sessions", invoke: (api) => api.sessions() },
+  { operationId: "createAcornFoxAssistantSession", method: "POST", pathTemplate: "/api/v1/acornfox/assistant/sessions", invoke: (api) => api.createSession({ kind: "host" }) },
+  { operationId: "submitAcornFoxAssistantRun", method: "POST", pathTemplate: "/api/v1/acornfox/assistant/sessions/{sessionId}/runs", invoke: (api) => api.submitRun("session", "show host facts", "retry-key") },
+  { operationId: "getAcornFoxAssistantEvents", method: "GET", pathTemplate: "/api/v1/acornfox/assistant/sessions/{sessionId}/events", invoke: (api) => api.events("session", 0) },
+  { operationId: "abortAcornFoxAssistantSessionRuns", method: "POST", pathTemplate: "/api/v1/acornfox/assistant/sessions/{sessionId}/abort", invoke: (api) => api.abort("session") },
+  { operationId: "listAcornFoxAssistantActions", method: "GET", pathTemplate: "/api/v1/acornfox/assistant/sessions/{sessionId}/actions", invoke: (api) => api.actions("session") },
+  { operationId: "decideAcornFoxAssistantAction", method: "POST", pathTemplate: "/api/v1/acornfox/assistant/sessions/{sessionId}/actions/{proposalId}/decision", invoke: (api) => api.decideAction("session", "proposal", true) },
+];
 
 function actualTemplate(url: string, expected: string): string {
   const pathname = new URL(url, "https://acornfox.invalid").pathname;
@@ -125,14 +189,13 @@ function actualTemplate(url: string, expected: string): string {
 }
 
 describe("AcornFox OpenAPI parity", () => {
-  it.skipIf(!matrix)("derives visible Web coverage, status, and proof from fresh OpenAPI", async () => {
+  it.skipIf(!matrix)("derives legacy-client coverage, status, and proof from fresh OpenAPI", async () => {
     const contract = matrix!;
     expect(contract.sourceRequestType).toBe("public_git");
     expect(contract.sourceRevisionKind).toBe("git_https");
-    const visible = contract.operations.filter((operation) => operation.visible);
-    expect(contract.operations.every((operation) => operation.visible)).toBe(true);
-    expect(webOperations).toHaveLength(visible.length);
-    const contractByID = new Map(visible.map((operation) => [operation.operationId, operation]));
+    const legacy = contract.operations.filter((operation) => operation.webClient === "legacy");
+    expect(webOperations).toHaveLength(legacy.length);
+    const contractByID = new Map(legacy.map((operation) => [operation.operationId, operation]));
 
     for (const declared of webOperations) {
       const operation = contractByID.get(declared.operationId);
@@ -145,8 +208,8 @@ describe("AcornFox OpenAPI parity", () => {
         seen.push({ url: String(input), init: init ?? {} });
         const body = payload(declared.operationId, contract.sourceRevisionKind);
         return body === undefined
-          ? new Response(null, { status: operation!.successStatus })
-          : new Response(JSON.stringify(body), { status: operation!.successStatus, headers: { "Content-Type": "application/json" } });
+          ? new Response(null, { status: operation!.successStatuses[0] })
+          : new Response(JSON.stringify(body), { status: operation!.successStatuses[0], headers: { "Content-Type": "application/json" } });
       });
       await declared.invoke(api);
       expect(seen).toHaveLength(1);
@@ -159,6 +222,8 @@ describe("AcornFox OpenAPI parity", () => {
       const hasKey = headers.get("Idempotency-Key") !== null;
       expect({
         "anonymous-login": [false, false],
+        "anonymous-setup-read": [false, false],
+        "anonymous-setup-mutation": [true, false],
         "session-read": [false, false],
         "csrf-session-mutation": [true, false],
         "csrf-idempotency-mutation": [true, true],
@@ -167,6 +232,90 @@ describe("AcornFox OpenAPI parity", () => {
         const body = JSON.parse(String(request.init.body)) as { source: { type: string } };
         expect(body.source.type).toBe(contract.sourceRequestType);
       }
+    }
+  });
+
+  it.skipIf(!matrix)("derives integration-client coverage, status, and proof from fresh OpenAPI", async () => {
+    const contract = matrix!;
+    const integration = contract.operations.filter((operation) => operation.webClient === "integration");
+    expect(integration.map((operation) => operation.operationId).sort()).toEqual([
+      "getAcornFoxDeliverySource", "getAcornFoxHostMetrics", "getAcornFoxOperationResult", "getAcornFoxSetupState", "getAcornFoxSourceMetadata", "initializeAcornFoxAdministrator", "updateAcornFoxSourceRevision",
+    ]);
+    expect(integrationOperations).toHaveLength(integration.length);
+    expect(contract.operations.filter((operation) => operation.webClient === "none")).toHaveLength(0);
+    const contractByID = new Map(integration.map((operation) => [operation.operationId, operation]));
+
+    for (const declared of integrationOperations) {
+      const operation = contractByID.get(declared.operationId);
+      expect(operation).toBeDefined();
+      expect(declared.method).toBe(operation!.method);
+      expect(declared.pathTemplate).toBe(operation!.pathTemplate);
+      const seen: { url: string; init: RequestInit }[] = [];
+      Object.defineProperty(globalThis, "document", { configurable: true, value: { cookie: "__Host-acornfox_csrf=csrf" } });
+      const api = createAcornFoxIntegrationClient(async (input, init) => {
+        seen.push({ url: String(input), init: init ?? {} });
+        const body = payload(declared.operationId, contract.sourceRevisionKind);
+        return new Response(JSON.stringify(body), { status: operation!.successStatuses[0], headers: { "Content-Type": "application/json" } });
+      });
+      await declared.invoke(api);
+      expect(seen).toHaveLength(1);
+      const request = seen[0]!;
+      expect(actualTemplate(request.url, declared.pathTemplate)).toBe(operation!.pathTemplate);
+      expect((request.init.method ?? "GET").toUpperCase()).toBe(operation!.method);
+      expect(request.init.credentials).toBe("include");
+      const headers = new Headers(request.init.headers);
+      const hasCSRF = headers.get("X-AcornFox-CSRF") === "csrf";
+      const hasKey = headers.get("Idempotency-Key") !== null;
+      expect({
+        "anonymous-setup-read": [false, false],
+        "anonymous-setup-mutation": [true, false],
+        "anonymous-login": [false, false],
+        "session-read": [false, false],
+        "csrf-session-mutation": [true, false],
+        "csrf-idempotency-mutation": [true, true],
+      }[operation!.proof]).toEqual([hasCSRF, hasKey]);
+    }
+  });
+
+  it.skipIf(!matrix)("derives assistant-client coverage, status, and proof from fresh OpenAPI", async () => {
+    const contract = matrix!;
+    const assistant = contract.operations.filter((operation) => operation.webClient === "assistant");
+    expect(assistant.map((operation) => operation.operationId).sort()).toEqual([
+      "abortAcornFoxAssistantSessionRuns", "createAcornFoxAssistantSession", "decideAcornFoxAssistantAction", "getAcornFoxAssistantEvents", "listAcornFoxAssistantActions", "listAcornFoxAssistantSessions", "submitAcornFoxAssistantRun",
+    ]);
+    expect(assistantOperations).toHaveLength(assistant.length);
+    const contractByID = new Map(assistant.map((operation) => [operation.operationId, operation]));
+
+    for (const declared of assistantOperations) {
+      const operation = contractByID.get(declared.operationId);
+      expect(operation).toBeDefined();
+      expect(declared.method).toBe(operation!.method);
+      expect(declared.pathTemplate).toBe(operation!.pathTemplate);
+      const seen: { url: string; init: RequestInit }[] = [];
+      Object.defineProperty(globalThis, "document", { configurable: true, value: { cookie: "__Host-acornfox_csrf=csrf" } });
+      const api = createAcornFoxAssistantClient(async (input, init) => {
+        seen.push({ url: String(input), init: init ?? {} });
+        const body = payload(declared.operationId, contract.sourceRevisionKind);
+        const status = declared.operationId === "submitAcornFoxAssistantRun" || declared.operationId === "decideAcornFoxAssistantAction" ? 202 : operation!.successStatuses[0]!;
+        expect(operation!.successStatuses).toContain(status);
+        return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
+      });
+      await declared.invoke(api);
+      expect(seen).toHaveLength(1);
+      const request = seen[0]!;
+      expect(actualTemplate(request.url, declared.pathTemplate)).toBe(operation!.pathTemplate);
+      expect((request.init.method ?? "GET").toUpperCase()).toBe(operation!.method);
+      expect(request.init.credentials).toBe("include");
+      const headers = new Headers(request.init.headers);
+      const hasCSRF = headers.get("X-AcornFox-CSRF") === "csrf";
+      expect({
+        "session-read": false,
+        "csrf-session-mutation": true,
+        "anonymous-login": false,
+        "anonymous-setup-read": false,
+        "anonymous-setup-mutation": true,
+        "csrf-idempotency-mutation": true,
+      }[operation!.proof]).toBe(hasCSRF);
     }
   });
 });

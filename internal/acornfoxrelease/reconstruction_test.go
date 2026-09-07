@@ -121,7 +121,7 @@ func reconstructionClone(t *testing.T, origin, parent, name, commit string) stri
 func reconstructSyntheticCandidate(t *testing.T, root string, toolchain ToolchainInputsV1) reconstructionResult {
 	t.Helper()
 	policy := policyForTree(t, root, "github.com/acme/acornfox-fixture")
-	runtimeRoot, runtime := candidateInputRoot(t, candidateRuntimeFixturePaths(), 0o755)
+	runtimeRoot, runtime := candidateRuntimeInputRoot(t)
 	licenseRoot, license := candidateLicenseRoot(t, installerFixturePaths(func(path string) bool { return strings.HasPrefix(path, "docs/licenses/") }))
 	witness := witnessForInputs(t, policy, toolchain, runtime, license)
 	witness.decision.SourceCommit = gitRun(t, root, "rev-parse", "HEAD")
@@ -158,7 +158,7 @@ func reconstructSyntheticCandidate(t *testing.T, root string, toolchain Toolchai
 	if err != nil {
 		t.Fatalf("web receipt: %v", err)
 	}
-	tree, err := BuildCandidateTreeV1(plan, goStage, webStage, runtimeRoot, runtime, licenseRoot, license, buildTaskRoot(t))
+	tree, err := buildCandidateTreeForTest(plan, goStage, webStage, runtimeRoot, runtime, licenseRoot, license, buildTaskRoot(t))
 	if err != nil {
 		t.Fatalf("build candidate tree: %v", err)
 	}

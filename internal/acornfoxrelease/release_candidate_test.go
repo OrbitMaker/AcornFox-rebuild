@@ -26,7 +26,7 @@ func releaseTreeFixture(t *testing.T, version string) *CandidateTreeStageV1 {
 	t.Helper()
 	plan, goStage, webStage, runtimeRoot, runtime, licenseRoot, license := candidateTreeVersionFixture(t, version, releaseLicenseFixture)
 	t.Cleanup(func() { _ = goStage.Close(); _ = webStage.Close() })
-	tree, err := BuildReleaseCandidateTreeV1(plan, goStage, webStage, runtimeRoot, runtime, licenseRoot, license, buildTaskRoot(t))
+	tree, err := buildReleaseCandidateTreeForTest(plan, goStage, webStage, runtimeRoot, runtime, licenseRoot, license, buildTaskRoot(t))
 	if err != nil {
 		t.Fatal(err)
 	}

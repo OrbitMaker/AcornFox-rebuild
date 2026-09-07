@@ -3,17 +3,33 @@ package install
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/open-card/open-card/internal/acornfoxsetup"
 )
 
 type acornFoxUpgradeServiceFake struct {
 	calls             []string
 	failNext, failOld bool
 	old               string
+}
+
+type acornFoxUpgradePIServiceFake struct {
+	*acornFoxUpgradeServiceFake
+	enabled bool
+	err     error
+	queries int
+}
+
+func (f *acornFoxUpgradePIServiceFake) PIEnabled(context.Context) (bool, error) {
+	f.queries++
+	return f.enabled, f.err
 }
 
 func (f *acornFoxUpgradeServiceFake) Run(_ context.Context, verb, unit string) error {
@@ -49,6 +65,297 @@ func upgradeFixture(t *testing.T) (*acornFoxUpgrade, acornFoxProductionPreparedF
 	service := &acornFoxUpgradeServiceFake{old: p.binding}
 	u.services = service
 	return u, p, AcornFoxUpgradeRequestV1{candidate, next.bindingSHA, p.binding, sha}, service
+}
+
+func provisionUpgradeAssistantConfig(t *testing.T, p acornFoxProductionPreparedFixture) {
+	t.Helper()
+	root, err := p.store.openHostRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	principal, ok := p.layout.owner(AcornFoxLiveRootRole)
+	if !ok || acornFoxAssistantPrepareDirectory(root, p.store, principal) != nil {
+		t.Fatal("assistant directory unavailable")
+	}
+	key := []byte("sk-upgrade-0123456789abcdefghijklmnop")
+	if err := acornFoxAssistantStage(root, p.store, acornFoxAssistantKeyNew, key, principal); err != nil {
+		t.Fatal(err)
+	}
+	if err := acornFoxAssistantStage(root, p.store, acornFoxAssistantConfigNew, acornFoxAssistantCanonicalConfig(), principal); err != nil {
+		t.Fatal(err)
+	}
+	if err := root.Rename(acornFoxAssistantKeyNew, acornFoxAssistantKey); err != nil {
+		t.Fatal(err)
+	}
+	if err := root.Rename(acornFoxAssistantConfigNew, acornFoxAssistantConfig); err != nil {
+		t.Fatal(err)
+	}
+	if configured, err := acornFoxAssistantConfigurationState(root, p.store); err != nil || !configured {
+		t.Fatalf("configured=%t err=%v", configured, err)
+	}
+}
+
+func TestAcornFoxUpgradePreservesOptionalPIServiceIntent(t *testing.T) {
+	t.Run("enabled-worker-orders-before-core-stop-and-server-start", func(t *testing.T) {
+		u, p, request, base := upgradeFixture(t)
+		provisionUpgradeAssistantConfig(t, p)
+		services := &acornFoxUpgradePIServiceFake{acornFoxUpgradeServiceFake: base, enabled: true}
+		u.services = services
+		if _, err := u.upgrade(context.Background(), request); err != nil {
+			t.Fatalf("err=%v calls=%q", err, base.calls)
+		}
+		want := []string{
+			"stop acornfox-pi-worker.service", "stop acornfox-edge.service", "stop acornfox-agent.service", "stop acornfox-server.service", "stop acornfox-caddy.service", "stop acornfox-buildkit.service", "stop acornfox-build-network.service",
+			"daemon-reload ", "start acornfox-build-network.service", "start acornfox-buildkit.service", "start acornfox-caddy.service", "start acornfox-pi-worker.service", "start acornfox-server.service", "start acornfox-agent.service",
+			"healthy " + request.BindingSHA256, "start acornfox-edge.service", "edge healthy",
+		}
+		if services.queries != 1 || !reflect.DeepEqual(base.calls, want) {
+			t.Fatalf("queries=%d\ncalls=%q\nwant=%q", services.queries, base.calls, want)
+		}
+		journal, err := os.ReadFile(filepath.Join(p.state, acornFoxUpgradeJournalPath))
+		if err != nil || !bytes.Contains(journal, []byte(`"pi_enabled":true`)) {
+			t.Fatalf("enabled intent missing from private journal: %v", err)
+		}
+	})
+	t.Run("disabled-worker-is-never-started", func(t *testing.T) {
+		u, p, request, base := upgradeFixture(t)
+		services := &acornFoxUpgradePIServiceFake{acornFoxUpgradeServiceFake: base}
+		u.services = services
+		if _, err := u.upgrade(context.Background(), request); err != nil {
+			t.Fatal(err)
+		}
+		for _, call := range base.calls {
+			if strings.Contains(call, "acornfox-pi-worker.service") {
+				t.Fatalf("disabled worker changed state: %q", base.calls)
+			}
+		}
+		journal, err := os.ReadFile(filepath.Join(p.state, acornFoxUpgradeJournalPath))
+		if err != nil || bytes.Contains(journal, []byte(`"pi_enabled"`)) {
+			t.Fatalf("disabled compatibility journal changed: %v", err)
+		}
+	})
+}
+
+func TestAcornFoxUpgradeRollbackAndRecoveryRestoreEnabledPIWorker(t *testing.T) {
+	t.Run("health-rollback", func(t *testing.T) {
+		u, p, request, base := upgradeFixture(t)
+		provisionUpgradeAssistantConfig(t, p)
+		base.failNext = true
+		services := &acornFoxUpgradePIServiceFake{acornFoxUpgradeServiceFake: base, enabled: true}
+		u.services = services
+		if receipt, err := u.upgrade(context.Background(), request); !errors.Is(err, ErrAcornFoxUpgradeRolledBack) || receipt.State != "ROLLED_BACK" {
+			t.Fatalf("receipt=%#v err=%v calls=%q", receipt, err, base.calls)
+		}
+		if countCall(base.calls, "stop acornfox-pi-worker.service") != 2 || countCall(base.calls, "start acornfox-pi-worker.service") != 2 {
+			t.Fatalf("worker intent not restored: %q", base.calls)
+		}
+		assertPIStartsBeforeLastServer(t, base.calls)
+	})
+	t.Run("durable-recovery", func(t *testing.T) {
+		u, p, request, base := upgradeFixture(t)
+		provisionUpgradeAssistantConfig(t, p)
+		services := &acornFoxUpgradePIServiceFake{acornFoxUpgradeServiceFake: base, enabled: true}
+		u.services = services
+		fired := false
+		u.step = func(name string) error {
+			if name == "healthy" && !fired {
+				fired = true
+				return errors.New("power loss")
+			}
+			return nil
+		}
+		if _, err := u.upgrade(context.Background(), request); !errors.Is(err, ErrAcornFoxUpgradeUnknown) || !fired {
+			t.Fatalf("err=%v fired=%t calls=%q", err, fired, base.calls)
+		}
+		base.calls = nil
+		u.step = func(string) error { return nil }
+		expected := AcornFoxBuildIdentityV1{1, AcornFoxV1Product, 1, "upgrade", "1.2.4-test.1", "release-1.2.4-test.1", strings.Repeat("a", 40)}
+		if receipt, handled, err := u.recover(context.Background(), expected); err != nil || !handled || receipt.State != "ROLLED_BACK" {
+			t.Fatalf("receipt=%#v handled=%t err=%v", receipt, handled, err)
+		}
+		if len(base.calls) == 0 || base.calls[0] != "stop acornfox-pi-worker.service" || countCall(base.calls, "start acornfox-pi-worker.service") != 1 {
+			t.Fatalf("recovery did not restore worker: %q", base.calls)
+		}
+		assertPIStartsBeforeLastServer(t, base.calls)
+	})
+}
+
+func countCall(calls []string, want string) int {
+	count := 0
+	for _, call := range calls {
+		if call == want {
+			count++
+		}
+	}
+	return count
+}
+
+func assertPIStartsBeforeLastServer(t *testing.T, calls []string) {
+	t.Helper()
+	pi, server := -1, -1
+	for index, call := range calls {
+		if call == "start acornfox-pi-worker.service" {
+			pi = index
+		}
+		if call == "start acornfox-server.service" {
+			server = index
+		}
+	}
+	if pi < 0 || server < 0 || pi >= server {
+		t.Fatalf("PI did not start before server: %q", calls)
+	}
+}
+
+func TestAcornFoxUpgradePIQueryFailureHasNoHostEffects(t *testing.T) {
+	u, p, request, base := upgradeFixture(t)
+	services := &acornFoxUpgradePIServiceFake{acornFoxUpgradeServiceFake: base, err: ErrAcornFoxUpgradeUnknown}
+	u.services = services
+	if _, err := u.upgrade(context.Background(), request); !errors.Is(err, ErrAcornFoxUpgradeUnknown) {
+		t.Fatalf("err=%v", err)
+	}
+	if services.queries != 1 || len(base.calls) != 0 {
+		t.Fatalf("queries=%d calls=%q", services.queries, base.calls)
+	}
+	for _, path := range []string{filepath.Join(p.state, acornFoxUpgradeJournalPath), filepath.Join(p.host, acornFoxUpgradeMarkerPath), u.stagePath(request.BindingSHA256)} {
+		if _, err := os.Lstat(path); !os.IsNotExist(err) {
+			t.Fatalf("query failure created %s: %v", path, err)
+		}
+	}
+	p.assertExternalSentinel(t)
+}
+
+func TestParseAcornFoxPIServiceStateRejectsInconsistency(t *testing.T) {
+	state := func(unitFile, active, sub string) []byte {
+		return []byte("Id=acornfox-pi-worker.service\nLoadState=loaded\nUnitFileState=" + unitFile + "\nActiveState=" + active + "\nSubState=" + sub + "\n")
+	}
+	for _, test := range []struct {
+		isEnabled bool
+		raw       []byte
+		enabled   bool
+		err       error
+	}{{true, state("enabled", "active", "running"), true, nil}, {false, state("disabled", "inactive", "dead"), false, nil}, {false, state("disabled", "active", "running"), false, ErrAcornFoxUpgradeConflict}, {true, state("enabled", "inactive", "dead"), false, ErrAcornFoxUpgradeConflict}, {true, state("disabled", "active", "running"), false, ErrAcornFoxUpgradeConflict}, {false, []byte("malformed"), false, ErrAcornFoxUpgradeUnknown}} {
+		enabled, err := parseAcornFoxPIServiceState(test.isEnabled, test.raw)
+		if enabled != test.enabled || !errors.Is(err, test.err) {
+			t.Fatalf("enabled=%t err=%v want=%t/%v raw=%q", enabled, err, test.enabled, test.err, test.raw)
+		}
+	}
+}
+
+// upgradeLegacyRuntimeFixture models the completed 0034 runtime state before
+// setup_token existed. It is intentionally constructed only in upgrade tests;
+// normal runtime parsing continues to reject this old schema.
+func upgradeLegacyRuntimeFixture(t *testing.T) (*acornFoxUpgrade, acornFoxProductionPreparedFixture, AcornFoxUpgradeRequestV1, *acornFoxUpgradeServiceFake, []byte) {
+	t.Helper()
+	u, p, request, services := upgradeFixture(t)
+	_, raw := runtimeIntentForTest(t, p)
+	legacy, err := parseAcornFoxRuntimeIntent(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := acornFoxRuntimeRemoveSetupToken(p.store.hostRoot, p.store, legacy); err != nil {
+		t.Fatal(err)
+	}
+	legacy.SetupToken = nil
+	legacyRaw := acornFoxUpgradeJSON(legacy)
+	runtimeOverwrite(t, filepath.Join(p.state, acornFoxRuntimeIntentName), legacyRaw, 0600)
+	receiptRaw, err := MarshalAcornFoxRuntimeConfigReceiptV1(legacy.receipt(legacyRaw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeOverwrite(t, filepath.Join(p.state, acornFoxRuntimeReceiptName), receiptRaw, 0600)
+	if _, err := parseAcornFoxRuntimeIntentForUpgrade(legacyRaw); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := parseAcornFoxRuntimeIntent(legacyRaw); err == nil {
+		t.Fatal("tokenless runtime was accepted by ordinary parser")
+	}
+	return u, p, request, services, legacyRaw
+}
+
+func TestAcornFoxUpgradeRejectsCrossSchemaBindingBeforeRuntimeConversion(t *testing.T) {
+	u, p, request, services := upgradeFixture(t)
+	legacy := newAcornFoxFixture(t, "1.2.3-test.1", nil)
+	legacy.binding.MigrationVersion = AcornFoxLegacyPredecessorMigration
+	refreshAcornFoxBinding(t, &legacy)
+	runtimeOverwrite(t, filepath.Join(p.state, "bindings", legacy.bindingSHA+".json"), legacy.bindingRaw, 0600)
+	if err := os.RemoveAll(request.Directory); err != nil {
+		t.Fatal(err)
+	}
+	successor := newAcornFoxFixture(t, "1.2.4-test.1", &legacy)
+	candidate, self, selfSHA := writeAcornFoxBridgeCandidate(t, p.parent, successor)
+	u.self = acornFoxSelfVerifier{path: self, uid: os.Getuid(), gid: os.Getgid()}
+	services.old = legacy.bindingSHA
+	request = AcornFoxUpgradeRequestV1{candidate, successor.bindingSHA, legacy.bindingSHA, selfSHA}
+	tokenBefore, err := os.ReadFile(filepath.Join(p.host, acornFoxSetupCredentialPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fired := false
+	u.step = func(name string) error {
+		if name == "setup-credential-published" && !fired {
+			fired = true
+			return errors.New("simulated power loss")
+		}
+		return nil
+	}
+	if _, err := u.upgrade(context.Background(), request); !errors.Is(err, ErrAcornFoxUpgradeConflict) || fired {
+		t.Fatalf("cross-schema binding bypassed retained-state guard: err=%v fault=%t", err, fired)
+	}
+	if _, err := os.Lstat(filepath.Join(p.state, acornFoxUpgradeJournalPath)); !os.IsNotExist(err) {
+		t.Fatalf("blocked cross-schema upgrade wrote a journal: %v", err)
+	}
+	if tokenAfter, err := os.ReadFile(filepath.Join(p.host, acornFoxSetupCredentialPath)); err != nil || !bytes.Equal(tokenBefore, tokenAfter) {
+		t.Fatalf("blocked cross-schema upgrade changed the existing credential: %v", err)
+	}
+	p.assertExternalSentinel(t)
+}
+
+func TestAcornFoxRuntimeOnlyLegacyConversionPublishesAndRemovesPinnedToken(t *testing.T) {
+	_, p, request, _, oldRaw := upgradeLegacyRuntimeFixture(t)
+	old, err := parseAcornFoxRuntimeIntentForUpgrade(oldRaw)
+	if err != nil || len(old.SetupToken) != 0 {
+		t.Fatalf("legacy runtime=%#v err=%v", old, err)
+	}
+	nextRaw, err := os.ReadFile(filepath.Join(request.Directory, acornFoxCandidateBindingFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ParseAcornFoxCandidateBindingV1(nextRaw, request.BindingSHA256); err != nil {
+		t.Fatal(err)
+	}
+	var next AcornFoxCandidateBindingV1
+	if err := json.Unmarshal(nextRaw, &next); err != nil {
+		t.Fatal(err)
+	}
+	token, err := acornfoxsetup.GenerateSetupToken(bytes.NewReader(bytes.Repeat([]byte{0x42}, 128)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	converted, err := acornFoxUpgradeRebind(old, next, request.BindingSHA256, token)
+	if err != nil || acornfoxsetup.ValidateSetupToken(converted.SetupToken) != nil || !bytes.Equal(converted.SetupToken, token) {
+		t.Fatalf("runtime conversion=%#v err=%v", converted, err)
+	}
+	token[0] ^= 1
+	if bytes.Equal(converted.SetupToken, token) {
+		t.Fatal("conversion retained caller token bytes")
+	}
+	if err := acornFoxRuntimePublishSetupToken(context.Background(), p.store.hostRoot, p.store, converted); err != nil {
+		t.Fatal(err)
+	}
+	if err := acornFoxRuntimePublishSetupToken(context.Background(), p.store.hostRoot, p.store, converted); err != nil {
+		t.Fatalf("recovery replay rewrote the pinned token: %v", err)
+	}
+	if raw, err := os.ReadFile(filepath.Join(p.host, acornFoxSetupCredentialPath)); err != nil || !bytes.Equal(raw, converted.SetupToken) {
+		t.Fatal("runtime conversion did not publish the pinned credential")
+	}
+	if err := acornFoxRuntimeRemoveSetupToken(p.store.hostRoot, p.store, converted); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(p.host, acornFoxSetupCredentialDirectory)); !os.IsNotExist(err) {
+		t.Fatalf("runtime-only rollback retained credential: %v", err)
+	}
+	p.assertExternalSentinel(t)
 }
 func TestAcornFoxUpgradeSuccessPreservesDataAndRebindsReceipts(t *testing.T) {
 	u, p, request, services := upgradeFixture(t)

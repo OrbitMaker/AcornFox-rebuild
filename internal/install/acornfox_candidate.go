@@ -9,14 +9,16 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+
+	"github.com/open-card/open-card/internal/pibundle"
 )
 
 // AcornFox V1 names are fixed package policy, not installer configuration.
 const (
 	AcornFoxV1Product          = "acornfox"
 	AcornFoxV1Architecture     = "amd64"
-	AcornFoxV1MigrationVersion = "0034"
-	AcornFoxV1DataVersion      = 34
+	AcornFoxV1MigrationVersion = "0038"
+	AcornFoxV1DataVersion      = 38
 	AcornFoxV1InstallPrefix    = "/opt/acornfox"
 	AcornFoxV1ConfigDir        = "/etc/acornfox"
 	AcornFoxV1DataDir          = "/var/lib/acornfox"
@@ -28,13 +30,17 @@ const (
 	AcornFoxV1EdgeAccount      = "acornfox-edge"
 
 	AcornFoxCandidateBindingV1Schema = 1
-	acornFoxCandidateBindingMaxBytes = 64 * 1024
-	acornFoxManifestMaxBytes         = 2 * 1024 * 1024
-	acornFoxBundleManifestMaxBytes   = 4 * 1024
-	acornFoxArchiveMaxBytes          = 512 * 1024 * 1024
-	acornFoxArchiveMaxMembers        = 256
-	acornFoxArchiveMaxMemberBytes    = 128 * 1024 * 1024
-	acornFoxArchiveMaxTotalBytes     = 1024 * 1024 * 1024
+	// AcornFoxLegacyPredecessorMigration is accepted only while parsing an
+	// already-installed, independently pinned predecessor binding. New
+	// candidates continue to require AcornFoxV1MigrationVersion.
+	AcornFoxLegacyPredecessorMigration = "0034"
+	acornFoxCandidateBindingMaxBytes   = 64 * 1024
+	acornFoxManifestMaxBytes           = 2 * 1024 * 1024
+	acornFoxBundleManifestMaxBytes     = 4 * 1024
+	acornFoxArchiveMaxBytes            = 512 * 1024 * 1024
+	acornFoxArchiveMaxMembers          = 512
+	acornFoxArchiveMaxMemberBytes      = 128 * 1024 * 1024
+	acornFoxArchiveMaxTotalBytes       = 1024 * 1024 * 1024
 )
 
 var (
@@ -42,6 +48,7 @@ var (
 		"bin/acornfox-server", "bin/acornfox-agent", "bin/acornfox-static-server",
 		"bin/acornfox-secretctl", "bin/acornfox-security-probe", "bin/acornfox-imagegc",
 		"bin/acornfox", "bin/acornfox-admin", "bin/acornfox-upgrade", "bin/acornfox-healthcheck",
+		"bin/acornfox-pi-worker",
 		"bin/buildkitd", "bin/buildctl", "bin/buildkit-runc", "bin/rootlesskit", "bin/caddy",
 	}
 	acornFoxV1Units = []string{
@@ -51,6 +58,7 @@ var (
 		"systemd/acornfox-caddy.service", "systemd/acornfox-edge.service", "systemd/acornfox-healthcheck.service",
 		"systemd/acornfox-healthcheck.timer", "systemd/acornfox-upgrade-recover.service",
 		"systemd/acornfox-upgrade-safe.target", "systemd/acornfox-upgrade-finalize.service",
+		"systemd/acornfox-pi-worker.service",
 		"systemd/acornfox-edge.service.d/10-upgrade-marker.conf",
 	}
 	acornFoxV1Scripts = []string{
@@ -68,7 +76,7 @@ var (
 		"0025_acornfox_build_plan_binding.sql", "0026_acornfox_build_network_policy.sql", "0027_acornfox_probe_observations.sql",
 		"0028_acornfox_log_metadata.sql", "0029_acornfox_log_provenance.sql", "0030_dns_change_provider_neutral.sql",
 		"0031_acornfox_public_access.sql", "0032_dns_change_execution.sql", "0033_acornfox_discovery_task_lookup.sql",
-		"0034_artifacts_per_build.sql",
+		"0034_artifacts_per_build.sql", "0035_acornfox_source_metadata.sql", "0036_acornfox_source_updates.sql", "0037_acornfox_assistant.sql", "0038_acornfox_assistant_actions.sql",
 	}
 	acornFoxV1WebAssetName = regexp.MustCompile(`^[A-Za-z0-9_.-]+-[A-Za-z0-9_-]{8,}\.(?:(?:css|js)(?:\.map)?|map|png|jpe?g|svg|gif|webp|ico|woff2?|ttf)$`)
 	acornFoxGitHubPath     = regexp.MustCompile(`^/[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$`)
@@ -82,7 +90,8 @@ type AcornFoxV1PackageFile struct {
 // AcornFoxV1RequiredFiles returns a defensive copy of the fixed required set.
 // Only direct, hashed web/dist/assets members may be added by a release.
 func AcornFoxV1RequiredFiles() []AcornFoxV1PackageFile {
-	files := make([]AcornFoxV1PackageFile, 0, len(acornFoxV1Binaries)+len(acornFoxV1Units)+len(acornFoxV1Scripts)+len(acornFoxV1Migrations)+10)
+	piFiles, _ := pibundle.Entries()
+	files := make([]AcornFoxV1PackageFile, 0, len(acornFoxV1Binaries)+len(acornFoxV1Units)+len(acornFoxV1Scripts)+len(acornFoxV1Migrations)+len(piFiles)+20)
 	for _, path := range acornFoxV1Binaries {
 		files = append(files, AcornFoxV1PackageFile{path, 0o755})
 	}
@@ -95,7 +104,12 @@ func AcornFoxV1RequiredFiles() []AcornFoxV1PackageFile {
 	for _, name := range acornFoxV1Migrations {
 		files = append(files, AcornFoxV1PackageFile{"migrations/control-plane/" + name, 0o640})
 	}
+	for _, file := range piFiles {
+		files = append(files, AcornFoxV1PackageFile{file.Path, file.Mode})
+	}
 	return append(files,
+		AcornFoxV1PackageFile{"pi/extensions/acornfox-tools.ts", 0o644},
+		AcornFoxV1PackageFile{"pi/UPSTREAM-ASSETS.json", 0o644},
 		AcornFoxV1PackageFile{"config/acornfox-build-network-policy-v1.json", 0o644},
 		AcornFoxV1PackageFile{"config/acornfox-build-resolv.conf", 0o644},
 		AcornFoxV1PackageFile{"config/acornfox-rootlesskit.apparmor", 0o644},
@@ -155,23 +169,54 @@ func (b VerifiedAcornFoxBindingV1) valid() bool {
 }
 
 func ParseAcornFoxCandidateBindingV1(data []byte, expectedSHA256 string) (VerifiedAcornFoxBindingV1, error) {
-	if len(data) == 0 || len(data) > acornFoxCandidateBindingMaxBytes {
-		return VerifiedAcornFoxBindingV1{}, errors.New("AcornFox candidate binding size is invalid")
-	}
-	if !digestPattern.MatchString(expectedSHA256) {
-		return VerifiedAcornFoxBindingV1{}, errors.New("AcornFox candidate binding expected sha256 is invalid")
-	}
-	if sha256Hex(data) != expectedSHA256 {
-		return VerifiedAcornFoxBindingV1{}, errors.New("AcornFox candidate binding sha256 mismatch")
-	}
-	var binding AcornFoxCandidateBindingV1
-	if err := strictCanonicalJSON(data, &binding, "AcornFox candidate binding"); err != nil {
+	binding, err := parseAcornFoxCandidateBindingV1(data, expectedSHA256)
+	if err != nil {
 		return VerifiedAcornFoxBindingV1{}, err
 	}
 	if err := validateAcornFoxBinding(binding); err != nil {
 		return VerifiedAcornFoxBindingV1{}, err
 	}
 	return VerifiedAcornFoxBindingV1{binding: cloneAcornFoxBinding(binding), digest: expectedSHA256}, nil
+}
+
+// ParseAcornFoxPredecessorBindingV1 validates an exact, caller-pinned
+// predecessor only. It is intentionally not a candidate parser: new package
+// inputs must keep using ParseAcornFoxCandidateBindingV1 and the current
+// migration policy.
+func ParseAcornFoxPredecessorBindingV1(data []byte, expectedSHA256 string) error {
+	_, err := parseAcornFoxPredecessorBindingV1(data, expectedSHA256)
+	return err
+}
+
+func parseAcornFoxCandidateBindingV1(data []byte, expectedSHA256 string) (AcornFoxCandidateBindingV1, error) {
+	if len(data) == 0 || len(data) > acornFoxCandidateBindingMaxBytes {
+		return AcornFoxCandidateBindingV1{}, errors.New("AcornFox candidate binding size is invalid")
+	}
+	if !digestPattern.MatchString(expectedSHA256) {
+		return AcornFoxCandidateBindingV1{}, errors.New("AcornFox candidate binding expected sha256 is invalid")
+	}
+	if sha256Hex(data) != expectedSHA256 {
+		return AcornFoxCandidateBindingV1{}, errors.New("AcornFox candidate binding sha256 mismatch")
+	}
+	var binding AcornFoxCandidateBindingV1
+	if err := strictCanonicalJSON(data, &binding, "AcornFox candidate binding"); err != nil {
+		return AcornFoxCandidateBindingV1{}, err
+	}
+	return binding, nil
+}
+
+func parseAcornFoxPredecessorBindingV1(data []byte, expectedSHA256 string) (AcornFoxCandidateBindingV1, error) {
+	binding, err := parseAcornFoxCandidateBindingV1(data, expectedSHA256)
+	if err != nil {
+		return AcornFoxCandidateBindingV1{}, err
+	}
+	if err := validateAcornFoxBinding(binding); err == nil {
+		return binding, nil
+	}
+	if err := validateAcornFoxLegacyPredecessorBinding(binding); err != nil {
+		return AcornFoxCandidateBindingV1{}, err
+	}
+	return binding, nil
 }
 
 func cloneAcornFoxBinding(binding AcornFoxCandidateBindingV1) AcornFoxCandidateBindingV1 {
@@ -217,7 +262,7 @@ func validateAcornFoxNMinusOne(n AcornFoxNMinusOneV1) error {
 	if err := ParseVersion(n.Version); err != nil || strings.TrimSpace(n.Version) != n.Version {
 		return errors.New("version is invalid")
 	}
-	if n.MigrationVersion != AcornFoxV1MigrationVersion || ValidateMigrationVersion(n.MigrationVersion) != nil {
+	if (n.MigrationVersion != AcornFoxV1MigrationVersion && n.MigrationVersion != AcornFoxLegacyPredecessorMigration) || ValidateMigrationVersion(n.MigrationVersion) != nil {
 		return errors.New("migration_version is invalid")
 	}
 	if !regexp.MustCompile(`^[a-f0-9]{40}$`).MatchString(n.SourceCommit) {
@@ -225,6 +270,25 @@ func validateAcornFoxNMinusOne(n AcornFoxNMinusOneV1) error {
 	}
 	if !digestPattern.MatchString(n.ReleaseManifestSHA256) || !digestPattern.MatchString(n.ArchiveSHA256) || !digestPattern.MatchString(n.BundleManifestSHA256) || !digestPattern.MatchString(n.BindingSHA256) {
 		return errors.New("digest is invalid")
+	}
+	return nil
+}
+
+func validateAcornFoxLegacyPredecessorBinding(b AcornFoxCandidateBindingV1) error {
+	if b.SchemaVersion != AcornFoxCandidateBindingV1Schema || b.Product != AcornFoxV1Product || b.ReleaseID != "release-"+b.Version {
+		return errors.New("AcornFox predecessor binding product or release_id is invalid")
+	}
+	if err := ParseVersion(b.Version); err != nil || strings.TrimSpace(b.Version) != b.Version {
+		return errors.New("AcornFox predecessor binding version is invalid")
+	}
+	if !validAcornFoxGitHubRepository(b.SourceRepository) || !regexp.MustCompile(`^[a-f0-9]{40}$`).MatchString(b.SourceCommit) {
+		return errors.New("AcornFox predecessor binding source identity is invalid")
+	}
+	if b.Architecture != AcornFoxV1Architecture || b.MigrationVersion != AcornFoxLegacyPredecessorMigration || ValidateMigrationVersion(b.MigrationVersion) != nil {
+		return errors.New("AcornFox predecessor binding layout identity is invalid")
+	}
+	if !digestPattern.MatchString(b.ManifestSHA256) || !digestPattern.MatchString(b.ArchiveSHA256) || !digestPattern.MatchString(b.BundleManifestSHA256) || b.NMinusOne != nil {
+		return errors.New("AcornFox predecessor binding immutable identity is invalid")
 	}
 	return nil
 }
@@ -320,6 +384,9 @@ func sameAcornFoxNMinusOne(m *NMinusOne, b *AcornFoxNMinusOneV1) bool {
 }
 
 func validateAcornFoxV1PackageInventory(files []FileDigest) error {
+	if _, err := pibundle.Entries(); err != nil {
+		return errors.New("AcornFox Pi package inventory is invalid")
+	}
 	required := AcornFoxV1RequiredFiles()
 	if len(files) < len(required) {
 		return errors.New("AcornFox package misses required entries")
@@ -385,12 +452,12 @@ func verifyAcornFoxPredecessor(raw []byte, successor AcornFoxCandidateBindingV1,
 	if len(raw) == 0 || sha256Hex(raw) != successor.NMinusOne.BindingSHA256 {
 		return errors.New("AcornFox predecessor binding sha256 mismatch")
 	}
-	predecessor, err := ParseAcornFoxCandidateBindingV1(raw, successor.NMinusOne.BindingSHA256)
+	predecessor, err := parseAcornFoxPredecessorBindingV1(raw, successor.NMinusOne.BindingSHA256)
 	if err != nil {
 		return fmt.Errorf("AcornFox predecessor binding: %w", err)
 	}
 	n := successor.NMinusOne
-	p := predecessor.binding
+	p := predecessor
 	if manifestPredecessor == nil || p.Version != n.Version || p.MigrationVersion != n.MigrationVersion || p.SourceCommit != n.SourceCommit || p.ManifestSHA256 != n.ReleaseManifestSHA256 || p.ArchiveSHA256 != n.ArchiveSHA256 || p.BundleManifestSHA256 != n.BundleManifestSHA256 || !sameAcornFoxNMinusOne(manifestPredecessor, n) {
 		return errors.New("AcornFox predecessor identity does not match successor")
 	}

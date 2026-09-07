@@ -29,6 +29,7 @@ const (
 	AcornFoxLiveBuildKitRole AcornFoxLiveRole = "acornfox-buildkit"
 	AcornFoxLiveCaddyRole    AcornFoxLiveRole = "acornfox-caddy"
 	AcornFoxLiveEdgeRole     AcornFoxLiveRole = "acornfox-edge"
+	AcornFoxLivePIRole       AcornFoxLiveRole = "acornfox-pi"
 )
 
 // AcornFoxLiveEntryV1 contains the symbolic requested account plan and the only
@@ -90,6 +91,8 @@ func acornFoxLiveRoleForOwner(role OwnerRole) (AcornFoxLiveRole, bool) {
 		return AcornFoxLiveCaddyRole, true
 	case OwnerRoleEdge:
 		return AcornFoxLiveEdgeRole, true
+	case OwnerRolePI:
+		return AcornFoxLivePIRole, true
 	default:
 		return "", false
 	}
@@ -97,7 +100,7 @@ func acornFoxLiveRoleForOwner(role OwnerRole) (AcornFoxLiveRole, bool) {
 
 func validAcornFoxLiveRole(role AcornFoxLiveRole) bool {
 	switch role {
-	case AcornFoxLiveRootRole, AcornFoxLiveServerRole, AcornFoxLiveAgentRole, AcornFoxLiveBuildKitRole, AcornFoxLiveCaddyRole, AcornFoxLiveEdgeRole:
+	case AcornFoxLiveRootRole, AcornFoxLiveServerRole, AcornFoxLiveAgentRole, AcornFoxLiveBuildKitRole, AcornFoxLiveCaddyRole, AcornFoxLiveEdgeRole, AcornFoxLivePIRole:
 		return true
 	default:
 		return false

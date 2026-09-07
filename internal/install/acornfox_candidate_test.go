@@ -140,6 +140,65 @@ func TestVerifyAcornFoxCandidateArtifactsV1CleanAndUpgrade(t *testing.T) {
 	}
 }
 
+func TestAcornFoxLegacy0034BindingIsPredecessorOnly(t *testing.T) {
+	// This is the canonical binding shape retained in the verified beta.1
+	// evidence. It is intentionally accepted only as a hash-pinned predecessor.
+	raw := []byte(`{"schema_version":1,"product":"acornfox","version":"0.1.0-beta.1","release_id":"release-0.1.0-beta.1","source_repository":"https://github.com/EleJiuDeiChi/acornfox","source_commit":"6ed40027c0ac892e404c31e5daafaf0749eec216","architecture":"amd64","migration_version":"0034","manifest_sha256":"77c8f27ad93012ef606bf9bbf5ad820989a9a2f40928f22584fdbddc4be23d47","archive_sha256":"ef4722471203272dc0961c63a1d32a275b6ec44a82cf600f992c16fb7aaf849d","bundle_manifest_sha256":"429130db1deffb69cf0bd2b9d40b1cf0dfcf620ad6bb7233f2c5e5d23b89dd69"}`)
+	digest := sha256Hex(raw)
+	if _, err := ParseAcornFoxCandidateBindingV1(raw, digest); err == nil {
+		t.Fatal("ordinary current-candidate parser accepted the legacy predecessor")
+	}
+	if err := ParseAcornFoxPredecessorBindingV1(raw, digest); err != nil {
+		t.Fatalf("pinned legacy predecessor rejected: %v", err)
+	}
+	var old AcornFoxCandidateBindingV1
+	if err := json.Unmarshal(raw, &old); err != nil {
+		t.Fatal(err)
+	}
+	predecessor := acornFoxFixture{binding: old, bindingRaw: raw, bindingSHA: digest}
+	successor := newAcornFoxFixture(t, "1.2.3-test.1", &predecessor)
+	if _, err := VerifyAcornFoxCandidateArtifactsV1(successor.input(raw)); err != nil {
+		t.Fatalf("successor rejected pinned legacy predecessor: %v", err)
+	}
+	old.MigrationVersion = "0033"
+	changed, err := json.Marshal(old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ParseAcornFoxPredecessorBindingV1(changed, sha256Hex(changed)); err == nil {
+		t.Fatal("unlisted legacy predecessor migration was accepted")
+	}
+}
+
+func TestAcornFoxPackagePinsPiWorkerAndCompleteUpstreamAssetInventory(t *testing.T) {
+	required := AcornFoxV1RequiredFiles()
+	want := map[string]uint32{
+		"bin/acornfox-pi-worker":             0o755,
+		"systemd/acornfox-pi-worker.service": 0o644,
+		"pi/pi":                              0o755,
+		"pi/package.json":                    0o644,
+		"pi/theme/dark.json":                 0o644,
+		"pi/photon_rs_bg.wasm":               0o644,
+		"pi/extensions/acornfox-tools.ts":    0o644,
+		"pi/UPSTREAM-ASSETS.json":            0o644,
+	}
+	piFiles := 0
+	for _, file := range required {
+		if strings.HasPrefix(file.Path, "pi/") && file.Path != "pi/extensions/acornfox-tools.ts" && file.Path != "pi/UPSTREAM-ASSETS.json" {
+			piFiles++
+		}
+		if mode, ok := want[file.Path]; ok {
+			if file.Mode != mode {
+				t.Fatalf("%s mode = %o", file.Path, file.Mode)
+			}
+			delete(want, file.Path)
+		}
+	}
+	if piFiles != 218 || len(want) != 0 {
+		t.Fatalf("Pi file count/missing = %d/%#v", piFiles, want)
+	}
+}
+
 func TestVerifyAcornFoxCandidateArtifactsV1RejectsDigestMismatches(t *testing.T) {
 	fixture := newAcornFoxFixture(t, "1.2.3-test.1", nil)
 	for _, candidate := range []struct {

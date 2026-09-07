@@ -94,12 +94,12 @@ func TestAcornFoxDiscoveryRejectsInvalidQueriesAndIsReadOnly(t *testing.T) {
 			t.Fatalf("%s status=%d", path, response.Code)
 		}
 	}
-	request := httptest.NewRequest(http.MethodPost, "/api/v1/acornfox/apps/app_1/sources", nil)
+	request := httptest.NewRequest(http.MethodPut, "/api/v1/acornfox/apps/app_1/sources", nil)
 	request.AddCookie(session)
 	addAcornFoxWriteProof(request, csrf)
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, request)
-	if response.Code != http.StatusMethodNotAllowed || response.Header().Get("Allow") != "GET, OPTIONS" {
+	if response.Code != http.StatusMethodNotAllowed || response.Header().Get("Allow") != "GET, POST, OPTIONS" {
 		t.Fatalf("method status/allow=%d/%q", response.Code, response.Header().Get("Allow"))
 	}
 }

@@ -14,7 +14,7 @@ func candidatePredecessor(raw []byte, expectedSHA256 string) (*install.AcornFoxN
 	if len(raw) == 0 && expectedSHA256 == "" {
 		return nil, nil, nil
 	}
-	if _, err := install.ParseAcornFoxCandidateBindingV1(raw, expectedSHA256); err != nil {
+	if err := install.ParseAcornFoxPredecessorBindingV1(raw, expectedSHA256); err != nil {
 		return nil, nil, ErrCandidateArtifacts
 	}
 	// Decode only after the installer's exact-SHA canonical parser has accepted

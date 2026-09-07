@@ -74,6 +74,7 @@ type upgradeCommandConfig struct {
 	selfSHA256           string
 	publicOrigin         string
 	gitResolvers         string
+	deepSeekKeyFile      string
 }
 
 type upgradeRuntime struct {
@@ -137,6 +138,8 @@ type acornFoxCleanDependencies struct {
 	verifyHelper            func(install.AcornFoxBuildIdentityV1) bool
 	prepareRuntimeNetwork   func(context.Context) (runtimenetwork.Receipt, error)
 	verifyRuntimeNetwork    func(context.Context) error
+	configureAssistant      func(context.Context, string) (install.AcornFoxAssistantConfigReceiptV1, error)
+	disableAssistant        func(context.Context) (install.AcornFoxAssistantConfigReceiptV1, error)
 }
 
 type productionBootstrapRuntimeDependencies struct {
@@ -267,6 +270,8 @@ func productionUpgradeDependencies() upgradeDependencies {
 			},
 			prepareRuntimeNetwork: runtimenetwork.Ensure,
 			verifyRuntimeNetwork:  runtimenetwork.Verify,
+			configureAssistant:    install.ConfigureAcornFoxAssistantV1,
+			disableAssistant:      install.DisableAcornFoxAssistantV1,
 		},
 	}
 }
@@ -354,6 +359,9 @@ func runWithDependencies(ctx context.Context, args []string, stdout, stderr io.W
 // helper.  It intentionally shares no parser or runtime constructor with the
 // legacy Open Card upgrade engine.
 func runAcornFoxClean(ctx context.Context, args []string, stdout io.Writer, role string, deps acornFoxCleanDependencies) int {
+	if len(args) == 2 && args[1] == "--help" && (args[0] == "configure-assistant" || args[0] == "disable-assistant") {
+		return writeAcornFoxAssistantHelp(stdout, args[0])
+	}
 	if len(args) == 1 && (args[0] == "build-network-serve" || args[0] == "build-network-cleanup") {
 		identity, ok := acornFoxCleanBuildIdentity(role)
 		if !ok || os.Geteuid() != 0 || !install.VerifyProductionAcornFoxHelperContract(identity).OK {
@@ -387,6 +395,25 @@ func runAcornFoxClean(ctx context.Context, args []string, stdout io.Writer, role
 	}
 	if deps.euid == nil || deps.euid() != 0 {
 		return writeAcornFoxCleanError(stdout, exitIneligible, "root_ineligible")
+	}
+	if config.command == "configure-assistant" || config.command == "disable-assistant" {
+		var receipt install.AcornFoxAssistantConfigReceiptV1
+		var assistantErr error
+		if config.command == "configure-assistant" {
+			if deps.configureAssistant == nil {
+				return writeAcornFoxCleanError(stdout, exitIneligible, "assistant_configuration_ineligible")
+			}
+			receipt, assistantErr = deps.configureAssistant(ctx, config.deepSeekKeyFile)
+		} else {
+			if deps.disableAssistant == nil {
+				return writeAcornFoxCleanError(stdout, exitIneligible, "assistant_configuration_ineligible")
+			}
+			receipt, assistantErr = deps.disableAssistant(ctx)
+		}
+		if assistantErr != nil || receipt.Validate() != nil {
+			return writeAcornFoxCleanAssistantError(stdout, assistantErr)
+		}
+		return writeUpgradeJSON(stdout, exitOK, map[string]any{"ok": true, "command": config.command, "receipt": receipt})
 	}
 	if config.command == "validate-runtime-inputs" || config.command == "configure-runtime" {
 		input := acornfoxsetup.Inputs{Origin: config.publicOrigin, Version: identity.Version, ResolverEndpoints: strings.Split(config.gitResolvers, ","), Now: time.Now().UTC()}
@@ -507,6 +534,25 @@ func runAcornFoxClean(ctx context.Context, args []string, stdout io.Writer, role
 	return writeUpgradeJSON(stdout, exitOK, map[string]any{"ok": true, "command": config.command, "receipt": receipt})
 }
 
+func writeAcornFoxAssistantHelp(stdout io.Writer, command string) int {
+	if stdout == nil {
+		return exitInternal
+	}
+	var help string
+	switch command {
+	case "configure-assistant":
+		help = "usage: acornfox-upgrade configure-assistant --deepseek-key-file ABS\nconfigures and starts the optional assistant, then restarts only acornfox-server.service; application containers are not restarted\n"
+	case "disable-assistant":
+		help = "usage: acornfox-upgrade disable-assistant\nstops and disables the optional assistant while retaining its configuration, then restarts only acornfox-server.service; application containers are not restarted\n"
+	default:
+		return exitArgs
+	}
+	if _, err := io.WriteString(stdout, help); err != nil {
+		return exitInternal
+	}
+	return exitOK
+}
+
 // acornFoxCleanBuildIdentity is intentionally local: the clean bootstrap
 // command may run before a candidate is installed, so it cannot call the
 // installed-helper contract verifier to learn its identity.
@@ -579,6 +625,15 @@ func parseAcornFoxCleanArgs(args []string) (upgradeCommandConfig, error) {
 		if len(args) != 1 {
 			return upgradeCommandConfig{}, errors.New("invalid runtime network arguments")
 		}
+	case "configure-assistant":
+		if len(args) != 3 || args[1] != "--deepseek-key-file" || !filepath.IsAbs(args[2]) || filepath.Clean(args[2]) != args[2] || args[2] == string(filepath.Separator) || strings.ContainsRune(args[2], 0) {
+			return upgradeCommandConfig{}, errors.New("invalid assistant configuration arguments")
+		}
+		config.deepSeekKeyFile = args[2]
+	case "disable-assistant":
+		if len(args) != 1 {
+			return upgradeCommandConfig{}, errors.New("invalid assistant disable arguments")
+		}
 	case "recover-prepare", "recover-finalize", "migrate-control-plane":
 		if len(args) != 2 || args[1] != "--pending" {
 			return upgradeCommandConfig{}, errors.New("invalid pending command")
@@ -588,6 +643,19 @@ func parseAcornFoxCleanArgs(args []string) (upgradeCommandConfig, error) {
 		return upgradeCommandConfig{}, errors.New("unsupported clean command")
 	}
 	return config, nil
+}
+
+func writeAcornFoxCleanAssistantError(stdout io.Writer, err error) int {
+	switch {
+	case errors.Is(err, install.ErrAcornFoxRepoLocked):
+		return writeAcornFoxCleanError(stdout, exitLocked, "repository_locked")
+	case errors.Is(err, install.ErrAcornFoxAssistantConfigConflict):
+		return writeAcornFoxCleanError(stdout, exitConflict, "assistant_configuration_conflict")
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded), errors.Is(err, install.ErrAcornFoxAssistantConfigUnknown):
+		return writeAcornFoxCleanError(stdout, exitRecovery, "assistant_configuration_unknown")
+	default:
+		return writeAcornFoxCleanError(stdout, exitIneligible, "assistant_configuration_ineligible")
+	}
 }
 
 func writeAcornFoxCleanControlPlaneError(stdout io.Writer, err error) int {

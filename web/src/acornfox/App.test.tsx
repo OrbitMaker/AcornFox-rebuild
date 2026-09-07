@@ -1,5 +1,5 @@
 import { renderToStaticMarkup } from "react-dom/server";
-import AcornFoxApp, { DeliveryWorkspace, Login } from "./App";
+import AcornFoxApp, { DeliveryWorkspace, hostIsFresh, Login, operationIsTerminal } from "./App";
 import type { AcornFoxClient } from "./client";
 
 const api: AcornFoxClient = {
@@ -86,16 +86,16 @@ describe("AcornFox clean entry", () => {
     expect(html).toContain("管理员密码");
     expect(html).toContain("current-password");
   });
-  it("renders only the first-version operational navigation", () => {
+  it("renders the compact first-version operational navigation without unsupported product areas", () => {
     const html = renderToStaticMarkup(
       <AcornFoxApp api={api} initialAuthenticated />,
     );
     for (const text of [
       "AcornFox",
-      "应用列表",
+      "首页",
       "创建应用",
-      "公开 HTTPS Git 地址",
-      "应用工作区",
+      "本机资源",
+      "运行情况请查看部署详情",
     ])
       expect(html).toContain(text);
     for (const forbidden of [
@@ -109,5 +109,20 @@ describe("AcornFox clean entry", () => {
       "private Git",
     ])
       expect(html).not.toContain(forbidden);
+  });
+
+  it("hides host facts once their server-provided observation expires", () => {
+    const now = Date.now();
+    expect(hostIsFresh({ schemaVersion: 1, availability: "available", observedAt: new Date(now - 5_000).toISOString(), staleAfterSeconds: 15 })).toBe(true);
+    expect(hostIsFresh({ schemaVersion: 1, availability: "available", observedAt: new Date(now - 16_000).toISOString(), staleAfterSeconds: 15 })).toBe(false);
+    expect(hostIsFresh({ schemaVersion: 1, availability: "available", staleAfterSeconds: 15 })).toBe(false);
+  });
+
+  it("stops operation polling only for verified, failed, and unknown facts", () => {
+    expect(operationIsTerminal("accepted")).toBe(false);
+    expect(operationIsTerminal("running")).toBe(false);
+    expect(operationIsTerminal("verified")).toBe(true);
+    expect(operationIsTerminal("failed")).toBe(true);
+    expect(operationIsTerminal("unknown")).toBe(true);
   });
 });

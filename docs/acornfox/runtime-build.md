@@ -1,6 +1,8 @@
 # 构建随包容器运行工具
 
-首版目标为 Ubuntu 24.04 amd64。BuildKit `0.32.2`、RootlessKit `3.1.0`、Caddy `2.11.4` 取自各自官方发布，归档来源和摘要见 `release/runtime-inputs.json`。该历史归档清单也含未进入 AcornFox 首版的 Buildx；实际首版 runtime 输入只包含五个文件：`bin/buildkitd`、`bin/buildctl`、`bin/buildkit-runc`、`bin/rootlesskit`、`bin/caddy`。
+首版目标为 Ubuntu 24.04 amd64。BuildKit `0.32.2`、RootlessKit `3.1.0`、Caddy `2.11.4` 和 Pi `0.85.1` 取自各自官方发布，归档来源和摘要见 `release/runtime-inputs.json`。该历史归档清单也含未进入 AcornFox 首版的 Buildx；实际 runtime 输入包含五个原有 `bin/` 文件，以及官方 Pi Linux x64 归档的完整 218 文件树。Pi 最终位于 `/opt/acornfox/current/pi/**`，不在安装或运行时下载，也不裁成单独 executable。
+
+Pi 归档的固定资产清单是 `internal/pibundle/assets-v0.85.1-linux-x64.json`。输入冻结同时验证官方归档 SHA-256、250 个 tar members、218 个普通文件的路径、mode、size、逐文件 SHA，以及解包后的 `runtime_root/pi/**`；候选包还携带同一清单为 `pi/UPSTREAM-ASSETS.json`。
 
 `buildkitd`、`buildctl`、`rootlesskit`、`caddy` 保留官方归档原字节。**不要复制官方 BuildKit 归档中的静态 `buildkit-runc` 到本版输入目录。** 本版使用下面的动态构建，同样保留 seccomp 支持。构建身份、编译器和系统包版本、输入及输出摘要见 `release/acornfox-runc-build-v1.json`。
 

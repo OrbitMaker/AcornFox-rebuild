@@ -20,6 +20,8 @@ func (c *cli) command(args []string) error {
 			return errors.New("usage: acornfox session")
 		}
 		return c.callCommand(http.MethodGet, "/auth/session", nil, false, "", 15*time.Second, shapeSession)
+	case "host":
+		return c.host(args[1:])
 	case "password":
 		return c.passwordCommand(args[1:])
 	case "apps":
@@ -32,12 +34,16 @@ func (c *cli) command(args []string) error {
 		return c.deploy(args[1:])
 	case "status":
 		return c.status(args[1:])
+	case "operation":
+		return c.operation(args[1:])
 	case "logs":
 		return c.logs(args[1:])
 	case "restart", "redeploy", "probe":
 		return c.deliveryAction(args[0], args[1:])
 	case "public-access":
 		return c.publicAccess(args[1:])
+	case "delivery-source":
+		return c.deliverySource(args[1:])
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
@@ -248,7 +254,52 @@ func (c *cli) sources(args []string) error {
 		}
 		return c.callCommand(http.MethodGet, "/apps/"+pathID(app)+"/sources/"+pathID(source), nil, false, "", 15*time.Second, shapeSource)
 	}
-	return errors.New("usage: acornfox sources list|get APP_ID [SOURCE_ID]")
+	if len(args) == 3 && args[0] == "metadata" {
+		app, err := requireID(args[1], "application ID")
+		if err != nil {
+			return err
+		}
+		source, err := requireID(args[2], "source ID")
+		if err != nil {
+			return err
+		}
+		return c.callCommand(http.MethodGet, "/apps/"+pathID(app)+"/sources/"+pathID(source)+"/metadata", nil, false, "", 15*time.Second, shapeSourceMetadata)
+	}
+	if len(args) < 4 || args[0] != "update" {
+		return errors.New("usage: acornfox sources list|get|metadata APP_ID [SOURCE_ID]")
+	}
+	app, err := requireID(args[1], "application ID")
+	if err != nil {
+		return err
+	}
+	base, err := requireID(args[2], "base source revision ID")
+	if err != nil {
+		return err
+	}
+	positionals, values, err := parseFlags(args[3:], "--idempotency-key")
+	if err != nil {
+		return err
+	}
+	if len(positionals) != 1 {
+		return errors.New("usage: acornfox sources update APP_ID BASE_SOURCE_REVISION_ID REF [--idempotency-key]")
+	}
+	ref, err := requireRef(positionals[0])
+	if err != nil {
+		return err
+	}
+	key, err := idempotencyKey(values)
+	if err != nil {
+		return err
+	}
+	body := map[string]string{"base_source_revision_id": base, "ref": ref}
+	return c.callCommand(http.MethodPost, "/apps/"+pathID(app)+"/sources", body, true, key, 3*time.Minute, shapeSourceUpdate)
+}
+
+func (c *cli) host(args []string) error {
+	if len(args) != 1 || args[0] != "metrics" {
+		return errors.New("usage: acornfox host metrics")
+	}
+	return c.callCommand(http.MethodGet, "/host/metrics", nil, false, "", 15*time.Second, shapeHostMetrics)
 }
 func (c *cli) deployments(args []string) error {
 	if len(args) < 2 || args[0] != "list" {
@@ -316,6 +367,34 @@ func (c *cli) status(args []string) error {
 		return err
 	}
 	return c.callCommand(http.MethodGet, "/apps/"+pathID(app)+"/deliveries/"+pathID(deployment), nil, false, "", 15*time.Second, shapeStatus)
+}
+func (c *cli) operation(args []string) error {
+	if len(args) != 2 {
+		return errors.New("usage: acornfox operation APP_ID OPERATION_ID")
+	}
+	app, err := requireID(args[0], "application ID")
+	if err != nil {
+		return err
+	}
+	operationID, err := requireID(args[1], "operation ID")
+	if err != nil {
+		return err
+	}
+	return c.callCommand(http.MethodGet, "/apps/"+pathID(app)+"/operations/"+pathID(operationID), nil, false, "", 15*time.Second, shapeOperationResult)
+}
+func (c *cli) deliverySource(args []string) error {
+	if len(args) != 2 {
+		return errors.New("usage: acornfox delivery-source APP_ID DEPLOYMENT_ID")
+	}
+	app, err := requireID(args[0], "application ID")
+	if err != nil {
+		return err
+	}
+	deployment, err := requireID(args[1], "deployment ID")
+	if err != nil {
+		return err
+	}
+	return c.callCommand(http.MethodGet, "/apps/"+pathID(app)+"/deliveries/"+pathID(deployment)+"/source", nil, false, "", 15*time.Second, shapeDeliverySource)
 }
 func (c *cli) logs(args []string) error {
 	if len(args) < 2 {

@@ -17,6 +17,7 @@ import (
 	"syscall"
 
 	"github.com/open-card/open-card/internal/install"
+	"github.com/open-card/open-card/internal/pibundle"
 )
 
 var ErrCandidateTree = errors.New("acornfox synthetic candidate tree is invalid")
@@ -59,7 +60,7 @@ func (r CandidateTreeReceiptV1) Validate() error {
 }
 
 func validateCandidateDigests(files []install.FileDigest) error {
-	if len(files) == 0 || len(files) > 256 {
+	if len(files) == 0 || len(files) > 512 {
 		return ErrCandidateTree
 	}
 	for index, file := range files {
@@ -80,7 +81,7 @@ type CandidateTreeStageV1 struct {
 // BuildCandidateTreeV1 only produces a private synthetic tree for later
 // packaging tests. It does not write an archive, binding, candidate, or host.
 func BuildCandidateTreeV1(plan GoBuildPlanV1, goStage *GoBinaryStageV1, webStage *WebAssetStageV1, runtimeRoot string, runtime RuntimeInputsV1, licenseRoot string, license LicenseInputsV1, taskRoot string) (*CandidateTreeStageV1, error) {
-	return buildCandidateTreeV1(plan, goStage, webStage, runtimeRoot, runtime, licenseRoot, license, taskRoot, nil)
+	return buildCandidateTreeV1(plan, goStage, webStage, runtimeRoot, runtime, licenseRoot, license, taskRoot, nil, true)
 }
 
 // BuildReleaseCandidateTreeV1 requires explicit project and dependency license
@@ -90,11 +91,15 @@ func BuildReleaseCandidateTreeV1(plan GoBuildPlanV1, goStage *GoBinaryStageV1, w
 	if err != nil {
 		return nil, err
 	}
-	return buildCandidateTreeV1(plan, goStage, webStage, runtimeRoot, runtime, licenseRoot, license, taskRoot, &metadata)
+	return buildCandidateTreeV1(plan, goStage, webStage, runtimeRoot, runtime, licenseRoot, license, taskRoot, &metadata, true)
 }
 
-func buildCandidateTreeV1(plan GoBuildPlanV1, goStage *GoBinaryStageV1, webStage *WebAssetStageV1, runtimeRoot string, runtime RuntimeInputsV1, licenseRoot string, license LicenseInputsV1, taskRoot string, metadata *ReleaseLicenseManifestV1) (*CandidateTreeStageV1, error) {
-	if !plan.Valid() || goStage == nil || webStage == nil || VerifyRuntimeTree(runtimeRoot, runtime) != nil || VerifyLicenseTree(licenseRoot, license) != nil || inputDigest(runtime, CanonicalRuntimeInputsV1) != plan.runtimeInputSHA256 || inputDigest(license, CanonicalLicenseInputsV1) != plan.licenseInputSHA256 {
+func buildCandidateTreeV1(plan GoBuildPlanV1, goStage *GoBinaryStageV1, webStage *WebAssetStageV1, runtimeRoot string, runtime RuntimeInputsV1, licenseRoot string, license LicenseInputsV1, taskRoot string, metadata *ReleaseLicenseManifestV1, strictPi bool) (*CandidateTreeStageV1, error) {
+	piRuntime := make([]pibundle.Entry, 0, len(runtime.Files))
+	for _, file := range runtime.Files {
+		piRuntime = append(piRuntime, pibundle.Entry{Path: file.Path, Mode: file.Mode, SHA256: file.SHA256})
+	}
+	if !plan.Valid() || goStage == nil || webStage == nil || pibundle.ValidateRuntimeEntries(piRuntime, strictPi) != nil || VerifyRuntimeTree(runtimeRoot, runtime) != nil || VerifyLicenseTree(licenseRoot, license) != nil || inputDigest(runtime, CanonicalRuntimeInputsV1) != plan.runtimeInputSHA256 || inputDigest(license, CanonicalLicenseInputsV1) != plan.licenseInputSHA256 {
 		return nil, ErrCandidateTree
 	}
 	parent, parentPin, err := pinCandidateParent(taskRoot)
@@ -156,13 +161,15 @@ func buildCandidateTreeV1(plan GoBuildPlanV1, goStage *GoBinaryStageV1, webStage
 	if err := copyWebStage(plan, webStage, add); err != nil {
 		return failWith("web stage")
 	}
-	if err := copyInputGroup(runtimeRoot, runtime.Files, installerPaths(required, added, func(path string) bool { return strings.HasPrefix(path, "bin/") }), add, runtimeFileBytes); err != nil {
+	if err := copyInputGroup(runtimeRoot, runtime.Files, installerPaths(required, added, func(path string) bool {
+		return strings.HasPrefix(path, "bin/") || strings.HasPrefix(path, "pi/") && path != "pi/extensions/acornfox-tools.ts" && path != "pi/UPSTREAM-ASSETS.json"
+	}), add, runtimeFileBytes); err != nil {
 		return failWith("runtime input")
 	}
 	if err := copyInputGroup(licenseRoot, license.Files, installerPaths(required, added, func(path string) bool { return strings.HasPrefix(path, "docs/licenses/") }), add, licenseFileBytes); err != nil {
 		return failWith("license input")
 	}
-	if err := copyStaticSource(plan, required, added, add); err != nil || VerifySourceTree(plan.sourceRoot, plan.sourcePolicy) != nil || VerifyRuntimeTree(runtimeRoot, runtime) != nil || VerifyLicenseTree(licenseRoot, license) != nil {
+	if err := copyStaticSource(plan, required, added, add, strictPi); err != nil || VerifySourceTree(plan.sourceRoot, plan.sourcePolicy) != nil || VerifyRuntimeTree(runtimeRoot, runtime) != nil || VerifyLicenseTree(licenseRoot, license) != nil {
 		return failWith("static source")
 	}
 	if err := addGenerated(target, "source-manifest.sha256", 0o644, sourceManifest(plan.sourcePolicy), &entries, added); err != nil {
@@ -214,6 +221,9 @@ func pinCandidateParent(path string) (string, *directoryPin, error) {
 }
 
 func requiredCandidatePaths() (map[string]uint32, error) {
+	if _, err := pibundle.Entries(); err != nil {
+		return nil, ErrCandidateTree
+	}
 	required := make(map[string]uint32)
 	for _, file := range install.AcornFoxV1RequiredFiles() {
 		_, duplicate := required[file.Path]
@@ -284,7 +294,7 @@ func copyInputGroup(root string, files []FileEntryV1, want map[string]uint32, ad
 	return boolError(len(want) == 0)
 }
 
-func copyStaticSource(plan GoBuildPlanV1, required map[string]uint32, added map[string]bool, add func(string, uint32, string, string, FileEntryV1, int64) error) error {
+func copyStaticSource(plan GoBuildPlanV1, required map[string]uint32, added map[string]bool, add func(string, uint32, string, string, FileEntryV1, int64) error, strictPi bool) error {
 	source := make(map[string]FileEntryV1, len(plan.sourcePolicy.Files))
 	for _, entry := range plan.sourcePolicy.Files {
 		source[entry.Path] = entry
@@ -295,6 +305,9 @@ func copyStaticSource(plan GoBuildPlanV1, required map[string]uint32, added map[
 		}
 		sourcePath, ok := staticSourcePath(destination)
 		entry, found := source[sourcePath]
+		if strictPi && destination == "pi/UPSTREAM-ASSETS.json" && entry.SHA256 != pibundle.ManifestSHA256 {
+			return ErrCandidateTree
+		}
 		if !ok || !found || add(destination, required[destination], plan.sourceRoot, sourcePath, entry, sourceFileBytes) != nil {
 			return ErrCandidateTree
 		}
@@ -306,6 +319,10 @@ func staticSourcePath(destination string) (string, bool) {
 	switch {
 	case strings.HasPrefix(destination, "systemd/"):
 		return "deploy/systemd/" + strings.TrimPrefix(destination, "systemd/"), true
+	case destination == "pi/extensions/acornfox-tools.ts":
+		return "deploy/pi/acornfox-tools.ts", true
+	case destination == "pi/UPSTREAM-ASSETS.json":
+		return "internal/pibundle/assets-v0.85.1-linux-x64.json", true
 	case destination == "config/acornfox-buildkitd.toml":
 		return "deploy/buildkit/acornfox-buildkitd.toml", true
 	case destination == "config/acornfox-build-network-policy-v1.json":

@@ -74,6 +74,17 @@ func TestSuccessorCandidatePinsBootstrapAndRetainsUnapprovedClassification(t *te
 	}
 }
 
+func TestCandidatePredecessorAcceptsPinnedLegacy0034Only(t *testing.T) {
+	raw := []byte(`{"schema_version":1,"product":"acornfox","version":"0.1.0-beta.1","release_id":"release-0.1.0-beta.1","source_repository":"https://github.com/EleJiuDeiChi/acornfox","source_commit":"6ed40027c0ac892e404c31e5daafaf0749eec216","architecture":"amd64","migration_version":"0034","manifest_sha256":"77c8f27ad93012ef606bf9bbf5ad820989a9a2f40928f22584fdbddc4be23d47","archive_sha256":"ef4722471203272dc0961c63a1d32a275b6ec44a82cf600f992c16fb7aaf849d","bundle_manifest_sha256":"429130db1deffb69cf0bd2b9d40b1cf0dfcf620ad6bb7233f2c5e5d23b89dd69"}`)
+	n, m, err := candidatePredecessor(raw, sha256Text(raw))
+	if err != nil || n == nil || m == nil || n.MigrationVersion != install.AcornFoxLegacyPredecessorMigration || m.MigrationVersion != n.MigrationVersion {
+		t.Fatalf("legacy predecessor=%+v/%+v err=%v", n, m, err)
+	}
+	if _, _, err := candidatePredecessor(raw, strings.Repeat("0", 64)); err == nil {
+		t.Fatal("legacy predecessor accepted an unpinned digest")
+	}
+}
+
 func TestSuccessorSealRejectsUnpinnedOrNoncanonicalPredecessorWithoutOutput(t *testing.T) {
 	bootstrap := releaseArtifactFixture(t)
 	raw := readArtifactFile(t, bootstrap, "candidate-binding.json")

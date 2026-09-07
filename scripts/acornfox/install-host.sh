@@ -87,12 +87,17 @@ safe_helper() {
 }
 
 require_distinct_accounts() {
-  local account record _ uid gid seen=" "
-  for account in acornfox acornfox-agent acornfox-buildkit acornfox-caddy acornfox-edge; do
+  local account record _ uid gid seen=" " service_uids=" "
+  for account in acornfox acornfox-agent acornfox-buildkit acornfox-caddy acornfox-edge acornfox-pi; do
     record=$(clean_output /usr/bin/getent passwd "$account") || fail
     IFS=: read -r _ _ uid gid _ <<<"$record"
     [[ $seen != *" $uid:$gid "* ]] || fail
     seen+="$uid:$gid "
+    if [[ $account == acornfox-pi ]]; then
+      [[ $service_uids != *" $uid "* ]] || fail
+    else
+      service_uids+="$uid "
+    fi
   done
 }
 
@@ -125,7 +130,7 @@ git_resolvers=${ACORNFOX_GIT_RESOLVERS:-}
 effect /usr/bin/apt-get update
 effect /usr/bin/apt-get install -y --no-install-recommends ca-certificates docker.io postgresql postgresql-client uidmap util-linux apparmor apparmor-utils nftables iptables iproute2
 
-for account in acornfox acornfox-agent acornfox-buildkit acornfox-caddy acornfox-edge; do
+for account in acornfox acornfox-agent acornfox-buildkit acornfox-caddy acornfox-edge acornfox-pi; do
   require_account "$account"
 done
 require_distinct_accounts
@@ -140,6 +145,9 @@ effect /usr/bin/systemctl enable --now postgresql.service
 "${CLEAN_ENV[@]}" "$MIGRATE" --pending
 "${CLEAN_ENV[@]}" /opt/acornfox/upgrade-tools/acornfox-upgrade configure-runtime --public-origin "$public_origin" --git-resolvers "$git_resolvers"
 effect /usr/bin/systemctl daemon-reload
+# Model configuration is optional. A fresh host never starts the worker until
+# configure-assistant has installed both root-only canonical files.
+effect /usr/bin/systemctl disable --now acornfox-pi-worker.service
 effect /usr/bin/systemctl enable acornfox-upgrade-safe.target
 effect /usr/bin/systemctl enable acornfox-build-network.service
 effect /usr/bin/systemctl enable acornfox-buildkit.service
@@ -163,5 +171,9 @@ for unit in acornfox-upgrade-safe.target acornfox-build-network.service acornfox
   clean_output /usr/bin/systemctl is-enabled --quiet "$unit" || fail
   clean_output /usr/bin/systemctl is-active --quiet "$unit" || fail
 done
+if clean_output /usr/bin/systemctl is-enabled --quiet acornfox-pi-worker.service || clean_output /usr/bin/systemctl is-active --quiet acornfox-pi-worker.service; then
+  fail
+fi
+[[ ! -e /run/acornfox-pi/worker.sock && ! -L /run/acornfox-pi/worker.sock ]] || fail
 
 printf '{"code":"installed","ok":true,"schema_version":1}\n'

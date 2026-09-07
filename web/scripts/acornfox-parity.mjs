@@ -27,9 +27,10 @@ function parameter(document, value) {
 
 function proofClass(document, pathItem, operation, method, operationId) {
   if (Array.isArray(operation.security) && operation.security.length === 0) {
+    if (operationId === "loginAcornFoxAdministrator") return "anonymous-login";
+    if (parityScope(operation, operationId) === "integration_ui") return method === "get" ? "anonymous-setup-read" : "anonymous-setup-mutation";
     if (operationId !== "loginAcornFoxAdministrator")
       fail(`${operationId} is anonymous but is not the login operation`);
-    return "anonymous-login";
   }
   if (
     !Array.isArray(operation.security) ||
@@ -49,11 +50,18 @@ function proofClass(document, pathItem, operation, method, operationId) {
     : "csrf-session-mutation";
 }
 
-function successStatus(operation, operationId) {
+function successStatuses(operation, operationId) {
   const statuses = Object.keys(operation.responses ?? {}).filter((status) => /^2\d\d$/.test(status));
-  if (statuses.length !== 1)
-    fail(`${operationId} must declare exactly one 2xx response, found ${statuses.join(", ") || "none"}`);
-  return Number(statuses[0]);
+  if (statuses.length === 0)
+    fail(`${operationId} must declare a 2xx response`);
+  return statuses.map(Number).sort((left, right) => left - right);
+}
+
+function parityScope(operation, operationId) {
+  const scope = operation["x-acornfox-parity"] ?? "legacy_cli";
+  if (!["legacy_cli", "integration_cli", "integration_ui", "assistant_ui_only", "cli_only"].includes(scope))
+    fail(`${operationId} has invalid x-acornfox-parity ${JSON.stringify(scope)}`);
+  return scope;
 }
 
 try {
@@ -71,9 +79,11 @@ try {
         operationId: operation.operationId,
         method: method.toUpperCase(),
         pathTemplate,
-        successStatus: successStatus(operation, operation.operationId),
+        successStatuses: successStatuses(operation, operation.operationId),
         proof: proofClass(document, pathItem, operation, method, operation.operationId),
-        visible: true,
+        parity: parityScope(operation, operation.operationId),
+        cli: parityScope(operation, operation.operationId) !== "integration_ui" && parityScope(operation, operation.operationId) !== "assistant_ui_only",
+        webClient: parityScope(operation, operation.operationId) === "legacy_cli" ? "legacy" : parityScope(operation, operation.operationId) === "cli_only" ? "none" : parityScope(operation, operation.operationId) === "assistant_ui_only" ? "assistant" : "integration",
       });
     }
   }
@@ -104,7 +114,12 @@ try {
     env: environment,
     stdio: "inherit",
   });
-  console.log(`AcornFox parity passed: ${operations.length} visible operations in CLI and Web.`);
+  const cliOperations = operations.filter((operation) => operation.cli).length;
+  const legacyWebOperations = operations.filter((operation) => operation.webClient === "legacy").length;
+  const integrationWebOperations = operations.filter((operation) => operation.webClient === "integration").length;
+  const assistantWebOperations = operations.filter((operation) => operation.webClient === "assistant").length;
+  const cliOnlyOperations = operations.filter((operation) => operation.webClient === "none").length;
+  console.log(`AcornFox parity passed: ${cliOperations} CLI, ${legacyWebOperations} legacy-Web, ${integrationWebOperations} integration-Web, ${assistantWebOperations} assistant-Web, ${cliOnlyOperations} CLI-only, and ${operations.length} declared operations.`);
 } finally {
   rmSync(matrixDirectory, { recursive: true, force: true });
 }
