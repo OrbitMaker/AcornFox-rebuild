@@ -373,7 +373,8 @@ func acornFoxLiveEnsureDirOwned(root *os.Root, store *TaskAcornFoxRepoStore, pat
 		if mkdirErr != nil && !errors.Is(mkdirErr, os.ErrExist) {
 			return mkdirErr
 		}
-		if mkdirErr == nil {
+		created = mkdirErr == nil
+		if created {
 			markEffect()
 		}
 		if err = acornFoxLiveStep("mkdir-post"); err != nil {
@@ -381,7 +382,7 @@ func acornFoxLiveEnsureDirOwned(root *os.Root, store *TaskAcornFoxRepoStore, pat
 		}
 		info, err = root.Lstat(path)
 	}
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != mode {
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || !created && info.Mode().Perm() != mode {
 		return ErrAcornFoxLiveConflict
 	}
 	if created {
@@ -389,7 +390,17 @@ func acornFoxLiveEnsureDirOwned(root *os.Root, store *TaskAcornFoxRepoStore, pat
 		if openErr != nil {
 			return openErr
 		}
-		ownerErr := acornFoxLiveApplyOwner(store, file, principal)
+		opened, statErr := file.Stat()
+		if statErr != nil || !os.SameFile(info, opened) || !opened.IsDir() {
+			_ = file.Close()
+			return ErrAcornFoxLiveConflict
+		}
+		// Only our successful mkdir grants permission to normalize umask-filtered
+		// modes. Existing directories, including interrupted prefixes, stay strict.
+		ownerErr := file.Chmod(mode)
+		if ownerErr == nil {
+			ownerErr = acornFoxLiveApplyOwner(store, file, principal)
+		}
 		syncErr := file.Sync()
 		closeErr := file.Close()
 		if ownerErr != nil {
@@ -405,11 +416,11 @@ func acornFoxLiveEnsureDirOwned(root *os.Root, store *TaskAcornFoxRepoStore, pat
 			return err
 		}
 		info, err = root.Lstat(path)
-		if err != nil {
-			return err
+		if err != nil || !os.SameFile(opened, info) {
+			return ErrAcornFoxLiveConflict
 		}
 	}
-	if !acornFoxLiveObservedOwner(store, info, principal) {
+	if info.Mode().Perm() != mode || !acornFoxLiveObservedOwner(store, info, principal) {
 		return ErrAcornFoxLiveConflict
 	}
 	return nil
