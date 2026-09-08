@@ -188,4 +188,16 @@ func TestCompatibilityDisabledCapabilitiesAreStable(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("disabled capabilities=%v want %v", got, want)
 	}
+	if !containsString(AgentCapabilitiesByVersion[compatibility.Version{Major: 1, Minor: 1}], AgentCapabilityAcornFoxCandidateValidation) || !containsString(want, AgentCapabilityAcornFoxCandidateValidation) {
+		t.Fatalf("candidate capability current=%v legacy-disabled=%v", AgentCapabilitiesByVersion[compatibility.Version{Major: 1, Minor: 1}], want)
+	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }

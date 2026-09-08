@@ -154,6 +154,45 @@ func TestGatewayNegotiatesAndGatesAcornFoxRuntimeOnlyOnCurrentProtocol(t *testin
 	}
 }
 
+func TestGatewayNegotiatesAndGatesAcornFoxCandidateValidationOnlyOnCurrentProtocol(t *testing.T) {
+	gateway := NewGateway(nil)
+	fixture := newAgentTLSServer(t, gateway, tls.RequireAndVerifyClientCert)
+	taskFor := func(instanceID, nodeID, taskID string) v1.Envelope {
+		return makeAgentEnvelope(t, instanceID, nodeID, v1.KindTaskRequest, "message-"+taskID, v1.TaskRequest{
+			TaskID: taskID, InstanceID: instanceID, NodeID: nodeID, Kind: v1.TaskDeploy, IdempotencyKey: "idem-" + taskID, LeaseID: "lease-" + taskID,
+			Parameters: json.RawMessage(`{"acornfox_candidate_payload_type":"acornfox_candidate_validation_v1","request":{}}`), Deadline: time.Now().Add(time.Minute).UTC(),
+		})
+	}
+	missing := testHello("instance-candidate-missing", "node-candidate-missing", fixture.clientCertificate.SerialNumber.String())
+	status, response := postAgentJSON(t, fixture.client, fixture.server.URL+"/v1/agent/connect", ConnectRequest{Hello: missing, MinVersion: v1.ProtocolVersion, MaxVersion: v1.ProtocolVersion}, &ConnectResponse{})
+	if status != http.StatusOK || !containsCapability(response.(*ConnectResponse).DisabledCapabilities, v1.AgentCapabilityAcornFoxCandidateValidation) {
+		t.Fatalf("missing candidate capability was not explicit: status=%d response=%#v", status, response)
+	}
+	if _, err := gateway.Enqueue(missing.InstanceID, missing.NodeID, taskFor(missing.InstanceID, missing.NodeID, "candidate-missing")); err == nil || !strings.Contains(err.Error(), v1.AgentCapabilityAcornFoxCandidateValidation) {
+		t.Fatalf("Agent without candidate capability accepted task: %v", err)
+	}
+
+	capable := testHello("instance-candidate", "node-candidate", fixture.clientCertificate.SerialNumber.String())
+	capable.Capabilities = append(capable.Capabilities, v1.AgentCapabilityAcornFoxCandidateValidation)
+	status, response = postAgentJSON(t, fixture.client, fixture.server.URL+"/v1/agent/connect", ConnectRequest{Hello: capable, MinVersion: v1.ProtocolVersion, MaxVersion: v1.ProtocolVersion}, &ConnectResponse{})
+	if status != http.StatusOK || !containsCapability(response.(*ConnectResponse).EnabledCapabilities, v1.AgentCapabilityAcornFoxCandidateValidation) || containsCapability(response.(*ConnectResponse).DisabledCapabilities, v1.AgentCapabilityAcornFoxCandidateValidation) {
+		t.Fatalf("candidate capability was not negotiated: status=%d response=%#v", status, response)
+	}
+	if cursor, err := gateway.Enqueue(capable.InstanceID, capable.NodeID, taskFor(capable.InstanceID, capable.NodeID, "candidate-current")); err != nil || cursor != 1 {
+		t.Fatalf("current capable Agent rejected candidate task: cursor=%d err=%v", cursor, err)
+	}
+
+	legacy := testHello("instance-candidate-old", "node-candidate-old", fixture.clientCertificate.SerialNumber.String())
+	legacy.Capabilities = append(legacy.Capabilities, v1.AgentCapabilityAcornFoxCandidateValidation)
+	status, response = postAgentJSON(t, fixture.client, fixture.server.URL+"/v1/agent/connect", ConnectRequest{Hello: legacy, MinVersion: v1.PreviousProtocolVersion, MaxVersion: v1.PreviousProtocolVersion}, &ConnectResponse{})
+	if status != http.StatusOK || containsCapability(response.(*ConnectResponse).EnabledCapabilities, v1.AgentCapabilityAcornFoxCandidateValidation) || !containsCapability(response.(*ConnectResponse).DisabledCapabilities, v1.AgentCapabilityAcornFoxCandidateValidation) {
+		t.Fatalf("N-1 Agent did not fail closed for candidate capability: status=%d response=%#v", status, response)
+	}
+	if _, err := gateway.Enqueue(legacy.InstanceID, legacy.NodeID, taskFor(legacy.InstanceID, legacy.NodeID, "candidate-old")); err == nil || !strings.Contains(err.Error(), "protocol cannot accept") {
+		t.Fatalf("candidate task silently downgraded to N-1: %v", err)
+	}
+}
+
 func TestGatewayNegotiatesAndGatesAcornFoxProbeOnlyOnCurrentProtocol(t *testing.T) {
 	gateway := NewGateway(nil)
 	fixture := newAgentTLSServer(t, gateway, tls.RequireAndVerifyClientCert)
@@ -575,11 +614,38 @@ func TestClientRejectsGappedPollCursor(t *testing.T) {
 	if err := client.connect(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	if client.NegotiatedVersion() != v1.PreviousProtocolVersion || !containsCapability(client.DisabledCapabilities(), v1.AgentCapabilityAcornFoxCandidateValidation) {
+		t.Fatalf("legacy fallback did not disable candidate capability: version=%s disabled=%v", client.NegotiatedVersion(), client.DisabledCapabilities())
+	}
 	if err := client.pollOnce(context.Background()); err == nil {
 		t.Fatal("expected gapped poll cursor to be rejected")
 	}
 	if got := client.Cursor(); got != 0 {
 		t.Fatalf("client cursor after rejected gap = %d, want 0", got)
+	}
+}
+
+func TestClientRejectsCandidateCapabilityEnabledByNMinusOneServer(t *testing.T) {
+	for _, negotiated := range []string{"", v1.PreviousProtocolVersion} {
+		t.Run("version-"+negotiated, func(t *testing.T) {
+			serverHandler := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				if request.URL.Path != "/v1/agent/connect" {
+					writeGatewayError(writer, http.StatusNotFound, "not_found", "not found")
+					return
+				}
+				writeGatewayJSON(writer, http.StatusOK, ConnectResponse{SessionID: "session-candidate-old", NegotiatedVersion: negotiated, EnabledCapabilities: []string{v1.AgentCapabilityAcornFoxCandidateValidation}})
+			})
+			fixture := newAgentTLSServer(t, serverHandler, tls.RequireAndVerifyClientCert)
+			hello := testHello("instance-candidate-client-old", "node-candidate-client-old", fixture.clientCertificate.SerialNumber.String())
+			hello.Capabilities = append(hello.Capabilities, v1.AgentCapabilityAcornFoxCandidateValidation)
+			client := newTestAgentClient(fixture, hello, &countingAgentHandler{})
+			if err := client.normalize(); err != nil {
+				t.Fatal(err)
+			}
+			if err := client.connect(context.Background()); err == nil || !strings.Contains(err.Error(), "current-only capability") {
+				t.Fatalf("N-1 candidate enable err=%v", err)
+			}
+		})
 	}
 }
 

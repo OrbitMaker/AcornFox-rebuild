@@ -142,7 +142,7 @@ func (c *Client) connect(ctx context.Context) error {
 	}
 	if response.NegotiatedVersion == "" {
 		response.NegotiatedVersion = v1.PreviousProtocolVersion
-		response.DisabledCapabilities = append(response.DisabledCapabilities, "agent_sequence", "observation_details", v1.AgentCapabilityAcornFoxRuntime, v1.AgentCapabilityAcornFoxProbe, v1.AgentCapabilityAcornFoxLogs, v1.AgentCapabilityRuntimeDeployGroup, v1.AgentCapabilityRuntimeObserveGroup, v1.AgentCapabilityRuntimeRollbackGroup, v1.AgentCapabilityRuntimeDestroyGroup)
+		response.DisabledCapabilities = append(response.DisabledCapabilities, "agent_sequence", "observation_details", v1.AgentCapabilityAcornFoxRuntime, v1.AgentCapabilityAcornFoxProbe, v1.AgentCapabilityAcornFoxLogs, v1.AgentCapabilityAcornFoxCandidateValidation, v1.AgentCapabilityRuntimeDeployGroup, v1.AgentCapabilityRuntimeObserveGroup, v1.AgentCapabilityRuntimeRollbackGroup, v1.AgentCapabilityRuntimeDestroyGroup)
 	}
 	negotiatedVersion, err := v1.NormalizeProtocolVersion(response.NegotiatedVersion)
 	if err != nil {
@@ -156,8 +156,8 @@ func (c *Client) connect(ctx context.Context) error {
 		if _, ok := advertised[capability]; !ok {
 			return errors.New("control plane enabled an Agent capability that was not advertised")
 		}
-		if v1.IsAggregateRuntimeCapability(capability) && negotiatedVersion != v1.ProtocolVersion {
-			return errors.New("control plane enabled aggregate runtime on an incompatible Agent protocol")
+		if (v1.IsAggregateRuntimeCapability(capability) || capability == v1.AgentCapabilityAcornFoxCandidateValidation) && negotiatedVersion != v1.ProtocolVersion {
+			return errors.New("control plane enabled a current-only capability on an incompatible Agent protocol")
 		}
 	}
 	c.mu.Lock()

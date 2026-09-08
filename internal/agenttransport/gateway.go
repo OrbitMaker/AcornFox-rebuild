@@ -273,10 +273,11 @@ func (g *Gateway) handleConnect(writer http.ResponseWriter, request *http.Reques
 func negotiateSessionCapabilities(advertised []string, protocolVersion string, protocolDisabled []string) ([]string, []string) {
 	allowed := map[string]struct{}{
 		"docker.read.facts": {}, "runtime.deploy.digest": {}, "runtime.observe": {}, "runtime.logs": {}, "runtime.restart": {}, "runtime.destroy": {},
-		v1.AgentCapabilityAcornFoxRuntime:    {},
-		v1.AgentCapabilityAcornFoxProbe:      {},
-		v1.AgentCapabilityAcornFoxLogs:       {},
-		v1.AgentCapabilityRuntimeDeployGroup: {}, v1.AgentCapabilityRuntimeObserveGroup: {}, v1.AgentCapabilityRuntimeLogsGroup: {}, v1.AgentCapabilityRuntimeRollbackGroup: {}, v1.AgentCapabilityRuntimeDestroyGroup: {},
+		v1.AgentCapabilityAcornFoxRuntime:             {},
+		v1.AgentCapabilityAcornFoxProbe:               {},
+		v1.AgentCapabilityAcornFoxLogs:                {},
+		v1.AgentCapabilityAcornFoxCandidateValidation: {},
+		v1.AgentCapabilityRuntimeDeployGroup:          {}, v1.AgentCapabilityRuntimeObserveGroup: {}, v1.AgentCapabilityRuntimeLogsGroup: {}, v1.AgentCapabilityRuntimeRollbackGroup: {}, v1.AgentCapabilityRuntimeDestroyGroup: {},
 		v1.AgentCapabilityRuntimeRestartGroupService: {}, v1.AgentCapabilityRuntimeRestartGroup: {},
 	}
 	enabledSet := make(map[string]struct{})
@@ -307,8 +308,10 @@ func negotiateSessionCapabilities(advertised []string, protocolVersion string, p
 		disabledSet[v1.AgentCapabilityAcornFoxProbe] = struct{}{}
 		delete(enabledSet, v1.AgentCapabilityAcornFoxLogs)
 		disabledSet[v1.AgentCapabilityAcornFoxLogs] = struct{}{}
+		delete(enabledSet, v1.AgentCapabilityAcornFoxCandidateValidation)
+		disabledSet[v1.AgentCapabilityAcornFoxCandidateValidation] = struct{}{}
 	} else {
-		for _, capability := range []string{v1.AgentCapabilityAcornFoxRuntime, v1.AgentCapabilityAcornFoxProbe, v1.AgentCapabilityAcornFoxLogs} {
+		for _, capability := range []string{v1.AgentCapabilityAcornFoxRuntime, v1.AgentCapabilityAcornFoxProbe, v1.AgentCapabilityAcornFoxLogs, v1.AgentCapabilityAcornFoxCandidateValidation} {
 			if _, ok := enabledSet[capability]; !ok {
 				disabledSet[capability] = struct{}{}
 			}
