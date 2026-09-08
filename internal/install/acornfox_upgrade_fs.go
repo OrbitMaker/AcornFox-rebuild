@@ -115,6 +115,11 @@ func (u *acornFoxUpgrade) atomicFileOwnedAtTemp(s *TaskAcornFoxRepoStore, root *
 		return ErrAcornFoxUpgradeConflict
 	}
 	if partial, pe := u.read(root, temp, 0600, acornFoxArchiveMaxBytes); pe == nil {
+		if root == s.root && path == acornFoxUpgradeJournalPath && strings.HasPrefix(temp, ".acornfox-post-cross-") && bytes.Equal(partial, next) {
+			// The successor may already be the fixed boot reader. Never erase
+			// its durable pending journal while resuming the atomic commit.
+			return u.finishAtomicFile(s, root, path, temp, current, old, next, mode, principal)
+		}
 		safe := bytes.HasPrefix(next, partial) || old != nil && bytes.HasPrefix(old, partial)
 		if !safe && path == acornFoxUpgradeJournalPath {
 			var j acornFoxUpgradeJournal
@@ -198,8 +203,25 @@ func (u *acornFoxUpgrade) atomicFileOwnedAtTemp(s *TaskAcornFoxRepoStore, root *
 		return ErrAcornFoxUpgradeUnknown
 	}
 	if path == acornFoxUpgradeJournalPath && temp != acornFoxUpgradeTemp(path) {
-		if e := u.fault("legacy-0039-journal-staged"); e != nil {
+		point := "legacy-0039-journal-staged"
+		if strings.HasPrefix(temp, ".acornfox-post-cross-") {
+			point = "post-cross-journal-staged"
+		}
+		if strings.HasPrefix(temp, ".acornfox-post-phase-") {
+			point = "post-cross-phase-staged"
+		}
+		if e := u.fault(point); e != nil {
 			return e
+		}
+	}
+
+	return u.finishAtomicFile(s, root, path, temp, current, old, next, mode, principal)
+}
+
+func (u *acornFoxUpgrade) finishAtomicFile(s *TaskAcornFoxRepoStore, root *os.Root, path, temp string, current, old, next []byte, mode os.FileMode, principal acornFoxInstallPrincipal) error {
+	if root == s.root && path == acornFoxUpgradeJournalPath && strings.HasPrefix(temp, ".acornfox-post-cross-") {
+		if err := u.preparePostCrossHelper(s, old, next, temp); err != nil {
+			return err
 		}
 	}
 	// Re-read before replacement. Foreign bytes or inode metadata cannot become
@@ -212,7 +234,7 @@ func (u *acornFoxUpgrade) atomicFileOwnedAtTemp(s *TaskAcornFoxRepoStore, root *
 	} else if ae != nil || !bytes.Equal(again, current) {
 		return ErrAcornFoxUpgradeConflict
 	}
-	if e = root.Rename(temp, path); e != nil {
+	if e := root.Rename(temp, path); e != nil {
 		return ErrAcornFoxUpgradeUnknown
 	}
 	if e := acornFoxLiveSyncDir(root, acornFoxUpgradeParent(path)); e != nil {
@@ -222,6 +244,9 @@ func (u *acornFoxUpgrade) atomicFileOwnedAtTemp(s *TaskAcornFoxRepoStore, root *
 		if e := acornFoxLiveSyncDir(root, acornFoxUpgradeParent(temp)); e != nil {
 			return e
 		}
+	}
+	if root == s.root && path == acornFoxUpgradeJournalPath && strings.HasPrefix(temp, ".acornfox-post-cross-") {
+		return u.fault("post-cross-journal-committed")
 	}
 	if root == s.hostRoot && path != acornFoxUpgradeMarkerPath {
 		return u.fault("host-file-renamed")
@@ -434,6 +459,9 @@ func (u *acornFoxUpgrade) imageManifest(s *TaskAcornFoxRepoStore, j acornFoxUpgr
 }
 
 func (u *acornFoxUpgrade) copyNextSubstrate(s *TaskAcornFoxRepoStore, j acornFoxUpgradeJournal) error {
+	if e := u.retirePostCrossStash(s, j); e != nil {
+		return e
+	}
 	if e := u.retire0039Stash(s, j); e != nil {
 		return e
 	}
@@ -661,7 +689,7 @@ func (u *acornFoxUpgrade) applyImage(s *TaskAcornFoxRepoStore, j acornFoxUpgrade
 	for _, p := range keys {
 		wanted := new[p]
 		mode := nm[p]
-		if !next && old[p] != nil && !(j.CrossSchema != nil && p == AcornFoxUpgradeHelperPath) {
+		if !next && old[p] != nil && !(j.retainsSuccessorHelper() && p == AcornFoxUpgradeHelperPath) {
 			wanted = old[p]
 			mode = om[p]
 		}

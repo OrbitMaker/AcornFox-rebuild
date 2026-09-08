@@ -254,3 +254,18 @@ journalctl -u acornfox-server.service -u acornfox-agent.service -u acornfox-edge
 ```
 
 升级前保存可恢复的数据备份，并安排控制台和公网入口的维护时间。保留旧版本与事务记录，不要手工删除 `/var/lib/acornfox/upgrade-in-progress`。升级后重新检查管理员登录、原有应用和公网 HTTPS 响应。支持的前驱版本、数据兼容条件和恢复限制以该次升级的发布说明为准。
+
+### 跨 schema 后的 schema 0040 修复版本
+
+完成并验证 `0034 → 0040` 或 `0039 → 0040` 升级后，可以继续安装声明兼容的 schema `0040` 后继修复包。每次升级都必须匹配当前版本的完整 binding、安装状态与上一条成功事务，继续使用原来的数据库连接、业务数据及 API Key，不重复执行迁移或创建新数据库。
+
+这条修复链最多允许 **8 次成功后继交接**。安装器保存每一层前驱事务原文、SHA-256 和对应私有安装材料，并一直验证最初跨 schema 升级的数据库依据。达到上限会返回 retention 限制；普通没有跨 schema 来源的安装仍保留原有的两版本限制。不要通过删除历史目录、改数据库名称或覆盖安装记录绕过限制。
+
+修复包先持久化待提交事务，再发布与新包 manifest 匹配的恢复程序，最后提交新的升级记录。因此在这条修复链的中断恢复中，固定恢复入口可以读取待提交或已提交的记录。回退应用时，该恢复程序继续保留新版本；应用文件、配置及数据库连接按事务中的前一版本恢复。需要手动运行恢复时，使用：
+
+```sh
+sudo /opt/acornfox/upgrade-tools/acornfox-upgrade recover-prepare --pending
+sudo /opt/acornfox/upgrade-tools/acornfox-upgrade recover-finalize --pending
+```
+
+恢复后先验证旧应用和数据，再用同一个已校验候选包重试。只有成功完成当前交接后，才开始下一个修复版本。

@@ -9,7 +9,7 @@ import (
 // share placeholder content and cannot prove recovery executable selection.
 func changeAcornFoxRecoveryHelperFixture(t *testing.T, fixture *acornFoxFixture) []byte {
 	t.Helper()
-	helper := []byte("authenticated successor recovery helper\n")
+	helper := []byte("authenticated successor recovery helper " + fixture.binding.Version + "\n")
 	files, contents := fixtureManifestAndContents(t, *fixture)
 	contents["bin/acornfox-upgrade"] = helper
 	for i := range files {

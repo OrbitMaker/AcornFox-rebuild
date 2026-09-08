@@ -67,6 +67,7 @@ type acornFoxUpgradeJournal struct {
 	PIEnabled     bool                          `json:"pi_enabled,omitempty"`
 	CrossSchema   *acornFoxCrossSchemaUpgradeV1 `json:"cross_schema,omitempty"`
 	Retired0039   *acornFoxRetired0039          `json:"retired_0039,omitempty"`
+	PostCross     *acornFoxPostCrossUpgrade     `json:"post_cross,omitempty"`
 	Old           acornFoxUpgradeImage          `json:"old"`
 	Next          acornFoxUpgradeImage          `json:"next"`
 }
@@ -109,6 +110,9 @@ func (i acornFoxUpgradeImage) validate(layout acornFoxInstallLayout, requireSetu
 	return nil
 }
 func (j acornFoxUpgradeJournal) validate(layout acornFoxInstallLayout) error {
+	if j.PostCross != nil && j.PostCross.validate(j, layout) != nil {
+		return ErrAcornFoxUpgradeConflict
+	}
 	if j.Retired0039 != nil && j.Retired0039.validate(j, layout) != nil {
 		return ErrAcornFoxUpgradeConflict
 	}
@@ -329,6 +333,7 @@ func (u *acornFoxUpgrade) upgrade(ctx context.Context, request AcornFoxUpgradeRe
 	}
 	defer lock.Release()
 	var retired *acornFoxRetired0039
+	var postCross *acornFoxPostCrossUpgrade
 	if j, e := u.load(s); e == nil {
 		if j.Next.Repo.BindingSHA256 == request.BindingSHA256 && (j.Phase == "UPGRADED" || j.Phase == "ROLLED_BACK") {
 			if e := u.verifyImage(s, j, j.Phase == "UPGRADED"); e != nil {
@@ -355,6 +360,14 @@ func (u *acornFoxUpgrade) upgrade(ctx context.Context, request AcornFoxUpgradeRe
 			}
 			raw := acornFoxUpgradeJSON(j)
 			retired = &acornFoxRetired0039{JournalSHA256: sha256Hex(raw), Journal: raw}
+		} else if !crossSchema && old.binding.MigrationVersion == "0040" && j.Phase == "UPGRADED" && j.Next.Repo.BindingSHA256 == request.CurrentBindingSHA256 && (j.CrossSchema != nil || j.PostCross != nil) {
+			postCross, e = acornFoxNewPostCrossUpgrade(j)
+			if e != nil {
+				return empty, e
+			}
+			if e := u.verifyImage(s, j, true); e != nil {
+				return empty, e
+			}
 		} else {
 			if j.Phase == "UPGRADED" || j.Phase == "ROLLED_BACK" {
 				return empty, ErrAcornFoxUpgradeRetentionFull
@@ -420,7 +433,7 @@ func (u *acornFoxUpgrade) upgrade(ctx context.Context, request AcornFoxUpgradeRe
 	if e != nil {
 		return empty, e
 	}
-	j := acornFoxUpgradeJournal{SchemaVersion: 1, Phase: "PREPARED", LayoutSHA256: u.layout.evidence(), PIEnabled: piEnabled, Retired0039: retired, Old: prior, Next: next}
+	j := acornFoxUpgradeJournal{SchemaVersion: 1, Phase: "PREPARED", LayoutSHA256: u.layout.evidence(), PIEnabled: piEnabled, Retired0039: retired, PostCross: postCross, Old: prior, Next: next}
 	if databasePrivate != nil {
 		j.CrossSchema = &acornFoxCrossSchemaUpgradeV1{SchemaVersion: 1, HostProvisionSHA256: u.hostProvisionSHA256, OldMigrationVersion: prior.ControlPlane.MigrationVersion, NextMigrationVersion: AcornFoxV1MigrationVersion, TargetRowsSHA256: acornFoxMigrationRowsSHA256(migrations.rows), Database: databasePrivate.Evidence, Assistant: assistant}
 	}
@@ -493,6 +506,16 @@ func (u *acornFoxUpgrade) recoverMode(ctx context.Context, expected AcornFoxBuil
 	if e != nil {
 		return empty, true, e
 	}
+
+	if expected != j.Old.identity() && expected != j.Next.identity() {
+		pending, handled, pendingErr := u.recoverPostCrossPending(ctx, s, j, expected)
+		if pendingErr != nil {
+			return empty, true, pendingErr
+		}
+		if handled {
+			j = pending
+		}
+	}
 	if j.CrossSchema != nil {
 		hostEvidence := u.hostProvisionSHA256
 		if j.CrossSchema.OldMigrationVersion == acornFoxRecentPredecessorMigration {
@@ -529,7 +552,7 @@ func (u *acornFoxUpgrade) recoverMode(ctx context.Context, expected AcornFoxBuil
 		}
 		return j.receipt(), true, nil
 	}
-	if prepareOnly && j.CrossSchema != nil && j.Phase == "RECOVERY_PREPARED" {
+	if prepareOnly && j.retainsSuccessorHelper() && j.Phase == "RECOVERY_PREPARED" {
 		if e := u.verifyImage(s, j, false); e != nil {
 			return empty, true, e
 		}
@@ -749,9 +772,19 @@ func (u *acornFoxUpgrade) save(s *TaskAcornFoxRepoStore, j acornFoxUpgradeJourna
 		return e
 	}
 	old, e := u.read(s.root, acornFoxUpgradeJournalPath, 0600, acornFoxUpgradeMaxJournal)
-	retiring := initial && j.Retired0039 != nil
+	var retiredRaw []byte
+	temp := ""
+	if initial && j.Retired0039 != nil {
+		retiredRaw = j.Retired0039.Journal
+		temp = ".acornfox-retired-0039-" + j.Retired0039.JournalSHA256
+	}
+	if initial && j.PostCross != nil {
+		retiredRaw = j.PostCross.Journal
+		temp = ".acornfox-post-cross-" + j.PostCross.JournalSHA256
+	}
+	retiring := retiredRaw != nil
 	if retiring {
-		if e != nil || !bytes.Equal(old, j.Retired0039.Journal) {
+		if e != nil || !bytes.Equal(old, retiredRaw) {
 			return ErrAcornFoxUpgradeConflict
 		}
 		initial = false
@@ -765,7 +798,12 @@ func (u *acornFoxUpgrade) save(s *TaskAcornFoxRepoStore, j acornFoxUpgradeJourna
 	if retiring {
 		// Until the atomic journal replacement, the completed 0039 upgrade
 		// directory must remain an exact closed pair, including after a crash.
-		temp := ".acornfox-retired-0039-" + j.Retired0039.JournalSHA256
+		return u.atomicFileOwnedAtTemp(s, s.root, acornFoxUpgradeJournalPath, old, acornFoxUpgradeJSON(j), 0600, acornFoxInstallPrincipal{}, temp)
+	}
+	if j.PostCross != nil {
+		// Phase writes also stay outside the closed retained pair: an
+		// uncommitted phase must not make a terminal journal unbootable.
+		temp := ".acornfox-post-phase-" + j.Next.Repo.BindingSHA256
 		return u.atomicFileOwnedAtTemp(s, s.root, acornFoxUpgradeJournalPath, old, acornFoxUpgradeJSON(j), 0600, acornFoxInstallPrincipal{}, temp)
 	}
 	return u.atomicFile(s, s.root, acornFoxUpgradeJournalPath, old, acornFoxUpgradeJSON(j), 0600)

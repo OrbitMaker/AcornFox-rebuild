@@ -6,7 +6,7 @@ import "context"
 // cross-schema journal must retain its authenticated successor reader at the
 // fixed boot entrypoint; the previous release and its snapshots remain intact.
 func acornFoxCrossSchemaRecoveryHelperEntry(j acornFoxUpgradeJournal, layout acornFoxInstallLayout) (SubstrateEntry, error) {
-	if j.CrossSchema == nil || j.validate(layout) != nil {
+	if !j.retainsSuccessorHelper() || j.validate(layout) != nil {
 		return SubstrateEntry{}, ErrAcornFoxUpgradeConflict
 	}
 	entry := substrateEntryAt(j.Next.Substrate.Entries, AcornFoxUpgradeHelperPath)
@@ -42,7 +42,7 @@ func (u *acornFoxUpgrade) healthy(ctx context.Context, j acornFoxUpgradeJournal,
 	if next {
 		image = j.Next
 	}
-	if j.CrossSchema == nil {
+	if !j.retainsSuccessorHelper() {
 		return u.services.Healthy(ctx, image)
 	}
 	if j.validate(u.layout) != nil {

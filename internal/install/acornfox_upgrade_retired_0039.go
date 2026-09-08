@@ -27,7 +27,7 @@ func (acornFoxRetired0039) Format(state fmt.State, _ rune) {
 }
 
 func validateAcornFoxCompleted0039(j acornFoxUpgradeJournal, layout acornFoxInstallLayout, env []byte) error {
-	if j.SchemaVersion != 1 || j.Phase != "UPGRADED" || j.CrossSchema != nil || j.Retired0039 != nil || j.LayoutSHA256 != layout.evidence() {
+	if j.SchemaVersion != 1 || j.Phase != "UPGRADED" || j.CrossSchema != nil || j.Retired0039 != nil || j.PostCross != nil || j.LayoutSHA256 != layout.evidence() {
 		return ErrAcornFoxUpgradeConflict
 	}
 	for _, image := range []acornFoxUpgradeImage{j.Old, j.Next} {

@@ -328,10 +328,51 @@ func (b *acornFoxBindingStore) readNamed(root *os.Root, name, digest string, tem
 		return nil, ErrAcornFoxRepoConflict
 	}
 	if _, err = ParseAcornFoxCandidateBindingV1(raw, digest); err != nil {
-		return nil, ErrAcornFoxRepoConflict
+		// Historic bindings remain immutable catalog records after a schema
+		// upgrade. They are readable only when the validated upgrade journal
+		// names these exact bytes; they are never accepted as new candidates.
+		if temporary || !b.retainedUpgradeBinding(raw, digest) {
+			return nil, ErrAcornFoxRepoConflict
+		}
 	}
 	return raw, nil
 }
 func (b *acornFoxBindingStore) sync(root *os.Root) error {
 	return b.store.syncDirectory(root, acornFoxBindingStoreDir)
+}
+
+func (b *acornFoxBindingStore) retainedUpgradeBinding(raw []byte, digest string) bool {
+	if _, err := verifiedAcornFoxUpgradePredecessor(raw, digest); err != nil {
+		return false
+	}
+	reader := &acornFoxUpgrade{layout: b.store.layout, ownership: b.store.ownership}
+	journal, err := reader.load(b.store)
+	if err != nil {
+		return false
+	}
+	matches := func(image acornFoxUpgradeImage) bool {
+		return image.Repo.BindingSHA256 == digest && bytes.Equal(image.Binding, raw)
+	}
+	for depth := 0; depth <= acornFoxPostCrossMaxDepth; depth++ {
+		if matches(journal.Old) || matches(journal.Next) {
+			return true
+		}
+		if journal.Retired0039 != nil {
+			old, err := journal.Retired0039.decode(journal, b.store.layout)
+			if err != nil {
+				return false
+			}
+			if matches(old.Old) || matches(old.Next) {
+				return true
+			}
+		}
+		if journal.PostCross == nil {
+			return false
+		}
+		journal, err = journal.PostCross.previous(journal)
+		if err != nil {
+			return false
+		}
+	}
+	return false
 }

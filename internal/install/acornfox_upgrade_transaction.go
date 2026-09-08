@@ -67,7 +67,16 @@ func (u *acornFoxUpgrade) capture(ctx context.Context, s *TaskAcornFoxRepoStore,
 		return image, e
 	}
 	databaseEnv, e := u.read(s.root, acornFoxControlPlaneStateEnv, 0600, acornFoxUpgradeMaxJournal)
-	if e != nil || !validAcornFoxBoundControlPlaneEnvironment(databaseEnv, cp, acornFoxControlPlaneDatabase) {
+	expectedDatabase := acornFoxControlPlaneDatabase
+	if e == nil {
+		if observed, nameErr := acornFoxControlPlaneDatabaseName(databaseEnv); nameErr == nil && observed != expectedDatabase {
+			expectedDatabase, e = acornFoxExpectedCurrentDatabase(s, j.BindingSHA256)
+			if e == nil && observed != expectedDatabase {
+				e = ErrAcornFoxUpgradeConflict
+			}
+		}
+	}
+	if e != nil || !validAcornFoxBoundControlPlaneEnvironment(databaseEnv, cp, expectedDatabase) {
 		return image, ErrAcornFoxUpgradeConflict
 	}
 	raw, e = u.read(s.root, acornFoxRuntimeIntentName, 0600, acornFoxRuntimeMaxIntent)
@@ -92,7 +101,7 @@ func (u *acornFoxUpgrade) capture(ctx context.Context, s *TaskAcornFoxRepoStore,
 		return image, ErrAcornFoxUpgradeConflict
 	}
 	var privateDatabaseEnv []byte
-	if installed.binding.MigrationVersion == AcornFoxLegacyPredecessorMigration {
+	if expectedDatabase != acornFoxControlPlaneDatabase || installed.binding.MigrationVersion == AcornFoxLegacyPredecessorMigration {
 		privateDatabaseEnv = bytes.Clone(databaseEnv)
 	}
 	image = acornFoxUpgradeImage{Binding: append([]byte(nil), binding...), Substrate: sub.receipt, Repo: j, Live: live, Activation: a, ControlPlane: cp, DatabaseEnv: privateDatabaseEnv, Runtime: runtime}
@@ -339,7 +348,7 @@ func (u *acornFoxUpgrade) nextImage(old acornFoxUpgradeImage, set *acornFoxCandi
 	}
 	cp := old.ControlPlane
 	cp.BindingSHA256, cp.ReleaseID, cp.SourceCommit = set.bindingSHA256, set.binding.binding.ReleaseID, set.binding.binding.SourceCommit
-	var databaseEnv []byte
+	var databaseEnv = bytes.Clone(old.DatabaseEnv)
 	if database != nil {
 		if database.Evidence.validate() != nil || !migrations.valid() || database.Evidence.State != acornFoxUpgradeDatabasePrefixVerified {
 			return i, ErrAcornFoxUpgradeConflict
@@ -475,6 +484,9 @@ func (u *acornFoxUpgrade) unblock(ctx context.Context, s *TaskAcornFoxRepoStore,
 	return u.services.EdgeHealthy(ctx)
 }
 func (u *acornFoxUpgrade) forward(ctx context.Context, s *TaskAcornFoxRepoStore, j *acornFoxUpgradeJournal) error {
+	if e := u.retirePostCrossStash(s, *j); e != nil {
+		return e
+	}
 	if e := u.retire0039Stash(s, *j); e != nil {
 		return e
 	}
@@ -673,7 +685,7 @@ func (u *acornFoxUpgrade) rollback(ctx context.Context, s *TaskAcornFoxRepoStore
 			_ = u.services.Run(context.WithoutCancel(ctx), "stop", "acornfox-edge.service")
 		}
 	}()
-	if j.CrossSchema != nil && j.Phase == "RECOVERY_PREPARED" {
+	if j.retainsSuccessorHelper() && j.Phase == "RECOVERY_PREPARED" {
 		// Prepare already restored the exact previous image. Finalize must
 		// follow RECOVERY_PREPARED -> ROLLED_BACK, never rewind the journal.
 		if err = u.verifyImage(s, *j, false); err != nil {
@@ -695,6 +707,13 @@ func (u *acornFoxUpgrade) rollback(ctx context.Context, s *TaskAcornFoxRepoStore
 }
 
 func (u *acornFoxUpgrade) verifyImage(s *TaskAcornFoxRepoStore, j acornFoxUpgradeJournal, next bool) error {
+	return u.verifyImageWithPending(s, j, next, nil)
+}
+func (u *acornFoxUpgrade) verifyImageWithPending(s *TaskAcornFoxRepoStore, j acornFoxUpgradeJournal, next bool, pending *acornFoxUpgradeJournal) error {
+	if pending != nil && (!next || validateAcornFoxPostCrossPendingPair(j, *pending, u.layout) != nil) {
+		return ErrAcornFoxUpgradeConflict
+	}
+
 	if j.CrossSchema == nil && j.Next.ControlPlane.MigrationVersion == acornFoxRecentPredecessorMigration {
 		if err := u.verifyCompleted0039Manifests(s, j); err != nil {
 			return err
@@ -713,8 +732,12 @@ func (u *acornFoxUpgrade) verifyImage(s *TaskAcornFoxRepoStore, j acornFoxUpgrad
 		return e
 	}
 	var recoveryHelper *SubstrateEntry
-	if j.CrossSchema != nil && !next {
-		entry, raw, err := u.crossSchemaRecoveryHelper(s, j)
+	if pending != nil || j.retainsSuccessorHelper() && !next {
+		helperJournal := j
+		if pending != nil {
+			helperJournal = *pending
+		}
+		entry, raw, err := u.crossSchemaRecoveryHelper(s, helperJournal)
 		if err != nil {
 			return err
 		}
@@ -775,7 +798,7 @@ func (u *acornFoxUpgrade) verifyImage(s *TaskAcornFoxRepoStore, j acornFoxUpgrad
 			return ErrAcornFoxUpgradeConflict
 		}
 	}
-	if err := u.verifyRetainedScope(s, j, image); err != nil {
+	if err := u.verifyRetainedScopeWithPending(s, j, image, pending); err != nil {
 		return err
 	}
 	return verifyAcornFoxUpgradeAssistantConfig(s, j, next)
@@ -815,6 +838,13 @@ func acornFoxUpgradeRetainedScope(root *os.Root, s *TaskAcornFoxRepoStore, activ
 	return true, u.verifyImage(s, j, image.Repo.BindingSHA256 == j.Next.Repo.BindingSHA256)
 }
 func (u *acornFoxUpgrade) verifyRetainedScope(s *TaskAcornFoxRepoStore, j acornFoxUpgradeJournal, current acornFoxUpgradeImage) error {
+	return u.verifyRetainedScopeWithPending(s, j, current, nil)
+}
+func (u *acornFoxUpgrade) verifyRetainedScopeWithPending(s *TaskAcornFoxRepoStore, j acornFoxUpgradeJournal, current acornFoxUpgradeImage, pending *acornFoxUpgradeJournal) error {
+	if pending != nil && (current.Repo.BindingSHA256 != j.Next.Repo.BindingSHA256 || validateAcornFoxPostCrossPendingPair(j, *pending, u.layout) != nil) {
+		return ErrAcornFoxUpgradeConflict
+	}
+
 	entries := map[string]SubstrateEntry{}
 	files := map[string][]byte{}
 	modes := map[string]os.FileMode{}
@@ -822,6 +852,23 @@ func (u *acornFoxUpgrade) verifyRetainedScope(s *TaskAcornFoxRepoStore, j acornF
 	// Shared paths use the selected image. Only versioned immutable material from
 	// the other image extends the inventory.
 	images := []acornFoxUpgradeImage{j.Old, j.Next}
+	if j.PostCross != nil {
+		archives, origin, err := acornFoxPostCrossArchives(j)
+		if err != nil {
+			return err
+		}
+		for _, archive := range archives {
+			images = append(images, archive.image)
+		}
+		if origin.Retired0039 != nil {
+			prior, err := origin.Retired0039.decode(origin, u.layout)
+			if err != nil {
+				return err
+			}
+			prior.Old.DatabaseEnv = bytes.Clone(origin.Old.DatabaseEnv)
+			images = append(images, prior.Old)
+		}
+	}
 	if j.Retired0039 != nil {
 		prior, err := j.Retired0039.decode(j, u.layout)
 		if err != nil {
@@ -872,8 +919,12 @@ func (u *acornFoxUpgrade) verifyRetainedScope(s *TaskAcornFoxRepoStore, j acornF
 			}
 		}
 	}
-	if j.CrossSchema != nil && current.Repo.BindingSHA256 == j.Old.Repo.BindingSHA256 {
-		entry, err := acornFoxCrossSchemaRecoveryHelperEntry(j, u.layout)
+	if pending != nil || j.retainsSuccessorHelper() && current.Repo.BindingSHA256 == j.Old.Repo.BindingSHA256 {
+		helperJournal := j
+		if pending != nil {
+			helperJournal = *pending
+		}
+		entry, err := acornFoxCrossSchemaRecoveryHelperEntry(helperJournal, u.layout)
 		if err != nil {
 			return err
 		}
@@ -1027,21 +1078,36 @@ func (u *acornFoxUpgrade) verifyPrivateStore(s *TaskAcornFoxRepoStore, j acornFo
 	if e != nil {
 		return e
 	}
-	wantChildren := 3
+
+	wantChildren := map[string]bool{"journal.json": true, "old-state": true, "new-state": true}
 	if j.CrossSchema != nil && current.Repo.BindingSHA256 == j.Next.Repo.BindingSHA256 {
-		wantChildren = 4
+		wantChildren[acornFoxUpgradeDatabaseRoot] = true
 	}
 	if j.Retired0039 != nil {
-		wantChildren++
+		wantChildren[acornFoxRetired0039StashName] = true
 	}
-	if len(children) != wantChildren {
+	if j.PostCross != nil {
+		archives, origin, err := acornFoxPostCrossArchives(j)
+		if err != nil {
+			return err
+		}
+		for _, archive := range archives {
+			wantChildren[strings.TrimPrefix(archive.path, "upgrade/")] = true
+		}
+		wantChildren[acornFoxUpgradeDatabaseRoot] = true
+		if origin.Retired0039 != nil {
+			wantChildren[acornFoxRetired0039StashName] = true
+		}
+	}
+	if len(children) != len(wantChildren) {
 		return ErrAcornFoxUpgradeConflict
 	}
 	for _, child := range children {
-		if child.Name() != "journal.json" && child.Name() != "old-state" && child.Name() != "new-state" && !(j.CrossSchema != nil && current.Repo.BindingSHA256 == j.Next.Repo.BindingSHA256 && child.Name() == acornFoxUpgradeDatabaseRoot) && !(j.Retired0039 != nil && child.Name() == acornFoxRetired0039StashName) {
+		if !wantChildren[child.Name()] {
 			return ErrAcornFoxUpgradeConflict
 		}
 	}
+
 	for _, item := range []struct {
 		path  string
 		image acornFoxUpgradeImage
@@ -1087,6 +1153,9 @@ func (u *acornFoxUpgrade) verifyPrivateStore(s *TaskAcornFoxRepoStore, j acornFo
 		if err := u.verifyRetired0039Stash(s, j); err != nil {
 			return err
 		}
+	}
+	if j.PostCross != nil {
+		return u.verifyPostCrossArchives(s, j)
 	}
 	if j.CrossSchema == nil || current.Repo.BindingSHA256 == j.Old.Repo.BindingSHA256 {
 		return nil

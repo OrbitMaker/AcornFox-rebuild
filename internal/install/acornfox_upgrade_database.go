@@ -284,8 +284,8 @@ func (d *acornFoxUpgradeDatabase) Close() error {
 // acornFoxExpectedCurrentDatabase is the sole bridge that permits ordinary
 // runtime/admin validation to accept a non-default AcornFox database. A name
 // matching the shadow regex is insufficient: the locked current repository
-// and the canonical terminal cross-schema journal must bind the same next
-// image and VALIDATED database evidence.
+// and the canonical terminal journal must bind the selected image to VALIDATED
+// cross-schema database evidence, directly or through the bounded post-cross chain.
 func acornFoxExpectedCurrentDatabase(store *TaskAcornFoxRepoStore, bindingSHA256 string) (string, error) {
 	if store == nil || !store.ownsLock() || store.layout.validate() != nil || store.layout.mode != acornFoxInstallLayoutProduction || !validSHA(bindingSHA256) {
 		return "", ErrAcornFoxUpgradeConflict
@@ -296,14 +296,37 @@ func acornFoxExpectedCurrentDatabase(store *TaskAcornFoxRepoStore, bindingSHA256
 	}
 	reader := &acornFoxUpgrade{layout: store.layout, ownership: store.ownership}
 	journal, err := reader.load(store)
-	if err != nil || journal.Phase != "UPGRADED" || journal.CrossSchema == nil || journal.CrossSchema.validate(journal) != nil {
+	if err != nil {
 		return "", ErrAcornFoxUpgradeConflict
 	}
 	return acornFoxExpectedCurrentDatabaseFromJournal(repository, journal, bindingSHA256)
 }
 
 func acornFoxExpectedCurrentDatabaseFromJournal(repository AcornFoxRepoJournalV1, journal acornFoxUpgradeJournal, bindingSHA256 string) (string, error) {
-	if !validSHA(bindingSHA256) || repository.Validate() != nil || repository.Phase != AcornFoxRepoPreparedFinal || repository.NeedsRecovery || repository.BindingSHA256 != bindingSHA256 || journal.Phase != "UPGRADED" || journal.CrossSchema == nil {
+	if !validSHA(bindingSHA256) || repository.Validate() != nil || repository.Phase != AcornFoxRepoPreparedFinal || repository.NeedsRecovery || repository.BindingSHA256 != bindingSHA256 {
+		return "", ErrAcornFoxUpgradeConflict
+	}
+	if journal.PostCross != nil {
+		selected := journal.Next
+		if journal.Phase == "ROLLED_BACK" {
+			selected = journal.Old
+		} else if journal.Phase != "UPGRADED" {
+			return "", ErrAcornFoxUpgradeConflict
+		}
+		if journal.SchemaVersion != 1 || journal.LayoutSHA256 != repository.LayoutSHA256 || selected.Repo.BindingSHA256 != bindingSHA256 || !sameAcornFoxRepoJournal(repository, selected.Repo) {
+			return "", ErrAcornFoxUpgradeConflict
+		}
+		origin, err := acornFoxPostCrossOrigin(journal)
+		if err != nil {
+			return "", ErrAcornFoxUpgradeConflict
+		}
+		evidence := origin.CrossSchema.Database
+		if evidence.NextBindingSHA256 != origin.Next.Repo.BindingSHA256 || !validAcornFoxBoundControlPlaneEnvironment(selected.DatabaseEnv, selected.ControlPlane, evidence.ShadowDatabase) || selected.ControlPlane.DatabaseEnvSHA256 != evidence.CandidateDatabaseEnvSHA256 || selected.ControlPlane.MigrationRowsSHA256 != origin.CrossSchema.TargetRowsSHA256 {
+			return "", ErrAcornFoxUpgradeConflict
+		}
+		return evidence.ShadowDatabase, nil
+	}
+	if journal.Phase != "UPGRADED" || journal.CrossSchema == nil {
 		return "", ErrAcornFoxUpgradeConflict
 	}
 	evidence := journal.CrossSchema.Database
