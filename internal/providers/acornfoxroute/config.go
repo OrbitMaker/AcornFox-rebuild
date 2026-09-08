@@ -55,7 +55,19 @@ func proxy(target string) object {
 // console is statically automated. Other certificate requests must receive
 // permission from the local persisted-intent endpoint; no wildcard cert or
 // DNS credentials are requested. Caddy owns HTTP-01 and HTTPS redirects.
+const EdgeGracePeriod = "5s"
+
 func InitialConfig(origin string, resolvers []string) ([]byte, error) {
+	return initialConfig(origin, resolvers, EdgeGracePeriod)
+}
+
+// LegacyInitialConfig preserves the exact persisted pre-drain profile. It is
+// only a validation input; new runtime generation uses the bounded profile.
+func LegacyInitialConfig(origin string, resolvers []string) ([]byte, error) {
+	return initialConfig(origin, resolvers, "")
+}
+
+func initialConfig(origin string, resolvers []string, grace string) ([]byte, error) {
 	host, err := AuthorizedRoot(origin)
 	if err != nil {
 		return nil, err
@@ -97,6 +109,9 @@ func InitialConfig(origin string, resolvers []string) ([]byte, error) {
 				},
 			},
 		},
+	}
+	if grace != "" {
+		config["apps"].(object)["http"].(object)["grace_period"] = grace
 	}
 	raw, err := json.Marshal(config)
 	if err != nil {

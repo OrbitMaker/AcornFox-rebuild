@@ -2,6 +2,7 @@ package acornfoxsetup
 
 import (
 	"bytes"
+	"github.com/open-card/open-card/internal/providers/acornfoxroute"
 	"slices"
 )
 
@@ -9,7 +10,7 @@ import (
 // replacing only its version binding. The returned files and resolver list do
 // not share mutable storage with the caller. No files are written.
 func RebindVersion(bundle Bundle, input Inputs, nextVersion string) (Bundle, Inputs, error) {
-	if err := Validate(bundle, input); err != nil {
+	if err := ValidateExistingRuntime(bundle, input); err != nil {
 		return Bundle{}, Inputs{}, err
 	}
 	nextInput := input
@@ -37,8 +38,28 @@ func RebindVersion(bundle Bundle, input Inputs, nextVersion string) (Bundle, Inp
 			f.Data = agentEnv(nextInput)
 		}
 	}
-	if err := Validate(nextBundle, nextInput); err != nil {
+	if err := ValidateExistingRuntime(nextBundle, nextInput); err != nil {
 		return Bundle{}, Inputs{}, err
 	}
 	return nextBundle, nextInput, nil
+}
+
+// WithBoundedEdgeGrace upgrades only the exact initial edge profile while
+// keeping identities, credentials, origin and resolvers unchanged.
+func WithBoundedEdgeGrace(bundle Bundle, input Inputs) (Bundle, error) {
+	if err := ValidateExistingRuntime(bundle, input); err != nil {
+		return Bundle{}, err
+	}
+	edge, err := acornfoxroute.InitialConfig(input.Origin, input.ResolverEndpoints)
+	if err != nil {
+		return Bundle{}, err
+	}
+	result := Bundle{Files: slices.Clone(bundle.Files)}
+	for index := range result.Files {
+		result.Files[index].Data = bytes.Clone(result.Files[index].Data)
+		if result.Files[index].Path == EdgeConfiguration {
+			result.Files[index].Data = bytes.Clone(edge)
+		}
+	}
+	return result, Validate(result, input)
 }

@@ -82,7 +82,7 @@ func (i acornFoxUpgradeImage) identity() AcornFoxBuildIdentityV1 {
 }
 func (i acornFoxUpgradeImage) validate(layout acornFoxInstallLayout, requireSetupToken bool) error {
 	b, e := ParseAcornFoxCandidateBindingV1(i.Binding, i.Repo.BindingSHA256)
-	if e != nil || i.Substrate.Validate() != nil || i.Repo.Validate() != nil || i.Live.Validate() != nil || i.Activation.Validate() != nil || i.ControlPlane.validateMigration(b.binding.MigrationVersion) != nil || (requireSetupToken && i.Runtime.validate() != nil) || (!requireSetupToken && i.Runtime.validateForUpgrade() != nil) {
+	if e != nil || i.Substrate.Validate() != nil || i.Repo.Validate() != nil || i.Live.Validate() != nil || i.Activation.Validate() != nil || i.ControlPlane.validateMigration(b.binding.MigrationVersion) != nil || i.Runtime.validateExisting(requireSetupToken) != nil {
 		return ErrAcornFoxUpgradeConflict
 	}
 	if len(i.DatabaseEnv) != 0 {
@@ -154,8 +154,14 @@ func (j acornFoxUpgradeJournal) validate(layout acornFoxInstallLayout) error {
 		return ErrAcornFoxUpgradeConflict
 	}
 	rebound, e := acornFoxUpgradeRebind(j.Old.Runtime, next.binding, next.digest, j.Next.Runtime.SetupToken)
-	if e != nil || !bytes.Equal(acornFoxUpgradeJSON(rebound), acornFoxUpgradeJSON(j.Next.Runtime)) {
+	if e != nil {
 		return ErrAcornFoxUpgradeConflict
+	}
+	if !bytes.Equal(acornFoxUpgradeJSON(rebound), acornFoxUpgradeJSON(j.Next.Runtime)) {
+		bounded, boundErr := acornFoxUpgradeBoundedEdge(rebound)
+		if boundErr != nil || !bytes.Equal(acornFoxUpgradeJSON(bounded), acornFoxUpgradeJSON(j.Next.Runtime)) {
+			return ErrAcornFoxUpgradeConflict
+		}
 	}
 	return nil
 }
@@ -178,7 +184,7 @@ func acornFoxUpgradeRebind(old acornFoxRuntimeIntent, next AcornFoxCandidateBind
 	for _, f := range bundle.Files {
 		i.Files = append(i.Files, acornFoxRuntimeFileWire{f.Path, f.Mode, f.Owner, f.Group, f.Data})
 	}
-	return i, i.validate()
+	return i, i.validateExisting(true)
 }
 
 type acornFoxUpgrade struct {
@@ -807,4 +813,16 @@ func (u *acornFoxUpgrade) save(s *TaskAcornFoxRepoStore, j acornFoxUpgradeJourna
 		return u.atomicFileOwnedAtTemp(s, s.root, acornFoxUpgradeJournalPath, old, acornFoxUpgradeJSON(j), 0600, acornFoxInstallPrincipal{}, temp)
 	}
 	return u.atomicFile(s, s.root, acornFoxUpgradeJournalPath, old, acornFoxUpgradeJSON(j), 0600)
+}
+
+func acornFoxUpgradeBoundedEdge(i acornFoxRuntimeIntent) (acornFoxRuntimeIntent, error) {
+	bundle, err := acornfoxsetup.WithBoundedEdgeGrace(i.bundle(), i.Inputs)
+	if err != nil {
+		return acornFoxRuntimeIntent{}, ErrAcornFoxUpgradeConflict
+	}
+	i.Files = nil
+	for _, file := range bundle.Files {
+		i.Files = append(i.Files, acornFoxRuntimeFileWire{file.Path, file.Mode, file.Owner, file.Group, file.Data})
+	}
+	return i, i.validate()
 }

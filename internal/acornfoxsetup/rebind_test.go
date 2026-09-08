@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/open-card/open-card/internal/acornfoxenv"
+	"github.com/open-card/open-card/internal/providers/acornfoxroute"
 )
 
 func TestRebindVersionPreservesRuntime(t *testing.T) {
@@ -112,5 +113,63 @@ func TestRebindVersionDoesNotAlias(t *testing.T) {
 				t.Fatal("rebound state shares mutable storage")
 			}
 		})
+	}
+}
+
+func TestLegacyEdgeGracePromotesOnlyOneBoundFile(t *testing.T) {
+	input := inputs()
+	bundle := generate(t)
+	legacy, err := acornfoxroute.LegacyInitialConfig(input.Origin, input.ResolverEndpoints)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := range bundle.Files {
+		if bundle.Files[index].Path == EdgeConfiguration {
+			bundle.Files[index].Data = legacy
+		}
+	}
+	if Validate(bundle, input) == nil {
+		t.Fatal("new setup accepted legacy grace")
+	}
+	if err := ValidateExistingRuntime(bundle, input); err != nil {
+		t.Fatal("existing legacy profile rejected", err)
+	}
+	before := clone(bundle)
+	rebound, nextInput, err := RebindVersion(bundle, input, "v1.0.0-beta.2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(file(rebound, EdgeConfiguration), legacy) {
+		t.Fatal("historical rebind rewrote edge")
+	}
+	bounded, err := WithBoundedEdgeGrace(rebound, nextInput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index, old := range rebound.Files {
+		actual := bounded.Files[index]
+		if actual.Path != old.Path || actual.Mode != old.Mode || actual.Owner != old.Owner || actual.Group != old.Group {
+			t.Fatal("file metadata changed")
+		}
+		if old.Path != EdgeConfiguration && !bytes.Equal(old.Data, actual.Data) {
+			t.Fatal("unrelated runtime file changed")
+		}
+	}
+	if !bytes.Contains(file(bounded, EdgeConfiguration), []byte(`"grace_period":"5s"`)) {
+		t.Fatal("bounded grace missing")
+	}
+	if !reflect.DeepEqual(bundle, before) {
+		t.Fatal("old runtime mutated")
+	}
+	for _, bad := range []string{"0s", "1h"} {
+		forged := clone(bounded)
+		for index := range forged.Files {
+			if forged.Files[index].Path == EdgeConfiguration {
+				forged.Files[index].Data = bytes.ReplaceAll(forged.Files[index].Data, []byte(`"grace_period":"5s"`), []byte(`"grace_period":"`+bad+`"`))
+			}
+		}
+		if Validate(forged, nextInput) == nil {
+			t.Fatal("arbitrary grace accepted")
+		}
 	}
 }

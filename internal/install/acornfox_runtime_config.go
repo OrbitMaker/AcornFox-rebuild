@@ -92,16 +92,23 @@ func (i acornFoxRuntimeIntent) bundle() acornfoxsetup.Bundle {
 	return b
 }
 func (i acornFoxRuntimeIntent) validate() error {
-	return i.validateWithToken(true)
+	return i.validateProfile(true, false)
 }
 
 // validateForUpgrade accepts only the prior, tokenless intent format for an
 // explicit upgrade conversion. Runtime startup and ordinary recovery remain
 // strict and always require the setup token.
-func (i acornFoxRuntimeIntent) validateForUpgrade() error { return i.validateWithToken(false) }
+func (i acornFoxRuntimeIntent) validateForUpgrade() error { return i.validateExisting(false) }
+func (i acornFoxRuntimeIntent) validateExisting(required bool) error {
+	return i.validateProfile(required, true)
+}
 
-func (i acornFoxRuntimeIntent) validateWithToken(required bool) error {
-	if i.SchemaVersion != 1 || !validSHA(i.BindingSHA256) || !validID(i.ReleaseID) || !acornFoxHostSourceCommit.MatchString(i.SourceCommit) || i.ReleaseID != "release-"+i.Inputs.Version || acornfoxsetup.Validate(i.bundle(), i.Inputs) != nil || (required && acornfoxsetup.ValidateSetupToken(i.SetupToken) != nil) || (!required && len(i.SetupToken) != 0 && acornfoxsetup.ValidateSetupToken(i.SetupToken) != nil) {
+func (i acornFoxRuntimeIntent) validateProfile(required, existing bool) error {
+	validate := acornfoxsetup.Validate
+	if existing {
+		validate = acornfoxsetup.ValidateExistingRuntime
+	}
+	if i.SchemaVersion != 1 || !validSHA(i.BindingSHA256) || !validID(i.ReleaseID) || !acornFoxHostSourceCommit.MatchString(i.SourceCommit) || i.ReleaseID != "release-"+i.Inputs.Version || validate(i.bundle(), i.Inputs) != nil || (required && acornfoxsetup.ValidateSetupToken(i.SetupToken) != nil) || (!required && len(i.SetupToken) != 0 && acornfoxsetup.ValidateSetupToken(i.SetupToken) != nil) {
 		return ErrAcornFoxRuntimeConfigConflict
 	}
 	return nil
@@ -109,6 +116,13 @@ func (i acornFoxRuntimeIntent) validateWithToken(required bool) error {
 func parseAcornFoxRuntimeIntent(raw []byte) (acornFoxRuntimeIntent, error) {
 	var i acornFoxRuntimeIntent
 	if len(raw) > acornFoxRuntimeMaxIntent || strictCanonicalJSON(raw, &i, "runtime intent") != nil || i.validate() != nil {
+		return acornFoxRuntimeIntent{}, ErrAcornFoxRuntimeConfigConflict
+	}
+	return i, nil
+}
+func parseAcornFoxExistingRuntimeIntent(raw []byte, required bool) (acornFoxRuntimeIntent, error) {
+	var i acornFoxRuntimeIntent
+	if len(raw) > acornFoxRuntimeMaxIntent || strictCanonicalJSON(raw, &i, "existing runtime intent") != nil || i.validateExisting(required) != nil {
 		return acornFoxRuntimeIntent{}, ErrAcornFoxRuntimeConfigConflict
 	}
 	return i, nil
@@ -237,6 +251,9 @@ func (s *acornFoxRuntimeConfig) run(ctx context.Context, expected AcornFoxBuildI
 		}
 	}
 	intent, err := parseAcornFoxRuntimeIntent(raw)
+	if !intentMissing {
+		intent, err = parseAcornFoxExistingRuntimeIntent(raw, true)
+	}
 	if err != nil || intent.BindingSHA256 != a.BindingSHA256 || intent.ReleaseID != identity.ReleaseID || intent.SourceCommit != identity.SourceCommit {
 		return empty, ErrAcornFoxRuntimeConfigConflict
 	}
@@ -477,7 +494,7 @@ func acornFoxRuntimeConfigScopeWithTokenPolicy(root *os.Root, store *TaskAcornFo
 	if err != nil {
 		return nil, ErrAcornFoxRuntimeConfigConflict
 	}
-	i, err := parseAcornFoxRuntimeIntent(raw)
+	i, err := parseAcornFoxExistingRuntimeIntent(raw, true)
 	if !requireToken {
 		i, err = parseAcornFoxRuntimeIntentForUpgrade(raw)
 	}

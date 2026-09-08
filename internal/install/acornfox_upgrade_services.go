@@ -133,6 +133,13 @@ func (acornFoxRealUpgradeServices) Run(ctx context.Context, verb, unit string) e
 	default:
 		return ErrAcornFoxUpgradeConflict
 	}
+	if verb == "stop" && unit == acornFoxEdgeUnit {
+		legacy, err := acornFoxEdgeLegacyStopAuthority()
+		if err != nil {
+			return err
+		}
+		return stopAcornFoxEdge(ctx, acornFoxUpgradeCommand, legacy, acornFoxEdgeStopBudget, 200*time.Millisecond)
+	}
 	_, e := acornFoxUpgradeCommand(ctx, "/usr/bin/systemctl", verb, unit)
 	return e
 }

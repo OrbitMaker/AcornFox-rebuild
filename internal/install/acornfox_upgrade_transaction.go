@@ -158,7 +158,7 @@ func (u *acornFoxUpgrade) captureRecent0039(ctx context.Context, s *TaskAcornFox
 		return image, err
 	}
 	runtime, err := parseAcornFoxRuntimeIntentForUpgrade(runtimeRaw)
-	if err != nil || runtime.validate() != nil {
+	if err != nil || runtime.validateExisting(true) != nil {
 		return image, ErrAcornFoxUpgradeConflict
 	}
 	receiptRaw, err := u.read(s.root, acornFoxRuntimeReceiptName, 0600, acornFoxRuntimeMaxIntent)
@@ -370,6 +370,9 @@ func (u *acornFoxUpgrade) nextImage(old acornFoxUpgradeImage, set *acornFoxCandi
 		}
 	}
 	runtime, e := acornFoxUpgradeRebind(old.Runtime, set.binding.binding, set.bindingSHA256, setupToken)
+	if e == nil {
+		runtime, e = acornFoxUpgradeBoundedEdge(runtime)
+	}
 	if e != nil {
 		return i, e
 	}

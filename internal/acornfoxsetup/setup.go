@@ -134,7 +134,15 @@ func fileSpecs() []File {
 // files; noncanonical bytes; mismatched keys, certificate profiles, signatures,
 // and env bindings. It validates consistency against trusted Inputs, not intent
 // authenticity: the caller must protect persisted intent against replacement.
-func Validate(bundle Bundle, input Inputs) error {
+func Validate(bundle Bundle, input Inputs) error { return validateProfile(bundle, input, false) }
+
+// ValidateExistingRuntime reads an already persisted runtime or upgrade
+// snapshot. It does not authorize creating a new legacy setup profile.
+func ValidateExistingRuntime(bundle Bundle, input Inputs) error {
+	return validateProfile(bundle, input, true)
+}
+
+func validateProfile(bundle Bundle, input Inputs, legacyAllowed bool) error {
 	if err := validateInputs(input); err != nil {
 		return err
 	}
@@ -187,8 +195,17 @@ func Validate(bundle Bundle, input Inputs) error {
 		return errInvalid
 	}
 	edge, err := acornfoxroute.InitialConfig(input.Origin, input.ResolverEndpoints)
-	if err != nil || !bytes.Equal(files[EdgeConfiguration], edge) {
+	if err != nil {
 		return errInvalid
+	}
+	if !bytes.Equal(files[EdgeConfiguration], edge) {
+		if !legacyAllowed {
+			return errInvalid
+		}
+		legacy, legacyErr := acornfoxroute.LegacyInitialConfig(input.Origin, input.ResolverEndpoints)
+		if legacyErr != nil || !bytes.Equal(files[EdgeConfiguration], legacy) {
+			return errInvalid
+		}
 	}
 	return nil
 }
