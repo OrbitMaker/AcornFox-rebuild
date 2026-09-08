@@ -246,6 +246,21 @@ type apiFixCandidate struct {
 	CreatedAt               time.Time              `json:"created_at"`
 	ExpiresAt               time.Time              `json:"expires_at"`
 }
+
+func (v apiFixCandidate) MarshalJSON() ([]byte, error) {
+	if v.Status == "preparing" || v.Status == "failed" {
+		return json.Marshal(struct {
+			CandidateID          string    `json:"candidate_id"`
+			ApplicationID        string    `json:"application_id"`
+			BaseSourceRevisionID string    `json:"base_source_revision_id"`
+			Status               string    `json:"status"`
+			CreatedAt            time.Time `json:"created_at"`
+		}{CandidateID: v.CandidateID, ApplicationID: v.ApplicationID, BaseSourceRevisionID: v.BaseSourceRevisionID, Status: v.Status, CreatedAt: v.CreatedAt})
+	}
+	type wire apiFixCandidate
+	return json.Marshal(wire(v))
+}
+
 type apiFixCandidates struct {
 	Items []apiFixCandidate `json:"items"`
 }

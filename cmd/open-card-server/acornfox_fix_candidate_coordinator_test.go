@@ -14,13 +14,14 @@ import (
 )
 
 type fixCandidateAsyncFixture struct {
-	mu       sync.Mutex
-	accepted int
-	executed int
-	canceled int
-	started  chan struct{}
-	start    sync.Once
-	replay   *application.AcornFoxFixCandidate
+	mu         sync.Mutex
+	accepted   int
+	executed   int
+	canceled   int
+	started    chan struct{}
+	start      sync.Once
+	replay     *application.AcornFoxFixCandidate
+	executeErr error
 }
 
 func (f *fixCandidateAsyncFixture) Replay(context.Context, application.AcornFoxFixCandidateCreateRequest) (*application.AcornFoxFixCandidate, error) {
@@ -49,11 +50,44 @@ func (f *fixCandidateAsyncFixture) Execute(ctx context.Context, _ application.Ac
 	if f.started != nil {
 		f.start.Do(func() { close(f.started) })
 	}
+	if f.executeErr != nil {
+		return application.AcornFoxFixCandidate{}, f.executeErr
+	}
 	<-ctx.Done()
 	f.mu.Lock()
 	f.canceled++
 	f.mu.Unlock()
 	return application.AcornFoxFixCandidate{}, ctx.Err()
+}
+
+func TestFixCandidateCoordinatorLogsOnlyFixedFailureStage(t *testing.T) {
+	lifecycle, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fixture := &fixCandidateAsyncFixture{executeErr: errors.New("secret-token-should-not-be-logged")}
+	coordinator, err := newAcornFoxFixCandidateCoordinator(lifecycle, fixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logged := make(chan string, 1)
+	coordinator.failureLog = func(id domain.ID, stage string) { logged <- id.String() + ":" + stage }
+	request := application.AcornFoxFixCandidateCreateRequest{ApplicationID: "app_candidate", BaseSourceRevisionID: "src_base", Paths: []string{"Dockerfile"}, UnifiedDiff: []byte("diff\n"), ContainerPort: 8080, IdempotencyKey: "candidate-log-stage", OwnerAdminID: "admin_candidate"}
+	accepted, err := coordinator.Create(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case value := <-logged:
+		if value != accepted.ID.String()+":unknown" || strings.Contains(value, "secret-token") {
+			t.Fatalf("logged=%q", value)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("candidate failure stage was not logged")
+	}
+	closeContext, closeCancel := context.WithTimeout(context.Background(), time.Second)
+	defer closeCancel()
+	if err := coordinator.Close(closeContext); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestFixCandidateCoordinatorDetachesAcceptedWorkFromRequestCancellation(t *testing.T) {

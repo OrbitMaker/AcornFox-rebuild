@@ -16,6 +16,16 @@ type fixCandidateRuntimeStoreFixture struct {
 	reads   int
 }
 
+type fixCandidateImageCleanupFixture struct {
+	candidate domain.ID
+	image     domain.ImageDigest
+}
+
+func (f *fixCandidateImageCleanupFixture) CleanupCandidate(_ context.Context, candidate domain.ID, image domain.ImageDigest) error {
+	f.candidate, f.image = candidate, image
+	return nil
+}
+
 func (f *fixCandidateRuntimeStoreFixture) EnqueueAcornFoxFixCandidateRuntimeTask(_ context.Context, request postgres.AcornFoxFixCandidateRuntimeTaskRequest) (domain.ID, error) {
 	f.request = request
 	return "task_candidate", nil
@@ -30,10 +40,11 @@ func (f *fixCandidateRuntimeStoreFixture) GetAcornFoxFixCandidateRuntimeEvidence
 
 func TestAcornFoxFixCandidateRuntimeDispatcherWaitsForCleanupEvidence(t *testing.T) {
 	store := &fixCandidateRuntimeStoreFixture{}
-	dispatcher := &acornFoxFixCandidateRuntimeDispatcher{store: store, poll: time.Millisecond, clock: func() time.Time { return time.Unix(1, 0).UTC() }}
+	cleanup := &fixCandidateImageCleanupFixture{}
+	dispatcher := &acornFoxFixCandidateRuntimeDispatcher{store: store, images: cleanup, poll: time.Millisecond, clock: func() time.Time { return time.Unix(1, 0).UTC() }}
 	image, _ := domain.ParseImageDigest("local/candidate", "sha256:"+strings.Repeat("b", 64))
 	evidence, err := dispatcher.ValidateCandidateRuntime(context.Background(), application.AcornFoxFixCandidateRuntimeRequest{CandidateID: "candidate_0123456789abcdef0123456789abcdef", ApplicationID: "app_candidate", Image: image, ContainerPort: 8080, IdempotencyKey: "runtime", Actor: "admin"})
-	if err != nil || !evidence.CleanupConfirmed || store.reads != 2 || store.request.Image != image || store.request.ContainerPort != 8080 {
+	if err != nil || !evidence.CleanupConfirmed || store.reads != 2 || store.request.Image != image || store.request.ContainerPort != 8080 || cleanup.candidate != "candidate_0123456789abcdef0123456789abcdef" || cleanup.image != image {
 		t.Fatalf("evidence=%+v request=%+v reads=%d err=%v", evidence, store.request, store.reads, err)
 	}
 }

@@ -135,9 +135,13 @@ func (f fixCandidateWorkspaceFixture) Release(acornfoxcandidate.Snapshot) error 
 
 type fixCandidateBuilderFixture struct {
 	evidence AcornFoxFixCandidateBuildEvidence
+	err      error
 }
 
 func (f fixCandidateBuilderFixture) Build(context.Context, acornfoxcandidate.Snapshot, string, string) (AcornFoxFixCandidateBuildEvidence, error) {
+	if f.err != nil {
+		return AcornFoxFixCandidateBuildEvidence{}, f.err
+	}
 	return f.evidence, nil
 }
 
@@ -274,14 +278,45 @@ func TestAcornFoxFixCandidateAcceptedIdentityBindsOwnerKeyAndBody(t *testing.T) 
 }
 
 func TestAcornFoxFixCandidateRejectsDuplicatePathsBeforeReservation(t *testing.T) {
-	request := AcornFoxFixCandidateCreateRequest{ApplicationID: "app_candidate", BaseSourceRevisionID: "src_base", Paths: []string{"Dockerfile", "Dockerfile"}, UnifiedDiff: []byte("diff\n"), ContainerPort: 8080, IdempotencyKey: "candidate-key", OwnerAdminID: "admin_candidate"}
-	store := &fixCandidateStoreFixture{}
-	service := &AcornFoxFixCandidateService{Store: store, Workspace: fixCandidateWorkspaceFixture{}, Builder: fixCandidateBuilderFixture{}, Runtime: fixCandidateRuntimeFixture{}}
-	if _, _, _, err := service.Accept(context.Background(), request); !domain.IsCode(err, domain.ErrValidation) {
-		t.Fatalf("duplicate paths err=%v", err)
+	valid := AcornFoxFixCandidateCreateRequest{ApplicationID: "app_candidate", BaseSourceRevisionID: "src_base", Paths: []string{"Dockerfile"}, UnifiedDiff: []byte("diff --git a/Dockerfile b/Dockerfile\n--- a/Dockerfile\n+++ b/Dockerfile\n@@ -1 +1 @@\n-a\n+b\n"), ContainerPort: 8080, IdempotencyKey: "candidate-key", OwnerAdminID: "admin_candidate"}
+	for name, mutate := range map[string]func(*AcornFoxFixCandidateCreateRequest){
+		"duplicate paths": func(request *AcornFoxFixCandidateCreateRequest) { request.Paths = []string{"Dockerfile", "Dockerfile"} },
+		"missing header": func(request *AcornFoxFixCandidateCreateRequest) {
+			request.UnifiedDiff = []byte("--- a/Dockerfile\n+++ b/Dockerfile\n@@ -1 +1 @@\n-a\n+b\n")
+		},
+		"wrong hunk count": func(request *AcornFoxFixCandidateCreateRequest) {
+			request.UnifiedDiff = []byte("diff --git a/Dockerfile b/Dockerfile\n--- a/Dockerfile\n+++ b/Dockerfile\n@@ -1,1 +1,1 @@\n context\n-a\n+b\n")
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			request := valid
+			mutate(&request)
+			store := &fixCandidateStoreFixture{}
+			service := &AcornFoxFixCandidateService{Store: store, Workspace: fixCandidateWorkspaceFixture{}, Builder: fixCandidateBuilderFixture{}, Runtime: fixCandidateRuntimeFixture{}}
+			if _, _, _, err := service.Accept(context.Background(), request); !domain.IsCode(err, domain.ErrValidation) {
+				t.Fatalf("invalid request err=%v", err)
+			}
+			if store.beginCalls != 0 {
+				t.Fatalf("invalid request reserved %d rows", store.beginCalls)
+			}
+		})
 	}
-	if store.beginCalls != 0 {
-		t.Fatalf("duplicate paths reserved %d rows", store.beginCalls)
+}
+
+func TestAcornFoxFixCandidateExecutionReturnsFixedBuildStage(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	snapshot := applicationCandidateSnapshot(t, now)
+	base := domain.SourceRevision{ID: snapshot.BaseSourceRevisionID, ApplicationID: snapshot.ApplicationID, Kind: domain.SourceGitHTTPS, Locator: snapshot.BaseRepositoryURL, Ref: "main", Commit: snapshot.BaseCommit, ContentDigest: snapshot.BaseTreeDigest, WorkspaceRef: "/immutable/base", CreatedAt: now, Immutable: true}
+	store := &fixCandidateStoreFixture{base: base, metadata: map[domain.ID]contracts.AcornFoxSourceMetadata{base.ID: {SourceRevisionID: base.ID, Availability: contracts.AcornFoxAvailable, RepositoryURL: base.Locator}}}
+	raw := errors.New("secret provider detail")
+	service := &AcornFoxFixCandidateService{Store: store, Workspace: fixCandidateWorkspaceFixture{snapshot: snapshot}, Builder: fixCandidateBuilderFixture{err: raw}, Runtime: fixCandidateRuntimeFixture{}, Clock: func() time.Time { return now }, Lifetime: time.Hour}
+	request := AcornFoxFixCandidateCreateRequest{ApplicationID: base.ApplicationID, BaseSourceRevisionID: base.ID, Paths: []string{"Dockerfile"}, UnifiedDiff: snapshot.CanonicalDiff, ContainerPort: 8080, IdempotencyKey: "fix-stage", OwnerAdminID: "admin_1"}
+	_, err := service.Create(context.Background(), request)
+	if !errors.Is(err, raw) || AcornFoxFixCandidateFailureStage(err) != AcornFoxFixCandidateStageBuild || !store.failed {
+		t.Fatalf("stage=%s failed=%v err=%v", AcornFoxFixCandidateFailureStage(err), store.failed, err)
+	}
+	if strings.Contains(err.Error(), "secret provider detail") {
+		t.Fatalf("execution error exposed raw cause: %v", err)
 	}
 }
 

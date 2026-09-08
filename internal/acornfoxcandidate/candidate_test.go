@@ -69,12 +69,15 @@ func TestManagerAppliesDurablyReservedCandidateIdentity(t *testing.T) {
 
 func TestManagerRejectsUnsafePatchShapesAndBaseLinks(t *testing.T) {
 	for name, patch := range map[string]string{
-		"traversal": "diff --git a/../x b/../x\n--- a/../x\n+++ b/../x\n@@ -1 +1 @@\n-a\n+b\n",
-		"rename":    "diff --git a/a b/b\nsimilarity index 100%\nrename from a\nrename to b\n",
-		"mode":      "diff --git a/a b/a\nold mode 100644\nnew mode 100755\n",
-		"binary":    "diff --git a/a b/a\nGIT binary patch\nliteral 0\n",
-		"addition":  "diff --git a/a b/a\n--- /dev/null\n+++ b/a\n@@ -0,0 +1 @@\n+a\n",
-		"sensitive": "diff --git a/.env b/.env\n--- a/.env\n+++ b/.env\n@@ -1 +1 @@\n-a\n+b\n",
+		"missing diff header": "--- a/Dockerfile\n+++ b/Dockerfile\n@@ -1 +1 @@\n-a\n+b\n",
+		"wrong hunk count":    "diff --git a/Dockerfile b/Dockerfile\n--- a/Dockerfile\n+++ b/Dockerfile\n@@ -1,1 +1,1 @@\n line one\n-line two\n+line changed\n",
+		"context only":        "diff --git a/Dockerfile b/Dockerfile\n--- a/Dockerfile\n+++ b/Dockerfile\n@@ -1 +1 @@\n unchanged\n",
+		"traversal":           "diff --git a/../x b/../x\n--- a/../x\n+++ b/../x\n@@ -1 +1 @@\n-a\n+b\n",
+		"rename":              "diff --git a/a b/b\nsimilarity index 100%\nrename from a\nrename to b\n",
+		"mode":                "diff --git a/a b/a\nold mode 100644\nnew mode 100755\n",
+		"binary":              "diff --git a/a b/a\nGIT binary patch\nliteral 0\n",
+		"addition":            "diff --git a/a b/a\n--- /dev/null\n+++ b/a\n@@ -0,0 +1 @@\n+a\n",
+		"sensitive":           "diff --git a/.env b/.env\n--- a/.env\n+++ b/.env\n@@ -1 +1 @@\n-a\n+b\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, _, err := validatePatch([]byte(patch)); err == nil {
@@ -103,6 +106,55 @@ func TestManagerRejectsStaleBaseAndPatchPreimage(t *testing.T) {
 	}
 }
 
+func TestRetireLegacyWorkspaceRemovesOnlyKnownUnlinkedCandidateTrees(t *testing.T) {
+	root := t.TempDir()
+	legacy := filepath.Join(root, ".acornfox-candidates")
+	known := filepath.Join(legacy, "candidate_0123456789abcdef0123456789abcdef")
+	if err := os.MkdirAll(known, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(known, "Dockerfile"), []byte("FROM scratch\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := RetireLegacyWorkspace(root); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(legacy); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("legacy root still exists: %v", err)
+	}
+
+	if err := os.MkdirAll(legacy, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacy, "unknown"), []byte("foreign"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := RetireLegacyWorkspace(root); err == nil {
+		t.Fatal("unknown legacy entry was removed")
+	}
+	if _, err := os.Stat(filepath.Join(legacy, "unknown")); err != nil {
+		t.Fatalf("unknown entry did not remain fail-closed: %v", err)
+	}
+}
+
+func TestRetireLegacyWorkspaceRejectsHardlinkedCandidateFile(t *testing.T) {
+	root := t.TempDir()
+	known := filepath.Join(root, ".acornfox-candidates", "candidate_0123456789abcdef0123456789abcdef")
+	if err := os.MkdirAll(known, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	original := filepath.Join(known, "Dockerfile")
+	if err := os.WriteFile(original, []byte("FROM scratch\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(original, filepath.Join(root, "outside-link")); err != nil {
+		t.Fatal(err)
+	}
+	if err := RetireLegacyWorkspace(root); err == nil {
+		t.Fatal("hardlinked legacy file was removed")
+	}
+}
+
 func candidateFixture(t *testing.T) (*Manager, domain.SourceRevision) {
 	t.Helper()
 	workspaceRoot := t.TempDir()
@@ -127,7 +179,11 @@ func candidateFixture(t *testing.T) (*Manager, domain.SourceRevision) {
 		t.Fatal(err)
 	}
 	base := domain.SourceRevision{ID: "src_public_base", ApplicationID: "app_candidate", Kind: domain.SourceGitHTTPS, Locator: "https://github.com/OrbitMaker/acornfox.git", Ref: "main", Commit: "f78b7df2922b7af805a398a3e108bed1828928ae", ContentDigest: "sha256:" + digest, WorkspaceRef: baseRoot, CreatedAt: time.Unix(1, 0).UTC(), Immutable: true}
-	manager, err := NewManager(workspaceRoot)
+	candidateRoot := t.TempDir()
+	if err := os.Chmod(candidateRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := NewManager(workspaceRoot, candidateRoot)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -15,7 +15,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -111,19 +113,19 @@ type Manager struct {
 	clock         func() time.Time
 }
 
-func NewManager(workspaceRoot string) (*Manager, error) {
+func NewManager(workspaceRoot, candidateWorkspaceRoot string) (*Manager, error) {
 	root, err := secureExistingRoot(workspaceRoot)
 	if err != nil {
 		return nil, err
+	}
+	candidateRoot, err := secureExistingRoot(candidateWorkspaceRoot)
+	if err != nil || within(root, candidateRoot) || within(candidateRoot, root) || candidateRoot == root {
+		return nil, errors.New("candidate workspace root is unsafe")
 	}
 	gitBinary := "/usr/bin/git"
 	gitDigest, err := digestRegularFile(gitBinary)
 	if err != nil {
 		return nil, fmt.Errorf("candidate Git executable is unavailable")
-	}
-	candidateRoot := filepath.Join(root, ".acornfox-candidates")
-	if err := os.Mkdir(candidateRoot, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
-		return nil, err
 	}
 	info, err := os.Lstat(candidateRoot)
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 {
@@ -135,9 +137,9 @@ func NewManager(workspaceRoot string) (*Manager, error) {
 	}
 	for _, entry := range entries {
 		name := entry.Name()
-		owned := strings.HasPrefix(name, ".stage-") || strings.HasPrefix(name, "candidate_") && len(name) == len("candidate_")+32
+		owned := strings.HasPrefix(name, ".stage-") && len(name) > len(".stage-") || validCandidateID(domain.ID(name))
 		if !owned {
-			continue
+			return nil, errors.New("candidate workspace root contains an unknown entry")
 		}
 		path := filepath.Join(candidateRoot, name)
 		info, err := os.Lstat(path)
@@ -146,6 +148,65 @@ func NewManager(workspaceRoot string) (*Manager, error) {
 		}
 	}
 	return &Manager{workspaceRoot: root, candidateRoot: candidateRoot, gitBinary: gitBinary, gitDigest: gitDigest, clock: time.Now}, nil
+}
+
+// RetireLegacyWorkspace removes the one obsolete namespace created by the
+// first candidate implementation inside the source pool. Unknown entries,
+// links, hardlinks, special files, or loose permissions fail closed so source
+// capacity accounting is never taught to ignore foreign data.
+func RetireLegacyWorkspace(workspaceRoot string) error {
+	root, err := secureExistingRoot(workspaceRoot)
+	if err != nil {
+		return err
+	}
+	legacy := filepath.Join(root, ".acornfox-candidates")
+	info, err := os.Lstat(legacy)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 {
+		return errors.New("legacy candidate workspace is unsafe")
+	}
+	entries, err := os.ReadDir(legacy)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		knownStage := strings.HasPrefix(name, ".stage-") && len(name) > len(".stage-")
+		knownCandidate := validCandidateID(domain.ID(name))
+		if !knownStage && !knownCandidate {
+			return errors.New("legacy candidate workspace contains an unknown entry")
+		}
+		path := filepath.Join(legacy, name)
+		info, err := os.Lstat(path)
+		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return errors.New("legacy candidate workspace entry is not an owned directory")
+		}
+		if err := validateLegacyCandidateTree(path); err != nil {
+			return err
+		}
+	}
+	return removeCandidateTree(legacy)
+}
+
+func validateLegacyCandidateTree(root string) error {
+	return filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return errors.New("legacy candidate workspace is unreadable")
+		}
+		info, err := os.Lstat(path)
+		if err != nil || info.Mode()&os.ModeSymlink != 0 {
+			return errors.New("legacy candidate workspace contains a link")
+		}
+		if info.IsDir() {
+			return nil
+		}
+		if !singleRegular(info) {
+			return errors.New("legacy candidate workspace contains a linked or special file")
+		}
+		return nil
+	})
 }
 
 func (m *Manager) Read(ctx context.Context, base domain.SourceRevision, paths []string) (ReadResult, error) {
@@ -432,15 +493,20 @@ func (b *boundedBuffer) Write(value []byte) (int, error) {
 }
 
 func validatePatch(raw []byte) ([]byte, []string, error) {
-	if bytes.Contains(raw, []byte("\r")) || raw[len(raw)-1] != '\n' {
+	if len(raw) == 0 {
+		return nil, nil, ErrInvalidPatch
+	}
+	if bytes.Contains(raw, []byte("\r")) || bytes.IndexByte(raw, 0) >= 0 || !utf8.Valid(raw) || raw[len(raw)-1] != '\n' {
 		return nil, nil, ErrInvalidPatch
 	}
 	lines := strings.Split(string(raw), "\n")
 	changed := map[string]bool{}
 	var current string
-	seenOld, seenNew, seenHunk := false, false, false
+	seenOld, seenNew, seenHunk, seenChange := false, false, false, false
+	oldRemaining, newRemaining := 0, 0
+	var err error
 	finish := func() error {
-		if current != "" && (!seenOld || !seenNew || !seenHunk) {
+		if current != "" && (!seenOld || !seenNew || !seenHunk || !seenChange || oldRemaining != 0 || newRemaining != 0) {
 			return ErrInvalidPatch
 		}
 		return nil
@@ -460,7 +526,7 @@ func validatePatch(raw []byte) ([]byte, []string, error) {
 				return nil, nil, ErrUnsafePath
 			}
 			current, changed[oldPath] = oldPath, true
-			seenOld, seenNew, seenHunk = false, false, false
+			seenOld, seenNew, seenHunk, seenChange = false, false, false, false
 		case current == "":
 			return nil, nil, ErrInvalidPatch
 		case strings.HasPrefix(line, "--- "):
@@ -474,8 +540,12 @@ func validatePatch(raw []byte) ([]byte, []string, error) {
 			}
 			seenNew = true
 		case strings.HasPrefix(line, "@@ "):
-			if !seenOld || !seenNew {
+			if !seenOld || !seenNew || seenHunk && (oldRemaining != 0 || newRemaining != 0) {
 				return nil, nil, ErrInvalidPatch
+			}
+			oldRemaining, newRemaining, err = candidateHunkCounts(line)
+			if err != nil {
+				return nil, nil, err
 			}
 			seenHunk = true
 		case strings.HasPrefix(line, "index "):
@@ -483,7 +553,34 @@ func validatePatch(raw []byte) ([]byte, []string, error) {
 			if seenOld || len(fields) < 2 || len(fields) > 3 || !strings.Contains(fields[1], "..") || len(fields) == 3 && fields[2] != "100644" && fields[2] != "100755" {
 				return nil, nil, ErrInvalidPatch
 			}
-		case strings.HasPrefix(line, " "), strings.HasPrefix(line, "+"), strings.HasPrefix(line, "-"), line == `\ No newline at end of file`:
+		case strings.HasPrefix(line, " "):
+			if !seenHunk {
+				return nil, nil, ErrInvalidPatch
+			}
+			oldRemaining--
+			newRemaining--
+			if oldRemaining < 0 || newRemaining < 0 {
+				return nil, nil, ErrInvalidPatch
+			}
+		case strings.HasPrefix(line, "+"):
+			if !seenHunk {
+				return nil, nil, ErrInvalidPatch
+			}
+			newRemaining--
+			seenChange = true
+			if newRemaining < 0 {
+				return nil, nil, ErrInvalidPatch
+			}
+		case strings.HasPrefix(line, "-"):
+			if !seenHunk {
+				return nil, nil, ErrInvalidPatch
+			}
+			oldRemaining--
+			seenChange = true
+			if oldRemaining < 0 {
+				return nil, nil, ErrInvalidPatch
+			}
+		case line == `\ No newline at end of file`:
 			if !seenHunk {
 				return nil, nil, ErrInvalidPatch
 			}
@@ -500,6 +597,64 @@ func validatePatch(raw []byte) ([]byte, []string, error) {
 	}
 	sort.Strings(paths)
 	return append([]byte(nil), raw...), paths, nil
+}
+
+var candidateHunkHeader = regexp.MustCompile(`^@@ -([0-9]+)(?:,([0-9]+))? \+([0-9]+)(?:,([0-9]+))? @@(?: .*)?$`)
+
+func candidateHunkCounts(header string) (int, int, error) {
+	match := candidateHunkHeader.FindStringSubmatch(header)
+	if len(match) != 5 {
+		return 0, 0, ErrInvalidPatch
+	}
+	oldStart, oldCount, err := candidateHunkSide(match[1], match[2])
+	if err != nil {
+		return 0, 0, err
+	}
+	newStart, newCount, err := candidateHunkSide(match[3], match[4])
+	if err != nil {
+		return 0, 0, err
+	}
+	if oldStart == 0 && oldCount != 0 || newStart == 0 && newCount != 0 {
+		return 0, 0, ErrInvalidPatch
+	}
+	return oldCount, newCount, nil
+}
+
+func candidateHunkSide(startRaw, countRaw string) (int, int, error) {
+	start, err := strconv.Atoi(startRaw)
+	if err != nil || start < 0 {
+		return 0, 0, ErrInvalidPatch
+	}
+	count := 1
+	if countRaw != "" {
+		count, err = strconv.Atoi(countRaw)
+		if err != nil || count < 0 {
+			return 0, 0, ErrInvalidPatch
+		}
+	}
+	return start, count, nil
+}
+
+// ValidatePatch checks the complete unified-diff envelope and hunk counts
+// before a durable candidate reservation is created.
+func ValidatePatch(raw []byte, allowedPaths []string) error {
+	_, changed, err := validatePatch(raw)
+	if err != nil {
+		return err
+	}
+	allowed := make(map[string]bool, len(allowedPaths))
+	for _, path := range allowedPaths {
+		if safeRelativePath(path) != nil || allowed[path] {
+			return ErrUnsafePath
+		}
+		allowed[path] = true
+	}
+	for _, path := range changed {
+		if !allowed[path] {
+			return ErrUnsafePath
+		}
+	}
+	return nil
 }
 
 func safeRelativePath(value string) error {

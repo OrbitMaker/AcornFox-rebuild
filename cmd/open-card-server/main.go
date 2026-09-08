@@ -8,6 +8,7 @@ import (
 	"net/http"
 	stdio "os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -181,9 +182,13 @@ func main() {
 					cancel()
 				}
 			}()
-			imageStore, err := imageprovider.New(imageprovider.Config{Root: getenv(acornfoxenv.OCIStoreRoot)})
+			rawImageStore, err := imageprovider.New(imageprovider.Config{Root: getenv(acornfoxenv.OCIStoreRoot)})
 			if err != nil {
 				log.Fatal(err)
+			}
+			imageStore, err := newAcornFoxGatedImageStore(rawImageStore, store.DB())
+			if err != nil {
+				log.Fatal("image mutation gate unavailable")
 			}
 			capacityConfig := capacity.Config{DiskPath: buildWorkRoot, BuildReserve: contracts.ResourceLimits{CPUMillis: 250, MemoryBytes: 256 << 20, DiskBytes: 512 << 20}, RuntimeReserve: contracts.ResourceLimits{CPUMillis: 250, MemoryBytes: 256 << 20, DiskBytes: 512 << 20}}
 			if value := getenv(acornfoxenv.CapacityFixedHostPort); value != "" {
@@ -280,7 +285,20 @@ func main() {
 					}
 					log.Fatal("fix candidate execution leader was lost during startup")
 				}
-				candidateWorkspace, candidateErr := acornfoxcandidate.NewManager(workspaceRoot)
+				if candidateErr := acornfoxcandidate.RetireLegacyWorkspace(workspaceRoot); candidateErr != nil {
+					log.Fatal("legacy fix candidate workspace retirement failed")
+				}
+				candidateSourceRoot := filepath.Join(buildWorkRoot, "candidate-sources")
+				candidateBuildRoot := filepath.Join(buildWorkRoot, "candidate-builds")
+				for _, root := range []string{candidateSourceRoot, candidateBuildRoot} {
+					if candidateErr := prepareAcornFoxCandidateWorkRoot(root); candidateErr != nil {
+						log.Fatal("fix candidate work root unavailable")
+					}
+				}
+				if candidateErr := recoverAcornFoxCandidateBuildRoot(candidateBuildRoot); candidateErr != nil {
+					log.Fatal("fix candidate build recovery failed")
+				}
+				candidateWorkspace, candidateErr := acornfoxcandidate.NewManager(workspaceRoot, candidateSourceRoot)
 				if candidateErr != nil {
 					log.Fatal("fix candidate workspace unavailable")
 				}
@@ -291,18 +309,62 @@ func main() {
 				if candidateErr := candidateStore.RecoverAcornFoxFixCandidates(candidateLeaderContext, time.Now().UTC()); candidateErr != nil {
 					log.Fatal("fix candidate recovery unavailable")
 				}
+				candidateLogRoot := filepath.Join(buildWorkRoot, "candidate-logs")
+				if candidateErr := prepareAcornFoxCandidateWorkRoot(candidateLogRoot); candidateErr != nil {
+					log.Fatal("fix candidate log root unavailable")
+				}
+				candidateLogStore, candidateErr := observability.NewLogStore(observability.LogStoreConfig{RootDir: candidateLogRoot, MaxFileBytes: acornFoxCandidateBuildLogMaxBytes, MaxTotalBytes: 32 << 20, MaxBuildFiles: 32, MaxFilesPerStream: 4, Secrets: append(append([]string(nil), redactionRoots...), candidateLogRoot)})
+				if candidateErr != nil {
+					log.Fatal("fix candidate log store unavailable")
+				}
+				candidateBuildConfig := buildConfig
+				candidateBuildConfig.WorkspaceRoot = candidateSourceRoot
+				candidateBuildConfig.WorkRoot = candidateBuildRoot
+				candidateImageRoot := filepath.Join(buildWorkRoot, "candidate-images")
+				candidateImageStore, candidateErr := newAcornFoxCandidateImageStore(imageStore, postgresAcornFoxCandidateImageGuard{store: store}, candidateImageRoot)
+				if candidateErr != nil {
+					log.Fatal("fix candidate image tracker unavailable")
+				}
+				candidateBuildConfig.ImageStore = candidateImageStore
+				candidateBuildConfig.LogSink = &acornFoxCandidateBuildLogSink{logs: candidateLogStore, redactionRoots: append(append([]string(nil), redactionRoots...), candidateLogRoot)}
+				candidateBuildProvider, candidateErr := buildkit.New(candidateBuildConfig)
+				if candidateErr != nil {
+					log.Fatal("fix candidate build provider unavailable")
+				}
 				candidateService := &application.AcornFoxFixCandidateService{
 					Store: candidateStore, Workspace: candidateWorkspace,
-					Builder: &application.AcornFoxFixCandidateBuilder{Builder: buildProvider, Capacity: capacityProvider, Network: buildNetwork, TargetRepository: "acornfox.local/apps", StorageKeyPrefix: "acornfox-candidate"},
-					Runtime: &acornFoxFixCandidateRuntimeDispatcher{store: store}, Publisher: deliveryService,
+					Builder: &application.AcornFoxFixCandidateBuilder{Builder: candidateBuildProvider, Capacity: capacityProvider, Network: buildNetwork, TargetRepository: "acornfox.local/apps", StorageKeyPrefix: "acornfox-candidate"},
+					Runtime: &acornFoxFixCandidateRuntimeDispatcher{store: store, images: candidateImageStore}, Publisher: deliveryService,
 				}
 				candidateCoordinator, candidateErr := newAcornFoxFixCandidateCoordinator(candidateLeaderContext, candidateService)
 				if candidateErr != nil {
 					log.Fatal("fix candidate coordinator unavailable")
 				}
 				candidateHandler.Service = candidateCoordinator
+				if err := candidateImageStore.Recover(candidateLeaderContext); err != nil {
+					log.Printf("fix candidate image cleanup deferred")
+				}
+				candidateImageCleanupDone := make(chan struct{})
+				go func() {
+					defer close(candidateImageCleanupDone)
+					ticker := time.NewTicker(time.Minute)
+					defer ticker.Stop()
+					for {
+						select {
+						case <-candidateLeaderContext.Done():
+							return
+						case <-ticker.C:
+							cleanupContext, cleanupCancel := context.WithTimeout(candidateLeaderContext, 10*time.Second)
+							if err := candidateImageStore.Recover(cleanupContext); err != nil {
+								log.Printf("fix candidate image cleanup deferred")
+							}
+							cleanupCancel()
+						}
+					}
+				}()
 				defer func() {
 					candidateLeaderCancel()
+					<-candidateImageCleanupDone
 					closeContext, closeCancel := context.WithTimeout(context.Background(), 30*time.Second)
 					closeErr := candidateCoordinator.Close(closeContext)
 					closeCancel()

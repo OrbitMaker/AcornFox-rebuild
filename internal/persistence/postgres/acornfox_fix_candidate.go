@@ -277,6 +277,8 @@ type acornFoxCandidateTaskPayload struct {
 	Parameters json.RawMessage `json:"parameters"`
 }
 
+const acornFoxCandidateEnvironmentName = "acornfox-candidate-validation"
+
 func (s *Store) EnqueueAcornFoxFixCandidateRuntimeTask(ctx context.Context, request AcornFoxFixCandidateRuntimeTaskRequest) (domain.ID, error) {
 	if request.CandidateID.Empty() || request.ApplicationID.Empty() || request.Image.Validate() != nil || request.ContainerPort < 1 || request.ContainerPort > 65535 || request.IdempotencyKey == "" || request.Actor == "" {
 		return "", domain.ValidationError("candidate runtime task is invalid")
@@ -284,14 +286,7 @@ func (s *Store) EnqueueAcornFoxFixCandidateRuntimeTask(ctx context.Context, requ
 	if request.Now.IsZero() {
 		request.Now = s.now()
 	}
-	var environmentID domain.ID
-	err := s.db.QueryRowContext(ctx, `SELECT id FROM environments WHERE application_id=$1 AND name='default'`, request.ApplicationID.String()).Scan(&environmentID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", ErrNotFound
-	}
-	if err != nil {
-		return "", err
-	}
+	environmentID := domain.ID("env_candidate_" + candidateStoreID("environment", request.ApplicationID.String())[:24])
 	identity := candidateStoreID(request.CandidateID.String(), request.Image.Repository, request.Image.Digest, request.IdempotencyKey)
 	operation, err := domain.NewOperation(request.ApplicationID, environmentID, domain.OperationDeploy, "candidate/"+request.CandidateID.String()+"/runtime", request.IdempotencyKey, request.Now.UTC())
 	if err != nil {
@@ -308,8 +303,26 @@ func (s *Store) EnqueueAcornFoxFixCandidateRuntimeTask(ctx context.Context, requ
 	if err != nil {
 		return "", err
 	}
-	if _, err := s.EnqueueControllerTask(ctx, EnqueueControllerTaskRequest{Operation: operation, TaskID: taskID, Payload: payload, MaxAttempts: 3}); err != nil {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
 		return "", err
+	}
+	rollback := func(cause error) (domain.ID, error) { return "", rollbackTx(tx, cause) }
+	if _, err := tx.ExecContext(ctx, `INSERT INTO environments(id,application_id,name,created_at) VALUES($1,$2,$3,$4) ON CONFLICT(application_id,name) DO NOTHING`, environmentID.String(), request.ApplicationID.String(), acornFoxCandidateEnvironmentName, request.Now.UTC()); err != nil {
+		return rollback(err)
+	}
+	var storedID, storedApplication, storedName string
+	if err := tx.QueryRowContext(ctx, `SELECT id,application_id,name FROM environments WHERE application_id=$1 AND name=$2 FOR SHARE`, request.ApplicationID.String(), acornFoxCandidateEnvironmentName).Scan(&storedID, &storedApplication, &storedName); err != nil {
+		return rollback(err)
+	}
+	if storedID != environmentID.String() || storedApplication != request.ApplicationID.String() || storedName != acornFoxCandidateEnvironmentName {
+		return rollback(domain.ValidationError("candidate runtime environment scope is not platform-owned"))
+	}
+	if _, err := s.enqueueControllerTaskTx(ctx, tx, EnqueueControllerTaskRequest{Operation: operation, TaskID: taskID, Payload: payload, MaxAttempts: 3}); err != nil {
+		return rollback(err)
+	}
+	if err := tx.Commit(); err != nil {
+		return "", fmt.Errorf("commit candidate runtime task: %w", err)
 	}
 	return taskID, nil
 }
@@ -330,7 +343,8 @@ func (s *Store) GetAcornFoxFixCandidateRuntimeEvidence(ctx context.Context, task
 		return application.AcornFoxFixCandidateRuntimeEvidence{}, false, errors.New("candidate runtime task payload is invalid")
 	}
 	var wrapper acornFoxCandidateAgentWrapper
-	if err := decodeControllerTaskJSON(durable.Parameters, &wrapper); err != nil || wrapper.PayloadType != "acornfox_candidate_validation_v1" || wrapper.Request.Image != image || wrapper.Request.CandidateID.Empty() || wrapper.Request.ApplicationID != task.Operation.ApplicationID || wrapper.Request.ContainerPort < 1 || task.Operation.Type != domain.OperationDeploy || task.Operation.TargetRef != "candidate/"+wrapper.Request.CandidateID.String()+"/runtime" || wrapper.Request.Resources != (acornFoxCandidateAgentResources{CPUMillis: 500, MemoryBytes: 512 << 20, PIDs: 128, DiskReservationBytes: 1 << 30}) {
+	expectedEnvironmentID := domain.ID("env_candidate_" + candidateStoreID("environment", task.Operation.ApplicationID.String())[:24])
+	if err := decodeControllerTaskJSON(durable.Parameters, &wrapper); err != nil || wrapper.PayloadType != "acornfox_candidate_validation_v1" || wrapper.Request.Image != image || wrapper.Request.CandidateID.Empty() || wrapper.Request.ApplicationID != task.Operation.ApplicationID || wrapper.Request.ContainerPort < 1 || task.Operation.Type != domain.OperationDeploy || task.Operation.EnvironmentID != expectedEnvironmentID || task.Operation.TargetRef != "candidate/"+wrapper.Request.CandidateID.String()+"/runtime" || wrapper.Request.Resources != (acornFoxCandidateAgentResources{CPUMillis: 500, MemoryBytes: 512 << 20, PIDs: 128, DiskReservationBytes: 1 << 30}) {
 		return application.AcornFoxFixCandidateRuntimeEvidence{}, false, errors.New("candidate runtime task identity is invalid")
 	}
 	runtimeID, err := candidateAgentRuntimeID(wrapper.Request)

@@ -15,14 +15,19 @@ type acornFoxFixCandidateRuntimeStore interface {
 	GetAcornFoxFixCandidateRuntimeEvidence(context.Context, domain.ID, domain.ImageDigest) (application.AcornFoxFixCandidateRuntimeEvidence, bool, error)
 }
 
+type acornFoxFixCandidateImageCleanup interface {
+	CleanupCandidate(context.Context, domain.ID, domain.ImageDigest) error
+}
+
 type acornFoxFixCandidateRuntimeDispatcher struct {
-	store acornFoxFixCandidateRuntimeStore
-	clock func() time.Time
-	poll  time.Duration
+	store  acornFoxFixCandidateRuntimeStore
+	images acornFoxFixCandidateImageCleanup
+	clock  func() time.Time
+	poll   time.Duration
 }
 
 func (d *acornFoxFixCandidateRuntimeDispatcher) ValidateCandidateRuntime(ctx context.Context, request application.AcornFoxFixCandidateRuntimeRequest) (application.AcornFoxFixCandidateRuntimeEvidence, error) {
-	if d == nil || d.store == nil {
+	if d == nil || d.store == nil || d.images == nil {
 		return application.AcornFoxFixCandidateRuntimeEvidence{}, errors.New("candidate runtime dispatcher is unavailable")
 	}
 	now := time.Now().UTC()
@@ -40,9 +45,13 @@ func (d *acornFoxFixCandidateRuntimeDispatcher) ValidateCandidateRuntime(ctx con
 	for {
 		evidence, complete, err := d.store.GetAcornFoxFixCandidateRuntimeEvidence(ctx, taskID, request.Image)
 		if err != nil {
+			_ = d.cleanupCandidateImage(ctx, request)
 			return application.AcornFoxFixCandidateRuntimeEvidence{}, err
 		}
 		if complete {
+			if err := d.cleanupCandidateImage(ctx, request); err != nil {
+				return application.AcornFoxFixCandidateRuntimeEvidence{}, errors.New("candidate image cleanup was not confirmed")
+			}
 			return evidence, nil
 		}
 		select {
@@ -51,4 +60,10 @@ func (d *acornFoxFixCandidateRuntimeDispatcher) ValidateCandidateRuntime(ctx con
 		case <-time.After(poll):
 		}
 	}
+}
+
+func (d *acornFoxFixCandidateRuntimeDispatcher) cleanupCandidateImage(ctx context.Context, request application.AcornFoxFixCandidateRuntimeRequest) error {
+	cleanupContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	return d.images.CleanupCandidate(cleanupContext, request.CandidateID, request.Image)
 }

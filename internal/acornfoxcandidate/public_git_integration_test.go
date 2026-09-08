@@ -45,7 +45,11 @@ func TestCandidateReadsCanonicalPublicGitRevisionAndAppliesKnownFix(t *testing.T
 	if prepared.Revision.Commit != "4504127dea582ffaa7f6fde1729aa0629216a724" {
 		t.Fatalf("resolved commit=%s", prepared.Revision.Commit)
 	}
-	manager, err := NewManager(workspaceRoot)
+	candidateRoot := filepath.Join(root, "candidate-sources")
+	if err := os.Mkdir(candidateRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := NewManager(workspaceRoot, candidateRoot)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"log"
 	"sync"
 	"time"
 
@@ -35,14 +36,15 @@ type acornFoxFixCandidateAsyncCommand interface {
 }
 
 type acornFoxFixCandidateCoordinator struct {
-	service acornFoxFixCandidateAsyncCommand
-	ctx     context.Context
-	cancel  context.CancelFunc
-	queue   chan acornFoxFixCandidateJob
-	slots   chan struct{}
-	mu      sync.Mutex
-	closing bool
-	workers sync.WaitGroup
+	service    acornFoxFixCandidateAsyncCommand
+	ctx        context.Context
+	cancel     context.CancelFunc
+	queue      chan acornFoxFixCandidateJob
+	slots      chan struct{}
+	mu         sync.Mutex
+	closing    bool
+	workers    sync.WaitGroup
+	failureLog func(domain.ID, string)
 }
 
 func newAcornFoxFixCandidateCoordinator(lifecycle context.Context, service acornFoxFixCandidateAsyncCommand) (*acornFoxFixCandidateCoordinator, error) {
@@ -110,7 +112,14 @@ func (c *acornFoxFixCandidateCoordinator) execute(job acornFoxFixCandidateJob) {
 	defer func() { <-c.slots }()
 	ctx, cancel := context.WithTimeout(c.ctx, acornFoxFixCandidateExecutionLimit)
 	defer cancel()
-	_, _ = c.service.Execute(ctx, job.accepted, job.request, job.digest)
+	if _, err := c.service.Execute(ctx, job.accepted, job.request, job.digest); err != nil {
+		stage := application.AcornFoxFixCandidateFailureStage(err)
+		if c.failureLog != nil {
+			c.failureLog(job.accepted.ID, stage)
+			return
+		}
+		log.Printf("fix candidate %s failed during %s", job.accepted.ID, stage)
+	}
 }
 
 func (c *acornFoxFixCandidateCoordinator) Close(ctx context.Context) error {

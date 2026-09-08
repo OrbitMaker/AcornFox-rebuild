@@ -102,20 +102,26 @@ ledger records bounded candidate and verification facts without changing the exi
 
 Phase 1 reads an exact application-owned public-Git `SourceRevision` from its existing
 read-only workspace. The source provider rechecks the persisted tree digest before and
-after copying into a private candidate directory below the configured source workspace
-root. Model context contains only an explicit allowlist of at most 32 ordinary text
+after copying into a private candidate source directory below the configured build work
+root. Candidate source, build, log and image-tracking directories are separate siblings;
+the source pool remains reserved for its existing digest/staging vocabulary. Model context contains only an explicit allowlist of at most 32 ordinary text
 files, and Assistant source reads fail closed when the application has any active secret
-reference. A proposed unified diff is limited to 128 KiB and 32 paths. Fixed Git argv reads
+reference. A proposed Git-format unified diff is limited to 128 KiB and 32 paths; its
+headers, paths and hunk counts are checked before durable acceptance. Fixed Git argv reads
 the diff from stdin; no shell or caller-selected executable is available. Binary,
 rename, copy, mode, symlink, hardlink, absolute, traversal, `.git`, credential and
 sensitive-file changes fail closed. The resulting tree is rehashed, made read-only and
 represented as a transient `candidate://` source with no Git commit. BuildKit validates
 that transient source through the existing AcornFox Dockerfile binder, trusted network
 policy, capacity lease, bounded logs and immutable OCI store. Candidate build facts do
-not enter the normal build/release tables.
+not enter the normal build/release tables. The candidate uses a separate mandatory
+private Build-category log sink (1 MiB per log, 32 MiB total, 32 streams), with redaction
+and integrity readback, and never inserts a normal M4 build-log index.
 
 Phase 2 sends only a digest-bound candidate runtime request through the existing Agent
-task envelope and a dedicated capability marker. The Agent uses a separate candidate
+task envelope and a dedicated capability marker. A fixed, application-owned candidate
+environment keeps normal observe/log operations in the default environment untouched.
+The Agent uses a separate candidate
 runtime provider below its configured runtime work root, a fixed task prefix and an
 internal Docker network. It accepts no volumes, secrets, Caddy route, host path, command
 or shell. Success requires exact OCI readback, bounded runtime observation, loopback
@@ -151,3 +157,11 @@ One server owns candidate execution through a dedicated PostgreSQL session advis
 Every candidate state mutation uses that same session, so loss of the leader connection
 fences completion immediately; a pool connection cannot write a stale validated result.
 Other server instances remain read-only for candidate item and list discovery.
+
+Candidate OCI archives are tracked before publication and reclaimed after terminal
+runtime cleanup. Crash intents receive the execution budget plus a one-minute grace
+window and are retried at startup and periodically. Normal and candidate image mutations
+share one PostgreSQL cross-process gate; deletion rechecks active work, ordinary artifact
+references, other candidate receipts and the ImageStore retention protections. Shared or
+uncertain images are retained. Only fixed candidate identifiers and failure-stage codes
+are logged for execution failures; raw errors, patches and credentials are excluded.

@@ -63,6 +63,22 @@ func TestFixCandidateDecoderAcceptsLifecycleAndBoundedList(t *testing.T) {
 	if _, err := decodeResponse(strings.NewReader(withEvidence), shapeFixCandidate); err == nil {
 		t.Fatal("preparing candidate with validation evidence was accepted")
 	}
+	decoded, err := decodeResponse(strings.NewReader(pending), shapeFixCandidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire, err := json.Marshal(decoded)
+	if err != nil || string(wire) != pending {
+		t.Fatalf("lifecycle wire=%s err=%v", wire, err)
+	}
+	list, err := decodeResponse(strings.NewReader(`{"items":[`+pending+`]}`), shapeFixCandidateList)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listWire, err := json.Marshal(list)
+	if err != nil || string(listWire) != `{"items":[`+pending+`]}` {
+		t.Fatalf("list wire=%s err=%v", listWire, err)
+	}
 }
 
 func TestFixCandidateListUsesOwnerScopedCollection(t *testing.T) {

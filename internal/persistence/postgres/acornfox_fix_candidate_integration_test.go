@@ -175,13 +175,23 @@ func TestAcornFoxFixCandidateLedgerReplayOwnerAndSourceMatch(t *testing.T) {
 	if err != nil || matched.Status != application.AcornFoxFixCandidateSourceMatched || matched.MatchedSourceRevisionID != "src_candidate_imported" {
 		t.Fatalf("matched=%+v err=%v", matched, err)
 	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO operations(id,application_id,environment_id,operation_type,idempotency_key,state,target_ref,created_at,updated_at) VALUES('op_candidate_default_observe','app_candidate','env_candidate','observe','default-observe','pending','deployment/default/logs',$1,$1)`, now); err != nil {
+		t.Fatal(err)
+	}
 	taskID, err := store.EnqueueAcornFoxFixCandidateRuntimeTask(ctx, AcornFoxFixCandidateRuntimeTaskRequest{CandidateID: candidate.ID, ApplicationID: candidate.ApplicationID, Image: candidate.ValidatedImage, ContainerPort: candidate.ContainerPort, IdempotencyKey: "candidate-runtime", Actor: "admin_candidate", Now: now})
 	if err != nil {
 		t.Fatal(err)
 	}
 	task, err := store.GetControllerTask(ctx, taskID)
-	if err != nil || !task.DeploymentID.Empty() || task.Operation.Type != domain.OperationDeploy || task.Task.State != TaskReady || !strings.Contains(string(task.Task.Payload), "acornfox_candidate_validation_v1") {
+	if err != nil || !task.DeploymentID.Empty() || task.Operation.Type != domain.OperationDeploy || task.Operation.EnvironmentID == "env_candidate" || task.Task.State != TaskReady || !strings.Contains(string(task.Task.Payload), "acornfox_candidate_validation_v1") {
 		t.Fatalf("candidate task=%+v err=%v", task, err)
+	}
+	var candidateEnvironmentApplication, candidateEnvironmentName, defaultOperationState string
+	if err := db.QueryRowContext(ctx, `SELECT application_id,name FROM environments WHERE id=$1`, task.Operation.EnvironmentID.String()).Scan(&candidateEnvironmentApplication, &candidateEnvironmentName); err != nil || candidateEnvironmentApplication != candidate.ApplicationID.String() || candidateEnvironmentName != acornFoxCandidateEnvironmentName {
+		t.Fatalf("candidate environment app=%q name=%q err=%v", candidateEnvironmentApplication, candidateEnvironmentName, err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT state FROM operations WHERE id='op_candidate_default_observe'`).Scan(&defaultOperationState); err != nil || defaultOperationState != "pending" {
+		t.Fatalf("default observe state=%q err=%v", defaultOperationState, err)
 	}
 	var deployments int
 	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM deployments`).Scan(&deployments); err != nil || deployments != 0 {
@@ -251,6 +261,15 @@ func TestAcornFoxFixCandidateLedgerReplayOwnerAndSourceMatch(t *testing.T) {
 	}
 	if _, _, err := store.GetAcornFoxFixCandidateRuntimeEvidence(ctx, badTaskID, candidate.ValidatedImage); err == nil {
 		t.Fatal("container-unbound absence evidence was accepted")
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO applications(id,name,created_at,updated_at) VALUES('app_candidate_collision','collision',$1,$1)`, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO environments(id,application_id,name,created_at) VALUES('env_foreign_reserved','app_candidate_collision',$2,$1)`, now, acornFoxCandidateEnvironmentName); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.EnqueueAcornFoxFixCandidateRuntimeTask(ctx, AcornFoxFixCandidateRuntimeTaskRequest{CandidateID: "candidate_ffffffffffffffffffffffffffffffff", ApplicationID: "app_candidate_collision", Image: candidate.ValidatedImage, ContainerPort: candidate.ContainerPort, IdempotencyKey: "candidate-runtime-collision", Actor: "admin_candidate", Now: now}); !domain.IsCode(err, domain.ErrValidation) {
+		t.Fatalf("reserved environment collision err=%v", err)
 	}
 	if err := executionLeader.Release(ctx); err != nil {
 		t.Fatal(err)

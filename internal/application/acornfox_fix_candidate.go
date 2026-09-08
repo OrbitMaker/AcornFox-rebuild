@@ -23,6 +23,33 @@ var (
 	ErrAcornFoxFixCandidateFailed     = errors.New("fix candidate failed")
 )
 
+const (
+	AcornFoxFixCandidateStageSource   = "source"
+	AcornFoxFixCandidateStageApply    = "apply"
+	AcornFoxFixCandidateStageBuild    = "build"
+	AcornFoxFixCandidateStageRuntime  = "runtime"
+	AcornFoxFixCandidateStageComplete = "complete"
+)
+
+type acornFoxFixCandidateExecutionError struct {
+	stage string
+	cause error
+}
+
+func (e *acornFoxFixCandidateExecutionError) Error() string {
+	return "fix candidate execution failed at " + e.stage
+}
+
+func (e *acornFoxFixCandidateExecutionError) Unwrap() error { return e.cause }
+
+func AcornFoxFixCandidateFailureStage(err error) string {
+	var failure *acornFoxFixCandidateExecutionError
+	if errors.As(err, &failure) {
+		return failure.stage
+	}
+	return "unknown"
+}
+
 type AcornFoxFixCandidateStatus string
 
 const (
@@ -362,7 +389,7 @@ func (s *AcornFoxFixCandidateService) Execute(ctx context.Context, accepted Acor
 	if lifetime == 0 {
 		lifetime = time.Hour
 	}
-	fail := func(cause error) (AcornFoxFixCandidate, error) {
+	fail := func(stage string, cause error) (AcornFoxFixCandidate, error) {
 		failedAt := time.Now().UTC()
 		if s.Clock != nil {
 			failedAt = s.Clock().UTC()
@@ -370,32 +397,32 @@ func (s *AcornFoxFixCandidateService) Execute(ctx context.Context, accepted Acor
 		failContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = s.Store.FailAcornFoxFixCandidate(failContext, request.ApplicationID, request.IdempotencyKey, digest, failedAt)
-		return AcornFoxFixCandidate{}, cause
+		return AcornFoxFixCandidate{}, &acornFoxFixCandidateExecutionError{stage: stage, cause: cause}
 	}
 	base, err := s.Store.GetSourceRevision(ctx, request.BaseSourceRevisionID)
 	if err != nil || base.ApplicationID != request.ApplicationID || base.Kind != domain.SourceGitHTTPS || !base.Immutable {
 		if err == nil {
 			err = domain.ValidationError("candidate base source is invalid")
 		}
-		return fail(err)
+		return fail(AcornFoxFixCandidateStageSource, err)
 	}
 	metadata, err := s.Store.GetAcornFoxSourceMetadata(ctx, request.ApplicationID, request.BaseSourceRevisionID)
 	if err != nil || metadata.Availability != contracts.AcornFoxAvailable || metadata.RepositoryURL != base.Locator {
 		if err == nil {
 			err = domain.ValidationError("candidate base source is not proven public")
 		}
-		return fail(err)
+		return fail(AcornFoxFixCandidateStageSource, err)
 	}
 	read, err := s.Workspace.Read(ctx, base, request.Paths)
 	if err != nil || read.BaseTreeDigest != base.ContentDigest {
 		if err == nil {
 			err = errors.New("candidate base read is inconsistent")
 		}
-		return fail(err)
+		return fail(AcornFoxFixCandidateStageSource, err)
 	}
 	snapshot, err := s.Workspace.ApplyFor(ctx, accepted.ID, base, metadata.RepositoryURL, request.UnifiedDiff, lifetime)
 	if err != nil {
-		return fail(err)
+		return fail(AcornFoxFixCandidateStageApply, err)
 	}
 	defer s.Workspace.Release(snapshot)
 	allowed := make(map[string]bool, len(read.Files))
@@ -404,22 +431,22 @@ func (s *AcornFoxFixCandidateService) Execute(ctx context.Context, accepted Acor
 	}
 	for _, path := range snapshot.ChangedPaths {
 		if !allowed[path] {
-			return fail(domain.ValidationError("candidate changed a file outside the reviewed context"))
+			return fail(AcornFoxFixCandidateStageApply, domain.ValidationError("candidate changed a file outside the reviewed context"))
 		}
 	}
 	if err := s.Workspace.Verify(snapshot); err != nil {
-		return fail(err)
+		return fail(AcornFoxFixCandidateStageApply, err)
 	}
 	built, err := s.Builder.Build(ctx, snapshot, request.IdempotencyKey, request.OwnerAdminID.String())
 	if err != nil {
-		return fail(err)
+		return fail(AcornFoxFixCandidateStageBuild, err)
 	}
 	runtime, err := s.Runtime.ValidateCandidateRuntime(ctx, AcornFoxFixCandidateRuntimeRequest{CandidateID: snapshot.ID, ApplicationID: request.ApplicationID, Image: built.Image, ContainerPort: request.ContainerPort, IdempotencyKey: request.IdempotencyKey + ":runtime", Actor: request.OwnerAdminID.String()})
 	if err != nil || !runtime.CleanupConfirmed || runtime.Image != built.Image {
 		if err == nil {
 			err = errors.New("candidate runtime cleanup was not confirmed")
 		}
-		return fail(err)
+		return fail(AcornFoxFixCandidateStageRuntime, err)
 	}
 	candidate := AcornFoxFixCandidate{
 		ID: snapshot.ID, ApplicationID: request.ApplicationID, BaseSourceRevisionID: base.ID,
@@ -431,10 +458,10 @@ func (s *AcornFoxFixCandidateService) Execute(ctx context.Context, accepted Acor
 		CreatedAt: accepted.CreatedAt, ExpiresAt: snapshot.ExpiresAt,
 	}
 	if err := candidate.Validate(); err != nil {
-		return fail(err)
+		return fail(AcornFoxFixCandidateStageComplete, err)
 	}
 	if err := s.Store.CompleteAcornFoxFixCandidate(ctx, candidate, digest); err != nil {
-		return fail(err)
+		return fail(AcornFoxFixCandidateStageComplete, err)
 	}
 	return candidate, nil
 }
@@ -478,6 +505,9 @@ func validateAcornFoxFixCandidateRequest(request AcornFoxFixCandidateCreateReque
 			return domain.ValidationError("fix candidate paths must be nonempty and unique")
 		}
 		seen[path] = true
+	}
+	if err := acornfoxcandidate.ValidatePatch(request.UnifiedDiff, request.Paths); err != nil {
+		return domain.ValidationError("fix candidate patch is invalid")
 	}
 	return nil
 }
