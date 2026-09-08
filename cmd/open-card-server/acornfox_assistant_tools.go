@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/open-card/open-card/internal/acornfoxcandidate"
 	aicontext "github.com/open-card/open-card/internal/ai/context"
@@ -64,7 +65,12 @@ func newAcornFoxAssistantToolExecutor(server *Server, metrics http.Handler) assi
 			if server == nil || server.acornFoxAssistantActions == nil {
 				return assistanttools.Response{Code: "unavailable"}
 			}
-			return assistantCurrentActionFacts(ctx, server.acornFoxAssistantActions.Service, grant, app)
+			facts := assistantCurrentActionFacts(ctx, server.acornFoxAssistantActions.Service, grant, app)
+			var candidates acornFoxFixCandidateReader
+			if server.acornFoxFixCandidate != nil {
+				candidates = server.acornFoxFixCandidate.Store
+			}
+			return assistantAttachCandidateFacts(ctx, candidates, grant, app, facts)
 		}
 		if call.Tool == "acornfox_propose_restart" || call.Tool == "acornfox_propose_redeploy" {
 			if server.acornFoxAssistantActions == nil || server.acornFoxAssistantActions.Service == nil {
@@ -221,6 +227,59 @@ func assistantCurrentActionFacts(ctx context.Context, service *assistantactions.
 		}
 	}
 	raw, err := json.Marshal(map[string]any{"actions": selected})
+	if err != nil || len(raw) > assistanttools.MaxResult {
+		return assistanttools.Response{Code: "result_too_large"}
+	}
+	return assistanttools.Response{OK: true, Result: raw}
+}
+
+// Candidate summaries exclude patches and private request/owner fields so the
+// current-state tool stays bounded even when a validated diff is large.
+func assistantAttachCandidateFacts(ctx context.Context, reader acornFoxFixCandidateReader, grant assistanttools.Grant, app string, facts assistanttools.Response) assistanttools.Response {
+	if !facts.OK {
+		return facts
+	}
+	if grant.Actor == "" || !assistantToolID(app) || (!grant.Scope.Admin && grant.Scope.ApplicationID != app) {
+		return assistanttools.Response{Code: "forbidden"}
+	}
+	var body map[string]any
+	if json.Unmarshal(facts.Result, &body) != nil || body == nil {
+		return assistanttools.Response{Code: "unavailable"}
+	}
+	body["candidate_availability"] = "unavailable"
+	if reader != nil {
+		values, err := reader.ListAcornFoxFixCandidates(ctx, domain.ID(app), domain.ID(grant.Actor))
+		if err == nil {
+			if len(values) > 50 {
+				return assistanttools.Response{Code: "result_too_large"}
+			}
+			summaries := make([]map[string]any, 0, len(values))
+			for _, value := range values {
+				if value.Validate() != nil || value.ApplicationID.String() != app || value.OwnerAdminID.String() != grant.Actor {
+					return assistanttools.Response{Code: "unavailable"}
+				}
+				summary := map[string]any{"candidate_id": value.ID, "application_id": value.ApplicationID, "base_source_revision_id": value.BaseSourceRevisionID, "status": value.Status, "created_at": value.CreatedAt}
+				if !value.ExpiresAt.IsZero() {
+					summary["expires_at"] = value.ExpiresAt
+					summary["expired"] = !time.Now().Before(value.ExpiresAt)
+				}
+				if value.Status == application.AcornFoxFixCandidateValidated || value.Status == application.AcornFoxFixCandidateSourceMatched {
+					summary["result_tree_digest"] = value.ResultTreeDigest
+					summary["validated_image"] = value.ValidatedImage
+					summary["build_evidence_digest"] = value.BuildEvidenceDigest
+					summary["runtime_evidence_digest"] = value.Runtime.EvidenceDigest
+					summary["cleanup_confirmed"] = value.Runtime.CleanupConfirmed
+				}
+				if !value.MatchedSourceRevisionID.Empty() {
+					summary["matched_source_revision_id"] = value.MatchedSourceRevisionID
+				}
+				summaries = append(summaries, summary)
+			}
+			body["candidate_availability"] = "available"
+			body["candidates"] = summaries
+		}
+	}
+	raw, err := json.Marshal(body)
 	if err != nil || len(raw) > assistanttools.MaxResult {
 		return assistanttools.Response{Code: "result_too_large"}
 	}
