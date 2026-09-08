@@ -163,10 +163,12 @@ func runOutboundAgent(controlPlaneURL, instanceID, nodeID, version string, envir
 		}
 		capabilities = append(capabilities, runtimeCapabilities...)
 		candidateWorkRoot := filepath.Join(getenv(acornfoxenv.RuntimeWorkRoot), "candidates")
+		candidateTaskPrefix := getenv(acornfoxenv.RuntimeTaskPrefix) + "-candidate"
+		candidateNetwork := candidateTaskPrefix + "-network"
 		if err := os.MkdirAll(candidateWorkRoot, 0o700); err != nil {
 			log.Fatal("candidate runtime work root is unavailable")
 		}
-		candidateProvider, candidateErr := standalone.New(standalone.Config{TaskPrefix: getenv(acornfoxenv.RuntimeTaskPrefix) + "-candidate", WorkRoot: candidateWorkRoot, ImageStore: store, Capacity: capacityProvider, WorkerNetworkIsolated: false})
+		candidateProvider, candidateErr := standalone.New(standalone.Config{TaskPrefix: candidateTaskPrefix, Network: candidateNetwork, WorkRoot: candidateWorkRoot, ImageStore: store, Capacity: capacityProvider, WorkerNetworkIsolated: false})
 		if candidateErr != nil || candidateProvider.Reconcile(context.Background()) != nil {
 			log.Fatal("candidate runtime is unavailable")
 		}
@@ -174,7 +176,7 @@ func runOutboundAgent(controlPlaneURL, instanceID, nodeID, version string, envir
 		if candidateErr != nil {
 			log.Fatal("candidate runtime probe is unavailable")
 		}
-		candidateInspector, candidateErr := newUnixAcornFoxCandidateContainerInspector(socketPath)
+		candidateInspector, candidateErr := newUnixAcornFoxCandidateContainerInspector(socketPath, candidateTaskPrefix, candidateNetwork)
 		if candidateErr != nil {
 			log.Fatal("candidate runtime inspector is unavailable")
 		}
