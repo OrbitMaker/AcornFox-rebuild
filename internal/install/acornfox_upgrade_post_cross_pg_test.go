@@ -71,7 +71,10 @@ func TestAcornFoxPostCrossSameSchemaRealPostgres(t *testing.T) {
 	if err != nil || !validAcornFoxControlPlaneEnvironmentForDatabase(origin.Next.DatabaseEnv, shadow) {
 		t.Fatal("invalid synthetic shadow environment")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	// Two upgrades also verify complete filesystem images. Race instrumentation
+	// must not consume the budget reserved for the fresh database assertions.
+	// This bounds the test only; product command deadlines remain unchanged.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 	pg.createShadow(t, ctx, dsn, shadow)
 	// All business and ledger access uses the exact DSN from the upgrade image;
@@ -154,12 +157,15 @@ INSERT INTO preservation_events VALUES
 		if err != nil {
 			t.Fatal("parse inherited environment failed")
 		}
-		fresh, err := pgx.Connect(ctx, nextDSN)
+		databaseCtx, databaseCancel := context.WithTimeout(ctx, 15*time.Second)
+		fresh, err := pgx.Connect(databaseCtx, nextDSN)
 		if err != nil {
-			t.Fatal("fresh current-database connection failed")
+			databaseCancel()
+			t.Fatalf("fresh current-database connection failed (type=%T, test_context=%v)", err, ctx.Err())
 		}
-		after := snapshotAcornFoxPostCrossPG(t, ctx, fresh)
+		after := snapshotAcornFoxPostCrossPG(t, databaseCtx, fresh)
 		fresh.Close(context.Background())
+		databaseCancel()
 		if after != before || factoryCalls != 0 {
 			t.Fatal("hotfix changed database identity, complete business rows, or migration ledger; or called migration factory")
 		}
