@@ -146,6 +146,9 @@ func assistantFixCandidateTool(ctx context.Context, server *Server, grant assist
 		if !input.SourceRevisionID.Empty() || len(input.UnifiedDiff) == 0 || len(input.UnifiedDiff) > 48<<10 {
 			return assistanttools.Response{Code: "invalid_request"}
 		}
+		if !strings.HasSuffix(input.UnifiedDiff, "\n") {
+			return assistanttools.Response{Code: "invalid_request", Result: json.RawMessage(`{"field":"unified_diff","reason":"missing_final_newline","correction":"End the final patch line with an LF newline (\\n in the JSON string). Correct this once and retry; if rejected again, report the returned validation fact instead of guessing a build or runtime cause."}`)}
+		}
 		value, err = server.acornFoxFixCandidate.Service.Create(ctx, application.AcornFoxFixCandidateCreateRequest{ApplicationID: input.ApplicationID, BaseSourceRevisionID: input.BaseSourceRevisionID, Paths: input.Paths, UnifiedDiff: []byte(input.UnifiedDiff), ContainerPort: input.ContainerPort, IdempotencyKey: "assistant:" + grant.RunID + ":" + call.CallID, OwnerAdminID: domain.ID(grant.Actor)})
 	}
 	if err != nil {
