@@ -1,12 +1,14 @@
 package standalone
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -16,6 +18,275 @@ import (
 	"github.com/open-card/open-card/internal/domain"
 	capacityprovider "github.com/open-card/open-card/internal/providers/capacity"
 )
+
+func TestFailedDockerRunRemovesNeverStartedContainerBeforeReleasingCapacity(t *testing.T) {
+	root := t.TempDir()
+	runner := dockerHappyRunner(t)
+	happy := runner.run
+	failedRun := false
+	orphan := false
+	runner.run = func(args []string, stdout io.Writer) error {
+		if len(args) > 0 && args[0] == "run" && !failedRun {
+			failedRun = true
+			orphan = true
+			if err := happy(args, stdout); err != nil {
+				return err
+			}
+			return errors.New("runtime entrypoint permission denied")
+		}
+		if len(args) > 1 && args[0] == "container" && args[1] == "inspect" && orphan {
+			var captured bytes.Buffer
+			if err := happy(args, &captured); err != nil {
+				return err
+			}
+			payload := strings.Replace(captured.String(), `"RestartCount":3`, `"RestartCount":0`, 1)
+			payload = strings.Replace(payload, `"State":{"Running":true}`, `"State":{"Running":false,"Status":"created","Pid":0,"StartedAt":"0001-01-01T00:00:00Z"}`, 1)
+			_, err := io.WriteString(stdout, payload)
+			return err
+		}
+		if len(args) > 0 && args[0] == "rm" {
+			orphan = false
+		}
+		return happy(args, stdout)
+	}
+	ports := &fixedPorts{port: 39124}
+	provider := testProviderAt(t, root, runner, ports)
+	request := testRequest("never-started-cleanup")
+	if _, err := provider.Deploy(context.Background(), request); err == nil {
+		t.Fatal("failed Docker start became deployment success")
+	}
+	if got := len(runner.callsFor("rm")); got != 1 || len(runner.callsFor("rm")[0]) != 2 || runner.callsFor("rm")[0][1] != testContainerID {
+		t.Fatalf("never-started cleanup did not address exact container ID: %#v", runner.callsFor("rm"))
+	}
+	snapshot := mustDurableSnapshot(t, provider, request.DeploymentID)
+	if snapshot.Phase != "pending" || snapshot.Capacity != nil || snapshot.LeaseGeneration != 1 {
+		t.Fatalf("snapshot=%+v", snapshot)
+	}
+	fresh := testProviderAt(t, root, runner, ports)
+	if err := fresh.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if deployment, err := fresh.Deploy(context.Background(), request); err != nil || deployment.ID != request.DeploymentID {
+		t.Fatalf("retry deployment=%+v err=%v", deployment, err)
+	}
+	if got := len(runner.callsFor("run")); got != 2 {
+		t.Fatalf("run count=%d", got)
+	}
+}
+
+func TestFailedDockerRunDoesNotForceContainerThatStartsAcrossCleanupBoundary(t *testing.T) {
+	runner := dockerHappyRunner(t)
+	happy := runner.run
+	failedRun := false
+	runner.run = func(args []string, stdout io.Writer) error {
+		if len(args) > 0 && args[0] == "run" && !failedRun {
+			failedRun = true
+			if err := happy(args, stdout); err != nil {
+				return err
+			}
+			return errors.New("runtime start acknowledgement failed")
+		}
+		if len(args) > 1 && args[0] == "container" && args[1] == "inspect" {
+			var captured bytes.Buffer
+			if err := happy(args, &captured); err != nil {
+				return err
+			}
+			payload := strings.Replace(captured.String(), `"RestartCount":3`, `"RestartCount":0`, 1)
+			payload = strings.Replace(payload, `"State":{"Running":true}`, `"State":{"Running":false,"Status":"created","Pid":0,"StartedAt":"0001-01-01T00:00:00Z"}`, 1)
+			_, err := io.WriteString(stdout, payload)
+			return err
+		}
+		if len(args) > 0 && args[0] == "rm" {
+			return errors.New("container became running")
+		}
+		return happy(args, stdout)
+	}
+	ports := &fixedPorts{port: 39124}
+	provider := testProvider(t, runner, ports)
+	request := testRequest("cleanup-start-race")
+	if _, err := provider.Deploy(context.Background(), request); err == nil {
+		t.Fatal("cleanup race became deployment success")
+	}
+	if calls := runner.callsFor("rm"); len(calls) != 1 || len(calls[0]) != 2 || calls[0][1] != testContainerID {
+		t.Fatalf("cleanup used a force or non-exact removal: %#v", calls)
+	}
+	snapshot := mustDurableSnapshot(t, provider, request.DeploymentID)
+	ports.mu.Lock()
+	released := ports.released
+	ports.mu.Unlock()
+	if snapshot.Capacity == nil || released != 0 {
+		t.Fatalf("uncertain container released capacity: snapshot=%+v released=%d", snapshot, released)
+	}
+}
+
+func TestPostRunConfigurationDriftDoesNotRemoveContainerOrReleaseCapacity(t *testing.T) {
+	runner := dockerHappyRunner(t)
+	happy := runner.run
+	runner.run = func(args []string, stdout io.Writer) error {
+		if len(args) > 1 && args[0] == "container" && args[1] == "inspect" {
+			var captured bytes.Buffer
+			if err := happy(args, &captured); err != nil {
+				return err
+			}
+			_, err := io.WriteString(stdout, strings.Replace(captured.String(), `"open-card.release-id":"rel_1"`, `"open-card.release-id":"rel_changed"`, 1))
+			return err
+		}
+		return happy(args, stdout)
+	}
+	ports := &fixedPorts{port: 39124}
+	provider := testProvider(t, runner, ports)
+	request := testRequest("post-run-drift")
+	if _, err := provider.Deploy(context.Background(), request); err == nil {
+		t.Fatal("post-run configuration drift became success")
+	}
+	if calls := runner.callsFor("rm"); len(calls) != 0 {
+		t.Fatalf("configuration-drifted container was removed: %#v", calls)
+	}
+	snapshot := mustDurableSnapshot(t, provider, request.DeploymentID)
+	ports.mu.Lock()
+	released := ports.released
+	ports.mu.Unlock()
+	if snapshot.Capacity == nil || released != 0 {
+		t.Fatalf("configuration drift released capacity: snapshot=%+v released=%d", snapshot, released)
+	}
+}
+
+func TestActiveStatePersistenceFailureDoesNotRemoveRunningContainerOrReleaseCapacity(t *testing.T) {
+	root := t.TempDir()
+	runner := dockerHappyRunner(t)
+	happy := runner.run
+	request := testRequest("active-persist-failure")
+	statePath := filepath.Join(root, ".standalone-state-"+hash(request.DeploymentID.String())[:32]+".json")
+	sabotaged := false
+	runner.run = func(args []string, stdout io.Writer) error {
+		if len(args) > 1 && args[0] == "container" && args[1] == "inspect" {
+			if err := happy(args, stdout); err != nil {
+				return err
+			}
+			if !sabotaged {
+				sabotaged = true
+				if err := os.Remove(statePath); err != nil {
+					return err
+				}
+				if err := os.Mkdir(statePath, 0o700); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		return happy(args, stdout)
+	}
+	ports := &fixedPorts{port: 39124}
+	provider := testProviderAt(t, root, runner, ports)
+	if _, err := provider.Deploy(context.Background(), request); err == nil {
+		t.Fatal("active state persistence failure became deployment success")
+	}
+	if calls := runner.callsFor("rm"); len(calls) != 0 {
+		t.Fatalf("running container was removed after persistence failure: %#v", calls)
+	}
+	ports.mu.Lock()
+	released := ports.released
+	ports.mu.Unlock()
+	if released != 0 {
+		t.Fatalf("running container capacity was released: %d", released)
+	}
+}
+
+func TestReconcileRemovesHistoricalNeverStartedContainerWithoutCapacity(t *testing.T) {
+	root := t.TempDir()
+	runner := dockerHappyRunner(t)
+	ports := &fixedPorts{port: 39124}
+	first := testProviderAt(t, root, runner, ports)
+	request := testRequest("historical-never-started")
+	deployment, err := first.Deploy(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := mustDurableSnapshot(t, first, deployment.ID)
+	snapshot.Phase, snapshot.Capacity, snapshot.LeaseGeneration = "pending", nil, 1
+	writeDurableSnapshot(t, first, snapshot)
+	ports.Release(39124)
+	happy := runner.run
+	runner.run = func(args []string, stdout io.Writer) error {
+		if len(args) > 1 && args[0] == "container" && args[1] == "inspect" {
+			payload := strings.Replace(ownedContainerInspect(request, testDigest), `"RestartCount":3`, `"RestartCount":0`, 1)
+			payload = strings.Replace(payload, `"State":{"Running":true}`, `"State":{"Running":false,"Status":"created","Pid":0,"StartedAt":"0001-01-01T00:00:00Z"}`, 1)
+			payload = strings.Replace(payload, `"HostPort":"39130"`, `"HostPort":"39124"`, 1)
+			_, err := io.WriteString(stdout, payload)
+			return err
+		}
+		return happy(args, stdout)
+	}
+	fresh := testProviderAt(t, root, runner, ports)
+	if err := fresh.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(runner.callsFor("rm")); got != 1 || runner.callsFor("rm")[0][1] != testContainerID {
+		t.Fatalf("historical cleanup=%#v", runner.callsFor("rm"))
+	}
+	recovered := mustDurableSnapshot(t, fresh, deployment.ID)
+	if recovered.Phase != "pending" || recovered.Capacity != nil {
+		t.Fatalf("recovered=%+v", recovered)
+	}
+}
+
+func TestReconcileDoesNotRemoveHistoricalContainerThatPreviouslyStarted(t *testing.T) {
+	root := t.TempDir()
+	runner := dockerHappyRunner(t)
+	ports := &fixedPorts{port: 39124}
+	first := testProviderAt(t, root, runner, ports)
+	request := testRequest("historical-started")
+	deployment, err := first.Deploy(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := mustDurableSnapshot(t, first, deployment.ID)
+	snapshot.Phase, snapshot.Capacity, snapshot.LeaseGeneration = "pending", nil, 1
+	writeDurableSnapshot(t, first, snapshot)
+	ports.Release(39124)
+	happy := runner.run
+	runner.run = func(args []string, stdout io.Writer) error {
+		if len(args) > 1 && args[0] == "container" && args[1] == "inspect" {
+			payload := strings.Replace(ownedContainerInspect(request, testDigest), `"RestartCount":3`, `"RestartCount":0`, 1)
+			payload = strings.Replace(payload, `"State":{"Running":true}`, `"State":{"Running":false,"Status":"exited","Pid":0,"StartedAt":"2026-09-08T00:00:00Z"}`, 1)
+			payload = strings.Replace(payload, `"HostPort":"39130"`, `"HostPort":"39124"`, 1)
+			_, err := io.WriteString(stdout, payload)
+			return err
+		}
+		return happy(args, stdout)
+	}
+	fresh := testProviderAt(t, root, runner, ports)
+	if err := fresh.Reconcile(context.Background()); err == nil {
+		t.Fatal("previously started container was reconciled as never-started")
+	}
+	if calls := runner.callsFor("rm"); len(calls) != 0 {
+		t.Fatalf("previously started container was removed: %#v", calls)
+	}
+}
+
+func TestNeverStartedPredicateRejectsAnyExecutionOrUncertainState(t *testing.T) {
+	base := inspectFacts{RestartCount: 0}
+	base.State.Status, base.State.Pid, base.State.StartedAt = "created", 0, "0001-01-01T00:00:00Z"
+	if !base.neverStarted() {
+		t.Fatal("exact never-started state was rejected")
+	}
+	for name, mutate := range map[string]func(*inspectFacts){
+		"running":       func(f *inspectFacts) { f.State.Running = true },
+		"exited":        func(f *inspectFacts) { f.State.Status = "exited" },
+		"pid":           func(f *inspectFacts) { f.State.Pid = 1 },
+		"restart":       func(f *inspectFacts) { f.RestartCount = 1 },
+		"started":       func(f *inspectFacts) { f.State.StartedAt = "2026-09-08T00:00:00Z" },
+		"missing start": func(f *inspectFacts) { f.State.StartedAt = "" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			facts := base
+			mutate(&facts)
+			if facts.neverStarted() {
+				t.Fatal("uncertain or executed state was accepted")
+			}
+		})
+	}
+}
 
 func TestDurableStateRestoresLifecycleWithoutNewPortLease(t *testing.T) {
 	root := t.TempDir()

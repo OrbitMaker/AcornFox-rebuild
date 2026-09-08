@@ -301,6 +301,12 @@ func (p *Provider) stateFromDurable(ctx context.Context, snapshot durableRuntime
 		state.phase, state.recovery = "active", runtimeRecoveryActive
 	}
 	if state.capacity == nil {
+		if snapshot.Phase == "pending" && facts.neverStarted() {
+			if err := p.removeNeverStartedPendingContainer(ctx, state, facts, operation, capability, action); err != nil {
+				return nil, err
+			}
+			return state, nil
+		}
 		return nil, p.failure(operation, capability, action, contracts.ErrConflict, "durable runtime state has no active capacity lease", contracts.RetryNever, false, nil)
 	}
 	reconciler, ok := p.config.Capacity.(capacityActiveReconciler)
@@ -386,6 +392,7 @@ type inspectFacts struct {
 	State struct {
 		Running   bool   `json:"Running"`
 		Status    string `json:"Status"`
+		Pid       int    `json:"Pid"`
 		StartedAt string `json:"StartedAt"`
 	} `json:"State"`
 	NetworkSettings struct {
@@ -425,6 +432,59 @@ func (p *Provider) inspectFacts(ctx context.Context, container string) (inspectF
 		return inspectFacts{}, err
 	}
 	return facts, nil
+}
+
+func (facts inspectFacts) neverStarted() bool {
+	if facts.State.Running || facts.State.Status != "created" || facts.State.Pid != 0 || facts.RestartCount != 0 || facts.State.StartedAt == "" {
+		return false
+	}
+	started, err := time.Parse(time.RFC3339Nano, facts.State.StartedAt)
+	return err == nil && started.IsZero()
+}
+
+func (p *Provider) removeNeverStartedPendingContainer(ctx context.Context, state *runtimeState, facts inspectFacts, operation contracts.OperationContext, capability contracts.Capability, action string) error {
+	if state == nil || state.phase != "pending" || state.capacity != nil || !facts.neverStarted() || !validContainerID(facts.ID) {
+		return p.failure(operation, capability, action, contracts.ErrConflict, "pending runtime is not eligible for never-started cleanup", contracts.RetryNever, false, nil)
+	}
+	if err := p.run(ctx, []string{"rm", facts.ID}); err != nil {
+		return p.commandError(operation, capability, action, err)
+	}
+	absent, err := p.confirmContainerAbsent(ctx, state.container)
+	if err != nil || !absent {
+		return p.failure(operation, capability, action, contracts.ErrUnavailable, "never-started runtime absence was not confirmed", contracts.RetryAfterReconnect, true, err)
+	}
+	state.containerID, state.port = "", 0
+	state.recovery, state.updatedAt = runtimeRecoveryPendingAbsent, p.config.Clock().UTC()
+	if err := p.persistState(state); err != nil {
+		return p.failure(operation, capability, action, contracts.ErrUnavailable, "never-started runtime cleanup could not be persisted", contracts.RetryAfterReconnect, true, err)
+	}
+	return nil
+}
+
+func (p *Provider) cleanupFailedDeployContainer(ctx context.Context, state *runtimeState, spec contracts.RuntimeSpec, operation contracts.OperationContext) error {
+	if state == nil || state.phase != "pending" || state.capacity == nil {
+		return p.failure(operation, contracts.CapabilityRuntimeDeploy, "cleanup", contracts.ErrConflict, "failed runtime cleanup state is invalid", contracts.RetryNever, false, nil)
+	}
+	facts, err := p.inspectFacts(ctx, state.container)
+	if err != nil {
+		absent, absenceErr := p.confirmContainerAbsent(ctx, state.container)
+		if absenceErr != nil || !absent {
+			return p.failure(operation, contracts.CapabilityRuntimeDeploy, "cleanup", contracts.ErrUnavailable, "failed runtime absence could not be confirmed", contracts.RetryAfterReconnect, true, absenceErr)
+		}
+		return nil
+	}
+	port, matches := facts.matchesConfiguration(p.config, state.deployment, spec)
+	if !matches || port != state.capacity.HostPort || !facts.neverStarted() {
+		return p.failure(operation, contracts.CapabilityRuntimeDeploy, "cleanup", contracts.ErrConflict, "failed runtime container is not eligible for never-started cleanup", contracts.RetryNever, false, nil)
+	}
+	if err := p.run(ctx, []string{"rm", facts.ID}); err != nil {
+		return p.commandError(operation, contracts.CapabilityRuntimeDeploy, "cleanup", err)
+	}
+	absent, err := p.confirmContainerAbsent(ctx, state.container)
+	if err != nil || !absent {
+		return p.failure(operation, contracts.CapabilityRuntimeDeploy, "cleanup", contracts.ErrUnavailable, "failed runtime absence was not confirmed", contracts.RetryAfterReconnect, true, err)
+	}
+	return nil
 }
 
 func (facts inspectFacts) matchesConfiguration(config Config, deployment domain.Deployment, spec contracts.RuntimeSpec) (int, bool) {

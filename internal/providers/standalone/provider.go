@@ -505,6 +505,13 @@ func (p *Provider) deploy(ctx context.Context, request contracts.DeployRequest, 
 	}
 	defer func() {
 		if err != nil {
+			cleanupContext, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			cleanupErr := p.cleanupFailedDeployContainer(cleanupContext, pending, request.Spec, request.Operation)
+			cleanupCancel()
+			if cleanupErr != nil {
+				err = fmt.Errorf("%w; failed runtime cleanup was not confirmed", err)
+				return
+			}
 			releaseOperation := request.Operation
 			releaseOperation.IdempotencyKey += ":runtime-capacity-release:" + strconv.Itoa(leaseGeneration)
 			releaseErr := p.config.Capacity.Release(context.Background(), capacity, releaseOperation)
@@ -568,7 +575,6 @@ func (p *Provider) deploy(ctx context.Context, request contracts.DeployRequest, 
 	facts, inspectErr := p.inspectFacts(ctx, container)
 	observedPort, matches := facts.matchesRunning(p.config, deployment, request.Spec)
 	if inspectErr != nil || !matches || observedPort != port {
-		_ = p.run(context.Background(), []string{"rm", "--force", container})
 		return domain.Deployment{}, nil, p.failure(request.Operation, contracts.CapabilityRuntimeDeploy, "inspect", contracts.ErrConflict, "Docker runtime facts do not match the constrained deployment", contracts.RetryNever, false, inspectErr)
 	}
 	if err := deployment.Transition(domain.DeploymentRuntimeReady, p.config.Clock()); err != nil {
@@ -581,7 +587,6 @@ func (p *Provider) deploy(ctx context.Context, request contracts.DeployRequest, 
 	deployAction := actionIdentity("deploy", request.Operation.IdempotencyKey)
 	state.actions[deployAction] = runtimeAction{identityHash: deployAction, action: "deploy", fingerprint: fingerprint, status: "succeeded", at: now}
 	if err := p.persistState(state); err != nil {
-		_ = p.run(context.Background(), []string{"rm", "--force", container})
 		return domain.Deployment{}, nil, p.failure(request.Operation, contracts.CapabilityRuntimeDeploy, "persist_state", contracts.ErrUnavailable, "durable runtime state could not be persisted", contracts.RetryBackoff, true, err)
 	}
 	return deployment, state, nil
