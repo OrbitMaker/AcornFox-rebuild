@@ -34,10 +34,23 @@ phase=$2
 
 [[ $(/usr/bin/id -u) -eq 0 ]] || fail
 [[ -r /etc/os-release ]] || fail
-if ! clean /usr/bin/grep -qx 'ID=ubuntu' /etc/os-release || ! clean /usr/bin/grep -Eq '^VERSION_ID="?24\.04"?$' /etc/os-release; then
+if clean /usr/bin/grep -qx 'ID=ubuntu' /etc/os-release && clean /usr/bin/grep -Eq '^VERSION_ID="?24\.04"?$' /etc/os-release; then
+  os_id=ubuntu
+  os_version=24.04
+elif clean /usr/bin/grep -qx 'ID=debian' /etc/os-release && clean /usr/bin/grep -Eq '^VERSION_ID="?13"?$' /etc/os-release; then
+  os_id=debian
+  os_version=13
+else
   fail
 fi
-[[ $(clean /usr/bin/uname -m) == x86_64 ]] || fail
+case $(clean /usr/bin/uname -m) in
+  x86_64) architecture=amd64 ;;
+  aarch64) architecture=arm64 ;;
+  *) fail ;;
+esac
+if [[ $os_id == debian && $architecture != amd64 ]]; then
+  fail
+fi
 clean /usr/bin/systemctl --version >/dev/null || fail
 [[ $(clean /usr/bin/systemctl is-system-running) == running ]] || fail
 
@@ -53,11 +66,15 @@ disk_avail_kb=$(clean /usr/bin/df -k --output=avail / | clean /usr/bin/tail -n 1
 
 if [[ $phase == post ]]; then
   docker_version=$(clean /usr/bin/docker --version) || fail
-  psql_version=$(clean /usr/bin/psql --version) || fail
+  psql_version=$(clean /usr/lib/postgresql/16/bin/psql --version) || fail
   postgres_version=$(clean /usr/lib/postgresql/16/bin/postgres --version) || fail
+  pg_dump_version=$(clean /usr/lib/postgresql/16/bin/pg_dump --version) || fail
+  pg_restore_version=$(clean /usr/lib/postgresql/16/bin/pg_restore --version) || fail
   [[ $docker_version == Docker\ version\ * ]] || fail
   [[ $psql_version == psql\ \(PostgreSQL\)\ 16.* ]] || fail
   [[ $postgres_version == postgres\ \(PostgreSQL\)\ 16.* ]] || fail
+  [[ $pg_dump_version == pg_dump\ \(PostgreSQL\)\ 16.* ]] || fail
+  [[ $pg_restore_version == pg_restore\ \(PostgreSQL\)\ 16.* ]] || fail
   clean /usr/bin/systemctl is-enabled --quiet docker.service || fail
   clean /usr/bin/systemctl is-active --quiet docker.service || fail
   clean /usr/bin/systemctl is-enabled --quiet postgresql.service || fail
@@ -87,4 +104,4 @@ if [[ $phase == pre ]]; then
 else
   prerequisites=ready
 fi
-printf '{"architecture":"amd64","code":"ok","ok":true,"os_id":"ubuntu","os_version":"24.04","phase":"%s","prerequisites":"%s","schema_version":1,"systemd":"running"}\n' "$phase" "$prerequisites"
+printf '{"architecture":"%s","code":"ok","ok":true,"os_id":"%s","os_version":"%s","phase":"%s","prerequisites":"%s","schema_version":1,"systemd":"running"}\n' "$architecture" "$os_id" "$os_version" "$phase" "$prerequisites"

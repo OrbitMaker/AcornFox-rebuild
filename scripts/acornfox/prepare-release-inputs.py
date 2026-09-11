@@ -23,10 +23,22 @@ MODULE = 'github.com/open-card/open-card'
 VERSION = re.compile(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
                      r'(-[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?(\+[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?')
 REPOSITORY = re.compile(r'https://github\.com/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}')
-PI_ARCHIVE_SHA256 = '494e498f47d74d21f40b3386f6a5e921a3d49531a169cab55bbdaca0ea1fe25a'
 PI_SHA256SUMS_SHA256 = '0b70b2e422339b7a1277c3addb3705e1239d21ca1c20a17741a7b1c06d7526b0'
-PI_MANIFEST_SHA256 = 'e8d788ebaab78af97ca959b91a1abfe9fc820de4a4c6aadcd870bb500679934d'
-PI_MANIFEST = pathlib.Path('internal/pibundle/assets-v0.85.1-linux-x64.json')
+
+PI_SPECS = {
+    'amd64': {
+        'archive_sha256': '494e498f47d74d21f40b3386f6a5e921a3d49531a169cab55bbdaca0ea1fe25a',
+        'manifest_sha256': 'e8d788ebaab78af97ca959b91a1abfe9fc820de4a4c6aadcd870bb500679934d',
+        'manifest_path': pathlib.Path('internal/pibundle/assets-v0.85.1-linux-x64.json'),
+        'total_bytes': 113642165,
+    },
+    'arm64': {
+        'archive_sha256': '042d20ae885ee4f3b102815f3280b962c377b2e9fb44de4037908cc530eae4d4',
+        'manifest_sha256': '7217207f1aeb5d298de152897e3aa6eafd7c55be1a534f3da71d0d9649131ec6',
+        'manifest_path': pathlib.Path('internal/pibundle/assets-v0.85.1-linux-arm64.json'),
+        'total_bytes': 113605101,
+    },
+}
 
 
 def require(condition, message):
@@ -74,14 +86,16 @@ def clean_file(value):
     return path
 
 
-def load_pi_manifest(source):
-    path = source / PI_MANIFEST
+def load_pi_manifest(source, arch='amd64'):
+    require(arch in PI_SPECS, f'unsupported architecture: {arch}')
+    spec = PI_SPECS[arch]
+    path = source / spec['manifest_path']
     raw = path.read_bytes()
-    require(len(raw) <= 1 << 20 and sha(raw) == PI_MANIFEST_SHA256,
+    require(len(raw) <= 1 << 20 and sha(raw) == spec['manifest_sha256'],
             'pinned pi asset manifest digest mismatch')
     value = json.loads(raw)
     require(raw == canonical(value) + b'\n' and value.get('schema_version') == 1 and
-            value.get('version') == '0.85.1' and value.get('archive_sha256') == PI_ARCHIVE_SHA256 and
+            value.get('version') == '0.85.1' and value.get('archive_sha256') == spec['archive_sha256'] and
             value.get('sha256sums_sha256') == PI_SHA256SUMS_SHA256,
             'pinned pi asset manifest identity mismatch')
     files = value.get('files')
@@ -96,14 +110,14 @@ def load_pi_manifest(source):
                 re.fullmatch('[0-9a-f]{64}', entry['sha256']),
                 'pinned pi asset manifest entry invalid')
         previous = entry['path']
-    require(sum(entry['size'] for entry in files) == 113642165,
+    require(sum(entry['size'] for entry in files) == spec['total_bytes'],
             'pinned pi asset manifest size mismatch')
     return value
 
 
-def verify_pi_archive(source, archive):
-    manifest = load_pi_manifest(source)
-    require(file_sha(archive) == PI_ARCHIVE_SHA256, 'pi archive sha256 mismatch')
+def verify_pi_archive(source, archive, arch='amd64'):
+    manifest = load_pi_manifest(source, arch)
+    require(file_sha(archive) == PI_SPECS[arch]['archive_sha256'], 'pi archive sha256 mismatch')
     expected = {entry['path']: entry for entry in manifest['files']}
     expected_dirs = {'pi/'}
     for name in expected:
@@ -189,7 +203,15 @@ def main():
     for name in ('source', 'runtime', 'license', 'control', 'version'):
         parser.add_argument(name)
     parser.add_argument('--pi-archive', required=True)
+    parser.add_argument('--architecture', choices=('amd64', 'arm64'), default='amd64',
+                        help='target CPU architecture (default: amd64)')
     args = parser.parse_args()
+    arch = args.architecture
+    import platform
+    machine = platform.machine().lower()
+    host_arch = 'arm64' if machine in ('arm64', 'aarch64') else ('amd64' if machine in ('x86_64', 'amd64') else machine)
+    require(platform.system() == 'Linux' and host_arch == arch,
+            f'native Linux host architecture {host_arch} does not match target architecture {arch}')
     require(VERSION.fullmatch(args.version), 'invalid release version')
     source, runtime, licenses = [clean_path(value) for value in (args.source, args.runtime, args.license)]
     pi_archive = clean_file(args.pi_archive)
@@ -214,7 +236,7 @@ def main():
         require(paths[name].is_file(), 'tool path must resolve to a regular file')
     env = dict(os.environ)
     env.update(GOTOOLCHAIN='local', GOWORK='off', GOENV='off', GOFLAGS='',
-               GOOS='linux', GOARCH='amd64', CGO_ENABLED='0', GOPROXY='off',
+               GOOS='linux', GOARCH=arch, CGO_ENABLED='0', GOPROXY='off',
                GOSUMDB='off', GOVCS='*:off', GIT_CONFIG_NOSYSTEM='1',
                GIT_CONFIG_GLOBAL='/dev/null', GIT_TERMINAL_PROMPT='0',
                GIT_OPTIONAL_LOCKS='0', GIT_NO_REPLACE_OBJECTS='1')
@@ -251,7 +273,7 @@ def main():
         return origin, commit
 
     origin, commit = git_identity()
-    pi_manifest = verify_pi_archive(source, pi_archive)
+    pi_manifest = verify_pi_archive(source, pi_archive, arch)
     before = inventory(source, 'source')
     require(output('go', 'list', '-m') == MODULE, 'unexpected project Go module')
     raw = output('go', 'list', '-deps', '-f', '{{if .Module}}{{if .Module.Main}}{{.ImportPath}}{{end}}{{end}}',
@@ -271,13 +293,13 @@ def main():
     for value, pattern in ((go_version, r'go\d+\.\d+\.\d+'), (git_version, r'\d+\.\d+\.\d+'),
                            (node_version, r'v\d+\.\d+\.\d+'), (npm_version, r'\d+\.\d+\.\d+')):
         require(re.fullmatch(pattern, value), 'tool version is outside the release contract')
-    toolchain = dict(schema_version=1, product='acornfox', architecture='amd64',
+    toolchain = dict(schema_version=1, product='acornfox', architecture=arch,
                     go_version=go_version, go_binary_sha256=file_sha(paths['go']),
                     git_version=git_version, git_binary_sha256=file_sha(paths['git']),
                     node_version=node_version, node_binary_sha256=file_sha(paths['node']),
                     npm_version=npm_version, npm_cli_sha256=file_sha(paths['npm']),
                     build_policy=['build_id_empty', 'build_vcs_disabled', 'cgo_disabled', 'trimpath'])
-    runtime_input = dict(schema_version=1, product='acornfox', architecture='amd64', files=inventory(runtime, 'runtime'))
+    runtime_input = dict(schema_version=1, product='acornfox', architecture=arch, files=inventory(runtime, 'runtime'))
     verify_pi_runtime(runtime, runtime_input['files'], pi_manifest)
     license_input = dict(schema_version=1, product='acornfox', files=inventory(licenses, 'license'))
     require(before == inventory(source, 'source') and git_identity() == (origin, commit),
@@ -285,7 +307,7 @@ def main():
     inputs = {'source-policy': policy, 'toolchain': toolchain,
               'runtime-inputs': runtime_input, 'license-inputs': license_input}
     encoded = {name + '.json': canonical(value) for name, value in inputs.items()}
-    decision = dict(schema_version=1, product='acornfox', architecture='amd64', migration='0040', layout=1,
+    decision = dict(schema_version=1, product='acornfox', architecture=arch, migration='0040', layout=1,
                     version=args.version, release_id='release-' + args.version,
                     source_repository=origin, source_commit=commit,
                     source_policy_sha256=sha(encoded['source-policy.json']),

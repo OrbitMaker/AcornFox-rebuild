@@ -1,8 +1,8 @@
 # 构建随包容器运行工具
 
-首版目标为 Ubuntu 24.04 amd64。BuildKit `0.32.2`、RootlessKit `3.1.0`、Caddy `2.11.4` 和 Pi `0.85.1` 取自各自官方发布，归档来源和摘要见 `release/runtime-inputs.json`。该历史归档清单也含未进入 AcornFox 首版的 Buildx；实际 runtime 输入包含五个原有 `bin/` 文件，以及官方 Pi Linux x64 归档的完整 218 文件树。Pi 最终位于 `/opt/acornfox/current/pi/**`，不在安装或运行时下载，也不裁成单独 executable。
+首版已完成的运行时输入覆盖 Ubuntu 24.04 的原生 Linux amd64 和 Linux arm64：BuildKit `0.32.2`、RootlessKit `3.1.0`、Caddy `2.11.4` 和 Pi `0.85.1` 都取自各自官方发布，归档 URL 和摘要见 `release/runtime-inputs.json`。该历史归档清单也含未进入 AcornFox 首版的 Buildx；实际 runtime 输入包含五个原有 `bin/` 文件以及所选架构官方 Pi 归档的完整 218 文件树。Pi 最终位于 `/opt/acornfox/current/pi/**`，不在安装或运行时下载，也不裁成单独 executable。
 
-Pi 归档的固定资产清单是 `internal/pibundle/assets-v0.85.1-linux-x64.json`。输入冻结同时验证官方归档 SHA-256、250 个 tar members、218 个普通文件的路径、mode、size、逐文件 SHA，以及解包后的 `runtime_root/pi/**`；候选包还携带同一清单为 `pi/UPSTREAM-ASSETS.json`。
+Linux amd64 选择 `internal/pibundle/assets-v0.85.1-linux-x64.json`，Linux arm64 选择 `internal/pibundle/assets-v0.85.1-linux-arm64.json`。每个固定资产清单分别锁定官方归档 SHA-256、250 个 tar members、218 个普通文件的路径、mode、size、逐文件 SHA，以及解包后的 `runtime_root/pi/**`；候选包携带对应清单为 `pi/UPSTREAM-ASSETS.json`。Pi 的两个归档摘要都来自其官方 `SHA256SUMS`，不是旧 M7 归档的来源记录。
 
 `buildkitd`、`buildctl`、`rootlesskit`、`caddy` 保留官方归档原字节。**不要复制官方 BuildKit 归档中的静态 `buildkit-runc` 到本版输入目录。** 本版使用下面的动态构建，同样保留 seccomp 支持。构建身份、编译器和系统包版本、输入及输出摘要见 `release/acornfox-runc-build-v1.json`。
 
@@ -51,5 +51,13 @@ sha256sum "$build_root/output/buildkit-runc"
 ```
 
 发布构建的输出摘要为 `5702b7a2f87e40a4f5cfae74984ef94e6dcb2840ee4ddb6a7accd8d47a4bce56`。版本输出包含 `1.4.3+acornfox.1`、`go1.25.13` 和 `libseccomp: 2.5.5`。动态依赖应为 `libseccomp.so.2`、`libc.so.6`，解释器为 `/lib64/ld-linux-x86-64.so.2`；不得携带私有 RPATH/RUNPATH。修改编译器、源码或库后输出摘要可能不同，须重新冻结运行工具输入并验证构建和容器行为。
+
+## Linux arm64 runc 复现
+
+ARM 的已完成构建事实记录在 `release/acornfox-runc-build-linux-arm64-v1.json`：Ubuntu 24.04 arm64 上使用 Go `1.25.13`、GCC `13.3.0` 和系统 `libseccomp-dev:arm64 2.5.5-1ubuntu3.1`，对官方 runc `v1.4.3` 源码（摘要 `e0a89f9e883ce93e740d14bb105b25c665f7d7beade4cfd0714fcafb38855d35`）原生构建两次，输出摘要均为 `6607030be180844bcf95fa857cef618fcedeffd54d69fe2f829d1e2c3faee3bf`。
+
+复现必须在干净的原生 Ubuntu 24.04 arm64 主机执行：先校验 Go Linux arm64 归档摘要 `adad240fcb6bd180cf973b4b7c747baf4ec81d08b7d40ca35940ee4531971490` 与 runc 源码摘要；在新的私有工作目录解包二者，再以干净环境设置 `GOOS=linux GOARCH=arm64 CGO_ENABLED=1 GOPROXY=off GOSUMDB=off GOVCS='*:off'`。构建使用 `-p=2 -trimpath -buildmode=pie -mod=vendor -buildvcs=false`、tags `seccomp urfave_cli_no_docs`，以及收据中的 ldflags；对两次输出分别校验摘要、`runc --version`、AArch64 ELF、`libseccomp.so.2`/`libc.so.6` 和无 RPATH/RUNPATH。该 ARM 记录使用宿主系统的官方 arm64 开发包，不复制 amd64 私有 sysroot 方法。
+
+这些模块证明了架构选择、官方运行时输入和 ARM runc 的可复现构建；它们不等于 ARM 候选已安装或可对客户交付。ARM 候选归档、干净 Ubuntu 安装、服务启动、容器部署和公开访问仍须按各自验收层完成。
 
 宿主的共享 libseccomp/libc 不打进 AcornFox 归档，也不锁死用户提供的接口兼容共享库字节。实际 Ubuntu 包版权文本存于 `native-licenses/`；runc、Go 及其依赖的上游完整许可材料存于 `docs/licenses/licenses-manifest.json`。runc 源码及 vendor 未修改，只有构建元数据使用 `+acornfox.1` 标记。

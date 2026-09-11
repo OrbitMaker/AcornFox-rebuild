@@ -71,6 +71,14 @@
           "sha256sums_url": "https://github.com/earendil-works/pi/releases/download/v0.85.1/SHA256SUMS",
           "sha256sums_sha256": "0b70b2e422339b7a1277c3addb3705e1239d21ca1c20a17741a7b1c06d7526b0",
           "asset_manifest_sha256": "e8d788ebaab78af97ca959b91a1abfe9fc820de4a4c6aadcd870bb500679934d"
+        },
+        "arm64": {
+          "url": "https://github.com/earendil-works/pi/releases/download/v0.85.1/pi-linux-arm64.tar.gz",
+          "filename": "pi-linux-arm64.tar.gz",
+          "sha256": "042d20ae885ee4f3b102815f3280b962c377b2e9fb44de4037908cc530eae4d4",
+          "sha256sums_url": "https://github.com/earendil-works/pi/releases/download/v0.85.1/SHA256SUMS",
+          "sha256sums_sha256": "0b70b2e422339b7a1277c3addb3705e1239d21ca1c20a17741a7b1c06d7526b0",
+          "asset_manifest_sha256": "7217207f1aeb5d298de152897e3aa6eafd7c55be1a534f3da71d0d9649131ec6"
         }
       }
     }

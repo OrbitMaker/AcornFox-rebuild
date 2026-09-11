@@ -250,7 +250,7 @@ def build_cloud_init_safe_yaml(hostname, pubkey_line):
         f"fqdn: {json.dumps(hostname + '.local')}\n"
         "manage_etc_hosts: true\n"
         "users:\n"
-        "  - name: acornfox\n"
+        "  - name: tester\n"
         "    gecos: AcornFox Test User\n"
         "    sudo: ALL=(ALL) NOPASSWD:ALL\n"
         "    shell: /bin/bash\n"

@@ -169,7 +169,7 @@ func TestCandidateArtifactReceiptV1RequiresExactNamedCrossHashes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(raw), `"source_repository"`) || !strings.Contains(string(raw), `"architecture":"amd64"`) || !strings.Contains(string(raw), `"migration_version":"`+Migration+`"`) {
+	if !strings.Contains(string(raw), `"source_repository"`) || !strings.Contains(string(raw), `"architecture":"`+Architecture+`"`) || !strings.Contains(string(raw), `"migration_version":"`+Migration+`"`) {
 		t.Fatalf("receipt JSON lost stable schema fields: %s", raw)
 	}
 	for _, mutate := range []struct {

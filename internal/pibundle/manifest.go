@@ -5,7 +5,6 @@ package pibundle
 import (
 	"bytes"
 	"crypto/sha256"
-	_ "embed"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -16,18 +15,12 @@ import (
 
 const (
 	Version                = "0.85.1"
-	ArchiveSHA256          = "494e498f47d74d21f40b3386f6a5e921a3d49531a169cab55bbdaca0ea1fe25a"
 	SHA256SUMSSHA256       = "0b70b2e422339b7a1277c3addb3705e1239d21ca1c20a17741a7b1c06d7526b0"
-	ManifestSHA256         = "e8d788ebaab78af97ca959b91a1abfe9fc820de4a4c6aadcd870bb500679934d"
 	FileCount              = 218
-	TotalBytes       int64 = 113642165
 	MaxFileBytes     int64 = 128 << 20
 )
 
 var ErrInvalidManifest = errors.New("pibundle: invalid pinned asset manifest")
-
-//go:embed assets-v0.85.1-linux-x64.json
-var manifestRaw []byte
 
 type Entry struct {
 	Path   string `json:"path"`

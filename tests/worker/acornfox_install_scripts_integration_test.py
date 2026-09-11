@@ -11,6 +11,7 @@ or /opt to escape the temporary root.
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import re
 import subprocess
@@ -36,48 +37,72 @@ SHA = "a" * 64
 TOKEN_COUNTS = {
     "/usr/bin/env": 10,
     "/usr/bin/id": 5,
-    "/etc/os-release": 3,
-    "/usr/bin/grep": 10,
+    "/etc/os-release": 7,
+    "/usr/bin/grep": 14,
     "/usr/bin/uname": 1,
-    "/usr/bin/systemctl": 30,
+    "/usr/bin/systemctl": 48,
     "/usr/bin/docker": 1,
-    "/usr/bin/psql": 1,
     "/usr/lib/postgresql/16/bin/postgres": 1,
+    "/usr/lib/postgresql/16/bin/psql": 1,
+    "/usr/lib/postgresql/16/bin/pg_dump": 1,
+    "/usr/lib/postgresql/16/bin/pg_restore": 1,
     "/usr/bin/getent": 5,
-    "/usr/bin/stat": 8,
+    "/usr/bin/stat": 16,
     "/var/lib/acornfox": 1,
     "/var/lib/acornfox/install": 2,
     "/etc/subuid": 4,
     "/etc/subgid": 4,
-    "/usr/bin/apt-get": 2,
+    "/usr/bin/apt-get": 5,
     "/usr/sbin/groupadd": 1,
     "/usr/sbin/useradd": 1,
     "/usr/sbin/usermod": 1,
-    "/usr/bin/install": 2,
+    "/usr/bin/install": 4,
     "/usr/bin/dirname": 1,
-    "/usr/bin/sha256sum": 3,
-    "/opt/acornfox/upgrade-tools/acornfox-upgrade": 2,
+    "/usr/bin/sha256sum": 4,
+    "/usr/bin/cmp": 1,
+    "/usr/bin/chmod": 2,
+    "/usr/bin/tee": 3,
+    "/usr/bin/mktemp": 2,
+    "/usr/bin/cp": 1,
+    "/usr/bin/sync": 2,
+    "/usr/bin/mv": 1,
+    "/usr/bin/rm": 3,
+    "/usr/bin/rmdir": 2,
+    "/run/acornfox-pgdg.XXXXXXXX": 1,
+    "/etc/apt": 1,
+    "/opt/acornfox/upgrade-tools/acornfox-upgrade": 5,
+    "/usr/bin/nproc": 1,
+    "/usr/bin/awk": 1,
+    "/usr/bin/df": 1,
+    "/usr/bin/tail": 1,
+    "/usr/bin/tr": 1,
 }
 
 FAKE_NAMES = {
     "/usr/bin/env": "env", "/usr/bin/id": "id", "/etc/os-release": "os-release",
     "/usr/bin/grep": "grep", "/usr/bin/uname": "uname", "/usr/bin/systemctl": "systemctl",
-    "/usr/bin/docker": "docker", "/usr/bin/psql": "psql", "/usr/lib/postgresql/16/bin/postgres": "postgres",
+    "/usr/bin/docker": "docker", "/usr/lib/postgresql/16/bin/postgres": "postgres",
+    "/usr/lib/postgresql/16/bin/psql": "psql", "/usr/lib/postgresql/16/bin/pg_dump": "pg_dump", "/usr/lib/postgresql/16/bin/pg_restore": "pg_restore",
     "/usr/bin/getent": "getent", "/usr/bin/stat": "stat", "/var/lib/acornfox": "state-parent", "/var/lib/acornfox/install": "state-install",
     "/etc/subuid": "subuid", "/etc/subgid": "subgid", "/usr/bin/apt-get": "apt-get",
     "/usr/sbin/groupadd": "groupadd", "/usr/sbin/useradd": "useradd", "/usr/sbin/usermod": "usermod",
     "/usr/bin/install": "install", "/usr/bin/dirname": "dirname", "/usr/bin/sha256sum": "sha256sum",
+    "/usr/bin/cmp": "cmp", "/usr/bin/chmod": "chmod", "/usr/bin/tee": "tee", "/usr/bin/mktemp": "mktemp",
+    "/usr/bin/cp": "cp", "/usr/bin/sync": "sync", "/usr/bin/mv": "mv", "/usr/bin/rm": "rm", "/usr/bin/rmdir": "rmdir",
+    "/run/acornfox-pgdg.XXXXXXXX": "pgdg-temp-template", "/etc/apt": "apt-root",
+    "/usr/bin/nproc": "nproc", "/usr/bin/awk": "awk", "/usr/bin/df": "df", "/usr/bin/tail": "tail", "/usr/bin/tr": "tr",
     "/opt/acornfox/upgrade-tools/acornfox-upgrade": "current-helper",
 }
 
 
 FAKE_PROGRAM = r'''#!__PYTHON__
-import json, os, pathlib, sys
+import hashlib, json, os, pathlib, shutil, sys
 
 ROOT = pathlib.Path(__ROOT__)
 STATE = ROOT / "state.json"
 LOG = ROOT / "calls.jsonl"
 CONTROL = ROOT / "control"
+PLATFORM = ROOT / "platform"
 SHA = "a" * 64
 
 def load():
@@ -90,6 +115,9 @@ def save(value):
 
 def control():
     return CONTROL.read_text().strip() if CONTROL.exists() else ""
+
+def platform():
+    return PLATFORM.read_text().strip() if PLATFORM.exists() else "ubuntu-amd64"
 
 def event(name, args, include_env=True):
     value = {"name": name, "argv": args}
@@ -137,9 +165,16 @@ def main():
     elif name == "dirname":
         print(str(pathlib.Path(args[-1]).parent))
     elif name == "uname":
-        print("x86_64")
+        print("aarch64" if platform().endswith("arm64") else "x86_64")
     elif name == "grep":
         needle = " ".join(args)
+        if "ID=ubuntu" in needle:
+            raise SystemExit(0 if platform().startswith("ubuntu-") else 1)
+        if "ID=debian" in needle:
+            raise SystemExit(0 if platform().startswith("debian-") else 1)
+        if "VERSION_ID" in needle:
+            expected = "24\\.04" if platform().startswith("ubuntu-") else "13"
+            raise SystemExit(0 if expected in needle else 1)
         if "acornfox-buildkit:231072:65536" in needle:
             raise SystemExit(0 if state["subid"] else 1)
         if "^acornfox-buildkit:" in needle:
@@ -171,31 +206,111 @@ def main():
         state["subid"] = True
         save(state)
     elif name == "stat":
-        subject = pathlib.Path(args[-1]).name
+        path = pathlib.Path(args[-1])
+        subject = path.name
         marker = control()
+        fmt = args[args.index("-c") + 1]
+        if not path.exists() and not path.is_symlink():
+            raise SystemExit(1)
+        mode = 0o777 if marker == "bad-mode" else path.stat().st_mode & 0o777
+        nlink = 2 if marker == "bad-nlink" else path.stat().st_nlink
+        if fmt == "%a":
+            print(f"{mode:o}")
+            return
+        if fmt == "%d:%i":
+            print(f"1:{path.stat().st_ino}")
+            return
+        if fmt == "%d:%i:%u:%g:%a:%F:%h":
+            kind = "directory" if path.is_dir() else "regular file"
+            print(f"1:{path.stat().st_ino}:0:0:{mode:o}:{kind}:{nlink}")
+            return
         if marker == "bad-mode":
             print("0:0:777:regular file:1" if subject.endswith("helper") else "0:0:777:directory:2")
         elif marker == "bad-nlink":
             print("0:0:755:regular file:2" if subject.endswith("helper") else "0:0:755:directory:3")
-        elif subject.endswith("helper"):
-            print("0:0:755:regular file:1")
-        elif subject == "candidate":
-            print("0:0:755:directory:2")
+        elif path.is_file():
+            print(f"0:0:{'755' if subject.endswith('helper') else f'{mode:o}'}:regular file:{nlink}")
+        elif path.is_dir():
+            if subject == "install":
+                print("0:0:700:directory:2" if any("%h" in arg for arg in args) else "0:0:700:directory")
+            else:
+                print("0:0:755:directory:2" if any("%h" in arg for arg in args) else "0:0:755:directory")
         else:
-            print("0:0:700:directory:2" if "%h" in args else "0:0:700:directory")
+            raise SystemExit(1)
     elif name == "sha256sum":
-        print(("b" * 64 if control() == "bad-digest" else "a" * 64) + "  " + args[-1])
+        path = pathlib.Path(args[-1])
+        if path.name == "acornfox-postgresql.asc":
+            print(hashlib.sha256(path.read_bytes()).hexdigest() + "  " + args[-1])
+        else:
+            print(("b" * 64 if control() == "bad-digest" else "a" * 64) + "  " + args[-1])
+    elif name == "mktemp":
+        if "-d" in args:
+            target = ROOT / "pgdg-private"
+            target.mkdir(mode=0o700, exist_ok=True)
+        else:
+            template = pathlib.Path(args[-1])
+            target = template.parent / (template.name.replace("XXXXXXXX", "fake-" + str(len(list(template.parent.glob("*.acornfox.fake-*"))))))
+            target.touch(exist_ok=False)
+        print(target)
+    elif name == "tee":
+        path = pathlib.Path(args[-1])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if control() == "publish-tee-failure" and ".acornfox." in path.name:
+            path.write_bytes(b"partial")
+            raise SystemExit(97)
+        path.write_bytes(sys.stdin.buffer.read())
+    elif name == "cmp":
+        left, right = pathlib.Path(args[-2]), pathlib.Path(args[-1])
+        raise SystemExit(0 if left.read_bytes() == right.read_bytes() else 1)
+    elif name == "chmod":
+        pathlib.Path(args[-1]).chmod(int(args[-2], 8))
+    elif name == "cp":
+        shutil.copyfile(args[-2], args[-1])
+        if control() == "unknown-pgdg-child":
+            pathlib.Path(args[-1]).parent.joinpath("unknown-source").write_bytes(b"unknown")
+    elif name == "sync":
+        pass
+    elif name == "mv":
+        source, target = pathlib.Path(args[-2]), pathlib.Path(args[-1])
+        if control() == "target-appears":
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"competing target")
+        elif not target.exists() and not target.is_symlink():
+            source.replace(target)
+    elif name == "rm":
+        pathlib.Path(args[-1]).unlink()
+    elif name == "rmdir":
+        pathlib.Path(args[-1]).rmdir()
+    elif name == "install" and "-d" in args:
+        path = pathlib.Path(args[-1])
+        path.mkdir(mode=int(args[args.index("-m") + 1], 8), parents=True, exist_ok=True)
     elif name == "systemctl":
         if args == ["is-system-running"]:
             print("running")
         elif args == ["--version"]:
             print("systemd 255")
+        elif args in (["is-enabled", "--quiet", "acornfox-pi-worker.service"], ["is-active", "--quiet", "acornfox-pi-worker.service"]):
+            raise SystemExit(1)
+    elif name == "nproc":
+        print("2")
+    elif name == "awk":
+        print("3891200")
+    elif name == "df":
+        print("Avail\n10485760")
+    elif name == "tail":
+        print(sys.stdin.read().splitlines()[-1])
+    elif name == "tr":
+        sys.stdout.write(sys.stdin.read())
     elif name == "docker":
         print("Docker version 26.0.0, build fake")
     elif name == "psql":
         print("psql (PostgreSQL) 16.3")
     elif name == "postgres":
         print("postgres (PostgreSQL) 16.3")
+    elif name == "pg_dump":
+        print("pg_dump (PostgreSQL) 16.3")
+    elif name == "pg_restore":
+        print("pg_restore (PostgreSQL) 16.3")
     elif name == "bootstrap-helper":
         if args[:1] == ["validate-runtime-inputs"]:
             assert args == ["validate-runtime-inputs", "--public-origin", "https://console.example.org", "--git-resolvers", "223.5.5.5:53,223.6.6.6:53"]
@@ -235,6 +350,12 @@ class RewrittenHost:
         self.successor = self.root / "successor-helper"
         self.log = self.root / "calls.jsonl"
         self.control = self.root / "control"
+        self.platform_file = self.root / "platform"
+        self.apt_root = self.root / "apt-root"
+        self.apt_key = self.apt_root / "keyrings" / "acornfox-postgresql.asc"
+        self.apt_source = self.apt_root / "sources.list.d" / "acornfox-postgresql.sources"
+        self.system_source = self.apt_root / "sources.list.d" / "debian.sources"
+        self.pgdg_private = self.root / "pgdg-private"
         self._prepare()
 
     def close(self) -> None:
@@ -250,13 +371,26 @@ class RewrittenHost:
         self.fakes.mkdir()
         self.candidate.mkdir()
         replacements = {token: str(self.fakes / FAKE_NAMES[token]) for token in TOKEN_COUNTS}
+        replacements["/etc/apt"] = str(self.apt_root)
+        replacements["/run/acornfox-pgdg.XXXXXXXX"] = str(self.root / "pgdg-temp-template")
+        replacements["/var/lib/acornfox"] = str(self.root / "state-parent")
+        replacements["/var/lib/acornfox/install"] = str(self.root / "state-parent" / "install")
         replacements["/opt/acornfox/upgrade-tools/acornfox-upgrade"] = str(self.current)
         all_source = "".join((SOURCE / name).read_text(encoding="utf-8") for name in NAMES)
         for token, expected in TOKEN_COUNTS.items():
             count = len(re.findall(re.escape(token) + r"(?![A-Za-z0-9_./-])", all_source))
             if count != expected:
                 raise AssertionError(f"token drift {token}: {count} != {expected}")
-            self._write_fake(pathlib.Path(replacements[token]))
+            if token == "/etc/apt":
+                (self.apt_root / "keyrings").mkdir(parents=True)
+                (self.apt_root / "sources.list.d").mkdir()
+                self.system_source.write_text("Types: deb\nURIs: http://system.example.invalid/debian\n", encoding="utf-8")
+            elif token == "/run/acornfox-pgdg.XXXXXXXX":
+                pathlib.Path(replacements[token]).parent.mkdir(parents=True, exist_ok=True)
+            elif token in {"/var/lib/acornfox", "/var/lib/acornfox/install"}:
+                continue
+            else:
+                self._write_fake(pathlib.Path(replacements[token]))
         self._write_fake(self.bootstrap)
         self._write_fake(self.successor)
         for name in NAMES:
@@ -290,6 +424,9 @@ class RewrittenHost:
         elif self.control.exists():
             self.control.unlink()
 
+    def set_platform(self, value: str = "ubuntu-amd64") -> None:
+        self.platform_file.write_text(value, encoding="utf-8")
+
     def calls(self) -> list[dict[str, object]]:
         if not self.log.exists():
             return []
@@ -306,7 +443,7 @@ class RewrittenHost:
         }
         if confirmations:
             env.update({"ACORNFOX_INSTALL_CONFIRMATION": "ACORNFOX-INSTALL", "ACORNFOX_DEDICATED_HOST_CONFIRMATION": "ACORNFOX-DEDICATED-HOST", "ACORNFOX_PUBLIC_ORIGIN":"https://console.example.org", "ACORNFOX_GIT_RESOLVERS":"223.5.5.5:53,223.6.6.6:53"})
-        return subprocess.run(["/bin/bash", str(self.scripts / script), *args], capture_output=True, text=True, env=env, check=False)
+        return subprocess.run(["/bin/bash", str(self.scripts / script), *args], capture_output=True, text=True, env=env, check=False, preexec_fn=lambda: os.umask(0o022))
 
     def host_args(self) -> list[str]:
         return ["--candidate-dir", str(self.candidate), "--binding-sha256", SHA, "--bootstrap-helper", str(self.bootstrap), "--bootstrap-helper-sha256", SHA]
@@ -362,6 +499,158 @@ class AcornFoxInstallScriptIntegrationTest(unittest.TestCase):
         self.assertNotIn(["is-active", "--quiet", "acornfox-healthcheck.service"], systemctl)
         self.assert_clean_child_env()
         self.assertEqual((sentinel.stat().st_ino, sentinel.read_bytes()), before)
+
+    def test_preflight_reports_supported_matrix_and_rejects_mismatches(self) -> None:
+        for platform, expected in (
+            ("ubuntu-amd64", {"architecture": "amd64", "os_id": "ubuntu", "os_version": "24.04"}),
+            ("ubuntu-arm64", {"architecture": "arm64", "os_id": "ubuntu", "os_version": "24.04"}),
+            ("debian-amd64", {"architecture": "amd64", "os_id": "debian", "os_version": "13"}),
+        ):
+            self.host.log.unlink(missing_ok=True)
+            self.host.set_platform(platform)
+            result = self.host.run("host-preflight.sh", ["--phase", "pre"])
+            self.assertEqual(result.returncode, 0, (platform, result.stdout, result.stderr))
+            receipt = json.loads(result.stdout)
+            self.assertEqual({key: receipt[key] for key in expected}, expected)
+            self.assertEqual(receipt["prerequisites"], "unchecked")
+            self.assertEqual([call for call in self.host.calls() if call["name"] == "apt-get"], [], platform)
+        for platform in ("debian-arm64", "other-amd64"):
+            self.host.log.unlink(missing_ok=True)
+            self.host.set_platform(platform)
+            result = self.host.run("host-preflight.sh", ["--phase", "pre"])
+            self.assertEqual(result.returncode, 23, (platform, result.stdout, result.stderr))
+            self.assertEqual([call for call in self.host.calls() if call["name"] == "apt-get"], [], platform)
+
+    def test_debian_bootstraps_ca_from_system_sources_then_publishes_pg16(self) -> None:
+        self.host.set_platform("debian-amd64")
+        first = self.host.run("install-host.sh", self.host.host_args(), confirmations=True)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        apt_calls = [call["argv"] for call in self.host.calls() if call["name"] == "apt-get"]
+        system_options = [
+            "-o", f"Dir::Etc::sourcelist={self.host.apt_root / 'sources.list'}",
+            "-o", f"Dir::Etc::sourceparts={self.host.pgdg_private / 'system-sourceparts'}",
+        ]
+        self.assertEqual(len(apt_calls), 4, apt_calls)
+        self.assertEqual(apt_calls[0], [*system_options, "update"])
+        self.assertEqual(apt_calls[1], [*system_options, "install", "-y", "--no-install-recommends", "ca-certificates"])
+        self.assertEqual(apt_calls[2], ["update"])
+        self.assertIn("postgresql-16", apt_calls[3])
+        self.assertIn("postgresql-client-16", apt_calls[3])
+        self.assertNotIn("postgresql", apt_calls[3])
+        copy_calls = [call["argv"] for call in self.host.calls() if call["name"] == "cp"]
+        self.assertEqual(len(copy_calls), 1, copy_calls)
+        self.assertEqual(copy_calls[0][-2], str(self.host.system_source))
+        self.assertIn("system-sourceparts/debian.sources", copy_calls[0][-1])
+        calls = self.host.calls()
+        ca_install = next(index for index, call in enumerate(calls) if call["name"] == "apt-get" and "ca-certificates" in call["argv"])
+        first_publish = next(index for index, call in enumerate(calls) if call["name"] == "mv")
+        second_update = next(index for index, call in enumerate(calls) if call["name"] == "apt-get" and call["argv"] == ["update"])
+        self.assertLess(ca_install, first_publish)
+        self.assertLess(first_publish, second_update)
+        self.assertEqual(self.host.apt_key.stat().st_mode & 0o777, 0o644)
+        self.assertEqual(self.host.apt_source.stat().st_mode & 0o777, 0o644)
+        self.assertIn(b"Suites: trixie-pgdg\n", self.host.apt_source.read_bytes())
+        self.assertFalse(self.host.pgdg_private.exists())
+        sync_calls = [call["argv"] for call in self.host.calls() if call["name"] == "sync"]
+        self.assertEqual(len(sync_calls), 4, sync_calls)
+        self.assertEqual(sync_calls[1][-1], str(self.host.apt_key.parent))
+        self.assertEqual(sync_calls[3][-1], str(self.host.apt_source.parent))
+        self.host.apt_key.chmod(0o600)
+        self.host.apt_source.chmod(0o600)
+        self.host.log.unlink()
+        second = self.host.run("install-host.sh", self.host.host_args(), confirmations=True)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(len([call for call in self.host.calls() if call["name"] == "mv"]), 0)
+        self.assertEqual(self.host.apt_key.stat().st_mode & 0o777, 0o644)
+        self.assertEqual(self.host.apt_source.stat().st_mode & 0o777, 0o644)
+
+    def test_debian_cleanup_preserves_unknown_private_snapshot_child(self) -> None:
+        self.host.set_platform("debian-amd64")
+        self.host.set_control("unknown-pgdg-child")
+        result = self.host.run("install-host.sh", self.host.host_args(), confirmations=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            (self.host.pgdg_private / "system-sourceparts" / "unknown-source").read_bytes(),
+            b"unknown",
+        )
+
+    def test_debian_atomic_publication_leaves_no_partial_final_and_retries(self) -> None:
+        self.host.set_platform("debian-amd64")
+        self.host.set_control("publish-tee-failure")
+        failed = self.host.run("install-host.sh", self.host.host_args(), confirmations=True)
+        self.assertEqual(failed.returncode, 23, failed.stderr)
+        self.assertFalse(self.host.apt_key.exists())
+        self.assertFalse(self.host.apt_source.exists())
+        self.assertEqual(list((self.host.apt_root / "keyrings").glob(".acornfox-postgresql.asc.acornfox.*")), [])
+        failed_apt = [call["argv"] for call in self.host.calls() if call["name"] == "apt-get"]
+        self.assertEqual(len(failed_apt), 2, failed_apt)
+        self.assertIn("ca-certificates", failed_apt[1])
+        cleanup_calls = [call["argv"] for call in self.host.calls() if call["name"] == "rm"]
+        self.assertEqual(len(cleanup_calls), 4, cleanup_calls)
+        self.assertEqual(sum(".acornfox." in call[-1] for call in cleanup_calls), 1, cleanup_calls)
+        self.assertTrue(all("pgdg-private" in call[-1] or ".acornfox." in call[-1] for call in cleanup_calls), cleanup_calls)
+        self.assertEqual([call for call in self.host.calls() if call["name"] == "groupadd"], [])
+        self.host.set_control()
+        self.host.log.unlink()
+        retried = self.host.run("install-host.sh", self.host.host_args(), confirmations=True)
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        self.assertEqual(self.host.apt_key.stat().st_mode & 0o777, 0o644)
+        self.assertEqual(self.host.apt_source.stat().st_mode & 0o777, 0o644)
+
+    def test_debian_atomic_publication_does_not_overwrite_competing_target(self) -> None:
+        self.host.set_platform("debian-amd64")
+        self.host.set_control("target-appears")
+        result = self.host.run("install-host.sh", self.host.host_args(), confirmations=True)
+        self.assertEqual(result.returncode, 23, result.stderr)
+        self.assertEqual(self.host.apt_key.read_bytes(), b"competing target")
+        self.assertFalse(self.host.apt_source.exists())
+        self.assertEqual(list((self.host.apt_root / "keyrings").glob(".acornfox-postgresql.asc.acornfox.*")), [])
+        self.assertEqual([call for call in self.host.calls() if call["name"] == "groupadd"], [])
+        cleanup_calls = [call["argv"] for call in self.host.calls() if call["name"] == "rm"]
+        self.assertEqual(len(cleanup_calls), 4, cleanup_calls)
+        self.assertEqual(sum(".acornfox." in call[-1] for call in cleanup_calls), 1, cleanup_calls)
+        self.assertTrue(all("pgdg-private" in call[-1] or ".acornfox." in call[-1] for call in cleanup_calls), cleanup_calls)
+
+    def test_debian_rejects_hardlinked_exact_apt_material_before_apt_or_accounts(self) -> None:
+        self.host.set_platform("debian-amd64")
+        first = self.host.run("install-host.sh", self.host.host_args(), confirmations=True)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        alias = self.host.root / "pgdg-key-alias"
+        os.link(self.host.apt_key, alias)
+        self.host.log.unlink()
+        second = self.host.run("install-host.sh", self.host.host_args(), confirmations=True)
+        self.assertEqual(second.returncode, 23, second.stderr)
+        names = [call["name"] for call in self.host.calls()]
+        self.assertEqual(names.count("apt-get"), 0, names)
+        self.assertEqual(names.count("groupadd"), 0, names)
+
+    def test_debian_rejects_foreign_apt_material_before_apt_or_accounts(self) -> None:
+        self.host.set_platform("debian-amd64")
+        cases = ((self.host.apt_key, b"foreign key\n"), (self.host.apt_source, b"foreign source\n"))
+        for path, content in cases:
+            self.host.log.unlink(missing_ok=True)
+            path.write_bytes(content)
+            path.chmod(0o644)
+            result = self.host.run("install-host.sh", self.host.host_args(), confirmations=True)
+            self.assertEqual(result.returncode, 23, (path, result.stdout, result.stderr))
+            names = [call["name"] for call in self.host.calls()]
+            self.assertEqual(names.count("apt-get"), 0, (path, names))
+            self.assertEqual(names.count("groupadd"), 0, (path, names))
+            path.unlink()
+        self.host.apt_key.symlink_to(self.host.root / "foreign-key")
+        result = self.host.run("install-host.sh", self.host.host_args(), confirmations=True)
+        self.assertEqual(result.returncode, 23, (result.stdout, result.stderr))
+        names = [call["name"] for call in self.host.calls()]
+        self.assertEqual(names.count("apt-get"), 0, names)
+        self.assertEqual(names.count("groupadd"), 0, names)
+        self.host.apt_key.unlink()
+        self.host.apt_key.mkdir()
+        self.host.log.unlink()
+        result = self.host.run("install-host.sh", self.host.host_args(), confirmations=True)
+        self.assertEqual(result.returncode, 23, (result.stdout, result.stderr))
+        names = [call["name"] for call in self.host.calls()]
+        self.assertEqual(names.count("apt-get"), 0, names)
+        self.assertEqual(names.count("groupadd"), 0, names)
 
     def test_upgrade_wrapper_handoffs_only_to_a_test_successor(self) -> None:
         next_binding = "b" * 64

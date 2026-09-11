@@ -322,7 +322,7 @@ func staticSourcePath(destination string) (string, bool) {
 	case destination == "pi/extensions/acornfox-tools.ts":
 		return "deploy/pi/acornfox-tools.ts", true
 	case destination == "pi/UPSTREAM-ASSETS.json":
-		return "internal/pibundle/assets-v0.85.1-linux-x64.json", true
+		return pibundle.ManifestSourcePath, true
 	case destination == "config/acornfox-buildkitd.toml":
 		return "deploy/buildkit/acornfox-buildkitd.toml", true
 	case destination == "config/acornfox-build-network-policy-v1.json":

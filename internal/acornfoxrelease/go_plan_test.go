@@ -85,7 +85,7 @@ func TestPrepareGoBuildPlanV1UsesOnlySealedGoList(t *testing.T) {
 		}
 		switch args[0] {
 		case "version":
-			return []byte("go version " + toolchain.GoVersion + " linux/amd64\n"), nil
+			return []byte("go version " + toolchain.GoVersion + " linux/" + Architecture + "\n"), nil
 		case "mod":
 			if !sameStrings(args, []string{"mod", "verify"}) {
 				t.Fatalf("verify args=%q", args)
@@ -145,7 +145,7 @@ func TestPrepareGoBuildPlanV1PinsGoExecutableAndStopsOnVerifyFailure(t *testing.
 		calls = append(calls, append([]string(nil), args...))
 		switch args[0] {
 		case "version":
-			return []byte("go version " + toolchain.GoVersion + " linux/amd64\n"), nil
+			return []byte("go version " + toolchain.GoVersion + " linux/" + Architecture + "\n"), nil
 		case "mod":
 			return nil, errors.New("tampered module cache")
 		case "list":
@@ -195,7 +195,7 @@ func TestPrepareGoBuildPlanV1RejectsExecutableAndCacheDrift(t *testing.T) {
 	plan, err = prepareGoBuildPlanV1(context.Background(), witness, policy, toolchain, root, cacheRoot, localNPMCLIPath(t), func(_ context.Context, _ string, args []string, dir string, _ []string) ([]byte, error) {
 		switch args[0] {
 		case "version":
-			return []byte("go version " + toolchain.GoVersion + " linux/amd64\n"), nil
+			return []byte("go version " + toolchain.GoVersion + " linux/" + Architecture + "\n"), nil
 		case "mod":
 			modVerifies++
 			if modVerifies == 2 {

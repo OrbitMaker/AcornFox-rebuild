@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "product": "acornfox",
+  "component": "buildkit-runc",
+  "architecture": "arm64",
+  "source_url": "https://codeload.github.com/opencontainers/runc/tar.gz/refs/tags/v1.4.3",
+  "build_kind": "source-built-dynamic-ubuntu-24.04",
+  "source_version": "v1.4.3",
+  "source_commit": "bb14dabeb7185bb72c8c86735d090dcb20f36587",
+  "source_archive_sha256": "e0a89f9e883ce93e740d14bb105b25c665f7d7beade4cfd0714fcafb38855d35",
+  "binary_sha256": "6607030be180844bcf95fa857cef618fcedeffd54d69fe2f829d1e2c3faee3bf",
+  "go_version": "go1.25.13",
+  "gcc_version": "13.3.0",
+  "two_builds_match": true,
+  "runc_version_output": [
+    "runc version 1.4.3+acornfox.1",
+    "commit: bb14dabeb7185bb72c8c86735d090dcb20f36587",
+    "spec: 1.3.0",
+    "go: go1.25.13",
+    "libseccomp: 2.5.5"
+  ],
+  "tools": {
+    "go": {
+      "sha256": "3bdb0a47b70b72ae6361e19cac9efcea0d4eb89e99339540d93b98543c802bee"
+    },
+    "gcc": {
+      "sha256": "a20520ee21543f243d40636a9181a142c45ecd989de31ab86b99a8ea5ada870d"
+    },
+    "ld": {
+      "sha256": "1e4d3369b76845fa8e099b83513bf28f6f722e046f9b2cde1378c9e27f96d19c"
+    },
+    "pkg-config": {
+      "sha256": "b21b58e97876992968c82d823d74034abbc6a4176f8c9d5f2e0400f343e73fc1"
+    },
+    "make": {
+      "sha256": "abbecc214fcadef6530d1cc137bde7ceb74cae3f6b992c7d10a8669a7314c7e0"
+    }
+  },
+  "host_package_versions": [
+    "binutils\t2.42-4ubuntu2.10",
+    "gcc\t4:13.2.0-7ubuntu1",
+    "gcc-13\t13.3.0-6ubuntu2~24.04.1",
+    "libc6:arm64\t2.39-0ubuntu8.8",
+    "libc6-dev:arm64\t2.39-0ubuntu8.8",
+    "libseccomp-dev:arm64\t2.5.5-1ubuntu3.1",
+    "libseccomp2:arm64\t2.5.5-1ubuntu3.1",
+    "make\t4.3-4.1build2",
+    "pkg-config:arm64\t1.8.1-2build1"
+  ],
+  "build_flags": [
+    "-p=2",
+    "-trimpath",
+    "-buildmode=pie",
+    "-mod=vendor",
+    "-buildvcs=false",
+    "-tags=seccomp urfave_cli_no_docs",
+    "-ldflags=-s -w -buildid= -X main.gitCommit=bb14dabeb7185bb72c8c86735d090dcb20f36587 -X main.extraVersion=+acornfox.1"
+  ],
+  "dynamic_libraries": [
+    "libseccomp.so.2",
+    "libc.so.6"
+  ],
+  "dynamic_loader": "/lib/ld-linux-aarch64.so.1"
+}

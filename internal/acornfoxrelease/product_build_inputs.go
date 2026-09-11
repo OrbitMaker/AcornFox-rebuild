@@ -14,7 +14,10 @@ import (
 // boundary were malformed, drifted, or were paired with the wrong policy.
 var ErrProductBuildInputs = errors.New("acornfox product build inputs are invalid")
 
-const productBuildInputsSchemaV1 = 1
+const (
+	productBuildInputsSchemaV1      = 1
+	historicalProductArchitectureV1 = "amd64"
+)
 
 // ControlledEgressPolicyV1 describes the complete network boundary for the
 // download phase. The build phase is deliberately offline and is not a
@@ -79,7 +82,9 @@ var expectedDownloadDomainsV1 = []string{
 }
 
 func (v ControlledEgressPolicyV1) Validate() error {
-	if v.SchemaVersion != productBuildInputsSchemaV1 || v.Product != Product || v.Architecture != Architecture || !v.DenyIPv6 || !v.DenyUnexpectedDNS || !v.NoProxy || !v.NoCredentials || !v.DenyOtherEgress || !v.DenyIngress || !v.OfflineBuildRequired {
+	// These records attest the original amd64 product build. They must not
+	// follow the CPU of a later release-builder binary.
+	if v.SchemaVersion != productBuildInputsSchemaV1 || v.Product != Product || v.Architecture != historicalProductArchitectureV1 || !v.DenyIPv6 || !v.DenyUnexpectedDNS || !v.NoProxy || !v.NoCredentials || !v.DenyOtherEgress || !v.DenyIngress || !v.OfflineBuildRequired {
 		return ErrProductBuildInputs
 	}
 	if !sameSortedStrings(v.ResolverIPv4, expectedEgressResolversV1) || !sameSortedStrings(v.ResolverProtocols, []string{"tcp", "udp"}) || len(v.ResolverPorts) != 1 || v.ResolverPorts[0] != 53 || !sameSortedStrings(v.DenyIPv4CIDRs, expectedEgressDenyCIDRsV1) || !sameSortedStrings(v.DownloadDNSDomains, expectedDownloadDomainsV1) || len(v.AllowPublicTCPPorts) != 2 || v.AllowPublicTCPPorts[0] != 80 || v.AllowPublicTCPPorts[1] != 443 {
@@ -89,7 +94,7 @@ func (v ControlledEgressPolicyV1) Validate() error {
 }
 
 func (v ProductBuildInputsV1) Validate() error {
-	if v.SchemaVersion != productBuildInputsSchemaV1 || v.Product != Product || v.Architecture != Architecture || v.SourceCommit != "15f3fb979876b6e6ac03b8c6bf68ed9638e4401e" || v.SourceTree != "90211b60c03be63cbb48e51f7c51bd92805fe46b" || v.SourceCommitEpoch != 1788608137 || v.TrackedFiles != 1278 || v.TransferArchiveSHA256 != "c543b62a2254c70ab283c4a9b2c8f4d05b82cb8d517c90cff43e092d2de291b0" || !policyDigestText(v.ControlledEgressPolicySHA) {
+	if v.SchemaVersion != productBuildInputsSchemaV1 || v.Product != Product || v.Architecture != historicalProductArchitectureV1 || v.SourceCommit != "15f3fb979876b6e6ac03b8c6bf68ed9638e4401e" || v.SourceTree != "90211b60c03be63cbb48e51f7c51bd92805fe46b" || v.SourceCommitEpoch != 1788608137 || v.TrackedFiles != 1278 || v.TransferArchiveSHA256 != "c543b62a2254c70ab283c4a9b2c8f4d05b82cb8d517c90cff43e092d2de291b0" || !policyDigestText(v.ControlledEgressPolicySHA) {
 		return ErrProductBuildInputs
 	}
 	if !sameBuildLockFiles(v.LockFiles, expectedBuildLockFilesV1()) || !sameBuildToolchains(v.Toolchains, expectedBuildToolchainsV1()) {

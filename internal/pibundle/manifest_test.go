@@ -14,7 +14,7 @@ func TestPinnedManifestIdentityAndRuntimeResources(t *testing.T) {
 		t.Fatalf("entry count = %d", len(entries))
 	}
 	want := map[string]string{
-		"pi/pi":                "443bd83f30e4dbc7bac2eed9c6aa2461b9a15016fd555f48c92a0591d028c403",
+		"pi/pi":                expectedPiBinarySHA256,
 		"pi/package.json":      "f1738e4b42203e5f22bcb513f13fb2fb224f1e98d1f129ff042f87048665a94c",
 		"pi/theme/dark.json":   "103a5aecb74a2dab5cc903c9741845ee6158658ce2ff6e5445948784116eaef8",
 		"pi/photon_rs_bg.wasm": "10468181565c56004c867f3a4af96f89a0ef5a63a72f2b5fb12c1f1992a3615c",

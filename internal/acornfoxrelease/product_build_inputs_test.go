@@ -38,6 +38,9 @@ func TestProductBuildInputLockIsCanonicalAndPolicyBound(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if inputs.Architecture != historicalProductArchitectureV1 || policy.Architecture != historicalProductArchitectureV1 {
+		t.Fatalf("historical architecture = inputs %q, policy %q", inputs.Architecture, policy.Architecture)
+	}
 	canonicalInputs, err := CanonicalProductBuildInputsV1(inputs)
 	if err != nil || !bytes.Equal(canonicalInputs, inputsRaw) {
 		t.Fatal("input lock was not canonical")
@@ -70,6 +73,7 @@ func TestProductBuildInputLockRejectsStructuralAndFactDrift(t *testing.T) {
 		{"unsafe url", func(v *ProductBuildInputsV1) { v.Toolchains[0].URL = "http://dl.google.com/go.tar.gz" }},
 		{"toolchain version", func(v *ProductBuildInputsV1) { v.Toolchains[1].Version = "v22.22.1" }},
 		{"source commit", func(v *ProductBuildInputsV1) { v.SourceCommit = strings.Repeat("a", 40) }},
+		{"historical architecture", func(v *ProductBuildInputsV1) { v.Architecture = "arm64" }},
 	}
 	for _, tc := range inputsCases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -94,6 +98,7 @@ func TestProductBuildInputLockRejectsStructuralAndFactDrift(t *testing.T) {
 		}},
 		{"ipv6 enabled", func(v *ControlledEgressPolicyV1) { v.DenyIPv6 = false }},
 		{"offline build disabled", func(v *ControlledEgressPolicyV1) { v.OfflineBuildRequired = false }},
+		{"historical architecture", func(v *ControlledEgressPolicyV1) { v.Architecture = "arm64" }},
 	}
 	for _, tc := range policyCases {
 		t.Run(tc.name, func(t *testing.T) {
