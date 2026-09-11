@@ -127,6 +127,8 @@ type Server struct {
 	acornFoxSourceMetadata     *AcornFoxSourceMetadataHTTPHandler
 	acornFoxFixCandidate       *AcornFoxFixCandidateHTTPHandler
 	acornFoxTLSAllow           *acornFoxTLSAllowHandler
+	acornFoxDockerfileImporter acornFoxDockerfileImporter
+	consoleAccessMode          ConsoleAccessMode
 	broker                     *eventBroker
 	agentGateway               *agenttransport.Gateway
 	repositoryHealth           interface {
@@ -230,15 +232,43 @@ func (s *Server) SetAcornFoxSourceUpdate(handler *AcornFoxSourceUpdateHTTPHandle
 func (s *Server) SetAcornFoxFixCandidate(handler *AcornFoxFixCandidateHTTPHandler) {
 	s.acornFoxFixCandidate = handler
 }
+func (s *Server) SetAcornFoxDockerfileImporter(importer acornFoxDockerfileImporter) {
+	s.acornFoxDockerfileImporter = importer
+}
 func (s *Server) SetAcornFoxHostMetrics(handler http.Handler) { s.acornFoxHostMetrics = handler }
 func (s *Server) SetLegacyRoutesEnabled(enabled bool)         { s.legacyRoutesEnabled = enabled }
-func (s *Server) Handler() http.Handler                       { return http.HandlerFunc(s.serveHTTP) }
-func (s *Server) AgentGateway() *agenttransport.Gateway       { return s.agentGateway }
+func (s *Server) SetConsoleAccessMode(mode ConsoleAccessMode) error {
+	switch mode {
+	case "", ConsoleAccessPublicHTTPS:
+		s.consoleAccessMode = ConsoleAccessPublicHTTPS
+		return nil
+	case ConsoleAccessLocalLoopback:
+		s.consoleAccessMode = ConsoleAccessLocalLoopback
+		return nil
+	default:
+		return errors.New("unknown console access mode: " + string(mode))
+	}
+}
+func (s *Server) ConsoleAccessMode() ConsoleAccessMode { return s.consoleAccessMode }
+func (s *Server) Handler() http.Handler                { return http.HandlerFunc(s.serveHTTP) }
+func (s *Server) AgentGateway() *agenttransport.Gateway { return s.agentGateway }
 func (s *Server) HTTPServer(addr string) *http.Server {
 	return &http.Server{Addr: addr, Handler: s.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 0, IdleTimeout: 60 * time.Second}
 }
 
 func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
+	switch s.consoleAccessMode {
+	case "", ConsoleAccessPublicHTTPS:
+		// Public HTTPS mode
+	case ConsoleAccessLocalLoopback:
+		if !validateLocalLoopbackRequest(request) {
+			writeJSONError(writer, http.StatusForbidden, "access_denied", "local loopback access denied")
+			return
+		}
+	default:
+		writeJSONError(writer, http.StatusInternalServerError, "invalid_configuration", "invalid console access mode")
+		return
+	}
 	if s.handleAcornFoxHTTPSBoundary(writer, request) {
 		return
 	}
@@ -282,7 +312,11 @@ func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 	if isAcornFoxAuthRoute(request.URL.Path) {
-		if s.auth != nil && s.auth.HandleAcornFox(writer, request) {
+		config := acornFoxAuthRouteConfig
+		if s.consoleAccessMode == ConsoleAccessLocalLoopback {
+			config = localAuthRouteConfig
+		}
+		if s.auth != nil && s.auth.HandleAcornFoxWithConfig(writer, request, config) {
 			return
 		}
 		authNoStore(writer)
@@ -290,7 +324,12 @@ func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 	if request.URL.Path == acornFoxSetupPath {
-		s.acornFoxWebSetup.Handle(writer, request)
+		if s.acornFoxWebSetup != nil {
+			s.acornFoxWebSetup.HandleWithPolicy(writer, request, s.consoleAccessMode)
+		} else {
+			authNoStore(writer)
+			writeJSONError(writer, http.StatusServiceUnavailable, "setup_unavailable", "setup unavailable")
+		}
 		return
 	}
 	var authenticated bool

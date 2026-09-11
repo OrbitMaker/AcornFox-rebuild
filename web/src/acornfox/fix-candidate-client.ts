@@ -1,4 +1,5 @@
 import { AcornFoxRequestError, type Command } from "./client";
+import { resolveCsrfToken } from "./csrf";
 
 type CandidateBase = {
   candidate_id: string;
@@ -73,8 +74,7 @@ export function createFixCandidateClient(fetcher: Fetcher = fetch): FixCandidate
   async function request(url: string, expected: number, init: RequestInit = {}): Promise<unknown> {
     const headers = new Headers(init.headers); headers.set("Accept", "application/json");
     if (init.method === "POST") {
-      const cookie = typeof document === "undefined" ? undefined : document.cookie.split(";").map((part) => part.trim()).find((part) => part.startsWith("__Host-acornfox_csrf="));
-      let token: string | undefined; try { token = cookie ? decodeURIComponent(cookie.slice("__Host-acornfox_csrf=".length)) : undefined; } catch { /* malformed cookie is not authorization */ }
+      const token = resolveCsrfToken();
       if (!token) throw new AcornFoxRequestError(401, "csrf_missing", "登录已过期，请重新登录。");
       headers.set("X-AcornFox-CSRF", token);
       if (init.body !== undefined) headers.set("Content-Type", "application/json");

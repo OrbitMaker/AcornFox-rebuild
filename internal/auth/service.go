@@ -88,21 +88,41 @@ type SessionInfo struct {
 	AbsoluteAt    time.Time
 }
 
+const ExactLocalLoopbackOrigin = "http://127.0.0.1:8080"
+
 func NewService(config Config) (*Service, error) { return newService(config, false) }
+
+func NewLocalService(config Config) (*Service, error) { return newLocalService(config, false) }
 
 // newService permits lower PBKDF2 iterations only for package-local unit tests.
 // Production callers must use NewService, which enforces the fixed minimum.
 func newService(config Config, allowTestParameters bool) (*Service, error) {
+	return newServiceInternal(config, allowTestParameters, false)
+}
+
+func newLocalService(config Config, allowTestParameters bool) (*Service, error) {
+	return newServiceInternal(config, allowTestParameters, true)
+}
+
+func newServiceInternal(config Config, allowTestParameters bool, allowLocalLoopback bool) (*Service, error) {
 	if config.Store == nil {
 		return nil, errors.New("auth store is required")
 	}
-	origin := strings.TrimSpace(config.Origin)
-	if origin != "" {
-		parsed, err := url.Parse(origin)
-		if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
-			return nil, errors.New("auth origin must be an exact HTTPS origin")
+	var origin string
+	if allowLocalLoopback {
+		if config.Origin != ExactLocalLoopbackOrigin {
+			return nil, errors.New("local auth origin must be exact " + ExactLocalLoopbackOrigin)
 		}
-		origin = parsed.String()
+		origin = ExactLocalLoopbackOrigin
+	} else {
+		trimmed := strings.TrimSpace(config.Origin)
+		if trimmed != "" {
+			parsed, err := url.Parse(trimmed)
+			if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+				return nil, errors.New("auth origin must be an exact HTTPS origin")
+			}
+			origin = parsed.String()
+		}
 	}
 	iterations := config.Iterations
 	if iterations == 0 {

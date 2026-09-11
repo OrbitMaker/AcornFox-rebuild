@@ -1,6 +1,7 @@
 package install
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,6 +10,8 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+
+	"github.com/open-card/open-card/internal/acornfoxsetup"
 )
 
 type acornFoxUpgradeServices interface {
@@ -165,6 +168,9 @@ func (acornFoxRealUpgradeServices) HealthyWithRecoveryHelper(ctx context.Context
 			return e
 		}
 	}
+	if image.Runtime.Inputs.Origin == acornfoxsetup.ExactLocalLoopbackOrigin {
+		return VerifyAcornFoxLocalReadyV1(ctx)
+	}
 	return acornFoxUpgradeHTTP(ctx, []string{"http://127.0.0.1:18481/healthz", "http://127.0.0.1:18481/readyz"})
 }
 
@@ -235,4 +241,128 @@ func acornFoxUpgradeHTTP(ctx context.Context, targets []string) error {
 		}
 	}
 	return nil
+}
+
+var localReadyHTTPClient = &http.Client{
+	Timeout: 3 * time.Second,
+	Transport: &http.Transport{
+		Proxy: nil,
+	},
+	CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
+
+// VerifyAcornFoxLocalReadyV1 performs a bounded, strict health check on local loopback:
+// 1. http://127.0.0.1:18481/healthz (200 OK)
+// 2. http://127.0.0.1:18481/readyz (200 OK)
+// 3. http://127.0.0.1:8080/api/v1/acornfox/setup (200 OK, JSON state == "initialized" or "uninitialized")
+func VerifyAcornFoxLocalReadyV1(ctx context.Context) error {
+	return verifyLocalReadyWithTimeout(ctx, 45*time.Second, "http://127.0.0.1:18481", "http://127.0.0.1:8080")
+}
+
+func verifyLocalReadyWithTimeout(ctx context.Context, timeout time.Duration, direct18481Base, caddy8080Base string) error {
+	bounded, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	// 1. Direct healthz and readyz on server port 18481
+	for _, path := range []string{"/healthz", "/readyz"} {
+		target := direct18481Base + path
+		for {
+			req, err := http.NewRequestWithContext(bounded, http.MethodGet, target, nil)
+			if err != nil {
+				return ErrAcornFoxUpgradeUnknown
+			}
+			resp, err := localReadyHTTPClient.Do(req)
+			ok := err == nil && resp.StatusCode == http.StatusOK
+			if resp != nil {
+				_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+				_ = resp.Body.Close()
+			}
+			if ok {
+				break
+			}
+			select {
+			case <-bounded.Done():
+				return ErrAcornFoxUpgradeUnknown
+			case <-time.After(200 * time.Millisecond):
+			}
+		}
+	}
+
+	// 2. Local Caddy setup API on port 8080
+	setupTarget := caddy8080Base + "/api/v1/acornfox/setup"
+	for {
+		req, err := http.NewRequestWithContext(bounded, http.MethodGet, setupTarget, nil)
+		if err != nil {
+			return ErrAcornFoxUpgradeUnknown
+		}
+		resp, err := localReadyHTTPClient.Do(req)
+		var ok bool
+		if err == nil && resp.StatusCode == http.StatusOK {
+			body, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			if readErr == nil && len(body) < 4096 {
+				ok = isValidStrictSetupPayload(body)
+			}
+		}
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+		if ok {
+			break
+		}
+		select {
+		case <-bounded.Done():
+			return ErrAcornFoxUpgradeUnknown
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+
+	return nil
+}
+
+func isValidStrictSetupPayload(data []byte) bool {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	// 1. Must start with '{'
+	t, err := dec.Token()
+	if err != nil || t != json.Delim('{') {
+		return false
+	}
+	stateVal := ""
+	stateFound := false
+
+	// 2. Iterate object tokens: must contain only "state": "initialized"|"uninitialized"
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return false
+		}
+		key, ok := keyTok.(string)
+		if !ok || key != "state" || stateFound {
+			return false // unexpected or duplicate key
+		}
+		valTok, err := dec.Token()
+		if err != nil {
+			return false
+		}
+		val, ok := valTok.(string)
+		if !ok {
+			return false
+		}
+		stateVal = val
+		stateFound = true
+	}
+
+	// 3. Must end with '}'
+	t, err = dec.Token()
+	if err != nil || t != json.Delim('}') {
+		return false
+	}
+
+	// 4. Must not have trailing JSON tokens
+	if _, err := dec.Token(); err != io.EOF {
+		return false
+	}
+
+	return stateVal == "initialized" || stateVal == "uninitialized"
 }

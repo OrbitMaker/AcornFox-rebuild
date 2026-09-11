@@ -31,6 +31,7 @@ const (
 	shapePublicAccess
 	shapeHostMetrics
 	shapeSourceMetadata
+	shapeDeploymentPlan
 	shapeDeliverySource
 	shapeOperationResult
 	shapeSourceUpdate
@@ -147,6 +148,8 @@ func expectedSuccessStatus(method, rawPath string, shape responseShape) (int, bo
 		case hasApp && len(segments) == 4 && segments[2] == "sources" && noQuery && shape == shapeSource:
 			return http.StatusOK, true
 		case hasApp && len(segments) == 5 && segments[2] == "sources" && segments[4] == "metadata" && noQuery && shape == shapeSourceMetadata:
+			return http.StatusOK, true
+		case hasApp && len(segments) == 5 && segments[2] == "sources" && segments[4] == "deployment-plan" && noQuery && shape == shapeDeploymentPlan:
 			return http.StatusOK, true
 		case hasApp && len(segments) == 4 && segments[2] == "fix-candidates" && noQuery && shape == shapeFixCandidate:
 			return http.StatusOK, true

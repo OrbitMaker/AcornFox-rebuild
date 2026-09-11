@@ -131,6 +131,7 @@ type acornFoxCleanDependencies struct {
 	verifyPrepared          func(context.Context) (install.AcornFoxHostBootstrapReceiptV1, error)
 	migrateControlPlane     func(context.Context, install.AcornFoxBuildIdentityV1) (install.AcornFoxControlPlaneMigrationReceiptV1, error)
 	configureRuntime        func(context.Context, install.AcornFoxBuildIdentityV1, string, []string) (install.AcornFoxRuntimeConfigReceiptV1, error)
+	configureLocalRuntime   func(context.Context, install.AcornFoxBuildIdentityV1, []string) (install.AcornFoxRuntimeConfigReceiptV1, error)
 	recoverRuntime          func(context.Context, install.AcornFoxBuildIdentityV1) error
 	upgrade                 func(context.Context, install.AcornFoxUpgradeRequestV1) (install.AcornFoxUpgradeReceiptV1, error)
 	prepareUpgradeRecovery  func(context.Context, install.AcornFoxBuildIdentityV1) (install.AcornFoxUpgradeReceiptV1, bool, error)
@@ -140,6 +141,7 @@ type acornFoxCleanDependencies struct {
 	verifyRuntimeNetwork    func(context.Context) error
 	configureAssistant      func(context.Context, string) (install.AcornFoxAssistantConfigReceiptV1, error)
 	disableAssistant        func(context.Context) (install.AcornFoxAssistantConfigReceiptV1, error)
+	waitLocalReady          func(context.Context) error
 }
 
 type productionBootstrapRuntimeDependencies struct {
@@ -261,6 +263,7 @@ func productionUpgradeDependencies() upgradeDependencies {
 			verifyPrepared:          install.VerifyPreparedAcornFoxHostV1,
 			migrateControlPlane:     install.MigrateAcornFoxControlPlaneV1,
 			configureRuntime:        install.ConfigureAcornFoxRuntimeV1,
+			configureLocalRuntime:   install.ConfigureAcornFoxLocalRuntimeV1,
 			recoverRuntime:          install.RecoverAcornFoxRuntimeV1,
 			upgrade:                 install.UpgradeAcornFoxHostV1,
 			prepareUpgradeRecovery:  install.PrepareAcornFoxUpgradeRecoveryV1,
@@ -272,6 +275,7 @@ func productionUpgradeDependencies() upgradeDependencies {
 			verifyRuntimeNetwork:  runtimenetwork.Verify,
 			configureAssistant:    install.ConfigureAcornFoxAssistantV1,
 			disableAssistant:      install.DisableAcornFoxAssistantV1,
+			waitLocalReady:        install.VerifyAcornFoxLocalReadyV1,
 		},
 	}
 }
@@ -431,6 +435,36 @@ func runAcornFoxClean(ctx context.Context, args []string, stdout io.Writer, role
 			return writeAcornFoxCleanError(stdout, exitRecovery, "runtime_configuration_incomplete")
 		}
 		return writeUpgradeJSON(stdout, exitOK, map[string]any{"ok": true, "command": config.command, "receipt": receipt})
+	}
+	if config.command == "validate-local-runtime-inputs" || config.command == "configure-local-runtime" {
+		var resolvers []string
+		if config.gitResolvers != "" {
+			resolvers = strings.Split(config.gitResolvers, ",")
+		}
+		input := acornfoxsetup.Inputs{Origin: acornfoxsetup.ExactLocalLoopbackOrigin, Version: identity.Version, ResolverEndpoints: resolvers, Now: time.Now().UTC()}
+		if acornfoxsetup.ValidateLocalInputs(input) != nil {
+			return writeAcornFoxCleanError(stdout, exitArgs, "runtime_inputs_invalid")
+		}
+		if config.command == "validate-local-runtime-inputs" {
+			return writeUpgradeJSON(stdout, exitOK, map[string]any{"ok": true, "code": "runtime_inputs_valid"})
+		}
+		if deps.configureLocalRuntime == nil {
+			return writeAcornFoxCleanError(stdout, exitIneligible, "runtime_configuration_ineligible")
+		}
+		receipt, err := deps.configureLocalRuntime(ctx, identity, resolvers)
+		if err != nil || receipt.Validate() != nil || receipt.ReleaseID != identity.ReleaseID || receipt.SourceCommit != identity.SourceCommit {
+			return writeAcornFoxCleanError(stdout, exitRecovery, "runtime_configuration_incomplete")
+		}
+		return writeUpgradeJSON(stdout, exitOK, map[string]any{"ok": true, "command": config.command, "receipt": receipt})
+	}
+	if config.command == "wait-local-ready" {
+		if deps.waitLocalReady == nil {
+			return writeAcornFoxCleanError(stdout, exitIneligible, "runtime_health_ineligible")
+		}
+		if err := deps.waitLocalReady(ctx); err != nil {
+			return writeAcornFoxCleanError(stdout, exitRecovery, "runtime_health_unavailable")
+		}
+		return writeUpgradeJSON(stdout, exitOK, map[string]any{"ok": true, "code": "local_runtime_ready"})
 	}
 	if config.command == "runtime-network-prepare" || config.command == "runtime-network-verify" {
 		if deps.verifyHelper == nil || !deps.verifyHelper(identity) {
@@ -621,9 +655,18 @@ func parseAcornFoxCleanArgs(args []string) (upgradeCommandConfig, error) {
 		if config.publicOrigin == "" || config.gitResolvers == "" {
 			return upgradeCommandConfig{}, errors.New("runtime configuration is required")
 		}
-	case "runtime-network-prepare", "runtime-network-verify":
+	case "validate-local-runtime-inputs", "configure-local-runtime":
+		if len(args) == 1 {
+			// No flags: origin is fixed to ExactLocalLoopbackOrigin, empty resolvers permitted
+			break
+		}
+		if len(args) != 3 || args[1] != "--git-resolvers" {
+			return upgradeCommandConfig{}, errors.New("invalid local runtime configuration arguments")
+		}
+		config.gitResolvers = args[2]
+	case "runtime-network-prepare", "runtime-network-verify", "wait-local-ready":
 		if len(args) != 1 {
-			return upgradeCommandConfig{}, errors.New("invalid runtime network arguments")
+			return upgradeCommandConfig{}, errors.New("invalid zero-arg clean command")
 		}
 	case "configure-assistant":
 		if len(args) != 3 || args[1] != "--deepseek-key-file" || !filepath.IsAbs(args[2]) || filepath.Clean(args[2]) != args[2] || args[2] == string(filepath.Separator) || strings.ContainsRune(args[2], 0) {

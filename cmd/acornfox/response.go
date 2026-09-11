@@ -157,6 +157,69 @@ type apiSourceMetadata struct {
 	Availability     string  `json:"availability"`
 	RepositoryURL    *string `json:"repository_url,omitempty"`
 }
+type apiDeploymentPlanDockerfile struct {
+	Status     string                    `json:"status"`
+	Path       string                    `json:"path"`
+	Digest     string                    `json:"digest,omitempty"`
+	StageCount int                       `json:"stage_count"`
+	FinalStage *apiDeploymentPlanStage   `json:"final_stage,omitempty"`
+	Workdir    string                    `json:"workdir,omitempty"`
+	Entrypoint *apiDeploymentPlanCommand `json:"entrypoint,omitempty"`
+	Command    *apiDeploymentPlanCommand `json:"command,omitempty"`
+}
+type apiDeploymentPlanStage struct {
+	Name     string `json:"name"`
+	Index    int    `json:"index"`
+	From     string `json:"from"`
+	Platform string `json:"platform,omitempty"`
+}
+type apiDeploymentPlanCommand struct {
+	Form   string   `json:"form,omitempty"`
+	Values []string `json:"values,omitempty"`
+}
+type apiDeploymentPlanPort struct {
+	Port     int    `json:"port"`
+	Protocol string `json:"protocol"`
+	Source   string `json:"source"`
+}
+type apiDeploymentPlanPortSelection struct {
+	Status         string `json:"status"`
+	Reason         string `json:"reason"`
+	SelectedPort   *int   `json:"selected_port,omitempty"`
+	Candidates     []int  `json:"candidates"`
+	SuggestedPorts []int  `json:"suggested_ports,omitempty"`
+}
+type apiDeploymentPlanHealthcheck struct {
+	Present            bool     `json:"present"`
+	Disabled           bool     `json:"disabled,omitempty"`
+	Form               string   `json:"form,omitempty"`
+	Test               []string `json:"test,omitempty"`
+	IntervalSeconds    int      `json:"interval_seconds,omitempty"`
+	TimeoutSeconds     int      `json:"timeout_seconds,omitempty"`
+	StartPeriodSeconds int      `json:"start_period_seconds,omitempty"`
+	Retries            int      `json:"retries,omitempty"`
+}
+type apiDeploymentPlanEnvironment struct {
+	Name     string `json:"name"`
+	Value    string `json:"value,omitempty"`
+	Redacted bool   `json:"redacted,omitempty"`
+}
+type apiDeploymentPlan struct {
+	ApplicationID    string                         `json:"application_id"`
+	SourceRevisionID string                         `json:"source_revision_id"`
+	RepositoryURL    string                         `json:"repository_url"`
+	Ref              string                         `json:"ref"`
+	Commit           string                         `json:"commit"`
+	Dockerfile       apiDeploymentPlanDockerfile    `json:"dockerfile"`
+	Ports            []apiDeploymentPlanPort        `json:"ports"`
+	PortSelection    apiDeploymentPlanPortSelection `json:"port_selection"`
+	Healthcheck      apiDeploymentPlanHealthcheck   `json:"healthcheck"`
+	Environment      []apiDeploymentPlanEnvironment `json:"environment"`
+	Gaps             []string                       `json:"gaps"`
+	Warnings         []string                       `json:"warnings"`
+	RequiredActions  []string                       `json:"required_actions"`
+	ReadyToDeploy    bool                           `json:"ready_to_deploy"`
+}
 type apiDeliverySource struct {
 	DeploymentID     string  `json:"deployment_id"`
 	Availability     string  `json:"availability"`
@@ -316,6 +379,9 @@ func decodeResponse(body io.Reader, shape responseShape) (any, error) {
 	case shapeSourceMetadata:
 		var v apiSourceMetadata
 		return decodeTyped(data, &v, validateSourceMetadata)
+	case shapeDeploymentPlan:
+		var v apiDeploymentPlan
+		return decodeTyped(data, &v, validateDeploymentPlan)
 	case shapeDeliverySource:
 		var v apiDeliverySource
 		return decodeTyped(data, &v, validateDeliverySource)
@@ -369,6 +435,17 @@ func optionalNonNullableNull(data []byte, shape responseShape) bool {
 	}
 	if shape == shapeSourceMetadata {
 		return nullField(object, "repository_url")
+	}
+	if shape == shapeDeploymentPlan {
+		if nullField(object, "selected_port") {
+			return true
+		}
+		raw, present := object["port_selection"]
+		if !present {
+			return false
+		}
+		var selection map[string]json.RawMessage
+		return json.Unmarshal(raw, &selection) != nil || nullField(selection, "selected_port")
 	}
 	if shape == shapeDeliverySource {
 		return nullField(object, "source_revision_id", "commit", "ref", "repository_url")
@@ -457,6 +534,8 @@ func requiredResponseFields(data []byte, shape responseShape) bool {
 		keys = []string{"schema_version", "availability", "stale_after_seconds"}
 	case shapeSourceMetadata:
 		keys = []string{"source_revision_id", "availability"}
+	case shapeDeploymentPlan:
+		keys = []string{"application_id", "source_revision_id", "repository_url", "ref", "commit", "dockerfile", "ports", "port_selection", "healthcheck", "environment", "gaps", "warnings", "required_actions", "ready_to_deploy"}
 	case shapeDeliverySource:
 		keys = []string{"deployment_id", "availability"}
 	case shapeOperationResult:
@@ -607,6 +686,39 @@ func validateSourceMetadata(v *apiSourceMetadata) bool {
 	}
 	parsed, err := url.Parse(*v.RepositoryURL)
 	return err == nil && parsed.Scheme == "https" && parsed.Host != ""
+}
+func validateDeploymentPlan(v *apiDeploymentPlan) bool {
+	if !nonempty(v.ApplicationID, v.SourceRevisionID, v.RepositoryURL, v.Ref, v.Commit, v.Dockerfile.Path) || !validCLIHash(v.Dockerfile.Digest) && v.Dockerfile.Digest != "" {
+		return false
+	}
+	parsed, err := url.Parse(v.RepositoryURL)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+		return false
+	}
+	if v.Dockerfile.Status != "ready" && v.Dockerfile.Status != "waiting_later" && v.Dockerfile.Status != "unsupported" {
+		return false
+	}
+	if v.PortSelection.Status != "selected" && v.PortSelection.Status != "required" && v.PortSelection.Status != "unavailable" {
+		return false
+	}
+	if v.PortSelection.Status == "selected" {
+		if v.PortSelection.SelectedPort == nil || *v.PortSelection.SelectedPort < 1 || *v.PortSelection.SelectedPort > 65535 {
+			return false
+		}
+	} else if v.PortSelection.SelectedPort != nil {
+		return false
+	}
+	for _, port := range v.Ports {
+		if port.Port < 1 || port.Port > 65535 || (port.Protocol != "tcp" && port.Protocol != "udp") || port.Source != "dockerfile_expose" {
+			return false
+		}
+	}
+	for _, item := range v.Environment {
+		if !nonempty(item.Name) || item.Redacted && item.Value != "" {
+			return false
+		}
+	}
+	return v.ReadyToDeploy == (v.Dockerfile.Status == "ready" && v.PortSelection.Status == "selected")
 }
 func validateDeliverySource(v *apiDeliverySource) bool {
 	if !nonempty(v.DeploymentID) || !(v.Availability == "available" || v.Availability == "unavailable") {

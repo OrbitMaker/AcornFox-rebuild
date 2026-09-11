@@ -34,16 +34,17 @@ import (
 type Role string
 
 const (
-	Root              Role = "root"
-	Server            Role = "server" // acornfox group
-	Agent             Role = "agent"  // acornfox-agent group
-	RuntimeDirectory       = "/etc/acornfox/runtime"
-	ServerEnvironment      = RuntimeDirectory + "/server.env"
-	AgentEnvironment       = RuntimeDirectory + "/agent.env"
-	EdgeConfiguration      = RuntimeDirectory + "/edge.json"
-	GatewayName            = "acornfox-agent-gateway"
-	InstanceID             = "acornfox-local"
-	NodeID                 = "acornfox-node"
+	Root                     Role = "root"
+	Server                   Role = "server" // acornfox group
+	Agent                    Role = "agent"  // acornfox-agent group
+	RuntimeDirectory              = "/etc/acornfox/runtime"
+	ServerEnvironment             = RuntimeDirectory + "/server.env"
+	AgentEnvironment              = RuntimeDirectory + "/agent.env"
+	EdgeConfiguration             = RuntimeDirectory + "/edge.json"
+	GatewayName                   = "acornfox-agent-gateway"
+	InstanceID                    = "acornfox-local"
+	NodeID                        = "acornfox-node"
+	ExactLocalLoopbackOrigin      = "http://127.0.0.1:8080"
 )
 
 // Inputs is the caller's trusted generation intent. Preserve Now for replay
@@ -78,6 +79,38 @@ var errInvalid = errors.New("invalid AcornFox setup bundle")
 // ValidateInputs checks operator choices without generating or publishing keys.
 func ValidateInputs(input Inputs) error { return validateInputs(input) }
 
+type keyPairs struct {
+	ca        *x509.Certificate
+	caKey     ed25519.PrivateKey
+	server    *x509.Certificate
+	serverKey ed25519.PrivateKey
+	agent     *x509.Certificate
+	agentKey  ed25519.PrivateKey
+}
+
+func generateCertificates(now time.Time, randomness io.Reader) (keyPairs, error) {
+	ca, caKey, err := generateCertificate(now, "ca", nil, nil, randomness)
+	if err != nil {
+		return keyPairs{}, errInvalid
+	}
+	server, serverKey, err := generateCertificate(now, "server", ca, caKey, randomness)
+	if err != nil {
+		return keyPairs{}, errInvalid
+	}
+	agent, agentKey, err := generateCertificate(now, "agent", ca, caKey, randomness)
+	if err != nil {
+		return keyPairs{}, errInvalid
+	}
+	return keyPairs{
+		ca:        ca,
+		caKey:     caKey,
+		server:    server,
+		serverKey: serverKey,
+		agent:     agent,
+		agentKey:  agentKey,
+	}, nil
+}
+
 // Generate uses only the caller's random source. Supply crypto/rand.Reader in
 // production. On any error it returns an empty bundle and no private material.
 func Generate(input Inputs, randomness io.Reader) (Bundle, error) {
@@ -87,26 +120,18 @@ func Generate(input Inputs, randomness io.Reader) (Bundle, error) {
 	if randomness == nil {
 		return Bundle{}, errors.New("AcornFox setup randomness is required")
 	}
-	ca, caKey, err := generateCertificate(input.Now, "ca", nil, nil, randomness)
+	kp, err := generateCertificates(input.Now, randomness)
 	if err != nil {
-		return Bundle{}, errInvalid
-	}
-	server, serverKey, err := generateCertificate(input.Now, "server", ca, caKey, randomness)
-	if err != nil {
-		return Bundle{}, errInvalid
-	}
-	agent, agentKey, err := generateCertificate(input.Now, "agent", ca, caKey, randomness)
-	if err != nil {
-		return Bundle{}, errInvalid
+		return Bundle{}, err
 	}
 	bundle := Bundle{Files: fileSpecs()}
-	bundle.Files[0].Data = serverEnv(input, agent.SerialNumber.String())
+	bundle.Files[0].Data = serverEnv(input, kp.agent.SerialNumber.String())
 	bundle.Files[1].Data = agentEnv(input)
-	bundle.Files[2].Data = certificatePEM(ca)
-	bundle.Files[3].Data = certificatePEM(server)
-	bundle.Files[4].Data = privatePEM(serverKey)
-	bundle.Files[5].Data = certificatePEM(agent)
-	bundle.Files[6].Data = privatePEM(agentKey)
+	bundle.Files[2].Data = certificatePEM(kp.ca)
+	bundle.Files[3].Data = certificatePEM(kp.server)
+	bundle.Files[4].Data = privatePEM(kp.serverKey)
+	bundle.Files[5].Data = certificatePEM(kp.agent)
+	bundle.Files[6].Data = privatePEM(kp.agentKey)
 	bundle.Files[7].Data, err = acornfoxroute.InitialConfig(input.Origin, input.ResolverEndpoints)
 	if err != nil {
 		return Bundle{}, errInvalid
@@ -130,6 +155,124 @@ func fileSpecs() []File {
 	}
 }
 
+func localFileSpecs() []File {
+	return []File{
+		{Path: ServerEnvironment, Mode: 0644, Owner: Root, Group: Root},
+		{Path: AgentEnvironment, Mode: 0644, Owner: Root, Group: Root},
+		{Path: RuntimeDirectory + "/ca.crt", Mode: 0644, Owner: Root, Group: Root},
+		{Path: RuntimeDirectory + "/server.crt", Mode: 0644, Owner: Root, Group: Root},
+		{Path: RuntimeDirectory + "/server.key", Mode: 0600, Owner: Root, Group: Root},
+		{Path: RuntimeDirectory + "/agent.crt", Mode: 0644, Owner: Root, Group: Root},
+		{Path: RuntimeDirectory + "/agent.key", Mode: 0600, Owner: Root, Group: Root},
+	}
+}
+
+// ValidateLocalInputs checks local operator choices without generating or publishing keys.
+func ValidateLocalInputs(input Inputs) error { return validateLocalInputs(input) }
+
+func extractAndValidateFiles(bundle Bundle, specs []File) (map[string][]byte, error) {
+	if len(bundle.Files) != len(specs) {
+		return nil, errInvalid
+	}
+	files := make(map[string][]byte, len(specs))
+	for _, f := range bundle.Files {
+		if _, exists := files[f.Path]; exists {
+			return nil, errInvalid
+		}
+		found := false
+		for _, spec := range specs {
+			if f.Path == spec.Path && f.Mode == spec.Mode && f.Owner == spec.Owner && f.Group == spec.Group {
+				found = true
+				break
+			}
+		}
+		if !found || len(f.Data) == 0 || len(f.Data) > 16384 {
+			return nil, errInvalid
+		}
+		files[f.Path] = f.Data
+	}
+	return files, nil
+}
+
+type parsedCerts struct {
+	ca     *x509.Certificate
+	server *x509.Certificate
+	agent  *x509.Certificate
+}
+
+func validateCommonCertificatesAndKeys(files map[string][]byte, now time.Time) (parsedCerts, error) {
+	ca, err := parseCertificate(files[RuntimeDirectory+"/ca.crt"])
+	if err != nil {
+		return parsedCerts{}, errInvalid
+	}
+	server, err := parseCertificate(files[RuntimeDirectory+"/server.crt"])
+	if err != nil {
+		return parsedCerts{}, errInvalid
+	}
+	agent, err := parseCertificate(files[RuntimeDirectory+"/agent.crt"])
+	if err != nil {
+		return parsedCerts{}, errInvalid
+	}
+	if ca.SerialNumber.Cmp(server.SerialNumber) == 0 || ca.SerialNumber.Cmp(agent.SerialNumber) == 0 || server.SerialNumber.Cmp(agent.SerialNumber) == 0 {
+		return parsedCerts{}, errInvalid
+	}
+	if !validProfile(ca, ca, "ca", now) || !validProfile(server, ca, "server", now) || !validProfile(agent, ca, "agent", now) {
+		return parsedCerts{}, errInvalid
+	}
+	if !validKey(files[RuntimeDirectory+"/server.key"], server) || !validKey(files[RuntimeDirectory+"/agent.key"], agent) {
+		return parsedCerts{}, errInvalid
+	}
+	if bytes.Equal(server.RawSubjectPublicKeyInfo, agent.RawSubjectPublicKeyInfo) || bytes.Equal(ca.RawSubjectPublicKeyInfo, server.RawSubjectPublicKeyInfo) || bytes.Equal(ca.RawSubjectPublicKeyInfo, agent.RawSubjectPublicKeyInfo) {
+		return parsedCerts{}, errInvalid
+	}
+	return parsedCerts{ca: ca, server: server, agent: agent}, nil
+}
+
+// GenerateLocal generates a closed bundle for local loopback operation (no public Edge, local console).
+func GenerateLocal(input Inputs, randomness io.Reader) (Bundle, error) {
+	if err := validateLocalInputs(input); err != nil {
+		return Bundle{}, err
+	}
+	if randomness == nil {
+		return Bundle{}, errors.New("AcornFox setup randomness is required")
+	}
+	kp, err := generateCertificates(input.Now, randomness)
+	if err != nil {
+		return Bundle{}, err
+	}
+	bundle := Bundle{Files: localFileSpecs()}
+	bundle.Files[0].Data = serverEnvLocal(input, kp.agent.SerialNumber.String())
+	bundle.Files[1].Data = agentEnv(input)
+	bundle.Files[2].Data = certificatePEM(kp.ca)
+	bundle.Files[3].Data = certificatePEM(kp.server)
+	bundle.Files[4].Data = privatePEM(kp.serverKey)
+	bundle.Files[5].Data = certificatePEM(kp.agent)
+	bundle.Files[6].Data = privatePEM(kp.agentKey)
+	if err := ValidateLocal(bundle, input); err != nil {
+		return Bundle{}, err
+	}
+	return bundle, nil
+}
+
+// ValidateLocal validates that a bundle matches exact local loopback requirements.
+func ValidateLocal(bundle Bundle, input Inputs) error {
+	if err := validateLocalInputs(input); err != nil {
+		return err
+	}
+	files, err := extractAndValidateFiles(bundle, localFileSpecs())
+	if err != nil {
+		return err
+	}
+	certs, err := validateCommonCertificatesAndKeys(files, input.Now)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(files[ServerEnvironment], serverEnvLocal(input, certs.agent.SerialNumber.String())) || !bytes.Equal(files[AgentEnvironment], agentEnv(input)) {
+		return errInvalid
+	}
+	return nil
+}
+
 // Validate rejects extra, missing, duplicate, relocated or incorrectly owned
 // files; noncanonical bytes; mismatched keys, certificate profiles, signatures,
 // and env bindings. It validates consistency against trusted Inputs, not intent
@@ -146,52 +289,15 @@ func validateProfile(bundle Bundle, input Inputs, legacyAllowed bool) error {
 	if err := validateInputs(input); err != nil {
 		return err
 	}
-	specs := fileSpecs()
-	if len(bundle.Files) != len(specs) {
-		return errInvalid
-	}
-	files := make(map[string][]byte, len(specs))
-	for _, f := range bundle.Files {
-		if _, exists := files[f.Path]; exists {
-			return errInvalid
-		}
-		found := false
-		for _, spec := range specs {
-			if f.Path == spec.Path && f.Mode == spec.Mode && f.Owner == spec.Owner && f.Group == spec.Group {
-				found = true
-				break
-			}
-		}
-		if !found || len(f.Data) == 0 || len(f.Data) > 16384 {
-			return errInvalid
-		}
-		files[f.Path] = f.Data
-	}
-	ca, err := parseCertificate(files[RuntimeDirectory+"/ca.crt"])
+	files, err := extractAndValidateFiles(bundle, fileSpecs())
 	if err != nil {
-		return errInvalid
+		return err
 	}
-	server, err := parseCertificate(files[RuntimeDirectory+"/server.crt"])
+	certs, err := validateCommonCertificatesAndKeys(files, input.Now)
 	if err != nil {
-		return errInvalid
+		return err
 	}
-	agent, err := parseCertificate(files[RuntimeDirectory+"/agent.crt"])
-	if err != nil {
-		return errInvalid
-	}
-	if ca.SerialNumber.Cmp(server.SerialNumber) == 0 || ca.SerialNumber.Cmp(agent.SerialNumber) == 0 || server.SerialNumber.Cmp(agent.SerialNumber) == 0 {
-		return errInvalid
-	}
-	if !validProfile(ca, ca, "ca", input.Now) || !validProfile(server, ca, "server", input.Now) || !validProfile(agent, ca, "agent", input.Now) {
-		return errInvalid
-	}
-	if !validKey(files[RuntimeDirectory+"/server.key"], server) || !validKey(files[RuntimeDirectory+"/agent.key"], agent) {
-		return errInvalid
-	}
-	if bytes.Equal(server.RawSubjectPublicKeyInfo, agent.RawSubjectPublicKeyInfo) || bytes.Equal(ca.RawSubjectPublicKeyInfo, server.RawSubjectPublicKeyInfo) || bytes.Equal(ca.RawSubjectPublicKeyInfo, agent.RawSubjectPublicKeyInfo) {
-		return errInvalid
-	}
-	if !bytes.Equal(files[ServerEnvironment], serverEnv(input, agent.SerialNumber.String())) || !bytes.Equal(files[AgentEnvironment], agentEnv(input)) {
+	if !bytes.Equal(files[ServerEnvironment], serverEnv(input, certs.agent.SerialNumber.String())) || !bytes.Equal(files[AgentEnvironment], agentEnv(input)) {
 		return errInvalid
 	}
 	edge, err := acornfoxroute.InitialConfig(input.Origin, input.ResolverEndpoints)
@@ -401,6 +507,41 @@ func serverEnv(in Inputs, serial string) []byte {
 		"BUILDKIT_COMMAND": "/opt/acornfox/current/bin/buildctl", "BUILDKIT_WORKER": "acornfox-installed", "BUILDKIT_ADDRESS": "unix:///run/acornfox-buildkit/buildkitd.sock",
 	})
 }
+func validateLocalInputs(in Inputs) error {
+	if in.Origin != ExactLocalLoopbackOrigin {
+		return errors.New("AcornFox local setup requires exact origin " + ExactLocalLoopbackOrigin)
+	}
+	if in.Now.IsZero() || in.Now.Year() < 2000 || in.Now.Year() > 9998 || !safeVersion.MatchString(in.Version) {
+		return errors.New("invalid AcornFox setup version or generation time")
+	}
+	if len(in.ResolverEndpoints) > 0 {
+		if len(in.ResolverEndpoints) < 2 || len(in.ResolverEndpoints) > 8 {
+			return errors.New("AcornFox setup requires 2 to 8 distinct public DNS endpoints when configured")
+		}
+		seen := map[netip.Addr]bool{}
+		for _, raw := range in.ResolverEndpoints {
+			p, err := netip.ParseAddrPort(raw)
+			if err != nil || p.String() != raw || p.Port() != 53 || !publicAddress(p.Addr()) || seen[p.Addr()] {
+				return errors.New("invalid AcornFox setup public DNS endpoint")
+			}
+			seen[p.Addr()] = true
+		}
+	}
+	return nil
+}
+
+func serverEnvLocal(in Inputs, serial string) []byte {
+	envMap := map[string]string{
+		"RUNTIME_MODE": "clean", "CONSOLE_ACCESS": "local_loopback", "M1_ENABLED": "true", "AUTH_ORIGIN": ExactLocalLoopbackOrigin, "AGENT_GATEWAY_ADDR": "127.0.0.1:8092",
+		"SERVER_AGENT_TLS_CA": RuntimeDirectory + "/ca.crt", "SERVER_AGENT_TLS_CERT": RuntimeDirectory + "/server.crt", "SERVER_AGENT_TLS_KEY": "/run/credentials/acornfox-server.service/server.key",
+		"AGENT_IDENTITIES_JSON":      `[{"certificate_id":"` + serial + `","instance_id":"` + InstanceID + `","node_id":"` + NodeID + `"}]`,
+		"AGENT_DISPATCH_INSTANCE_ID": InstanceID, "AGENT_DISPATCH_NODE_ID": NodeID,
+		"SOURCE_UPLOAD_ROOT": "/var/lib/acornfox/uploads", "SOURCE_WORKSPACE_ROOT": "/var/lib/acornfox/workspaces", "BUILD_WORK_ROOT": "/var/lib/acornfox/build-work", "LOG_ROOT": "/var/log/acornfox/server", "OCI_STORE_ROOT": "/var/lib/acornfox/oci", "SECRET_ROOT": "/var/lib/acornfox/secrets", "SECRET_MATERIAL_ROOT": "/var/lib/acornfox/secret-materials", "SECRET_MASTER_KEY": "/var/lib/acornfox/secrets/master.key", "SOURCE_GIT_RESOLVERS": strings.Join(in.ResolverEndpoints, ","),
+		"BUILDKIT_COMMAND": "/opt/acornfox/current/bin/buildctl", "BUILDKIT_WORKER": "acornfox-installed", "BUILDKIT_ADDRESS": "unix:///run/acornfox-buildkit/buildkitd.sock",
+	}
+	return environment(envMap)
+}
+
 func agentEnv(in Inputs) []byte {
 	return environment(map[string]string{
 		"RUNTIME_MODE": "clean", "CONTROL_PLANE_URL": "https://127.0.0.1:8092", "CONTROL_PLANE_SERVER_NAME": GatewayName,

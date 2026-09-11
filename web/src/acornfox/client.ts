@@ -1,4 +1,5 @@
 import type { components } from "../api/acornfox-generated-schema";
+import { resolveCsrfToken } from "./csrf";
 
 export type AcornFoxSchemas = components["schemas"];
 export type Application = AcornFoxSchemas["Application"];
@@ -544,17 +545,7 @@ function discoveryPage<T>(
 }
 
 function csrfCookie(): string | undefined {
-  if (typeof document === "undefined") return undefined;
-  const entry = document.cookie
-    .split(";")
-    .map((item) => item.trim())
-    .find((item) => item.startsWith("__Host-acornfox_csrf="));
-  if (!entry) return undefined;
-  try {
-    return decodeURIComponent(entry.slice("__Host-acornfox_csrf=".length));
-  } catch {
-    return undefined;
-  }
+  return resolveCsrfToken();
 }
 function idempotencyKey(): string {
   if (typeof crypto === "undefined") invalid();

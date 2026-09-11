@@ -105,7 +105,9 @@ func (i acornFoxRuntimeIntent) validateExisting(required bool) error {
 
 func (i acornFoxRuntimeIntent) validateProfile(required, existing bool) error {
 	validate := acornfoxsetup.Validate
-	if existing {
+	if i.Inputs.Origin == acornfoxsetup.ExactLocalLoopbackOrigin {
+		validate = acornfoxsetup.ValidateLocal
+	} else if existing {
 		validate = acornfoxsetup.ValidateExistingRuntime
 	}
 	if i.SchemaVersion != 1 || !validSHA(i.BindingSHA256) || !validID(i.ReleaseID) || !acornFoxHostSourceCommit.MatchString(i.SourceCommit) || i.ReleaseID != "release-"+i.Inputs.Version || validate(i.bundle(), i.Inputs) != nil || (required && acornfoxsetup.ValidateSetupToken(i.SetupToken) != nil) || (!required && len(i.SetupToken) != 0 && acornfoxsetup.ValidateSetupToken(i.SetupToken) != nil) {
@@ -162,6 +164,13 @@ func ConfigureAcornFoxRuntimeV1(ctx context.Context, expected AcornFoxBuildIdent
 		return AcornFoxRuntimeConfigReceiptV1{}, ErrAcornFoxRuntimeConfigConflict
 	}
 	return newAcornFoxRuntimeConfig(layout).run(ctx, expected, origin, resolvers, false)
+}
+func ConfigureAcornFoxLocalRuntimeV1(ctx context.Context, expected AcornFoxBuildIdentityV1, resolvers []string) (AcornFoxRuntimeConfigReceiptV1, error) {
+	layout, err := newProductionAcornFoxLayout()
+	if err != nil {
+		return AcornFoxRuntimeConfigReceiptV1{}, ErrAcornFoxRuntimeConfigConflict
+	}
+	return newAcornFoxRuntimeConfig(layout).run(ctx, expected, acornfoxsetup.ExactLocalLoopbackOrigin, resolvers, false)
 }
 func RecoverAcornFoxRuntimeV1(ctx context.Context, expected AcornFoxBuildIdentityV1) error {
 	layout, err := newProductionAcornFoxLayout()
@@ -227,7 +236,13 @@ func (s *acornFoxRuntimeConfig) run(ctx context.Context, expected AcornFoxBuildI
 			return empty, err
 		}
 		input := acornfoxsetup.Inputs{Origin: origin, Version: expected.Version, ResolverEndpoints: append([]string(nil), resolvers...), Now: s.now()}
-		bundle, gerr := acornfoxsetup.Generate(input, s.random)
+		var bundle acornfoxsetup.Bundle
+		var gerr error
+		if origin == acornfoxsetup.ExactLocalLoopbackOrigin {
+			bundle, gerr = acornfoxsetup.GenerateLocal(input, s.random)
+		} else {
+			bundle, gerr = acornfoxsetup.Generate(input, s.random)
+		}
 		if gerr != nil {
 			return empty, ErrAcornFoxRuntimeConfigConflict
 		}

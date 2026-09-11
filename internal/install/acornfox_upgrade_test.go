@@ -18,6 +18,8 @@ type acornFoxUpgradeServiceFake struct {
 	calls             []string
 	failNext, failOld bool
 	old               string
+	forbidEdge        bool
+	edgeViolations    []string
 }
 
 type acornFoxUpgradePIServiceFake struct {
@@ -34,6 +36,10 @@ func (f *acornFoxUpgradePIServiceFake) PIEnabled(context.Context) (bool, error) 
 
 func (f *acornFoxUpgradeServiceFake) Run(_ context.Context, verb, unit string) error {
 	f.calls = append(f.calls, verb+" "+unit)
+	if f.forbidEdge && strings.Contains(unit, "acornfox-edge") {
+		f.edgeViolations = append(f.edgeViolations, verb+" "+unit)
+		return errors.New("forbidden edge call in local loopback: " + verb + " " + unit)
+	}
 	return nil
 }
 func (f *acornFoxUpgradeServiceFake) Healthy(_ context.Context, i acornFoxUpgradeImage) error {
@@ -55,6 +61,10 @@ func (f *acornFoxUpgradeServiceFake) HealthyWithRecoveryHelper(ctx context.Conte
 
 func (f *acornFoxUpgradeServiceFake) EdgeHealthy(context.Context) error {
 	f.calls = append(f.calls, "edge healthy")
+	if f.forbidEdge {
+		f.edgeViolations = append(f.edgeViolations, "edge healthy")
+		return errors.New("forbidden edge healthy probe in local loopback")
+	}
 	return nil
 }
 func upgradeFixture(t *testing.T) (*acornFoxUpgrade, acornFoxProductionPreparedFixture, AcornFoxUpgradeRequestV1, *acornFoxUpgradeServiceFake) {
@@ -755,5 +765,100 @@ func TestAcornFoxUpgradeTerminalVerificationFailureHasNoSuccessReceipt(t *testin
 	r, e = u.upgrade(context.Background(), request)
 	if e == nil || r.SchemaVersion != 0 {
 		t.Fatal("failed terminal upgrade replay returned receipt")
+	}
+}
+
+func TestAcornFoxLocalUpgradeLifecycleAndEdgeOmission(t *testing.T) {
+	runtime, p, id := runtimeConfigFixture(t)
+	// 1. Configure local loopback runtime
+	if _, e := runtime.run(context.Background(), id, acornfoxsetup.ExactLocalLoopbackOrigin, nil, false); e != nil {
+		t.Fatal(e)
+	}
+
+	initialIntent, _ := runtimeIntentForTest(t, p)
+
+	old := newAcornFoxFixture(t, "1.2.3-test.1", nil)
+	next := newAcornFoxFixture(t, "1.2.4-test.1", &old)
+	candidate, self, sha := writeAcornFoxBridgeCandidate(t, p.parent, next)
+	if e := os.MkdirAll(filepath.Join(p.host, "var/tmp"), 0755); e != nil {
+		t.Fatal(e)
+	}
+	u := newAcornFoxUpgrade(p.layout)
+	u.ownership = p.owners.edge()
+	u.self = acornFoxSelfVerifier{path: self, uid: os.Getuid(), gid: os.Getgid()}
+	service := &acornFoxUpgradeServiceFake{old: p.binding, forbidEdge: true}
+	u.services = service
+
+	request := AcornFoxUpgradeRequestV1{candidate, next.bindingSHA, p.binding, sha}
+
+	// 2. Test Rollback first: failNext causes forward to fail and triggers rollback
+	service.failNext = true
+	rollbackReceipt, err := u.upgrade(context.Background(), request)
+	if !errors.Is(err, ErrAcornFoxUpgradeRolledBack) || rollbackReceipt.State != "ROLLED_BACK" {
+		t.Fatalf("expected rollback, got err=%v receipt=%#v", err, rollbackReceipt)
+	}
+	if len(service.edgeViolations) != 0 {
+		t.Fatalf("local rollback invoked edge: %v", service.edgeViolations)
+	}
+
+	// 3. Retry upgrade with health succeeding -> UPGRADED
+	service.failNext = false
+	service.calls = nil
+	receipt, err := u.upgrade(context.Background(), request)
+	if err != nil {
+		t.Fatalf("local upgrade retry failed: %v", err)
+	}
+	if receipt.State != "UPGRADED" {
+		t.Fatalf("expected UPGRADED state, got %s", receipt.State)
+	}
+	if len(service.edgeViolations) != 0 {
+		t.Fatalf("local upgrade invoked edge: %v", service.edgeViolations)
+	}
+
+	// 4. Verify upgraded intent preserves 7 files, exact loopback origin, identical keys, and setup token
+	upgradedIntent, _ := runtimeIntentForTest(t, p)
+	if upgradedIntent.Inputs.Origin != acornfoxsetup.ExactLocalLoopbackOrigin {
+		t.Fatalf("upgraded intent lost local origin: %s", upgradedIntent.Inputs.Origin)
+	}
+	if len(upgradedIntent.Files) != 7 {
+		t.Fatalf("expected 7 files in local upgraded intent, got %d", len(upgradedIntent.Files))
+	}
+	if upgradedIntent.Inputs.Version != "1.2.4-test.1" {
+		t.Fatalf("expected version 1.2.4-test.1, got %s", upgradedIntent.Inputs.Version)
+	}
+	// Validate setup token bytes preserved exactly
+	if len(upgradedIntent.SetupToken) == 0 || !bytes.Equal(upgradedIntent.SetupToken, initialIntent.SetupToken) {
+		t.Fatalf("setup token bytes changed during upgrade")
+	}
+	// Verify key and cert files byte-for-byte identical
+	keyCertFiles := []string{"ca.crt", "server.crt", "server.key", "agent.crt", "agent.key"}
+	for _, name := range keyCertFiles {
+		var oldData, nextData []byte
+		for _, f := range initialIntent.Files {
+			if filepath.Base(f.Path) == name {
+				oldData = f.Data
+				break
+			}
+		}
+		for _, f := range upgradedIntent.Files {
+			if filepath.Base(f.Path) == name {
+				nextData = f.Data
+				break
+			}
+		}
+		if len(oldData) == 0 || !bytes.Equal(oldData, nextData) {
+			t.Fatalf("file %s bytes changed during upgrade", name)
+		}
+	}
+
+	// 5. Mode switching rejection: mutates the valid saved journal's next image to public origin and asserts rejection
+	j, err := u.load(p.store)
+	if err != nil {
+		t.Fatalf("load journal failed: %v", err)
+	}
+	mutatedJournal := j
+	mutatedJournal.Next.Runtime.Inputs.Origin = "https://public.example.com"
+	if mutatedJournal.validate(p.layout) == nil {
+		t.Fatal("journal accepted mode switch between local and public")
 	}
 }

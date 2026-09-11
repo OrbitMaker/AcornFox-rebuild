@@ -265,7 +265,7 @@ func buildStageEnvironment(base []string, goCache, tmp string) ([]string, error)
 	}
 	values["GOCACHE"] = "GOCACHE=" + goCache
 	values["TMPDIR"] = "TMPDIR=" + tmp
-	for _, required := range []string{"GOMODCACHE", "GOPROXY=off", "GOSUMDB=off", "GOVCS=*:off", "GOTOOLCHAIN=local", "GOOS=linux", "GOARCH=amd64", "CGO_ENABLED=0"} {
+	for _, required := range []string{"GOMODCACHE", "GOPROXY=off", "GOSUMDB=off", "GOVCS=*:off", "GOTOOLCHAIN=local", "GOOS=linux", "GOARCH=" + Architecture, "CGO_ENABLED=0"} {
 		key, value, hasValue := strings.Cut(required, "=")
 		if !hasValue {
 			if values[key] == "" {
@@ -336,7 +336,11 @@ func inspectOneBinary(path string, target GoBuildTargetV1, plan GoBuildPlanV1) (
 		return FileEntryV1{}, ErrGoStage
 	}
 	elfFile, err := elf.NewFile(binary.file)
-	if err != nil || elfFile.Class != elf.ELFCLASS64 || elfFile.Data != elf.ELFDATA2LSB || elfFile.Machine != elf.EM_X86_64 {
+	expectedMachine := elf.EM_X86_64
+	if Architecture == "arm64" {
+		expectedMachine = elf.EM_AARCH64
+	}
+	if err != nil || elfFile.Class != elf.ELFCLASS64 || elfFile.Data != elf.ELFDATA2LSB || elfFile.Machine != expectedMachine {
 		if elfFile != nil {
 			_ = elfFile.Close()
 		}
@@ -372,7 +376,7 @@ func buildSettingsMatch(build *buildinfo.BuildInfo, plan GoBuildPlanV1, target G
 	for _, setting := range build.Settings {
 		settings[setting.Key] = setting.Value
 	}
-	if settings["GOOS"] != "linux" || settings["GOARCH"] != "amd64" || settings["CGO_ENABLED"] != "0" || settings["-trimpath"] != "true" {
+	if settings["GOOS"] != "linux" || settings["GOARCH"] != Architecture || settings["CGO_ENABLED"] != "0" || settings["-trimpath"] != "true" {
 		return false
 	}
 	// Go 1.25 omits -ldflags from debug/buildinfo entirely. If a toolchain

@@ -25,6 +25,28 @@ const observationFixture = {
     expires_at: "2030-01-01T00:05:00Z",
   },
 } as const;
+const deploymentPlanFixture = {
+  application_id: "app_1",
+  source_revision_id: "s",
+  repository_url: "https://github.com/example/app.git",
+  ref: "main",
+  commit: "a".repeat(40),
+  dockerfile: {
+    status: "ready",
+    path: "Dockerfile",
+    digest: sha("d"),
+    stage_count: 1,
+    final_stage: { name: "final", index: 0, from: "scratch" },
+  },
+  ports: [{ port: 3000, protocol: "tcp", source: "dockerfile_expose" }],
+  port_selection: { status: "selected", reason: "dockerfile_expose", selected_port: 3000, candidates: [3000] },
+  healthcheck: { present: false },
+  environment: [{ name: "PORT", value: "3000" }, { name: "API_TOKEN", redacted: true }],
+  gaps: ["healthcheck_missing"],
+  warnings: [],
+  required_actions: [],
+  ready_to_deploy: true,
+} as const;
 
 describe("AcornFox integration client", () => {
   beforeEach(() => {
@@ -39,6 +61,7 @@ describe("AcornFox integration client", () => {
       if (url.endsWith("/setup")) return json({ state: "uninitialized" });
       if (url.endsWith("/host/metrics")) return json({ schema_version: 1, availability: "warming_up", stale_after_seconds: 15, cpu: { logical_cores: 4 } });
       if (url.endsWith("/sources") && init?.method === "POST") return json({ source_revision_id: "s-next", status: "imported" }, 201);
+      if (url.endsWith("/deployment-plan")) return json(deploymentPlanFixture);
       if (url.endsWith("/metadata")) return json({ source_revision_id: "s", availability: "unavailable" });
       if (url.includes("/operations/")) return json({ operation_id: "o", operation_type: "probe", status: "verified", task_id: "t", deployment_id: "d", accepted_at: "2030-01-01T00:00:00Z", updated_at: "2030-01-01T00:00:01Z", evidence: { kind: "response_observation", verdict: "unhealthy", observed_at: "2030-01-01T00:00:01Z", http_status: 500 } });
       if (url.endsWith("/access-observation")) return json(observationFixture);
@@ -48,6 +71,7 @@ describe("AcornFox integration client", () => {
     await expect(api.setup({ setupToken: "single-use", password: "not-a-real-password" })).resolves.toBeUndefined();
     await expect(api.hostMetrics()).resolves.toMatchObject({ availability: "warming_up", cpu: { logicalCores: 4 } });
     await expect(api.sourceMetadata("app id", "s id")).resolves.toEqual({ sourceRevisionId: "s", availability: "unavailable" });
+    await expect(api.deploymentPlan("app id", "s id")).resolves.toMatchObject({ sourceRevisionId: "s", portSelection: { selectedPort: 3000 }, environment: [{ name: "PORT", value: "3000", redacted: false }, { name: "API_TOKEN", redacted: true }] });
     await expect(api.sourceUpdate("app id", { baseSourceRevisionId: "s id", ref: "main" }, "same-request")).resolves.toEqual({ sourceRevisionId: "s-next", status: "imported" });
     await expect(api.deploymentSource("app id", "d id")).resolves.toMatchObject({ deploymentId: "d", commit: "abc" });
     await expect(api.operationResult("app id", "o id")).resolves.toMatchObject({ operationId: "o", status: "verified", evidence: { verdict: "unhealthy", httpStatus: 500 } });
@@ -78,6 +102,7 @@ describe("AcornFox integration client", () => {
       "/api/v1/acornfox/setup",
       "/api/v1/acornfox/host/metrics",
       "/api/v1/acornfox/apps/app%20id/sources/s%20id/metadata",
+      "/api/v1/acornfox/apps/app%20id/sources/s%20id/deployment-plan",
       "/api/v1/acornfox/apps/app%20id/sources",
       "/api/v1/acornfox/apps/app%20id/deliveries/d%20id/source",
       "/api/v1/acornfox/apps/app%20id/operations/o%20id",
@@ -85,12 +110,12 @@ describe("AcornFox integration client", () => {
     ]);
     expect(new Headers(seen[1]?.init?.headers).get("X-AcornFox-CSRF")).toBe("csrf value");
     expect(new Headers(seen[1]?.init?.headers).get("Idempotency-Key")).toBeNull();
-    expect(new Headers(seen[4]?.init?.headers).get("Idempotency-Key")).toBe("same-request");
-    expect(JSON.parse(String(seen[4]?.init?.body))).toEqual({ base_source_revision_id: "s id", ref: "main" });
-    expect(seen[5]?.init?.method).toBeUndefined();
-    expect(new Headers(seen[5]?.init?.headers).get("X-AcornFox-CSRF")).toBeNull();
-    expect(seen[7]?.init?.method).toBeUndefined();
-    expect(new Headers(seen[7]?.init?.headers).get("X-AcornFox-CSRF")).toBeNull();
+    expect(new Headers(seen[5]?.init?.headers).get("Idempotency-Key")).toBe("same-request");
+    expect(JSON.parse(String(seen[5]?.init?.body))).toEqual({ base_source_revision_id: "s id", ref: "main" });
+    expect(seen[6]?.init?.method).toBeUndefined();
+    expect(new Headers(seen[6]?.init?.headers).get("X-AcornFox-CSRF")).toBeNull();
+    expect(seen[8]?.init?.method).toBeUndefined();
+    expect(new Headers(seen[8]?.init?.headers).get("X-AcornFox-CSRF")).toBeNull();
   });
 
   it("does not turn malformed or unavailable added capabilities into success", async () => {

@@ -74,6 +74,7 @@ func TestAcornFoxOpenAPIParity(t *testing.T) {
 		{"updateAcornFoxSourceRevision", http.MethodPost, "/apps/app/sources", shapeSourceUpdate, map[string]string{"base_source_revision_id": "source", "ref": "main"}},
 		{"getAcornFoxSourceRevision", http.MethodGet, "/apps/app/sources/source", shapeSource, nil},
 		{"getAcornFoxSourceMetadata", http.MethodGet, "/apps/app/sources/source/metadata", shapeSourceMetadata, nil},
+		{"getAcornFoxDeploymentPlan", http.MethodGet, "/apps/app/sources/source/deployment-plan", shapeDeploymentPlan, nil},
 		{"createAcornFoxFixCandidate", http.MethodPost, "/apps/app/fix-candidates", shapeFixCandidate, map[string]any{"base_source_revision_id": "source", "paths": []string{"Dockerfile"}, "unified_diff": "diff\n", "container_port": 8080}},
 		{"listAcornFoxFixCandidates", http.MethodGet, "/apps/app/fix-candidates", shapeFixCandidateList, nil},
 		{"getAcornFoxFixCandidate", http.MethodGet, "/apps/app/fix-candidates/candidate", shapeFixCandidate, nil},

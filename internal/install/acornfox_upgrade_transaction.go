@@ -443,13 +443,17 @@ func (u *acornFoxUpgrade) capturePIEnabled(ctx context.Context, store *TaskAcorn
 	return enabled, nil
 }
 
-func (u *acornFoxUpgrade) stop(ctx context.Context, piEnabled bool) error {
+func (u *acornFoxUpgrade) stop(ctx context.Context, piEnabled, isLocal bool) error {
 	if piEnabled {
 		if e := u.services.Run(ctx, "stop", "acornfox-pi-worker.service"); e != nil {
 			return e
 		}
 	}
-	for _, unit := range []string{"acornfox-edge.service", "acornfox-agent.service", "acornfox-server.service", "acornfox-caddy.service", "acornfox-buildkit.service", "acornfox-build-network.service"} {
+	units := []string{"acornfox-agent.service", "acornfox-server.service", "acornfox-caddy.service", "acornfox-buildkit.service", "acornfox-build-network.service"}
+	if !isLocal {
+		units = append([]string{"acornfox-edge.service"}, units...)
+	}
+	for _, unit := range units {
 		if e := u.services.Run(ctx, "stop", unit); e != nil {
 			return e
 		}
@@ -473,6 +477,10 @@ func (u *acornFoxUpgrade) start(ctx context.Context, piEnabled bool) error {
 	return nil
 }
 func (u *acornFoxUpgrade) unblock(ctx context.Context, s *TaskAcornFoxRepoStore, j acornFoxUpgradeJournal) error {
+	// In local loopback mode, acornfox-edge is deliberately disabled/inactive and not started.
+	if j.Next.Runtime.Inputs.Origin == acornfoxsetup.ExactLocalLoopbackOrigin {
+		return u.marker(s, j, false)
+	}
 	// systemd ConditionPathExists on edge requires removing the marker first.
 	// Any failure reinstates it and stops edge before rollback is attempted.
 	if e := u.marker(s, j, false); e != nil {
@@ -499,7 +507,7 @@ func (u *acornFoxUpgrade) forward(ctx context.Context, s *TaskAcornFoxRepoStore,
 	if e := u.phase(s, j, "BLOCKED"); e != nil {
 		return e
 	}
-	if e := u.stop(ctx, j.PIEnabled); e != nil {
+	if e := u.stop(ctx, j.PIEnabled, j.isLocal()); e != nil {
 		return e
 	}
 	if e := u.fault("services-stopped"); e != nil {
@@ -599,7 +607,9 @@ func (u *acornFoxUpgrade) restore(ctx context.Context, s *TaskAcornFoxRepoStore,
 	defer func() {
 		if err != nil {
 			_ = u.marker(s, *j, true)
-			_ = u.services.Run(context.WithoutCancel(ctx), "stop", "acornfox-edge.service")
+			if !j.isLocal() {
+				_ = u.services.Run(context.WithoutCancel(ctx), "stop", "acornfox-edge.service")
+			}
 		}
 	}()
 	if err = u.marker(s, *j, true); err != nil {
@@ -608,7 +618,7 @@ func (u *acornFoxUpgrade) restore(ctx context.Context, s *TaskAcornFoxRepoStore,
 	if err = u.phase(s, j, "ROLLING_BACK"); err != nil {
 		return err
 	}
-	if err = u.stop(ctx, j.PIEnabled); err != nil {
+	if err = u.stop(ctx, j.PIEnabled, j.isLocal()); err != nil {
 		return err
 	}
 	if err = u.copyNextSubstrate(s, *j); err != nil {
@@ -685,7 +695,9 @@ func (u *acornFoxUpgrade) rollback(ctx context.Context, s *TaskAcornFoxRepoStore
 	defer func() {
 		if err != nil {
 			_ = u.marker(s, *j, true)
-			_ = u.services.Run(context.WithoutCancel(ctx), "stop", "acornfox-edge.service")
+			if !j.isLocal() {
+				_ = u.services.Run(context.WithoutCancel(ctx), "stop", "acornfox-edge.service")
+			}
 		}
 	}()
 	if j.retainsSuccessorHelper() && j.Phase == "RECOVERY_PREPARED" {

@@ -126,6 +126,49 @@ func TestProductionConstructorRejectsWeakPBKDF2(t *testing.T) {
 	}
 }
 
+func TestLocalServiceConstructorStrictness(t *testing.T) {
+	// NewService must continue rejecting HTTP
+	if _, err := NewService(Config{Store: &memoryStore{}, Origin: "http://127.0.0.1:8080"}); err == nil {
+		t.Fatal("NewService unexpectedly accepted HTTP origin")
+	}
+
+	// NewLocalService accepts exact http://127.0.0.1:8080
+	service, err := NewLocalService(Config{Store: &memoryStore{}, Origin: "http://127.0.0.1:8080"})
+	if err != nil {
+		t.Fatalf("NewLocalService rejected exact http://127.0.0.1:8080: %v", err)
+	}
+	if err := service.RequireOrigin("http://127.0.0.1:8080"); err != nil {
+		t.Fatalf("RequireOrigin rejected exact loopback origin: %v", err)
+	}
+	if err := service.RequireOrigin("http://localhost:8080"); !errors.Is(err, ErrOriginDenied) {
+		t.Fatalf("expected ErrOriginDenied for localhost, got %v", err)
+	}
+
+	// NewLocalService rejects non-exact loopback origins (including empty, whitespace, padded)
+	invalidLocalOrigins := []string{
+		"",
+		" ",
+		" http://127.0.0.1:8080",
+		"http://127.0.0.1:8080 ",
+		"http://localhost:8080",
+		"http://127.0.0.1:8080\n",
+		"http://127.0.0.2:8080",
+		"http://127.0.0.1:80",
+		"http://127.0.0.1:8081",
+		"http://127.0.0.1:8080/",
+		"http://127.0.0.1:8080/path",
+		"http://127.0.0.1:8080?query=1",
+		"http://user:pass@127.0.0.1:8080",
+		"https://127.0.0.1:8080",
+		"http://[::1]:8080",
+	}
+	for _, invalidOrigin := range invalidLocalOrigins {
+		if _, err := NewLocalService(Config{Store: &memoryStore{}, Origin: invalidOrigin}); err == nil {
+			t.Fatalf("NewLocalService accepted non-exact origin: %q", invalidOrigin)
+		}
+	}
+}
+
 func TestPasswordPolicyAndVersionedPBKDF2Encoding(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
 	service := newTestService(t, &memoryStore{}, &now)

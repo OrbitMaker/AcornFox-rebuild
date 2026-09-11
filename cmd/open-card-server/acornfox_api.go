@@ -92,6 +92,10 @@ func (s *Server) handleAcornFoxAPI(w http.ResponseWriter, r *http.Request) bool 
 		s.acornFoxSourceMetadata.HandleSourceMetadata(w, r, domain.ID(parts[0]), domain.ID(parts[2]))
 		return true
 	}
+	if len(parts) == 4 && parts[1] == "sources" && parts[3] == "deployment-plan" {
+		s.handleAcornFoxDeploymentPlan(w, r, domain.ID(parts[0]), domain.ID(parts[2]))
+		return true
+	}
 	if len(parts) == 3 && parts[1] == "operations" {
 		s.acornFoxOperation.Handle(w, r, domain.ID(parts[0]), domain.ID(parts[2]))
 		return true
@@ -180,6 +184,9 @@ func acornFoxRouteAllow(path string) (string, bool) {
 		return "GET", true
 	}
 	if len(parts) == 4 && parts[0] != "" && parts[1] == "sources" && parts[2] != "" && parts[3] == "metadata" {
+		return "GET", true
+	}
+	if len(parts) == 4 && parts[0] != "" && parts[1] == "sources" && parts[2] != "" && parts[3] == "deployment-plan" {
 		return "GET", true
 	}
 	if len(parts) == 3 && parts[0] != "" && (parts[1] == "sources" || parts[1] == "operations") && parts[2] != "" {

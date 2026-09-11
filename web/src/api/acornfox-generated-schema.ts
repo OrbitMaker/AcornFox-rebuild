@@ -316,6 +316,25 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/acornfox/apps/{applicationId}/sources/{sourceRevisionId}/deployment-plan": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                applicationId: components["parameters"]["ApplicationId"];
+                sourceRevisionId: components["parameters"]["SourceRevisionId"];
+            };
+            cookie?: never;
+        };
+        get: operations["getAcornFoxDeploymentPlan"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/acornfox/apps/{applicationId}/fix-candidates": {
         parameters: {
             query?: never;
@@ -735,6 +754,71 @@ export interface components {
             availability: "available" | "unavailable";
             /** Format: uri */
             repository_url?: string;
+        };
+        DeploymentPlanDockerfile: {
+            /** @enum {string} */
+            status: "ready" | "waiting_later" | "unsupported";
+            path: string;
+            digest?: string;
+            stage_count: number;
+            final_stage?: {
+                [key: string]: unknown;
+            };
+            workdir?: string;
+            entrypoint?: {
+                [key: string]: unknown;
+            };
+            command?: {
+                [key: string]: unknown;
+            };
+        };
+        DeploymentPlanPort: {
+            port: number;
+            /** @enum {string} */
+            protocol: "tcp" | "udp";
+            /** @enum {string} */
+            source: "dockerfile_expose";
+        };
+        DeploymentPlanPortSelection: {
+            /** @enum {string} */
+            status: "selected" | "required" | "unavailable";
+            reason: string;
+            selected_port?: number;
+            candidates: number[];
+            suggested_ports?: number[];
+        };
+        DeploymentPlanEnvironment: {
+            name: string;
+            value?: string;
+            redacted?: boolean;
+        };
+        DeploymentPlanHealthcheck: {
+            present?: boolean;
+            disabled?: boolean;
+            /** @enum {string} */
+            form?: "exec" | "shell";
+            test?: string[];
+            interval_seconds?: number;
+            timeout_seconds?: number;
+            start_period_seconds?: number;
+            retries?: number;
+        };
+        DeploymentPlan: {
+            application_id: string;
+            source_revision_id: string;
+            /** Format: uri */
+            repository_url: string;
+            ref: string;
+            commit: string;
+            dockerfile: components["schemas"]["DeploymentPlanDockerfile"];
+            ports: components["schemas"]["DeploymentPlanPort"][];
+            port_selection: components["schemas"]["DeploymentPlanPortSelection"];
+            healthcheck: components["schemas"]["DeploymentPlanHealthcheck"];
+            environment: components["schemas"]["DeploymentPlanEnvironment"][];
+            gaps: string[];
+            warnings: string[];
+            required_actions: string[];
+            ready_to_deploy: boolean;
         };
         SourceRevisionList: {
             items: components["schemas"]["SourceRevision"][];
@@ -1871,6 +1955,32 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["SourceMetadataResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationFailed"];
+            404: components["responses"]["NotFound"];
+            503: components["responses"]["TemporarilyUnavailable"];
+        };
+    };
+    getAcornFoxDeploymentPlan: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                applicationId: components["parameters"]["ApplicationId"];
+                sourceRevisionId: components["parameters"]["SourceRevisionId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Read-only deployment plan derived from the immutable source and its root Dockerfile. It does not build, deploy, or mutate the source. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeploymentPlan"];
                 };
             };
             401: components["responses"]["AuthenticationFailed"];

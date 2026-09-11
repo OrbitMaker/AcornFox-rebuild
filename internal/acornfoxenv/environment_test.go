@@ -108,11 +108,11 @@ func TestResolveRejectsIdentityModeMismatchAndUnknownCleanNames(t *testing.T) {
 }
 
 func TestKeySpecsAreCompleteAndNamesAreUnique(t *testing.T) {
-	if len(specs) != int(AssistantToolsSocket) {
-		t.Fatalf("key specs=%d want=%d", len(specs), AssistantToolsSocket)
+	if len(specs) != int(ConsoleAccess) {
+		t.Fatalf("key specs=%d want=%d", len(specs), ConsoleAccess)
 	}
 	names := map[string]Key{}
-	for key := RuntimeMode; key <= AssistantToolsSocket; key++ {
+	for key := RuntimeMode; key <= ConsoleAccess; key++ {
 		spec := mustSpec(key)
 		if spec.canonical == "" {
 			t.Fatalf("key %d has no canonical name", key)
@@ -132,5 +132,92 @@ func TestKeySpecsAreCompleteAndNamesAreUnique(t *testing.T) {
 			t.Fatal("unknown key was accepted")
 		}
 	}()
-	_ = Environment{}.Get(AssistantToolsSocket + 1)
+	_ = Environment{}.Get(ConsoleAccess + 1)
+}
+
+func TestConsoleAccessValidation(t *testing.T) {
+	// Default clean environment resolves ConsoleAccess to public_https
+	env, err := ResolveEnviron(ProcessServer, "acornfox", []string{"ACORNFOX_RUNTIME_MODE=clean"})
+	if err != nil {
+		t.Fatalf("expected clean default env to succeed, got %v", err)
+	}
+	if env.Get(ConsoleAccess) != "public_https" {
+		t.Fatalf("expected default ConsoleAccess to be public_https, got %q", env.Get(ConsoleAccess))
+	}
+
+	// Valid local_loopback with empty PublicRoot and exact AuthOrigin
+	envLocal, err := ResolveEnviron(ProcessServer, "acornfox", []string{
+		"ACORNFOX_RUNTIME_MODE=clean",
+		"ACORNFOX_CONSOLE_ACCESS=local_loopback",
+		"ACORNFOX_AUTH_ORIGIN=http://127.0.0.1:8080",
+	})
+	if err != nil {
+		t.Fatalf("expected valid local_loopback to succeed, got %v", err)
+	}
+	if envLocal.Get(ConsoleAccess) != "local_loopback" {
+		t.Fatalf("expected local_loopback, got %q", envLocal.Get(ConsoleAccess))
+	}
+
+	// local_loopback with empty or padded AuthOrigin must fail
+	for _, badOrigin := range []string{"", " ", "http://127.0.0.1:8080 ", " http://127.0.0.1:8080"} {
+		_, err = ResolveEnviron(ProcessServer, "acornfox", []string{
+			"ACORNFOX_RUNTIME_MODE=clean",
+			"ACORNFOX_CONSOLE_ACCESS=local_loopback",
+			"ACORNFOX_AUTH_ORIGIN=" + badOrigin,
+		})
+		if err == nil {
+			t.Fatalf("expected local_loopback with bad origin %q to fail", badOrigin)
+		}
+	}
+
+	// Agent process cannot use local_loopback
+	_, err = ResolveEnviron(ProcessAgent, "acornfox", []string{
+		"ACORNFOX_RUNTIME_MODE=clean",
+		"ACORNFOX_CONSOLE_ACCESS=local_loopback",
+		"ACORNFOX_DATABASE_URL=postgres://127.0.0.1:5432/test",
+		"ACORNFOX_AUTH_ORIGIN=http://127.0.0.1:8080",
+	})
+	if err == nil {
+		t.Fatal("expected ProcessAgent with local_loopback to fail")
+	}
+
+	// Legacy runtime cannot use local_loopback
+	_, err = ResolveEnviron(ProcessServer, "legacy", []string{
+		"ACORNFOX_CONSOLE_ACCESS=local_loopback",
+	})
+	if err == nil {
+		t.Fatal("expected legacy with local_loopback to fail")
+	}
+
+	// local_loopback with PublicRoot conflicts and must fail
+	_, err = ResolveEnviron(ProcessServer, "acornfox", []string{
+		"ACORNFOX_RUNTIME_MODE=clean",
+		"ACORNFOX_CONSOLE_ACCESS=local_loopback",
+		"ACORNFOX_DATABASE_URL=postgres://127.0.0.1:5432/test",
+		"ACORNFOX_AUTH_ORIGIN=http://127.0.0.1:8080",
+		"ACORNFOX_PUBLIC_ROOT=/srv",
+	})
+	if err == nil {
+		t.Fatal("expected local_loopback with public root to fail")
+	}
+
+	// local_loopback with non-loopback AuthOrigin must fail
+	_, err = ResolveEnviron(ProcessServer, "acornfox", []string{
+		"ACORNFOX_RUNTIME_MODE=clean",
+		"ACORNFOX_CONSOLE_ACCESS=local_loopback",
+		"ACORNFOX_DATABASE_URL=postgres://127.0.0.1:5432/test",
+		"ACORNFOX_AUTH_ORIGIN=https://console.example.com",
+	})
+	if err == nil {
+		t.Fatal("expected local_loopback with https origin to fail")
+	}
+
+	// Unknown console access value must fail
+	_, err = ResolveEnviron(ProcessServer, "acornfox", []string{
+		"ACORNFOX_RUNTIME_MODE=clean",
+		"ACORNFOX_CONSOLE_ACCESS=invalid_mode",
+	})
+	if err == nil {
+		t.Fatal("expected invalid console access value to fail")
+	}
 }

@@ -67,6 +67,10 @@ func (s acornFoxWebSetupStore) CreateAdminCredential(ctx context.Context, creden
 }
 
 func (h *AcornFoxWebSetupHTTPHandler) Handle(writer http.ResponseWriter, request *http.Request) bool {
+	return h.HandleWithPolicy(writer, request, ConsoleAccessPublicHTTPS)
+}
+
+func (h *AcornFoxWebSetupHTTPHandler) HandleWithPolicy(writer http.ResponseWriter, request *http.Request, policy ConsoleAccessMode) bool {
 	if request.URL.Path != acornFoxSetupPath {
 		return false
 	}
@@ -87,7 +91,7 @@ func (h *AcornFoxWebSetupHTTPHandler) Handle(writer http.ResponseWriter, request
 	case http.MethodGet:
 		writeJSON(writer, http.StatusOK, map[string]string{"state": string(h.Service.State(request.Context()))})
 	case http.MethodPost:
-		h.post(writer, request)
+		h.post(writer, request, policy)
 	default:
 		writer.Header().Set("Allow", http.MethodGet+", "+http.MethodPost)
 		acornFoxSetupError(writer, http.StatusMethodNotAllowed, "method not allowed")
@@ -95,8 +99,8 @@ func (h *AcornFoxWebSetupHTTPHandler) Handle(writer http.ResponseWriter, request
 	return true
 }
 
-func (h *AcornFoxWebSetupHTTPHandler) post(writer http.ResponseWriter, request *http.Request) {
-	if !acornFoxSetupHTTPSBoundary(request) {
+func (h *AcornFoxWebSetupHTTPHandler) post(writer http.ResponseWriter, request *http.Request, policy ConsoleAccessMode) {
+	if !h.boundaryAllowed(request, policy) {
 		acornFoxSetupError(writer, http.StatusUnauthorized, "setup failed")
 		return
 	}
@@ -118,6 +122,17 @@ func (h *AcornFoxWebSetupHTTPHandler) post(writer http.ResponseWriter, request *
 		acornFoxSetupError(writer, http.StatusBadRequest, "invalid request")
 	default:
 		acornFoxSetupError(writer, http.StatusServiceUnavailable, "setup unavailable")
+	}
+}
+
+func (h *AcornFoxWebSetupHTTPHandler) boundaryAllowed(request *http.Request, policy ConsoleAccessMode) bool {
+	switch policy {
+	case ConsoleAccessLocalLoopback:
+		return tlsAllowLoopback(request.RemoteAddr)
+	case "", ConsoleAccessPublicHTTPS:
+		return acornFoxSetupHTTPSBoundary(request)
+	default:
+		return false
 	}
 }
 

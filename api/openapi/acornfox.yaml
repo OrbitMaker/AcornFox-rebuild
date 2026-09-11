@@ -250,6 +250,17 @@ paths:
         '401': {$ref: '#/components/responses/AuthenticationFailed'}
         '404': {$ref: '#/components/responses/NotFound'}
         '503': {$ref: '#/components/responses/TemporarilyUnavailable'}
+  /api/v1/acornfox/apps/{applicationId}/sources/{sourceRevisionId}/deployment-plan:
+    parameters: [{$ref: '#/components/parameters/ApplicationId'}, {$ref: '#/components/parameters/SourceRevisionId'}]
+    get:
+      operationId: getAcornFoxDeploymentPlan
+      x-acornfox-parity: integration_cli
+      security: [{AdministratorSession: []}]
+      responses:
+        '200': {description: "Read-only deployment plan derived from the immutable source and its root Dockerfile. It does not build, deploy, or mutate the source.", content: {application/json: {schema: {$ref: '#/components/schemas/DeploymentPlan'}}}}
+        '401': {$ref: '#/components/responses/AuthenticationFailed'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/TemporarilyUnavailable'}
   /api/v1/acornfox/apps/{applicationId}/fix-candidates:
     parameters: [{$ref: '#/components/parameters/ApplicationId'}]
     get:
@@ -492,7 +503,7 @@ components:
       in: header
       required: true
       schema: {type: string, minLength: 1}
-      description: Must equal the non-HttpOnly __Host-acornfox_csrf cookie and use the allowed Origin.
+      description: Must equal the non-HttpOnly CSRF cookie (__Host-acornfox_csrf under public HTTPS or acornfox_local_csrf under local loopback) and use the allowed Origin.
   responses:
     InvalidRequest: {description: Request JSON content type or body shape is invalid, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
     AuthenticationFailed: {description: Authentication origin CSRF or session validation failed, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
@@ -654,6 +665,70 @@ components:
       required: [source_revision_id, availability]
       additionalProperties: false
       properties: {source_revision_id: {type: string}, availability: {type: string, enum: [available, unavailable]}, repository_url: {type: string, format: uri}}
+    DeploymentPlanDockerfile:
+      type: object
+      required: [status, path, stage_count]
+      additionalProperties: false
+      properties:
+        status: {type: string, enum: [ready, waiting_later, unsupported]}
+        path: {type: string}
+        digest: {type: string}
+        stage_count: {type: integer, minimum: 0}
+        final_stage: {type: object, additionalProperties: true}
+        workdir: {type: string}
+        entrypoint: {type: object, additionalProperties: true}
+        command: {type: object, additionalProperties: true}
+    DeploymentPlanPort:
+      type: object
+      required: [port, protocol, source]
+      additionalProperties: false
+      properties: {port: {type: integer, minimum: 1, maximum: 65535}, protocol: {type: string, enum: [tcp, udp]}, source: {type: string, enum: [dockerfile_expose]}}
+    DeploymentPlanPortSelection:
+      type: object
+      required: [status, reason, candidates]
+      additionalProperties: false
+      properties:
+        status: {type: string, enum: [selected, required, unavailable]}
+        reason: {type: string}
+        selected_port: {type: integer, minimum: 1, maximum: 65535}
+        candidates: {type: array, uniqueItems: true, items: {type: integer, minimum: 1, maximum: 65535}}
+        suggested_ports: {type: array, uniqueItems: true, items: {type: integer, minimum: 1, maximum: 65535}}
+    DeploymentPlanEnvironment:
+      type: object
+      required: [name]
+      additionalProperties: false
+      properties: {name: {type: string}, value: {type: string}, redacted: {type: boolean}}
+    DeploymentPlanHealthcheck:
+      type: object
+      additionalProperties: false
+      properties:
+        present: {type: boolean}
+        disabled: {type: boolean}
+        form: {type: string, enum: [exec, shell]}
+        test: {type: array, items: {type: string}}
+        interval_seconds: {type: integer}
+        timeout_seconds: {type: integer}
+        start_period_seconds: {type: integer}
+        retries: {type: integer}
+    DeploymentPlan:
+      type: object
+      required: [application_id, source_revision_id, repository_url, ref, commit, dockerfile, ports, port_selection, healthcheck, environment, gaps, warnings, required_actions, ready_to_deploy]
+      additionalProperties: false
+      properties:
+        application_id: {type: string}
+        source_revision_id: {type: string}
+        repository_url: {type: string, format: uri}
+        ref: {type: string}
+        commit: {type: string}
+        dockerfile: {$ref: '#/components/schemas/DeploymentPlanDockerfile'}
+        ports: {type: array, items: {$ref: '#/components/schemas/DeploymentPlanPort'}}
+        port_selection: {$ref: '#/components/schemas/DeploymentPlanPortSelection'}
+        healthcheck: {$ref: '#/components/schemas/DeploymentPlanHealthcheck'}
+        environment: {type: array, items: {$ref: '#/components/schemas/DeploymentPlanEnvironment'}}
+        gaps: {type: array, items: {type: string}}
+        warnings: {type: array, items: {type: string}}
+        required_actions: {type: array, items: {type: string}}
+        ready_to_deploy: {type: boolean}
     SourceRevisionList:
       type: object
       required: [items, next_cursor]

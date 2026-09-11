@@ -1,4 +1,5 @@
 import { AcornFoxRequestError } from "./client";
+import { resolveCsrfToken } from "./csrf";
 
 const base = "/api/v1/acornfox";
 
@@ -38,6 +39,53 @@ export type DeploymentSource = {
 };
 
 export type SourceUpdate = { sourceRevisionId: string; status: "imported" };
+
+export type DeploymentPlanPort = {
+  port: number;
+  protocol: "tcp" | "udp";
+  source: "dockerfile_expose";
+};
+
+export type DeploymentPlan = {
+  applicationId: string;
+  sourceRevisionId: string;
+  repositoryUrl: string;
+  ref: string;
+  commit: string;
+  dockerfile: {
+    status: "ready" | "waiting_later" | "unsupported";
+    path: string;
+    digest?: string;
+    stageCount: number;
+    finalStage?: { name: string; index: number; from: string; platform?: string };
+    workdir?: string;
+    entrypoint?: { form?: string; values?: string[] };
+    command?: { form?: string; values?: string[] };
+  };
+  ports: DeploymentPlanPort[];
+  portSelection: {
+    status: "selected" | "required" | "unavailable";
+    reason: string;
+    selectedPort?: number;
+    candidates: number[];
+    suggestedPorts: number[];
+  };
+  healthcheck: {
+    present: boolean;
+    disabled: boolean;
+    form?: "exec" | "shell";
+    test: string[];
+    intervalSeconds?: number;
+    timeoutSeconds?: number;
+    startPeriodSeconds?: number;
+    retries?: number;
+  };
+  environment: Array<{ name: string; value?: string; redacted: boolean }>;
+  gaps: string[];
+  warnings: string[];
+  requiredActions: string[];
+  readyToDeploy: boolean;
+};
 
 export type AccessDNSObservation =
   | { state: "observed"; addresses: string[] }
@@ -100,6 +148,7 @@ export interface AcornFoxIntegrationClient {
   setup(input: { setupToken: string; password: string }): Promise<void>;
   hostMetrics(signal?: AbortSignal): Promise<HostMetrics>;
   sourceMetadata(applicationId: string, sourceRevisionId: string): Promise<SourceMetadata>;
+  deploymentPlan(applicationId: string, sourceRevisionId: string): Promise<DeploymentPlan>;
   sourceUpdate(applicationId: string, input: { baseSourceRevisionId: string; ref: string }, idempotencyKey: string): Promise<SourceUpdate>;
   deploymentSource(applicationId: string, deploymentId: string): Promise<DeploymentSource>;
   operationResult(applicationId: string, operationId: string): Promise<AcornFoxOperationResult>;
@@ -215,6 +264,107 @@ function sourceMetadata(value: unknown): SourceMetadata {
 function sourceUpdate(value: unknown): SourceUpdate {
   const row = exact(value, ["source_revision_id", "status"]);
   return { sourceRevisionId: string(row.source_revision_id), status: enumValue(row.status, ["imported"]) };
+}
+function deploymentPlanCommand(value: unknown): { form?: "exec" | "shell"; values?: string[] } | undefined {
+  if (value === undefined) return undefined;
+  const row = exact(value, [], ["form", "values"]);
+  const form = row.form === undefined ? undefined : enumValue(row.form, ["exec", "shell"]);
+  const values = row.values === undefined ? undefined : arrayOfStrings(row.values);
+  return { ...(form === undefined ? {} : { form }), ...(values === undefined ? {} : { values }) };
+}
+function arrayOfStrings(value: unknown): string[] {
+  if (!Array.isArray(value)) invalid();
+  return value.map(string);
+}
+function deploymentPlan(value: unknown): DeploymentPlan {
+  const row = exact(value, [
+    "application_id", "source_revision_id", "repository_url", "ref", "commit", "dockerfile", "ports",
+    "port_selection", "healthcheck", "environment", "gaps", "warnings", "required_actions", "ready_to_deploy",
+  ]);
+  const repositoryUrl = string(row.repository_url);
+  let parsed: URL;
+  try { parsed = new URL(repositoryUrl); } catch { invalid(); }
+  if (parsed.protocol !== "https:" || !parsed.host) invalid();
+  const dockerfileRow = exact(row.dockerfile, ["status", "path", "stage_count"], ["status", "path", "digest", "stage_count", "final_stage", "workdir", "entrypoint", "command"]);
+  const finalStage = dockerfileRow.final_stage === undefined ? undefined : (() => {
+    const stage = exact(dockerfileRow.final_stage, ["name", "index", "from"], ["name", "index", "from", "platform"]);
+    return { name: string(stage.name), index: integer(stage.index), from: string(stage.from), ...(stage.platform === undefined ? {} : { platform: string(stage.platform) }) };
+  })();
+  const dockerfile: DeploymentPlan["dockerfile"] = {
+    status: enumValue(dockerfileRow.status, ["ready", "waiting_later", "unsupported"]),
+    path: string(dockerfileRow.path),
+    stageCount: integer(dockerfileRow.stage_count),
+    ...(dockerfileRow.digest === undefined ? {} : { digest: sha256(dockerfileRow.digest) }),
+    ...(finalStage === undefined ? {} : { finalStage }),
+    ...(dockerfileRow.workdir === undefined ? {} : { workdir: string(dockerfileRow.workdir) }),
+    ...(dockerfileRow.entrypoint === undefined ? {} : { entrypoint: deploymentPlanCommand(dockerfileRow.entrypoint) }),
+    ...(dockerfileRow.command === undefined ? {} : { command: deploymentPlanCommand(dockerfileRow.command) }),
+  };
+  if (!Array.isArray(row.ports)) invalid();
+  const ports = row.ports.map((value) => {
+    const port = exact(value, ["port", "protocol", "source"]);
+    const number = integer(port.port);
+    if (number < 1 || number > 65535) invalid();
+    return { port: number, protocol: enumValue(port.protocol, ["tcp", "udp"]), source: enumValue(port.source, ["dockerfile_expose"]) };
+  });
+  const selectionRow = exact(row.port_selection, ["status", "reason", "candidates"], ["status", "reason", "selected_port", "candidates", "suggested_ports"]);
+  const selectedPort = selectionRow.selected_port === undefined ? undefined : integer(selectionRow.selected_port);
+  if (selectedPort !== undefined && (selectedPort < 1 || selectedPort > 65535)) invalid();
+  const candidates = arrayOfNumbers(selectionRow.candidates);
+  const suggestedPorts = selectionRow.suggested_ports === undefined ? [] : arrayOfNumbers(selectionRow.suggested_ports);
+  const healthRow = exact(row.healthcheck, [], ["present", "disabled", "form", "test", "interval_seconds", "timeout_seconds", "start_period_seconds", "retries"]);
+  const healthcheck: DeploymentPlan["healthcheck"] = {
+    present: healthRow.present === undefined ? false : bool(healthRow.present),
+    disabled: healthRow.disabled === undefined ? false : bool(healthRow.disabled),
+    test: healthRow.test === undefined ? [] : arrayOfStrings(healthRow.test),
+  };
+  if (healthRow.form !== undefined) healthcheck.form = enumValue<"exec" | "shell">(healthRow.form, ["exec", "shell"]);
+  if (healthRow.interval_seconds !== undefined) healthcheck.intervalSeconds = integer(healthRow.interval_seconds);
+  if (healthRow.timeout_seconds !== undefined) healthcheck.timeoutSeconds = integer(healthRow.timeout_seconds);
+  if (healthRow.start_period_seconds !== undefined) healthcheck.startPeriodSeconds = integer(healthRow.start_period_seconds);
+  if (healthRow.retries !== undefined) healthcheck.retries = integer(healthRow.retries);
+  if (!Array.isArray(row.environment)) invalid();
+  const environment = row.environment.map((value) => {
+    const item = exact(value, ["name"], ["name", "value", "redacted"]);
+    const redacted = item.redacted === undefined ? false : bool(item.redacted);
+    const environmentValue = item.value === undefined ? undefined : string(item.value);
+    if (redacted && environmentValue !== undefined) invalid();
+    return { name: string(item.name), redacted, ...(environmentValue === undefined ? {} : { value: environmentValue }) };
+  });
+  const plan: DeploymentPlan = {
+    applicationId: string(row.application_id),
+    sourceRevisionId: string(row.source_revision_id),
+    repositoryUrl,
+    ref: string(row.ref),
+    commit: string(row.commit),
+    dockerfile,
+    ports,
+    portSelection: {
+      status: enumValue(selectionRow.status, ["selected", "required", "unavailable"]),
+      reason: string(selectionRow.reason),
+      ...(selectedPort === undefined ? {} : { selectedPort }),
+      candidates,
+      suggestedPorts,
+    },
+    healthcheck,
+    environment,
+    gaps: arrayOfStrings(row.gaps),
+    warnings: arrayOfStrings(row.warnings),
+    requiredActions: arrayOfStrings(row.required_actions),
+    readyToDeploy: bool(row.ready_to_deploy),
+  };
+  if (plan.readyToDeploy !== (plan.dockerfile.status === "ready" && plan.portSelection.status === "selected")) invalid();
+  if (plan.portSelection.status !== "selected" && plan.portSelection.selectedPort !== undefined) invalid();
+  if (plan.portSelection.status === "selected" && plan.portSelection.selectedPort === undefined) invalid();
+  return plan;
+}
+function arrayOfNumbers(value: unknown): number[] {
+  if (!Array.isArray(value)) invalid();
+  return value.map((item) => {
+    const number = integer(item);
+    if (number < 1 || number > 65535) invalid();
+    return number;
+  });
 }
 function sha256(value: unknown): string {
   const result = string(value);
@@ -384,7 +534,7 @@ export function createAcornFoxIntegrationClient(fetcher: Fetcher = fetch): Acorn
     const headers = new Headers(init.headers);
     if (init.body !== undefined) headers.set("Content-Type", "application/json");
     if (init.method && init.method !== "GET") {
-      const token = csrfCookie();
+      const token = resolveCsrfToken();
       if (token) headers.set("X-AcornFox-CSRF", token);
     }
     let response: Response;
@@ -415,6 +565,7 @@ export function createAcornFoxIntegrationClient(fetcher: Fetcher = fetch): Acorn
     },
     hostMetrics: (signal) => request("/host/metrics", host, { signal }),
     sourceMetadata: (applicationId, sourceRevisionId) => request(`/apps/${pathPart(applicationId)}/sources/${pathPart(sourceRevisionId)}/metadata`, sourceMetadata),
+    deploymentPlan: (applicationId, sourceRevisionId) => request(`/apps/${pathPart(applicationId)}/sources/${pathPart(sourceRevisionId)}/deployment-plan`, deploymentPlan),
     sourceUpdate: (applicationId, input, idempotencyKey) => {
       if (!input.baseSourceRevisionId || !input.ref.trim() || !idempotencyKey) throw new AcornFoxRequestError(422, "invalid_input", "来源版本、引用和请求标识不能为空。");
       return request(`/apps/${pathPart(applicationId)}/sources`, sourceUpdate, { method: "POST", headers: { "Idempotency-Key": idempotencyKey }, body: JSON.stringify({ base_source_revision_id: input.baseSourceRevisionId, ref: input.ref.trim() }) }, 201);

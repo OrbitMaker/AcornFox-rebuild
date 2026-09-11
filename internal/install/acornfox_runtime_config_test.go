@@ -527,3 +527,89 @@ func TestAcornFoxRuntimeConfigMetadataWriteBeforeSync(t *testing.T) {
 		})
 	}
 }
+
+func TestAcornFoxLocalRuntimeConfigLifecycle(t *testing.T) {
+	s, p, id := runtimeConfigFixture(t)
+
+	// 1. Initial Local Runtime Configuration: 7 files published, no edge.json
+	receipt, err := s.run(context.Background(), id, acornfoxsetup.ExactLocalLoopbackOrigin, nil, false)
+	if err != nil {
+		t.Fatalf("local runtime run failed: %v", err)
+	}
+	if err := receipt.Validate(); err != nil {
+		t.Fatalf("receipt invalid: %v", err)
+	}
+
+	intent, raw := runtimeIntentForTest(t, p)
+	if intent.Inputs.Origin != acornfoxsetup.ExactLocalLoopbackOrigin {
+		t.Fatalf("expected exact local origin, got %s", intent.Inputs.Origin)
+	}
+	if len(intent.Files) != 7 {
+		t.Fatalf("expected exactly 7 files in local intent, got %d", len(intent.Files))
+	}
+	// Verify edge.json does not exist in intent or host
+	for _, f := range intent.Files {
+		if filepath.Base(f.Path) == "edge.json" {
+			t.Fatal("edge.json found in local intent")
+		}
+	}
+	if _, err := os.Lstat(filepath.Join(p.host, acornFoxRuntimeTarget, "edge.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("edge.json exists in target directory for local loopback")
+	}
+
+	// 2. Recovery on persisted local intent (no entropy, no regenerated timestamp)
+	s.random = bytes.NewReader(nil)
+	s.now = func() time.Time { panic("local recovery regenerated keys") }
+	recoveryReceipt, err := s.run(context.Background(), id, "", nil, true)
+	if err != nil {
+		t.Fatalf("local recovery failed: %v", err)
+	}
+	if recoveryReceipt != receipt {
+		t.Fatalf("recovery receipt mismatch: got %#v, want %#v", recoveryReceipt, receipt)
+	}
+
+	// 3. Re-run with mismatching origin or resolvers fails
+	if _, err := s.run(context.Background(), id, "https://example.com", nil, false); err == nil {
+		t.Fatal("re-running local intent with public origin succeeded, expected conflict")
+	}
+
+	// 4. Scope inspect has exactly 7 runtime files + 1 runtime dir + 1 setup credential dir + 1 setup token file = 10 entries
+	entries, err := runtimeScopeForTest(t, p)
+	if err != nil {
+		t.Fatalf("runtimeScopeForTest failed: %v", err)
+	}
+	if len(entries) != 10 {
+		t.Fatalf("expected 10 scope entries for local runtime, got %d", len(entries))
+	}
+
+	// 5. Tampering: adding edge.json to local bundle must cause validation failure
+	tamperedIntent := intent
+	tamperedIntent.Files = append(tamperedIntent.Files, acornFoxRuntimeFileWire{
+		Path:  acornfoxsetup.EdgeConfiguration,
+		Mode:  0644,
+		Owner: acornfoxsetup.Root,
+		Group: acornfoxsetup.Root,
+		Data:  []byte("{}"),
+	})
+	if tamperedIntent.validate() == nil {
+		t.Fatal("tampered local intent with edge.json passed validation")
+	}
+
+	// 6. Mode switching rejection: public intent cannot be validated as local
+	publicInputs := acornfoxsetup.Inputs{Origin: runtimeTestOrigin, Version: "1.2.3", ResolverEndpoints: runtimeTestResolvers, Now: time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)}
+	publicBundle, err := acornfoxsetup.Generate(publicInputs, rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, _ := acornfoxsetup.GenerateSetupToken(rand.Reader)
+	publicIntent := acornFoxRuntimeIntent{SchemaVersion: 1, BindingSHA256: strings.Repeat("a", 64), ReleaseID: "release-1.2.3", SourceCommit: strings.Repeat("b", 40), Inputs: publicInputs, SetupToken: token}
+	for _, f := range publicBundle.Files {
+		publicIntent.Files = append(publicIntent.Files, acornFoxRuntimeFileWire{f.Path, f.Mode, f.Owner, f.Group, f.Data})
+	}
+	// Local bundle validation on public intent must fail
+	publicIntent.Inputs.Origin = acornfoxsetup.ExactLocalLoopbackOrigin
+	if publicIntent.validate() == nil {
+		t.Fatal("public bundle with rewritten local origin passed validation")
+	}
+	_ = raw
+}

@@ -153,6 +153,12 @@ func (j acornFoxUpgradeJournal) validate(layout acornFoxInstallLayout) error {
 	if j.CrossSchema == nil && (j.Old.ControlPlane.MigrationRowsSHA256 != j.Next.ControlPlane.MigrationRowsSHA256 || j.Old.ControlPlane.DatabaseEnvSHA256 != j.Next.ControlPlane.DatabaseEnvSHA256) {
 		return ErrAcornFoxUpgradeConflict
 	}
+	oldLocal := j.Old.Runtime.Inputs.Origin == acornfoxsetup.ExactLocalLoopbackOrigin
+	nextLocal := j.Next.Runtime.Inputs.Origin == acornfoxsetup.ExactLocalLoopbackOrigin
+	if oldLocal != nextLocal {
+		// Strictly forbid mode switching between public and local loopback during upgrades
+		return ErrAcornFoxUpgradeConflict
+	}
 	rebound, e := acornFoxUpgradeRebind(j.Old.Runtime, next.binding, next.digest, j.Next.Runtime.SetupToken)
 	if e != nil {
 		return ErrAcornFoxUpgradeConflict
@@ -165,6 +171,10 @@ func (j acornFoxUpgradeJournal) validate(layout acornFoxInstallLayout) error {
 	}
 	return nil
 }
+func (j acornFoxUpgradeJournal) isLocal() bool {
+	return j.Old.Runtime.Inputs.Origin == acornfoxsetup.ExactLocalLoopbackOrigin || j.Next.Runtime.Inputs.Origin == acornfoxsetup.ExactLocalLoopbackOrigin
+}
+
 func (j acornFoxUpgradeJournal) receipt() AcornFoxUpgradeReceiptV1 {
 	i := j.Next
 	if j.Phase == "ROLLED_BACK" || j.Phase == "RECOVERY_PREPARED" {
@@ -173,7 +183,14 @@ func (j acornFoxUpgradeJournal) receipt() AcornFoxUpgradeReceiptV1 {
 	return AcornFoxUpgradeReceiptV1{1, j.Phase, i.Repo.BindingSHA256, j.Old.Repo.BindingSHA256, i.identity().ReleaseID, i.identity().SourceCommit, j.LayoutSHA256}
 }
 func acornFoxUpgradeRebind(old acornFoxRuntimeIntent, next AcornFoxCandidateBindingV1, digest string, setupToken []byte) (acornFoxRuntimeIntent, error) {
-	bundle, input, e := acornfoxsetup.RebindVersion(old.bundle(), old.Inputs, next.Version)
+	var bundle acornfoxsetup.Bundle
+	var input acornfoxsetup.Inputs
+	var e error
+	if old.Inputs.Origin == acornfoxsetup.ExactLocalLoopbackOrigin {
+		bundle, input, e = acornfoxsetup.RebindLocalVersion(old.bundle(), old.Inputs, next.Version)
+	} else {
+		bundle, input, e = acornfoxsetup.RebindVersion(old.bundle(), old.Inputs, next.Version)
+	}
 	if e != nil {
 		return acornFoxRuntimeIntent{}, ErrAcornFoxUpgradeConflict
 	}

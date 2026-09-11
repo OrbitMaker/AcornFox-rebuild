@@ -311,7 +311,7 @@ func sealedGoEnvironment(root, taskCacheRoot string) (string, sealedGoCache, []s
 	}
 	env := []string{
 		"PATH=" + os.Getenv("PATH"), "LANG=" + os.Getenv("LANG"), "TMPDIR=" + os.Getenv("TMPDIR"),
-		"GOOS=linux", "GOARCH=amd64", "CGO_ENABLED=0", "GOWORK=off", "GOENV=off", "GOTOOLCHAIN=local", "GOPROXY=off", "GOVCS=*:off", "GOSUMDB=off",
+		"GOOS=linux", "GOARCH=" + Architecture, "CGO_ENABLED=0", "GOWORK=off", "GOENV=off", "GOTOOLCHAIN=local", "GOPROXY=off", "GOVCS=*:off", "GOSUMDB=off",
 		"GOCACHE=" + goCache, "GOMODCACHE=" + modCache,
 		"GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0",
 	}

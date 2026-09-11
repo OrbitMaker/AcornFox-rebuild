@@ -41,6 +41,16 @@ fi
 clean /usr/bin/systemctl --version >/dev/null || fail
 [[ $(clean /usr/bin/systemctl is-system-running) == running ]] || fail
 
+# Baseline resource checks (>= 2 CPU, >= 3800 MiB MemTotal to accommodate 4GiB guest kernel reservation, >= 10 GiB available disk on /)
+cpu_count=$(clean /usr/bin/nproc) || fail
+[[ $cpu_count =~ ^[0-9]+$ ]] && (( cpu_count >= 2 )) || fail
+
+mem_total_kb=$(clean /usr/bin/awk '/^MemTotal:/ {print $2}' /proc/meminfo) || fail
+[[ $mem_total_kb =~ ^[0-9]+$ ]] && (( mem_total_kb >= 3891200 )) || fail # ~3800 MiB in KiB
+
+disk_avail_kb=$(clean /usr/bin/df -k --output=avail / | clean /usr/bin/tail -n 1 | clean /usr/bin/tr -d '[:space:]') || fail
+[[ $disk_avail_kb =~ ^[0-9]+$ ]] && (( disk_avail_kb >= 10485760 )) || fail # >= 10 GiB in KiB
+
 if [[ $phase == post ]]; then
   docker_version=$(clean /usr/bin/docker --version) || fail
   psql_version=$(clean /usr/bin/psql --version) || fail

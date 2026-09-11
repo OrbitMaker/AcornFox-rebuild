@@ -1,4 +1,5 @@
 import { AcornFoxRequestError } from "./client";
+import { resolveCsrfToken } from "./csrf";
 
 const base = "/api/v1/acornfox/assistant";
 const maxStreamBufferBytes = 128 << 10;
@@ -36,7 +37,7 @@ function date(value: unknown): string { const result = string(value); return Num
 function exact(value: unknown, required: readonly string[], allowed = required): JsonRecord { const row = record(value); if (!required.every((key) => Object.hasOwn(row, key)) || !Object.keys(row).every((key) => allowed.includes(key))) invalid(); return row; }
 function oneOf<T extends string>(value: unknown, values: readonly T[]): T { return typeof value === "string" && values.includes(value as T) ? value as T : invalid(); }
 function escapePath(value: string): string { return encodeURIComponent(value); }
-function csrf(): string | undefined { if (typeof document === "undefined") return undefined; const cookie = document.cookie.split(";").map((part) => part.trim()).find((part) => part.startsWith("__Host-acornfox_csrf=")); if (!cookie) return undefined; try { return decodeURIComponent(cookie.slice("__Host-acornfox_csrf=".length)); } catch { return undefined; } }
+function csrf(): string | undefined { return resolveCsrfToken(); }
 function error(status: number, body: unknown): AcornFoxRequestError { const row = typeof body === "object" && body !== null ? body as JsonRecord : undefined; return new AcornFoxRequestError(status, typeof row?.code === "string" ? row.code : `http_${status}`, typeof row?.message === "string" ? row.message : "请求未完成，请稍后重试。"); }
 function scope(value: unknown): AssistantScope { const row = exact(value, ["kind"], ["kind", "app_id"]); const kind = oneOf(row.kind, ["host", "app"]); if (kind === "host") { if (row.app_id !== undefined) invalid(); return { kind }; } return { kind, appId: string(row.app_id) }; }
 function session(value: unknown): AssistantSession { const row = exact(value, ["session_id", "scope", "created_at", "updated_at"]); return { sessionId: string(row.session_id), scope: scope(row.scope), createdAt: date(row.created_at), updatedAt: date(row.updated_at) }; }

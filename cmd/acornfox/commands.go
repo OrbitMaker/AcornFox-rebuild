@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -26,6 +27,8 @@ func (c *cli) command(args []string) error {
 		return c.passwordCommand(args[1:])
 	case "apps":
 		return c.apps(args[1:])
+	case "up":
+		return c.up(args[1:])
 	case "sources":
 		return c.sources(args[1:])
 	case "deployments":
@@ -226,6 +229,111 @@ func (c *cli) apps(args []string) error {
 	}
 	body := map[string]any{"name": values["--name"], "source": map[string]string{"type": "public_git", "repository_url": repository, "ref": ref}}
 	return c.callCommand(http.MethodPost, "/apps", body, true, key, 3*time.Minute, shapeCreateApp)
+}
+func (c *cli) up(args []string) error {
+	args, noDeploy, err := parseBooleanFlag(args, "--no-deploy")
+	if err != nil {
+		return err
+	}
+	positionals, values, err := parseFlags(args, "--name", "--ref", "--port", "--idempotency-key")
+	if err != nil {
+		return err
+	}
+	if len(positionals) != 1 {
+		return errors.New("usage: acornfox up REPOSITORY [--name NAME] [--ref REF] [--port PORT] [--no-deploy] [--idempotency-key KEY]")
+	}
+	repository, err := normalizePublicGit(positionals[0])
+	if err != nil {
+		return err
+	}
+	ref := strings.TrimSpace(values["--ref"])
+	if ref == "" {
+		ref = "main"
+	}
+	if _, err := requireRef(ref); err != nil {
+		return err
+	}
+	name := strings.TrimSpace(values["--name"])
+	if name == "" {
+		name = acornFoxDefaultAppName(repository)
+	}
+	baseKey, err := idempotencyKey(values)
+	if err != nil {
+		return err
+	}
+	state, err := loadState(c.env)
+	if err != nil {
+		return err
+	}
+	createdValue, err := c.performCall(state, http.MethodPost, "/apps", map[string]any{
+		"name":   name,
+		"source": map[string]string{"type": "public_git", "repository_url": repository, "ref": ref},
+	}, true, baseKey+":app", 3*time.Minute, shapeCreateApp)
+	if err != nil {
+		return err
+	}
+	created := createdValue.(apiCreateApp)
+	planValue, err := c.performCall(state, http.MethodGet, "/apps/"+pathID(created.Application.ID)+"/sources/"+pathID(created.SourceRevisionID)+"/deployment-plan", nil, false, "", 15*time.Second, shapeDeploymentPlan)
+	if err != nil {
+		return err
+	}
+	plan := planValue.(apiDeploymentPlan)
+	selectedPort := 0
+	if raw := values["--port"]; raw != "" {
+		selectedPort, err = parsePort(raw)
+		if err != nil {
+			return err
+		}
+	} else if plan.PortSelection.SelectedPort != nil {
+		selectedPort = *plan.PortSelection.SelectedPort
+	}
+	result := map[string]any{"application": created.Application, "source_revision_id": created.SourceRevisionID, "deployment_plan": plan, "deployed": false}
+	if noDeploy {
+		return c.emit(result)
+	}
+	if selectedPort == 0 {
+		if len(plan.PortSelection.Candidates) > 0 {
+			return fmt.Errorf("container port is required; detected candidates: %v", plan.PortSelection.Candidates)
+		}
+		return errors.New("container port is required; no Dockerfile EXPOSE port was detected")
+	}
+	deliveredValue, err := c.performCall(state, http.MethodPost, "/apps/"+pathID(created.Application.ID)+"/deliveries", map[string]any{
+		"source_revision_id": created.SourceRevisionID,
+		"container_port":     selectedPort,
+	}, true, baseKey+":delivery", 10*time.Minute, shapeCommand)
+	if err != nil {
+		return err
+	}
+	result["deployed"] = true
+	result["deployment"] = deliveredValue.(apiCommand)
+	return c.emit(result)
+}
+
+func acornFoxDefaultAppName(repository string) string {
+	parsed, err := url.Parse(repository)
+	if err != nil {
+		return "app"
+	}
+	name := strings.TrimSuffix(strings.TrimSuffix(parsed.Path, "/"), ".git")
+	if index := strings.LastIndex(name, "/"); index >= 0 {
+		name = name[index+1:]
+	}
+	name = strings.TrimSpace(strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			return r
+		default:
+			return '-'
+		}
+	}, name))
+	name = strings.Trim(name, "-_")
+	if name == "" {
+		return "app"
+	}
+	if len(name) > 64 {
+		name = name[:64]
+	}
+	return name
 }
 func (c *cli) sources(args []string) error {
 	if len(args) >= 2 && args[0] == "list" {

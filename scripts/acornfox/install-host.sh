@@ -118,11 +118,26 @@ bootstrap_helper_sha256=$8
 is_sha256 "$binding_sha256" && is_sha256 "$bootstrap_helper_sha256" || fail
 safe_candidate_dir "$candidate_dir" || fail
 safe_helper "$bootstrap_helper" "$bootstrap_helper_sha256" || fail
+
+console_access=${ACORNFOX_CONSOLE_ACCESS:-public_https}
 public_origin=${ACORNFOX_PUBLIC_ORIGIN:-}
 git_resolvers=${ACORNFOX_GIT_RESOLVERS:-}
-[[ -n $public_origin && -n $git_resolvers ]] || fail
-# Validate operator choices before package or host changes.
-"${CLEAN_ENV[@]}" "$bootstrap_helper" validate-runtime-inputs --public-origin "$public_origin" --git-resolvers "$git_resolvers"
+
+if [[ $console_access == public_https ]]; then
+  [[ -n $public_origin && -n $git_resolvers ]] || fail
+  # Validate operator choices before package or host changes.
+  "${CLEAN_ENV[@]}" "$bootstrap_helper" validate-runtime-inputs --public-origin "$public_origin" --git-resolvers "$git_resolvers"
+elif [[ $console_access == local_loopback ]]; then
+  [[ -z $public_origin ]] || fail
+  # For local_loopback, validate choices with validate-local-runtime-inputs before changes.
+  if [[ -n $git_resolvers ]]; then
+    "${CLEAN_ENV[@]}" "$bootstrap_helper" validate-local-runtime-inputs --git-resolvers "$git_resolvers"
+  else
+    "${CLEAN_ENV[@]}" "$bootstrap_helper" validate-local-runtime-inputs
+  fi
+else
+  fail
+fi
 
 # stdout is reserved for machine-readable helper receipts. The preflight is
 # read-only, so its canonical receipt is deliberately passed through.
@@ -143,7 +158,15 @@ effect /usr/bin/systemctl enable --now postgresql.service
 
 "${CLEAN_ENV[@]}" "$INSTALL" --candidate-dir "$candidate_dir" --binding-sha256 "$binding_sha256" --bootstrap-helper "$bootstrap_helper" --bootstrap-helper-sha256 "$bootstrap_helper_sha256"
 "${CLEAN_ENV[@]}" "$MIGRATE" --pending
-"${CLEAN_ENV[@]}" /opt/acornfox/upgrade-tools/acornfox-upgrade configure-runtime --public-origin "$public_origin" --git-resolvers "$git_resolvers"
+if [[ $console_access == public_https ]]; then
+  "${CLEAN_ENV[@]}" /opt/acornfox/upgrade-tools/acornfox-upgrade configure-runtime --public-origin "$public_origin" --git-resolvers "$git_resolvers"
+else
+  if [[ -n $git_resolvers ]]; then
+    "${CLEAN_ENV[@]}" /opt/acornfox/upgrade-tools/acornfox-upgrade configure-local-runtime --git-resolvers "$git_resolvers"
+  else
+    "${CLEAN_ENV[@]}" /opt/acornfox/upgrade-tools/acornfox-upgrade configure-local-runtime
+  fi
+fi
 effect /usr/bin/systemctl daemon-reload
 # Model configuration is optional. A fresh host never starts the worker until
 # configure-assistant has installed both root-only canonical files.
@@ -155,22 +178,48 @@ effect /usr/bin/systemctl enable acornfox-runtime-network.service
 effect /usr/bin/systemctl enable acornfox-caddy.service
 effect /usr/bin/systemctl enable acornfox-server.service
 effect /usr/bin/systemctl enable acornfox-agent.service
-effect /usr/bin/systemctl enable acornfox-edge.service
-effect /usr/bin/systemctl enable acornfox-healthcheck.timer
-effect /usr/bin/systemctl start acornfox-upgrade-safe.target
-effect /usr/bin/systemctl start acornfox-build-network.service
-effect /usr/bin/systemctl start acornfox-buildkit.service
-effect /usr/bin/systemctl start acornfox-runtime-network.service
-effect /usr/bin/systemctl start acornfox-caddy.service
-effect /usr/bin/systemctl start acornfox-server.service
-effect /usr/bin/systemctl start acornfox-agent.service
-effect /usr/bin/systemctl start acornfox-edge.service
-effect /usr/bin/systemctl start acornfox-healthcheck.timer
-effect /usr/bin/systemctl start acornfox-healthcheck.service
-for unit in acornfox-upgrade-safe.target acornfox-build-network.service acornfox-buildkit.service acornfox-runtime-network.service acornfox-caddy.service acornfox-server.service acornfox-agent.service acornfox-edge.service acornfox-healthcheck.timer; do
-  clean_output /usr/bin/systemctl is-enabled --quiet "$unit" || fail
-  clean_output /usr/bin/systemctl is-active --quiet "$unit" || fail
-done
+
+if [[ $console_access == public_https ]]; then
+  effect /usr/bin/systemctl enable acornfox-edge.service
+  effect /usr/bin/systemctl enable acornfox-healthcheck.timer
+  effect /usr/bin/systemctl start acornfox-upgrade-safe.target
+  effect /usr/bin/systemctl start acornfox-build-network.service
+  effect /usr/bin/systemctl start acornfox-buildkit.service
+  effect /usr/bin/systemctl start acornfox-runtime-network.service
+  effect /usr/bin/systemctl start acornfox-caddy.service
+  effect /usr/bin/systemctl start acornfox-server.service
+  effect /usr/bin/systemctl start acornfox-agent.service
+  effect /usr/bin/systemctl start acornfox-edge.service
+  effect /usr/bin/systemctl start acornfox-healthcheck.timer
+  effect /usr/bin/systemctl start acornfox-healthcheck.service
+  for unit in acornfox-upgrade-safe.target acornfox-build-network.service acornfox-buildkit.service acornfox-runtime-network.service acornfox-caddy.service acornfox-server.service acornfox-agent.service acornfox-edge.service acornfox-healthcheck.timer; do
+    clean_output /usr/bin/systemctl is-enabled --quiet "$unit" || fail
+    clean_output /usr/bin/systemctl is-active --quiet "$unit" || fail
+  done
+else
+  # local_loopback: acornfox-edge and healthcheck timer (which checks port 18482) are disabled and inactive.
+  effect /usr/bin/systemctl disable --now acornfox-edge.service
+  effect /usr/bin/systemctl disable --now acornfox-healthcheck.timer
+  effect /usr/bin/systemctl start acornfox-upgrade-safe.target
+  effect /usr/bin/systemctl start acornfox-build-network.service
+  effect /usr/bin/systemctl start acornfox-buildkit.service
+  effect /usr/bin/systemctl start acornfox-runtime-network.service
+  effect /usr/bin/systemctl start acornfox-caddy.service
+  effect /usr/bin/systemctl start acornfox-server.service
+  effect /usr/bin/systemctl start acornfox-agent.service
+  for unit in acornfox-upgrade-safe.target acornfox-build-network.service acornfox-buildkit.service acornfox-runtime-network.service acornfox-caddy.service acornfox-server.service acornfox-agent.service; do
+    clean_output /usr/bin/systemctl is-enabled --quiet "$unit" || fail
+    clean_output /usr/bin/systemctl is-active --quiet "$unit" || fail
+  done
+  if clean_output /usr/bin/systemctl is-enabled --quiet acornfox-edge.service || clean_output /usr/bin/systemctl is-active --quiet acornfox-edge.service; then
+    fail
+  fi
+  if clean_output /usr/bin/systemctl is-enabled --quiet acornfox-healthcheck.timer || clean_output /usr/bin/systemctl is-active --quiet acornfox-healthcheck.timer; then
+    fail
+  fi
+  # Verify local endpoints on 18481 (healthz, readyz) and 8080 (setup page) with wait-local-ready helper
+  "${CLEAN_ENV[@]}" /opt/acornfox/upgrade-tools/acornfox-upgrade wait-local-ready
+fi
 if clean_output /usr/bin/systemctl is-enabled --quiet acornfox-pi-worker.service || clean_output /usr/bin/systemctl is-active --quiet acornfox-pi-worker.service; then
   fail
 fi

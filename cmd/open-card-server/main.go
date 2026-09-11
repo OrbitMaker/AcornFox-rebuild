@@ -79,6 +79,13 @@ func main() {
 	server.SetLegacyRoutesEnabled(compatibilityMode)
 	var controllerStore *postgres.Store
 	databaseURL := getenv(acornfoxenv.DatabaseURL)
+	consoleAccessMode := ConsoleAccessMode(getenv(acornfoxenv.ConsoleAccess))
+	if consoleAccessMode == "" {
+		consoleAccessMode = ConsoleAccessPublicHTTPS
+	}
+	if consoleAccessMode == ConsoleAccessLocalLoopback && strings.TrimSpace(databaseURL) == "" {
+		log.Fatalf("local loopback console requires persistent database: %s is unset", environment.Name(acornfoxenv.DatabaseURL))
+	}
 	if err := validateFeatureHierarchy(databaseURL != "", getenv(acornfoxenv.M1Enabled) == "true", getenv(acornfoxenv.M2Enabled) == "true", getenv(acornfoxenv.M3Enabled) == "true", getenv(acornfoxenv.M4Enabled) == "true", getenv(acornfoxenv.M4RolloutEnabled) == "true", getenv(acornfoxenv.M5Enabled) == "true", getenv(acornfoxenv.M6Enabled) == "true"); err != nil {
 		log.Fatal(err)
 	}
@@ -104,9 +111,18 @@ func main() {
 		server.SetSystemStatusStore(store)
 		server.SetApplicationProjectionStore(store)
 		server.SetSystemStatusNode(getenv(acornfoxenv.AgentDispatchInstanceID), getenv(acornfoxenv.AgentDispatchNodeID))
+		if err := server.SetConsoleAccessMode(consoleAccessMode); err != nil {
+			log.Fatalf("invalid console access mode configuration: %v", err)
+		}
 		origin := strings.TrimSpace(getenv(acornfoxenv.AuthOrigin))
 		if origin != "" {
-			authService, authErr := auth.NewService(auth.Config{Store: store, Origin: origin})
+			var authService *auth.Service
+			var authErr error
+			if consoleAccessMode == ConsoleAccessLocalLoopback {
+				authService, authErr = auth.NewLocalService(auth.Config{Store: store, Origin: origin})
+			} else {
+				authService, authErr = auth.NewService(auth.Config{Store: store, Origin: origin})
+			}
 			if authErr != nil {
 				log.Fatal(authErr)
 			}
@@ -250,6 +266,7 @@ func main() {
 			server.SetReleaseController(releaseController)
 			server.SetApplicationPublisher(store, releaseController)
 			acornFoxStore := acornFoxPostgresAdapter{store: store}
+			server.SetAcornFoxDockerfileImporter(dockerfile.New())
 			deliveryService := &application.AcornFoxDeliveryService{
 				Idempotency: acornFoxStore, Sources: acornFoxStore, Importer: dockerfile.New(), Builds: acornFoxStore,
 				Tasks: acornFoxStore, Runtime: acornFoxStore, Observer: acornFoxStore, Builder: buildProvider, Capacity: capacityProvider,

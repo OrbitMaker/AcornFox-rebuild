@@ -18,7 +18,7 @@ import (
 const (
 	DecisionV1Schema = 1
 	Product          = "acornfox"
-	Architecture     = "amd64"
+	Architecture     = install.AcornFoxV1Architecture
 	Migration        = install.AcornFoxV1MigrationVersion
 	Layout           = 1
 	maxDecisionBytes = 16 << 10

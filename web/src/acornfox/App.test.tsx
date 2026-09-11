@@ -94,7 +94,7 @@ describe("AcornFox clean entry", () => {
     for (const text of [
       "AcornFox",
       "首页",
-      "创建应用",
+      "从 GitHub 部署",
       "本机资源",
       "运行情况请查看部署详情",
     ])

@@ -34,10 +34,11 @@ type authRouteConfig struct {
 	sessionCookie string
 	csrfCookie    string
 	csrfHeader    string
+	secure        bool
 }
 
-var legacyAuthRouteConfig = authRouteConfig{sessionCookie: authSessionCookie, csrfCookie: authCSRFCookie, csrfHeader: authCSRFHeader}
-var acornFoxAuthRouteConfig = authRouteConfig{sessionCookie: acornFoxAuthSessionCookie, csrfCookie: acornFoxAuthCSRFCookie, csrfHeader: acornFoxAuthCSRFHeader}
+var legacyAuthRouteConfig = authRouteConfig{sessionCookie: authSessionCookie, csrfCookie: authCSRFCookie, csrfHeader: authCSRFHeader, secure: true}
+var acornFoxAuthRouteConfig = authRouteConfig{sessionCookie: acornFoxAuthSessionCookie, csrfCookie: acornFoxAuthCSRFCookie, csrfHeader: acornFoxAuthCSRFHeader, secure: true}
 
 type authLoginInput struct {
 	Password string `json:"password"`
@@ -56,6 +57,10 @@ func (h *AuthHTTPHandler) Handle(writer http.ResponseWriter, request *http.Reque
 // session, cookie, origin, or CSRF behavior of the established auth service.
 func (h *AuthHTTPHandler) HandleAcornFox(writer http.ResponseWriter, request *http.Request) bool {
 	return h.handleAtBase(writer, request, acornFoxAuthAPIBase, acornFoxAuthRouteConfig)
+}
+
+func (h *AuthHTTPHandler) HandleAcornFoxWithConfig(writer http.ResponseWriter, request *http.Request, config authRouteConfig) bool {
+	return h.handleAtBase(writer, request, acornFoxAuthAPIBase, config)
 }
 
 func (h *AuthHTTPHandler) handleAtBase(writer http.ResponseWriter, request *http.Request, base string, config authRouteConfig) bool {
@@ -211,14 +216,14 @@ func authRemoteIP(remoteAddr string) net.IP {
 }
 
 func setAuthCookies(writer http.ResponseWriter, config authRouteConfig, session, csrf string, expires time.Time) {
-	http.SetCookie(writer, &http.Cookie{Name: config.sessionCookie, Value: session, Path: "/", Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode, Expires: expires.UTC()})
-	http.SetCookie(writer, &http.Cookie{Name: config.csrfCookie, Value: csrf, Path: "/", Secure: true, HttpOnly: false, SameSite: http.SameSiteStrictMode, Expires: expires.UTC()})
+	http.SetCookie(writer, &http.Cookie{Name: config.sessionCookie, Value: session, Path: "/", Secure: config.secure, HttpOnly: true, SameSite: http.SameSiteStrictMode, Expires: expires.UTC()})
+	http.SetCookie(writer, &http.Cookie{Name: config.csrfCookie, Value: csrf, Path: "/", Secure: config.secure, HttpOnly: false, SameSite: http.SameSiteStrictMode, Expires: expires.UTC()})
 }
 
 func clearAuthCookies(writer http.ResponseWriter, config authRouteConfig) {
 	expires := time.Unix(1, 0).UTC()
-	http.SetCookie(writer, &http.Cookie{Name: config.sessionCookie, Value: "", Path: "/", Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode, Expires: expires, MaxAge: -1})
-	http.SetCookie(writer, &http.Cookie{Name: config.csrfCookie, Value: "", Path: "/", Secure: true, HttpOnly: false, SameSite: http.SameSiteStrictMode, Expires: expires, MaxAge: -1})
+	http.SetCookie(writer, &http.Cookie{Name: config.sessionCookie, Value: "", Path: "/", Secure: config.secure, HttpOnly: true, SameSite: http.SameSiteStrictMode, Expires: expires, MaxAge: -1})
+	http.SetCookie(writer, &http.Cookie{Name: config.csrfCookie, Value: "", Path: "/", Secure: config.secure, HttpOnly: false, SameSite: http.SameSiteStrictMode, Expires: expires, MaxAge: -1})
 }
 
 func clearAuthCookiesForInvalidSession(writer http.ResponseWriter, config authRouteConfig, err error) {

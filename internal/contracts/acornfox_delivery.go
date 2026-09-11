@@ -227,6 +227,7 @@ var acornFoxPublicRoutes = [...]AcornFoxPublicRoute{
 	{Path: "/api/v1/acornfox/apps/{applicationId}/sources", Methods: []string{"get", "post"}},
 	{Path: "/api/v1/acornfox/apps/{applicationId}/sources/{sourceRevisionId}", Methods: []string{"get"}},
 	{Path: "/api/v1/acornfox/apps/{applicationId}/sources/{sourceRevisionId}/metadata", Methods: []string{"get"}},
+	{Path: "/api/v1/acornfox/apps/{applicationId}/sources/{sourceRevisionId}/deployment-plan", Methods: []string{"get"}},
 	{Path: "/api/v1/acornfox/apps/{applicationId}/fix-candidates", Methods: []string{"get", "post"}},
 	{Path: "/api/v1/acornfox/apps/{applicationId}/fix-candidates/{candidateId}", Methods: []string{"get"}},
 	{Path: "/api/v1/acornfox/apps/{applicationId}/fix-candidates/{candidateId}/source-match", Methods: []string{"post"}},

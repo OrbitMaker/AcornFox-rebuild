@@ -837,6 +837,8 @@ func TestAllCommandFamiliesUseTheirDeclaredRouteAndProof(t *testing.T) {
 			response = `{"id":"source","application_id":"app","kind":"git_https","locator_sha256":"digest","content_digest":"content","created_at":"2030-01-01T00:00:00Z","immutable":true}`
 		case apiBase + "/apps/app/sources/source/metadata":
 			response = `{"source_revision_id":"source","availability":"unavailable"}`
+		case apiBase + "/apps/app/sources/source/deployment-plan":
+			response = `{"application_id":"app","source_revision_id":"source","repository_url":"https://github.com/example/repo.git","ref":"main","commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","dockerfile":{"status":"ready","path":"Dockerfile","digest":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","stage_count":1,"final_stage":{"name":"final","index":0,"from":"scratch"}},"ports":[{"port":8080,"protocol":"tcp","source":"dockerfile_expose"}],"port_selection":{"status":"selected","reason":"dockerfile_expose","selected_port":8080,"candidates":[8080]},"healthcheck":{"present":false},"environment":[],"gaps":["healthcheck_missing"],"warnings":[],"required_actions":[],"ready_to_deploy":true}`
 		case apiBase + "/apps/app/deliveries":
 			if r.Method == http.MethodGet {
 				response = `{"items":[],"next_cursor":null}`
@@ -878,6 +880,7 @@ func TestAllCommandFamiliesUseTheirDeclaredRouteAndProof(t *testing.T) {
 	c := &cli{in: strings.NewReader(""), out: io.Discard, err: io.Discard, env: env, client: server.Client(), json: true}
 	commands := [][]string{
 		{"host", "metrics"}, {"apps", "list"}, {"apps", "get", "app"}, {"operation", "app", "operation"}, {"apps", "create", "--name", "demo", "--repository", "https://github.com/example/repo.git", "--ref", "main"},
+		{"up", "https://github.com/example/repo.git", "--name", "demo", "--ref", "main", "--port", "8080"},
 		{"sources", "list", "app", "--limit", "2", "--cursor", "opaque"}, {"sources", "update", "app", "source", "main"}, {"sources", "get", "app", "source"}, {"sources", "metadata", "app", "source"}, {"deployments", "list", "app", "--limit", "2", "--cursor", "opaque"},
 		{"deploy", "app", "--source", "source", "--port", "8080"}, {"status", "app", "deployment"}, {"delivery-source", "app", "deployment"}, {"logs", "app", "deployment", "--source", "runtime", "--limit", "2", "--cursor", "opaque"},
 		{"probe", "app", "deployment"}, {"restart", "app", "deployment"}, {"redeploy", "app", "deployment"}, {"public-access", "get", "app", "deployment"}, {"public-access", "enable", "app", "deployment"}, {"public-access", "disable", "app", "deployment"},
@@ -886,6 +889,45 @@ func TestAllCommandFamiliesUseTheirDeclaredRouteAndProof(t *testing.T) {
 		if err := c.command(args); err != nil {
 			t.Fatalf("args=%v err=%v", args, err)
 		}
+	}
+}
+
+func TestUpRequiresPortWhenDeploymentPlanIsAmbiguous(t *testing.T) {
+	root := t.TempDir()
+	env := func(key string) string {
+		if key == "XDG_STATE_HOME" {
+			return root
+		}
+		return ""
+	}
+	deployed := false
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == apiBase+"/apps" && r.Method == http.MethodPost:
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, `{"application":{"id":"app","name":"demo","created_at":"2030-01-01T00:00:00Z","updated_at":"2030-01-01T00:00:00Z"},"source_revision_id":"source","operation_id":"operation"}`)
+		case r.URL.Path == apiBase+"/apps/app/sources/source/deployment-plan":
+			_, _ = io.WriteString(w, `{"application_id":"app","source_revision_id":"source","repository_url":"https://github.com/example/repo.git","ref":"main","commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","dockerfile":{"status":"ready","path":"Dockerfile","digest":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","stage_count":1},"ports":[{"port":3000,"protocol":"tcp","source":"dockerfile_expose"},{"port":8080,"protocol":"tcp","source":"dockerfile_expose"}],"port_selection":{"status":"required","reason":"multiple_dockerfile_ports","candidates":[3000,8080]},"healthcheck":{"present":false},"environment":[],"gaps":[],"warnings":[],"required_actions":[],"ready_to_deploy":false}`)
+		case r.URL.Path == apiBase+"/apps/app/deliveries":
+			deployed = true
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = io.WriteString(w, `{"deployment_id":"deployment","operation_id":"operation","task_id":"task","status":"accepted"}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, `{"code":"not_found","message":"not found"}`)
+		}
+	}))
+	defer server.Close()
+	if err := saveState(env, sessionState{Origin: server.URL, Session: "session", CSRF: "csrf", ExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	c := &cli{in: strings.NewReader(""), out: io.Discard, err: io.Discard, env: env, client: server.Client(), json: true}
+	err := c.command([]string{"up", "https://github.com/example/repo.git", "--name", "demo"})
+	if err == nil || !strings.Contains(err.Error(), "3000") || !strings.Contains(err.Error(), "8080") {
+		t.Fatalf("ambiguous plan error=%v", err)
+	}
+	if deployed {
+		t.Fatal("up deployed without an explicit port")
 	}
 }
 

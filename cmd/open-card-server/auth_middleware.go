@@ -43,7 +43,11 @@ func (s *Server) authenticateControlPlane(writer http.ResponseWriter, request *h
 }
 
 func (s *Server) authenticateAcornFoxControlPlane(writer http.ResponseWriter, request *http.Request) (*http.Request, bool) {
-	return s.authenticateControlPlaneWithAuth(writer, request, acornFoxAuthRouteConfig)
+	config := acornFoxAuthRouteConfig
+	if s.consoleAccessMode == ConsoleAccessLocalLoopback {
+		config = localAuthRouteConfig
+	}
+	return s.authenticateControlPlaneWithAuth(writer, request, config)
 }
 
 func (s *Server) authenticateControlPlaneWithAuth(writer http.ResponseWriter, request *http.Request, config authRouteConfig) (*http.Request, bool) {

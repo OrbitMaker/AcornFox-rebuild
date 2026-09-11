@@ -99,6 +99,8 @@ function payload(operationId: string, sourceRevisionKind: string): unknown {
       return { schema_version: 1, availability: "warming_up", observed_at: "2030-01-01T00:00:00Z", stale_after_seconds: 15, cpu: { logical_cores: 4 }, memory: { total_bytes: 4096, available_bytes: 1024, used_bytes: 3072 }, disk: { mountpoint: "/", total_bytes: 8192, free_bytes: 4096, used_bytes: 4096 } };
     case "getAcornFoxSourceMetadata":
       return { source_revision_id: "source", availability: "unavailable" };
+    case "getAcornFoxDeploymentPlan":
+      return { application_id: "app", source_revision_id: "source", repository_url: "https://github.com/example/app.git", ref: "main", commit: "a".repeat(40), dockerfile: { status: "ready", path: "Dockerfile", digest: `sha256:${"d".repeat(64)}`, stage_count: 1, final_stage: { name: "final", index: 0, from: "scratch" } }, ports: [{ port: 3000, protocol: "tcp", source: "dockerfile_expose" }], port_selection: { status: "selected", reason: "dockerfile_expose", selected_port: 3000, candidates: [3000] }, healthcheck: { present: false }, environment: [], gaps: [], warnings: [], required_actions: [], ready_to_deploy: true };
     case "updateAcornFoxSourceRevision":
       return { source_revision_id: "source-next", status: "imported" };
     case "getAcornFoxDeliverySource":
@@ -170,6 +172,7 @@ const integrationOperations: IntegrationOperation[] = [
   { operationId: "initializeAcornFoxAdministrator", method: "POST", pathTemplate: "/api/v1/acornfox/setup", invoke: (api) => api.setup({ setupToken: "single-use", password: "not-a-real-password" }) },
   { operationId: "getAcornFoxHostMetrics", method: "GET", pathTemplate: "/api/v1/acornfox/host/metrics", invoke: (api) => api.hostMetrics() },
   { operationId: "getAcornFoxSourceMetadata", method: "GET", pathTemplate: "/api/v1/acornfox/apps/{applicationId}/sources/{sourceRevisionId}/metadata", invoke: (api) => api.sourceMetadata("app", "source") },
+  { operationId: "getAcornFoxDeploymentPlan", method: "GET", pathTemplate: "/api/v1/acornfox/apps/{applicationId}/sources/{sourceRevisionId}/deployment-plan", invoke: (api) => api.deploymentPlan("app", "source") },
   { operationId: "updateAcornFoxSourceRevision", method: "POST", pathTemplate: "/api/v1/acornfox/apps/{applicationId}/sources", invoke: (api) => api.sourceUpdate("app", { baseSourceRevisionId: "source", ref: "main" }, "retry-key") },
   { operationId: "getAcornFoxDeliverySource", method: "GET", pathTemplate: "/api/v1/acornfox/apps/{applicationId}/deliveries/{deploymentId}/source", invoke: (api) => api.deploymentSource("app", "deployment") },
   { operationId: "getAcornFoxOperationResult", method: "GET", pathTemplate: "/api/v1/acornfox/apps/{applicationId}/operations/{operationId}", invoke: (api) => api.operationResult("app", "operation") },
@@ -264,7 +267,7 @@ describe("AcornFox OpenAPI parity", () => {
     const contract = matrix!;
     const integration = contract.operations.filter((operation) => operation.webClient === "integration");
     expect(integration.map((operation) => operation.operationId).sort()).toEqual([
-      "getAcornFoxDeliverySource", "getAcornFoxExternalAccessObservation", "getAcornFoxHostMetrics", "getAcornFoxOperationResult", "getAcornFoxSetupState", "getAcornFoxSourceMetadata", "initializeAcornFoxAdministrator", "updateAcornFoxSourceRevision",
+      "getAcornFoxDeliverySource", "getAcornFoxDeploymentPlan", "getAcornFoxExternalAccessObservation", "getAcornFoxHostMetrics", "getAcornFoxOperationResult", "getAcornFoxSetupState", "getAcornFoxSourceMetadata", "initializeAcornFoxAdministrator", "updateAcornFoxSourceRevision",
     ]);
     expect(integrationOperations).toHaveLength(integration.length);
     expect(contract.operations.filter((operation) => operation.webClient === "none").map((operation) => operation.operationId)).toEqual(["createAcornFoxFixCandidate", "reportAcornFoxExternalAccessObservation"]);

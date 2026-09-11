@@ -170,16 +170,17 @@ func TestAcornFoxOptionsUsesExactRouteMethodParity(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
 	_, session, _ := attachTestAcornFoxAdministratorTokens(t, server, &now)
 	for path, want := range map[string]string{
-		"/api/v1/acornfox/apps":                                 "GET, POST, OPTIONS",
-		"/api/v1/acornfox/apps/app_1":                           "GET, OPTIONS",
-		"/api/v1/acornfox/apps/app_1/sources":                   "GET, POST, OPTIONS",
-		"/api/v1/acornfox/apps/app_1/sources/src_1":             "GET, OPTIONS",
-		"/api/v1/acornfox/apps/app_1/deliveries":                "GET, POST, OPTIONS",
-		"/api/v1/acornfox/apps/app_1/deliveries/dep_1":          "GET, OPTIONS",
-		"/api/v1/acornfox/apps/app_1/deliveries/dep_1/restart":  "POST, OPTIONS",
-		"/api/v1/acornfox/apps/app_1/deliveries/dep_1/redeploy": "POST, OPTIONS",
-		"/api/v1/acornfox/apps/app_1/deliveries/dep_1/probes":   "POST, OPTIONS",
-		"/api/v1/acornfox/apps/app_1/deliveries/dep_1/logs":     "GET, OPTIONS",
+		"/api/v1/acornfox/apps":                                     "GET, POST, OPTIONS",
+		"/api/v1/acornfox/apps/app_1":                               "GET, OPTIONS",
+		"/api/v1/acornfox/apps/app_1/sources":                       "GET, POST, OPTIONS",
+		"/api/v1/acornfox/apps/app_1/sources/src_1":                 "GET, OPTIONS",
+		"/api/v1/acornfox/apps/app_1/sources/src_1/deployment-plan": "GET, OPTIONS",
+		"/api/v1/acornfox/apps/app_1/deliveries":                    "GET, POST, OPTIONS",
+		"/api/v1/acornfox/apps/app_1/deliveries/dep_1":              "GET, OPTIONS",
+		"/api/v1/acornfox/apps/app_1/deliveries/dep_1/restart":      "POST, OPTIONS",
+		"/api/v1/acornfox/apps/app_1/deliveries/dep_1/redeploy":     "POST, OPTIONS",
+		"/api/v1/acornfox/apps/app_1/deliveries/dep_1/probes":       "POST, OPTIONS",
+		"/api/v1/acornfox/apps/app_1/deliveries/dep_1/logs":         "GET, OPTIONS",
 	} {
 		request := httptest.NewRequest(http.MethodOptions, path, nil)
 		request.AddCookie(session)

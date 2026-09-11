@@ -16,7 +16,6 @@ import (
 // AcornFox V1 names are fixed package policy, not installer configuration.
 const (
 	AcornFoxV1Product          = "acornfox"
-	AcornFoxV1Architecture     = "amd64"
 	AcornFoxV1MigrationVersion = "0040"
 	AcornFoxV1DataVersion      = 40
 	AcornFoxV1InstallPrefix    = "/opt/acornfox"
