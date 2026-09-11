@@ -52,7 +52,7 @@ TOKEN_COUNTS = {
     "/var/lib/acornfox/install": 2,
     "/etc/subuid": 4,
     "/etc/subgid": 4,
-    "/usr/bin/apt-get": 5,
+    "/usr/bin/apt-get": 1,
     "/usr/sbin/groupadd": 1,
     "/usr/sbin/useradd": 1,
     "/usr/sbin/usermod": 1,
@@ -125,7 +125,7 @@ def event(name, args, include_env=True):
         # A child spawned through the rewritten CLEAN_ENV must see exactly
         # this set; do not serialize unrelated parent process variables.
         value["env"] = {key: os.environ[key] for key in sorted(os.environ)
-                        if key in {"PATH", "LANG", "LC_ALL"}}
+                        if key in {"PATH", "LANG", "LC_ALL", "DEBIAN_FRONTEND", "NEEDRESTART_MODE"}}
         value["env_keys"] = sorted(os.environ)
     with LOG.open("a") as handle:
         handle.write(json.dumps(value, sort_keys=True) + "\n")
@@ -467,8 +467,16 @@ class AcornFoxInstallScriptIntegrationTest(unittest.TestCase):
                 direct_non_clean.add(call["name"])
                 parent_injection_seen |= injected.issubset(set(call["env_keys"]))
                 continue
-            self.assertEqual(set(call["env_keys"]) - {"__CF_USER_TEXT_ENCODING", "PWD", "SHLVL", "_"}, {"LANG", "LC_ALL", "PATH"}, call)
-            self.assertEqual(call["env"], {"LANG": "C", "LC_ALL": "C", "PATH": "/usr/sbin:/usr/bin:/sbin:/bin"}, call)
+            expected = {"LANG", "LC_ALL", "PATH"}
+            if call["name"] == "apt-get":
+                expected |= {"DEBIAN_FRONTEND", "NEEDRESTART_MODE"}
+                self.assertEqual(call["env"].get("DEBIAN_FRONTEND"), "noninteractive", call)
+                self.assertEqual(call["env"].get("NEEDRESTART_MODE"), "l", call)
+            self.assertEqual(set(call["env_keys"]) - {"__CF_USER_TEXT_ENCODING", "PWD", "SHLVL", "_"}, expected, call)
+            expected_values = {"LANG": "C", "LC_ALL": "C", "PATH": "/usr/sbin:/usr/bin:/sbin:/bin"}
+            if call["name"] == "apt-get":
+                expected_values |= {"DEBIAN_FRONTEND": "noninteractive", "NEEDRESTART_MODE": "l"}
+            self.assertEqual(call["env"], expected_values, call)
             self.assertFalse(injected.intersection(call["env_keys"]), call)
         self.assertTrue(direct_non_clean.issubset({"id", "dirname"}))
         self.assertTrue(parent_injection_seen, "test parent did not carry injected secret/proxy/DSN")
@@ -485,6 +493,10 @@ class AcornFoxInstallScriptIntegrationTest(unittest.TestCase):
         names = [str(call["name"]) for call in self.host.calls() if call["name"] != "env" and call["argv"][:1] != ["validate-runtime-inputs"]]
         major = [name for name in names if name in {"apt-get", "groupadd", "useradd", "usermod", "install", "bootstrap-helper", "current-helper", "systemctl"}]
         calls = self.host.calls()
+        ubuntu_apt = [call["argv"] for call in calls if call["name"] == "apt-get"]
+        self.assertEqual(len(ubuntu_apt), 2, ubuntu_apt)
+        self.assertIn("git", ubuntu_apt[1])
+        self.assertNotIn("docker-cli", ubuntu_apt[1])
         validation = next(i for i,c in enumerate(calls) if c["name"] == "bootstrap-helper" and c["argv"][:1] == ["validate-runtime-inputs"])
         self.assertLess(validation, next(i for i,c in enumerate(calls) if c["name"] == "apt-get"))
         self.assertLess(major.index("apt-get"), major.index("groupadd"))
@@ -532,11 +544,16 @@ class AcornFoxInstallScriptIntegrationTest(unittest.TestCase):
             "-o", f"Dir::Etc::sourceparts={self.host.pgdg_private / 'system-sourceparts'}",
         ]
         self.assertEqual(len(apt_calls), 4, apt_calls)
+        apt_envs = [call["env"] for call in self.host.calls() if call["name"] == "apt-get"]
+        self.assertEqual(len(apt_envs), 4, apt_envs)
+        self.assertTrue(all(env.get("DEBIAN_FRONTEND") == "noninteractive" and env.get("NEEDRESTART_MODE") == "l" for env in apt_envs), apt_envs)
         self.assertEqual(apt_calls[0], [*system_options, "update"])
         self.assertEqual(apt_calls[1], [*system_options, "install", "-y", "--no-install-recommends", "ca-certificates"])
         self.assertEqual(apt_calls[2], ["update"])
         self.assertIn("postgresql-16", apt_calls[3])
         self.assertIn("postgresql-client-16", apt_calls[3])
+        self.assertIn("docker-cli", apt_calls[3])
+        self.assertIn("git", apt_calls[3])
         self.assertNotIn("postgresql", apt_calls[3])
         copy_calls = [call["argv"] for call in self.host.calls() if call["name"] == "cp"]
         self.assertEqual(len(copy_calls), 1, copy_calls)

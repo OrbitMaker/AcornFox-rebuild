@@ -116,9 +116,11 @@ class AcornFoxInstallScriptsTest(unittest.TestCase):
             "safe_root_file_matches", "safe_public_apt_file_matches", "/usr/bin/cmp", "/usr/bin/mktemp",
             "/usr/bin/sync -f", "/usr/bin/mv -n -T", "cleanup_own_temp_file", "debian_system_apt",
             "/run/acornfox-pgdg.XXXXXXXX", "trap 'cleanup_pgdg_tmp || true' EXIT", "pgdg_tmp_children_are_closed", "safe_root_private_directory",
+            "DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l /usr/bin/apt-get",
         ):
             self.assertIn(required, install)
         self.assertNotIn("apt-key", install)
+        self.assertNotIn("NEEDRESTART_SUSPEND", install)
         self.assertNotIn("/var/tmp/acornfox-pgdg.", install)
 
 

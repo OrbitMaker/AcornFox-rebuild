@@ -45,6 +45,10 @@ clean_output() {
   "${CLEAN_ENV[@]}" "$@"
 }
 
+apt_effect() {
+  "${CLEAN_ENV[@]}" DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l /usr/bin/apt-get "$@" >&2
+}
+
 safe_root_directory() {
   local detail mode
   [[ ! -L $1 && -d $1 ]] || return 1
@@ -387,7 +391,7 @@ prepare_debian_system_sources() {
 }
 
 debian_system_apt() {
-  effect /usr/bin/apt-get -o "Dir::Etc::sourcelist=$APT_ROOT/sources.list" -o "Dir::Etc::sourceparts=$PGDG_SYSTEM_SOURCEPARTS" "$@"
+  apt_effect -o "Dir::Etc::sourcelist=$APT_ROOT/sources.list" -o "Dir::Etc::sourceparts=$PGDG_SYSTEM_SOURCEPARTS" "$@"
 }
 
 publish_debian_pgdg() {
@@ -505,8 +509,8 @@ fi
 "${CLEAN_ENV[@]}" "$PREFLIGHT" --phase pre
 if clean_output /usr/bin/grep -qx 'ID=ubuntu' /etc/os-release; then
   # Ubuntu 24.04 provides PostgreSQL 16 through its existing dependency path.
-  effect /usr/bin/apt-get update
-  effect /usr/bin/apt-get install -y --no-install-recommends ca-certificates docker.io postgresql postgresql-client uidmap util-linux apparmor apparmor-utils nftables iptables iproute2
+  apt_effect update
+  apt_effect install -y --no-install-recommends ca-certificates docker.io postgresql postgresql-client git uidmap util-linux apparmor apparmor-utils nftables iptables iproute2
 elif clean_output /usr/bin/grep -qx 'ID=debian' /etc/os-release; then
   # Debian 13's postgresql meta package currently selects 17.  Validate any
   # pre-existing AcornFox PGDG material before apt or account side effects.
@@ -517,8 +521,8 @@ elif clean_output /usr/bin/grep -qx 'ID=debian' /etc/os-release; then
   debian_system_apt update
   debian_system_apt install -y --no-install-recommends ca-certificates
   publish_debian_pgdg
-  effect /usr/bin/apt-get update
-  effect /usr/bin/apt-get install -y --no-install-recommends docker.io postgresql-16 postgresql-client-16 uidmap util-linux apparmor apparmor-utils nftables iptables iproute2
+  apt_effect update
+  apt_effect install -y --no-install-recommends docker.io docker-cli postgresql-16 postgresql-client-16 git uidmap util-linux apparmor apparmor-utils nftables iptables iproute2
 else
   fail
 fi
