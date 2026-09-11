@@ -68,6 +68,7 @@ type acornFoxUpgradeJournal struct {
 	CrossSchema   *acornFoxCrossSchemaUpgradeV1 `json:"cross_schema,omitempty"`
 	Retired0039   *acornFoxRetired0039          `json:"retired_0039,omitempty"`
 	PostCross     *acornFoxPostCrossUpgrade     `json:"post_cross,omitempty"`
+	LocalRollover *acornFoxLocalRollover        `json:"local_rollover,omitempty"`
 	Old           acornFoxUpgradeImage          `json:"old"`
 	Next          acornFoxUpgradeImage          `json:"next"`
 }
@@ -110,6 +111,9 @@ func (i acornFoxUpgradeImage) validate(layout acornFoxInstallLayout, requireSetu
 	return nil
 }
 func (j acornFoxUpgradeJournal) validate(layout acornFoxInstallLayout) error {
+	if j.LocalRollover != nil && j.LocalRollover.validate(j, layout) != nil {
+		return ErrAcornFoxUpgradeConflict
+	}
 	if j.PostCross != nil && j.PostCross.validate(j, layout) != nil {
 		return ErrAcornFoxUpgradeConflict
 	}
@@ -357,7 +361,11 @@ func (u *acornFoxUpgrade) upgrade(ctx context.Context, request AcornFoxUpgradeRe
 	defer lock.Release()
 	var retired *acornFoxRetired0039
 	var postCross *acornFoxPostCrossUpgrade
+	var rollover *acornFoxLocalRollover
 	if j, e := u.load(s); e == nil {
+		if j.LocalRollover != nil {
+			return empty, ErrAcornFoxUpgradeUnknown
+		}
 		if j.Next.Repo.BindingSHA256 == request.BindingSHA256 && (j.Phase == "UPGRADED" || j.Phase == "ROLLED_BACK") {
 			if e := u.verifyImage(s, j, j.Phase == "UPGRADED"); e != nil {
 				return empty, e
@@ -391,6 +399,14 @@ func (u *acornFoxUpgrade) upgrade(ctx context.Context, request AcornFoxUpgradeRe
 			if e := u.verifyImage(s, j, true); e != nil {
 				return empty, e
 			}
+		} else if !crossSchema && acornFoxLocalRolloverEligible(j, request.CurrentBindingSHA256) {
+			if set.binding.binding.ReleaseID == acornFoxLocalNonCurrent(j).Activation.ReleaseID {
+				return empty, ErrAcornFoxUpgradeConflict
+			}
+			if e := u.verifyImage(s, j, j.Phase == "UPGRADED"); e != nil {
+				return empty, e
+			}
+			rollover = acornFoxNewLocalRollover(j)
 		} else {
 			if j.Phase == "UPGRADED" || j.Phase == "ROLLED_BACK" {
 				return empty, ErrAcornFoxUpgradeRetentionFull
@@ -456,7 +472,7 @@ func (u *acornFoxUpgrade) upgrade(ctx context.Context, request AcornFoxUpgradeRe
 	if e != nil {
 		return empty, e
 	}
-	j := acornFoxUpgradeJournal{SchemaVersion: 1, Phase: "PREPARED", LayoutSHA256: u.layout.evidence(), PIEnabled: piEnabled, Retired0039: retired, PostCross: postCross, Old: prior, Next: next}
+	j := acornFoxUpgradeJournal{SchemaVersion: 1, Phase: "PREPARED", LayoutSHA256: u.layout.evidence(), PIEnabled: piEnabled, Retired0039: retired, PostCross: postCross, LocalRollover: rollover, Old: prior, Next: next}
 	if databasePrivate != nil {
 		j.CrossSchema = &acornFoxCrossSchemaUpgradeV1{SchemaVersion: 1, HostProvisionSHA256: u.hostProvisionSHA256, OldMigrationVersion: prior.ControlPlane.MigrationVersion, NextMigrationVersion: AcornFoxV1MigrationVersion, TargetRowsSHA256: acornFoxMigrationRowsSHA256(migrations.rows), Database: databasePrivate.Evidence, Assistant: assistant}
 	}
@@ -475,6 +491,9 @@ func (u *acornFoxUpgrade) attempt(ctx context.Context, s *TaskAcornFoxRepoStore,
 	}
 	e := u.forward(ctx, s, j)
 	if e == nil {
+		if err := u.finishLocalRollover(s, j); err != nil {
+			return empty, err
+		}
 		return j.receipt(), nil
 	}
 	if errors.Is(e, errAcornFoxUpgradeInjectedCrash) {
@@ -483,7 +502,11 @@ func (u *acornFoxUpgrade) attempt(ctx context.Context, s *TaskAcornFoxRepoStore,
 	if recovery := u.rollback(context.WithoutCancel(ctx), s, j); recovery != nil {
 		return empty, ErrAcornFoxUpgradeUnknown
 	}
-	return j.receipt(), errors.Join(ErrAcornFoxUpgradeRolledBack, e)
+	receipt := j.receipt()
+	if err := u.finishLocalRollover(s, j); err != nil {
+		return empty, err
+	}
+	return receipt, errors.Join(ErrAcornFoxUpgradeRolledBack, e)
 }
 
 var errAcornFoxUpgradeInjectedCrash = errors.New("AcornFox injected upgrade crash")
@@ -530,6 +553,15 @@ func (u *acornFoxUpgrade) recoverMode(ctx context.Context, expected AcornFoxBuil
 		return empty, true, e
 	}
 
+	if j.LocalRollover == nil {
+		pending, handled, err := u.recoverLocalRolloverPending(ctx, s, j, expected)
+		if err != nil {
+			return empty, true, err
+		}
+		if handled {
+			j = pending
+		}
+	}
 	if expected != j.Old.identity() && expected != j.Next.identity() {
 		pending, handled, pendingErr := u.recoverPostCrossPending(ctx, s, j, expected)
 		if pendingErr != nil {
@@ -570,6 +602,13 @@ func (u *acornFoxUpgrade) recoverMode(ctx context.Context, expected AcornFoxBuil
 		return empty, true, ErrAcornFoxUpgradeConflict
 	}
 	if j.Phase == "UPGRADED" || j.Phase == "ROLLED_BACK" {
+		receipt := j.receipt()
+		if j.LocalRollover != nil {
+			if e := u.finishLocalRollover(s, &j); e != nil {
+				return empty, true, e
+			}
+			return receipt, true, nil
+		}
 		if e := u.verifyImage(s, j, j.Phase == "UPGRADED"); e != nil {
 			return empty, true, e
 		}
@@ -592,7 +631,13 @@ func (u *acornFoxUpgrade) recoverMode(ctx context.Context, expected AcornFoxBuil
 	if e != nil {
 		return empty, true, ErrAcornFoxUpgradeUnknown
 	}
-	return j.receipt(), true, nil
+	receipt := j.receipt()
+	if !prepareOnly {
+		if err := u.finishLocalRollover(s, &j); err != nil {
+			return empty, true, err
+		}
+	}
+	return receipt, true, nil
 }
 func acornFoxUpgradeSameMigrations(oldRaw, nextRaw []byte) error {
 	var old, next Manifest
@@ -805,6 +850,10 @@ func (u *acornFoxUpgrade) save(s *TaskAcornFoxRepoStore, j acornFoxUpgradeJourna
 		retiredRaw = j.PostCross.Journal
 		temp = ".acornfox-post-cross-" + j.PostCross.JournalSHA256
 	}
+	if initial && j.LocalRollover != nil {
+		retiredRaw = j.LocalRollover.PreviousJournal
+		temp = ".acornfox-local-rollover-" + j.LocalRollover.PreviousJournalSHA256
+	}
 	retiring := retiredRaw != nil
 	if retiring {
 		if e != nil || !bytes.Equal(old, retiredRaw) {
@@ -819,9 +868,17 @@ func (u *acornFoxUpgrade) save(s *TaskAcornFoxRepoStore, j acornFoxUpgradeJourna
 		old = nil
 	}
 	if retiring {
+		if j.LocalRollover != nil {
+			if err := u.prepareLocalRolloverIntent(s, j); err != nil {
+				return err
+			}
+		}
 		// Until the atomic journal replacement, the completed 0039 upgrade
 		// directory must remain an exact closed pair, including after a crash.
 		return u.atomicFileOwnedAtTemp(s, s.root, acornFoxUpgradeJournalPath, old, acornFoxUpgradeJSON(j), 0600, acornFoxInstallPrincipal{}, temp)
+	}
+	if j.LocalRollover != nil {
+		return u.atomicFileOwnedAtTemp(s, s.root, acornFoxUpgradeJournalPath, old, acornFoxUpgradeJSON(j), 0600, acornFoxInstallPrincipal{}, ".acornfox-local-phase-"+j.Next.Repo.BindingSHA256)
 	}
 	if j.PostCross != nil {
 		// Phase writes also stay outside the closed retained pair: an

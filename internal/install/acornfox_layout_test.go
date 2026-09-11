@@ -653,7 +653,7 @@ type acornFoxProductionPreparedFixture struct {
 	raw       []byte
 }
 
-func newAcornFoxProductionPreparedFixture(t *testing.T) acornFoxProductionPreparedFixture {
+func newAcornFoxProductionPreparedFixture(t *testing.T, versions ...string) acornFoxProductionPreparedFixture {
 	t.Helper()
 	parent := t.TempDir()
 	host := filepath.Join(parent, "host")
@@ -676,7 +676,11 @@ func newAcornFoxProductionPreparedFixture(t *testing.T) acornFoxProductionPrepar
 		t.Fatal(err)
 	}
 	defer stager.Close()
-	fixture := newAcornFoxFixture(t, "1.2.3-test.1", nil)
+	version := "1.2.3-test.1"
+	if len(versions) > 0 {
+		version = versions[0]
+	}
+	fixture := newAcornFoxFixture(t, version, nil)
 	stage, receipt, err := stager.Stage(fixture.input(nil))
 	if err != nil {
 		t.Fatal(err)

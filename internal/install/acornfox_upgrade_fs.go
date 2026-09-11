@@ -161,6 +161,9 @@ func (u *acornFoxUpgrade) atomicFileOwnedAtTemp(s *TaskAcornFoxRepoStore, root *
 	}
 	if e = acornFoxLiveApplyOwner(s, f, acornFoxInstallPrincipal{s.uid, s.gid}); e == nil {
 		midpoint := len(next) / 2
+		if root == s.root && strings.HasPrefix(path, acornFoxLocalIntentPrefix) {
+			midpoint = len(next)
+		}
 		n, we := f.Write(next[:midpoint])
 		e = we
 		if e == nil && n != midpoint {
@@ -171,6 +174,9 @@ func (u *acornFoxUpgrade) atomicFileOwnedAtTemp(s *TaskAcornFoxRepoStore, root *
 		}
 		if e == nil && root == s.hostRoot && path != acornFoxUpgradeMarkerPath {
 			e = u.fault("host-file-prefix")
+		}
+		if e == nil && root == s.root && path == acornFoxUpgradeJournalPath && strings.HasPrefix(temp, ".acornfox-local-rollover-") {
+			e = u.fault("local-journal-prefix")
 		}
 		if e == nil {
 			n, we = f.Write(next[midpoint:])
@@ -210,11 +216,25 @@ func (u *acornFoxUpgrade) atomicFileOwnedAtTemp(s *TaskAcornFoxRepoStore, root *
 		if strings.HasPrefix(temp, ".acornfox-post-phase-") {
 			point = "post-cross-phase-staged"
 		}
+		if strings.HasPrefix(temp, ".acornfox-local-rollover-") {
+			point = "local-journal-staged"
+		}
+		if strings.HasPrefix(temp, ".acornfox-local-phase-") {
+			point = "local-phase-staged"
+		}
+		if strings.HasPrefix(temp, ".acornfox-local-settle-") {
+			point = "local-settle-staged"
+		}
 		if e := u.fault(point); e != nil {
 			return e
 		}
 	}
 
+	if root == s.root && strings.HasPrefix(path, acornFoxLocalIntentPrefix) {
+		if err := u.fault("local-intent-staged"); err != nil {
+			return err
+		}
+	}
 	return u.finishAtomicFile(s, root, path, temp, current, old, next, mode, principal)
 }
 
@@ -247,6 +267,19 @@ func (u *acornFoxUpgrade) finishAtomicFile(s *TaskAcornFoxRepoStore, root *os.Ro
 	}
 	if root == s.root && path == acornFoxUpgradeJournalPath && strings.HasPrefix(temp, ".acornfox-post-cross-") {
 		return u.fault("post-cross-journal-committed")
+	}
+	if root == s.root && path == acornFoxUpgradeJournalPath && strings.HasPrefix(temp, ".acornfox-local-") {
+		point := "local-journal-committed"
+		if strings.HasPrefix(temp, ".acornfox-local-phase-") {
+			point = "local-phase-committed"
+		}
+		if strings.HasPrefix(temp, ".acornfox-local-settle-") {
+			point = "local-settle-committed"
+		}
+		return u.fault(point)
+	}
+	if root == s.root && strings.HasPrefix(path, acornFoxLocalIntentPrefix) {
+		return u.fault("local-intent-committed")
 	}
 	if root == s.hostRoot && path != acornFoxUpgradeMarkerPath {
 		return u.fault("host-file-renamed")
@@ -459,6 +492,9 @@ func (u *acornFoxUpgrade) imageManifest(s *TaskAcornFoxRepoStore, j acornFoxUpgr
 }
 
 func (u *acornFoxUpgrade) copyNextSubstrate(s *TaskAcornFoxRepoStore, j acornFoxUpgradeJournal) error {
+	if e := u.retireLocalRolloverStash(s, j); e != nil {
+		return e
+	}
 	if e := u.retirePostCrossStash(s, j); e != nil {
 		return e
 	}

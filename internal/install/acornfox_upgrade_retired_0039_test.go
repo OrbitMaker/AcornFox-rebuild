@@ -607,6 +607,13 @@ func TestAcornFoxRetired0039RecoveryChildProcess(t *testing.T) {
 	u.ownership = owners.edge()
 	u.self = acornFoxSelfVerifier{path: input.Self, uid: os.Getuid(), gid: os.Getgid()}
 	u.services = &acornFoxUpgradePIServiceFake{acornFoxUpgradeServiceFake: &acornFoxUpgradeServiceFake{}, enabled: true}
+	if store, err := u.openStore(); err == nil {
+		journal, loadErr := u.load(store)
+		store.Close()
+		if loadErr == nil && journal.isLocal() {
+			u.services = &acornFoxUpgradeServiceFake{forbidEdge: true}
+		}
+	}
 	receipt, handled, err := u.recoverMode(context.Background(), input.Expected, input.Prepare)
 	if err != nil || !handled {
 		t.Fatalf("recovery prepare=%t failed: %v", input.Prepare, err)

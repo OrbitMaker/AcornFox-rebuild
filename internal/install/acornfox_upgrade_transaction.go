@@ -495,6 +495,9 @@ func (u *acornFoxUpgrade) unblock(ctx context.Context, s *TaskAcornFoxRepoStore,
 	return u.services.EdgeHealthy(ctx)
 }
 func (u *acornFoxUpgrade) forward(ctx context.Context, s *TaskAcornFoxRepoStore, j *acornFoxUpgradeJournal) error {
+	if e := u.retireLocalRolloverStash(s, *j); e != nil {
+		return e
+	}
 	if e := u.retirePostCrossStash(s, *j); e != nil {
 		return e
 	}
@@ -604,6 +607,9 @@ func (u *acornFoxUpgrade) forward(ctx context.Context, s *TaskAcornFoxRepoStore,
 	return u.phase(s, j, "UPGRADED")
 }
 func (u *acornFoxUpgrade) restore(ctx context.Context, s *TaskAcornFoxRepoStore, j *acornFoxUpgradeJournal) (err error) {
+	if e := u.retireLocalRolloverStash(s, *j); e != nil {
+		return e
+	}
 	defer func() {
 		if err != nil {
 			_ = u.marker(s, *j, true)
@@ -867,6 +873,13 @@ func (u *acornFoxUpgrade) verifyRetainedScopeWithPending(s *TaskAcornFoxRepoStor
 	// Shared paths use the selected image. Only versioned immutable material from
 	// the other image extends the inventory.
 	images := []acornFoxUpgradeImage{j.Old, j.Next}
+	if j.LocalRollover != nil {
+		prev, e := j.LocalRollover.previous(j)
+		if e != nil {
+			return e
+		}
+		images = append(images, acornFoxLocalNonCurrent(prev))
+	}
 	if j.PostCross != nil {
 		archives, origin, err := acornFoxPostCrossArchives(j)
 		if err != nil {
@@ -1095,6 +1108,9 @@ func (u *acornFoxUpgrade) verifyPrivateStore(s *TaskAcornFoxRepoStore, j acornFo
 	}
 
 	wantChildren := map[string]bool{"journal.json": true, "old-state": true, "new-state": true}
+	if j.LocalRollover != nil {
+		wantChildren["local-retiring"] = true
+	}
 	if j.CrossSchema != nil && current.Repo.BindingSHA256 == j.Next.Repo.BindingSHA256 {
 		wantChildren[acornFoxUpgradeDatabaseRoot] = true
 	}
@@ -1162,6 +1178,15 @@ func (u *acornFoxUpgrade) verifyPrivateStore(s *TaskAcornFoxRepoStore, j acornFo
 			if err := u.retired0039SubstrateAt(s, item.path, item.image); err != nil {
 				return err
 			}
+		}
+	}
+	if j.LocalRollover != nil {
+		prev, e := j.LocalRollover.previous(j)
+		if e != nil {
+			return e
+		}
+		if e := u.retired0039SubstrateAt(s, "upgrade/local-retiring", acornFoxLocalNonCurrent(prev)); e != nil {
+			return e
 		}
 	}
 	if j.Retired0039 != nil {

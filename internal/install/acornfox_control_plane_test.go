@@ -62,9 +62,9 @@ func (f *acornFoxControlPlaneProvisionerFake) Run(_ context.Context, argv []stri
 	return f.err
 }
 
-func newAcornFoxControlPlanePrepared(t *testing.T, ledger *acornFoxControlPlaneLedgerFake, runner *acornFoxControlPlaneProvisionerFake) (*acornFoxControlPlane, acornFoxProductionPreparedFixture) {
+func newAcornFoxControlPlanePrepared(t *testing.T, ledger *acornFoxControlPlaneLedgerFake, runner *acornFoxControlPlaneProvisionerFake, versions ...string) (*acornFoxControlPlane, acornFoxProductionPreparedFixture) {
 	t.Helper()
-	prepared := newAcornFoxProductionPreparedFixture(t)
+	prepared := newAcornFoxProductionPreparedFixture(t, versions...)
 	if err := prepareAcornFoxRepository(context.Background(), prepared.store, prepared.published, prepared.binding); err != nil {
 		t.Fatal(err)
 	}

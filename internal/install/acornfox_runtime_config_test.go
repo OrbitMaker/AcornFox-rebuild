@@ -21,9 +21,9 @@ var runtimeTestResolvers = []string{"1.1.1.1:53", "8.8.8.8:53"}
 
 const runtimeTestOrigin = "https://console.example.com"
 
-func runtimeConfigFixture(t *testing.T) (*acornFoxRuntimeConfig, acornFoxProductionPreparedFixture, AcornFoxBuildIdentityV1) {
+func runtimeConfigFixture(t *testing.T, versions ...string) (*acornFoxRuntimeConfig, acornFoxProductionPreparedFixture, AcornFoxBuildIdentityV1) {
 	t.Helper()
-	cp, p := newAcornFoxControlPlanePrepared(t, &acornFoxControlPlaneLedgerFake{}, &acornFoxControlPlaneProvisionerFake{})
+	cp, p := newAcornFoxControlPlanePrepared(t, &acornFoxControlPlaneLedgerFake{}, &acornFoxControlPlaneProvisionerFake{}, versions...)
 	if _, err := cp.migrate(context.Background()); err != nil {
 		t.Fatal(err)
 	}
