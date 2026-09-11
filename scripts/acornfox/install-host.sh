@@ -145,7 +145,9 @@ safe_own_temp_file() {
   [[ -n $expected_identity && ! -L $path && -f $path ]] || return 1
   detail=$(clean_output /usr/bin/stat -c '%d:%i:%u:%g:%a:%F:%h' -- "$path") || return 1
   [[ $detail == "$expected_identity":0:0:* ]] || return 1
-  [[ $detail =~ :0:0:[0-7]{3}:regular\ file:1$ ]] || return 1
+  # GNU stat describes the just-created, inode-bound mktemp file as a
+  # "regular empty file". It is permitted only before material is written.
+  [[ $detail =~ :0:0:[0-7]{3}:regular(\ empty)?\ file:1$ ]] || return 1
   mode=${detail#"$expected_identity":0:0:}
   mode=${mode%%:*}
   (( (8#$mode & 0022) == 0 ))

@@ -221,7 +221,7 @@ def main():
             print(f"1:{path.stat().st_ino}")
             return
         if fmt == "%d:%i:%u:%g:%a:%F:%h":
-            kind = "directory" if path.is_dir() else "regular file"
+            kind = "directory" if path.is_dir() else ("regular empty file" if path.stat().st_size == 0 else "regular file")
             print(f"1:{path.stat().st_ino}:0:0:{mode:o}:{kind}:{nlink}")
             return
         if marker == "bad-mode":
@@ -229,7 +229,8 @@ def main():
         elif marker == "bad-nlink":
             print("0:0:755:regular file:2" if subject.endswith("helper") else "0:0:755:directory:3")
         elif path.is_file():
-            print(f"0:0:{'755' if subject.endswith('helper') else f'{mode:o}'}:regular file:{nlink}")
+            kind = "regular empty file" if path.stat().st_size == 0 else "regular file"
+            print(f"0:0:{'755' if subject.endswith('helper') else f'{mode:o}'}:{kind}:{nlink}")
         elif path.is_dir():
             if subject == "install":
                 print("0:0:700:directory:2" if any("%h" in arg for arg in args) else "0:0:700:directory")
