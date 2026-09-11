@@ -49,10 +49,12 @@ type StagedReceipt struct {
 
 // DownloadStagingOptions controls execution of StageVerifiedUpdate.
 type DownloadStagingOptions struct {
-	IndexOptions CheckUpdateOptions
-	ParentDir    string
-	HTTPClient   *http.Client // Optional: only its Transport is used; opts.Timeout manages requests, Jar is forced nil, env proxy is preserved
-	Timeout      time.Duration
+	hostStageName     string
+	hostStageIdentity string
+	IndexOptions      CheckUpdateOptions
+	ParentDir         string
+	HTTPClient        *http.Client // Optional: only its Transport is used; opts.Timeout manages requests, Jar is forced nil, env proxy is preserved
+	Timeout           time.Duration
 	// Test hook overrides
 	DiskSpaceCheck func(path string) (uint64, error)
 	SyncHook       func(dirPath string) error
@@ -138,10 +140,25 @@ func StageVerifiedUpdate(ctx context.Context, envelopeBytes []byte, opts Downloa
 		return nil, res, fmt.Errorf("desktopupdate: entropy failure: %v", err)
 	}
 	stageDirName := fmt.Sprintf("stage-%s-%d-%s", res.Version, res.Sequence, hex.EncodeToString(randBuf[:]))
+	if opts.hostStageName != "" {
+		if !hostValidStageName(opts.hostStageName) {
+			return nil, res, ErrInvalidParentDir
+		}
+		stageDirName = opts.hostStageName
+	}
 	stageDirPath := filepath.Join(parentAbs, stageDirName)
 
-	if err := root.Mkdir(stageDirName, 0700); err != nil {
-		return nil, res, fmt.Errorf("desktopupdate: cannot create stage dir: %v", err)
+	if opts.hostStageName != "" {
+		key, e := hostDirectoryKey(stageDirPath)
+		if e != nil || key != opts.hostStageIdentity {
+			return nil, res, ErrInvalidParentDir
+		}
+		entries, e := os.ReadDir(stageDirPath)
+		if e != nil || len(entries) != 0 {
+			return nil, res, ErrInvalidParentDir
+		}
+	} else if err := root.Mkdir(stageDirName, 0700); err != nil {
+		return nil, res, err
 	}
 	if err := secureNewStageDirectory(ctx, stageDirPath); err != nil {
 		_ = root.Remove(stageDirName)

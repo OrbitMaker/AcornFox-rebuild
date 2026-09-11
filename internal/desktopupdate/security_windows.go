@@ -77,6 +77,11 @@ $data = $rawInput | ConvertFrom-Json
 $path = $data.path
 
 $acl = Get-Acl -LiteralPath $path
+$descriptor = New-Object System.Security.AccessControl.RawSecurityDescriptor($acl.GetSecurityDescriptorBinaryForm(), 0)
+if ($null -eq $descriptor.DiscretionaryAcl) {
+    [PSCustomObject]@{ allowed = $false; reason = "null DACL" } | ConvertTo-Json -Compress
+    exit 0
+}
 $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $adminGroup = (New-Object System.Security.Principal.SecurityIdentifier("S-1-5-32-544")).Value
 $systemGroup = (New-Object System.Security.Principal.SecurityIdentifier("S-1-5-18")).Value
