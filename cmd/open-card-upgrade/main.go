@@ -400,6 +400,21 @@ func runAcornFoxClean(ctx context.Context, args []string, stdout io.Writer, role
 	if deps.euid == nil || deps.euid() != 0 {
 		return writeAcornFoxCleanError(stdout, exitIneligible, "root_ineligible")
 	}
+	// Native launch verification must never enter upgrade recovery: that path
+	// may reconcile or roll back an in-flight transaction before returning.
+	if config.command == "verify-prepared" {
+		if deps.verifyPrepared == nil {
+			return writeAcornFoxCleanError(stdout, exitRecovery, "recovery_unknown")
+		}
+		receipt, err := deps.verifyPrepared(ctx)
+		if err != nil || receipt.Validate() != nil {
+			return writeAcornFoxCleanBridgeError(stdout, err)
+		}
+		if receipt.ReleaseID != identity.ReleaseID || receipt.SourceCommit != identity.SourceCommit {
+			return writeAcornFoxCleanError(stdout, exitIneligible, "helper_identity_ineligible")
+		}
+		return writeUpgradeJSON(stdout, exitOK, map[string]any{"ok": true, "command": config.command, "receipt": receipt})
+	}
 	if config.command == "configure-assistant" || config.command == "disable-assistant" {
 		var receipt install.AcornFoxAssistantConfigReceiptV1
 		var assistantErr error
@@ -664,7 +679,7 @@ func parseAcornFoxCleanArgs(args []string) (upgradeCommandConfig, error) {
 			return upgradeCommandConfig{}, errors.New("invalid local runtime configuration arguments")
 		}
 		config.gitResolvers = args[2]
-	case "runtime-network-prepare", "runtime-network-verify", "wait-local-ready":
+	case "runtime-network-prepare", "runtime-network-verify", "wait-local-ready", "verify-prepared":
 		if len(args) != 1 {
 			return upgradeCommandConfig{}, errors.New("invalid zero-arg clean command")
 		}

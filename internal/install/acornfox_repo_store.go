@@ -37,6 +37,7 @@ type TaskAcornFoxRepoStore struct {
 	fs                 acornFoxRepoFS
 	ownership          acornFoxOwnershipEdge
 	lock               *acornFoxRepoStoreLock
+	readOnly           bool // private verification view; never reconcile binding metadata
 	afterRootPathCheck func()
 }
 
@@ -404,7 +405,23 @@ func (s *TaskAcornFoxRepoStore) validateProductionBindingEvidence(journal AcornF
 	if s == nil || substrate == nil || s.layout.mode != acornFoxInstallLayoutProduction || journal.BindingSHA256 != substrate.receipt.CandidateReceipt.BindingSHA256 {
 		return ErrAcornFoxRepoConflict
 	}
-	raw, err := newAcornFoxBindingStore(s).Read(journal.BindingSHA256)
+	bindings := newAcornFoxBindingStore(s)
+	var raw []byte
+	var err error
+	if s.readOnly {
+		root, openErr := s.openRoot()
+		if openErr != nil {
+			return ErrAcornFoxRepoConflict
+		}
+		defer root.Close()
+		// validate rejects missing locks, every temporary and unknown entry.
+		// Unlike Read, these predicates never create or reconcile metadata.
+		if err = bindings.validate(root); err == nil {
+			raw, err = bindings.read(root, journal.BindingSHA256)
+		}
+	} else {
+		raw, err = bindings.Read(journal.BindingSHA256)
+	}
 	if err != nil {
 		return ErrAcornFoxRepoConflict
 	}

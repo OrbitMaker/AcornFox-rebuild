@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"regexp"
 )
 
@@ -83,9 +84,10 @@ func VerifyPreparedAcornFoxHostV1(ctx context.Context) (AcornFoxHostBootstrapRec
 // installer. Tests supply an already validated layout and a fake ownership
 // edge after construction.
 type acornFoxHostBridge struct {
-	layout    acornFoxInstallLayout
-	self      acornFoxSelfVerifier
-	ownership acornFoxOwnershipEdge
+	layout                    acornFoxInstallLayout
+	self                      acornFoxSelfVerifier
+	ownership                 acornFoxOwnershipEdge
+	beforeVerifyPreparedLease func() // private deterministic race seam; nil in production
 }
 
 func newAcornFoxHostBridge(layout acornFoxInstallLayout, self acornFoxSelfVerifier) acornFoxHostBridge {
@@ -145,6 +147,13 @@ func (b acornFoxHostBridge) verifyPrepared(ctx context.Context) (AcornFoxHostBoo
 		return AcornFoxHostBootstrapReceiptV1{}, ErrAcornFoxRepoRecoveryUnknown
 	}
 	defer publisher.Close()
+	openSubstrateFile := publisher.fs.openFile
+	publisher.fs.openFile = func(root *os.Root, name string, flags int, mode os.FileMode) (acornFoxSubstrateFile, error) {
+		if !acornFoxVerifyOpenAllowed(name, flags, acornFoxSubstrateLock) {
+			return nil, ErrAcornFoxRepoBootstrapConflict
+		}
+		return openSubstrateFile(root, name, flags, mode)
+	}
 	store, err := newAcornFoxRepoStoreForLayout(b.layout)
 	if err != nil {
 		return AcornFoxHostBootstrapReceiptV1{}, ErrAcornFoxRepoRecoveryUnknown
@@ -155,15 +164,66 @@ func (b acornFoxHostBridge) verifyPrepared(ctx context.Context) (AcornFoxHostBoo
 	if err != nil || journal.Phase != AcornFoxRepoPreparedFinal || journal.NeedsRecovery || journal.LayoutSHA256 != b.layout.evidence() || !validSHA(journal.BindingSHA256) {
 		return AcornFoxHostBootstrapReceiptV1{}, ErrAcornFoxRepoBootstrapConflict
 	}
-	if _, err = newAcornFoxBindingStore(store).Read(journal.BindingSHA256); err != nil {
-		return AcornFoxHostBootstrapReceiptV1{}, ErrAcornFoxRepoBootstrapConflict
-	}
 	substrate, err := b.reopenSubstrate(ctx, publisher, journal.BindingSHA256)
 	if err != nil {
 		return AcornFoxHostBootstrapReceiptV1{}, err
 	}
 	defer substrate.Close()
-	return b.materializeAndPrepare(ctx, store, substrate, journal.BindingSHA256)
+	if b.beforeVerifyPreparedLease != nil {
+		b.beforeVerifyPreparedLease()
+	}
+	return b.verifyPreparedRepository(ctx, store, substrate, journal.BindingSHA256)
+}
+
+// The ordinary lease may create a missing repository lock and reconcile a
+// binding temporary. A private view forbids both without changing install or
+// recovery semantics for every other store user. The original owns descriptors;
+// only this view owns/releases its newly acquired lease lock.
+func (b acornFoxHostBridge) verifyPreparedRepository(ctx context.Context, store *TaskAcornFoxRepoStore, substrate *PublishedAcornFoxSubstrateV1, binding string) (receipt AcornFoxHostBootstrapReceiptV1, err error) {
+	if store == nil || store.ownsLock() {
+		return receipt, ErrAcornFoxRepoBootstrapConflict
+	}
+	view := *store
+	view.readOnly = true
+	openFile := view.fs.openFile
+	view.fs.openFile = func(root *os.Root, name string, flags int, mode os.FileMode) (acornFoxRepoFile, error) {
+		if !acornFoxVerifyOpenAllowed(name, flags, acornFoxRepoInstallLock) {
+			return nil, ErrAcornFoxRepoBootstrapConflict
+		}
+		return openFile(root, name, flags, mode)
+	}
+	lease, err := view.mintLiveVerifiedLease(ctx, substrate, binding)
+	if err != nil {
+		return receipt, err
+	}
+	defer func() {
+		if releaseErr := lease.Release(); releaseErr != nil && err == nil {
+			receipt = AcornFoxHostBootstrapReceiptV1{}
+			err = ErrAcornFoxRepoBootstrapConflict
+		}
+	}()
+	l := lease.prepared
+	if l.journal.Phase != AcornFoxRepoPreparedFinal || l.journal.NeedsRecovery {
+		return receipt, ErrAcornFoxRepoBootstrapConflict
+	}
+	root, err := l.store.openHostRoot()
+	if err != nil {
+		return receipt, ErrAcornFoxRepoBootstrapConflict
+	}
+	defer root.Close()
+	activation, raw, err := acornFoxRepoActivationForLayout(l.store.layout, l.journal, lease.receipt, l.substrate)
+	if err != nil || !acornFoxRepoFinalForLayout(root, l.store, l.store.layout, l.journal, lease.receipt, l.substrate, activation, raw) {
+		return receipt, ErrAcornFoxRepoBootstrapConflict
+	}
+	return b.receiptForJournal(l.journal, l.substrate, binding)
+}
+
+func acornFoxVerifyOpenAllowed(name string, flags int, lockName string) bool {
+	if flags&(os.O_CREATE|os.O_EXCL|os.O_TRUNC|os.O_APPEND) != 0 {
+		return false
+	}
+	access := flags & (os.O_WRONLY | os.O_RDWR)
+	return access == 0 || access == os.O_RDWR && name == lockName
 }
 
 func (b acornFoxHostBridge) finish(ctx context.Context, set *acornFoxCandidateSet) (AcornFoxHostBootstrapReceiptV1, error) {
