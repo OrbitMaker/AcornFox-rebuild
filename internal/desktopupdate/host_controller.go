@@ -192,35 +192,39 @@ func (c *HostController) Select(ctx context.Context, envelope []byte, retryFaile
 	if state.Pending != nil {
 		return hostStatus(state), ErrHostPending
 	}
-	result, e := VerifyAndSelectUpdate(envelope, c.indexOptions(state, c.options.Now()))
+	return c.selectOffer(s, &state, envelope, retryFailed)
+}
+
+func (c *HostController) selectOffer(s *hostStore, state *HostSnapshot, envelope []byte, retryFailed bool) (HostUpdateStatus, error) {
+	result, e := VerifyAndSelectUpdate(envelope, c.indexOptions(*state, c.options.Now()))
 	if e != nil && !errors.Is(e, ErrNoUpdate) {
-		return hostStatus(state), e
+		return hostStatus(*state), e
 	}
 	if result == nil {
-		return hostStatus(state), ErrHostConflict
+		return hostStatus(*state), ErrHostConflict
 	}
 	digest, e2 := payloadDigest(envelope)
 	if e2 != nil {
-		return hostStatus(state), e2
+		return hostStatus(*state), e2
 	}
 	if result.Sequence < state.Catalog.Sequence || result.Sequence == state.Catalog.Sequence && digest != state.Catalog.PayloadSHA256 {
-		return hostStatus(state), ErrSequenceRollback
+		return hostStatus(*state), ErrSequenceRollback
 	}
 	state.Catalog = HostCatalogFloor{result.Sequence, digest}
 	if errors.Is(e, ErrNoUpdate) {
-		e = s.save(&state)
-		return hostStatus(state), e
+		e = s.save(state)
+		return hostStatus(*state), e
 	}
 	if result.Artifact == nil || validateSHA256(result.Artifact.BackendBinding) != nil {
-		return hostStatus(state), ErrHostConflict
+		return hostStatus(*state), ErrHostConflict
 	}
 	if !retryFailed {
 		for _, f := range state.Failures {
 			if f.Kind == "host" && f.CandidateSHA256 == result.Artifact.SHA256 || f.Kind == "backend" && f.CandidateSHA256 == result.Artifact.BackendBinding && f.FromBinding == state.Installed.BackendBinding {
-				if e := s.save(&state); e != nil {
-					return hostStatus(state), e
+				if e := s.save(state); e != nil {
+					return hostStatus(*state), e
 				}
-				return hostStatus(state), ErrHostSuppressed
+				return hostStatus(*state), ErrHostSuppressed
 			}
 		}
 	}
@@ -231,18 +235,18 @@ func (c *HostController) Select(ctx context.Context, envelope []byte, retryFaile
 		}
 	}
 	if len(state.Failures) >= 64 && (!retryFailed || !knownFailure) {
-		if e := s.save(&state); e != nil {
-			return hostStatus(state), e
+		if e := s.save(state); e != nil {
+			return hostStatus(*state), e
 		}
-		return hostStatus(state), ErrHostSuppressed
+		return hostStatus(*state), ErrHostSuppressed
 	}
 	random := make([]byte, 32)
 	if _, e := io.ReadFull(rand.Reader, random); e != nil {
-		return hostStatus(state), e
+		return hostStatus(*state), e
 	}
 	state.Pending = &HostPending{ID: hostSHA(random), Phase: "selected", Envelope: append([]byte(nil), envelope...), AcceptedAt: c.options.Now().UTC(), Candidate: *result, Previous: state.Installed}
-	e = s.save(&state)
-	return hostStatus(state), e
+	e = s.save(state)
+	return hostStatus(*state), e
 }
 func (c *HostController) verifyPending(state HostSnapshot, fresh bool) (CandidateResult, error) {
 	p := state.Pending
