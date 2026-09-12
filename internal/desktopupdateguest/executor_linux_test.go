@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/open-card/open-card/internal/desktopupdate"
+	"github.com/open-card/open-card/internal/install"
 )
 
 type fakeBackend struct {
@@ -33,6 +34,11 @@ type fakeBackend struct {
 type fakeWorld struct {
 	Binding           string
 	Calls, Recoveries int
+	RecoverError      string
+	UpgradeError      string
+	Ineligible        bool
+	NotReady          bool
+	NotFinalized      bool
 }
 
 func (f fakeBackend) read() fakeWorld {
@@ -53,7 +59,18 @@ func (f fakeBackend) write(w fakeWorld) {
 }
 func (f fakeBackend) Observe(context.Context) (desktopupdate.BackendObservation, error) {
 	w := f.read()
-	return desktopupdate.BackendObservation{Binding: w.Binding, Architecture: runtime.GOARCH, MigrationVersion: "0040", Ready: true, Finalized: true, LocalLoopback: true}, nil
+	arch := runtime.GOARCH
+	if w.Ineligible {
+		arch = "other-arch"
+	}
+	return desktopupdate.BackendObservation{
+		Binding:          w.Binding,
+		Architecture:     arch,
+		MigrationVersion: "0040",
+		Ready:            !w.NotReady,
+		Finalized:        !w.NotFinalized,
+		LocalLoopback:    true,
+	}, nil
 }
 func (f fakeBackend) Upgrade(_ context.Context, _ string, _ string, i desktopupdate.HostUpgradeIntent) error {
 	w := f.read()
@@ -61,6 +78,13 @@ func (f fakeBackend) Upgrade(_ context.Context, _ string, _ string, i desktopupd
 	f.write(w)
 	if f.delay {
 		time.Sleep(250 * time.Millisecond)
+	}
+	if w.UpgradeError == "rolled-back" {
+		return install.ErrAcornFoxUpgradeRolledBack
+	} else if w.UpgradeError == "busy" {
+		return ErrBusy
+	} else if w.UpgradeError == "none-stay-old" {
+		return nil
 	}
 	w.Binding = i.ToBinding
 	f.write(w)
@@ -70,6 +94,11 @@ func (f fakeBackend) Recover(context.Context) error {
 	w := f.read()
 	w.Recoveries++
 	f.write(w)
+	if w.RecoverError == "rolled-back" {
+		return install.ErrAcornFoxUpgradeRolledBack
+	} else if w.RecoverError == "busy" {
+		return ErrBusy
+	}
 	return nil
 }
 
@@ -348,7 +377,38 @@ func TestRecoveryUsesAcceptedTimeAndNeverReplaysUpgrade(t *testing.T) {
 		t.Fatalf("recovery effects: %+v", w)
 	}
 }
-func TestUnknownOldRecoveryRemainsUnknown(t *testing.T) {
+func TestInterruptedRunningRecoveryNilRollsBack(t *testing.T) {
+	f := newFixture(t)
+	submitFixture(t, f)
+	lock, e := f.x.lock()
+	if e != nil {
+		t.Fatal(e)
+	}
+	s, e := f.x.load()
+	if e != nil {
+		t.Fatal(e)
+	}
+	s.Jobs[0].State = "running"
+	s.Jobs[0].Process = processIdentity{PID: 999999, Boot: "old-boot", Start: "1"}
+	if e := f.x.save(s); e != nil {
+		t.Fatal(e)
+	}
+	lock.Close()
+
+	if e := f.x.Run(context.Background(), f.request.Intent.AttemptID, true); e != nil {
+		t.Fatalf("interrupted recovery: %v", e)
+	}
+	j, _ := f.x.Status(f.request.Intent.AttemptID)
+	if j.State != "rolled-back" || j.Reason != "recovered-old" {
+		t.Fatalf("unexpected state after interrupted running recovery: %+v", j)
+	}
+	w := f.x.backend.(fakeBackend).read()
+	if w.Calls != 0 || w.Recoveries != 1 {
+		t.Fatalf("unexpected backend calls: %+v", w)
+	}
+}
+
+func TestPreExistingUnknownReconciledViaExplicitRecovery(t *testing.T) {
 	f := newFixture(t)
 	submitFixture(t, f)
 	lock, _ := f.x.lock()
@@ -363,12 +423,160 @@ func TestUnknownOldRecoveryRemainsUnknown(t *testing.T) {
 		t.Fatal(e)
 	}
 	lock.Close()
-	if e := f.x.Run(context.Background(), f.request.Intent.AttemptID, true); !errors.Is(e, ErrBusy) {
-		t.Fatalf("ambiguous old state = %v", e)
+
+	// Explicit recovery reconciles unknown to rolled-back with zero upgrade calls
+	if e := f.x.Run(context.Background(), f.request.Intent.AttemptID, true); e != nil {
+		t.Fatalf("explicit recovery failed: %v", e)
 	}
 	j, _ := f.x.Status(f.request.Intent.AttemptID)
-	if j.State != "unknown" || f.x.backend.(fakeBackend).read().Calls != 0 {
-		t.Fatal("unknown recovery inferred upgrade/rollback")
+	if j.State != "rolled-back" || j.Reason != "recovered-old" {
+		t.Fatalf("unknown recovery expected rolled-back, got: %+v", j)
+	}
+	w := f.x.backend.(fakeBackend).read()
+	if w.Calls != 0 || w.Recoveries != 1 {
+		t.Fatalf("unexpected recovery calls: %+v", w)
+	}
+}
+
+func TestPreExistingUnknownRecoveryFailureStaysUnknown(t *testing.T) {
+	f := newFixture(t)
+	submitFixture(t, f)
+	w := f.x.backend.(fakeBackend).read()
+	w.RecoverError = "busy"
+	f.x.backend.(fakeBackend).write(w)
+
+	lock, _ := f.x.lock()
+	s, _ := f.x.load()
+	s.Jobs[0].State = "running"
+	s.Jobs[0].Process = processIdentity{PID: 999999, Boot: "old-boot", Start: "1"}
+	if e := f.x.save(s); e != nil {
+		t.Fatal(e)
+	}
+	s.Jobs[0].State = "unknown"
+	if e := f.x.save(s); e != nil {
+		t.Fatal(e)
+	}
+	lock.Close()
+
+	if e := f.x.Run(context.Background(), f.request.Intent.AttemptID, true); !errors.Is(e, ErrBusy) {
+		t.Fatalf("expected ErrBusy on recovery failure, got: %v", e)
+	}
+	j, _ := f.x.Status(f.request.Intent.AttemptID)
+	if j.State != "unknown" || j.Reason != "backend-outcome-unknown" {
+		t.Fatalf("expected state unknown after failed recovery, got: %+v", j)
+	}
+	if f.x.backend.(fakeBackend).read().Calls != 0 {
+		t.Fatal("unknown recovery must never invoke upgrade")
+	}
+}
+
+func TestTypedRollbackPreserved(t *testing.T) {
+	f := newFixture(t)
+	submitFixture(t, f)
+	lock, _ := f.x.lock()
+	s, _ := f.x.load()
+	s.Jobs[0].State = "running"
+	s.Jobs[0].Process = processIdentity{PID: 999999, Boot: "old-boot", Start: "1"}
+	_ = f.x.save(s)
+	lock.Close()
+
+	w := f.x.backend.(fakeBackend).read()
+	w.RecoverError = "rolled-back"
+	f.x.backend.(fakeBackend).write(w)
+
+	if e := f.x.Run(context.Background(), f.request.Intent.AttemptID, true); e != nil {
+		t.Fatalf("run recovery: %v", e)
+	}
+	j, _ := f.x.Status(f.request.Intent.AttemptID)
+	if j.State != "rolled-back" || j.Reason != "recovered-old" {
+		t.Fatalf("expected rolled-back with recovered-old, got: %+v", j)
+	}
+}
+
+func TestEligibleTargetStaysUpgradedDespiteHelperError(t *testing.T) {
+	f := newFixture(t)
+	submitFixture(t, f)
+	lock, _ := f.x.lock()
+	s, _ := f.x.load()
+	s.Jobs[0].State = "running"
+	s.Jobs[0].Process = processIdentity{PID: 999999, Boot: "old-boot", Start: "1"}
+	_ = f.x.save(s)
+	lock.Close()
+
+	w := f.x.backend.(fakeBackend).read()
+	w.Binding = f.request.Intent.ToBinding
+	w.RecoverError = "busy"
+	f.x.backend.(fakeBackend).write(w)
+
+	if e := f.x.Run(context.Background(), f.request.Intent.AttemptID, true); e != nil {
+		t.Fatalf("run recovery: %v", e)
+	}
+	j, _ := f.x.Status(f.request.Intent.AttemptID)
+	if j.State != "upgraded" || j.Reason != "" {
+		t.Fatalf("expected upgraded state despite helper error, got: %+v", j)
+	}
+}
+
+func TestRecoveryErrorOrIneligibleOrOtherBindingStaysUnknown(t *testing.T) {
+	f := newFixture(t)
+	submitFixture(t, f)
+
+	// Sub-case A: other unexpected binding
+	lock, _ := f.x.lock()
+	s, _ := f.x.load()
+	s.Jobs[0].State = "running"
+	s.Jobs[0].Process = processIdentity{PID: 999999, Boot: "old-boot", Start: "1"}
+	_ = f.x.save(s)
+	lock.Close()
+
+	w := f.x.backend.(fakeBackend).read()
+	w.Binding = strings.Repeat("f", 64)
+	f.x.backend.(fakeBackend).write(w)
+
+	if e := f.x.Run(context.Background(), f.request.Intent.AttemptID, true); !errors.Is(e, ErrBusy) {
+		t.Fatalf("expected ErrBusy, got %v", e)
+	}
+	j, _ := f.x.Status(f.request.Intent.AttemptID)
+	if j.State != "unknown" {
+		t.Fatalf("expected unknown on mismatched binding, got: %+v", j)
+	}
+
+	// Sub-case B: ineligible observation (not ready)
+	lock, _ = f.x.lock()
+	s, _ = f.x.load()
+	s.Jobs[0].State = "running"
+	s.Jobs[0].Process = processIdentity{PID: 999999, Boot: "old-boot", Start: "1"}
+	_ = f.x.save(s)
+	lock.Close()
+
+	w = f.x.backend.(fakeBackend).read()
+	w.Binding = f.request.Intent.FromBinding
+	w.NotReady = true
+	f.x.backend.(fakeBackend).write(w)
+
+	if e := f.x.Run(context.Background(), f.request.Intent.AttemptID, true); !errors.Is(e, ErrBusy) {
+		t.Fatalf("expected ErrBusy, got %v", e)
+	}
+	j, _ = f.x.Status(f.request.Intent.AttemptID)
+	if j.State != "unknown" {
+		t.Fatalf("expected unknown on not ready observation, got: %+v", j)
+	}
+}
+
+func TestFreshNilOldStaysUnknown(t *testing.T) {
+	f := newFixture(t)
+	submitFixture(t, f)
+
+	w := f.x.backend.(fakeBackend).read()
+	w.UpgradeError = "none-stay-old"
+	f.x.backend.(fakeBackend).write(w)
+
+	if e := f.x.Run(context.Background(), f.request.Intent.AttemptID, false); !errors.Is(e, ErrBusy) {
+		t.Fatalf("expected ErrBusy for fresh nil old binding, got: %v", e)
+	}
+	j, _ := f.x.Status(f.request.Intent.AttemptID)
+	if j.State != "unknown" || j.Reason != "backend-outcome-unknown" {
+		t.Fatalf("expected unknown state for fresh nil old binding, got: %+v", j)
 	}
 }
 func TestCommandRejectsPathAndTrustFlags(t *testing.T) {
@@ -677,8 +885,12 @@ func TestSnapshotCrashRecoveryNeverReplaysBackend(t *testing.T) {
 				e = x.Run(context.Background(), f.request.Intent.AttemptID, false)
 				world := x.backend.(fakeBackend).read()
 				if stage == "running" && point != "snapshot-partial" {
-					if !errors.Is(e, ErrBusy) || world.Calls != 0 || world.Recoveries != 1 {
+					if e != nil || world.Calls != 0 || world.Recoveries != 1 {
 						t.Fatalf("durable start must only recover: %+v %v", world, e)
+					}
+					j, _ := x.Status(f.request.Intent.AttemptID)
+					if j.State != "rolled-back" || j.Reason != "recovered-old" {
+						t.Fatalf("expected rolled-back after running crash, got: %+v", j)
 					}
 				} else {
 					if e != nil || world.Calls != 1 {

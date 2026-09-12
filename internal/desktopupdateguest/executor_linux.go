@@ -548,13 +548,9 @@ func (x *Executor) Run(ctx context.Context, id string, recoverOnly bool) error {
 		if obs.Binding == j.Intent.ToBinding {
 			j.State = "upgraded"
 			j.Reason = ""
-		} else if obs.Binding == j.Intent.FromBinding && errors.Is(e, install.ErrAcornFoxUpgradeRolledBack) {
+		} else if obs.Binding == j.Intent.FromBinding && (errors.Is(e, install.ErrAcornFoxUpgradeRolledBack) || (recovering && e == nil)) {
 			j.State = "rolled-back"
 			j.Reason = "recovered-old"
-			if !recovering && e == nil {
-				j.State = "unknown"
-				j.Reason = "backend-outcome-unknown"
-			}
 		}
 	}
 	lock, err := x.workerLock(ctx)

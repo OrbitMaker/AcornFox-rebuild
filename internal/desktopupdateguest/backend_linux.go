@@ -432,8 +432,9 @@ func (p productionBackend) Upgrade(ctx context.Context, dir, sha string, i deskt
 	return ErrBusy
 }
 func (p productionBackend) Recover(ctx context.Context) error {
+	var rolledBack bool
 	for _, verb := range []string{"recover-prepare", "recover-finalize"} {
-		raw, e := p.x.helper(ctx, "/"+install.AcornFoxUpgradeHelperPath, "", verb, "--pending")
+		raw, e := p.x.helper(ctx, filepath.Join(p.x.paths.anchor, install.AcornFoxUpgradeHelperPath), "", verb, "--pending")
 		if e != nil {
 			return ErrBusy
 		}
@@ -447,11 +448,17 @@ func (p productionBackend) Recover(ctx context.Context) error {
 		}
 		var upgraded install.AcornFoxUpgradeReceiptV1
 		if json.Unmarshal(r.Receipt, &upgraded) == nil && upgraded.Validate() == nil {
+			if upgraded.State == "ROLLED_BACK" {
+				rolledBack = true
+			}
 			continue
 		}
 		if _, e := install.ParseAcornFoxHostBootstrapReceiptV1(r.Receipt); e != nil {
 			return ErrBusy
 		}
+	}
+	if rolledBack {
+		return install.ErrAcornFoxUpgradeRolledBack
 	}
 	return nil
 }
