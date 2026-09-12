@@ -67,6 +67,7 @@ type snapshot struct {
 	Floor       uint64       `json:"catalog_floor"`
 	FloorSHA    string       `json:"catalog_payload_sha256"`
 	Jobs        []JobReceipt `json:"jobs"`
+	GC          *gcIntent    `json:"gc,omitempty"`
 }
 type processIdentity struct {
 	PID   int    `json:"pid"`
@@ -216,6 +217,10 @@ func (x *Executor) Observe(ctx context.Context, id string) (desktopupdate.Backen
 			if (j.State == "running" || j.State == "recovering") && !processAlive(j.Process) {
 				obs.AttemptState = "unknown"
 			}
+		} else if retired, e := x.readRetired(id); e == nil {
+			obs.AttemptState = retired.State
+		} else if !errors.Is(e, os.ErrNotExist) {
+			return obs, e
 		}
 	}
 	return obs, nil
@@ -235,7 +240,14 @@ func (x *Executor) Status(id string) (JobReceipt, error) {
 	}
 	i := jobIndex(s, id)
 	if i < 0 {
-		return JobReceipt{State: "absent"}, nil
+		retired, e := x.readRetired(id)
+		if errors.Is(e, os.ErrNotExist) {
+			return JobReceipt{State: "absent"}, nil
+		}
+		if e != nil {
+			return JobReceipt{}, e
+		}
+		return JobReceipt{Intent: desktopupdate.HostUpgradeIntent{AttemptID: id, InstanceID: x.instance.InstanceID}, State: retired.State, EnvelopeSHA: retired.EnvelopeSHA, Sequence: retired.Sequence}, nil
 	}
 	return s.Jobs[i], nil
 }
@@ -271,6 +283,17 @@ func (x *Executor) Submit(ctx context.Context, r SubmitRequest, payload io.Reade
 		}
 		return j, nil
 	}
+	if retired, e := x.readRetired(r.Intent.AttemptID); e == nil {
+		if retired.IntentSHA != digest(encoded(r.Intent)) || retired.EnvelopeSHA != digest(r.Envelope) {
+			return JobReceipt{}, ErrConflict
+		}
+		return JobReceipt{Intent: r.Intent, State: retired.State, EnvelopeSHA: retired.EnvelopeSHA, Sequence: retired.Sequence}, nil
+	} else if !errors.Is(e, os.ErrNotExist) {
+		return JobReceipt{}, e
+	}
+	if s, e = x.collect(ctx, s); e != nil {
+		return JobReceipt{}, e
+	}
 	for _, j := range s.Jobs {
 		if j.State == "queued" || j.State == "running" || j.State == "recovering" || j.State == "unknown" {
 			return JobReceipt{}, ErrBusy
@@ -285,7 +308,7 @@ func (x *Executor) Submit(ctx context.Context, r SubmitRequest, payload io.Reade
 	}
 	jobDirectories := 0
 	for _, entry := range entries {
-		if entry.Name() == "lock" || entry.Name() == "state.json" || entry.Name() == "state-quarantine" {
+		if entry.Name() == "lock" || entry.Name() == "state.json" || entry.Name() == "state-quarantine" || entry.Name() == "quarantine-owner.json" || entry.Name() == "retired" {
 			continue
 		}
 		if !strings.HasPrefix(entry.Name(), "job-") || !hexID.MatchString(strings.TrimPrefix(entry.Name(), "job-")) || !entry.IsDir() {
@@ -408,10 +431,10 @@ func eligible(o desktopupdate.BackendObservation, arch string) bool {
 // Run is called only by the fixed detached worker. A queued job may execute
 // upgrade once; any later invocation can only observe or use backend recovery.
 func (x *Executor) Run(ctx context.Context, id string, recoverOnly bool) error {
-	if !hexID.MatchString(id) {
+	if ctx == nil || !hexID.MatchString(id) {
 		return ErrConflict
 	}
-	lock, e := x.lock()
+	lock, e := x.workerLock(ctx)
 	if e != nil {
 		return e
 	}
@@ -534,7 +557,7 @@ func (x *Executor) Run(ctx context.Context, id string, recoverOnly bool) error {
 			}
 		}
 	}
-	lock, err := x.lock()
+	lock, err := x.workerLock(ctx)
 	if err != nil {
 		return err
 	}
@@ -554,7 +577,14 @@ func (x *Executor) Run(ctx context.Context, id string, recoverOnly bool) error {
 	if j.State == "unknown" {
 		return ErrBusy
 	}
-	return nil
+	if x.fault != nil {
+		x.fault("job-terminal-committed")
+	}
+	if s, err = x.load(); err != nil {
+		return err
+	}
+	_, err = x.collect(ctx, s)
+	return err
 }
 func (x *Executor) detach(id string) error {
 	f, e := openSafe(x.paths.anchor, x.paths.executable, 0755)
@@ -579,4 +609,23 @@ func (x *Executor) detach(id string) error {
 	}
 	go func() { _ = cmd.Wait() }()
 	return nil
+}
+
+// Read-only status polling must not cause a detached accepted worker to exit
+// before it acquires the store lock. Wait only for that lock; a live competing
+// worker for the same job is still rejected by the persisted process identity.
+func (x *Executor) workerLock(ctx context.Context) (*os.File, error) {
+	for {
+		lock, e := x.lock()
+		if !errors.Is(e, ErrBusy) {
+			return lock, e
+		}
+		timer := time.NewTimer(10 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
 }

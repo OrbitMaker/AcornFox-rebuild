@@ -38,6 +38,8 @@ Commands emit bounded JSON with stable result/error codes:
   exactly `payload_size` bytes and EOF. `envelope` is the original envelope as
   base64 JSON bytes. `intent` is the existing `HostUpgradeIntent` type.
 - `recover ATTEMPT_ID`: wakes the fixed detached worker for a durable job.
+- `collect`: resume only persisted GC intents and collect eligible owned terminal
+  intake files; there is no caller-selected deletion path.
 - `run ATTEMPT_ID`: fixed worker entry; only queued verified jobs can upgrade.
   Previously started jobs use recovery instead of replaying upgrade.
 
@@ -48,11 +50,19 @@ of installed state. A queued job still needs a currently valid index; already
 started jobs reverify using the root-recorded acceptance time for recovery.
 State snapshots carry a monotonic revision and the previous committed SHA.
 Recovery publishes only a fully validated legal next snapshot. A torn snapshot
-is preserved in a single root-owned `state-quarantine` slot; it is never parsed
-as authority and does not block subsequent jobs. A second torn snapshot while
-that slot is occupied fails closed. If the queued-receipt write was interrupted,
-only an explicit retry of the same ID/envelope can reuse the completed intake,
-after revalidating both payload streams and the exact extracted inventory.
+with a complete matching revision/previous-SHA/policy/instance header is bound
+by `quarantine-owner.json` to its inode, size, digest and committed baseline,
+then moved into the single `state-quarantine` slot. Once that baseline's active
+job has converged, exact GC removes the owned quarantine and owner record, so
+later independent torn snapshots can use the slot again. Legacy quarantine
+files without ownership evidence, ambiguous short headers, and unknown bytes
+are retained and fail closed; ownership is never invented from a directory scan.
+
+If the queued-receipt write was interrupted, only an explicit retry of the same
+ID/envelope can reuse the completed intake, after revalidating both payload
+streams and the exact extracted inventory. GC completion snapshots and owned
+quarantine-GC intents have a deterministic next value; a torn write is repaired
+only when every existing byte matches that exact authorized value.
 
 The worker's boot, PID, process-start and process-group identities prevent
 recovery from racing a still-live worker or its successor child.
@@ -63,17 +73,49 @@ requires the existing backend's typed rollback result. Interrupted recovery
 which only proves a healthy old binding remains `unknown`; it does not assert
 that the candidate was tried or found faulty.
 
+## Retention and deletion authority
+
+After a verified terminal result, and before accepting another new job, the
+executor retains the two most recent complete terminal jobs. The backend's
+actual current binding and strict readiness are checked before planning old-job
+cleanup. Active, queued, unknown and unverified orphan jobs are never selected.
+No backend release, installed helper, runtime data or native instance file is
+part of this cleanup.
+
+Each GC plan first revalidates the original signed envelope, complete payload,
+backend plan and extracted inventory. A bounded `snapshot.gc` intent records
+the exact receipt identity, nine regular files and two directories, including
+SHA256, size, mode, device and inode. It persists before any deletion. Every
+resume uses that same intent; missing entries are completed steps, while new
+children, replaced objects, symlinks, hardlinks or altered bytes stop cleanup.
+The intent is cleared only after exact deletion and parent-directory fsyncs.
+Quarantine cleanup follows the same intent protocol. Partial metadata writes
+may be completed only from a durable intent's exact expected byte prefix.
+
+Before deleting an old job, the executor persists a root-owned, strictly
+validated tombstone of at most 2 KiB under
+`retired/ID[0:2]/ID[2:4]/ID.json`. It retains the instance/policy identity, attempt
+ID, intent digest, envelope digest, sequence and terminal state. Lookups address
+one ID directly; they never scan or load all historical tombstones. Exact old
+requests remain idempotent, and the same ID with another intent is rejected.
+**Tombstone count and total small-metadata storage grow with update history.**
+They do not count toward the active/intake quota. This is intentional: deleting
+all memory of random historical IDs would weaken exact replay protection.
+
 ## Validation and remaining integration
 
 Linux root tests exercise real filesystem ownership, signatures, bundle bytes,
-fd execution, detached child processes, restart/replay and bounded receipts.
+fd execution, detached child processes and restart/replay. They include 40
+successive signed release versions while retaining two full jobs; repeated
+process interruption at every GC file/directory/metadata step; GC intent and
+completion snapshot crashes; and two independent torn-snapshot recoveries.
 Their backend adapter is a fixture, so these tests do not prove an actual
-system upgrade, rollback, VZ, WSL or desktop launcher update.
+system upgrade, rollback, VZ, WSL or desktop launcher update. Process-crash
+injection is not a physical power-loss durability test.
 
 Service/provisioning, host transport adapters and three-platform native glue
-are intentionally outside this package. No production key/URL is invented.
-Receipt retention and quarantined intake directories are capped at 32. At the
-limit, new jobs fail closed with `retention-full`. Precise terminal-job inventory
-GC and repair of incomplete intake or an occupied quarantine after a second
-torn state write are still required for
-indefinite production operation; no unknown file is deleted or promoted.
+are outside this package. No production key/URL is invented. Unverified partial
+intakes remain quarantined and count toward the 32-directory safety cap; they
+require explicit repair if their signed complete inventory cannot be proven.
+Unknown or legacy unowned quarantine content is likewise preserved, not guessed
+away. Normal verified successful update history does not exhaust this quota.

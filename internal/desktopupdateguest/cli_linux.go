@@ -18,6 +18,8 @@ func (x *Executor) Command(ctx context.Context, args []string, input io.Reader, 
 	var value any
 	var err error
 	switch {
+	case len(args) == 1 && args[0] == "collect":
+		err = x.Collect(ctx)
 	case len(args) == 1 && args[0] == "submit":
 		reader := bufio.NewReaderSize(input, 2<<20)
 		header, e := reader.ReadSlice('\n')

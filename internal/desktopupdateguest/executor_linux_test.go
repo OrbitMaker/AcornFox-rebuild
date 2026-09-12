@@ -151,9 +151,12 @@ func archive(t *testing.T, names []string, contents map[string][]byte, modes map
 	}
 	return b.Bytes()
 }
-func signedTestPayload(t *testing.T, from string) ([]byte, string) {
+func signedTestPayload(t *testing.T, from string, versions ...string) ([]byte, string) {
 	t.Helper()
 	version := "0.1.0-beta.14"
+	if len(versions) > 0 {
+		version = versions[0]
+	}
 	helper := []byte("signed fixture helper bytes")
 	helperSHA := digest(helper)
 	inner := archive(t, []string{"release/bin/acornfox-upgrade"}, map[string][]byte{"release/bin/acornfox-upgrade": helper}, map[string]int64{"release/bin/acornfox-upgrade": 0755})
@@ -179,9 +182,13 @@ func signedTestPayload(t *testing.T, from string) ([]byte, string) {
 	contents["bundle.json"] = encoded(m)
 	return archive(t, append([]string{"bundle.json"}, names...), contents, modes), to
 }
-func signFixture(t *testing.T, key ed25519.PrivateKey, payload []byte, to string, seq uint64, expires time.Time) []byte {
+func signFixture(t *testing.T, key ed25519.PrivateKey, payload []byte, to string, seq uint64, expires time.Time, versions ...string) []byte {
 	t.Helper()
-	p := desktopupdate.IndexPayload{Channel: "beta", Sequence: seq, ExpiresAt: expires.UTC().Format(time.RFC3339), Version: "0.1.0-beta.14", Artifacts: []desktopupdate.Artifact{{OS: "linux", Arch: runtime.GOARCH, URL: "https://updates.example.test/update.tar.gz", SHA256: digest(payload), Size: int64(len(payload)), BackendBinding: to}}}
+	version := "0.1.0-beta.14"
+	if len(versions) > 0 {
+		version = versions[0]
+	}
+	p := desktopupdate.IndexPayload{Channel: "beta", Sequence: seq, ExpiresAt: expires.UTC().Format(time.RFC3339), Version: version, Artifacts: []desktopupdate.Artifact{{OS: "linux", Arch: runtime.GOARCH, URL: "https://updates.example.test/update.tar.gz", SHA256: digest(payload), Size: int64(len(payload)), BackendBinding: to}}}
 	raw := encoded(p)
 	return encoded(desktopupdate.IndexEnvelope{SchemaVersion: 1, Payload: base64.StdEncoding.EncodeToString(raw), Signature: base64.StdEncoding.EncodeToString(ed25519.Sign(key, raw))})
 }
@@ -480,8 +487,8 @@ func TestBoundedReceiptAndConcurrentLocks(t *testing.T) {
 		}
 	}
 	lock.Close()
-	if _, e := f.x.Submit(context.Background(), f.request, bytes.NewReader(f.payload)); !errors.Is(e, ErrCapacity) {
-		t.Fatalf("receipt bound: %v", e)
+	if _, e := f.x.Submit(context.Background(), f.request, bytes.NewReader(f.payload)); !errors.Is(e, ErrConflict) {
+		t.Fatalf("unverifiable historical receipt must not be collected: %v", e)
 	}
 }
 
@@ -623,7 +630,7 @@ func TestSnapshotCrashChild(t *testing.T) {
 		if _, e := x.Submit(context.Background(), request, input); e != nil {
 			os.Exit(86)
 		}
-	} else if e := x.Run(context.Background(), strings.Repeat("2", 64), false); e != nil {
+	} else if e := x.Run(context.Background(), crashJobID(), false); e != nil {
 		os.Exit(86)
 	}
 	os.Exit(87)
@@ -692,9 +699,8 @@ func TestSnapshotCrashRecoveryNeverReplaysBackend(t *testing.T) {
 					if _, e := x.Submit(context.Background(), next, bytes.NewReader(payload)); e != nil {
 						t.Fatal(e)
 					}
-					raw, e := readSafe(x.paths.anchor, filepath.Join(x.paths.state, "state-quarantine"), 0600, 256<<10)
-					if e != nil || len(raw) == 0 {
-						t.Fatalf("partial bytes not retained: %v", e)
+					if _, e := os.Lstat(filepath.Join(x.paths.state, "state-quarantine")); !errors.Is(e, os.ErrNotExist) {
+						t.Fatalf("converged owned quarantine not collected: %v", e)
 					}
 				}
 			})
@@ -745,4 +751,11 @@ func TestObservationUsesSharedControllerAttemptStates(t *testing.T) {
 	if e != nil || obs.AttemptState != "running" {
 		t.Fatalf("shared attempt state = %s, %v", obs.AttemptState, e)
 	}
+}
+
+func crashJobID() string {
+	if id := os.Getenv("GUEST_UPDATE_CRASH_ID"); id != "" {
+		return id
+	}
+	return strings.Repeat("2", 64)
 }

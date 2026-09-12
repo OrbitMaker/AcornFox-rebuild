@@ -139,6 +139,9 @@ func (x *Executor) lock() (*os.File, error) {
 	return f, nil
 }
 func (x *Executor) load() (snapshot, error) {
+	if e := x.verifyInstance(); e != nil {
+		return snapshot{}, e
+	}
 	if e := x.recoverSnapshot(); e != nil {
 		return snapshot{}, e
 	}
@@ -149,7 +152,7 @@ func (x *Executor) load() (snapshot, error) {
 			return snapshot{}, readErr
 		}
 		for _, f := range entries {
-			if f.Name() != "lock" && f.Name() != "state-quarantine" {
+			if f.Name() != "lock" && f.Name() != "state-quarantine" && f.Name() != "quarantine-owner.json" {
 				return snapshot{}, ErrConflict
 			}
 		}
@@ -159,6 +162,17 @@ func (x *Executor) load() (snapshot, error) {
 		}
 		raw, e = readSafe(x.paths.anchor, filepath.Join(x.paths.state, "state.json"), 0600, 256<<10)
 	}
+	if e != nil {
+		return snapshot{}, e
+	}
+	var s snapshot
+	if decode(raw, &s) != nil || x.validateSnapshot(s) != nil {
+		return s, ErrConflict
+	}
+	return x.resumeGC(s)
+}
+func (x *Executor) readSnapshot() (snapshot, error) {
+	raw, e := readSafe(x.paths.anchor, filepath.Join(x.paths.state, "state.json"), 0600, 256<<10)
 	if e != nil {
 		return snapshot{}, e
 	}
@@ -187,9 +201,37 @@ func (x *Executor) validateSnapshot(s snapshot) error {
 		}
 		seen[j.Intent.AttemptID] = true
 	}
-	return nil
+	return x.validateGC(s)
 }
 func snapshotTransition(old, next snapshot) bool {
+	if old.GC != nil || next.GC != nil {
+		if old.Revision == 0 || old.Floor != next.Floor || old.FloorSHA != next.FloorSHA {
+			return false
+		}
+		if old.GC == nil && next.GC != nil {
+			return noActive(old) && bytes.Equal(encoded(old.Jobs), encoded(next.Jobs))
+		}
+		if old.GC != nil && next.GC == nil {
+			expected := old.Jobs
+			if old.GC.Kind == "job" {
+				if len(expected) == 0 {
+					return false
+				}
+				expected = expected[1:]
+			}
+			if len(expected) != len(next.Jobs) {
+				return false
+			}
+			for i := range expected {
+				if !bytes.Equal(encoded(expected[i]), encoded(next.Jobs[i])) {
+					return false
+				}
+			}
+			return true
+		}
+		return false
+	}
+
 	if old.Revision == 0 {
 		return next.Revision == 1 && next.Floor == 0 && len(next.Jobs) == 0
 	}
@@ -268,24 +310,39 @@ func (x *Executor) recoverSnapshot() error {
 		if len(current) > 0 {
 			previous = digest(current)
 		}
-		if x.validateSnapshot(next) != nil || next.Revision != old.Revision+1 || next.PreviousSHA != previous || !snapshotTransition(old, next) {
+		if x.validateSnapshot(next) != nil || next.Revision != old.Revision+1 || next.PreviousSHA != previous || !x.authorizedTransition(old, next) {
 			return ErrConflict
+		}
+		if e := x.syncSafeFile(temp); e != nil {
+			return e
 		}
 		if e := os.Rename(temp, filepath.Join(x.paths.state, "state.json")); e != nil {
 			return e
 		}
 		return syncDir(x.paths.state)
 	}
-	// A torn write has no execution authority. Preserve its bytes in one bounded
-	// quarantine slot; recover from the last committed receipt, never scan/promote.
-	quarantine := filepath.Join(x.paths.state, "state-quarantine")
-	if _, e := os.Lstat(quarantine); !errors.Is(e, os.ErrNotExist) {
-		return ErrConflict
+	// GC completion and owned-quarantine cleanup have an exact deterministic
+	// next snapshot. Repair only a matching byte prefix, avoiding recursion in
+	// the quarantine slot when its own cleanup snapshot is interrupted.
+	if old.GC != nil && x.gcCompleted(old.GC) == nil {
+		next := old
+		if old.GC.Kind == "job" {
+			next.Jobs = append([]JobReceipt(nil), old.Jobs[1:]...)
+		}
+		next.GC = nil
+		if ok, e := x.repairKnownSnapshot(raw, current, old, next); ok || e != nil {
+			return e
+		}
+	} else if old.GC == nil && noActive(old) {
+		if g, e := x.prepareQuarantineGC(old); e == nil && g != nil {
+			next := old
+			next.GC = g
+			if ok, e := x.repairKnownSnapshot(raw, current, old, next); ok || e != nil {
+				return e
+			}
+		}
 	}
-	if e := os.Rename(temp, quarantine); e != nil {
-		return e
-	}
-	return syncDir(x.paths.state)
+	return x.quarantineTorn(raw, current, old)
 }
 func (x *Executor) save(s snapshot) error {
 	p := filepath.Join(x.paths.state, "state.json")
@@ -304,7 +361,7 @@ func (x *Executor) save(s snapshot) error {
 	} else {
 		return e
 	}
-	if x.validateSnapshot(s) != nil || !snapshotTransition(old, s) {
+	if x.validateSnapshot(s) != nil || !x.authorizedTransition(old, s) {
 		return ErrConflict
 	}
 	next := encoded(s)
@@ -347,4 +404,34 @@ func jobIndex(s snapshot, id string) int {
 		}
 	}
 	return -1
+}
+
+func (x *Executor) authorizedTransition(old, next snapshot) bool {
+	if !snapshotTransition(old, next) {
+		return false
+	}
+	if old.GC != nil && next.GC == nil {
+		return x.gcCompleted(old.GC) == nil
+	}
+	return true
+}
+
+func (x *Executor) repairKnownSnapshot(partial, current []byte, old, next snapshot) (bool, error) {
+	next.Revision = old.Revision + 1
+	next.PreviousSHA = digest(current)
+	if x.validateSnapshot(next) != nil || !x.authorizedTransition(old, next) {
+		return false, ErrConflict
+	}
+	want := encoded(next)
+	if len(partial) > len(want) || !bytes.Equal(partial, want[:len(partial)]) {
+		return false, nil
+	}
+	temp := filepath.Join(x.paths.state, "state-next.json")
+	if e := x.ensureExactFile(temp, want, "snapshot-repair"); e != nil {
+		return true, e
+	}
+	if e := os.Rename(temp, filepath.Join(x.paths.state, "state.json")); e != nil {
+		return true, e
+	}
+	return true, syncDir(x.paths.state)
 }
