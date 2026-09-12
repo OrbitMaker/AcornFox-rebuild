@@ -412,7 +412,15 @@ func (c *HostController) Advance(ctx context.Context) (HostUpdateStatus, error) 
 	if e != nil {
 		return hostStatus(state), e
 	}
-	defer bundle.Close()
+	closeBundle := func() error {
+		if bundle == nil {
+			return nil
+		}
+		e := bundle.Close()
+		bundle = nil
+		return e
+	}
+	defer closeBundle()
 	bundle.envelope = append([]byte(nil), p.Envelope...)
 	m := bundle.manifest
 	target := m.Backend.ToBinding
@@ -452,8 +460,14 @@ func (c *HostController) Advance(ctx context.Context) (HostUpdateStatus, error) 
 				return hostStatus(state), e
 			}
 		} else if obs.AttemptState == "rolled-back" && obs.Binding == p.Previous.BackendBinding && obs.Ready && obs.Finalized {
+			if e := closeBundle(); e != nil {
+				return hostStatus(state), e
+			}
 			return c.finishFailure(ctx, s, &state, "backend", target, "rolled-back")
 		} else if obs.AttemptState == "rejected" && target != p.Previous.BackendBinding && obs.Binding == p.Previous.BackendBinding && obs.Ready && obs.Finalized {
+			if e := closeBundle(); e != nil {
+				return hostStatus(state), e
+			}
 			return c.finishFailure(ctx, s, &state, "backend", target, "rejected")
 		} else if obs.AttemptState == "absent" && obs.Binding == p.Previous.BackendBinding && obs.Ready && obs.Finalized {
 			if e = s.step("backend-before-ensure"); e != nil {
@@ -466,6 +480,12 @@ func (c *HostController) Advance(ctx context.Context) (HostUpdateStatus, error) 
 		} else {
 			return hostStatus(state), ErrHostConflict
 		}
+	}
+	// No later phase reads archive bytes. Release this verification handle
+	// before success/failure cleanup: Windows cannot delete an open payload.
+	// collect independently reopens and verifies its exact hash/size/identity.
+	if e := closeBundle(); e != nil {
+		return hostStatus(state), e
 	}
 	// A durable backend confirmation authorizes only host reconciliation. During
 	// native handoff the same VM may be stopped; requiring a live backend before

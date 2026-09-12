@@ -759,3 +759,45 @@ func TestHostFullFailureLedgerStillPersistsCatalogFloor(t *testing.T) {
 		t.Fatal("failure pruning lowered floor", e)
 	}
 }
+
+func TestHostControllerTerminalCleanupClosesPayload(t *testing.T) {
+	for _, kind := range []string{"success", "backend-rolled-back", "backend-rejected", "host-rolled-back"} {
+		t.Run(kind, func(t *testing.T) {
+			f := newHostFixture(t)
+			world := f.world.read()
+			world.Rollback = kind == "backend-rolled-back"
+			world.Reject = kind == "backend-rejected"
+			world.FailHost = kind == "host-rolled-back"
+			f.world.write(world)
+			selected, e := f.c.Select(context.Background(), f.envelope, false)
+			if e != nil {
+				t.Fatal(e)
+			}
+			stage := filepath.Join(f.c.options.Root, "download-"+selected.Snapshot.Pending.ID)
+			var last HostUpdateStatus
+			for n := 0; n < 5; n++ {
+				last, e = f.c.Advance(context.Background())
+				if e != nil {
+					t.Fatal("terminal cleanup failed", e)
+				}
+				if last.Snapshot.Pending == nil {
+					break
+				}
+			}
+			want := kind
+			if kind == "success" {
+				want = "updated"
+			}
+			if last.State != want || last.Snapshot.Pending != nil || len(last.Snapshot.Cleanup) != 0 || last.Snapshot.CollectSlots {
+				t.Fatal("cleanup did not settle", last.State)
+			}
+			if _, e := os.Lstat(stage); !errors.Is(e, os.ErrNotExist) {
+				t.Fatal("terminal stage retained", e)
+			}
+			// A second explicit reconciliation is unnecessary for handle reclamation.
+			if _, e = f.c.Advance(context.Background()); e != nil {
+				t.Fatal(e)
+			}
+		})
+	}
+}

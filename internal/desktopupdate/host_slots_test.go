@@ -27,25 +27,38 @@ var slotHelperError error
 func slotHelper(t *testing.T) []byte {
 	t.Helper()
 	slotHelperOnce.Do(func() {
+		supplied := os.Getenv("ACORNFOX_SLOT_TEST_HELPER")
+		expected := os.Getenv("ACORNFOX_SLOT_TEST_HELPER_SHA256")
+		if supplied != "" || expected != "" {
+			if !filepath.IsAbs(supplied) || validateSHA256(expected) != nil {
+				slotHelperError = errors.New("test helper requires absolute path and SHA256")
+				return
+			}
+			slotHelperBytes, slotHelperError = slotReadTestHelper(supplied, expected)
+			return
+		}
 		dir, e := os.MkdirTemp("", "acornfox-slot-helper-")
 		if e != nil {
 			slotHelperError = e
 			return
 		}
 		defer os.RemoveAll(dir)
-		source := filepath.Join(dir, "main.go")
-		e = os.WriteFile(source, []byte("package main\nimport (\"fmt\";\"os\")\nfunc main(){if len(os.Args)!=2||os.Args[1]!=\"fixture-start\"{os.Exit(3)};fmt.Print(\"fixture-started\")}\n"), 0600)
+		binary := filepath.Join(dir, "helper")
+		if runtime.GOOS == "windows" {
+			binary += ".exe"
+		}
+		source := filepath.Join("testdata", "slot_helper", "main.go")
+		out, e := exec.Command("go", "build", "-trimpath", "-ldflags=-s -w", "-o", binary, source).CombinedOutput()
+		if e != nil {
+			slotHelperError = fmt.Errorf("build helper (or provide ACORNFOX_SLOT_TEST_HELPER and pinned SHA256): %w %s", e, out)
+			return
+		}
+		raw, e := os.ReadFile(binary)
 		if e != nil {
 			slotHelperError = e
 			return
 		}
-		binary := filepath.Join(dir, "helper")
-		out, e := exec.Command("go", "build", "-trimpath", "-ldflags=-s -w", "-o", binary, source).CombinedOutput()
-		if e != nil {
-			slotHelperError = fmt.Errorf("build helper: %w %s", e, out)
-			return
-		}
-		slotHelperBytes, slotHelperError = os.ReadFile(binary)
+		slotHelperBytes, slotHelperError = slotReadTestHelper(binary, hostSHA(raw))
 	})
 	if slotHelperError != nil {
 		t.Fatal(slotHelperError)
@@ -65,10 +78,7 @@ type slotFixture struct {
 
 func newSlotFixture(t *testing.T) slotFixture {
 	t.Helper()
-	if runtime.GOOS == "windows" {
-		t.Skip("native Windows directory durability requires separate host acceptance")
-	}
-	base, e := filepath.EvalSymlinks(t.TempDir())
+	base, e := filepath.EvalSymlinks(createTestParentDir(t))
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -78,10 +88,17 @@ func newSlotFixture(t *testing.T) slotFixture {
 		if e = os.Mkdir(p, 0700); e != nil {
 			t.Fatal(e)
 		}
+		if e = secureNewStageDirectory(context.Background(), p); e != nil {
+			t.Fatal(e)
+		}
 	}
 	data := slotHelper(t)
 	spec := HostBootstrapSpec{Root: boot, OS: runtime.GOOS, Architecture: runtime.GOARCH, Version: "1.0.0", Launcher: "launcher", Controller: "controller", ControllerProtocol: 1, InstanceProtocol: 1, BackendAPIProtocol: 1}
-	for _, name := range []string{"controller", "launcher"} {
+	if runtime.GOOS == "windows" {
+		spec.Launcher += ".exe"
+		spec.Controller += ".exe"
+	}
+	for _, name := range []string{spec.Controller, spec.Launcher} {
 		if e = os.WriteFile(filepath.Join(boot, name), data, 0755); e != nil {
 			t.Fatal(e)
 		}
@@ -232,11 +249,15 @@ func TestHostSlotsFailClosed(t *testing.T) {
 			case "hash":
 				os.WriteFile(file, []byte("changed"), 0755)
 			case "mode":
-				os.Chmod(file, 0777)
+				if runtime.GOOS == "windows" {
+					slotGrantWideTestACL(t, file)
+				} else {
+					slotMust(t, os.Chmod(file, 0777))
+				}
 			case "link":
 				os.Link(file, filepath.Join(filepath.Dir(f.Root), "foreign-hardlink"))
 			case "bootstrap-drift":
-				os.Chmod(filepath.Join(f.Spec.Root, f.Spec.Launcher), 0777)
+				slotMust(t, os.WriteFile(filepath.Join(f.Spec.Root, f.Spec.Launcher), []byte("bootstrap drift"), 0755))
 			case "directory-swap":
 				os.Rename(dir, dir+"-old")
 				os.Mkdir(dir, 0700)
@@ -577,5 +598,71 @@ func TestHostSlotsStoppedHookIsIdempotentAcrossProcesses(t *testing.T) {
 	slotMust(t, e)
 	if current != b.SHA256() {
 		t.Fatal("recovered pointer not committed")
+	}
+}
+
+// External helper input is test-only. Its bytes must match an explicit digest
+// and this test process's actual CPU/OS before any copy is allowed to execute.
+func slotReadTestHelper(path, expected string) ([]byte, error) {
+	before, e := os.Lstat(path)
+	if e != nil {
+		return nil, e
+	}
+	if !before.Mode().IsRegular() || before.Mode()&os.ModeSymlink != 0 || before.Size() < 1 || before.Size() > 32<<20 || validateSHA256(expected) != nil {
+		return nil, ErrHostConflict
+	}
+	f, e := os.Open(path)
+	if e != nil {
+		return nil, e
+	}
+	defer f.Close()
+	opened, e := f.Stat()
+	if e != nil || !os.SameFile(before, opened) {
+		return nil, ErrHostConflict
+	}
+	raw, e := io.ReadAll(io.LimitReader(f, (32<<20)+1))
+	if e != nil || len(raw) > 32<<20 || int64(len(raw)) != before.Size() || hostSHA(raw) != expected {
+		return nil, ErrHostConflict
+	}
+	if e = slotCPU(f, runtime.GOOS, runtime.GOARCH); e != nil {
+		return nil, e
+	}
+	after, e := f.Stat()
+	if e != nil || after.Size() != before.Size() || !after.ModTime().Equal(before.ModTime()) {
+		return nil, ErrHostConflict
+	}
+	return raw, nil
+}
+func slotGrantWideTestACL(t *testing.T, file string) {
+	t.Helper()
+	systemRoot := os.Getenv("SystemRoot")
+	if !filepath.IsAbs(systemRoot) {
+		t.Fatal("missing absolute Windows SystemRoot")
+	}
+	tool := filepath.Join(systemRoot, "System32", "icacls.exe")
+	out, e := exec.Command(tool, file, "/grant", "*S-1-1-0:(W)").CombinedOutput()
+	if e != nil {
+		t.Fatalf("grant test-only wide write ACL: %v %s", e, out)
+	}
+	t.Cleanup(func() {
+		out, e := exec.Command(tool, file, "/remove:g", "*S-1-1-0").CombinedOutput()
+		if e != nil {
+			t.Errorf("restore test-only ACL: %v %s", e, out)
+		}
+	})
+}
+func TestHostSlotsPrebuiltHelperIsHashAndCPUPinned(t *testing.T) {
+	raw := slotHelper(t)
+	path := filepath.Join(t.TempDir(), "helper")
+	slotMust(t, os.WriteFile(path, raw, 0600))
+	if _, e := slotReadTestHelper(path, hostSHA(raw)); e != nil {
+		t.Fatal(e)
+	}
+	if _, e := slotReadTestHelper(path, strings.Repeat("0", 64)); !errors.Is(e, ErrHostConflict) {
+		t.Fatal("accepted wrong helper SHA", e)
+	}
+	slotMust(t, os.WriteFile(path, []byte("not native executable"), 0600))
+	if _, e := slotReadTestHelper(path, hostSHA([]byte("not native executable"))); !errors.Is(e, ErrHostConflict) {
+		t.Fatal("accepted wrong helper CPU", e)
 	}
 }
