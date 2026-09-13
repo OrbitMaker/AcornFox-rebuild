@@ -96,6 +96,13 @@ func (b *PinnedHostBootstrap) verify() error {
 	return slotVerifyTree(b.root, b.spec.Root, b.spec.Files, b.spec.Launcher, b.spec.Controller, b.spec.OS, b.spec.Architecture, false, false, nil)
 }
 
+// HostMaintenanceSession represents an active native maintenance session (such as
+// a maintenance VM/SSH endpoint). It provides Stop and Close to terminate the session.
+type HostMaintenanceSession interface {
+	Stop(context.Context) error
+	Close() error
+}
+
 // Hooks are trusted native adapters, not an execution API. Prepare never calls
 // them. No command or argv can be supplied by a bundle/JSON request.
 // Stop MUST be idempotent for (instance ID, attempt ID, old slot ID): recovery
@@ -104,9 +111,10 @@ func (b *PinnedHostBootstrap) verify() error {
 // as success, without stopping another instance or releasing unrelated resources.
 // Start must be idempotent for the verified slot and this fixed installation.
 type HostSlotHooks struct {
-	Stop  func(context.Context, string, string, HostSlotView) error
-	Start func(context.Context, string, HostSlotView) error
-	Probe func(context.Context, string, HostSlotView, string) error
+	Stop             func(context.Context, string, string, HostSlotView) error
+	Start            func(context.Context, string, HostSlotView) error
+	Probe            func(context.Context, string, HostSlotView, string) error
+	StartMaintenance func(context.Context, string, HostSlotView) (HostMaintenanceSession, error)
 }
 
 // HostSlotView is valid only during its trusted hook callback. Adapters must
