@@ -1,6 +1,7 @@
 package install
 
 import (
+	"bytes"
 	"errors"
 	"io"
 	"os"
@@ -9,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+
+	"github.com/open-card/open-card/internal/hostoverlay"
 )
 
 // acornFoxValidateProductionManagedScope is the narrow L3B host preflight.
@@ -487,7 +490,7 @@ func acornFoxValidateProductionSystemdWithBootLinks(root *os.Root, store *TaskAc
 				return ErrAcornFoxLiveConflict
 			}
 		}
-		return nil
+		return acornFoxValidateProductionBootstrapService(root, store, false)
 	}
 	if err != nil {
 		return ErrAcornFoxLiveConflict
@@ -497,8 +500,13 @@ func acornFoxValidateProductionSystemdWithBootLinks(root *os.Root, store *TaskAc
 	if readErr != nil || closeErr != nil {
 		return ErrAcornFoxLiveConflict
 	}
+	var bootstrapUnitFound bool
 	for _, child := range children {
 		if !strings.HasPrefix(child.Name(), "acornfox-") {
+			continue
+		}
+		if child.Name() == hostoverlay.BootstrapServiceName {
+			bootstrapUnitFound = true
 			continue
 		}
 		path := systemdRoot + "/" + child.Name()
@@ -520,6 +528,128 @@ func acornFoxValidateProductionSystemdWithBootLinks(root *os.Root, store *TaskAc
 		}
 		seen[path] = true
 	}
+	return acornFoxValidateProductionBootstrapService(root, store, bootstrapUnitFound)
+}
+
+func acornFoxValidateProductionBootstrapService(root *os.Root, store *TaskAcornFoxRepoStore, unitFoundInDir bool) error {
+	principal, ok := store.layout.owner(AcornFoxLiveRootRole)
+	if !ok {
+		return ErrAcornFoxLiveConflict
+	}
+
+	const systemdRoot = "etc/systemd/system"
+	systemdOSRoot, err := root.OpenRoot(systemdRoot)
+	if errors.Is(err, os.ErrNotExist) {
+		if unitFoundInDir {
+			return ErrAcornFoxLiveConflict
+		}
+		return nil
+	}
+	if err != nil {
+		return ErrAcornFoxLiveConflict
+	}
+	defer systemdOSRoot.Close()
+
+	unitInfo, unitErr := systemdOSRoot.Lstat(hostoverlay.BootstrapServiceName)
+	if unitErr != nil && !errors.Is(unitErr, os.ErrNotExist) {
+		return ErrAcornFoxLiveConflict
+	}
+	unitExists := unitErr == nil
+	if unitExists != unitFoundInDir {
+		return ErrAcornFoxLiveConflict
+	}
+
+	if unitExists {
+		// Unit is present: must be a 0644 regular single-link root-owned file
+		// with exact canonical bytes.
+		if !unitInfo.Mode().IsRegular() || unitInfo.Mode()&os.ModeSymlink != 0 || unitInfo.Mode().Perm() != hostoverlay.BootstrapUnitFileMode || acornFoxRepoNlink(unitInfo) != 1 || !acornFoxLiveObservedOwner(store, unitInfo, principal) {
+			return ErrAcornFoxLiveConflict
+		}
+
+		canonical := hostoverlay.BootstrapUnitBytes()
+		if unitInfo.Size() != int64(len(canonical)) {
+			return ErrAcornFoxLiveConflict
+		}
+		file, err := systemdOSRoot.OpenFile(hostoverlay.BootstrapServiceName, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+		if err != nil {
+			return ErrAcornFoxLiveConflict
+		}
+		opened, statErr := file.Stat()
+		raw, readErr := io.ReadAll(io.LimitReader(file, int64(len(canonical))+1))
+		closeErr := file.Close()
+		if statErr != nil || readErr != nil || closeErr != nil || !os.SameFile(unitInfo, opened) || !bytes.Equal(raw, canonical) {
+			return ErrAcornFoxLiveConflict
+		}
+	}
+
+	// Validate multi-user.target.wants parent directory before inspecting
+	// its fixed host-bootstrap link.
+	const wantsDirName = "multi-user.target.wants"
+	parentInfo, parentErr := systemdOSRoot.Lstat(wantsDirName)
+	if errors.Is(parentErr, os.ErrNotExist) {
+		// Parent multi-user.target.wants does not exist.
+		// Since parent is absent, no enable link can exist.
+		// Both State 1 (none) and State 2 (exact unit-only staged) are permitted.
+		return nil
+	}
+	if parentErr != nil {
+		return ErrAcornFoxLiveConflict
+	}
+
+	// Parent exists: require actual non-symlink directory with canonical 0755 and root principal.
+	if !parentInfo.IsDir() || parentInfo.Mode()&os.ModeSymlink != 0 || parentInfo.Mode().Perm() != 0o755 || !acornFoxLiveObservedOwner(store, parentInfo, principal) {
+		return ErrAcornFoxLiveConflict
+	}
+
+	// Verify directory FD and path identity via O_NOFOLLOW open to prevent symlink race.
+	parentFile, err := systemdOSRoot.OpenFile(wantsDirName, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return ErrAcornFoxLiveConflict
+	}
+	openedParentInfo, statErr := parentFile.Stat()
+	closeErr := parentFile.Close()
+	if statErr != nil || closeErr != nil || !os.SameFile(parentInfo, openedParentInfo) {
+		return ErrAcornFoxLiveConflict
+	}
+
+	// Open wantsRoot pinned to multi-user.target.wants from systemdOSRoot.
+	wantsRoot, err := systemdOSRoot.OpenRoot(wantsDirName)
+	if err != nil {
+		return ErrAcornFoxLiveConflict
+	}
+	defer wantsRoot.Close()
+	wantsRootStat, statErr := wantsRoot.Stat(".")
+	if statErr != nil || !os.SameFile(parentInfo, wantsRootStat) {
+		return ErrAcornFoxLiveConflict
+	}
+
+	// Inspect only the fixed host-bootstrap link within wantsRoot. Do NOT enumerate shared wants children.
+	linkInfo, linkErr := wantsRoot.Lstat(hostoverlay.BootstrapServiceName)
+	if errors.Is(linkErr, os.ErrNotExist) {
+		// Link does not exist in multi-user.target.wants.
+		// Both State 1 (none) and State 2 (exact unit-only staged) are permitted.
+		return nil
+	}
+	if linkErr != nil {
+		return ErrAcornFoxLiveConflict
+	}
+
+	// Link exists!
+	// Link exists but unit does not -> reject (link-only).
+	if !unitExists {
+		return ErrAcornFoxLiveConflict
+	}
+
+	// State 3: exact unit + canonical enable link.
+	// Link must be a single-link root-owned symlink pointing to "../acornfox-host-bootstrap.service".
+	if linkInfo.Mode()&os.ModeSymlink == 0 || acornFoxRepoNlink(linkInfo) != 1 || !acornFoxLiveObservedOwner(store, linkInfo, principal) {
+		return ErrAcornFoxLiveConflict
+	}
+	target, readlinkErr := wantsRoot.Readlink(hostoverlay.BootstrapServiceName)
+	if readlinkErr != nil || target != hostoverlay.BootstrapEnableLinkTarget {
+		return ErrAcornFoxLiveConflict
+	}
+
 	return nil
 }
 
