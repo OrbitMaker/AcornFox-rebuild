@@ -123,6 +123,11 @@ type HostSlotView struct {
 	id, version, launcher, controller string
 	external                          bool
 	root                              *os.Root
+
+	launcherRel  string
+	launcherFile HostBundleFile
+	osName       string
+	arch         string
 }
 
 func (v HostSlotView) ID() string              { return v.id }
@@ -178,7 +183,28 @@ func (m *HostSlots) view(s *slotStore, l slotLedger, id string) (HostSlotView, f
 		if e := b.verify(); e != nil {
 			return HostSlotView{}, noop, e
 		}
-		return HostSlotView{b.id, b.spec.Version, filepath.Join(b.spec.Root, filepath.FromSlash(b.spec.Launcher)), filepath.Join(b.spec.Root, filepath.FromSlash(b.spec.Controller)), true, b.root}, noop, nil
+		var launcherFile HostBundleFile
+		for _, f := range b.spec.Files {
+			if f.Path == b.spec.Launcher {
+				launcherFile = f
+				break
+			}
+		}
+		if launcherFile.Path == "" {
+			return HostSlotView{}, noop, ErrHostConflict
+		}
+		return HostSlotView{
+			id:           b.id,
+			version:      b.spec.Version,
+			launcher:     filepath.Join(b.spec.Root, filepath.FromSlash(b.spec.Launcher)),
+			controller:   filepath.Join(b.spec.Root, filepath.FromSlash(b.spec.Controller)),
+			external:     true,
+			root:         b.root,
+			launcherRel:  filepath.FromSlash(b.spec.Launcher),
+			launcherFile: launcherFile,
+			osName:       b.spec.OS,
+			arch:         b.spec.Architecture,
+		}, noop, nil
 	}
 	for _, r := range l.Records {
 		if r.ID != id {
@@ -195,8 +221,30 @@ func (m *HostSlots) view(s *slotStore, l slotLedger, id string) (HostSlotView, f
 			root.Close()
 			return HostSlotView{}, noop, e
 		}
+		var launcherFile HostBundleFile
+		for _, f := range r.Files {
+			if f.Path == r.Launcher {
+				launcherFile = f
+				break
+			}
+		}
+		if launcherFile.Path == "" {
+			root.Close()
+			return HostSlotView{}, noop, ErrHostConflict
+		}
 		base := filepath.Join(s.path, r.Directory)
-		return HostSlotView{r.ID, r.Version, filepath.Join(base, filepath.FromSlash(r.Launcher)), filepath.Join(base, filepath.FromSlash(r.Controller)), false, root}, func() { root.Close() }, nil
+		return HostSlotView{
+			id:           r.ID,
+			version:      r.Version,
+			launcher:     filepath.Join(base, filepath.FromSlash(r.Launcher)),
+			controller:   filepath.Join(base, filepath.FromSlash(r.Controller)),
+			external:     false,
+			root:         root,
+			launcherRel:  filepath.FromSlash(r.Launcher),
+			launcherFile: launcherFile,
+			osName:       r.OS,
+			arch:         r.Architecture,
+		}, func() { root.Close() }, nil
 	}
 	return HostSlotView{}, noop, ErrHostConflict
 }
