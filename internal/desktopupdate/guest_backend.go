@@ -16,6 +16,18 @@ var ErrGuestTransport = errors.New("desktopupdate: guest update transport interr
 var ErrGuestNotConfigured = errors.New("desktopupdate: guest update is not configured")
 var ErrGuestCapacity = errors.New("desktopupdate: guest update retention is full")
 
+type guestProcessRetainedError struct{}
+
+func (guestProcessRetainedError) Error() string {
+	return "desktopupdate: guest process termination retained"
+}
+
+func (guestProcessRetainedError) Unwrap() error {
+	return ErrGuestTransport
+}
+
+var ErrGuestProcessRetained error = guestProcessRetainedError{}
+
 const guestResponseLimit = 64 << 10
 
 // GuestCommand can only be constructed by this adapter. A trusted native
@@ -134,6 +146,9 @@ func (g *GuestBackend) call(ctx context.Context, verb, attempt string, input io.
 	}
 	var output guestOutput
 	exit, e := g.options.Transport(ctx, GuestCommand{verb, attempt}, input, &output)
+	if errors.Is(e, ErrGuestProcessRetained) {
+		return e
+	}
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}

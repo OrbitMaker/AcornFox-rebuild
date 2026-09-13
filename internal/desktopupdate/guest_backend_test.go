@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -559,4 +560,113 @@ func TestGuestBackendIOCopyCaptureIsBounded(t *testing.T) {
 	if _, e = g.Observe(context.Background(), ""); !errors.Is(e, ErrGuestProtocol) {
 		t.Fatal("overflow was not rejected", e)
 	}
+}
+
+func TestGuestBackendRetainedProcessFatalPreserved(t *testing.T) {
+	f := newGuestFixture(t)
+	var callCount int
+	g := guestAdapter(t, f, func(_ context.Context, _ GuestCommand, _ io.Reader, _ io.Writer) (int, error) {
+		callCount++
+		return 0, ErrGuestProcessRetained
+	})
+
+	// 1. Observe preserves ErrGuestProcessRetained
+	_, err := g.Observe(context.Background(), "")
+	if !errors.Is(err, ErrGuestProcessRetained) {
+		t.Fatalf("expected ErrGuestProcessRetained from Observe, got %v", err)
+	}
+	if !errors.Is(err, ErrGuestTransport) {
+		t.Fatalf("expected ErrGuestProcessRetained to wrap ErrGuestTransport, got %v", err)
+	}
+
+	// 2. EnsureUpgrade preserves ErrGuestProcessRetained
+	callCountBefore := callCount
+	err = g.EnsureUpgrade(context.Background(), f.intent, f.bundle)
+	if !errors.Is(err, ErrGuestProcessRetained) {
+		t.Fatalf("expected ErrGuestProcessRetained from EnsureUpgrade, got %v", err)
+	}
+	if callCount-callCountBefore != 1 {
+		t.Fatalf("expected exactly 1 call (no second submit), got %d", callCount-callCountBefore)
+	}
+}
+
+func TestGuestBackendSubmitProducerStoppedAndJoinedOnRetainedFatal(t *testing.T) {
+	for _, withCancel := range []bool{false, true} {
+		t.Run(fmt.Sprintf("withCancel=%v", withCancel), func(t *testing.T) {
+			f := newGuestFixture(t)
+			var statusCalls, submitCalls int
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			g := guestAdapter(t, f, func(_ context.Context, cmd GuestCommand, in io.Reader, out io.Writer) (int, error) {
+				switch cmd.verb {
+				case "status":
+					statusCalls++
+					return guestWrite(out, guestReceipt{State: "absent"})
+				case "submit":
+					submitCalls++
+					if withCancel {
+						cancel()
+					}
+					// Consume partial stdin
+					buf := make([]byte, 16)
+					_, _ = in.Read(buf)
+					return 0, ErrGuestProcessRetained
+				default:
+					t.Fatalf("unexpected verb %s", cmd.verb)
+					return 1, nil
+				}
+			})
+
+			start := time.Now()
+			err := g.EnsureUpgrade(ctx, f.intent, f.bundle)
+			elapsed := time.Since(start)
+
+			if elapsed > 2*time.Second {
+				t.Fatalf("EnsureUpgrade took too long: %v", elapsed)
+			}
+			if !errors.Is(err, ErrGuestProcessRetained) {
+				t.Fatalf("expected ErrGuestProcessRetained, got %v", err)
+			}
+			if !errors.Is(err, ErrGuestTransport) {
+				t.Fatalf("expected ErrGuestProcessRetained to wrap ErrGuestTransport, got %v", err)
+			}
+			if statusCalls != 1 {
+				t.Errorf("expected 1 status call, got %d", statusCalls)
+			}
+			if submitCalls != 1 {
+				t.Errorf("expected exactly 1 submit call (no second submit), got %d", submitCalls)
+			}
+		})
+	}
+}
+
+func TestGuestBackendCallRetainedFatalPrecedenceOverOverflowAndCancel(t *testing.T) {
+	f := newGuestFixture(t)
+
+	// Subtest 1: output overflow + ErrGuestProcessRetained -> returns ErrGuestProcessRetained
+	t.Run("overflow_and_retained", func(t *testing.T) {
+		g := guestAdapter(t, f, func(_ context.Context, _ GuestCommand, _ io.Reader, out io.Writer) (int, error) {
+			// Write > 64KB to trigger overflow
+			_, _ = out.Write(bytes.Repeat([]byte("A"), guestResponseLimit+1024))
+			return 0, ErrGuestProcessRetained
+		})
+		_, err := g.Observe(context.Background(), "")
+		if !errors.Is(err, ErrGuestProcessRetained) {
+			t.Fatalf("expected ErrGuestProcessRetained to take precedence over overflow, got %v", err)
+		}
+	})
+
+	// Subtest 2: cancelled ctx + ErrGuestProcessRetained -> returns ErrGuestProcessRetained
+	t.Run("cancel_and_retained", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		g := guestAdapter(t, f, func(_ context.Context, _ GuestCommand, _ io.Reader, _ io.Writer) (int, error) {
+			cancel()
+			return 0, ErrGuestProcessRetained
+		})
+		_, err := g.Observe(ctx, "")
+		if !errors.Is(err, ErrGuestProcessRetained) {
+			t.Fatalf("expected ErrGuestProcessRetained to take precedence over ctx.Err(), got %v", err)
+		}
+	})
 }
