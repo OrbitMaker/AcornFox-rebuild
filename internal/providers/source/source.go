@@ -673,6 +673,8 @@ func (p *Provider) pinnedGitConfig(authority gitAuthority) []string {
 		"protocol.ext.allow=never",
 		"http.followRedirects=false",
 		"http.sslVerify=true",
+		// Keep Git transfers compatible with supported Linux HTTP stacks and egress paths.
+		"http.version=HTTP/1.1",
 		"http.curloptResolve=",
 		"http.curloptResolve=" + authority.host + ":" + strconv.Itoa(int(authority.port)) + ":" + joinGitAddresses(authority.addresses),
 		"fetch.recurseSubmodules=false",
