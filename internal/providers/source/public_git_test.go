@@ -25,7 +25,7 @@ func (r fixtureGitResolver) LookupNetIP(_ context.Context, host string) ([]netip
 	return append([]netip.Addr(nil), r.answers[host]...), nil
 }
 
-func TestResolveGitAuthorityRequiresMatchingExplicitPublicResolvers(t *testing.T) {
+func TestResolveGitAuthorityRequiresExplicitPublicResolvers(t *testing.T) {
 	provider := newTestProvider(t, t.TempDir(), t.TempDir())
 	address := netip.MustParseAddr("8.8.8.8")
 	provider.gitResolvers = []GitResolver{
@@ -42,7 +42,7 @@ func TestResolveGitAuthorityRequiresMatchingExplicitPublicResolvers(t *testing.T
 	}
 }
 
-func TestResolveGitAuthorityFailsClosedForInvalidAndDivergentTargets(t *testing.T) {
+func TestResolveGitAuthorityFailsClosedForInvalidTargets(t *testing.T) {
 	for _, locator := range []string{
 		"http://git.public.org/repo.git",
 		"https://127.0.0.1/repo.git",
@@ -73,8 +73,8 @@ func TestResolveGitAuthorityFailsClosedForInvalidAndDivergentTargets(t *testing.
 		fixtureGitResolver{answers: map[string][]netip.Addr{"git.public.org": {netip.MustParseAddr("1.1.1.1")}}},
 	}
 	git, _ := foundation.NormalizeGitSource("https://git.public.org/repo.git", "main")
-	if _, err := provider.resolveGitAuthority(context.Background(), git); !errors.Is(err, errGitResolverConflict) {
-		t.Fatalf("resolver conflict error=%v", err)
+	if authority, err := provider.resolveGitAuthority(context.Background(), git); err != nil || len(authority.addresses) != 2 {
+		t.Fatalf("regional public answers authority=%+v error=%v", authority, err)
 	}
 	provider.gitResolvers = nil
 	if _, err := provider.resolveGitAuthority(context.Background(), git); !errors.Is(err, errGitPolicyUnavailable) {

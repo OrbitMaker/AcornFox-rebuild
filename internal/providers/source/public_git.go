@@ -126,7 +126,7 @@ func (p *Provider) resolveGitAuthority(ctx context.Context, git foundation.GitSo
 	if len(p.gitResolvers) < minimumGitResolvers {
 		return gitAuthority{}, errGitPolicyUnavailable
 	}
-	answerSets := make([][]netip.Addr, 0, len(p.gitResolvers))
+	var resolved []netip.Addr
 	for _, resolver := range p.gitResolvers {
 		query, cancel := context.WithTimeout(ctx, gitResolverTimeout)
 		addresses, lookupErr := resolver.LookupNetIP(query, host)
@@ -134,18 +134,25 @@ func (p *Provider) resolveGitAuthority(ctx context.Context, git foundation.GitSo
 		if lookupErr != nil {
 			return gitAuthority{}, errGitResolverUnavailable
 		}
+		// Different regions may return different servers for one HTTPS host.
+		// Every answer must still be public; never hide a private address by
+		// filtering it out of an otherwise acceptable response.
+		for _, address := range addresses {
+			address = address.Unmap()
+			if !(p.testGitFixture && address.IsLoopback()) && !isPublicGitAddress(address) {
+				return gitAuthority{}, errGitRejected
+			}
+		}
 		normalized := normalizePublicGitAnswers(addresses, p.testGitFixture)
 		if len(normalized) == 0 {
 			return gitAuthority{}, errGitRejected
 		}
-		answerSets = append(answerSets, normalized)
+		resolved = append(resolved, normalized...)
 	}
-	for index := 1; index < len(answerSets); index++ {
-		if !sameGitAddressSet(answerSets[0], answerSets[index]) {
-			return gitAuthority{}, errGitResolverConflict
-		}
-	}
-	return gitAuthority{host: host, port: port, addresses: answerSets[0]}, nil
+	// Pin only these validated addresses for the whole Git operation. The
+	// existing HTTPS certificate verification authenticates the hostname;
+	// redirects and host-resolver fallback remain disabled.
+	return gitAuthority{host: host, port: port, addresses: normalizePublicGitAnswers(resolved, p.testGitFixture)}, nil
 }
 
 func validatePublicGitHostname(host string, fixture bool) error {
@@ -222,18 +229,6 @@ func normalizePublicGitAnswers(values []netip.Addr, fixture bool) []netip.Addr {
 	}
 	sort.Slice(result, func(left, right int) bool { return result[left].Less(result[right]) })
 	return result
-}
-
-func sameGitAddressSet(left, right []netip.Addr) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	for index := range left {
-		if left[index] != right[index] {
-			return false
-		}
-	}
-	return true
 }
 
 func isPublicGitAddress(address netip.Addr) bool {
