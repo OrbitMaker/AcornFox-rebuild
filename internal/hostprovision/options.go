@@ -5,6 +5,7 @@ import (
 
 	"github.com/open-card/open-card/internal/desktopupdate"
 	"github.com/open-card/open-card/internal/hostconfig"
+	"github.com/open-card/open-card/internal/hostoverlay"
 )
 
 // DefaultGuestInstancePath is the fixed path to the guest instance descriptor.
@@ -21,6 +22,8 @@ type ProvisionPaths struct {
 	SlotsRoot           string // Root for HostSlots (/var/lib/acornfox-host/slots)
 	SlotsLock           string // Precreated slot lockfile (/var/lib/acornfox-host/slots/lock)
 	ControllerRoot      string // Root for HostController (/var/lib/acornfox-host/controller)
+	UnitPath            string // Canonical host bootstrap unit file (/etc/systemd/system/acornfox-host-bootstrap.service)
+	EnableLinkPath      string // Canonical enable symlink (/etc/systemd/system/multi-user.target.wants/acornfox-host-bootstrap.service)
 }
 
 // provisionOptions configures internal execution. It is unexported to eliminate
@@ -45,6 +48,8 @@ func DefaultProductionPaths() ProvisionPaths {
 		SlotsRoot:           hostconfig.DefaultSlotsRoot,
 		SlotsLock:           filepath.Join(hostconfig.DefaultSlotsRoot, "lock"),
 		ControllerRoot:      hostconfig.DefaultControllerRoot,
+		UnitPath:            hostoverlay.BootstrapUnitPath,
+		EnableLinkPath:      hostoverlay.BootstrapEnableLinkPath,
 	}
 }
 

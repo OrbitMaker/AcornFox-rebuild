@@ -16,6 +16,7 @@ import (
 
 	"github.com/open-card/open-card/internal/desktopupdate"
 	"github.com/open-card/open-card/internal/hostconfig"
+	"github.com/open-card/open-card/internal/hostoverlay"
 )
 
 type guestInstanceFile struct {
@@ -72,6 +73,12 @@ func provisionWithOptions(ctx context.Context, req ProvisionRequest, opts provis
 	paths := opts.paths
 	if paths.BootstrapExecutable == "" {
 		paths = DefaultProductionPaths()
+	}
+	if paths.UnitPath == "" {
+		paths.UnitPath = hostoverlay.BootstrapUnitPath
+	}
+	if paths.EnableLinkPath == "" {
+		paths.EnableLinkPath = hostoverlay.BootstrapEnableLinkPath
 	}
 	if err := validateTargetPaths(paths); err != nil {
 		return nil, err
@@ -235,9 +242,13 @@ func validateConfiguredReentryPreclassified(
 	if err != nil || !cpInfo.Mode().IsRegular() || cpInfo.Mode()&os.ModeSymlink != 0 || cpInfo.Mode().Perm() != 0755 {
 		return nil, fmt.Errorf("%w: controller binary missing or invalid during reentry: %v", ErrProvisionConflict, err)
 	}
+	uInfo, err := os.Lstat(paths.UnitPath)
+	if err != nil || !uInfo.Mode().IsRegular() || uInfo.Mode()&os.ModeSymlink != 0 || uInfo.Mode().Perm() != 0644 {
+		return nil, fmt.Errorf("%w: bootstrap unit missing or invalid during reentry: %v", ErrProvisionConflict, err)
+	}
 
 	if !opts.allowNonRoot {
-		for _, info := range []os.FileInfo{sInfo, lInfo, cInfo, bInfo, brInfo, lpInfo, cpInfo} {
+		for _, info := range []os.FileInfo{sInfo, lInfo, cInfo, bInfo, brInfo, lpInfo, cpInfo, uInfo} {
 			st, ok := info.Sys().(*syscall.Stat_t)
 			if !ok || st.Uid != 0 || st.Gid != 0 {
 				return nil, fmt.Errorf("%w: target dependency not owned by root:root", ErrInsecurePath)
@@ -329,6 +340,11 @@ func validateConfiguredReentryPreclassified(
 		return nil, fmt.Errorf("%w: controller on disk mismatch: %v", ErrProvisionConflict, err)
 	}
 
+	// Verify stable bootstrap unit on disk
+	if err := checkExistingTarget(paths.UnitPath, hostoverlay.BootstrapUnitBytes(), 0644, opts.allowNonRoot); err != nil {
+		return nil, fmt.Errorf("%w: bootstrap unit on disk mismatch: %v", ErrProvisionConflict, err)
+	}
+
 	// Verify distinct inodes
 	if err := checkDistinctInodes(paths.LauncherPath, paths.ControllerPath); err != nil {
 		return nil, err
@@ -350,6 +366,21 @@ func validateConfiguredReentryPreclassified(
 	// Final validation before returning success
 	if err := lockOwner.Validate(); err != nil {
 		return nil, err
+	}
+
+	// Verify or complete canonical enable link on reentry
+	_, linkErr := os.Lstat(paths.EnableLinkPath)
+	if linkErr == nil {
+		if err := checkExistingEnableLink(paths.EnableLinkPath, hostoverlay.BootstrapEnableLinkTarget, opts.allowNonRoot); err != nil {
+			return nil, fmt.Errorf("%w: bootstrap enable link invalid on reentry: %v", ErrProvisionConflict, err)
+		}
+	} else if errors.Is(linkErr, os.ErrNotExist) {
+		// Valid resume: publish canonical enable link
+		if err := publishSafeSymlink(paths.EnableLinkPath, hostoverlay.BootstrapEnableLinkTarget, opts.allowNonRoot); err != nil {
+			return nil, err
+		}
+	} else {
+		return nil, linkErr
 	}
 
 	return &ProvisionReceipt{
@@ -469,6 +500,22 @@ func freshOrResumeProvisioningPreclassified(
 		return nil, err
 	}
 
+	// 5. Pre-inspection: stable bootstrap unit must match or be absent
+	if _, err := os.Lstat(paths.UnitPath); err == nil {
+		if err := checkExistingTarget(paths.UnitPath, hostoverlay.BootstrapUnitBytes(), 0644, opts.allowNonRoot); err != nil {
+			return nil, fmt.Errorf("%w: existing bootstrap unit mismatch: %v", ErrProvisionConflict, err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+
+	// 6. Pre-inspection: enable link must NOT exist when config is absent
+	if _, err := os.Lstat(paths.EnableLinkPath); err == nil {
+		return nil, fmt.Errorf("%w: bootstrap enable link exists before config", ErrProvisionConflict)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+
 	// ALL PRE-EXISTING ITEMS HAVE BEEN VERIFIED ADMISSIBLE. NOW MUTATE.
 
 	// 5. Ensure controller root and slots root exist with exact 0700
@@ -578,6 +625,16 @@ func freshOrResumeProvisioningPreclassified(
 		}
 	}
 
+	// Publish canonical host unit BEFORE config
+	if _, err := os.Lstat(paths.UnitPath); errors.Is(err, os.ErrNotExist) {
+		if err := ensureDirSafeExact(filepath.Dir(paths.UnitPath), 0755, opts.allowNonRoot); err != nil {
+			return nil, err
+		}
+		if err := writeSafeFileRoot(paths.UnitPath, hostoverlay.BootstrapUnitBytes(), 0644, opts.allowNonRoot, opts.ancestorHook); err != nil {
+			return nil, err
+		}
+	}
+
 	// 11. Construct canonical HostConfigFile
 	files := []hostconfig.HostBundleFileConfig{
 		{
@@ -651,6 +708,11 @@ func freshOrResumeProvisioningPreclassified(
 	}
 	defer pinned.Close()
 
+	// 14. Publish canonical enable link AFTER config
+	if err := publishSafeSymlink(paths.EnableLinkPath, hostoverlay.BootstrapEnableLinkTarget, opts.allowNonRoot); err != nil {
+		return nil, err
+	}
+
 	// Final validation before returning success
 	if err := lockOwner.Validate(); err != nil {
 		return nil, err
@@ -704,6 +766,8 @@ func validateTargetPaths(p ProvisionPaths) error {
 		"SlotsRoot":           p.SlotsRoot,
 		"SlotsLock":           p.SlotsLock,
 		"ControllerRoot":      p.ControllerRoot,
+		"UnitPath":            p.UnitPath,
+		"EnableLinkPath":      p.EnableLinkPath,
 	} {
 		if !filepath.IsAbs(path) || filepath.Clean(path) != path {
 			return fmt.Errorf("%w: target path %s (%q) must be clean absolute", ErrInsecurePath, name, path)

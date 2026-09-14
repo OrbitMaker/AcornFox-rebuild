@@ -21,6 +21,7 @@ import (
 
 	"github.com/open-card/open-card/internal/acornfoxsetup"
 	"github.com/open-card/open-card/internal/buildnetwork"
+	"github.com/open-card/open-card/internal/hostprovision"
 	"github.com/open-card/open-card/internal/install"
 	"github.com/open-card/open-card/internal/runtimenetwork"
 )
@@ -75,6 +76,11 @@ type upgradeCommandConfig struct {
 	publicOrigin         string
 	gitResolvers         string
 	deepSeekKeyFile      string
+	hostBundle           string
+	envelope             string
+	publicKey            string
+	channel              string
+	allowedHosts         string
 }
 
 type upgradeRuntime struct {
@@ -142,6 +148,8 @@ type acornFoxCleanDependencies struct {
 	configureAssistant      func(context.Context, string) (install.AcornFoxAssistantConfigReceiptV1, error)
 	disableAssistant        func(context.Context) (install.AcornFoxAssistantConfigReceiptV1, error)
 	waitLocalReady          func(context.Context) error
+	guestProvision          func(context.Context, overlayGuestProvisionRequest) (*overlayGuestProvisionReceipt, error)
+	hostProvision           func(context.Context, hostprovision.ProvisionRequest) (*hostprovision.ProvisionReceipt, error)
 }
 
 type productionBootstrapRuntimeDependencies struct {
@@ -276,6 +284,8 @@ func productionUpgradeDependencies() upgradeDependencies {
 			configureAssistant:    install.ConfigureAcornFoxAssistantV1,
 			disableAssistant:      install.DisableAcornFoxAssistantV1,
 			waitLocalReady:        install.VerifyAcornFoxLocalReadyV1,
+			guestProvision:        defaultProductionGuestProvision,
+			hostProvision:         hostprovision.Provision,
 		},
 	}
 }
@@ -554,6 +564,12 @@ func runAcornFoxClean(ctx context.Context, args []string, stdout io.Writer, role
 		}
 		return writeUpgradeJSON(stdout, exitOK, map[string]any{"ok": true, "command": config.command, "receipt": receipt})
 	}
+	if config.command == "initial-host-overlay-preflight" || config.command == "verify-initial-host-overlay" {
+		return runInitialHostOverlayPreflight(ctx, config, stdout, role, deps)
+	}
+	if config.command == "initial-host-overlay-apply" || config.command == "apply-initial-host-overlay" || config.command == "initial-host-overlay" {
+		return runInitialHostOverlayApply(ctx, config, stdout, role, deps)
+	}
 	var receipt install.AcornFoxHostBootstrapReceiptV1
 	switch config.command {
 	case "repository-bootstrap":
@@ -697,6 +713,37 @@ func parseAcornFoxCleanArgs(args []string) (upgradeCommandConfig, error) {
 			return upgradeCommandConfig{}, errors.New("invalid pending command")
 		}
 		config.pending = true
+	case "initial-host-overlay-preflight", "initial-host-overlay-apply", "verify-initial-host-overlay", "apply-initial-host-overlay", "initial-host-overlay":
+		flags := []string{"--host-bundle", "--envelope", "--public-key", "--channel", "--allowed-hosts", "--binding-sha256"}
+		if len(args) != 1+2*len(flags) || !containsExactly(args[1:], flags...) {
+			return upgradeCommandConfig{}, errors.New("invalid initial host overlay arguments")
+		}
+		for index := 1; index < len(args); index += 2 {
+			flag, value := args[index], args[index+1]
+			switch flag {
+			case "--host-bundle":
+				config.hostBundle = value
+			case "--envelope":
+				config.envelope = value
+			case "--public-key":
+				config.publicKey = value
+			case "--channel":
+				config.channel = value
+			case "--allowed-hosts":
+				config.allowedHosts = value
+			case "--binding-sha256":
+				config.bindingSHA256 = value
+			default:
+				return upgradeCommandConfig{}, errors.New("unsupported flag")
+			}
+		}
+		if !filepath.IsAbs(config.hostBundle) || filepath.Clean(config.hostBundle) != config.hostBundle || config.hostBundle == string(filepath.Separator) ||
+			!filepath.IsAbs(config.envelope) || filepath.Clean(config.envelope) != config.envelope || config.envelope == string(filepath.Separator) ||
+			!validCLISHA(config.publicKey) || !validCLISHA(config.bindingSHA256) ||
+			(config.channel != "stable" && config.channel != "beta") ||
+			config.allowedHosts == "" {
+			return upgradeCommandConfig{}, errors.New("invalid initial host overlay arguments")
+		}
 	default:
 		return upgradeCommandConfig{}, errors.New("unsupported clean command")
 	}

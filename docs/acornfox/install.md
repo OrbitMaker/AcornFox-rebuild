@@ -150,14 +150,28 @@ export ACORNFOX_INSTALL_CONFIRMATION=ACORNFOX-INSTALL
 export ACORNFOX_DEDICATED_HOST_CONFIRMATION=ACORNFOX-DEDICATED-HOST
 export ACORNFOX_PUBLIC_ORIGIN=https://console.example.com
 export ACORNFOX_GIT_RESOLVERS=1.1.1.1:53,8.8.8.8:53
+
+# 方式 A：纯后端 / Mac guest（8参数形式，仅安装后端核心服务）
 "$helpers/install-host.sh" \
   --candidate-dir "$candidate" \
   --binding-sha256 "$binding_sha256" \
   --bootstrap-helper "$helpers/acornfox-upgrade" \
   --bootstrap-helper-sha256 "$helper_sha256"
+
+# 方式 B：Linux 原生 Overlay（18参数全量形式，自动校验签名、安装 guest/host 机制与启用 host-bootstrap 服务）
+# "$helpers/install-host.sh" \
+#   --candidate-dir "$candidate" \
+#   --binding-sha256 "$binding_sha256" \
+#   --bootstrap-helper "$helpers/acornfox-upgrade" \
+#   --bootstrap-helper-sha256 "$helper_sha256" \
+#   --host-bundle "/path/to/host-bundle.tar.gz" \
+#   --envelope "/path/to/envelope.json" \
+#   --public-key "$trusted_ed25519_pubkey_hex" \
+#   --channel "stable" \
+#   --allowed-hosts "updates.acornfox.com"
 ```
 
-安装完成会输出含 `"code":"installed"` 和 `"ok":true` 的回执。安装失败时保留候选包、安装输出和已有安装目录，先诊断明确的失败点；不要删除安装日志、手动修改 `current` 链接或覆盖配置来跳过恢复流程。
+安装完成会输出含 `"code":"installed"` 和 `"ok":true` 的回执。Linux 原生形式下，安装脚本会在服务准备就绪后校验宿主签名 Overlay、部署本地 guest worker 及宿主运行时、启用并启动 `acornfox-host-bootstrap.service`。安装失败时保留候选包、安装输出和已有安装目录，先诊断明确的失败点；不要删除安装日志、手动修改 `current` 链接或覆盖配置来跳过恢复流程。
 
 ## 4. 创建管理员并登录
 

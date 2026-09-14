@@ -25,6 +25,7 @@ PGDG_TMP_CHILD_TYPES=()
 
 usage() {
   printf '%s\n' 'usage: install-host.sh --candidate-dir ABS --binding-sha256 HEX --bootstrap-helper ABS --bootstrap-helper-sha256 HEX'
+  printf '%s\n' '       install-host.sh --candidate-dir ABS --binding-sha256 HEX --bootstrap-helper ABS --bootstrap-helper-sha256 HEX --host-bundle ABS --envelope ABS --public-key HEX --channel STRING --allowed-hosts HOSTS'
 }
 
 bad_args() {
@@ -466,23 +467,76 @@ require_distinct_accounts() {
   done
 }
 
+has_native_overlay=0
+candidate_dir=""
+binding_sha256=""
+bootstrap_helper=""
+bootstrap_helper_sha256=""
+host_bundle=""
+envelope=""
+public_key=""
+channel=""
+allowed_hosts=""
+
 if [[ $# -eq 1 && $1 == --help ]]; then
   usage
   exit 0
 fi
-if [[ $# -ne 8 || $1 != --candidate-dir || $3 != --binding-sha256 || $5 != --bootstrap-helper || $7 != --bootstrap-helper-sha256 ]]; then
+if [[ $# -eq 8 ]]; then
+  if [[ $1 != --candidate-dir || $3 != --binding-sha256 || $5 != --bootstrap-helper || $7 != --bootstrap-helper-sha256 ]]; then
+    bad_args
+  fi
+  candidate_dir=$2
+  binding_sha256=$4
+  bootstrap_helper=$6
+  bootstrap_helper_sha256=$8
+elif [[ $# -eq 18 ]]; then
+  seen_flags=" "
+  flag_count=0
+  while [[ $# -gt 0 ]]; do
+    flag=$1
+    val=$2
+    shift 2
+
+    [[ $seen_flags != *" $flag "* ]] || bad_args
+    seen_flags+="$flag "
+    (( flag_count += 1 ))
+
+    case $flag in
+      --candidate-dir) candidate_dir=$val ;;
+      --binding-sha256) binding_sha256=$val ;;
+      --bootstrap-helper) bootstrap_helper=$val ;;
+      --bootstrap-helper-sha256) bootstrap_helper_sha256=$val ;;
+      --host-bundle) host_bundle=$val ;;
+      --envelope) envelope=$val ;;
+      --public-key) public_key=$val ;;
+      --channel) channel=$val ;;
+      --allowed-hosts) allowed_hosts=$val ;;
+      *) bad_args ;;
+    esac
+  done
+  if (( flag_count != 9 )) || [[ -z $candidate_dir || -z $binding_sha256 || -z $bootstrap_helper || -z $bootstrap_helper_sha256 || -z $host_bundle || -z $envelope || -z $public_key || -z $channel || -z $allowed_hosts ]]; then
+    bad_args
+  fi
+  has_native_overlay=1
+else
   bad_args
 fi
+
 [[ $(/usr/bin/id -u) -eq 0 ]] || fail
 [[ ${ACORNFOX_INSTALL_CONFIRMATION:-} == ACORNFOX-INSTALL ]] || fail
 [[ ${ACORNFOX_DEDICATED_HOST_CONFIRMATION:-} == ACORNFOX-DEDICATED-HOST ]] || fail
-candidate_dir=$2
-binding_sha256=$4
-bootstrap_helper=$6
-bootstrap_helper_sha256=$8
 is_sha256 "$binding_sha256" && is_sha256 "$bootstrap_helper_sha256" || fail
 safe_candidate_dir "$candidate_dir" || fail
 safe_helper "$bootstrap_helper" "$bootstrap_helper_sha256" || fail
+
+if (( has_native_overlay )); then
+  is_sha256 "$public_key" || fail
+  [[ $channel == stable || $channel == beta ]] || fail
+  [[ -n $allowed_hosts ]] || fail
+  [[ $host_bundle == /* && -f $host_bundle && ! -L $host_bundle ]] || fail
+  [[ $envelope == /* && -f $envelope && ! -L $envelope ]] || fail
+fi
 
 console_access=${ACORNFOX_CONSOLE_ACCESS:-public_https}
 public_origin=${ACORNFOX_PUBLIC_ORIGIN:-}
@@ -502,6 +556,16 @@ elif [[ $console_access == local_loopback ]]; then
   fi
 else
   fail
+fi
+
+if (( has_native_overlay )); then
+  "${CLEAN_ENV[@]}" "$bootstrap_helper" initial-host-overlay-preflight \
+    --host-bundle "$host_bundle" \
+    --envelope "$envelope" \
+    --public-key "$public_key" \
+    --channel "$channel" \
+    --allowed-hosts "$allowed_hosts" \
+    --binding-sha256 "$binding_sha256" >/dev/null || fail
 fi
 
 # stdout is reserved for machine-readable helper receipts. The preflight is
@@ -606,5 +670,19 @@ if clean_output /usr/bin/systemctl is-enabled --quiet acornfox-pi-worker.service
   fail
 fi
 [[ ! -e /run/acornfox-pi/worker.sock && ! -L /run/acornfox-pi/worker.sock ]] || fail
+
+if (( has_native_overlay )); then
+  "${CLEAN_ENV[@]}" "$bootstrap_helper" initial-host-overlay-apply \
+    --host-bundle "$host_bundle" \
+    --envelope "$envelope" \
+    --public-key "$public_key" \
+    --channel "$channel" \
+    --allowed-hosts "$allowed_hosts" \
+    --binding-sha256 "$binding_sha256" >/dev/null || fail
+  effect /usr/bin/systemctl daemon-reload
+  effect /usr/bin/systemctl enable --now acornfox-host-bootstrap.service
+  clean_output /usr/bin/systemctl is-enabled --quiet acornfox-host-bootstrap.service || fail
+  clean_output /usr/bin/systemctl is-active --quiet acornfox-host-bootstrap.service || fail
+fi
 
 printf '{"code":"installed","ok":true,"schema_version":1}\n'

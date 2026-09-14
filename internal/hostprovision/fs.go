@@ -727,3 +727,120 @@ func isValidHexSHA256(s string) bool {
 	}
 	return true
 }
+
+// publishSafeSymlink ensures parent directory exists with 0755 root ownership,
+// opens verified parent *os.Root, checks for existing link (verifying canonical target/symlink/single-link),
+// creates symlink descriptor-relative via root.Symlink if absent, sets Lchown if needed,
+// fsyncs parent directory descriptor, post-verifies the created link, and revalidates pins.
+func publishSafeSymlink(linkPath string, target string, allowNonRoot bool) error {
+	parentDir := filepath.Dir(linkPath)
+	baseName := filepath.Base(linkPath)
+
+	if err := ensureDirSafeExact(parentDir, 0755, allowNonRoot); err != nil {
+		return err
+	}
+
+	root, pins, err := openVerifiedRoot(parentDir, allowNonRoot)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = root.Close()
+		closePins(pins)
+	}()
+
+	info, err := root.Lstat(baseName)
+	if err == nil {
+		if info.Mode()&os.ModeSymlink == 0 {
+			return fmt.Errorf("%w: enable link %q is not a symlink", ErrProvisionConflict, linkPath)
+		}
+		st, ok := info.Sys().(*syscall.Stat_t)
+		if !ok || st.Nlink != 1 {
+			return fmt.Errorf("%w: enable link %q nlink != 1", ErrProvisionConflict, linkPath)
+		}
+		if !allowNonRoot && (st.Uid != 0 || st.Gid != 0) {
+			return fmt.Errorf("%w: enable link %q not owned by root:root", ErrInsecurePath, linkPath)
+		}
+		actualTarget, err := root.Readlink(baseName)
+		if err != nil || actualTarget != target {
+			return fmt.Errorf("%w: enable link %q target mismatch: got %q, want %q", ErrProvisionConflict, linkPath, actualTarget, target)
+		}
+		return revalidatePins(pins)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
+	// Link is absent: create descriptor-relative symlink via root
+	if err := root.Symlink(target, baseName); err != nil {
+		return fmt.Errorf("%w: root.Symlink failed for %q -> %q: %v", ErrProvisionConflict, baseName, target, err)
+	}
+
+	if !allowNonRoot {
+		if err := root.Lchown(baseName, 0, 0); err != nil {
+			_ = root.Remove(baseName)
+			return fmt.Errorf("root.Lchown failed for %q: %w", baseName, err)
+		}
+	}
+
+	parentFD := pins[len(pins)-1]
+	if err := parentFD.Sync(); err != nil {
+		return fmt.Errorf("failed to fsync parent directory %q: %w", parentDir, err)
+	}
+
+	infoAfter, err := root.Lstat(baseName)
+	if err != nil {
+		return fmt.Errorf("%w: failed to lstat created symlink %q: %v", ErrInsecurePath, baseName, err)
+	}
+	if infoAfter.Mode()&os.ModeSymlink == 0 {
+		return fmt.Errorf("%w: created link %q is not a symlink", ErrInsecurePath, baseName)
+	}
+	stAfter, ok := infoAfter.Sys().(*syscall.Stat_t)
+	if !ok || stAfter.Nlink != 1 {
+		return fmt.Errorf("%w: created link %q nlink != 1", ErrInsecurePath, baseName)
+	}
+	if !allowNonRoot && (stAfter.Uid != 0 || stAfter.Gid != 0) {
+		return fmt.Errorf("%w: created link %q not owned by root:root", ErrInsecurePath, baseName)
+	}
+	actualTarget, err := root.Readlink(baseName)
+	if err != nil || actualTarget != target {
+		return fmt.Errorf("%w: created link %q target mismatch: got %q, want %q", ErrInsecurePath, baseName, actualTarget, target)
+	}
+
+	return revalidatePins(pins)
+}
+
+// checkExistingEnableLink inspects an existing symlink to verify it matches
+// canonical expectations without mutating anything.
+func checkExistingEnableLink(linkPath, expectedTarget string, allowNonRoot bool) error {
+	parentDir := filepath.Dir(linkPath)
+	baseName := filepath.Base(linkPath)
+
+	root, pins, err := openVerifiedRoot(parentDir, allowNonRoot)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = root.Close()
+		closePins(pins)
+	}()
+
+	info, err := root.Lstat(baseName)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		return fmt.Errorf("%w: link %q is not a symlink", ErrProvisionConflict, linkPath)
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || st.Nlink != 1 {
+		return fmt.Errorf("%w: link %q nlink != 1", ErrProvisionConflict, linkPath)
+	}
+	if !allowNonRoot && (st.Uid != 0 || st.Gid != 0) {
+		return fmt.Errorf("%w: link %q not owned by root:root", ErrInsecurePath, linkPath)
+	}
+	actualTarget, err := root.Readlink(baseName)
+	if err != nil || actualTarget != expectedTarget {
+		return fmt.Errorf("%w: link %q target mismatch: got %q, want %q", ErrProvisionConflict, linkPath, actualTarget, expectedTarget)
+	}
+	return revalidatePins(pins)
+}

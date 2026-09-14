@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -693,4 +694,148 @@ func TestG6HostPreflightAndProductionBuildKitCapacityStayFixed(t *testing.T) {
 			t.Fatalf("uninstall does not safely manage %q", required)
 		}
 	}
+}
+
+func TestAcornFoxInstallHostScriptArgumentsAndOrder(t *testing.T) {
+	scriptPath := filepath.Join(scriptRoot(t), "scripts", "acornfox", "install-host.sh")
+	sha := strings.Repeat("a", 64)
+
+	t.Run("Help", func(t *testing.T) {
+		out, err := runScript(t, scriptPath, "--help")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.Contains(out, "usage: install-host.sh --candidate-dir") {
+			t.Fatalf("missing usage line: %s", out)
+		}
+		if !strings.Contains(out, "--host-bundle") {
+			t.Fatalf("missing native overlay usage line: %s", out)
+		}
+	})
+
+	t.Run("Legacy8ArgsArgumentValidation", func(t *testing.T) {
+		out, err := runScript(t, scriptPath,
+			"--candidate-dir", "/opt/candidate",
+			"--binding-sha256", sha,
+			"--bootstrap-helper", "/opt/helper",
+			"--bootstrap-helper-sha256", sha,
+		)
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 23 {
+			t.Fatalf("expected exit 23 (pre-effect check failure), got %v, out=%s", err, out)
+		}
+
+		out, err = runScript(t, scriptPath,
+			"--candidate-dir", "/opt/candidate",
+			"--binding-sha256", sha,
+			"--wrong-flag", "/opt/helper",
+			"--bootstrap-helper-sha256", sha,
+		)
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 2 {
+			t.Fatalf("expected exit 2 (bad_args), got %v, out=%s", err, out)
+		}
+	})
+
+	t.Run("Native18ArgsArgumentValidation", func(t *testing.T) {
+		out, err := runScript(t, scriptPath,
+			"--candidate-dir", "/opt/candidate",
+			"--binding-sha256", sha,
+			"--bootstrap-helper", "/opt/helper",
+			"--bootstrap-helper-sha256", sha,
+			"--host-bundle", "/opt/bundle.tar.gz",
+			"--envelope", "/opt/envelope.json",
+			"--public-key", sha,
+			"--channel", "stable",
+			"--allowed-hosts", "updates.acornfox.test",
+		)
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 23 {
+			t.Fatalf("expected exit 23 (pre-effect check failure), got %v, out=%s", err, out)
+		}
+
+		out, err = runScript(t, scriptPath,
+			"--candidate-dir", "/opt/candidate",
+			"--binding-sha256", sha,
+			"--bootstrap-helper", "/opt/helper",
+			"--bootstrap-helper-sha256", sha,
+			"--host-bundle", "/opt/bundle.tar.gz",
+			"--envelope", "/opt/envelope.json",
+			"--public-key", sha,
+			"--channel", "stable",
+		)
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 2 {
+			t.Fatalf("expected exit 2 (bad_args), got %v, out=%s", err, out)
+		}
+
+		out, err = runScript(t, scriptPath,
+			"--candidate-dir", "/opt/candidate",
+			"--binding-sha256", sha,
+			"--bootstrap-helper", "/opt/helper",
+			"--bootstrap-helper-sha256", sha,
+			"--host-bundle", "/opt/bundle.tar.gz",
+			"--envelope", "/opt/envelope.json",
+			"--public-key", sha,
+			"--channel", "stable",
+			"--channel", "stable",
+		)
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 2 {
+			t.Fatalf("expected exit 2 (bad_args), got %v, out=%s", err, out)
+		}
+
+		out, err = runScript(t, scriptPath,
+			"--candidate-dir", "/opt/candidate",
+			"--binding-sha256", sha,
+			"--bootstrap-helper", "/opt/helper",
+			"--bootstrap-helper-sha256", sha,
+			"--host-bundle", "/opt/bundle.tar.gz",
+			"--envelope", "/opt/envelope.json",
+			"--public-key", sha,
+			"--channel", "stable",
+			"--unknown-flag", "val",
+		)
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 2 {
+			t.Fatalf("expected exit 2 (bad_args), got %v, out=%s", err, out)
+		}
+	})
+
+	t.Run("ScriptSequencingVerification", func(t *testing.T) {
+		raw, err := os.ReadFile(scriptPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := string(raw)
+
+		preflightIdx := strings.Index(text, "initial-host-overlay-preflight")
+		preflightPhaseIdx := strings.Index(text, `"$PREFLIGHT" --phase pre`)
+		aptIdx := strings.Index(text, "apt_effect install")
+		applyIdx := strings.Index(text, "initial-host-overlay-apply")
+		reloadIdx := strings.Index(text, "systemctl daemon-reload")
+		enableIdx := strings.Index(text, "systemctl enable --now acornfox-host-bootstrap.service")
+		isActiveIdx := strings.Index(text, "systemctl is-active --quiet acornfox-host-bootstrap.service")
+
+		if preflightIdx == -1 || preflightPhaseIdx == -1 || aptIdx == -1 || applyIdx == -1 || reloadIdx == -1 || enableIdx == -1 || isActiveIdx == -1 {
+			t.Fatalf("missing required sequencing steps in install-host.sh: preflight=%d, preflightPhase=%d, apt=%d, apply=%d, reload=%d, enable=%d, active=%d", preflightIdx, preflightPhaseIdx, aptIdx, applyIdx, reloadIdx, enableIdx, isActiveIdx)
+		}
+
+		if preflightIdx >= preflightPhaseIdx {
+			t.Fatal("initial-host-overlay-preflight must run before host-preflight.sh")
+		}
+		if preflightPhaseIdx >= aptIdx {
+			t.Fatal("preflight phase pre must run before apt install")
+		}
+		if applyIdx <= aptIdx {
+			t.Fatal("initial-host-overlay-apply must run after backend package setup")
+		}
+		nativeApplyIdx := strings.LastIndex(text, "initial-host-overlay-apply")
+		nativeReloadIdx := strings.LastIndex(text, "systemctl daemon-reload")
+		if nativeApplyIdx >= nativeReloadIdx {
+			t.Fatal("initial-host-overlay-apply must run before daemon-reload")
+		}
+		if nativeReloadIdx >= enableIdx {
+			t.Fatal("systemctl daemon-reload must run before systemctl enable --now")
+		}
+		if enableIdx >= isActiveIdx {
+			t.Fatal("systemctl enable --now must run before systemctl is-active")
+		}
+	})
 }

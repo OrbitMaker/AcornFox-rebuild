@@ -23,7 +23,9 @@ The provisioner targets the exact paths defined by the immutable host configurat
 | `/var/lib/acornfox-host/slots` | `0700` | `root:root` | Durable HostSlots state root |
 | `/var/lib/acornfox-host/slots/lock` | `0600` | `root:root` | Precreated slot mutex lockfile |
 | `/var/lib/acornfox-host/controller` | `0700` | `root:root` | Durable HostController state root |
-| `/etc/acornfox-host/host-runtime.json` | `0600` | `root:root` | Immutable host runtime configuration (published **last**) |
+| `/etc/systemd/system/acornfox-host-bootstrap.service` | `0644` | `root:root` | Canonical systemd service unit (published **before** config) |
+| `/etc/systemd/system/multi-user.target.wants/acornfox-host-bootstrap.service` | `symlink` | `root:root` | Canonical enable symlink (published **after** config) |
+| `/etc/acornfox-host/host-runtime.json` | `0600` | `root:root` | Immutable host runtime configuration |
 
 Runtime directory `/run/acornfox-host` is owned by systemd's `RuntimeDirectory` in `acornfox-host-bootstrap.service` (`RemainAfterExit=yes`), not by this provisioner. State ledgers (`state.json` and `ledger.json`) are never initialized by this provisioner; they are owned and initialized by real `HostSlots` and `HostController.Status`.
 
@@ -51,15 +53,17 @@ Runtime directory `/run/acornfox-host` is owned by systemd's `RuntimeDirectory` 
    Any mismatch or failure blocks publication and leaves existing state untouched.
 6. **Distinct C0 Binaries & No-Clobber Installation**:
    Launcher (`acornfox-host-launcher`) and controller (`acornfox-host-update`) are installed at separate paths with distinct inodes (`st.Ino`). Hardlinks between them are rejected (`checkDistinctInodes`). Files are published atomically via temporary file creation, `f.Sync()`, and `os.Link` (failing closed if target exists).
-7. **Canonical Policy & Policy-Last Publishing**:
-   The host policy source (`PolicySourcePath`) must be strictly canonical JSON matching `hostconfig.ConfigPolicyFile` without non-standard whitespace or reordered keys; `ExpectedPolicySHA256` and the receipt `PolicySHA256` refer to these exact canonical bytes without reentry hash drift.
-   `host-runtime.json` is published strictly last after all files and roots are verified. It is marshaled using `hostconfig.HostConfigFile` with deterministically sorted files, written via pinned descriptor-relative operations (`writeSafeFilePinned`), fsynced, atomically linked, and the parent directory is fsynced.
+7. **Canonical Unit, Policy, and Enable Link Publication Order**:
+   - The canonical service unit (`/etc/systemd/system/acornfox-host-bootstrap.service`) is published **before** `host-runtime.json` with mode `0644` and root ownership.
+   - The host policy source (`PolicySourcePath`) must be strictly canonical JSON matching `hostconfig.ConfigPolicyFile` without non-standard whitespace or reordered keys; `ExpectedPolicySHA256` and the receipt `PolicySHA256` refer to these exact canonical bytes without reentry hash drift.
+   - `host-runtime.json` is published after the unit and binaries are verified.
+   - The canonical enable symlink (`/etc/systemd/system/multi-user.target.wants/acornfox-host-bootstrap.service` -> `../acornfox-host-bootstrap.service`) is published **after** `host-runtime.json`.
 8. **Dual Production Verification**:
    Immediately following publication (or upon re-entry), the config and tree are validated using production `hostconfig.ReadAndValidateConfigFile` and `desktopupdate.PinHostBootstrap`.
 9. **Pre-Mutation Classification & Re-entry State Preservation**:
    - The provisioner classifies existing state before any directory creation or lockfile mutation.
-   - When `host-runtime.json` already exists (configured re-entry), all dependencies (`slots`, `slots/lock`, `controller`, `bootstrap`, `launcher`, `controller`) must pre-exist with exact modes and root ownership. Missing dependencies fail closed without repairing state. Lock is opened without `O_CREATE`. Pre-existing durable state (`state.json`, `ledger.json`, active slots) is preserved and never reset, clobbered, or adopted.
-   - When `host-runtime.json` is absent (fresh or resume), controller root must be empty (preventing adoption of unmanaged or torn state) and slots root may contain at most `lock`. Any foreign file causes immediate failure before creating slots or locks.
+   - When `host-runtime.json` already exists (configured re-entry), all dependencies (`slots`, `slots/lock`, `controller`, `bootstrap`, `launcher`, `controller`, `unit`) must pre-exist with exact modes and root ownership. Missing dependencies fail closed without repairing state. Lock is opened without `O_CREATE`. Pre-existing durable state (`state.json`, `ledger.json`, active slots) is preserved and never reset, clobbered, or adopted. If the enable link is missing, reentry completes only the canonical link (valid resume). If the link exists but is mismatched, it fails closed without clobber.
+   - When `host-runtime.json` is absent (fresh or resume), controller root must be empty (preventing adoption of unmanaged or torn state) and slots root may contain at most `lock`. The canonical unit may pre-exist in a staged unit-only state (valid resume); any mismatched unit or existing enable link before config causes immediate failure before creating slots or locks.
 10. **Secret-Free Bounded Receipts & Error Desensitization**:
     Receipts contain only instance ID, bootstrap ID, version, binding hash, and artifact SHA-256 digests. Errors never expose raw child stderr, private keys, or internal tokens. Positional or trailing CLI arguments are strictly rejected.
 

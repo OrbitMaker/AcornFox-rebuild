@@ -21,6 +21,7 @@ import (
 
 	"github.com/open-card/open-card/internal/desktopupdate"
 	"github.com/open-card/open-card/internal/hostconfig"
+	"github.com/open-card/open-card/internal/hostoverlay"
 )
 
 var (
@@ -210,6 +211,8 @@ func setupIsolatedTestEnv(t *testing.T) (string, ProvisionPaths, string, string)
 		SlotsRoot:           filepath.Join(targetDir, "slots"),
 		SlotsLock:           filepath.Join(targetDir, "slots", "lock"),
 		ControllerRoot:      filepath.Join(targetDir, "controller"),
+		UnitPath:            filepath.Join(targetDir, "systemd", "system", "acornfox-host-bootstrap.service"),
+		EnableLinkPath:      filepath.Join(targetDir, "systemd", "system", "multi-user.target.wants", "acornfox-host-bootstrap.service"),
 	}
 
 	return tmpDir, paths, stagingDir, targetDir
@@ -1264,5 +1267,294 @@ func TestProvisionCanceledObserve(t *testing.T) {
 
 	if _, err := os.Lstat(paths.ConfigPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("host-runtime.json should not exist when context canceled")
+	}
+}
+
+// 16. TestProvisionUnitAndLinkPublication: verifies canonical unit and enable link
+// publication ordering, interruption resume, and fail-closed mismatch handling.
+func TestProvisionUnitAndLinkPublication(t *testing.T) {
+	t.Run("FreshSuccessPublishesUnitAndLink", func(t *testing.T) {
+		_, paths, stagingDir, _ := setupIsolatedTestEnv(t)
+		req, instanceID := setupValidSources(t, stagingDir, paths.GuestInstancePath, "1.0.0", strings.Repeat("d", 64))
+
+		opts := provisionOptions{
+			allowNonRoot:   true,
+			paths:          paths,
+			guestTransport: createMockGuestTransport(instanceID, req.BootstrapBackendBinding, nil),
+		}
+
+		receipt, err := provisionWithOptions(context.Background(), req, opts)
+		if err != nil {
+			t.Fatalf("provision failed: %v", err)
+		}
+		if receipt == nil {
+			t.Fatal("nil receipt")
+		}
+
+		// Verify unit file
+		uData, err := os.ReadFile(paths.UnitPath)
+		if err != nil {
+			t.Fatalf("failed to read unit file: %v", err)
+		}
+		if !bytes.Equal(uData, hostoverlay.BootstrapUnitBytes()) {
+			t.Fatal("unit file content mismatch")
+		}
+		uInfo, err := os.Lstat(paths.UnitPath)
+		if err != nil || uInfo.Mode().Perm() != 0644 || uInfo.Mode()&os.ModeSymlink != 0 {
+			t.Fatalf("invalid unit file mode: %v", uInfo)
+		}
+
+		// Verify enable link
+		linkInfo, err := os.Lstat(paths.EnableLinkPath)
+		if err != nil || linkInfo.Mode()&os.ModeSymlink == 0 {
+			t.Fatalf("enable link is not a symlink: %v", linkInfo)
+		}
+		target, err := os.Readlink(paths.EnableLinkPath)
+		if err != nil || target != hostoverlay.BootstrapEnableLinkTarget {
+			t.Fatalf("enable link target mismatch: got %q, want %q", target, hostoverlay.BootstrapEnableLinkTarget)
+		}
+	})
+
+	t.Run("InterruptionAfterUnitResumeSucceeds", func(t *testing.T) {
+		_, paths, stagingDir, _ := setupIsolatedTestEnv(t)
+		req, instanceID := setupValidSources(t, stagingDir, paths.GuestInstancePath, "1.0.0", strings.Repeat("d", 64))
+
+		// Pre-create exact unit (staged interruption state)
+		if err := os.MkdirAll(filepath.Dir(paths.UnitPath), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(paths.UnitPath, hostoverlay.BootstrapUnitBytes(), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		opts := provisionOptions{
+			allowNonRoot:   true,
+			paths:          paths,
+			guestTransport: createMockGuestTransport(instanceID, req.BootstrapBackendBinding, nil),
+		}
+
+		receipt, err := provisionWithOptions(context.Background(), req, opts)
+		if err != nil {
+			t.Fatalf("provision failed: %v", err)
+		}
+		if receipt == nil {
+			t.Fatal("nil receipt")
+		}
+
+		// Verify config and link are now published
+		if _, err := os.Lstat(paths.ConfigPath); err != nil {
+			t.Fatalf("config missing after resume: %v", err)
+		}
+		target, err := os.Readlink(paths.EnableLinkPath)
+		if err != nil || target != hostoverlay.BootstrapEnableLinkTarget {
+			t.Fatalf("enable link target mismatch: got %q, want %q", target, hostoverlay.BootstrapEnableLinkTarget)
+		}
+	})
+
+	t.Run("InterruptionAfterConfigMissingLinkResumeCompletesLink", func(t *testing.T) {
+		_, paths, stagingDir, _ := setupIsolatedTestEnv(t)
+		req, instanceID := setupValidSources(t, stagingDir, paths.GuestInstancePath, "1.0.0", strings.Repeat("d", 64))
+
+		opts := provisionOptions{
+			allowNonRoot:   true,
+			paths:          paths,
+			guestTransport: createMockGuestTransport(instanceID, req.BootstrapBackendBinding, nil),
+		}
+
+		// Initial provision
+		_, err := provisionWithOptions(context.Background(), req, opts)
+		if err != nil {
+			t.Fatalf("initial provision failed: %v", err)
+		}
+
+		// Simulate interruption: remove only the enable link while keeping config and all dependencies intact
+		if err := os.Remove(paths.EnableLinkPath); err != nil {
+			t.Fatal(err)
+		}
+
+		// Reentry should complete only the missing link without error
+		receipt, err := provisionWithOptions(context.Background(), req, opts)
+		if err != nil {
+			t.Fatalf("reentry failed: %v", err)
+		}
+		if receipt == nil {
+			t.Fatal("nil receipt")
+		}
+
+		// Verify enable link was restored
+		target, err := os.Readlink(paths.EnableLinkPath)
+		if err != nil || target != hostoverlay.BootstrapEnableLinkTarget {
+			t.Fatalf("enable link target mismatch after reentry: got %q, want %q", target, hostoverlay.BootstrapEnableLinkTarget)
+		}
+	})
+
+	t.Run("LinkOnlyRejectedWithoutClobber", func(t *testing.T) {
+		_, paths, stagingDir, _ := setupIsolatedTestEnv(t)
+		req, instanceID := setupValidSources(t, stagingDir, paths.GuestInstancePath, "1.0.0", strings.Repeat("d", 64))
+
+		// Pre-create only the enable link, unit absent
+		if err := os.MkdirAll(filepath.Dir(paths.EnableLinkPath), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(hostoverlay.BootstrapEnableLinkTarget, paths.EnableLinkPath); err != nil {
+			t.Fatal(err)
+		}
+
+		opts := provisionOptions{
+			allowNonRoot:   true,
+			paths:          paths,
+			guestTransport: createMockGuestTransport(instanceID, req.BootstrapBackendBinding, nil),
+		}
+
+		_, err := provisionWithOptions(context.Background(), req, opts)
+		if !errors.Is(err, ErrProvisionConflict) {
+			t.Fatalf("expected ErrProvisionConflict for link-only, got %v", err)
+		}
+
+		// Config must not exist
+		if _, err := os.Lstat(paths.ConfigPath); !errors.Is(err, os.ErrNotExist) {
+			t.Fatal("config must not be created on conflict")
+		}
+	})
+
+	t.Run("UnitByteMismatchRejectedWithoutClobber", func(t *testing.T) {
+		_, paths, stagingDir, _ := setupIsolatedTestEnv(t)
+		req, instanceID := setupValidSources(t, stagingDir, paths.GuestInstancePath, "1.0.0", strings.Repeat("d", 64))
+
+		// Pre-create unit with tampered bytes
+		if err := os.MkdirAll(filepath.Dir(paths.UnitPath), 0755); err != nil {
+			t.Fatal(err)
+		}
+		corruptedBytes := append([]byte(nil), hostoverlay.BootstrapUnitBytes()...)
+		corruptedBytes[0] = 'X'
+		if err := os.WriteFile(paths.UnitPath, corruptedBytes, 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		opts := provisionOptions{
+			allowNonRoot:   true,
+			paths:          paths,
+			guestTransport: createMockGuestTransport(instanceID, req.BootstrapBackendBinding, nil),
+		}
+
+		_, err := provisionWithOptions(context.Background(), req, opts)
+		if !errors.Is(err, ErrProvisionConflict) {
+			t.Fatalf("expected ErrProvisionConflict for unit mismatch, got %v", err)
+		}
+
+		// Original corrupted bytes must not be overwritten
+		data, _ := os.ReadFile(paths.UnitPath)
+		if !bytes.Equal(data, corruptedBytes) {
+			t.Fatal("corrupted unit was overwritten")
+		}
+	})
+
+	t.Run("LinkTargetMismatchRejectedWithoutClobber", func(t *testing.T) {
+		_, paths, stagingDir, _ := setupIsolatedTestEnv(t)
+		req, instanceID := setupValidSources(t, stagingDir, paths.GuestInstancePath, "1.0.0", strings.Repeat("d", 64))
+
+		// Initial provision
+		opts := provisionOptions{
+			allowNonRoot:   true,
+			paths:          paths,
+			guestTransport: createMockGuestTransport(instanceID, req.BootstrapBackendBinding, nil),
+		}
+		_, err := provisionWithOptions(context.Background(), req, opts)
+		if err != nil {
+			t.Fatalf("setup provision failed: %v", err)
+		}
+
+		// Replace link with wrong target
+		_ = os.Remove(paths.EnableLinkPath)
+		if err := os.Symlink("/etc/wrong-target", paths.EnableLinkPath); err != nil {
+			t.Fatal(err)
+		}
+
+		_, err = provisionWithOptions(context.Background(), req, opts)
+		if !errors.Is(err, ErrProvisionConflict) {
+			t.Fatalf("expected ErrProvisionConflict for wrong link target, got %v", err)
+		}
+
+		// Wrong target must remain untouched
+		target, _ := os.Readlink(paths.EnableLinkPath)
+		if target != "/etc/wrong-target" {
+			t.Fatal("wrong link target was overwritten")
+		}
+	})
+
+	t.Run("LinkNotASymlinkRejectedWithoutClobber", func(t *testing.T) {
+		_, paths, stagingDir, _ := setupIsolatedTestEnv(t)
+		req, instanceID := setupValidSources(t, stagingDir, paths.GuestInstancePath, "1.0.0", strings.Repeat("d", 64))
+
+		// Initial provision
+		opts := provisionOptions{
+			allowNonRoot:   true,
+			paths:          paths,
+			guestTransport: createMockGuestTransport(instanceID, req.BootstrapBackendBinding, nil),
+		}
+		_, err := provisionWithOptions(context.Background(), req, opts)
+		if err != nil {
+			t.Fatalf("setup provision failed: %v", err)
+		}
+
+		// Replace link with regular file
+		_ = os.Remove(paths.EnableLinkPath)
+		if err := os.WriteFile(paths.EnableLinkPath, []byte("not a symlink"), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		_, err = provisionWithOptions(context.Background(), req, opts)
+		if !errors.Is(err, ErrProvisionConflict) {
+			t.Fatalf("expected ErrProvisionConflict for non-symlink, got %v", err)
+		}
+	})
+
+	t.Run("ExactReentryBothUnitAndLinkExistIdempotent", func(t *testing.T) {
+		_, paths, stagingDir, _ := setupIsolatedTestEnv(t)
+		req, instanceID := setupValidSources(t, stagingDir, paths.GuestInstancePath, "1.0.0", strings.Repeat("d", 64))
+
+		opts := provisionOptions{
+			allowNonRoot:   true,
+			paths:          paths,
+			guestTransport: createMockGuestTransport(instanceID, req.BootstrapBackendBinding, nil),
+		}
+		receipt1, err := provisionWithOptions(context.Background(), req, opts)
+		if err != nil {
+			t.Fatalf("initial provision failed: %v", err)
+		}
+
+		receipt2, err := provisionWithOptions(context.Background(), req, opts)
+		if err != nil {
+			t.Fatalf("second provision failed: %v", err)
+		}
+		if receipt1.InstanceID != receipt2.InstanceID || receipt1.ConfigSHA256 != receipt2.ConfigSHA256 {
+			t.Fatal("receipt mismatch across idempotent reentry")
+		}
+	})
+}
+
+func TestProvisionReentryCanceledDoesNotEnable(t *testing.T) {
+	_, paths, stagingDir, _ := setupIsolatedTestEnv(t)
+	req, instanceID := setupValidSources(t, stagingDir, paths.GuestInstancePath, "1.0.0", strings.Repeat("d", 64))
+	opts := provisionOptions{allowNonRoot: true, paths: paths, guestTransport: createMockGuestTransport(instanceID, req.BootstrapBackendBinding, nil)}
+	if _, err := provisionWithOptions(context.Background(), req, opts); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(paths.EnableLinkPath); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	opts.ancestorHook = func(stage, path string) error {
+		if stage == "after-lock-return" {
+			cancel()
+		}
+		return nil
+	}
+	if _, err := provisionWithOptions(ctx, req, opts); err == nil {
+		t.Fatal("canceled reentry was accepted")
+	}
+	if _, err := os.Lstat(paths.EnableLinkPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("canceled reentry published enable link: %v", err)
 	}
 }
