@@ -18,6 +18,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"syscall"
@@ -25,6 +26,9 @@ import (
 
 	"github.com/open-card/open-card/internal/desktopupdate"
 )
+
+// PEM boundary markers identify key material; bare words also occur in compiled Go diagnostics.
+var privatePEMMarker = regexp.MustCompile(`-----(?:BEGIN|END) [A-Z0-9 ]*PRIVATE[A-Z0-9 ]*-----`)
 
 type BuildOptions struct {
 	SpecPath   string
@@ -398,7 +402,7 @@ func scanPayloadDirectory(root *os.Root) ([]desktopupdate.HostBundleFile, map[st
 		}
 
 		// Defense-in-depth: check for private key material in payload files
-		if bytes.Contains(data, []byte("PRIVATE KEY")) {
+		if privatePEMMarker.Match(data) {
 			return fmt.Errorf("private key material detected in payload file %s: private keys must never be in payload", slashPath)
 		}
 		if block, _ := pem.Decode(data); block != nil && strings.Contains(block.Type, "PRIVATE") {
