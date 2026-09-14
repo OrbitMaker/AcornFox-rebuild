@@ -588,13 +588,22 @@ func verifyInventoryMatch(expected, actual []desktopupdate.HostBundleFile) error
 }
 
 func validateProducedBundle(ctx context.Context, artifactPath string, manifest desktopupdate.HostBundleManifest, artifactSHA string, artifactSize int64) error {
+	version, err := desktopupdate.ParseSemver(manifest.Version)
+	if err != nil {
+		return err
+	}
+	channel := "stable"
+	if version.IsPrerelease() {
+		channel = "beta"
+	}
+
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		return err
 	}
 
 	ephemeralPayload := desktopupdate.IndexPayload{
-		Channel:   "stable",
+		Channel:   channel,
 		Sequence:  1,
 		ExpiresAt: time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339),
 		Version:   manifest.Version,
@@ -630,7 +639,7 @@ func validateProducedBundle(ctx context.Context, artifactPath string, manifest d
 		PublicKey:       pub,
 		TargetOS:        manifest.OS,
 		TargetArch:      manifest.Architecture,
-		AllowedChannel:  "stable",
+		AllowedChannel:  channel,
 		CurrentSequence: 0,
 		CurrentVersion:  "",
 		CurrentTime:     time.Now().UTC(),
