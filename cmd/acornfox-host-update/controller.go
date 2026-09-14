@@ -159,9 +159,9 @@ func RunManagedChild(ctx context.Context, lifecycleConn io.ReadWriter, opts Cont
 		MaxArtifactSize: cfg.Policy.MaxArtifactSize,
 	}
 	initial := desktopupdate.HostInstallation{
-		Version:        cfg.BootstrapSpec.Version,
-		SlotSHA256:     pinned.ID(),
-		BackendBinding: cfg.BootstrapBackendBinding,
+		Version:         cfg.BootstrapSpec.Version,
+		SlotSHA256:      pinned.ID(),
+		BackendBinding:  cfg.BootstrapBackendBinding,
 		AppliedSequence: 0,
 	}
 	controllerOpts := desktopupdate.HostControllerOptions{
@@ -368,6 +368,8 @@ func RunManagedChild(ctx context.Context, lifecycleConn io.ReadWriter, opts Cont
 		return fmt.Errorf("unsupported operation %q", admit.Operation)
 	}
 
+	statusState, reasonCode = lifecycleOutcome(statusState, reasonCode)
+
 	// 11. Send bounded desensitized result echoing the admit nonce
 	result := &hostlifecycle.ResultFrame{
 		Type:          hostlifecycle.FrameTypeResult,
@@ -386,4 +388,16 @@ func RunManagedChild(ctx context.Context, lifecycleConn io.ReadWriter, opts Cont
 	}
 
 	return hostlifecycle.WriteFrame(lifecycleConn, resultBytes)
+}
+
+// Keep internal durable outcomes separate from the fixed lifecycle wire vocabulary.
+func lifecycleOutcome(state, reason string) (string, string) {
+	switch state {
+	case "backend-rolled-back", "host-rolled-back":
+		return "idle", "failed"
+	case "backend-rejected":
+		return "idle", "ineligible"
+	default:
+		return state, reason
+	}
 }
