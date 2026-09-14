@@ -67,11 +67,12 @@ var unitActiveRunner = func(ctx context.Context, unit string) (bool, error) {
 
 // UnitEnabledRunner checks if an optional unit is enabled. Overridable in tests.
 var unitEnabledRunner = func(ctx context.Context, unit string) (bool, error) {
-	cmd := exec.CommandContext(ctx, "/usr/bin/systemctl", "is-enabled", "--quiet", unit)
+	cmd := exec.CommandContext(ctx, "/usr/bin/systemctl", "is-enabled", unit)
 	cmd.Env = []string{"PATH=/usr/sbin:/usr/bin:/sbin:/bin", "LANG=C", "LC_ALL=C"}
-	err := cmd.Run()
+	output, err := cmd.Output()
 	if err == nil {
-		return true, nil
+		state := strings.TrimSpace(string(output))
+		return state == "enabled" || state == "enabled-runtime", nil
 	}
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {

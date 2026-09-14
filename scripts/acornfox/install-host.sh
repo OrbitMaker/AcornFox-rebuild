@@ -672,7 +672,8 @@ fi
 [[ ! -e /run/acornfox-pi/worker.sock && ! -L /run/acornfox-pi/worker.sock ]] || fail
 
 if (( has_native_overlay )); then
-  "${CLEAN_ENV[@]}" "$bootstrap_helper" initial-host-overlay-apply \
+  # Provisioning accepts only root-protected source ancestors; /tmp is shared.
+  "${CLEAN_ENV[@]}" TMPDIR=/run "$bootstrap_helper" initial-host-overlay-apply \
     --host-bundle "$host_bundle" \
     --envelope "$envelope" \
     --public-key "$public_key" \
