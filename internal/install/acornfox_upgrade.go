@@ -354,7 +354,7 @@ func (u *acornFoxUpgrade) upgrade(ctx context.Context, request AcornFoxUpgradeRe
 			return empty, ErrAcornFoxUpgradeConflict
 		}
 	}
-	lock, e := s.Acquire(ctx)
+	lock, e := acquireAcornFoxUpgradeLock(ctx, s)
 	if e != nil {
 		return empty, e
 	}

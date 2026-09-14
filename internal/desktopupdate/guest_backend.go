@@ -268,6 +268,18 @@ func (e guestExpected) match(r guestReceipt) error {
 // Compact retired receipts lacking a full intent fail closed; they are not fresh
 // backend evidence and this adapter never reconstructs missing intent fields.
 func (g *GuestBackend) Observe(ctx context.Context, attempt string) (BackendObservation, error) {
+	// Status does not inspect the installation. Avoid taking its repository lock
+	// while the accepted worker is preparing, applying, or recovering an update.
+	if attempt != "" {
+		r, e := g.receipt(ctx, "status", attempt)
+		if e != nil {
+			return BackendObservation{}, e
+		}
+		switch r.State {
+		case "queued", "running", "recovering":
+			return BackendObservation{}, ErrHostPending
+		}
+	}
 	var obs BackendObservation
 	if e := g.call(ctx, "observe", attempt, nil, &obs); e != nil {
 		return BackendObservation{}, e

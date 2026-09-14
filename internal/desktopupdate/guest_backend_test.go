@@ -147,10 +147,16 @@ func TestGuestBackendObserveDoesNotResumeOrInventReadiness(t *testing.T) {
 				}
 			})
 			got, e := g.Observe(context.Background(), f.intent.AttemptID)
+			if state == "running" {
+				if !errors.Is(e, ErrHostPending) || got != (BackendObservation{}) || strings.Join(verbs, ",") != "status" {
+					t.Fatal("active worker must not be inspected", got, e, verbs)
+				}
+				return
+			}
 			if e != nil {
 				t.Fatal(e)
 			}
-			if got != obs || strings.Join(verbs, ",") != "observe,status" {
+			if got != obs || strings.Join(verbs, ",") != "status,observe,status" {
 				t.Fatal("observation changed", got, verbs)
 			}
 		})
