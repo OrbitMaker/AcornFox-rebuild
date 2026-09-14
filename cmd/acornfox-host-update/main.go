@@ -29,9 +29,14 @@ func main() {
 			fmt.Fprintf(os.Stderr, "acornfox-host-update: lifecycle descriptor missing\n")
 			os.Exit(1)
 		}
-		defer lifecycleFile.Close()
+		lifecycleConn, err := adoptLifecycleFile(lifecycleFile)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "acornfox-host-update: invalid lifecycle descriptor")
+			os.Exit(1)
+		}
+		defer lifecycleConn.Close()
 
-		if err := RunManagedChild(ctx, lifecycleFile, opts); err != nil {
+		if err := RunManagedChild(ctx, lifecycleConn, opts); err != nil {
 			fmt.Fprintf(os.Stderr, "acornfox-host-update: controller error: %v\n", err)
 			os.Exit(1)
 		}
