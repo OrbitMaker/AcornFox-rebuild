@@ -163,6 +163,39 @@ paths:
         '404': {$ref: '#/components/responses/NotFound'}
         '409': {$ref: '#/components/responses/IdempotencyConflict'}
         '503': {$ref: '#/components/responses/TemporarilyUnavailable'}
+  /api/v1/acornfox/source-uploads:
+    post:
+      operationId: createAcornFoxSourceUpload
+      security: [{AdministratorSession: []}]
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}, {$ref: '#/components/parameters/CSRFToken'}]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/SourceUploadRequest'
+            encoding:
+              manifest:
+                contentType: application/json
+      responses:
+        '201': {description: Immutable upload accepted or replayed; no host path is returned, content: {application/json: {schema: {$ref: '#/components/schemas/SourceUploadResponse'}}}}
+        '400': {$ref: '#/components/responses/InvalidRequest'}
+        '401': {$ref: '#/components/responses/AuthenticationFailed'}
+        '409': {$ref: '#/components/responses/IdempotencyConflict'}
+        '413': {description: Upload exceeds configured limits}
+        '415': {description: Multipart form data is required}
+        '422': {$ref: '#/components/responses/ValidationFailed'}
+        '503': {$ref: '#/components/responses/TemporarilyUnavailable'}
+  /api/v1/acornfox/source-uploads/{uploadId}:
+    parameters: [{name: uploadId, in: path, required: true, schema: {type: string}}]
+    get:
+      operationId: getAcornFoxSourceUpload
+      security: [{AdministratorSession: []}]
+      responses:
+        '200': {description: Upload metadata without storage paths, content: {application/json: {schema: {$ref: '#/components/schemas/SourceUploadResponse'}}}}
+        '401': {$ref: '#/components/responses/AuthenticationFailed'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/TemporarilyUnavailable'}
   /api/v1/acornfox/apps:
     get:
       operationId: listAcornFoxApps
@@ -177,7 +210,7 @@ paths:
       parameters: [{$ref: '#/components/parameters/IdempotencyKey'}, {$ref: '#/components/parameters/CSRFToken'}]
       requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/CreateApplicationRequest'}}}}
       responses:
-        '201': {description: Application and immutable public-Git source accepted, content: {application/json: {schema: {$ref: '#/components/schemas/CreateApplicationResponse'}}}}
+        '201': {description: Application and immutable public-Git or claimed upload source accepted, content: {application/json: {schema: {$ref: '#/components/schemas/CreateApplicationResponse'}}}}
         '400': {$ref: '#/components/responses/InvalidRequest'}
         '401': {$ref: '#/components/responses/AuthenticationFailed'}
         '409': {$ref: '#/components/responses/IdempotencyConflict'}
@@ -200,7 +233,7 @@ paths:
       security: [{AdministratorSession: []}]
       parameters: [{$ref: '#/components/parameters/DiscoveryLimit'}, {$ref: '#/components/parameters/DiscoveryCursor'}]
       responses:
-        '200': {description: Immutable public HTTPS Git source revisions only, content: {application/json: {schema: {$ref: '#/components/schemas/SourceRevisionList'}}}}
+        '200': {description: Immutable public HTTPS Git or claimed upload source revisions only, content: {application/json: {schema: {$ref: '#/components/schemas/SourceRevisionList'}}}}
         '401': {$ref: '#/components/responses/AuthenticationFailed'}
         '404': {$ref: '#/components/responses/NotFound'}
         '422': {$ref: '#/components/responses/InvalidDiscoveryQuery'}
@@ -646,10 +679,65 @@ components:
       properties:
         name: {type: string, minLength: 1}
         source:
-          type: object
-          required: [type, repository_url, ref]
-          additionalProperties: false
-          properties: {type: {type: string, enum: [public_git]}, repository_url: {type: string, format: uri}, ref: {type: string}}
+          oneOf:
+            - type: object
+              required: [type, repository_url, ref]
+              additionalProperties: false
+              properties: {type: {type: string, enum: [public_git]}, repository_url: {type: string, format: uri}, ref: {type: string, minLength: 1}}
+            - type: object
+              required: [type, upload_id]
+              additionalProperties: false
+              properties: {type: {type: string, enum: [upload]}, upload_id: {type: string, minLength: 1}}
+    SourceUploadManifestEntry:
+      type: object
+      additionalProperties: false
+      required: [path, bytes, digest]
+      properties:
+        path: {type: string, pattern: '^(?!/)(?!.*//)(?!.*(?:^|/)\.(?:/|$))(?!.*(?:^|/)\.\.(?:/|$))(?!.*\/$)[A-Za-z0-9][A-Za-z0-9._/@+ -]*$', description: "Normalized relative path with no empty, dot, parent or trailing-slash segment."}
+        bytes: {type: integer, format: int64, minimum: 0}
+        digest: {type: string, pattern: '^sha256:[0-9a-f]{64}$'}
+    SourceUploadManifest:
+      type: object
+      additionalProperties: false
+      required: [files]
+      properties:
+        files: {type: array, minItems: 1, items: {$ref: '#/components/schemas/SourceUploadManifestEntry'}}
+    SourceUploadRequest:
+      oneOf:
+        - $ref: '#/components/schemas/SourceUploadArchiveRequest'
+        - $ref: '#/components/schemas/SourceUploadDirectoryRequest'
+      discriminator:
+        propertyName: mode
+        mapping:
+          archive: '#/components/schemas/SourceUploadArchiveRequest'
+          directory: '#/components/schemas/SourceUploadDirectoryRequest'
+    SourceUploadArchiveRequest:
+      type: object
+      additionalProperties: false
+      required: [mode, archive]
+      properties:
+        mode: {type: string, enum: [archive]}
+        archive: {type: string, format: binary, description: "Required exactly once; accepted filename extensions are .zip, .tar.gz and .tgz only."}
+    SourceUploadDirectoryRequest:
+      type: object
+      additionalProperties: false
+      required: [mode, files, manifest]
+      properties:
+        mode: {type: string, enum: [directory]}
+        files: {type: array, minItems: 1, items: {type: string, format: binary}, description: Required as repeated multipart parts. Each part filename is a normalized relative path cross-checked against manifest.files.}
+        manifest: {$ref: '#/components/schemas/SourceUploadManifest'}
+    SourceUploadResponse:
+      type: object
+      required: [id, kind, status, digest, bytes, file_count, expires_at]
+      additionalProperties: false
+      properties:
+        id: {type: string}
+        kind: {type: string, enum: [archive, directory]}
+        status: {type: string, enum: [ready, claimed, expired, failed]}
+        digest: {type: string, pattern: '^sha256:[a-f0-9]{64}$'}
+        bytes: {type: integer, minimum: 0}
+        file_count: {type: integer, minimum: 1}
+        expires_at: {type: string, format: date-time}
     CreateApplicationResponse:
       type: object
       required: [application, source_revision_id, operation_id]
@@ -659,7 +747,7 @@ components:
       type: object
       required: [id, application_id, kind, locator_sha256, content_digest, created_at, immutable]
       additionalProperties: false
-      properties: {id: {type: string}, application_id: {type: string}, kind: {type: string, enum: [git_https]}, locator_sha256: {type: string}, ref: {type: string}, commit: {type: string}, content_digest: {type: string}, created_at: {type: string, format: date-time}, immutable: {type: boolean}}
+      properties: {id: {type: string}, application_id: {type: string}, kind: {type: string, enum: [git_https, upload]}, locator_sha256: {type: string}, ref: {type: string}, commit: {type: string}, content_digest: {type: string}, created_at: {type: string, format: date-time}, immutable: {type: boolean}}
     SourceMetadataResponse:
       type: object
       required: [source_revision_id, availability]

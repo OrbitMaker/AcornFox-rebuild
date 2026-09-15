@@ -53,7 +53,7 @@ func (s *Store) ensureAcornFoxDiscoveryApplication(ctx context.Context, applicat
 	return err
 }
 
-// ListAcornFoxSourceRevisions returns only immutable public HTTPS Git facts.
+// ListAcornFoxSourceRevisions returns immutable proven public Git or claimed upload facts.
 // The raw locator remains inside persistence and is later hashed by the clean
 // contract projection.
 func (s *Store) ListAcornFoxSourceRevisions(ctx context.Context, applicationID domain.ID, after *AcornFoxDiscoveryCursor, limit int) (AcornFoxSourceRevisionPage, error) {
@@ -73,7 +73,7 @@ func (s *Store) ListAcornFoxSourceRevisions(ctx context.Context, applicationID d
 	statement := `
 		SELECT id,application_id,source_kind,locator,COALESCE(source_ref,''),COALESCE(git_commit,''),content_digest,workspace_ref,created_at,immutable
 		  FROM source_revisions
-		 WHERE application_id=$1 AND source_kind='git_https' AND immutable=true`
+		 WHERE application_id=$1 AND immutable=true AND (source_kind='git_https' OR (source_kind='upload' AND provider='upload'))`
 	args := []any{applicationID.String()}
 	if after != nil {
 		statement += ` AND (created_at,id)<($2,$3)`
@@ -97,16 +97,15 @@ func (s *Store) ListAcornFoxSourceRevisions(ctx context.Context, applicationID d
 	if err := rows.Err(); err != nil {
 		return AcornFoxSourceRevisionPage{}, err
 	}
-	proven, err := s.provenAcornFoxPublicSourceIDs(ctx, applicationID, raw)
+	proven, err := s.provenAcornFoxDiscoverySourceIDs(ctx, applicationID, raw)
 	if err != nil {
 		return AcornFoxSourceRevisionPage{}, err
 	}
 	page := AcornFoxSourceRevisionPage{Items: make([]domain.SourceRevision, 0, limit)}
 	selectedRawIndex := -1
 	for rawIndex, item := range raw {
-		// Historical, private, malformed, and upload-backed facts remain valid
-		// internal history but are not a clean public discovery source.
-		if item.Validate() != nil || !isAcornFoxPublicHTTPSGit(item) || !proven[item.ID] {
+		// Historical, private, malformed, or unclaimed facts remain internal history.
+		if !isAcornFoxDiscoverableSource(item) || !proven[item.ID] {
 			continue
 		}
 		page.Items = append(page.Items, item)
@@ -243,6 +242,96 @@ func acornFoxDiscoverySourceIDArguments(items []domain.SourceRevision) (string, 
 	return strings.Join(placeholders, ","), args
 }
 
+// Each source family has its own proof; uploaded files never acquire public-Git provenance.
+func (s *Store) provenAcornFoxDiscoverySourceIDs(ctx context.Context, applicationID domain.ID, candidates []domain.SourceRevision) (map[domain.ID]bool, error) {
+	gitCandidates := make([]domain.SourceRevision, 0, len(candidates))
+	uploadCandidates := make([]domain.SourceRevision, 0, len(candidates))
+	for _, item := range candidates {
+		if item.Kind == domain.SourceGitHTTPS {
+			gitCandidates = append(gitCandidates, item)
+		}
+		if isAcornFoxUploadedSource(item) {
+			uploadCandidates = append(uploadCandidates, item)
+		}
+	}
+	proven, err := s.provenAcornFoxPublicSourceIDs(ctx, applicationID, gitCandidates)
+	if err != nil {
+		return nil, err
+	}
+	uploads, err := s.provenAcornFoxClaimedUploadSourceIDs(ctx, applicationID, uploadCandidates)
+	if err != nil {
+		return nil, err
+	}
+	for id := range uploads {
+		proven[id] = true
+	}
+	return proven, nil
+}
+
+func isAcornFoxUploadedSource(item domain.SourceRevision) bool {
+	return item.Kind == domain.SourceUpload && item.Immutable && item.Commit == "" &&
+		item.Validate() == nil && domain.RequireID(domain.ID(item.Ref), "upload id") == nil &&
+		item.Locator == "upload://"+item.Ref && contracts.IsSHA256Digest(item.ContentDigest)
+}
+
+func isAcornFoxDiscoverableSource(item domain.SourceRevision) bool {
+	return item.Validate() == nil && (isAcornFoxPublicHTTPSGit(item) || isAcornFoxUploadedSource(item))
+}
+
+func (s *Store) provenAcornFoxClaimedUploadSourceIDs(ctx context.Context, applicationID domain.ID, candidates []domain.SourceRevision) (map[domain.ID]bool, error) {
+	proven := make(map[domain.ID]bool)
+	if len(candidates) == 0 {
+		return proven, nil
+	}
+	if len(candidates) > acornFoxDiscoveryScanLimit(100) {
+		return nil, domain.ValidationError("AcornFox upload discovery candidate bound exceeded")
+	}
+	args := []any{applicationID.String()}
+	placeholders := make([]string, 0, len(candidates))
+	for _, item := range candidates {
+		if !isAcornFoxUploadedSource(item) || item.ApplicationID != applicationID {
+			continue
+		}
+		args = append(args, item.ID.String())
+		placeholders = append(placeholders, "$"+fmt.Sprint(len(args)))
+	}
+	if len(placeholders) == 0 {
+		return proven, nil
+	}
+	// Upload bytes and the prepared tree have different digest semantics.
+	// Bind through the accepted claim and prepared-workspace event, not digest equality.
+	statement := `SELECT source.id
+        FROM source_uploads AS upload
+        JOIN source_revisions AS source
+          ON upload.claimed_source_revision_id=source.id
+         AND upload.claimed_application_id=source.application_id
+        WHERE upload.status='claimed' AND source.application_id=$1
+          AND source.source_kind='upload' AND source.provider='upload'
+          AND source.immutable=true AND source.git_commit IS NULL
+          AND upload.storage_ref=('upload://' || upload.id)
+          AND source.locator=upload.storage_ref AND source.source_ref=upload.id
+          AND upload.content_digest ~ '^sha256:[a-f0-9]{64}$'
+          AND source.content_digest ~ '^sha256:[a-f0-9]{64}$'
+          AND source.workspace_lifecycle='prepared'
+          AND EXISTS (SELECT 1 FROM source_workspace_events AS event
+                       WHERE event.source_revision_id=source.id AND event.sequence=1
+                         AND event.workspace_ref=source.workspace_ref AND event.state='prepared')
+          AND source.id IN (` + strings.Join(placeholders, ",") + `)`
+	rows, err := s.db.QueryContext(ctx, statement, args...)
+	if err != nil {
+		return nil, fmt.Errorf("prove AcornFox upload source: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id domain.ID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		proven[id] = true
+	}
+	return proven, rows.Err()
+}
+
 func isAcornFoxPublicHTTPSGit(item domain.SourceRevision) bool {
 	if item.Kind != domain.SourceGitHTTPS || !item.Immutable {
 		return false
@@ -252,7 +341,7 @@ func isAcornFoxPublicHTTPSGit(item domain.SourceRevision) bool {
 }
 
 // GetAcornFoxSourceRevision returns a source only when it meets the same
-// public-Git provenance rule as discovery. A known internal source is not a
+// public-Git or claimed-upload provenance rule as discovery. An internal source is not a
 // clean API resource merely because its opaque ID was guessed or retained.
 func (s *Store) GetAcornFoxSourceRevision(ctx context.Context, applicationID, sourceID domain.ID) (domain.SourceRevision, error) {
 	if err := s.requireDB(); err != nil {
@@ -268,10 +357,10 @@ func (s *Store) GetAcornFoxSourceRevision(ctx context.Context, applicationID, so
 	if err != nil {
 		return domain.SourceRevision{}, err
 	}
-	if item.Validate() != nil || !isAcornFoxPublicHTTPSGit(item) {
+	if !isAcornFoxDiscoverableSource(item) {
 		return domain.SourceRevision{}, ErrNotFound
 	}
-	proven, err := s.provenAcornFoxPublicSourceIDs(ctx, applicationID, []domain.SourceRevision{item})
+	proven, err := s.provenAcornFoxDiscoverySourceIDs(ctx, applicationID, []domain.SourceRevision{item})
 	if err != nil {
 		return domain.SourceRevision{}, err
 	}
@@ -285,7 +374,7 @@ func (s *Store) getAcornFoxDiscoverySource(ctx context.Context, applicationID, s
 	item, err := scanAcornFoxDiscoverySource(s.db.QueryRowContext(ctx, `
 		SELECT id,application_id,source_kind,locator,COALESCE(source_ref,''),COALESCE(git_commit,''),content_digest,workspace_ref,created_at,immutable
 		  FROM source_revisions
-		 WHERE id=$1 AND application_id=$2 AND source_kind='git_https' AND immutable=true
+		 WHERE id=$1 AND application_id=$2 AND immutable=true AND (source_kind='git_https' OR (source_kind='upload' AND provider='upload'))
 	`, sourceID.String(), applicationID.String()))
 	if errors.Is(err, sql.ErrNoRows) {
 		return domain.SourceRevision{}, ErrNotFound

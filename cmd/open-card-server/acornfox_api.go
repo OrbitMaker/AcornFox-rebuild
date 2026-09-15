@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
@@ -277,9 +278,10 @@ func (s *Server) handleAcornFoxApps(w http.ResponseWriter, r *http.Request) {
 		var input struct {
 			Name   string `json:"name"`
 			Source struct {
-				Type          string `json:"type"`
-				RepositoryURL string `json:"repository_url"`
-				Ref           string `json:"ref"`
+				Type          string          `json:"type"`
+				RepositoryURL json.RawMessage `json:"repository_url"`
+				Ref           json.RawMessage `json:"ref"`
+				UploadID      json.RawMessage `json:"upload_id"`
 			} `json:"source"`
 		}
 		if err := decodeJSON(r, &input); err != nil {
@@ -287,11 +289,39 @@ func (s *Server) handleAcornFoxApps(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		key := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
-		if key == "" || input.Source.Type != "public_git" {
-			writeJSONError(w, http.StatusUnprocessableEntity, "validation_failed", "name, public_git source, and Idempotency-Key are required")
+		if key == "" {
+			writeJSONError(w, http.StatusUnprocessableEntity, "validation_failed", "Idempotency-Key is required")
 			return
 		}
-		result, err := s.controller.CreateApplicationWithSource(r.Context(), input.Name, &application.CreateApplicationSource{Kind: application.CreateApplicationSourceGit, PublicGit: true, RepositoryURL: input.Source.RepositoryURL, Ref: input.Source.Ref}, key)
+		var applicationSource application.CreateApplicationSource
+		switch input.Source.Type {
+		case "public_git":
+			if input.Source.UploadID != nil || input.Source.RepositoryURL == nil || input.Source.Ref == nil {
+				writeJSONError(w, http.StatusUnprocessableEntity, "validation_failed", "public_git source requires repository_url and ref only")
+				return
+			}
+			var repositoryURL, ref string
+			if json.Unmarshal(input.Source.RepositoryURL, &repositoryURL) != nil || json.Unmarshal(input.Source.Ref, &ref) != nil {
+				writeJSONError(w, http.StatusUnprocessableEntity, "validation_failed", "repository_url and ref must be strings")
+				return
+			}
+			applicationSource = application.CreateApplicationSource{Kind: application.CreateApplicationSourceGit, PublicGit: true, RepositoryURL: repositoryURL, Ref: ref}
+		case "upload":
+			if input.Source.UploadID == nil || input.Source.RepositoryURL != nil || input.Source.Ref != nil {
+				writeJSONError(w, http.StatusUnprocessableEntity, "validation_failed", "upload source requires upload_id only")
+				return
+			}
+			var uploadID domain.ID
+			if json.Unmarshal(input.Source.UploadID, &uploadID) != nil {
+				writeJSONError(w, http.StatusUnprocessableEntity, "validation_failed", "upload_id must be a string")
+				return
+			}
+			applicationSource = application.CreateApplicationSource{Kind: application.CreateApplicationSourceUpload, UploadID: uploadID}
+		default:
+			writeJSONError(w, http.StatusUnprocessableEntity, "validation_failed", "source type must be public_git or upload")
+			return
+		}
+		result, err := s.controller.CreateApplicationWithSource(r.Context(), input.Name, &applicationSource, key)
 		if err != nil {
 			writeAcornFoxError(w, err)
 			return

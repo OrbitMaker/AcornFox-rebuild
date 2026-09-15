@@ -249,8 +249,8 @@ func (s *Server) SetConsoleAccessMode(mode ConsoleAccessMode) error {
 		return errors.New("unknown console access mode: " + string(mode))
 	}
 }
-func (s *Server) ConsoleAccessMode() ConsoleAccessMode { return s.consoleAccessMode }
-func (s *Server) Handler() http.Handler                { return http.HandlerFunc(s.serveHTTP) }
+func (s *Server) ConsoleAccessMode() ConsoleAccessMode  { return s.consoleAccessMode }
+func (s *Server) Handler() http.Handler                 { return http.HandlerFunc(s.serveHTTP) }
 func (s *Server) AgentGateway() *agenttransport.Gateway { return s.agentGateway }
 func (s *Server) HTTPServer(addr string) *http.Server {
 	return &http.Server{Addr: addr, Handler: s.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 0, IdleTimeout: 60 * time.Second}
@@ -371,6 +371,9 @@ func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
 		} else {
 			s.acornFoxHostMetrics.ServeHTTP(writer, request)
 		}
+		return
+	}
+	if s.handleAcornFoxSourceUpload(writer, request) {
 		return
 	}
 	if s.handleAcornFoxAPI(writer, request) {

@@ -207,6 +207,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/acornfox/source-uploads": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["createAcornFoxSourceUpload"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/acornfox/source-uploads/{uploadId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                uploadId: string;
+            };
+            cookie?: never;
+        };
+        get: operations["getAcornFoxSourceUpload"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/acornfox/apps": {
         parameters: {
             query?: never;
@@ -728,7 +762,56 @@ export interface components {
                 /** Format: uri */
                 repository_url: string;
                 ref: string;
+            } | {
+                /** @enum {string} */
+                type: "upload";
+                upload_id: string;
             };
+        };
+        SourceUploadManifestEntry: {
+            /** @description Normalized relative path with no empty, dot, parent or trailing-slash segment. */
+            path: string;
+            /** Format: int64 */
+            bytes: number;
+            digest: string;
+        };
+        SourceUploadManifest: {
+            files: components["schemas"]["SourceUploadManifestEntry"][];
+        };
+        SourceUploadRequest: components["schemas"]["SourceUploadArchiveRequest"] | components["schemas"]["SourceUploadDirectoryRequest"];
+        SourceUploadArchiveRequest: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            mode: "archive";
+            /**
+             * Format: binary
+             * @description Required exactly once; accepted filename extensions are .zip, .tar.gz and .tgz only.
+             */
+            archive: string;
+        };
+        SourceUploadDirectoryRequest: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            mode: "directory";
+            /** @description Required as repeated multipart parts. Each part filename is a normalized relative path cross-checked against manifest.files. */
+            files: string[];
+            manifest: components["schemas"]["SourceUploadManifest"];
+        };
+        SourceUploadResponse: {
+            id: string;
+            /** @enum {string} */
+            kind: "archive" | "directory";
+            /** @enum {string} */
+            status: "ready" | "claimed" | "expired" | "failed";
+            digest: string;
+            bytes: number;
+            file_count: number;
+            /** Format: date-time */
+            expires_at: string;
         };
         CreateApplicationResponse: {
             application: components["schemas"]["Application"];
@@ -739,7 +822,7 @@ export interface components {
             id: string;
             application_id: string;
             /** @enum {string} */
-            kind: "git_https";
+            kind: "git_https" | "upload";
             locator_sha256: string;
             ref?: string;
             commit?: string;
@@ -1321,7 +1404,7 @@ export interface components {
         DiscoveryLimit: number;
         /** @description Opaque versioned cursor bound to the application and list resource. */
         DiscoveryCursor: string;
-        /** @description Must equal the non-HttpOnly __Host-acornfox_csrf cookie and use the allowed Origin. */
+        /** @description Must equal the non-HttpOnly CSRF cookie (__Host-acornfox_csrf under public HTTPS or acornfox_local_csrf under local loopback) and use the allowed Origin. */
         CSRFToken: string;
     };
     requestBodies: never;
@@ -1412,7 +1495,7 @@ export interface operations {
         parameters: {
             query?: never;
             header: {
-                /** @description Must equal the non-HttpOnly __Host-acornfox_csrf cookie and use the allowed Origin. */
+                /** @description Must equal the non-HttpOnly CSRF cookie (__Host-acornfox_csrf under public HTTPS or acornfox_local_csrf under local loopback) and use the allowed Origin. */
                 "X-AcornFox-CSRF": components["parameters"]["CSRFToken"];
             };
             path?: never;
@@ -1457,7 +1540,7 @@ export interface operations {
         parameters: {
             query?: never;
             header: {
-                /** @description Must equal the non-HttpOnly __Host-acornfox_csrf cookie and use the allowed Origin. */
+                /** @description Must equal the non-HttpOnly CSRF cookie (__Host-acornfox_csrf under public HTTPS or acornfox_local_csrf under local loopback) and use the allowed Origin. */
                 "X-AcornFox-CSRF": components["parameters"]["CSRFToken"];
             };
             path?: never;
@@ -1529,7 +1612,7 @@ export interface operations {
         parameters: {
             query?: never;
             header: {
-                /** @description Must equal the non-HttpOnly __Host-acornfox_csrf cookie and use the allowed Origin. */
+                /** @description Must equal the non-HttpOnly CSRF cookie (__Host-acornfox_csrf under public HTTPS or acornfox_local_csrf under local loopback) and use the allowed Origin. */
                 "X-AcornFox-CSRF": components["parameters"]["CSRFToken"];
             };
             path?: never;
@@ -1560,7 +1643,7 @@ export interface operations {
         parameters: {
             query?: never;
             header: {
-                /** @description Must equal the non-HttpOnly __Host-acornfox_csrf cookie and use the allowed Origin. */
+                /** @description Must equal the non-HttpOnly CSRF cookie (__Host-acornfox_csrf under public HTTPS or acornfox_local_csrf under local loopback) and use the allowed Origin. */
                 "X-AcornFox-CSRF": components["parameters"]["CSRFToken"];
             };
             path: {
@@ -1645,7 +1728,7 @@ export interface operations {
         parameters: {
             query?: never;
             header: {
-                /** @description Must equal the non-HttpOnly __Host-acornfox_csrf cookie and use the allowed Origin. */
+                /** @description Must equal the non-HttpOnly CSRF cookie (__Host-acornfox_csrf under public HTTPS or acornfox_local_csrf under local loopback) and use the allowed Origin. */
                 "X-AcornFox-CSRF": components["parameters"]["CSRFToken"];
             };
             path: {
@@ -1699,7 +1782,7 @@ export interface operations {
         parameters: {
             query?: never;
             header: {
-                /** @description Must equal the non-HttpOnly __Host-acornfox_csrf cookie and use the allowed Origin. */
+                /** @description Must equal the non-HttpOnly CSRF cookie (__Host-acornfox_csrf under public HTTPS or acornfox_local_csrf under local loopback) and use the allowed Origin. */
                 "X-AcornFox-CSRF": components["parameters"]["CSRFToken"];
             };
             path: {
@@ -1739,6 +1822,78 @@ export interface operations {
             503: components["responses"]["TemporarilyUnavailable"];
         };
     };
+    createAcornFoxSourceUpload: {
+        parameters: {
+            query?: never;
+            header: {
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+                /** @description Must equal the non-HttpOnly CSRF cookie (__Host-acornfox_csrf under public HTTPS or acornfox_local_csrf under local loopback) and use the allowed Origin. */
+                "X-AcornFox-CSRF": components["parameters"]["CSRFToken"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "multipart/form-data": components["schemas"]["SourceUploadRequest"];
+            };
+        };
+        responses: {
+            /** @description Immutable upload accepted or replayed; no host path is returned */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SourceUploadResponse"];
+                };
+            };
+            400: components["responses"]["InvalidRequest"];
+            401: components["responses"]["AuthenticationFailed"];
+            409: components["responses"]["IdempotencyConflict"];
+            /** @description Upload exceeds configured limits */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Multipart form data is required */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            422: components["responses"]["ValidationFailed"];
+            503: components["responses"]["TemporarilyUnavailable"];
+        };
+    };
+    getAcornFoxSourceUpload: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                uploadId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Upload metadata without storage paths */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SourceUploadResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationFailed"];
+            404: components["responses"]["NotFound"];
+            503: components["responses"]["TemporarilyUnavailable"];
+        };
+    };
     listAcornFoxApps: {
         parameters: {
             query?: never;
@@ -1766,7 +1921,7 @@ export interface operations {
             query?: never;
             header: {
                 "Idempotency-Key": components["parameters"]["IdempotencyKey"];
-                /** @description Must equal the non-HttpOnly __Host-acornfox_csrf cookie and use the allowed Origin. */
+                /** @description Must equal the non-HttpOnly CSRF cookie (__Host-acornfox_csrf under public HTTPS or acornfox_local_csrf under local loopback) and use the allowed Origin. */
                 "X-AcornFox-CSRF": components["parameters"]["CSRFToken"];
             };
             path?: never;
@@ -1778,7 +1933,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Application and immutable public-Git source accepted */
+            /** @description Application and immutable public-Git or claimed upload source accepted */
             201: {
                 headers: {
                     [name: string]: unknown;
@@ -1834,7 +1989,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Immutable public HTTPS Git source revisions only */
+            /** @description Immutable public HTTPS Git or claimed upload source revisions only */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -1854,7 +2009,7 @@ export interface operations {
             query?: never;
             header: {
                 "Idempotency-Key": components["parameters"]["IdempotencyKey"];
-                /** @description Must equal the non-HttpOnly __Host-acornfox_csrf cookie and use the allowed Origin. */
+                /** @description Must equal the non-HttpOnly CSRF cookie (__Host-acornfox_csrf under public HTTPS or acornfox_local_csrf under local loopback) and use the allowed Origin. */
                 "X-AcornFox-CSRF": components["parameters"]["CSRFToken"];
             };
             path: {
@@ -2018,7 +2173,7 @@ export interface operations {
             query?: never;
             header: {
                 "Idempotency-Key": components["parameters"]["IdempotencyKey"];
-                /** @description Must equal the non-HttpOnly __Host-acornfox_csrf cookie and use the allowed Origin. */
+                /** @description Must equal the non-HttpOnly CSRF cookie (__Host-acornfox_csrf under public HTTPS or acornfox_local_csrf under local loopback) and use the allowed Origin. */
                 "X-AcornFox-CSRF": components["parameters"]["CSRFToken"];
             };
             path: {
@@ -2079,7 +2234,7 @@ export interface operations {
         parameters: {
             query?: never;
             header: {
-                /** @description Must equal the non-HttpOnly __Host-acornfox_csrf cookie and use the allowed Origin. */
+                /** @description Must equal the non-HttpOnly CSRF cookie (__Host-acornfox_csrf under public HTTPS or acornfox_local_csrf under local loopback) and use the allowed Origin. */
                 "X-AcornFox-CSRF": components["parameters"]["CSRFToken"];
             };
             path: {
@@ -2115,7 +2270,7 @@ export interface operations {
             query?: never;
             header: {
                 "Idempotency-Key": components["parameters"]["IdempotencyKey"];
-                /** @description Must equal the non-HttpOnly __Host-acornfox_csrf cookie and use the allowed Origin. */
+                /** @description Must equal the non-HttpOnly CSRF cookie (__Host-acornfox_csrf under public HTTPS or acornfox_local_csrf under local loopback) and use the allowed Origin. */
                 "X-AcornFox-CSRF": components["parameters"]["CSRFToken"];
             };
             path: {
@@ -2178,7 +2333,7 @@ export interface operations {
             query?: never;
             header: {
                 "Idempotency-Key": components["parameters"]["IdempotencyKey"];
-                /** @description Must equal the non-HttpOnly __Host-acornfox_csrf cookie and use the allowed Origin. */
+                /** @description Must equal the non-HttpOnly CSRF cookie (__Host-acornfox_csrf under public HTTPS or acornfox_local_csrf under local loopback) and use the allowed Origin. */
                 "X-AcornFox-CSRF": components["parameters"]["CSRFToken"];
             };
             path: {
@@ -2265,7 +2420,7 @@ export interface operations {
             query?: never;
             header: {
                 "Idempotency-Key": components["parameters"]["IdempotencyKey"];
-                /** @description Must equal the non-HttpOnly __Host-acornfox_csrf cookie and use the allowed Origin. */
+                /** @description Must equal the non-HttpOnly CSRF cookie (__Host-acornfox_csrf under public HTTPS or acornfox_local_csrf under local loopback) and use the allowed Origin. */
                 "X-AcornFox-CSRF": components["parameters"]["CSRFToken"];
             };
             path: {
@@ -2301,7 +2456,7 @@ export interface operations {
             query?: never;
             header: {
                 "Idempotency-Key": components["parameters"]["IdempotencyKey"];
-                /** @description Must equal the non-HttpOnly __Host-acornfox_csrf cookie and use the allowed Origin. */
+                /** @description Must equal the non-HttpOnly CSRF cookie (__Host-acornfox_csrf under public HTTPS or acornfox_local_csrf under local loopback) and use the allowed Origin. */
                 "X-AcornFox-CSRF": components["parameters"]["CSRFToken"];
             };
             path: {
@@ -2395,7 +2550,7 @@ export interface operations {
             query?: never;
             header: {
                 "Idempotency-Key": components["parameters"]["IdempotencyKey"];
-                /** @description Must equal the non-HttpOnly __Host-acornfox_csrf cookie and use the allowed Origin. */
+                /** @description Must equal the non-HttpOnly CSRF cookie (__Host-acornfox_csrf under public HTTPS or acornfox_local_csrf under local loopback) and use the allowed Origin. */
                 "X-AcornFox-CSRF": components["parameters"]["CSRFToken"];
             };
             path: {
@@ -2457,7 +2612,7 @@ export interface operations {
         parameters: {
             query?: never;
             header: {
-                /** @description Must equal the non-HttpOnly __Host-acornfox_csrf cookie and use the allowed Origin. */
+                /** @description Must equal the non-HttpOnly CSRF cookie (__Host-acornfox_csrf under public HTTPS or acornfox_local_csrf under local loopback) and use the allowed Origin. */
                 "X-AcornFox-CSRF": components["parameters"]["CSRFToken"];
             };
             path: {
@@ -2503,7 +2658,7 @@ export interface operations {
             query?: never;
             header: {
                 "Idempotency-Key": components["parameters"]["IdempotencyKey"];
-                /** @description Must equal the non-HttpOnly __Host-acornfox_csrf cookie and use the allowed Origin. */
+                /** @description Must equal the non-HttpOnly CSRF cookie (__Host-acornfox_csrf under public HTTPS or acornfox_local_csrf under local loopback) and use the allowed Origin. */
                 "X-AcornFox-CSRF": components["parameters"]["CSRFToken"];
             };
             path: {

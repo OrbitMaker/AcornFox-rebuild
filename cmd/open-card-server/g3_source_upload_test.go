@@ -10,6 +10,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -48,7 +49,11 @@ func newSourceUploadHTTPServer(t *testing.T, limits sourceupload.Limits) (*Serve
 	server := NewServer()
 	now := time.Unix(1_700_000_000, 0).UTC()
 	_, session, csrf := attachTestAdministratorTokens(t, server, &now)
-	manager, err := sourceupload.New(sourceupload.Config{Root: t.TempDir(), Limits: limits, Clock: func() time.Time { return now }})
+	uploadRoot := t.TempDir()
+	if err := os.Chmod(uploadRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := sourceupload.New(sourceupload.Config{Root: uploadRoot, Limits: limits, Clock: func() time.Time { return now }})
 	if err != nil {
 		t.Fatal(err)
 	}

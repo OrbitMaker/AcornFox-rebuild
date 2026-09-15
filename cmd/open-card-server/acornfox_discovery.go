@@ -75,7 +75,7 @@ func (h *AcornFoxDiscoveryHTTPHandler) HandleSources(w http.ResponseWriter, r *h
 	items := make([]contracts.AcornFoxInputRevision, 0, len(page.Items))
 	for _, item := range page.Items {
 		projected, err := contracts.ProjectAcornFoxInputRevision(item)
-		if err != nil || !isAcornFoxPublicDiscoverySource(item) {
+		if err != nil || !isAcornFoxDiscoverySource(item) {
 			writeJSONError(w, http.StatusServiceUnavailable, "discovery_unavailable", "source discovery is unavailable")
 			return
 		}
@@ -206,12 +206,26 @@ func (h *AcornFoxDiscoveryHTTPHandler) decodeCursor(applicationID domain.ID, res
 	return cursor, nil
 }
 
-func isAcornFoxPublicDiscoverySource(item domain.SourceRevision) bool {
-	if item.Kind != domain.SourceGitHTTPS || !item.Immutable {
+func isAcornFoxDiscoverySource(item domain.SourceRevision) bool {
+	if !item.Immutable {
 		return false
 	}
-	parsed, err := url.Parse(item.Locator)
-	return err == nil && parsed.Scheme == "https" && parsed.Host != "" && parsed.User == nil
+	switch item.Kind {
+	case domain.SourceGitHTTPS:
+		parsed, err := url.Parse(item.Locator)
+		return err == nil && parsed.Scheme == "https" && parsed.Host != "" && parsed.User == nil
+	case domain.SourceUpload:
+		if item.Commit != "" {
+			return false
+		}
+		ref := domain.ID(item.Ref)
+		if domain.RequireID(ref, "upload reference") != nil {
+			return false
+		}
+		return item.Locator == "upload://"+item.Ref
+	default:
+		return false
+	}
 }
 
 func (h *AcornFoxDiscoveryHTTPHandler) cursorMAC(applicationID domain.ID, resource string, version int, createdAt, id string) string {

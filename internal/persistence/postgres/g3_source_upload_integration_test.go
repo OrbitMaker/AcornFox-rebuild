@@ -143,6 +143,9 @@ func TestG3SourceUploadPersistsAndApplicationClaimIsAtomic(t *testing.T) {
 	}
 
 	uploadRoot := t.TempDir()
+	if err := os.Chmod(uploadRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	filesRoot := filepath.Join(uploadRoot, upload.ID.String(), "files", "src")
 	if err := os.MkdirAll(filesRoot, 0o700); err != nil {
 		t.Fatal(err)
@@ -170,6 +173,39 @@ func TestG3SourceUploadPersistsAndApplicationClaimIsAtomic(t *testing.T) {
 	if err := db.QueryRowContext(ctx, `SELECT locator,workspace_ref,content_digest FROM source_revisions WHERE id=$1`, created.SourceRevisionID.String()).Scan(&locator, &workspace, &contentDigest); err != nil || locator != "upload://upload_claim" || workspace == "" || !strings.HasPrefix(contentDigest, "sha256:") {
 		t.Fatalf("source revision locator=%q workspace=%q err=%v", locator, workspace, err)
 	}
+
+	// Real Controller/SourceProvider claim must be visible through the clean API.
+	// The upload manifest digest and the materialized tree digest are different identities.
+	discovered, err := store.GetAcornFoxSourceRevision(ctx, created.Application.ID, created.SourceRevisionID)
+	if err != nil || discovered.ID != created.SourceRevisionID || discovered.Kind != domain.SourceUpload || discovered.ContentDigest == upload.Digest {
+		t.Fatalf("claimed upload discovery=%+v upload_digest=%s err=%v", discovered, upload.Digest, err)
+	}
+	page, err := store.ListAcornFoxSourceRevisions(ctx, created.Application.ID, nil, 50)
+	if err != nil || len(page.Items) != 1 || page.Items[0].ID != created.SourceRevisionID {
+		t.Fatalf("claimed upload page=%+v err=%v", page, err)
+	}
+	if _, err := store.GetAcornFoxSourceRevision(ctx, "app_other", created.SourceRevisionID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("cross-application upload must be hidden: %v", err)
+	}
+	// A plausible internal snapshot with the same owner, locator and prepared
+	// event is still ineligible when the upload was claimed by another source ID.
+	if _, err := db.ExecContext(ctx, `INSERT INTO source_revisions(id,application_id,provider,source_kind,locator,source_ref,git_commit,content_digest,workspace_ref,workspace_lifecycle,immutable,created_at)
+        SELECT 'src_unclaimed_discovery',application_id,provider,source_kind,locator,source_ref,git_commit,('sha256:' || repeat('f',64)),workspace_ref,workspace_lifecycle,immutable,created_at
+          FROM source_revisions WHERE id=$1`, created.SourceRevisionID.String()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO source_workspace_events(source_revision_id,sequence,workspace_ref,state,created_at)
+        VALUES('src_unclaimed_discovery',1,$1,'prepared',$2)`, workspace, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.GetAcornFoxSourceRevision(ctx, created.Application.ID, "src_unclaimed_discovery"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unclaimed source must be hidden: %v", err)
+	}
+	page, err = store.ListAcornFoxSourceRevisions(ctx, created.Application.ID, nil, 50)
+	if err != nil || len(page.Items) != 1 || page.Items[0].ID != created.SourceRevisionID {
+		t.Fatalf("unclaimed clone leaked through list: %+v err=%v", page, err)
+	}
+
 	t.Cleanup(func() {
 		revision := domain.SourceRevision{ID: created.SourceRevisionID, ApplicationID: created.Application.ID, Kind: domain.SourceUpload, Locator: locator, ContentDigest: contentDigest, WorkspaceRef: workspace, Immutable: true}
 		if err := sourceProvider.Release(context.Background(), contracts.ReleaseSourceRequest{Revision: revision, Operation: contracts.OperationContext{IdempotencyKey: "release-g3-upload-test", Actor: "test"}}); err != nil {

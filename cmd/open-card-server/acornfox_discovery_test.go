@@ -114,3 +114,47 @@ func acornFoxDiscoveryRequest(t *testing.T, server *Server, session *http.Cookie
 }
 
 var _ acornFoxDiscoveryReader = (*acornFoxDiscoveryFixture)(nil)
+
+func TestAcornFoxUploadSourceDiscovery(t *testing.T) {
+	now := time.Unix(1700000000, 0).UTC()
+	base := domain.SourceRevision{ID: "src_upload", ApplicationID: "app_1", Kind: domain.SourceUpload, Locator: "upload://upload_1", Ref: "upload_1", ContentDigest: "sha256:" + strings.Repeat("b", 64), WorkspaceRef: "/private/workspace/src_upload", CreatedAt: now, Immutable: true}
+	cases := []struct {
+		name   string
+		change func(*domain.SourceRevision)
+		want   int
+	}{
+		{"claimed upload", func(*domain.SourceRevision) {}, http.StatusOK},
+		{"locator mismatch", func(s *domain.SourceRevision) { s.Locator = "upload://other" }, http.StatusServiceUnavailable},
+		{"empty reference", func(s *domain.SourceRevision) { s.Ref = ""; s.Locator = "upload://" }, http.StatusServiceUnavailable},
+		{"commit forbidden", func(s *domain.SourceRevision) { s.Commit = strings.Repeat("a", 40) }, http.StatusServiceUnavailable},
+		{"mutable forbidden", func(s *domain.SourceRevision) { s.Immutable = false }, http.StatusServiceUnavailable},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			source := base
+			tc.change(&source)
+			fixture := &acornFoxDiscoveryFixture{sources: postgres.AcornFoxSourceRevisionPage{Items: []domain.SourceRevision{source}}}
+			server := NewAcornFoxServer()
+			server.SetAcornFoxDiscovery(newAcornFoxDiscoveryHTTPHandler(fixture, [32]byte{1}))
+			_, session, _ := attachTestAcornFoxAdministratorTokens(t, server, &now)
+			response := acornFoxDiscoveryRequest(t, server, session, http.MethodGet, "/api/v1/acornfox/apps/app_1/sources")
+			if response.Code != tc.want {
+				t.Fatalf("status=%d expected=%d body=%s", response.Code, tc.want, response.Body.String())
+			}
+			if strings.Contains(response.Body.String(), source.Locator) || strings.Contains(response.Body.String(), source.WorkspaceRef) {
+				t.Fatal("source topology leaked")
+			}
+			if tc.want == http.StatusOK {
+				var body struct {
+					Items []struct {
+						Kind        string `json:"kind"`
+						LocatorHash string `json:"locator_sha256"`
+					} `json:"items"`
+				}
+				if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil || len(body.Items) != 1 || body.Items[0].Kind != "upload" || body.Items[0].LocatorHash == "" {
+					t.Fatalf("invalid redacted source response: %s", response.Body.String())
+				}
+			}
+		})
+	}
+}

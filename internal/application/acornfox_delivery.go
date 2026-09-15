@@ -39,9 +39,9 @@ type AcornFoxDeliveryIdempotencyStore interface {
 
 // AcornFoxDeliverySourceStore is intentionally read-only. The public command
 // names a revision ID, but its immutable source and application ownership come
-// exclusively from this store.
+// exclusively from this store. Reads must enforce public-Git or claimed-upload provenance.
 type AcornFoxDeliverySourceStore interface {
-	GetSourceRevision(context.Context, domain.ID) (domain.SourceRevision, error)
+	GetAcornFoxSourceRevision(context.Context, domain.ID, domain.ID) (domain.SourceRevision, error)
 	GetAcornFoxEnvironment(context.Context, domain.ID) (domain.ID, error)
 	NextAcornFoxDefinitionVersion(context.Context, domain.ID) (int, error)
 	NextAcornFoxReleaseVersion(context.Context, domain.ID) (int, error)
@@ -216,11 +216,11 @@ func (service *AcornFoxDeliveryService) ReplayVerifiedCandidate(ctx context.Cont
 }
 
 func (service *AcornFoxDeliveryService) create(ctx context.Context, request AcornFoxDeliveryCreateRequest, expectedImage *domain.ImageDigest, now time.Time, commit func(AcornFoxQueuedTask, AcornFoxDeliveryResult) error) (AcornFoxDeliveryResult, error) {
-	source, err := service.Sources.GetSourceRevision(ctx, request.SourceRevisionID)
+	source, err := service.Sources.GetAcornFoxSourceRevision(ctx, request.ApplicationID, request.SourceRevisionID)
 	if err != nil {
 		return AcornFoxDeliveryResult{}, err
 	}
-	if err := validateAcornFoxPublicGitSource(source, request.ApplicationID); err != nil {
+	if err := validateAcornFoxDeliverySource(source, request.ApplicationID); err != nil {
 		return AcornFoxDeliveryResult{}, err
 	}
 	definition, err := service.Importer.Import(source)
@@ -591,15 +591,25 @@ func validateAcornFoxDeliveryAction(request AcornFoxDeliveryActionRequest) error
 	return nil
 }
 
-func validateAcornFoxPublicGitSource(source domain.SourceRevision, applicationID domain.ID) error {
+func validateAcornFoxDeliverySource(source domain.SourceRevision, applicationID domain.ID) error {
 	if err := source.Validate(); err != nil {
-		return errors.New("AcornFox delivery requires an accepted immutable public Git source revision")
+		return errors.New("AcornFox delivery requires an accepted immutable public Git or uploaded source revision")
 	}
 	if source.ApplicationID != applicationID {
 		return domain.NewError(domain.ErrNotFound, "AcornFox source revision does not belong to application")
 	}
-	if source.Kind != domain.SourceGitHTTPS || !source.Immutable || strings.TrimSpace(source.Commit) == "" {
-		return errors.New("AcornFox delivery requires an accepted immutable public Git source revision")
+	if !source.Immutable {
+		return errors.New("AcornFox delivery requires an immutable source revision")
+	}
+	switch source.Kind {
+	case domain.SourceGitHTTPS:
+		if strings.TrimSpace(source.Commit) == "" {
+			return errors.New("AcornFox Git delivery requires an accepted commit")
+		}
+	case domain.SourceUpload:
+		// The controller owns upload claims and prepares this immutable snapshot.
+	default:
+		return errors.New("AcornFox delivery source kind is unsupported")
 	}
 	return nil
 }

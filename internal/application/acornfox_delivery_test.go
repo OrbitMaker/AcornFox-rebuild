@@ -170,6 +170,8 @@ func TestAcornFoxDeliveryProbeUsesCurrentTrustedRuntimeObservation(t *testing.T)
 }
 
 type acornFoxDeliveryFixture struct {
+	sourceProofErr  error
+	importCalls     int
 	service         *AcornFoxDeliveryService
 	source          domain.SourceRevision
 	definition      contracts.AcornFoxDockerfileDefinition
@@ -237,7 +239,11 @@ func (f *acornFoxDeliveryFixture) FailAcornFoxDelivery(_ context.Context, key, d
 	return nil
 }
 
-func (f *acornFoxDeliveryFixture) GetSourceRevision(_ context.Context, id domain.ID) (domain.SourceRevision, error) {
+func (f *acornFoxDeliveryFixture) GetAcornFoxSourceRevision(_ context.Context, app, id domain.ID) (domain.SourceRevision, error) {
+	if f.sourceProofErr != nil {
+		return domain.SourceRevision{}, f.sourceProofErr
+	}
+	// Deliberately permit a wrong-owner fixture result to exercise consumer validation.
 	if id != f.source.ID {
 		return domain.SourceRevision{}, ErrNotFound
 	}
@@ -261,6 +267,7 @@ func (f *acornFoxDeliveryFixture) CreateAcornFoxDefinition(_ context.Context, de
 	return definition, nil
 }
 func (f *acornFoxDeliveryFixture) Import(source domain.SourceRevision) (contracts.AcornFoxDockerfileDefinition, error) {
+	f.importCalls++
 	if source.ID != f.source.ID {
 		return contracts.AcornFoxDockerfileDefinition{}, ErrNotFound
 	}
@@ -386,5 +393,39 @@ func assertAcornFoxRestartTask(t *testing.T, task AcornFoxQueuedTask, deployment
 	actual, err := contracts.AcornFoxRuntimeDeploymentID(parameters.Request.Fact)
 	if err != nil || actual != deploymentID {
 		t.Fatalf("deployment=%s expected=%s err=%v", actual, deploymentID, err)
+	}
+}
+
+type acornFoxSourceProofCapacitySpy struct {
+	contracts.CapacityProvider
+	calls int
+}
+
+func (s *acornFoxSourceProofCapacitySpy) Reserve(ctx context.Context, request contracts.CapacityRequest) (contracts.CapacityLease, error) {
+	s.calls++
+	return s.CapacityProvider.Reserve(ctx, request)
+}
+func TestAcornFoxDeliveryRequiresSourceProofBeforeAnyBuild(t *testing.T) {
+	for _, candidate := range []bool{false, true} {
+		name := "normal"
+		if candidate {
+			name = "verified-candidate"
+		}
+		t.Run(name, func(t *testing.T) {
+			fixture := newAcornFoxDeliveryFixture(t)
+			fixture.sourceProofErr = ErrNotFound
+			capacity := &acornFoxSourceProofCapacitySpy{CapacityProvider: contracts.NewFakeCapacityProvider(true)}
+			fixture.service.Capacity = capacity
+			request := AcornFoxDeliveryCreateRequest{ApplicationID: fixture.source.ApplicationID, SourceRevisionID: fixture.source.ID, ContainerPort: 8080, IdempotencyKey: "proof-required", Actor: "admin"}
+			var err error
+			if candidate {
+				_, err = fixture.service.CreateVerifiedCandidate(context.Background(), request, domain.ImageDigest{Repository: "registry.example/acornfox/web", Digest: "sha256:" + strings.Repeat("d", 64)})
+			} else {
+				_, err = fixture.service.Create(context.Background(), request)
+			}
+			if !errors.Is(err, ErrNotFound) || fixture.importCalls != 0 || fixture.buildProvider.calls != 0 || capacity.calls != 0 || len(fixture.tasks) != 0 {
+				t.Fatalf("unproven source: err=%v imports=%d builds=%d capacity=%d tasks=%d", err, fixture.importCalls, fixture.buildProvider.calls, capacity.calls, len(fixture.tasks))
+			}
+		})
 	}
 }

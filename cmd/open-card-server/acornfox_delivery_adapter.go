@@ -73,6 +73,9 @@ func (a acornFoxPostgresAdapter) FailAcornFoxDelivery(ctx context.Context, key, 
 func (a acornFoxPostgresAdapter) GetSourceRevision(ctx context.Context, id domain.ID) (domain.SourceRevision, error) {
 	return a.store.GetSourceRevision(ctx, id)
 }
+func (a acornFoxPostgresAdapter) GetAcornFoxSourceRevision(ctx context.Context, app, source domain.ID) (domain.SourceRevision, error) {
+	return a.store.GetAcornFoxSourceRevision(ctx, app, source)
+}
 func (a acornFoxPostgresAdapter) GetAcornFoxEnvironment(ctx context.Context, app domain.ID) (domain.ID, error) {
 	return a.store.GetDefaultEnvironmentID(ctx, app)
 }
