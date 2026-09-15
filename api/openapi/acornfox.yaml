@@ -929,7 +929,7 @@ components:
       type: object
       required: [source_revision_id]
       additionalProperties: false
-      properties: {source_revision_id: {type: string, minLength: 1}, container_port: {type: integer, minimum: 0, maximum: 65535}}
+      properties: {source_revision_id: {type: string, minLength: 1}, container_port: {type: integer, minimum: 0, maximum: 65535}, runtime: {$ref: '#/components/schemas/RuntimeInput'}}
     EmptyRequest: {type: object, additionalProperties: false, maxProperties: 0}
     DeliveryCommandResponse:
       type: object
@@ -941,16 +941,51 @@ components:
       required: [repository, digest]
       additionalProperties: false
       properties: {repository: {type: string}, digest: {type: string}}
+    RuntimeEnvironmentVariable:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name: {type: string, pattern: '^[A-Za-z_][A-Za-z0-9_]{0,127}$'}
+        kind: {type: string, enum: [literal], default: literal}
+        value: {type: string, maxLength: 8192, description: Non-secret value persisted with the accepted configuration. Credential values must not be supplied here.}
+    RuntimeVolume:
+      type: object
+      additionalProperties: false
+      required: [name, mount_path, size_bytes]
+      properties:
+        name: {type: string, pattern: '^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$'}
+        mount_path: {type: string, maxLength: 512, description: Clean absolute container data path. System paths and overlapping mounts are rejected. Host paths are not accepted.}
+        size_bytes: {type: integer, format: int64, minimum: 1, maximum: 1125899906842624, description: Capacity reservation only. Docker local volumes do not enforce a per-volume disk quota.}
+        read_only: {type: boolean, default: false}
+    RuntimeConfiguration:
+      type: object
+      additionalProperties: false
+      properties:
+        entrypoint: {type: array, maxItems: 64, items: {type: string, minLength: 1, maxLength: 4096}}
+        command: {type: array, maxItems: 64, items: {type: string, minLength: 1, maxLength: 4096}}
+        environment: {type: array, maxItems: 128, items: {$ref: '#/components/schemas/RuntimeEnvironmentVariable'}}
+        volumes: {type: array, maxItems: 16, items: {$ref: '#/components/schemas/RuntimeVolume'}}
+    RuntimeInput:
+      type: object
+      additionalProperties: false
+      description: Immutable single-container runtime settings. Plain arguments and environment values are persisted. Secrets are not supported by this input. Missing resources use platform defaults plus declared volume capacity. Configured deployments require an online upgraded Agent.
+      properties:
+        entrypoint: {type: array, maxItems: 64, items: {type: string, minLength: 1, maxLength: 4096}}
+        command: {type: array, maxItems: 64, items: {type: string, minLength: 1, maxLength: 4096}}
+        environment: {type: array, maxItems: 128, items: {$ref: '#/components/schemas/RuntimeEnvironmentVariable'}}
+        volumes: {type: array, maxItems: 16, items: {$ref: '#/components/schemas/RuntimeVolume'}}
+        resources: {$ref: '#/components/schemas/RuntimeRequestedResources'}
     RuntimeRequestedResources:
       type: object
       required: [cpu_millis, memory_bytes, pids, disk_reservation_bytes]
       additionalProperties: false
-      properties: {cpu_millis: {type: integer, format: int64}, memory_bytes: {type: integer, format: int64}, pids: {type: integer, format: int64}, disk_reservation_bytes: {type: integer, format: int64}}
+      properties: {cpu_millis: {type: integer, format: int64, minimum: 10, maximum: 1000000}, memory_bytes: {type: integer, format: int64, minimum: 6291456, maximum: 1125899906842624}, pids: {type: integer, format: int64, minimum: 1, maximum: 1000000}, disk_reservation_bytes: {type: integer, format: int64, minimum: 1, maximum: 1125899906842624, description: Total capacity reservation including declared data volumes.}}
     RuntimeReleaseFact:
       type: object
       required: [application_id, environment_id, release_id, service_name, image, resources, accepted_at, immutable]
       additionalProperties: false
-      properties: {application_id: {type: string}, environment_id: {type: string}, release_id: {type: string}, service_name: {type: string}, image: {$ref: '#/components/schemas/ImageDigest'}, resources: {$ref: '#/components/schemas/RuntimeRequestedResources'}, container_port: {type: integer}, accepted_at: {type: string, format: date-time}, immutable: {type: boolean}}
+      properties: {schema_version: {type: integer, enum: [2], description: Absent for legacy default-only deployments.}, configuration: {$ref: '#/components/schemas/RuntimeConfiguration'}, config_digest: {type: string, pattern: '^sha256:[0-9a-f]{64}$'}, application_id: {type: string}, environment_id: {type: string}, release_id: {type: string}, service_name: {type: string}, image: {$ref: '#/components/schemas/ImageDigest'}, resources: {$ref: '#/components/schemas/RuntimeRequestedResources'}, container_port: {type: integer}, accepted_at: {type: string, format: date-time}, immutable: {type: boolean}}
     RuntimeAppliedLimits:
       type: object
       required: [cpu_millis, memory_bytes, pids]

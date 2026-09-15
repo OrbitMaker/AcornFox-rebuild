@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	v1 "github.com/open-card/open-card/api/agent/v1"
+	"github.com/open-card/open-card/internal/domain"
 	"log"
 	"net/http"
 	stdio "os"
@@ -268,6 +270,18 @@ func main() {
 			acornFoxStore := acornFoxPostgresAdapter{store: store}
 			server.SetAcornFoxDockerfileImporter(dockerfile.New())
 			deliveryService := &application.AcornFoxDeliveryService{
+				RuntimeConfigurationGate: func(context.Context) error {
+					instanceID, nodeID := getenv(acornfoxenv.AgentDispatchInstanceID), getenv(acornfoxenv.AgentDispatchNodeID)
+					gateway := server.AgentGateway()
+					if gateway.NodeStatus(instanceID, nodeID, time.Now()) == "online" {
+						for _, capability := range gateway.NodeCapabilities(instanceID, nodeID) {
+							if capability == v1.AgentCapabilityAcornFoxRuntimeConfig {
+								return nil
+							}
+						}
+					}
+					return domain.NewError(domain.ErrUnsupportedCapability, "online agent with runtime configuration support is required")
+				},
 				Idempotency: acornFoxStore, Sources: acornFoxStore, Importer: dockerfile.New(), Builds: acornFoxStore,
 				Tasks: acornFoxStore, Runtime: acornFoxStore, Observer: acornFoxStore, Builder: buildProvider, Capacity: capacityProvider,
 				Config: application.AcornFoxDeliveryConfig{TargetRepository: "acornfox.local/apps", StorageKeyPrefix: "acornfox-builds", BuildNetwork: buildNetwork},

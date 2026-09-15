@@ -11,7 +11,7 @@ import (
 
 var AgentCapabilitiesByVersion = map[compatibility.Version][]string{
 	{Major: 1, Minor: 0}: {"mtls", "typed_tasks", "heartbeat"},
-	{Major: 1, Minor: 1}: {"mtls", "typed_tasks", "heartbeat", "agent_sequence", "observation_details", AgentCapabilityAcornFoxRuntime, AgentCapabilityAcornFoxProbe, AgentCapabilityAcornFoxLogs, AgentCapabilityAcornFoxCandidateValidation, AgentCapabilityRuntimeDeployGroup, AgentCapabilityRuntimeObserveGroup, AgentCapabilityRuntimeRollbackGroup, AgentCapabilityRuntimeDestroyGroup, AgentCapabilityRuntimeRestartGroupService, AgentCapabilityRuntimeRestartGroup},
+	{Major: 1, Minor: 1}: {"mtls", "typed_tasks", "heartbeat", "agent_sequence", "observation_details", AgentCapabilityAcornFoxRuntime, AgentCapabilityAcornFoxRuntimeConfig, AgentCapabilityAcornFoxProbe, AgentCapabilityAcornFoxLogs, AgentCapabilityAcornFoxCandidateValidation, AgentCapabilityRuntimeDeployGroup, AgentCapabilityRuntimeObserveGroup, AgentCapabilityRuntimeRollbackGroup, AgentCapabilityRuntimeDestroyGroup, AgentCapabilityRuntimeRestartGroupService, AgentCapabilityRuntimeRestartGroup},
 }
 
 var SupportedAgentVersions = []compatibility.Version{{Major: 1, Minor: 1}, {Major: 1, Minor: 0}}
@@ -188,7 +188,7 @@ func DowngradeEnvelope(envelope Envelope, targetVersion string) (Envelope, Compa
 }
 
 func legacyDisabledCapabilities() []string {
-	values := []string{"agent_sequence", "observation_details", AgentCapabilityAcornFoxRuntime, AgentCapabilityAcornFoxProbe, AgentCapabilityAcornFoxLogs, AgentCapabilityAcornFoxCandidateValidation, AgentCapabilityRuntimeDeployGroup, AgentCapabilityRuntimeDestroyGroup, AgentCapabilityRuntimeObserveGroup, AgentCapabilityRuntimeRollbackGroup, AgentCapabilityRuntimeRestartGroupService, AgentCapabilityRuntimeRestartGroup}
+	values := []string{"agent_sequence", "observation_details", AgentCapabilityAcornFoxRuntime, AgentCapabilityAcornFoxRuntimeConfig, AgentCapabilityAcornFoxProbe, AgentCapabilityAcornFoxLogs, AgentCapabilityAcornFoxCandidateValidation, AgentCapabilityRuntimeDeployGroup, AgentCapabilityRuntimeDestroyGroup, AgentCapabilityRuntimeObserveGroup, AgentCapabilityRuntimeRollbackGroup, AgentCapabilityRuntimeRestartGroupService, AgentCapabilityRuntimeRestartGroup}
 	sort.Strings(values)
 	return values
 }

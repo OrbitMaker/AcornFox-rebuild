@@ -80,6 +80,7 @@ func (systemPortAllocator) Release(int) {}
 // Docker object this provider can create; it must not overlap arbitrary host
 // containers or networks.
 type Config struct {
+	Volumes               ManagedVolumeProvider
 	Command               string
 	TaskPrefix            string
 	Network               string
@@ -195,6 +196,8 @@ type deployRecord struct {
 }
 
 type runtimeState struct {
+	configuration   *contracts.AcornFoxRuntimeConfiguration
+	configDigest    string
 	deployment      domain.Deployment
 	service         string
 	image           domain.ImageDigest
@@ -273,6 +276,7 @@ func (p *Provider) Deploy(ctx context.Context, request contracts.DeployRequest) 
 }
 
 func (p *Provider) deployOperation(ctx context.Context, request contracts.DeployRequest) (domain.Deployment, error) {
+	request.Spec.Configuration = copyRuntimeConfiguration(request.Spec.Configuration)
 	if err := p.check(ctx, request.Operation, contracts.CapabilityRuntimeDeploy, "deploy"); err != nil {
 		return domain.Deployment{}, err
 	}
@@ -333,6 +337,7 @@ func (p *Provider) deployOperation(ctx context.Context, request contracts.Deploy
 // capacity and published port through a durable replacing phase. Legacy callers
 // preserve their existing destroyed-then-deploy replacement behavior.
 func (p *Provider) Recreate(ctx context.Context, request contracts.DeployRequest) (domain.Deployment, error) {
+	request.Spec.Configuration = copyRuntimeConfiguration(request.Spec.Configuration)
 	unlock := p.lockDeployment(request.DeploymentID)
 	defer unlock()
 	if err := p.check(ctx, request.Operation, contracts.CapabilityRuntimeDeploy, "recreate"); err != nil {
@@ -471,7 +476,7 @@ func (p *Provider) deploy(ctx context.Context, request contracts.DeployRequest, 
 		return domain.Deployment{}, nil, p.failure(request.Operation, contracts.CapabilityRuntimeDeploy, "deploy", contracts.ErrConflict, "active runtime without a durable ledger cannot be adopted", contracts.RetryNever, false, nil)
 	}
 	now := p.config.Clock().UTC()
-	pending := &runtimeState{deployment: deployment, service: request.Spec.ServiceName, image: request.Spec.Image, container: container, containerPort: request.Spec.Port, phase: "pending", fingerprint: fingerprint, createdAt: now, updatedAt: now, leaseGeneration: leaseGeneration, actions: make(map[string]runtimeAction), resources: request.Spec.Resources}
+	pending := &runtimeState{configuration: copyRuntimeConfiguration(request.Spec.Configuration), configDigest: request.Spec.ConfigDigest, deployment: deployment, service: request.Spec.ServiceName, image: request.Spec.Image, container: container, containerPort: request.Spec.Port, phase: "pending", fingerprint: fingerprint, createdAt: now, updatedAt: now, leaseGeneration: leaseGeneration, actions: make(map[string]runtimeAction), resources: request.Spec.Resources}
 	if err := p.persistState(pending); err != nil {
 		return domain.Deployment{}, nil, p.failure(request.Operation, contracts.CapabilityRuntimeDeploy, "persist_state", contracts.ErrUnavailable, "pending runtime generation could not be persisted", contracts.RetryBackoff, true, err)
 	}
@@ -543,7 +548,7 @@ func (p *Provider) deploy(ctx context.Context, request contracts.DeployRequest, 
 	if err := p.run(ctx, []string{"load", "--input", path}); err != nil {
 		return domain.Deployment{}, nil, p.commandError(request.Operation, contracts.CapabilityRuntimeDeploy, "deploy", err)
 	}
-	if err := p.verifyImage(ctx, request.Spec.Image, request.Operation); err != nil {
+	if err := p.verifyImage(ctx, request.Spec.Image, request.Operation, request.Spec); err != nil {
 		return domain.Deployment{}, nil, err
 	}
 	if err := p.ensureNetwork(ctx, request.Operation); err != nil {
@@ -556,6 +561,9 @@ func (p *Provider) deploy(ctx context.Context, request contracts.DeployRequest, 
 	}
 	if err := deployment.Transition(domain.DeploymentDeploying, p.config.Clock()); err != nil {
 		return domain.Deployment{}, nil, p.failure(request.Operation, contracts.CapabilityRuntimeDeploy, "deploy", contracts.ErrValidation, "deployment transition is invalid", contracts.RetryNever, false, err)
+	}
+	if err := p.prepareRuntimeVolumes(ctx, request.Spec, request.Operation); err != nil {
+		return domain.Deployment{}, nil, err
 	}
 	args := p.runArgs(container, deployment, request.Spec, port)
 	activateOperation := request.Operation
@@ -572,6 +580,9 @@ func (p *Provider) deploy(ctx context.Context, request contracts.DeployRequest, 
 	if err := p.run(ctx, args); err != nil {
 		return domain.Deployment{}, nil, p.commandError(request.Operation, contracts.CapabilityRuntimeDeploy, "deploy", err)
 	}
+	if err := p.verifyRuntimeVolumes(ctx, request.Spec, request.Operation); err != nil {
+		return domain.Deployment{}, nil, err
+	}
 	facts, inspectErr := p.inspectFacts(ctx, container)
 	observedPort, matches := facts.matchesRunning(p.config, deployment, request.Spec)
 	if inspectErr != nil || !matches || observedPort != port {
@@ -580,7 +591,7 @@ func (p *Provider) deploy(ctx context.Context, request contracts.DeployRequest, 
 	if err := deployment.Transition(domain.DeploymentRuntimeReady, p.config.Clock()); err != nil {
 		return domain.Deployment{}, nil, p.failure(request.Operation, contracts.CapabilityRuntimeDeploy, "deploy", contracts.ErrValidation, "deployment transition is invalid", contracts.RetryNever, false, err)
 	}
-	state = &runtimeState{deployment: deployment, service: request.Spec.ServiceName, image: request.Spec.Image, container: container, containerID: facts.ID, port: port, containerPort: request.Spec.Port, phase: "active", fingerprint: fingerprint, createdAt: now, updatedAt: p.config.Clock().UTC(), leaseGeneration: leaseGeneration, actions: make(map[string]runtimeAction), capacity: &capacity, resources: request.Spec.Resources}
+	state = &runtimeState{configuration: copyRuntimeConfiguration(request.Spec.Configuration), configDigest: request.Spec.ConfigDigest, deployment: deployment, service: request.Spec.ServiceName, image: request.Spec.Image, container: container, containerID: facts.ID, port: port, containerPort: request.Spec.Port, phase: "active", fingerprint: fingerprint, createdAt: now, updatedAt: p.config.Clock().UTC(), leaseGeneration: leaseGeneration, actions: make(map[string]runtimeAction), capacity: &capacity, resources: request.Spec.Resources}
 	for _, action := range priorActions {
 		state.actions[action.IdentityHash] = runtimeAction{identityHash: action.IdentityHash, action: action.Action, fingerprint: action.Fingerprint, status: action.Status, previousContainerID: action.PreviousContainerID, previousStartedAt: action.PreviousStartedAt, releaseAttempt: action.ReleaseAttempt, at: action.At}
 	}
@@ -608,7 +619,7 @@ func (p *Provider) recover(ctx context.Context, container string, deployment dom
 		return nil, true, err
 	}
 	now := p.config.Clock().UTC()
-	return &runtimeState{deployment: deployment, service: request.Spec.ServiceName, image: request.Spec.Image, container: container, containerID: facts.ID, port: port, containerPort: request.Spec.Port, phase: "active", fingerprint: p.fingerprint(deployment.ID, request.Spec), createdAt: now, updatedAt: now, actions: make(map[string]runtimeAction), resources: request.Spec.Resources}, true, nil
+	return &runtimeState{configuration: copyRuntimeConfiguration(request.Spec.Configuration), configDigest: request.Spec.ConfigDigest, deployment: deployment, service: request.Spec.ServiceName, image: request.Spec.Image, container: container, containerID: facts.ID, port: port, containerPort: request.Spec.Port, phase: "active", fingerprint: p.fingerprint(deployment.ID, request.Spec), createdAt: now, updatedAt: now, actions: make(map[string]runtimeAction), resources: request.Spec.Resources}, true, nil
 }
 
 func (p *Provider) Observe(ctx context.Context, request contracts.ObserveRequest) (contracts.RuntimeObservation, error) {
@@ -622,11 +633,14 @@ func (p *Provider) Observe(ctx context.Context, request contracts.ObserveRequest
 	if state.destroyed {
 		return p.observation(state, "stopped", false, 0, 0, 0, contracts.ResourceLimits{}, false, "", request.Operation), nil
 	}
+	if err := p.verifyRuntimeVolumes(ctx, state.runtimeSpec(), request.Operation); err != nil {
+		return contracts.RuntimeObservation{}, err
+	}
 	facts, err := p.inspectFacts(ctx, state.container)
 	if err != nil {
 		return contracts.RuntimeObservation{}, p.commandError(request.Operation, contracts.CapabilityRuntimeObserve, "observe", err)
 	}
-	port, valid := facts.matchesConfiguration(p.config, state.deployment, contracts.RuntimeSpec{ApplicationID: state.deployment.ApplicationID, EnvironmentID: state.deployment.EnvironmentID, ReleaseID: state.deployment.ReleaseID, ServiceName: state.service, Image: state.image, Resources: state.resources, Port: state.containerPort})
+	port, valid := facts.matchesConfiguration(p.config, state.deployment, state.runtimeSpec())
 	if !valid || port != state.port {
 		return contracts.RuntimeObservation{}, p.failure(request.Operation, contracts.CapabilityRuntimeObserve, "observe", contracts.ErrConflict, "Docker runtime readback does not match the constrained deployment", contracts.RetryNever, false, nil)
 	}
@@ -806,8 +820,11 @@ func (p *Provider) Restart(ctx context.Context, request contracts.RestartRequest
 	if action, done := state.actions[actionHash]; done && action.status == "succeeded" && action.action == "restart" && action.fingerprint == state.fingerprint {
 		return nil
 	}
+	if err := p.verifyRuntimeVolumes(ctx, state.runtimeSpec(), request.Operation); err != nil {
+		return err
+	}
 	facts, inspectErr := p.inspectFacts(ctx, state.container)
-	_, matches := facts.matchesConfiguration(p.config, state.deployment, contracts.RuntimeSpec{ApplicationID: state.deployment.ApplicationID, EnvironmentID: state.deployment.EnvironmentID, ReleaseID: state.deployment.ReleaseID, ServiceName: state.service, Image: state.image, Resources: state.resources, Port: state.containerPort})
+	_, matches := facts.matchesConfiguration(p.config, state.deployment, state.runtimeSpec())
 	if inspectErr != nil || !matches {
 		return p.failure(request.Operation, contracts.CapabilityRuntimeRestart, "restart", contracts.ErrConflict, "runtime facts do not match before restart", contracts.RetryNever, false, inspectErr)
 	}
@@ -829,6 +846,13 @@ func (p *Provider) Restart(ctx context.Context, request contracts.RestartRequest
 	}
 	if err := p.run(ctx, []string{"restart", state.container}); err != nil {
 		return p.commandError(request.Operation, contracts.CapabilityRuntimeRestart, "restart", err)
+	}
+	if state.configuration != nil {
+		after, err := p.inspectFacts(ctx, state.container)
+		_, matches := after.matchesRunning(p.config, state.deployment, state.runtimeSpec())
+		if err != nil || !matches || after.ID != facts.ID {
+			return p.failure(request.Operation, contracts.CapabilityRuntimeRestart, "restart", contracts.ErrConflict, "runtime configuration changed after restart", contracts.RetryNever, false, nil)
+		}
 	}
 	now := p.config.Clock().UTC()
 	state.actions[actionHash] = runtimeAction{identityHash: actionHash, action: "restart", fingerprint: state.fingerprint, status: "succeeded", at: now}
@@ -930,6 +954,9 @@ func (p *Provider) validateSpec(spec contracts.RuntimeSpec, operation contracts.
 	if spec.Port < 0 || spec.Port > 65535 {
 		return p.failure(operation, contracts.CapabilityRuntimeDeploy, "deploy", contracts.ErrValidation, "runtime container port is invalid", contracts.RetryNever, false, nil)
 	}
+	if err := p.validateConfiguredSpec(spec, operation); err != nil {
+		return err
+	}
 	if len(spec.Secrets) != 0 {
 		return p.failure(operation, contracts.CapabilityRuntimeDeploy, "deploy", contracts.ErrForbidden, "standalone M1 does not materialize runtime secrets", contracts.RetryUserAction, false, nil)
 	}
@@ -963,7 +990,7 @@ func (p *Provider) ensureNetwork(ctx context.Context, operation contracts.Operat
 	return nil
 }
 
-func (p *Provider) verifyImage(ctx context.Context, image domain.ImageDigest, operation contracts.OperationContext) error {
+func (p *Provider) verifyImage(ctx context.Context, image domain.ImageDigest, operation contracts.OperationContext, accepted ...contracts.RuntimeSpec) error {
 	output, err := p.output(ctx, []string{"image", "inspect", "--format", "{{.Id}}|{{json .Config}}", image.Digest})
 	if err != nil {
 		return p.commandError(operation, contracts.CapabilityRuntimeDeploy, "deploy", err)
@@ -978,13 +1005,17 @@ func (p *Provider) verifyImage(ctx context.Context, image domain.ImageDigest, op
 	var config struct {
 		Volumes map[string]any `json:"Volumes"`
 	}
-	if err := json.Unmarshal([]byte(parts[1]), &config); err != nil || len(config.Volumes) != 0 {
+	spec := contracts.RuntimeSpec{}
+	if len(accepted) == 1 {
+		spec = accepted[0]
+	}
+	if err := json.Unmarshal([]byte(parts[1]), &config); err != nil || !runtimeDeclaredVolumesCovered(config.Volumes, spec) {
 		return p.failure(operation, contracts.CapabilityRuntimeDeploy, "deploy", contracts.ErrForbidden, "images declaring volumes are not supported by standalone M1", contracts.RetryUserAction, false, nil)
 	}
 	return nil
 }
 
-func (p *Provider) runArgs(container string, deployment domain.Deployment, spec contracts.RuntimeSpec, port int) []string {
+func (p *Provider) runArgs(container string, deployment domain.Deployment, spec contracts.RuntimeSpec, port int, extraLabels ...string) []string {
 	args := []string{
 		"run", "--detach", "--name", container,
 		"--pull", "never", "--restart", "no",
@@ -1009,7 +1040,33 @@ func (p *Provider) runArgs(container string, deployment domain.Deployment, spec 
 	for _, resolver := range p.config.DNS {
 		args = append(args, "--dns", resolver)
 	}
-	return append(args, imageRef(spec.Image))
+	if c := spec.Configuration; c != nil {
+		args = append(args, "--label", "open-card.config-digest="+spec.ConfigDigest)
+		for _, v := range c.Environment {
+			args = append(args, "--env", v.Name+"="+v.Value)
+		}
+		for _, v := range c.Volumes {
+			mount := "type=volume,source=" + runtimeVolumeName(p.config.TaskPrefix, spec, v.Name) + ",target=" + v.MountPath
+			if v.ReadOnly {
+				mount += ",readonly"
+			}
+			args = append(args, "--mount", mount)
+		}
+		if len(c.Entrypoint) > 0 {
+			args = append(args, "--entrypoint", c.Entrypoint[0])
+		}
+	}
+	for _, label := range extraLabels {
+		args = append(args, "--label", label)
+	}
+	args = append(args, imageRef(spec.Image))
+	if c := spec.Configuration; c != nil {
+		if len(c.Entrypoint) > 1 {
+			args = append(args, c.Entrypoint[1:]...)
+		}
+		args = append(args, c.Command...)
+	}
+	return args
 }
 
 func (p *Provider) copyArchive(source io.Reader) (string, error) {
@@ -1175,7 +1232,11 @@ func (p *Provider) evidence(operation contracts.OperationContext, kind string) c
 }
 
 func (p *Provider) fingerprint(deploymentID domain.ID, spec contracts.RuntimeSpec) string {
-	return hash(string(deploymentID), string(spec.ApplicationID), string(spec.EnvironmentID), string(spec.ReleaseID), spec.ServiceName, spec.Image.Repository, spec.Image.Digest, fmt.Sprint(spec.Resources), fmt.Sprint(spec.Port))
+	parts := []string{string(deploymentID), string(spec.ApplicationID), string(spec.EnvironmentID), string(spec.ReleaseID), spec.ServiceName, spec.Image.Repository, spec.Image.Digest, fmt.Sprint(spec.Resources), fmt.Sprint(spec.Port)}
+	if spec.Configuration != nil {
+		parts = append(parts, "runtime-config-v2", spec.ConfigDigest)
+	}
+	return hash(parts...)
 }
 
 func imageRef(image domain.ImageDigest) string { return image.Digest }

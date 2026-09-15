@@ -74,8 +74,8 @@ func (p *Provider) durableSnapshot(state *runtimeState) durableRuntimeState {
 		actions = append(actions, durableRuntimeAction{IdentityHash: action.identityHash, Action: action.action, Fingerprint: action.fingerprint, Status: action.status, PreviousContainerID: action.previousContainerID, PreviousStartedAt: action.previousStartedAt, ReleaseAttempt: action.releaseAttempt, At: action.at.UTC()})
 	}
 	sort.Slice(actions, func(i, j int) bool { return actions[i].IdentityHash < actions[j].IdentityHash })
-	spec := contracts.RuntimeSpec{ApplicationID: state.deployment.ApplicationID, EnvironmentID: state.deployment.EnvironmentID, ReleaseID: state.deployment.ReleaseID, ServiceName: state.service, Image: state.image, Resources: state.resources, Port: state.containerPort}
-	return durableRuntimeState{SchemaVersion: durableRuntimeStateSchema, Deployment: state.deployment, Spec: spec, Fingerprint: state.fingerprint, Container: state.container, ContainerID: state.containerID, Phase: state.phase, Capacity: state.capacity, LeaseGeneration: state.leaseGeneration, Actions: actions, CreatedAt: state.createdAt.UTC(), UpdatedAt: state.updatedAt.UTC()}
+	spec := state.runtimeSpec()
+	return durableRuntimeState{SchemaVersion: runtimeStateSchema(spec), Deployment: state.deployment, Spec: spec, Fingerprint: state.fingerprint, Container: state.container, ContainerID: state.containerID, Phase: state.phase, Capacity: state.capacity, LeaseGeneration: state.leaseGeneration, Actions: actions, CreatedAt: state.createdAt.UTC(), UpdatedAt: state.updatedAt.UTC()}
 }
 
 func (p *Provider) persistState(state *runtimeState) error {
@@ -174,7 +174,7 @@ func (p *Provider) readDurableState(id domain.ID) (durableRuntimeState, bool, er
 }
 
 func validateDurableRuntimeState(snapshot durableRuntimeState, config Config) error {
-	if snapshot.SchemaVersion != durableRuntimeStateSchema || snapshot.Phase != "pending" && snapshot.Phase != "active" && snapshot.Phase != "destroying" && snapshot.Phase != "destroyed" && snapshot.Phase != "replacing" {
+	if snapshot.SchemaVersion != runtimeStateSchema(snapshot.Spec) || (snapshot.SchemaVersion != "1" && snapshot.SchemaVersion != "2") || snapshot.Phase != "pending" && snapshot.Phase != "active" && snapshot.Phase != "destroying" && snapshot.Phase != "destroyed" && snapshot.Phase != "replacing" {
 		return errors.New("standalone state schema or phase is unsupported")
 	}
 	if err := snapshot.Deployment.Validate(); err != nil {
@@ -214,9 +214,14 @@ func validateDurableRuntimeState(snapshot durableRuntimeState, config Config) er
 }
 
 func (p *Provider) stateFromDurable(ctx context.Context, snapshot durableRuntimeState, operation contracts.OperationContext, capability contracts.Capability, action string) (*runtimeState, error) {
-	state := &runtimeState{deployment: snapshot.Deployment, service: snapshot.Spec.ServiceName, image: snapshot.Spec.Image, container: snapshot.Container, containerID: snapshot.ContainerID, containerPort: snapshot.Spec.Port, fingerprint: snapshot.Fingerprint, phase: snapshot.Phase, capacity: snapshot.Capacity, leaseGeneration: snapshot.LeaseGeneration, resources: snapshot.Spec.Resources, createdAt: snapshot.CreatedAt, updatedAt: snapshot.UpdatedAt, actions: map[string]runtimeAction{}}
+	state := &runtimeState{configuration: copyRuntimeConfiguration(snapshot.Spec.Configuration), configDigest: snapshot.Spec.ConfigDigest, deployment: snapshot.Deployment, service: snapshot.Spec.ServiceName, image: snapshot.Spec.Image, container: snapshot.Container, containerID: snapshot.ContainerID, containerPort: snapshot.Spec.Port, fingerprint: snapshot.Fingerprint, phase: snapshot.Phase, capacity: snapshot.Capacity, leaseGeneration: snapshot.LeaseGeneration, resources: snapshot.Spec.Resources, createdAt: snapshot.CreatedAt, updatedAt: snapshot.UpdatedAt, actions: map[string]runtimeAction{}}
 	for _, persisted := range snapshot.Actions {
 		state.actions[persisted.IdentityHash] = runtimeAction{identityHash: persisted.IdentityHash, action: persisted.Action, fingerprint: persisted.Fingerprint, status: persisted.Status, previousContainerID: persisted.PreviousContainerID, previousStartedAt: persisted.PreviousStartedAt, releaseAttempt: persisted.ReleaseAttempt, at: persisted.At}
+	}
+	if state.phase == "active" || state.phase == "replacing" {
+		if err := p.verifyRuntimeVolumes(ctx, snapshot.Spec, operation); err != nil {
+			return nil, err
+		}
 	}
 	if state.phase == "replacing" {
 		return p.reconcileReplacement(ctx, snapshot, state, operation)
@@ -285,6 +290,9 @@ func (p *Provider) stateFromDurable(ctx context.Context, snapshot durableRuntime
 			}
 		}
 		return nil, p.failure(operation, capability, action, contracts.ErrUnavailable, "durable runtime container could not be inspected", contracts.RetryAfterReconnect, true, nil)
+	}
+	if err := p.verifyRuntimeVolumes(ctx, snapshot.Spec, operation); err != nil {
+		return nil, err
 	}
 	port, ok := facts.matchesConfiguration(p.config, state.deployment, snapshot.Spec)
 	if !ok {
@@ -382,12 +390,23 @@ func (p *Provider) Reconcile(ctx context.Context) error {
 }
 
 type inspectFacts struct {
+	imageConfiguration         runtimeImageConfiguration
+	imageConfigurationVerified bool
+	Mounts                     []struct {
+		Type        string `json:"Type"`
+		Name        string `json:"Name"`
+		Destination string `json:"Destination"`
+		RW          bool   `json:"RW"`
+	} `json:"Mounts"`
 	ID           string `json:"Id"`
 	Image        string `json:"Image"`
 	RestartCount uint64 `json:"RestartCount"`
 	Config       struct {
-		Labels  map[string]string `json:"Labels"`
-		Volumes map[string]any    `json:"Volumes"`
+		Entrypoint []string          `json:"Entrypoint"`
+		Cmd        []string          `json:"Cmd"`
+		Env        []string          `json:"Env"`
+		Labels     map[string]string `json:"Labels"`
+		Volumes    map[string]any    `json:"Volumes"`
 	} `json:"Config"`
 	State struct {
 		Running   bool   `json:"Running"`
@@ -430,6 +449,14 @@ func (p *Provider) inspectFacts(ctx context.Context, container string) (inspectF
 	var facts inspectFacts
 	if err := json.Unmarshal([]byte(output), &facts); err != nil {
 		return inspectFacts{}, err
+	}
+	if facts.Config.Labels["open-card.config-digest"] != "" {
+		imageConfig, err := p.loadRuntimeImageConfiguration(ctx, facts.Image)
+		if err != nil {
+			return inspectFacts{}, err
+		}
+		facts.imageConfiguration = imageConfig
+		facts.imageConfigurationVerified = true
 	}
 	return facts, nil
 }
@@ -490,7 +517,7 @@ func (p *Provider) cleanupFailedDeployContainer(ctx context.Context, state *runt
 func (facts inspectFacts) matchesConfiguration(config Config, deployment domain.Deployment, spec contracts.RuntimeSpec) (int, bool) {
 	labels := facts.Config.Labels
 	valid := validContainerID(facts.ID) && facts.Image == spec.Image.Digest && labels["open-card.managed"] == "true" && labels["open-card.task-prefix"] == config.TaskPrefix && labels["open-card.deployment-id"] == deployment.ID.String() && labels["open-card.application-id"] == spec.ApplicationID.String() && labels["open-card.environment-id"] == spec.EnvironmentID.String() && labels["open-card.release-id"] == spec.ReleaseID.String() && labels["open-card.service"] == spec.ServiceName && labels["open-card.image-repository"] == spec.Image.Repository && labels["open-card.image-digest"] == spec.Image.Digest
-	valid = valid && facts.HostConfig.NetworkMode == config.Network && !facts.HostConfig.Privileged && len(facts.HostConfig.Binds) == 0 && len(facts.Config.Volumes) == 0 && len(facts.HostConfig.CapAdd) == 0 && len(facts.HostConfig.CapDrop) == 1 && facts.HostConfig.CapDrop[0] == "ALL" && len(facts.HostConfig.SecurityOpt) == 1 && facts.HostConfig.SecurityOpt[0] == "no-new-privileges=true" && facts.HostConfig.RestartPolicy.Name == "no" && facts.HostConfig.Memory == spec.Resources.MemoryBytes && facts.HostConfig.MemorySwap == spec.Resources.MemoryBytes && facts.HostConfig.CpuPeriod == 100000 && facts.HostConfig.CpuQuota == spec.Resources.CPUMillis*100 && facts.HostConfig.PidsLimit != nil && *facts.HostConfig.PidsLimit == spec.Resources.PIDs
+	valid = valid && facts.HostConfig.NetworkMode == config.Network && !facts.HostConfig.Privileged && len(facts.HostConfig.Binds) == 0 && facts.matchesConfiguredRuntime(config, spec) && len(facts.HostConfig.CapAdd) == 0 && len(facts.HostConfig.CapDrop) == 1 && facts.HostConfig.CapDrop[0] == "ALL" && len(facts.HostConfig.SecurityOpt) == 1 && facts.HostConfig.SecurityOpt[0] == "no-new-privileges=true" && facts.HostConfig.RestartPolicy.Name == "no" && facts.HostConfig.Memory == spec.Resources.MemoryBytes && facts.HostConfig.MemorySwap == spec.Resources.MemoryBytes && facts.HostConfig.CpuPeriod == 100000 && facts.HostConfig.CpuQuota == spec.Resources.CPUMillis*100 && facts.HostConfig.PidsLimit != nil && *facts.HostConfig.PidsLimit == spec.Resources.PIDs
 	if !valid {
 		return 0, false
 	}

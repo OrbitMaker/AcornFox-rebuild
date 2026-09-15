@@ -209,6 +209,8 @@ type AcornFoxLegacyRoute struct {
 // intentionally independent from the historical Open Card OpenAPI document;
 // callers use it to cross-check the standalone AcornFox document and router.
 var acornFoxPublicRoutes = [...]AcornFoxPublicRoute{
+	{Path: "/api/v1/acornfox/source-uploads", Methods: []string{"post"}},
+	{Path: "/api/v1/acornfox/source-uploads/{uploadId}", Methods: []string{"get"}},
 	{Path: "/api/v1/acornfox/setup", Methods: []string{"get", "post"}},
 	{Path: "/api/v1/acornfox/auth/login", Methods: []string{"post"}},
 	{Path: "/api/v1/acornfox/auth/logout", Methods: []string{"post"}},

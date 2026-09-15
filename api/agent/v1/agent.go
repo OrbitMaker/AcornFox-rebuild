@@ -72,6 +72,8 @@ const (
 	// surface. It is intentionally one capability because all five accepted
 	// actions share the same immutable runtime fact boundary.
 	AgentCapabilityAcornFoxRuntime = "acornfox.runtime.v1"
+	// Configured runtime requires explicit negotiation; old agents cannot accept it.
+	AgentCapabilityAcornFoxRuntimeConfig = "acornfox.runtime.config.v1"
 	// AgentCapabilityAcornFoxProbe is separate from lifecycle control: it can
 	// observe a runtime-derived loopback address but cannot deploy or mutate.
 	AgentCapabilityAcornFoxProbe = "acornfox.probe.v1"
@@ -120,6 +122,25 @@ func RequiredCapabilityForTaskRequest(task TaskRequest) string {
 	if marker, present := acornFoxPayloadMarker(task.Parameters); present {
 		switch marker {
 		case "deploy", "redeploy", "observe", "restart", "destroy":
+			var wire struct {
+				Request struct {
+					Fact map[string]json.RawMessage `json:"fact"`
+				} `json:"request"`
+			}
+			if json.NewDecoder(bytes.NewReader(task.Parameters)).Decode(&wire) == nil {
+				fact := wire.Request.Fact
+				_, versionPresent := fact["schema_version"]
+				_, configurationPresent := fact["configuration"]
+				_, digestPresent := fact["config_digest"]
+				if versionPresent || configurationPresent || digestPresent {
+					var version int
+					var digest string
+					if json.Unmarshal(fact["schema_version"], &version) == nil && version == 2 && json.Unmarshal(fact["config_digest"], &digest) == nil && digest != "" && configurationPresent && string(fact["configuration"]) != "null" {
+						return AgentCapabilityAcornFoxRuntimeConfig
+					}
+					return "acornfox.unknown_configuration"
+				}
+			}
 			return AgentCapabilityAcornFoxRuntime
 		default:
 			return "acornfox.unknown_payload"

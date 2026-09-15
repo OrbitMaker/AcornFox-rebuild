@@ -151,7 +151,7 @@ type acornFoxHTTPCommand struct {
 }
 
 func (h acornFoxHTTPCommand) Create(ctx context.Context, app domain.ID, input acornFoxDeliveryInput, key, actor string) (acornFoxDeliveryResult, error) {
-	result, err := h.service.Create(ctx, application.AcornFoxDeliveryCreateRequest{ApplicationID: app, SourceRevisionID: input.SourceRevisionID, ContainerPort: input.ContainerPort, IdempotencyKey: acornFoxHTTPKey("create", app, input.SourceRevisionID, key), Actor: actor})
+	result, err := h.service.Create(ctx, application.AcornFoxDeliveryCreateRequest{ApplicationID: app, SourceRevisionID: input.SourceRevisionID, ContainerPort: input.ContainerPort, Runtime: input.Runtime, IdempotencyKey: acornFoxHTTPKey("create", app, input.SourceRevisionID, key), Actor: actor})
 	return acornFoxHTTPResult(result), err
 }
 func (h acornFoxHTTPCommand) Restart(ctx context.Context, app, deployment domain.ID, key, actor string) (acornFoxDeliveryResult, error) {

@@ -34,8 +34,9 @@ type acornFoxDeliveryCommand interface {
 }
 
 type acornFoxDeliveryInput struct {
-	SourceRevisionID domain.ID `json:"source_revision_id"`
-	ContainerPort    int       `json:"container_port,omitempty"`
+	Runtime          *contracts.AcornFoxRuntimeInput `json:"runtime,omitempty"`
+	SourceRevisionID domain.ID                       `json:"source_revision_id"`
+	ContainerPort    int                             `json:"container_port,omitempty"`
 }
 
 // Probe input has no target, port, address, URL, runtime fact or observation.

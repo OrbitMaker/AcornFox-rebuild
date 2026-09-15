@@ -110,20 +110,22 @@ func (config AcornFoxDeliveryConfig) validate() error {
 // `/api/v1/acornfox` façade. It has no DNS, logs, public reachability,
 // rollback, scale, rolling, group, volume, or Kubernetes behavior.
 type AcornFoxDeliveryService struct {
-	Idempotency AcornFoxDeliveryIdempotencyStore
-	Sources     AcornFoxDeliverySourceStore
-	Importer    AcornFoxDockerfileImporter
-	Builds      AcornFoxDeliveryBuildStore
-	Tasks       AcornFoxDeliveryTaskStore
-	Runtime     AcornFoxRuntimeFactStore
-	Observer    AcornFoxRuntimeObservationStore
-	Builder     contracts.BuildProvider
-	Capacity    contracts.CapacityProvider
-	Config      AcornFoxDeliveryConfig
-	Clock       func() time.Time
+	RuntimeConfigurationGate func(context.Context) error
+	Idempotency              AcornFoxDeliveryIdempotencyStore
+	Sources                  AcornFoxDeliverySourceStore
+	Importer                 AcornFoxDockerfileImporter
+	Builds                   AcornFoxDeliveryBuildStore
+	Tasks                    AcornFoxDeliveryTaskStore
+	Runtime                  AcornFoxRuntimeFactStore
+	Observer                 AcornFoxRuntimeObservationStore
+	Builder                  contracts.BuildProvider
+	Capacity                 contracts.CapacityProvider
+	Config                   AcornFoxDeliveryConfig
+	Clock                    func() time.Time
 }
 
 type AcornFoxDeliveryCreateRequest struct {
+	Runtime          *contracts.AcornFoxRuntimeInput
 	ApplicationID    domain.ID
 	SourceRevisionID domain.ID
 	ContainerPort    int
@@ -163,6 +165,7 @@ func (service *AcornFoxDeliveryService) Create(ctx context.Context, request Acor
 	}
 	now := service.now()
 	digest := acornFoxDeliveryDigest("create", request.ApplicationID.String(), request.SourceRevisionID.String(), fmt.Sprint(request.ContainerPort), strings.TrimSpace(service.Config.TargetRepository), strings.TrimSpace(service.Config.StorageKeyPrefix))
+	digest = configuredAcornFoxRequestDigest(request, digest)
 	if replay, found, err := service.Idempotency.BeginAcornFoxDelivery(ctx, request.IdempotencyKey, digest, now); err != nil {
 		return AcornFoxDeliveryResult{}, err
 	} else if found {
@@ -190,6 +193,7 @@ func (service *AcornFoxDeliveryService) CreateVerifiedCandidate(ctx context.Cont
 	}
 	now := service.now()
 	digest := acornFoxDeliveryDigest("verified-candidate", request.ApplicationID.String(), request.SourceRevisionID.String(), fmt.Sprint(request.ContainerPort), expectedImage.Repository, expectedImage.Digest, strings.TrimSpace(service.Config.TargetRepository), strings.TrimSpace(service.Config.StorageKeyPrefix))
+	digest = configuredAcornFoxRequestDigest(request, digest)
 	if replay, found, err := service.Idempotency.BeginAcornFoxDelivery(ctx, request.IdempotencyKey, digest, now); err != nil {
 		return AcornFoxDeliveryResult{}, err
 	} else if found {
@@ -212,10 +216,23 @@ func (service *AcornFoxDeliveryService) ReplayVerifiedCandidate(ctx context.Cont
 		return AcornFoxDeliveryResult{}, false, domain.ValidationError("verified candidate delivery replay is invalid")
 	}
 	digest := acornFoxDeliveryDigest("verified-candidate", request.ApplicationID.String(), request.SourceRevisionID.String(), fmt.Sprint(request.ContainerPort), expectedImage.Repository, expectedImage.Digest, strings.TrimSpace(service.Config.TargetRepository), strings.TrimSpace(service.Config.StorageKeyPrefix))
+	digest = configuredAcornFoxRequestDigest(request, digest)
 	return service.Idempotency.ReplayAcornFoxDelivery(ctx, request.IdempotencyKey, digest)
 }
 
 func (service *AcornFoxDeliveryService) create(ctx context.Context, request AcornFoxDeliveryCreateRequest, expectedImage *domain.ImageDigest, now time.Time, commit func(AcornFoxQueuedTask, AcornFoxDeliveryResult) error) (AcornFoxDeliveryResult, error) {
+	configuration, resources, configDigest, err := resolveAcornFoxRuntimeInput(request.Runtime, request.ContainerPort)
+	if err != nil {
+		return AcornFoxDeliveryResult{}, err
+	}
+	if configuration != nil {
+		if service.RuntimeConfigurationGate == nil {
+			return AcornFoxDeliveryResult{}, domain.NewError(domain.ErrUnsupportedCapability, "configured runtime is unavailable")
+		}
+		if err := service.RuntimeConfigurationGate(ctx); err != nil {
+			return AcornFoxDeliveryResult{}, err
+		}
+	}
 	source, err := service.Sources.GetAcornFoxSourceRevision(ctx, request.ApplicationID, request.SourceRevisionID)
 	if err != nil {
 		return AcornFoxDeliveryResult{}, err
@@ -253,6 +270,9 @@ func (service *AcornFoxDeliveryService) create(ctx context.Context, request Acor
 		CreatedAt:        now,
 		Immutable:        true,
 	}
+	if configuration != nil {
+		acceptedDefinition.Facts["runtime_configuration"] = acornFoxRuntimeDefinitionFact(configuration, resources, request.ContainerPort, configDigest)
+	}
 	if err := acceptedDefinition.Validate(); err != nil {
 		return AcornFoxDeliveryResult{}, err
 	}
@@ -264,6 +284,11 @@ func (service *AcornFoxDeliveryService) create(ctx context.Context, request Acor
 		return AcornFoxDeliveryResult{}, errors.New("AcornFox delivery definition persistence returned an invalid result")
 	}
 
+	if configuration != nil {
+		if err := validatePersistedAcornFoxRuntimeDefinition(acceptedDefinition, acornFoxRuntimeDefinitionFact(configuration, resources, request.ContainerPort, configDigest)); err != nil {
+			return AcornFoxDeliveryResult{}, err
+		}
+	}
 	binder := AcornFoxBuildBinder{}
 	target := strings.TrimSpace(service.Config.TargetRepository)
 	storageKey := acornFoxDeliveryStorageKey(service.Config.StorageKeyPrefix, request.ApplicationID, source.ID, request.IdempotencyKey)
@@ -312,15 +337,25 @@ func (service *AcornFoxDeliveryService) create(ctx context.Context, request Acor
 	// Release still has a historic mandatory service-group field. "legacy" is
 	// an unexposed persistence compatibility value only; no group behavior is
 	// enabled, exposed, or accepted by this service.
-	release, err := domain.NewRelease(request.ApplicationID, "legacy", releaseVersion, acornFoxDeliveryDigest(plan.ID.String(), built.Artifact.Image.Digest), map[string]domain.ImageDigest{"web": built.Artifact.Image}, service.now())
+	releaseConfigDigest := acornFoxDeliveryDigest(plan.ID.String(), built.Artifact.Image.Digest)
+	if configuration != nil {
+		releaseConfigDigest = configDigest
+	}
+	release, err := domain.NewRelease(request.ApplicationID, "legacy", releaseVersion, releaseConfigDigest, map[string]domain.ImageDigest{"web": built.Artifact.Image}, service.now())
 	if err != nil {
 		return AcornFoxDeliveryResult{}, service.failBuild(ctx, build.ID, err)
 	}
 	release.ID = domain.ID("rel_" + acornFoxDeliveryDigest("release", plan.ID.String(), built.Artifact.Image.Digest)[:32])
+	if configuration != nil {
+		release.ID = domain.ID("rel_" + acornFoxDeliveryDigest("release", plan.ID.String(), built.Artifact.Image.Digest, configDigest)[:32])
+	}
 	if _, err := service.Builds.CompleteAcornFoxBuild(ctx, *built.Artifact, *release, acceptedDefinition.ID, service.now()); err != nil {
 		return AcornFoxDeliveryResult{}, err
 	}
-	fact, err := contracts.ProjectAcornFoxRuntimeReleaseFact(*release, environmentID, acornFoxRuntimeResources(), request.ContainerPort, now)
+	fact, err := contracts.ProjectAcornFoxRuntimeReleaseFact(*release, environmentID, resources, request.ContainerPort, now)
+	if configuration != nil {
+		fact, err = contracts.ProjectAcornFoxConfiguredRuntimeReleaseFact(*release, environmentID, resources, request.ContainerPort, now, *configuration)
+	}
 	if err != nil {
 		return AcornFoxDeliveryResult{}, err
 	}
@@ -578,6 +613,9 @@ func (service *AcornFoxDeliveryService) now() time.Time {
 }
 
 func validateAcornFoxDeliveryCreate(request AcornFoxDeliveryCreateRequest) error {
+	if _, _, _, err := resolveAcornFoxRuntimeInput(request.Runtime, request.ContainerPort); err != nil {
+		return err
+	}
 	if request.ApplicationID.Empty() || request.SourceRevisionID.Empty() || strings.TrimSpace(request.IdempotencyKey) == "" || strings.TrimSpace(request.Actor) == "" || request.ContainerPort < 0 || request.ContainerPort > 65535 {
 		return domain.ValidationError("AcornFox delivery request is invalid")
 	}

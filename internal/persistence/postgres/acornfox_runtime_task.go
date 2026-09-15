@@ -53,6 +53,16 @@ func (s *Store) GetAcornFoxRuntimeRequest(ctx context.Context, applicationID, de
 		if err != nil || expected != deploymentID || request.Fact.ApplicationID != applicationID || request.Fact.EnvironmentID != environmentID || request.Fact.ReleaseID != releaseID {
 			return contracts.AcornFoxRuntimeDeployRequest{}, domain.ValidationError("AcornFox runtime task identity is invalid")
 		}
+		if request.Fact.SchemaVersion == 2 {
+			if err := rows.Close(); err != nil {
+				return contracts.AcornFoxRuntimeDeployRequest{}, err
+			}
+			release, err := s.GetRelease(ctx, releaseID)
+			image := release.ServiceDigests()[request.Fact.ServiceName]
+			if err != nil || release.ApplicationID != applicationID || release.ConfigDigest != request.Fact.ConfigDigest || len(release.ServiceDigests()) != 1 || image.Repository != request.Fact.Image.Repository || image.Digest != request.Fact.Image.Digest {
+				return contracts.AcornFoxRuntimeDeployRequest{}, domain.ValidationError("runtime fact does not match accepted release")
+			}
+		}
 		return request, nil
 	}
 	if err := rows.Err(); err != nil {

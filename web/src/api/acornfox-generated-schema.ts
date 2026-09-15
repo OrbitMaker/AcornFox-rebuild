@@ -1001,6 +1001,7 @@ export interface components {
         CreateDeliveryRequest: {
             source_revision_id: string;
             container_port?: number;
+            runtime?: components["schemas"]["RuntimeInput"];
         };
         EmptyRequest: Record<string, never>;
         DeliveryCommandResponse: {
@@ -1013,6 +1014,42 @@ export interface components {
             repository: string;
             digest: string;
         };
+        RuntimeEnvironmentVariable: {
+            name: string;
+            /**
+             * @default literal
+             * @enum {string}
+             */
+            kind: "literal";
+            /** @description Non-secret value persisted with the accepted configuration. Credential values must not be supplied here. */
+            value?: string;
+        };
+        RuntimeVolume: {
+            name: string;
+            /** @description Clean absolute container data path. System paths and overlapping mounts are rejected. Host paths are not accepted. */
+            mount_path: string;
+            /**
+             * Format: int64
+             * @description Capacity reservation only. Docker local volumes do not enforce a per-volume disk quota.
+             */
+            size_bytes: number;
+            /** @default false */
+            read_only: boolean;
+        };
+        RuntimeConfiguration: {
+            entrypoint?: string[];
+            command?: string[];
+            environment?: components["schemas"]["RuntimeEnvironmentVariable"][];
+            volumes?: components["schemas"]["RuntimeVolume"][];
+        };
+        /** @description Immutable single-container runtime settings. Plain arguments and environment values are persisted. Secrets are not supported by this input. Missing resources use platform defaults plus declared volume capacity. Configured deployments require an online upgraded Agent. */
+        RuntimeInput: {
+            entrypoint?: string[];
+            command?: string[];
+            environment?: components["schemas"]["RuntimeEnvironmentVariable"][];
+            volumes?: components["schemas"]["RuntimeVolume"][];
+            resources?: components["schemas"]["RuntimeRequestedResources"];
+        };
         RuntimeRequestedResources: {
             /** Format: int64 */
             cpu_millis: number;
@@ -1020,10 +1057,20 @@ export interface components {
             memory_bytes: number;
             /** Format: int64 */
             pids: number;
-            /** Format: int64 */
+            /**
+             * Format: int64
+             * @description Total capacity reservation including declared data volumes.
+             */
             disk_reservation_bytes: number;
         };
         RuntimeReleaseFact: {
+            /**
+             * @description Absent for legacy default-only deployments.
+             * @enum {integer}
+             */
+            schema_version?: 2;
+            configuration?: components["schemas"]["RuntimeConfiguration"];
+            config_digest?: string;
             application_id: string;
             environment_id: string;
             release_id: string;

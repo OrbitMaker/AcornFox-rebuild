@@ -141,7 +141,13 @@ func runOutboundAgent(controlPlaneURL, instanceID, nodeID, version string, envir
 		if capacityErr != nil {
 			log.Fatal(capacityErr)
 		}
+		volumes, volumeErr := volumeprovider.New(volumeprovider.Config{TaskPrefix: getenv(acornfoxenv.RuntimeTaskPrefix)})
+		if volumeErr != nil {
+			log.Fatal(volumeErr)
+		}
+		volumeRuntime = volumes
 		runtimeConfig := standalone.Config{
+			Volumes:               volumes,
 			TaskPrefix:            getenv(acornfoxenv.RuntimeTaskPrefix),
 			Network:               getenv(acornfoxenv.RuntimeNetwork),
 			WorkRoot:              getenv(acornfoxenv.RuntimeWorkRoot),
@@ -194,11 +200,6 @@ func runOutboundAgent(controlPlaneURL, instanceID, nodeID, version string, envir
 				}
 				metricsReader = m4GroupRuntimeMetricsAdapter{reader: reader}
 			}
-			volumes, volumeErr := volumeprovider.New(volumeprovider.Config{TaskPrefix: getenv(acornfoxenv.RuntimeTaskPrefix)})
-			if volumeErr != nil {
-				log.Fatal(volumeErr)
-			}
-			volumeRuntime = volumes
 			groupRuntime, storeErr = standalonegroup.New(standalonegroup.Config{
 				TaskPrefix: getenv(acornfoxenv.RuntimeTaskPrefix), Network: getenv(acornfoxenv.RuntimeGroupNetwork), WorkRoot: getenv(acornfoxenv.RuntimeWorkRoot),
 				ImageStore: store, Capacity: capacityProvider, Volumes: volumes, MetricsReader: metricsReader, WorkerNetworkIsolated: true,
@@ -251,7 +252,11 @@ func composeAcornFoxRuntime(ctx context.Context, provider acornFoxRuntimeProvide
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	return provider, acornFoxRuntime, []string{"runtime.deploy.digest", "runtime.observe", "runtime.logs", "runtime.restart", "runtime.destroy", v1.AgentCapabilityAcornFoxRuntime}, nil
+	capabilities := []string{"runtime.deploy.digest", "runtime.observe", "runtime.logs", "runtime.restart", "runtime.destroy", v1.AgentCapabilityAcornFoxRuntime}
+	if configured, ok := provider.(interface{ ConfiguredRuntimeSupported() bool }); ok && configured.ConfiguredRuntimeSupported() {
+		capabilities = append(capabilities, v1.AgentCapabilityAcornFoxRuntimeConfig)
+	}
+	return provider, acornFoxRuntime, capabilities, nil
 }
 
 func composeAcornFoxRuntimeWithProbe(ctx context.Context, provider acornFoxRuntimeProvider, buildProbe func() (acornFoxRuntimeProber, error)) (contracts.RuntimeDriver, contracts.AcornFoxRuntimeDriver, acornFoxRuntimeProber, []string, error) {

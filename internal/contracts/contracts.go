@@ -444,14 +444,16 @@ func IsSHA256Digest(value string) bool {
 }
 
 type RuntimeSpec struct {
-	ApplicationID domain.ID                `json:"application_id"`
-	EnvironmentID domain.ID                `json:"environment_id"`
-	ReleaseID     domain.ID                `json:"release_id"`
-	ServiceName   string                   `json:"service_name"`
-	Image         domain.ImageDigest       `json:"image"`
-	Resources     ResourceLimits           `json:"resources"`
-	Secrets       []domain.SecretReference `json:"secrets,omitempty"`
-	Port          int                      `json:"port,omitempty"`
+	Configuration *AcornFoxRuntimeConfiguration `json:"configuration,omitempty"`
+	ConfigDigest  string                        `json:"config_digest,omitempty"`
+	ApplicationID domain.ID                     `json:"application_id"`
+	EnvironmentID domain.ID                     `json:"environment_id"`
+	ReleaseID     domain.ID                     `json:"release_id"`
+	ServiceName   string                        `json:"service_name"`
+	Image         domain.ImageDigest            `json:"image"`
+	Resources     ResourceLimits                `json:"resources"`
+	Secrets       []domain.SecretReference      `json:"secrets,omitempty"`
+	Port          int                           `json:"port,omitempty"`
 }
 
 type DeployRequest struct {

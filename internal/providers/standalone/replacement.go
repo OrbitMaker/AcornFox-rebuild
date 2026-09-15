@@ -96,6 +96,10 @@ func (p *Provider) reconcileReplacement(ctx context.Context, snapshot durableRun
 }
 
 func (p *Provider) recreateRetainingCapacity(ctx context.Context, request contracts.DeployRequest) (domain.Deployment, error) {
+	if err := p.verifyRuntimeVolumes(ctx, request.Spec, request.Operation); err != nil {
+		return domain.Deployment{}, err
+	}
+
 	ctx, cancel := p.operationContext(ctx, request.Operation)
 	defer cancel()
 	state, err := p.ensureState(ctx, request.DeploymentID, request.Operation, contracts.CapabilityRuntimeDeploy, "recreate")
@@ -197,10 +201,15 @@ func (p *Provider) recreateRetainingCapacity(ctx context.Context, request contra
 	if err != nil || !absent {
 		return domain.Deployment{}, p.replacementFailure(request.Operation, "removed replacement container is not confirmed absent")
 	}
-	args := p.runArgs(state.container, state.deployment, request.Spec, state.capacity.HostPort)
-	args = append(args[:len(args)-1], "--label", replacementLabel+"="+key, args[len(args)-1])
+	if err := p.verifyRuntimeVolumes(ctx, request.Spec, request.Operation); err != nil {
+		return domain.Deployment{}, err
+	}
+	args := p.runArgs(state.container, state.deployment, request.Spec, state.capacity.HostPort, replacementLabel+"="+key)
 	if err := p.run(ctx, args); err != nil {
 		return domain.Deployment{}, p.commandError(request.Operation, contracts.CapabilityRuntimeDeploy, "recreate", err)
+	}
+	if err := p.verifyRuntimeVolumes(ctx, request.Spec, request.Operation); err != nil {
+		return domain.Deployment{}, err
 	}
 	facts, present, err = p.replacementFacts(ctx, snapshot, request.Operation)
 	if err != nil {
@@ -214,6 +223,7 @@ func (p *Provider) recreateRetainingCapacity(ctx context.Context, request contra
 
 func cloneReplacementState(state *runtimeState) runtimeState {
 	next := *state
+	next.configuration = copyRuntimeConfiguration(state.configuration)
 	next.actions = make(map[string]runtimeAction, len(state.actions))
 	for k, v := range state.actions {
 		next.actions[k] = v
@@ -254,7 +264,7 @@ func (p *Provider) loadReplacementImage(ctx context.Context, request contracts.D
 	if err := p.run(ctx, []string{"load", "--input", path}); err != nil {
 		return p.commandError(request.Operation, contracts.CapabilityRuntimeDeploy, "recreate", err)
 	}
-	return p.verifyImage(ctx, request.Spec.Image, request.Operation)
+	return p.verifyImage(ctx, request.Spec.Image, request.Operation, request.Spec)
 }
 
 // cancelReplacement records cancellation before removal so a crash cannot

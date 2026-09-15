@@ -18,6 +18,9 @@ var acornFoxRuntimeServiceName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*
 // single-service runtime. It is made only from a ready immutable Release that
 // contains exactly one service image.
 type AcornFoxRuntimeReleaseFact struct {
+	SchemaVersion int                               `json:"schema_version,omitempty"`
+	Configuration *AcornFoxRuntimeConfiguration     `json:"configuration,omitempty"`
+	ConfigDigest  string                            `json:"config_digest,omitempty"`
 	ApplicationID domain.ID                         `json:"application_id"`
 	EnvironmentID domain.ID                         `json:"environment_id"`
 	ReleaseID     domain.ID                         `json:"release_id"`
@@ -50,7 +53,38 @@ func ProjectAcornFoxRuntimeReleaseFact(release domain.Release, environmentID dom
 	return AcornFoxRuntimeReleaseFact{}, fmt.Errorf("runtime accepts exactly one service image")
 }
 
+// ProjectAcornFoxConfiguredRuntimeReleaseFact binds configuration to its Release.
+// Legacy facts retain their old wire shape and identity for restart after upgrade.
+func ProjectAcornFoxConfiguredRuntimeReleaseFact(release domain.Release, environmentID domain.ID, resources AcornFoxRuntimeRequestedResources, containerPort int, acceptedAt time.Time, configuration AcornFoxRuntimeConfiguration) (AcornFoxRuntimeReleaseFact, error) {
+	digest, err := CanonicalAcornFoxRuntimeConfigDigest(configuration, resources, containerPort)
+	if err != nil || release.ConfigDigest != digest {
+		return AcornFoxRuntimeReleaseFact{}, fmt.Errorf("runtime configuration does not match release")
+	}
+	fact, err := ProjectAcornFoxRuntimeReleaseFact(release, environmentID, resources, containerPort, acceptedAt)
+	if err != nil {
+		return AcornFoxRuntimeReleaseFact{}, err
+	}
+	configuration.Entrypoint = append([]string(nil), configuration.Entrypoint...)
+	configuration.Command = append([]string(nil), configuration.Command...)
+	configuration.Environment = append([]RuntimeEnvironmentVariable(nil), configuration.Environment...)
+	configuration.Volumes = append([]AcornFoxRuntimeVolume(nil), configuration.Volumes...)
+	configuration.Secrets = append([]AcornFoxRuntimeSecretBinding(nil), configuration.Secrets...)
+	fact.SchemaVersion = 2
+	fact.Configuration = &configuration
+	fact.ConfigDigest = digest
+	return fact, fact.Validate()
+}
+
 func (fact AcornFoxRuntimeReleaseFact) Validate() error {
+	if fact.SchemaVersion != 0 || fact.Configuration != nil || fact.ConfigDigest != "" {
+		if fact.SchemaVersion != 2 || fact.Configuration == nil {
+			return fmt.Errorf("runtime configuration version is invalid")
+		}
+		digest, err := CanonicalAcornFoxRuntimeConfigDigest(*fact.Configuration, fact.Resources, fact.ContainerPort)
+		if err != nil || fact.ConfigDigest != digest {
+			return fmt.Errorf("runtime configuration identity is invalid")
+		}
+	}
 	if fact.ApplicationID.Empty() || fact.EnvironmentID.Empty() || fact.ReleaseID.Empty() || !acornFoxRuntimeServiceName.MatchString(fact.ServiceName) || !fact.Immutable || fact.AcceptedAt.IsZero() {
 		return fmt.Errorf("runtime identity is invalid")
 	}
@@ -180,7 +214,11 @@ func AcornFoxRuntimeDeploymentID(fact AcornFoxRuntimeReleaseFact) (domain.ID, er
 	if err := fact.Validate(); err != nil {
 		return "", err
 	}
-	return domain.ID("dep_" + acornFoxRuntimeHash(fact.ApplicationID.String(), fact.EnvironmentID.String(), fact.ReleaseID.String(), fact.ServiceName, fact.Image.Repository, fact.Image.Digest, fmt.Sprint(fact.Resources), fmt.Sprint(fact.ContainerPort))[:32]), nil
+	parts := []string{fact.ApplicationID.String(), fact.EnvironmentID.String(), fact.ReleaseID.String(), fact.ServiceName, fact.Image.Repository, fact.Image.Digest, fmt.Sprint(fact.Resources), fmt.Sprint(fact.ContainerPort)}
+	if fact.SchemaVersion == 2 {
+		parts = append(parts, "runtime-config-v2", fact.ConfigDigest)
+	}
+	return domain.ID("dep_" + acornFoxRuntimeHash(parts...)[:32]), nil
 }
 
 // AcornFoxRuntimeOperationID is deterministic for one fact and operation.
@@ -188,7 +226,11 @@ func AcornFoxRuntimeOperationID(fact AcornFoxRuntimeReleaseFact, action, idempot
 	if _, err := AcornFoxRuntimeDeploymentID(fact); err != nil || strings.TrimSpace(action) == "" || strings.TrimSpace(idempotencyKey) == "" {
 		return "", fmt.Errorf("runtime operation identity is invalid")
 	}
-	return "acornfox-runtime-" + action + "-" + acornFoxRuntimeHash(fact.ApplicationID.String(), fact.EnvironmentID.String(), fact.ReleaseID.String(), fact.ServiceName, fact.Image.Repository, fact.Image.Digest, fmt.Sprint(fact.Resources), fmt.Sprint(fact.ContainerPort), action, idempotencyKey)[:24], nil
+	parts := []string{fact.ApplicationID.String(), fact.EnvironmentID.String(), fact.ReleaseID.String(), fact.ServiceName, fact.Image.Repository, fact.Image.Digest, fmt.Sprint(fact.Resources), fmt.Sprint(fact.ContainerPort), action, idempotencyKey}
+	if fact.SchemaVersion == 2 {
+		parts = append(parts, "runtime-config-v2", fact.ConfigDigest)
+	}
+	return "acornfox-runtime-" + action + "-" + acornFoxRuntimeHash(parts...)[:24], nil
 }
 
 func AcornFoxRuntimeLoopbackAddress(port int) (string, error) {

@@ -274,6 +274,7 @@ func negotiateSessionCapabilities(advertised []string, protocolVersion string, p
 	allowed := map[string]struct{}{
 		"docker.read.facts": {}, "runtime.deploy.digest": {}, "runtime.observe": {}, "runtime.logs": {}, "runtime.restart": {}, "runtime.destroy": {},
 		v1.AgentCapabilityAcornFoxRuntime:             {},
+		v1.AgentCapabilityAcornFoxRuntimeConfig:       {},
 		v1.AgentCapabilityAcornFoxProbe:               {},
 		v1.AgentCapabilityAcornFoxLogs:                {},
 		v1.AgentCapabilityAcornFoxCandidateValidation: {},
@@ -302,6 +303,8 @@ func negotiateSessionCapabilities(advertised []string, protocolVersion string, p
 		}
 	}
 	if protocolVersion != v1.ProtocolVersion {
+		delete(enabledSet, v1.AgentCapabilityAcornFoxRuntimeConfig)
+		disabledSet[v1.AgentCapabilityAcornFoxRuntimeConfig] = struct{}{}
 		delete(enabledSet, v1.AgentCapabilityAcornFoxRuntime)
 		disabledSet[v1.AgentCapabilityAcornFoxRuntime] = struct{}{}
 		delete(enabledSet, v1.AgentCapabilityAcornFoxProbe)
@@ -311,7 +314,7 @@ func negotiateSessionCapabilities(advertised []string, protocolVersion string, p
 		delete(enabledSet, v1.AgentCapabilityAcornFoxCandidateValidation)
 		disabledSet[v1.AgentCapabilityAcornFoxCandidateValidation] = struct{}{}
 	} else {
-		for _, capability := range []string{v1.AgentCapabilityAcornFoxRuntime, v1.AgentCapabilityAcornFoxProbe, v1.AgentCapabilityAcornFoxLogs, v1.AgentCapabilityAcornFoxCandidateValidation} {
+		for _, capability := range []string{v1.AgentCapabilityAcornFoxRuntime, v1.AgentCapabilityAcornFoxRuntimeConfig, v1.AgentCapabilityAcornFoxProbe, v1.AgentCapabilityAcornFoxLogs, v1.AgentCapabilityAcornFoxCandidateValidation} {
 			if _, ok := enabledSet[capability]; !ok {
 				disabledSet[capability] = struct{}{}
 			}

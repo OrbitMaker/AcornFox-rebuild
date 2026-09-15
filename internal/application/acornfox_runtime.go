@@ -57,7 +57,7 @@ func (service *AcornFoxRuntimeService) materialize(ctx context.Context, fact con
 	if err != nil {
 		return contracts.AcornFoxRuntimeDeployment{}, err
 	}
-	deployment, err := materialize(ctx, contracts.DeployRequest{DeploymentID: deploymentID, Spec: contracts.RuntimeSpec{ApplicationID: fact.ApplicationID, EnvironmentID: fact.EnvironmentID, ReleaseID: fact.ReleaseID, ServiceName: fact.ServiceName, Image: fact.Image, Resources: legacyAcornFoxRuntimeResources(fact.Resources), Port: fact.ContainerPort}, Operation: operation})
+	deployment, err := materialize(ctx, contracts.DeployRequest{DeploymentID: deploymentID, Spec: contracts.RuntimeSpec{Configuration: fact.Configuration, ConfigDigest: fact.ConfigDigest, ApplicationID: fact.ApplicationID, EnvironmentID: fact.EnvironmentID, ReleaseID: fact.ReleaseID, ServiceName: fact.ServiceName, Image: fact.Image, Resources: legacyAcornFoxRuntimeResources(fact.Resources), Port: fact.ContainerPort}, Operation: operation})
 	if err != nil {
 		return contracts.AcornFoxRuntimeDeployment{}, err
 	}
