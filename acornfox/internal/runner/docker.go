@@ -300,18 +300,179 @@ func (d *Docker) ImageInspect(ctx context.Context, app, ref string) (ImageInfo, 
 	return info, nil
 }
 
+// PullImage pulls an external image Ref and tags it ImageTag(App, DeploymentID).
+// If that tag already exists the existing image is returned without pulling.
+// A pull that fails for a user-visible reason (image not found, timeout,
+// registry error) comes back as PullResponse{OK:false} with a classified
+// Failure; daemon/transport problems come back as an error.
+func (d *Docker) PullImage(ctx context.Context, app, deploymentID, ref string) (PullResponse, error) {
+	tag := ImageTag(app, deploymentID)
+
+	// Fast path: this deployment's tag already exists (idempotent pull).
+	if info, err := d.inspectByTag(ctx, app, tag); err == nil {
+		return PullResponse{OK: true, Image: &info}, nil
+	} else if !cerrdefs.IsNotFound(err) {
+		return PullResponse{}, err
+	}
+
+	// Bound the pull to pullImageTimeout regardless of the caller's context.
+	pctx, cancel := context.WithTimeout(ctx, pullImageTimeout)
+	defer cancel()
+
+	resp, err := d.cli.ImagePull(pctx, ref, client.ImagePullOptions{})
+	if err != nil {
+		if f := classifyPull(pctx, err); f != nil {
+			return PullResponse{OK: false, Failure: f}, nil
+		}
+		return PullResponse{}, err
+	}
+	if werr := resp.Wait(pctx); werr != nil {
+		_ = resp.Close()
+		if f := classifyPull(pctx, werr); f != nil {
+			return PullResponse{OK: false, Failure: f}, nil
+		}
+		return PullResponse{}, werr
+	}
+	_ = resp.Close()
+
+	// Tag the pulled image as acornfox/<app>:<id> so it is owned by this app.
+	if _, err := d.cli.ImageTag(ctx, client.ImageTagOptions{Source: ref, Target: tag}); err != nil {
+		return PullResponse{}, err
+	}
+
+	info, err := d.inspectByTag(ctx, app, tag)
+	if err != nil {
+		if cerrdefs.IsNotFound(err) {
+			return PullResponse{OK: false, Failure: &Failure{
+				Stage: "image", Code: "pull_failed",
+				Message: "拉取结束但镜像不可用",
+				Hint:    "检查镜像引用后重试",
+			}}, nil
+		}
+		return PullResponse{}, err
+	}
+	return PullResponse{OK: true, Image: &info}, nil
+}
+
+// pullImageTimeout bounds a single image pull (contract: 10 minutes).
+const pullImageTimeout = 10 * time.Minute
+
+// pullNotFoundPattern matches "image not found / access denied" pull errors.
+var pullNotFoundPattern = regexp.MustCompile(`(?i)(manifest unknown|manifest for .* not found|not found|no such image|repository does not exist|pull access denied|unauthorized|access to the resource is denied)`)
+
+// classifyPull turns a pull error into a user-facing Failure, or nil when the
+// error is a daemon/transport problem the caller should surface as an error.
+func classifyPull(ctx context.Context, err error) *Failure {
+	if err == nil {
+		return nil
+	}
+	// Timeout: our own deadline elapsed, or the daemon reported a timeout.
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) {
+		return &Failure{
+			Stage: "image", Code: "pull_timeout",
+			Message: "拉取镜像超时",
+			Hint:    "国内服务器拉取公共镜像常超时，请为 Docker 配置镜像加速后重试",
+		}
+	}
+	msg := ansiPattern.ReplaceAllString(err.Error(), "")
+	if cerrdefs.IsNotFound(err) || cerrdefs.IsUnauthorized(err) || pullNotFoundPattern.MatchString(msg) {
+		return &Failure{
+			Stage: "image", Code: "image_not_found",
+			Message: "找不到镜像或无权访问：" + msg,
+			Hint:    "检查镜像名与标签是否正确（公开镜像无需登录）",
+		}
+	}
+	if pullFailurePattern.MatchString(msg) {
+		return &Failure{
+			Stage: "image", Code: "pull_timeout",
+			Message: "拉取镜像网络异常：" + msg,
+			Hint:    "为 Docker 配置镜像加速后重试",
+		}
+	}
+	// Any other daemon-reported pull error is a user-visible pull_failed.
+	return &Failure{
+		Stage: "image", Code: "pull_failed",
+		Message: "拉取镜像失败：" + msg,
+		Hint:    "检查镜像引用或稍后重试",
+	}
+}
+
+// inspectByTag inspects the image carrying tag and confirms tag ownership: a
+// pulled image has no acornfox labels, so ownership is established by the
+// acornfox/<app>:<id> tag itself. It returns cerrdefs.ErrNotFound when the tag
+// is absent or the image does not carry it.
+func (d *Docker) inspectByTag(ctx context.Context, app, tag string) (ImageInfo, error) {
+	res, err := d.cli.ImageInspect(ctx, tag)
+	if err != nil {
+		return ImageInfo{}, err
+	}
+	if !hasTag(res.RepoTags, tag) {
+		return ImageInfo{}, cerrdefs.ErrNotFound
+	}
+	info := imageInfoFromInspect(res)
+	// Pulled images have no acornfox labels; derive app/deployment from the tag.
+	info.App = app
+	if _, id, ok := parseAppTag(tag); ok {
+		info.DeploymentID = id
+	}
+	return info, nil
+}
+
+// hasTag reports whether tag is present in tags.
+func hasTag(tags []string, tag string) bool {
+	for _, t := range tags {
+		if t == tag {
+			return true
+		}
+	}
+	return false
+}
+
+// appTagPattern matches acornfox/<app>:<deployment-id> tags.
+var appTagPattern = regexp.MustCompile(`^acornfox/([a-z][a-z0-9-]{0,38}[a-z0-9]):([0-9a-f]{12})$`)
+
+// parseAppTag extracts (app, deploymentID) from an acornfox/<app>:<id> tag.
+func parseAppTag(tag string) (app, deploymentID string, ok bool) {
+	m := appTagPattern.FindStringSubmatch(tag)
+	if m == nil {
+		return "", "", false
+	}
+	return m[1], m[2], true
+}
+
+// ownsByTag reports whether any RepoTag is an acornfox/<app>: tag for app,
+// establishing ownership of images we pulled (which carry no labels).
+func ownsByTag(tags []string, app string) (deploymentID string, ok bool) {
+	for _, t := range tags {
+		if a, id, matched := parseAppTag(t); matched && a == app {
+			return id, true
+		}
+	}
+	return "", false
+}
+
 // inspectImage inspects ref and verifies it is a managed image of app.
+// Ownership holds when the image carries our labels (built images) or an
+// acornfox/<app>: RepoTag (pulled images have no labels, only the tag).
 func (d *Docker) inspectImage(ctx context.Context, ref, app string) (ImageInfo, error) {
 	res, err := d.cli.ImageInspect(ctx, ref)
 	if err != nil {
 		return ImageInfo{}, err
 	}
 	info := imageInfoFromInspect(res)
-	if info.App != app {
-		// Not a managed image of this app: treat as absent.
-		return ImageInfo{}, cerrdefs.ErrNotFound
+	if info.App == app {
+		return info, nil
 	}
-	return info, nil
+	// Pulled images have no labels: fall back to tag ownership.
+	if id, ok := ownsByTag(res.RepoTags, app); ok {
+		info.App = app
+		if info.DeploymentID == "" {
+			info.DeploymentID = id
+		}
+		return info, nil
+	}
+	// Not a managed image of this app: treat as absent.
+	return ImageInfo{}, cerrdefs.ErrNotFound
 }
 
 // imageInfoFromInspect maps a Docker image inspect into ImageInfo.
@@ -361,17 +522,21 @@ func sortedKeys(set map[string]struct{}) []string {
 	return out
 }
 
-// ListImages lists managed images, optionally filtered to one app.
+// ListImages lists managed images, optionally filtered to one app. It returns
+// both label-managed images (built) and images owned only by an
+// acornfox/<app>: RepoTag (pulled).
 func (d *Docker) ListImages(ctx context.Context, app string) ([]ImageInfo, error) {
-	filters := client.Filters{}.Add("label", LabelManaged+"=1")
+	seen := map[string]ImageInfo{}
+
+	// Label-managed images (built by us).
+	labelFilters := client.Filters{}.Add("label", LabelManaged+"=1")
 	if app != "" {
-		filters = filters.Add("label", LabelApp+"="+app)
+		labelFilters = labelFilters.Add("label", LabelApp+"="+app)
 	}
-	res, err := d.cli.ImageList(ctx, client.ImageListOptions{Filters: filters})
+	res, err := d.cli.ImageList(ctx, client.ImageListOptions{Filters: labelFilters})
 	if err != nil {
 		return nil, err
 	}
-	var out []ImageInfo
 	for _, summary := range res.Items {
 		if summary.Labels[LabelManaged] != "1" {
 			continue
@@ -380,10 +545,56 @@ func (d *Docker) ListImages(ctx context.Context, app string) ([]ImageInfo, error
 		if err != nil {
 			continue
 		}
+		seen[info.ID] = info
+	}
+
+	// Tag-owned images (pulled, no labels): match acornfox/<app> references.
+	ref := "acornfox/"
+	if app != "" {
+		ref = "acornfox/" + app
+	}
+	refFilters := client.Filters{}.Add("reference", ref+"*")
+	tagged, err := d.cli.ImageList(ctx, client.ImageListOptions{Filters: refFilters})
+	if err != nil {
+		return nil, err
+	}
+	for _, summary := range tagged.Items {
+		id, owner, ok := ownerFromTags(summary.RepoTags, app)
+		if !ok {
+			continue
+		}
+		if _, dup := seen[summary.ID]; dup {
+			continue
+		}
+		info, err := d.inspectImage(ctx, summary.ID, owner)
+		if err != nil {
+			continue
+		}
+		info.DeploymentID = id
+		seen[summary.ID] = info
+	}
+
+	out := make([]ImageInfo, 0, len(seen))
+	for _, info := range seen {
 		out = append(out, info)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Created > out[j].Created })
 	return out, nil
+}
+
+// ownerFromTags finds the acornfox app owning any of tags. When app is "" it
+// accepts any acornfox app; otherwise it requires a match.
+func ownerFromTags(tags []string, app string) (deploymentID, owner string, ok bool) {
+	for _, t := range tags {
+		a, id, matched := parseAppTag(t)
+		if !matched {
+			continue
+		}
+		if app == "" || a == app {
+			return id, a, true
+		}
+	}
+	return "", "", false
 }
 
 // RemoveImage removes a managed image of app. Missing is success.

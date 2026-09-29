@@ -267,3 +267,206 @@ func TestValidateListen(t *testing.T) {
 		}
 	}
 }
+
+func TestStatusHasAPIVersion(t *testing.T) {
+	h, _, _, _, _ := newTestServer(t)
+	w := do(t, h, "GET", "/v1/status", nil, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	var body struct {
+		APIVersion int `json:"api_version"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.APIVersion != 1 {
+		t.Fatalf("api_version = %d, want 1", body.APIVersion)
+	}
+}
+
+func TestDeployImageJSON(t *testing.T) {
+	h, st, k, _, _ := newTestServer(t)
+	body := []byte(`{"image":"nginx:1.27-alpine"}`)
+	w := do(t, h, "POST", "/v1/apps/web/deployments", body, map[string]string{"Content-Type": "application/json"})
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202; body=%s", w.Code, w.Body.String())
+	}
+	var dep state.Deployment
+	_ = json.Unmarshal(w.Body.Bytes(), &dep)
+	if dep.SourceKind != state.SourceImage || dep.SourceRef != "nginx:1.27-alpine" {
+		t.Fatalf("unexpected deployment: %+v", dep)
+	}
+	got, _ := st.GetDeployment(context.Background(), dep.ID)
+	if got.SourceKind != state.SourceImage {
+		t.Fatalf("stored source kind = %q", got.SourceKind)
+	}
+	if len(k.kicks) != 1 {
+		t.Fatalf("expected a kick")
+	}
+}
+
+func TestDeployImageJSONIdempotencyKey(t *testing.T) {
+	h, _, _, _, _ := newTestServer(t)
+	hdr := map[string]string{"Content-Type": "application/json", "Idempotency-Key": "k1"}
+	w1 := do(t, h, "POST", "/v1/apps/web/deployments", []byte(`{"image":"nginx:1.27-alpine"}`), hdr)
+	var d1 state.Deployment
+	_ = json.Unmarshal(w1.Body.Bytes(), &d1)
+	w2 := do(t, h, "POST", "/v1/apps/web/deployments", []byte(`{"image":"other:latest"}`), hdr)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("dup status = %d, want 200", w2.Code)
+	}
+	var d2 state.Deployment
+	_ = json.Unmarshal(w2.Body.Bytes(), &d2)
+	if d1.ID != d2.ID {
+		t.Fatalf("idempotency key did not dedupe: %s vs %s", d1.ID, d2.ID)
+	}
+}
+
+func TestDeployGitJSON(t *testing.T) {
+	h, _, _, _, _ := newTestServer(t)
+	body := []byte(`{"git":"https://github.com/acme/app.git","ref":"main"}`)
+	w := do(t, h, "POST", "/v1/apps/web/deployments", body, map[string]string{"Content-Type": "application/json"})
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202; body=%s", w.Code, w.Body.String())
+	}
+	var dep state.Deployment
+	_ = json.Unmarshal(w.Body.Bytes(), &dep)
+	if dep.SourceKind != state.SourceGit {
+		t.Fatalf("source_kind = %q, want git", dep.SourceKind)
+	}
+	if dep.SourceRef != "https://github.com/acme/app.git#main" {
+		t.Fatalf("source_ref = %q", dep.SourceRef)
+	}
+}
+
+func TestDeployGitRejectsNonHTTPS(t *testing.T) {
+	h, _, _, _, _ := newTestServer(t)
+	cases := []string{
+		`{"git":"http://github.com/acme/app.git"}`,
+		`{"git":"git@github.com:acme/app.git"}`,
+		`{"git":"https://user:pass@github.com/acme/app.git"}`,
+	}
+	for _, c := range cases {
+		w := do(t, h, "POST", "/v1/apps/web/deployments", []byte(c), map[string]string{"Content-Type": "application/json"})
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("git %s: status = %d, want 400", c, w.Code)
+		}
+	}
+}
+
+func TestDeployJSONRejectsBothOrNeither(t *testing.T) {
+	h, _, _, _, _ := newTestServer(t)
+	for _, c := range []string{`{}`, `{"image":"a","git":"https://x/y.git"}`} {
+		w := do(t, h, "POST", "/v1/apps/web/deployments", []byte(c), map[string]string{"Content-Type": "application/json"})
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("%s: status = %d, want 400", c, w.Code)
+		}
+	}
+}
+
+func TestDeployImageRejectsBadDigest(t *testing.T) {
+	h, _, _, _, _ := newTestServer(t)
+	w := do(t, h, "POST", "/v1/apps/web/deployments", []byte(`{"image":"nginx@sha256:short"}`), map[string]string{"Content-Type": "application/json"})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestPatchAppBounds(t *testing.T) {
+	h, st, _, _, _ := newTestServer(t)
+	ctx := context.Background()
+	st.EnsureApp(ctx, "web")
+
+	// Valid update.
+	body := []byte(`{"memory_mb":1024,"cpu_milli":2000,"port":3000,"health_path":"/healthz"}`)
+	w := do(t, h, "PATCH", "/v1/apps/web", body, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	a, _ := st.GetApp(ctx, "web")
+	if a.MemoryMB != 1024 || a.CPUMilli != 2000 || a.Port != 3000 || a.HealthPath != "/healthz" {
+		t.Fatalf("patch not applied: %+v", a)
+	}
+
+	// Out-of-bounds memory rejected and unchanged.
+	w = do(t, h, "PATCH", "/v1/apps/web", []byte(`{"memory_mb":32}`), nil)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("low memory status = %d, want 400", w.Code)
+	}
+	w = do(t, h, "PATCH", "/v1/apps/web", []byte(`{"memory_mb":99999}`), nil)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("high memory status = %d, want 400", w.Code)
+	}
+	w = do(t, h, "PATCH", "/v1/apps/web", []byte(`{"cpu_milli":50}`), nil)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("low cpu status = %d, want 400", w.Code)
+	}
+	a2, _ := st.GetApp(ctx, "web")
+	if a2.MemoryMB != 1024 || a2.CPUMilli != 2000 {
+		t.Fatalf("rejected patch changed state: %+v", a2)
+	}
+}
+
+func TestAppLogsNoLiveDeployment(t *testing.T) {
+	h, st, _, _, _ := newTestServer(t)
+	st.EnsureApp(context.Background(), "web")
+	w := do(t, h, "GET", "/v1/apps/web/logs", nil, nil)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body=%s", w.Code, w.Body.String())
+	}
+	var eb errorBody
+	_ = json.Unmarshal(w.Body.Bytes(), &eb)
+	if eb.Error.Code != "no_live_deployment" {
+		t.Fatalf("code = %q, want no_live_deployment", eb.Error.Code)
+	}
+}
+
+func TestAppLogsRedactsSecrets(t *testing.T) {
+	h, st, _, rn, _ := newTestServer(t)
+	ctx := context.Background()
+	st.EnsureApp(ctx, "web")
+	// Mark a live deployment.
+	d, _, _ := st.CreateDeployment(ctx, state.NewDeployment{App: "web", SourceKind: state.SourceUpload, SourceRef: "/x", SourceDigest: "dd"})
+	st.UpdateApp(ctx, "web", func(a *state.App) error { a.CurrentDeployment = d.ID; return nil })
+	// A secret env var whose value appears in the logs.
+	secret := "TOPSECRETVALUE123"
+	st.SetEnv(ctx, state.EnvVar{App: "web", Key: "API_KEY", Value: secret, Secret: true})
+
+	name := "af-web-" + d.ID
+	rn.logLines[name] = []string{"starting with key " + secret, "public line ok"}
+
+	w := do(t, h, "GET", "/v1/apps/web/logs?tail=50", nil, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), secret) {
+		t.Fatalf("secret leaked in logs: %s", w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "******") {
+		t.Fatalf("expected redaction mask: %s", w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "public line ok") {
+		t.Fatalf("non-secret line missing: %s", w.Body.String())
+	}
+}
+
+func TestAppLogsTailBounds(t *testing.T) {
+	h, st, _, rn, _ := newTestServer(t)
+	ctx := context.Background()
+	st.EnsureApp(ctx, "web")
+	d, _, _ := st.CreateDeployment(ctx, state.NewDeployment{App: "web", SourceKind: state.SourceUpload, SourceRef: "/x", SourceDigest: "dd"})
+	st.UpdateApp(ctx, "web", func(a *state.App) error { a.CurrentDeployment = d.ID; return nil })
+	rn.logLines["af-web-"+d.ID] = []string{"a", "b"}
+
+	// Invalid tail rejected.
+	w := do(t, h, "GET", "/v1/apps/web/logs?tail=0", nil, nil)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("tail=0 status = %d, want 400", w.Code)
+	}
+	// Large tail clamped, still 200.
+	w = do(t, h, "GET", "/v1/apps/web/logs?tail=99999", nil, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("tail=99999 status = %d, want 200", w.Code)
+	}
+}

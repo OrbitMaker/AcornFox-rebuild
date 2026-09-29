@@ -299,7 +299,7 @@ func (s *Store) CreateDeployment(ctx context.Context, in NewDeployment) (Deploym
 	if !ValidAppName(in.App) {
 		return Deployment{}, false, fmt.Errorf("%w: app name %q", ErrInvalid, in.App)
 	}
-	if in.SourceKind != SourceUpload && in.SourceKind != SourceImage {
+	if in.SourceKind != SourceUpload && in.SourceKind != SourceImage && in.SourceKind != SourceGit {
 		return Deployment{}, false, fmt.Errorf("%w: source kind %q", ErrInvalid, in.SourceKind)
 	}
 	var (

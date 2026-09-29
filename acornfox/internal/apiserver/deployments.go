@@ -31,6 +31,12 @@ func (s *server) createDeployment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A JSON body selects an image or git source; the default is a tar.gz upload.
+	if isJSONDeploy(r) {
+		s.createDeploymentJSON(w, r, app)
+		return
+	}
+
 	// Parse optional port / health_path before touching the store so a bad
 	// value fails fast without side effects.
 	port, hasPort, perr := parsePort(r.URL.Query().Get("port"))

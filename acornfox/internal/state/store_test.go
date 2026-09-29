@@ -49,8 +49,8 @@ func TestOpenPermissionsAndMigrations(t *testing.T) {
 	if err := s.db.QueryRow(`SELECT count(*) FROM _schema_migrations`).Scan(&n); err != nil {
 		t.Fatalf("count migrations: %v", err)
 	}
-	if n != 2 {
-		t.Errorf("migrations recorded = %d, want 2", n)
+	if n != 3 {
+		t.Errorf("migrations recorded = %d, want 3", n)
 	}
 	// Admin auth table present.
 	var tbl string
@@ -639,5 +639,55 @@ func TestPendingDeploymentsOrder(t *testing.T) {
 	pending, _ := s.PendingDeployments(ctx, "web")
 	if len(pending) != 1 || pending[0].ID != d2.ID {
 		t.Errorf("pending wrong: %+v", pending)
+	}
+}
+
+// TestCreateGitDeployment verifies migration 0003 widened the source_kind CHECK
+// so a 'git' deployment is accepted and round-trips through the store.
+func TestCreateGitDeployment(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	if _, _, err := s.EnsureApp(ctx, "notes"); err != nil {
+		t.Fatalf("EnsureApp: %v", err)
+	}
+	d, created, err := s.CreateDeployment(ctx, NewDeployment{
+		App:          "notes",
+		SourceKind:   SourceGit,
+		SourceRef:    "https://example.com/repo.git#main",
+		SourceDigest: "abc123",
+	})
+	if err != nil {
+		t.Fatalf("CreateDeployment(git): %v", err)
+	}
+	if !created {
+		t.Fatalf("expected a new deployment")
+	}
+	if d.SourceKind != SourceGit {
+		t.Fatalf("source_kind = %q, want git", d.SourceKind)
+	}
+	got, err := s.GetDeployment(ctx, d.ID)
+	if err != nil {
+		t.Fatalf("GetDeployment: %v", err)
+	}
+	if got.SourceKind != SourceGit || got.SourceRef != "https://example.com/repo.git#main" {
+		t.Fatalf("git deployment did not round-trip: %+v", got)
+	}
+}
+
+// TestCreateDeploymentRejectsUnknownSourceKind guards the widened CHECK still
+// rejects unknown kinds at the validation layer.
+func TestCreateDeploymentRejectsUnknownSourceKind(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	if _, _, err := s.EnsureApp(ctx, "notes"); err != nil {
+		t.Fatalf("EnsureApp: %v", err)
+	}
+	_, _, err := s.CreateDeployment(ctx, NewDeployment{
+		App:        "notes",
+		SourceKind: "bogus",
+		SourceRef:  "x",
+	})
+	if !errors.Is(err, ErrInvalid) {
+		t.Fatalf("want ErrInvalid, got %v", err)
 	}
 }

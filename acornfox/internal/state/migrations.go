@@ -232,12 +232,61 @@ CREATE INDEX IF NOT EXISTS admin_login_rate_limits_lock_idx
     WHERE locked_until IS NOT NULL;
 `
 
+// migration0003 widens the deployments.source_kind CHECK to also allow 'git'
+// (N2). SQLite cannot alter a CHECK constraint in place, so the table is
+// rebuilt: a new table with the widened constraint is created, existing rows
+// are copied verbatim, the old table is dropped and the new one renamed, then
+// every index is recreated. The 12-step rename preserves all data and the
+// unique/idempotency indexes byte-for-byte.
+const migration0003 = `
+CREATE TABLE deployments_new (
+    id            TEXT PRIMARY KEY NOT NULL,
+    app           TEXT NOT NULL REFERENCES apps(name) ON DELETE CASCADE,
+    seq           INTEGER NOT NULL,
+    source_kind   TEXT NOT NULL,
+    source_ref    TEXT NOT NULL,
+    source_digest TEXT NOT NULL,
+    request_key   TEXT NOT NULL DEFAULT '',
+    image_id      TEXT NOT NULL DEFAULT '',
+    status        TEXT NOT NULL,
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    diagnosis     TEXT NOT NULL DEFAULT '',
+    warnings      TEXT NOT NULL DEFAULT '',
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL,
+    finished_at   TEXT,
+    CHECK (source_kind IN ('upload','image','git')),
+    CHECK (seq > 0),
+    CHECK (attempts >= 0),
+    CHECK (created_at GLOB '` + timePattern + `'),
+    CHECK (updated_at GLOB '` + timePattern + `'),
+    CHECK (finished_at IS NULL OR finished_at GLOB '` + timePattern + `')
+);
+
+INSERT INTO deployments_new
+    (id, app, seq, source_kind, source_ref, source_digest, request_key, image_id, status, attempts, diagnosis, warnings, created_at, updated_at, finished_at)
+SELECT
+    id, app, seq, source_kind, source_ref, source_digest, request_key, image_id, status, attempts, diagnosis, warnings, created_at, updated_at, finished_at
+FROM deployments;
+
+DROP TABLE deployments;
+
+ALTER TABLE deployments_new RENAME TO deployments;
+
+CREATE UNIQUE INDEX deployments_app_seq_idx ON deployments (app, seq);
+
+CREATE UNIQUE INDEX deployments_app_request_key_idx ON deployments (app, request_key) WHERE request_key <> '';
+
+CREATE INDEX deployments_app_created_idx ON deployments (app, created_at);
+`
+
 // migrationList is the complete, ordered schema history. Never edit a shipped
 // entry; append a new one instead.
 func migrationList() []migration {
 	return []migration{
 		{"0001_apps", migration0001},
 		{"0002_admin_auth", migration0002},
+		{"0003_source_git", migration0003},
 	}
 }
 

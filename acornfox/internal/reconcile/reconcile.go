@@ -56,6 +56,9 @@ type Config struct {
 	Tick          time.Duration
 	HealthTimeout time.Duration
 	Now           func() time.Time
+	// Git performs server-side clones for git-source deployments. Nil uses the
+	// system git binary (DefaultGit); tests inject a fake.
+	Git Git
 }
 
 // Default configuration values.
@@ -417,23 +420,103 @@ func (r *Reconciler) build(ctx context.Context, app state.App, d *state.Deployme
 			imageID = resp.Image.ID
 			imageVolumes = resp.Image.Volumes
 		}
-	case state.SourceImage:
-		info, err := r.cfg.Runner.ImageInspect(ctx, app.Name, d.SourceRef)
-		if err != nil {
-			if errors.Is(err, runner.ErrNotFound) {
-				r.fail(ctx, app, d, env, &state.Diagnosis{
-					Stage:   "build",
-					Code:    "image_missing",
-					Message: "回退目标版本的镜像已被清理",
-					Hint:    "请重新构建该版本",
-				})
-				return
+	case state.SourceGit:
+		// Clone the repo into a tar.gz, then build it like an upload. The clone
+		// itself is network I/O and is not gated by the build semaphore; the
+		// build is.
+		tarball, diag, gerr := r.buildGitTarball(ctx, d)
+		if gerr != nil {
+			// Transient/internal failure: stay in building, retry next round and
+			// hand the crash-retry attempt back.
+			r.log.Error("git clone", "deployment", d.ID, "err", gerr)
+			if u, uerr := r.cfg.Store.UpdateDeployment(ctx, d.ID, func(dep *state.Deployment) error {
+				if dep.Attempts > 0 {
+					dep.Attempts--
+				}
+				return nil
+			}); uerr == nil {
+				*d = u
 			}
+			return
+		}
+		if diag != nil {
+			r.fail(ctx, app, d, env, diag)
+			return
+		}
+		select {
+		case r.buildSem <- struct{}{}:
+		case <-ctx.Done():
+			return
+		}
+		resp, err := r.cfg.Runner.Build(ctx, runner.BuildRequest{
+			App:          app.Name,
+			DeploymentID: d.ID,
+			ContextPath:  tarball,
+		})
+		<-r.buildSem
+		if err != nil {
+			r.log.Error("build (git)", "deployment", d.ID, "err", err)
+			if u, uerr := r.cfg.Store.UpdateDeployment(ctx, d.ID, func(dep *state.Deployment) error {
+				if dep.Attempts > 0 {
+					dep.Attempts--
+				}
+				return nil
+			}); uerr == nil {
+				*d = u
+			}
+			return
+		}
+		if !resp.OK {
+			bdiag := &state.Diagnosis{Stage: "build", Code: "build_failed", Message: "构建失败"}
+			if resp.Failure != nil {
+				bdiag.Stage = resp.Failure.Stage
+				bdiag.Code = resp.Failure.Code
+				bdiag.Message = resp.Failure.Message
+				bdiag.LogExcerpt = resp.Failure.LogExcerpt
+				bdiag.Hint = resp.Failure.Hint
+			}
+			r.fail(ctx, app, d, env, bdiag)
+			return
+		}
+		if resp.Image != nil {
+			imageID = resp.Image.ID
+			imageVolumes = resp.Image.Volumes
+		}
+	case state.SourceImage:
+		// Rollback and already-resolved deployments reference an image present
+		// locally: inspect it. A fresh `deploy --image` references an external
+		// image that must be pulled first (stage=image).
+		info, err := r.cfg.Runner.ImageInspect(ctx, app.Name, d.SourceRef)
+		if err == nil {
+			imageID = info.ID
+			imageVolumes = info.Volumes
+			break
+		}
+		if !errors.Is(err, runner.ErrNotFound) {
 			r.log.Error("image inspect", "deployment", d.ID, "err", err)
 			return
 		}
-		imageID = info.ID
-		imageVolumes = info.Volumes
+		resp, perr := r.cfg.Runner.PullImage(ctx, app.Name, d.ID, d.SourceRef)
+		if perr != nil {
+			r.log.Error("image pull", "deployment", d.ID, "err", perr)
+			return // transient: retry next round
+		}
+		if !resp.OK {
+			diag := &state.Diagnosis{Stage: "image", Code: "pull_failed", Message: "拉取镜像失败"}
+			if resp.Failure != nil {
+				diag.Stage = resp.Failure.Stage
+				diag.Code = resp.Failure.Code
+				diag.Message = resp.Failure.Message
+				diag.LogExcerpt = resp.Failure.LogExcerpt
+				diag.Hint = resp.Failure.Hint
+			}
+			r.fail(ctx, app, d, env, diag)
+			return
+		}
+		if resp.Image != nil {
+			imageID = resp.Image.ID
+			imageVolumes = resp.Image.Volumes
+		}
 	default:
 		r.log.Error("unknown source kind", "deployment", d.ID, "kind", d.SourceKind)
 		return

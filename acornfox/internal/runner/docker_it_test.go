@@ -201,6 +201,83 @@ func TestDockerLifecycle(t *testing.T) {
 	}
 }
 
+// TestDockerPullImage pulls an image already present locally (alpine:3.22),
+// tags it acornfox/<app>:<id>, and verifies ownership by tag through
+// ImageInspect/ListImages, then removes it. Guarded by ACORNFOX_DOCKER_IT=1.
+func TestDockerPullImage(t *testing.T) {
+	d := newDockerIT(t)
+	ctx := context.Background()
+
+	const app = "afitpull"
+	const dep = "0123456789cd"
+	tag := ImageTag(app, dep)
+
+	t.Cleanup(func() {
+		cctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_ = d.RemoveImage(cctx, app, tag)
+	})
+
+	// Pull an image that should already be present locally so the test does not
+	// depend on network access. If absent, Docker fetches it once.
+	resp, err := d.PullImage(ctx, app, dep, itBaseImage)
+	if err != nil {
+		t.Fatalf("PullImage: %v", err)
+	}
+	if !resp.OK || resp.Image == nil {
+		t.Fatalf("pull failed: %+v", resp.Failure)
+	}
+	if resp.Image.App != app || resp.Image.DeploymentID != dep {
+		t.Fatalf("pulled image not owned by tag: %+v", resp.Image)
+	}
+
+	// Idempotent: pulling again returns the same image without error.
+	again, err := d.PullImage(ctx, app, dep, itBaseImage)
+	if err != nil {
+		t.Fatalf("PullImage (second): %v", err)
+	}
+	if again.Image == nil || again.Image.ID != resp.Image.ID {
+		t.Fatalf("second pull produced a different image: %+v", again.Image)
+	}
+
+	// Ownership by tag through ImageInspect.
+	info, err := d.ImageInspect(ctx, app, tag)
+	if err != nil {
+		t.Fatalf("ImageInspect by tag: %v", err)
+	}
+	if info.App != app || info.DeploymentID != dep {
+		t.Fatalf("inspect ownership wrong: %+v", info)
+	}
+
+	// ListImages surfaces the tag-owned image.
+	list, err := d.ListImages(ctx, app)
+	if err != nil {
+		t.Fatalf("ListImages: %v", err)
+	}
+	found := false
+	for _, im := range list {
+		if im.DeploymentID == dep {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("pulled image missing from ListImages: %+v", list)
+	}
+
+	// A pull of a definitely-missing image is a classified user failure, not an
+	// error.
+	miss, err := d.PullImage(ctx, app, "0123456789ef", "acornfox/does-not-exist:nope-404")
+	if err != nil {
+		t.Fatalf("PullImage(missing) returned transport error: %v", err)
+	}
+	if miss.OK || miss.Failure == nil {
+		t.Fatalf("expected a classified pull failure, got %+v", miss)
+	}
+	if miss.Failure.Stage != "image" {
+		t.Fatalf("expected stage=image, got %+v", miss.Failure)
+	}
+}
+
 // TestDockerVolumeLifecycle ensures a managed volume and lists it.
 func TestDockerVolumeLifecycle(t *testing.T) {
 	d := newDockerIT(t)

@@ -25,6 +25,10 @@ type fakeAPI struct {
 	buildErr  error
 	buildReq  BuildRequest
 
+	pullResp PullResponse
+	pullErr  error
+	pullReq  PullRequest
+
 	inspectResp ImageInfo
 	inspectErr  error
 	inspectApp  string
@@ -73,6 +77,13 @@ func (f *fakeAPI) Build(_ context.Context, req BuildRequest) (BuildResponse, err
 	f.buildReq = req
 	f.mu.Unlock()
 	return f.buildResp, f.buildErr
+}
+
+func (f *fakeAPI) PullImage(_ context.Context, app, deploymentID, ref string) (PullResponse, error) {
+	f.mu.Lock()
+	f.pullReq = PullRequest{App: app, DeploymentID: deploymentID, Ref: ref}
+	f.mu.Unlock()
+	return f.pullResp, f.pullErr
 }
 
 func (f *fakeAPI) ImageInspect(_ context.Context, app, ref string) (ImageInfo, error) {
@@ -225,6 +236,43 @@ func TestClientBuildRoundTrip(t *testing.T) {
 	if !resp.OK || resp.Image == nil || resp.Image.ID != "sha256:abc" {
 		t.Fatalf("unexpected build response: %+v", resp)
 	}
+}
+
+func TestClientPullImageRoundTrip(t *testing.T) {
+	want := PullResponse{OK: true, Image: &ImageInfo{ID: "sha256:pulled", App: "demo", DeploymentID: "0123456789ab", Tags: []string{"acornfox/demo:0123456789ab"}}}
+	api := &fakeAPI{pullResp: want}
+	_, cli := newTestServer(t, api)
+
+	resp, err := cli.PullImage(context.Background(), "demo", "0123456789ab", "nginx:1.27-alpine")
+	if err != nil {
+		t.Fatalf("PullImage: %v", err)
+	}
+	if !resp.OK || resp.Image == nil || resp.Image.ID != "sha256:pulled" {
+		t.Fatalf("unexpected pull response: %+v", resp)
+	}
+	if api.pullReq.App != "demo" || api.pullReq.DeploymentID != "0123456789ab" || api.pullReq.Ref != "nginx:1.27-alpine" {
+		t.Fatalf("server did not receive pull request faithfully: %+v", api.pullReq)
+	}
+}
+
+func TestClientPullImageFailureRoundTrip(t *testing.T) {
+	want := PullResponse{OK: false, Failure: &Failure{Stage: "image", Code: "image_not_found", Message: "no such image"}}
+	api := &fakeAPI{pullResp: want}
+	_, cli := newTestServer(t, api)
+
+	resp, err := cli.PullImage(context.Background(), "demo", "0123456789ab", "nope:doesnotexist")
+	if err != nil {
+		t.Fatalf("PullImage: %v", err)
+	}
+	if resp.OK || resp.Failure == nil || resp.Failure.Code != "image_not_found" {
+		t.Fatalf("unexpected pull failure response: %+v", resp)
+	}
+}
+
+func TestServerValidatesPullDeploymentID(t *testing.T) {
+	_, cli := newTestServer(t, &fakeAPI{})
+	_, err := cli.PullImage(context.Background(), "demo", "not-hex", "nginx:1.27")
+	assertInvalidRequest(t, err)
 }
 
 func TestClientEnsureContainerRoundTrip(t *testing.T) {

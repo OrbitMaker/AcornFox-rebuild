@@ -309,12 +309,15 @@ type fakeRunner struct {
 	pingResp   runner.PingResponse
 	listErr    error
 	containers map[string][]runner.ContainerInfo
+	logLines   map[string][]string // keyed by container name
+	logsErr    error
 }
 
 func newFakeRunner() *fakeRunner {
 	return &fakeRunner{
 		pingResp:   runner.PingResponse{ServerVersion: "27.0.0", DockerAPIVersion: "1.47"},
 		containers: map[string][]runner.ContainerInfo{},
+		logLines:   map[string][]string{},
 	}
 }
 
@@ -330,6 +333,13 @@ func (r *fakeRunner) ListContainers(_ context.Context, app string) ([]runner.Con
 		return nil, r.listErr
 	}
 	return r.containers[app], nil
+}
+
+func (r *fakeRunner) Logs(_ context.Context, _, name string, _ int) ([]string, error) {
+	if r.logsErr != nil {
+		return nil, r.logsErr
+	}
+	return r.logLines[name], nil
 }
 
 var errRunnerDown = errors.New("runner down")

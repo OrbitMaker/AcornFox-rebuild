@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"path/filepath"
 	"regexp"
+	"strconv"
+	"strings"
 
 	"github.com/acornfox/acornfox/internal/runner"
 	"github.com/acornfox/acornfox/internal/state"
@@ -250,6 +252,143 @@ func (s *server) setDesired(w http.ResponseWriter, r *http.Request, desired stri
 	})
 }
 
+// patchAppRequest is the PATCH /v1/apps/{app} body; nil fields are unchanged.
+type patchAppRequest struct {
+	MemoryMB   *int    `json:"memory_mb,omitempty"`
+	CPUMilli   *int    `json:"cpu_milli,omitempty"`
+	Port       *int    `json:"port,omitempty"`
+	HealthPath *string `json:"health_path,omitempty"`
+}
+
+// patchApp implements PATCH /v1/apps/{app}: update app settings within bounds.
+// Changes take effect on the next deployment.
+func (s *server) patchApp(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	app := r.PathValue("app")
+	if !state.ValidAppName(app) {
+		writeError(w, http.StatusBadRequest, "invalid_app", "应用名不合法")
+		return
+	}
+	var body patchAppRequest
+	if err := decodeJSON(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_body", "请求体不是合法 JSON")
+		return
+	}
+	// Validate bounds before touching the store so a bad value has no effect.
+	if body.MemoryMB != nil && (*body.MemoryMB < minMemoryMB || *body.MemoryMB > maxMemoryMB) {
+		writeError(w, http.StatusBadRequest, "invalid_memory", "内存需在 64..16384 MB 之间")
+		return
+	}
+	if body.CPUMilli != nil && (*body.CPUMilli < minCPUMilli || *body.CPUMilli > maxCPUMilli) {
+		writeError(w, http.StatusBadRequest, "invalid_cpu", "CPU 需在 100..16000 (毫核) 之间")
+		return
+	}
+	if body.Port != nil && (*body.Port < 1 || *body.Port > 65535) {
+		writeError(w, http.StatusBadRequest, "invalid_port", "port 必须在 1..65535 之间")
+		return
+	}
+	if _, err := s.store.GetApp(ctx, app); err != nil {
+		s.mapStoreError(w, err)
+		return
+	}
+	updated, err := s.store.UpdateApp(ctx, app, func(a *state.App) error {
+		if body.MemoryMB != nil {
+			a.MemoryMB = *body.MemoryMB
+		}
+		if body.CPUMilli != nil {
+			a.CPUMilli = *body.CPUMilli
+		}
+		if body.Port != nil {
+			a.Port = *body.Port
+		}
+		if body.HealthPath != nil {
+			a.HealthPath = *body.HealthPath
+		}
+		return nil
+	})
+	if err != nil {
+		s.mapStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, s.buildAppView(ctx, updated, true))
+}
+
+// appLogs implements GET /v1/apps/{app}/logs?tail=N: the last N lines of the
+// live container, secrets redacted. It returns 404 no_live_deployment when
+// there is no live container.
+func (s *server) appLogs(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	app := r.PathValue("app")
+	if !state.ValidAppName(app) {
+		writeError(w, http.StatusBadRequest, "invalid_app", "应用名不合法")
+		return
+	}
+	tail := 100
+	if raw := r.URL.Query().Get("tail"); raw != "" {
+		v, err := strconv.Atoi(raw)
+		if err != nil || v < 1 {
+			writeError(w, http.StatusBadRequest, "invalid_tail", "tail 必须是正整数")
+			return
+		}
+		if v > 1000 {
+			v = 1000
+		}
+		tail = v
+	}
+
+	a, err := s.store.GetApp(ctx, app)
+	if err != nil {
+		s.mapStoreError(w, err)
+		return
+	}
+	if a.CurrentDeployment == "" {
+		writeError(w, http.StatusNotFound, "no_live_deployment", "该应用没有正在运行的版本")
+		return
+	}
+	name := runner.ContainerName(app, a.CurrentDeployment)
+	lines, err := s.runner.Logs(ctx, app, name, tail)
+	if err != nil {
+		if errors.Is(err, runner.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "no_live_deployment", "该应用没有正在运行的容器")
+			return
+		}
+		s.log.Error("app logs", "app", app, "err", err)
+		writeError(w, http.StatusServiceUnavailable, "runner_unavailable", "无法读取容器日志")
+		return
+	}
+	// Redact secret env values (length >= 4) from the returned lines.
+	lines = s.redactLogLines(ctx, app, lines)
+	if lines == nil {
+		lines = []string{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"lines": lines})
+}
+
+// redactLogLines masks any secret env value (length >= 4) appearing in lines.
+func (s *server) redactLogLines(ctx context.Context, app string, lines []string) []string {
+	vars, err := s.store.ListEnv(ctx, app)
+	if err != nil {
+		return lines
+	}
+	var secrets []string
+	for _, v := range vars {
+		if v.Secret && len(v.Value) >= 4 {
+			secrets = append(secrets, v.Value)
+		}
+	}
+	if len(secrets) == 0 {
+		return lines
+	}
+	out := make([]string, len(lines))
+	for i, l := range lines {
+		for _, sv := range secrets {
+			l = strings.ReplaceAll(l, sv, "******")
+		}
+		out[i] = l
+	}
+	return out
+}
+
 // status implements GET /v1/status.
 func (s *server) status(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -268,6 +407,7 @@ func (s *server) status(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
+		"api_version":    apiVersion,
 		"runner":         runnerState,
 		"docker_version": dockerVersion,
 		"apps":           appCount,

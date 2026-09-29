@@ -1,113 +1,43 @@
-// acornfox is the API-only command line client for the first AcornFox release.
-// It deliberately contains no database, Docker, cloud, or DNS code.
+// Command acornfox is the AcornFox client and server binary. Client commands
+// (deploy, status, env, ...) run in the internal/cli package; server-side
+// subcommands (server, runner, proxy) are handled here in package main.
 package main
 
 import (
-	"encoding/json"
-	"errors"
-	"fmt"
+	"context"
 	"io"
-	"net/http"
 	"os"
-	"strings"
-	"time"
+
+	"github.com/acornfox/acornfox/internal/cli"
+	"github.com/acornfox/acornfox/internal/client"
 )
 
-const apiBase = "/api/v1/acornfox"
+func main() { os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr)) }
 
-type cli struct {
-	in       io.Reader
-	out, err io.Writer
-	env      func(string) string
-	client   *http.Client
-	json     bool
-	secrets  []string
-}
-
-func main() { os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr, os.Getenv)) }
-
-func run(args []string, in io.Reader, out, errOut io.Writer, env func(string) string) int {
+// run dispatches the server-side subcommands to their handlers and everything
+// else to the CLI command layer.
+func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) > 0 {
 		switch args[0] {
 		case "server":
-			return runServer(args[1:], out, errOut)
+			return runServer(args[1:], stdout, stderr)
 		case "runner":
 			return runRunner(args[1:]...)
+		case "proxy":
+			return runProxy(args[1:], stdin, stdout, stderr)
 		}
 	}
-	c := &cli{in: in, out: out, err: errOut, env: env, client: &http.Client{Timeout: 30 * time.Second}}
-	clean, jsonOutput, err := consumeGlobalJSON(args)
-	if err != nil {
-		return c.fail("usage", 0, "usage", err.Error())
+	// The default connector wraps client.Connect so internal/cli stays
+	// decoupled from the transport implementation.
+	connect := func(ctx context.Context, t client.Target) (client.API, error) {
+		return client.Connect(ctx, t)
 	}
-	c.json = jsonOutput
-	if len(clean) == 0 {
-		return c.fail("usage", 0, "usage", "command is required")
-	}
-	if err := c.command(clean); err != nil {
-		var responseErr apiError
-		if errors.As(err, &responseErr) {
-			return c.fail(responseErr.class(), responseErr.status, responseErr.Code, responseErr.Message)
-		}
-		return c.fail("usage", 0, "usage", err.Error())
-	}
-	return 0
+	return cli.MainWithConnector(context.Background(), args, stdin, stdout, stderr, os.Getenv, connect, "", mustGetwd())
 }
 
-type apiError struct {
-	status        int
-	Code, Message string
-	network       bool
-	contract      bool
-}
-
-func (e apiError) Error() string { return e.Message }
-func (e apiError) class() string {
-	switch {
-	case e.contract:
-		return "contract"
-	case e.network || e.status == http.StatusServiceUnavailable:
-		return "unavailable"
-	case e.status == http.StatusUnauthorized || e.status == http.StatusTooManyRequests:
-		return "authentication"
-	case e.status == http.StatusConflict:
-		return "conflict"
-	case e.status >= 500:
-		return "contract"
-	default:
-		return "usage"
+func mustGetwd() string {
+	if wd, err := os.Getwd(); err == nil {
+		return wd
 	}
-}
-
-func (c *cli) fail(class string, status int, code, message string) int {
-	for _, secret := range c.secrets {
-		if secret != "" {
-			message = strings.ReplaceAll(message, secret, "[redacted]")
-		}
-	}
-	exit := map[string]int{"usage": 2, "authentication": 3, "conflict": 4, "unavailable": 5, "contract": 6}[class]
-	if c.json {
-		_ = json.NewEncoder(c.out).Encode(map[string]any{"ok": false, "error": map[string]any{"code": code, "message": message, "class": class, "http_status": nullableStatus(status)}})
-	} else {
-		fmt.Fprintln(c.err, message)
-	}
-	return exit
-}
-func nullableStatus(status int) any {
-	if status == 0 {
-		return nil
-	}
-	return status
-}
-
-func (c *cli) emit(value any) error {
-	if c.json {
-		return json.NewEncoder(c.out).Encode(value)
-	}
-	encoded, err := json.MarshalIndent(value, "", "  ")
-	if err != nil {
-		return err
-	}
-	_, err = fmt.Fprintln(c.out, string(encoded))
-	return err
+	return "."
 }

@@ -61,6 +61,7 @@ const (
 const (
 	PathPing            = "/v1/ping"              // GET  -> PingResponse
 	PathBuild           = "/v1/images/build"      // POST BuildRequest -> BuildResponse (long: up to 20 min)
+	PathImagePull       = "/v1/images/pull"       // POST PullRequest -> PullResponse (long: up to 10 min)
 	PathImageInspect    = "/v1/images/inspect"    // POST ImageRef -> ImageInfo (404 when missing)
 	PathImageList       = "/v1/images/list"       // POST AppRef -> ImageListResponse
 	PathImageRemove     = "/v1/images/remove"     // POST ImageRef -> OK (missing is success)
@@ -129,7 +130,7 @@ type BuildResponse struct {
 // Failure mirrors state.Diagnosis without importing it.
 type Failure struct {
 	Stage      string `json:"stage"`
-	Code       string `json:"code"` // upload_invalid | dockerfile_missing | build_failed | dependency_missing | registry_timeout | base_image_not_found
+	Code       string `json:"code"` // upload_invalid | dockerfile_missing | build_failed | dependency_missing | registry_timeout | base_image_not_found | pull_timeout | image_not_found | pull_failed
 	Message    string `json:"message"`
 	LogExcerpt string `json:"log_excerpt,omitempty"` // <= 40 lines, ANSI and step noise removed
 	Hint       string `json:"hint,omitempty"`
@@ -148,6 +149,23 @@ type ImageInfo struct {
 
 type ImageListResponse struct {
 	Images []ImageInfo `json:"images"`
+}
+
+// PullRequest pulls a public image Ref and tags it ImageTag(App, DeploymentID).
+// If an image already carries that tag it is returned without pulling again.
+type PullRequest struct {
+	App          string `json:"app"`
+	DeploymentID string `json:"deployment_id"`
+	Ref          string `json:"ref"` // an external image reference, e.g. nginx:1.27-alpine
+}
+
+// PullResponse mirrors BuildResponse: OK=false means a user-caused failure
+// (image not found, pull timeout, registry error) classified in Failure and
+// returned with HTTP 200; transport or daemon problems come back as an error.
+type PullResponse struct {
+	OK      bool       `json:"ok"`
+	Image   *ImageInfo `json:"image,omitempty"`
+	Failure *Failure   `json:"failure,omitempty"`
 }
 
 type Mount struct {
@@ -229,6 +247,7 @@ type VolumeListResponse struct {
 type API interface {
 	Ping(ctx context.Context) (PingResponse, error)
 	Build(ctx context.Context, req BuildRequest) (BuildResponse, error)
+	PullImage(ctx context.Context, app, deploymentID, ref string) (PullResponse, error)
 	ImageInspect(ctx context.Context, app, ref string) (ImageInfo, error)
 	ListImages(ctx context.Context, app string) ([]ImageInfo, error)
 	RemoveImage(ctx context.Context, app, ref string) error

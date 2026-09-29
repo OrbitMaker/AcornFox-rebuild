@@ -24,6 +24,18 @@ import (
 // zero: 200 MB.
 const DefaultMaxUploadBytes int64 = 200 << 20
 
+// apiVersion is the server API version reported by GET /v1/status. It must
+// match client.APIVersion; the client uses it to detect version mismatches.
+const apiVersion = 1
+
+// App setting bounds for PATCH /v1/apps/{app} (contract section 4).
+const (
+	minMemoryMB = 64
+	maxMemoryMB = 16384
+	minCPUMilli = 100
+	maxCPUMilli = 16000
+)
+
 // Store is the subset of *state.Store the API server depends on. The signatures
 // match state.Store exactly so the concrete store satisfies this interface.
 type Store interface {
@@ -56,6 +68,7 @@ type Kicker interface {
 type Runner interface {
 	Ping(ctx context.Context) (runner.PingResponse, error)
 	ListContainers(ctx context.Context, app string) ([]runner.ContainerInfo, error)
+	Logs(ctx context.Context, app, name string, tail int) ([]string, error)
 }
 
 // Config configures New. Store, Kicker, Runner and UploadDir are required.
@@ -118,6 +131,8 @@ func New(cfg Config) http.Handler {
 	mux.HandleFunc("GET /v1/deployments/{id}", s.getDeployment)
 	mux.HandleFunc("GET /v1/apps", s.listApps)
 	mux.HandleFunc("GET /v1/apps/{app}", s.getApp)
+	mux.HandleFunc("PATCH /v1/apps/{app}", s.patchApp)
+	mux.HandleFunc("GET /v1/apps/{app}/logs", s.appLogs)
 	mux.HandleFunc("PUT /v1/apps/{app}/env/{key}", s.putEnv)
 	mux.HandleFunc("DELETE /v1/apps/{app}/env/{key}", s.deleteEnv)
 	mux.HandleFunc("POST /v1/apps/{app}/volumes", s.addVolume)

@@ -1,3 +1,5 @@
+//go:build !windows
+
 // This file implements the "acornfox server" and "acornfox runner" subcommands
 // (N1): it wires state, runner, caddyroute, reconcile and apiserver together.
 package main
@@ -12,7 +14,10 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"os/user"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 
 	"github.com/moby/moby/client"
@@ -25,15 +30,19 @@ import (
 	"github.com/acornfox/acornfox/internal/state"
 )
 
-// runServer implements `acornfox server` (N1). It opens the state store, builds
-// a runner client, a Caddy router, the reconciler and the API, then serves the
-// API on -listen until SIGTERM/SIGINT.
+// runServer implements `acornfox server` (N1/N2). It opens the state store,
+// builds a runner client, a Caddy router, the reconciler and the API, then
+// serves the API on every -listen address until SIGTERM/SIGINT. -listen may be
+// repeated (TCP loopback and/or unix sockets); -listen-group sets the group
+// owner of unix sockets (mode 0660) so only members can connect.
 func runServer(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("server", flag.ContinueOnError)
 	fs.SetOutput(stderr)
+	var listens listenList
+	fs.Var(&listens, "listen", "API listen address (repeatable): 127.0.0.1:PORT or unix:/path.sock")
 	var (
 		dataDir      = fs.String("data-dir", "/var/lib/acornfox", "state directory (holds acornfox.db and uploads/)")
-		listen       = fs.String("listen", "127.0.0.1:18800", "API listen address (127.0.0.1 or unix socket only)")
+		listenGroup  = fs.String("listen-group", "", "group owner for unix socket listeners (mode 0660)")
 		runnerSocket = fs.String("runner-socket", "/run/acornfox/runner.sock", "runner peer socket path")
 		runnerUID    = fs.Int("runner-uid", os.Getuid(), "uid the runner process runs as")
 		caddyAdmin   = fs.String("caddy-admin", "/run/acornfox/caddy-admin.sock", "Caddy admin API unix socket")
@@ -42,10 +51,26 @@ func runServer(args []string, stdout, stderr io.Writer) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	if len(listens) == 0 {
+		// Default preserves the N1 behaviour when -listen is omitted.
+		listens = listenList{"127.0.0.1:18800"}
+	}
 
-	if err := apiserver.ValidateListen(*listen); err != nil {
-		fmt.Fprintln(stderr, "invalid -listen:", err)
-		return 2
+	for _, addr := range listens {
+		if err := apiserver.ValidateListen(addr); err != nil {
+			fmt.Fprintln(stderr, "invalid -listen:", err)
+			return 2
+		}
+	}
+
+	gid := -1
+	if *listenGroup != "" {
+		g, err := lookupGroupID(*listenGroup)
+		if err != nil {
+			fmt.Fprintln(stderr, "invalid -listen-group:", err)
+			return 2
+		}
+		gid = g
 	}
 
 	uploadDir := filepath.Join(*dataDir, "uploads")
@@ -92,19 +117,30 @@ func runServer(args []string, stdout, stderr io.Writer) int {
 		}
 	}()
 
-	// Listen: TCP for loopback, unix for socket paths.
-	ln, err := listenAPI(*listen)
-	if err != nil {
-		fmt.Fprintln(stderr, "listen:", err)
-		stop()
-		<-recDone
-		return 1
+	// Open every listener before serving.
+	var listeners []net.Listener
+	for _, addr := range listens {
+		ln, err := listenAPI(addr, gid)
+		if err != nil {
+			fmt.Fprintln(stderr, "listen:", err)
+			for _, l := range listeners {
+				_ = l.Close()
+			}
+			stop()
+			<-recDone
+			return 1
+		}
+		listeners = append(listeners, ln)
 	}
 
 	srv := &http.Server{Handler: handler}
-	serveErr := make(chan error, 1)
-	go func() { serveErr <- srv.Serve(ln) }()
-	fmt.Fprintln(stdout, "acornfox server listening on", *listen)
+	serveErr := make(chan error, len(listeners))
+	for _, ln := range listeners {
+		go func(l net.Listener) { serveErr <- srv.Serve(l) }(ln)
+	}
+	for _, addr := range listens {
+		fmt.Fprintln(stdout, "acornfox server listening on", addr)
+	}
 
 	select {
 	case <-ctx.Done():
@@ -123,14 +159,54 @@ func runServer(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
+// listenList is a repeatable string flag preserving order.
+type listenList []string
+
+func (l *listenList) String() string { return strings.Join(*l, ",") }
+func (l *listenList) Set(v string) error {
+	*l = append(*l, v)
+	return nil
+}
+
+// lookupGroupID resolves a group name (or numeric gid) to a gid.
+func lookupGroupID(name string) (int, error) {
+	if g, err := user.LookupGroup(name); err == nil {
+		return strconv.Atoi(g.Gid)
+	}
+	// Allow a numeric group id directly.
+	if id, err := strconv.Atoi(name); err == nil {
+		return id, nil
+	}
+	return 0, fmt.Errorf("unknown group %q", name)
+}
+
 // listenAPI opens the API listener for a validated address: an absolute path
 // (optionally "unix:"-prefixed) yields a unix socket, otherwise a TCP listener.
-func listenAPI(addr string) (net.Listener, error) {
+// For unix sockets it removes any stale socket first, then sets mode 0660 and,
+// when gid >= 0, chowns the socket group so only that group may connect.
+func listenAPI(addr string, gid int) (net.Listener, error) {
 	if p, ok := stripUnix(addr); ok {
 		if _, err := os.Stat(p); err == nil {
 			_ = os.Remove(p)
 		}
-		return net.Listen("unix", p)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			return nil, err
+		}
+		ln, err := net.Listen("unix", p)
+		if err != nil {
+			return nil, err
+		}
+		if gid >= 0 {
+			if err := os.Chown(p, -1, gid); err != nil {
+				_ = ln.Close()
+				return nil, fmt.Errorf("chown socket group: %w", err)
+			}
+		}
+		if err := os.Chmod(p, 0o660); err != nil {
+			_ = ln.Close()
+			return nil, fmt.Errorf("chmod socket: %w", err)
+		}
+		return ln, nil
 	}
 	return net.Listen("tcp", addr)
 }

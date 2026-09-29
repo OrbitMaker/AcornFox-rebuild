@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -271,6 +274,11 @@ type fakeRunner struct {
 	imageVolumes []string
 	exposedPorts []int
 
+	// pull behaviour keyed by deployment ID; default: success creating image
+	pullResp map[string]runner.PullResponse
+	pullErr  map[string]error
+	pullReqs []runner.PullRequest
+
 	// health simulation: name -> ContainerInfo overrides during checking
 	logs map[string][]string
 	diff map[string][]string
@@ -291,6 +299,8 @@ func newRunner() *fakeRunner {
 		volumes:    map[string]bool{},
 		buildResp:  map[string]runner.BuildResponse{},
 		buildErr:   map[string]error{},
+		pullResp:   map[string]runner.PullResponse{},
+		pullErr:    map[string]error{},
 		logs:       map[string][]string{},
 		diff:       map[string][]string{},
 		ensureErr:  map[string]error{},
@@ -348,6 +358,25 @@ func (f *fakeRunner) makeImageLocked(app, id string) runner.ImageInfo {
 	}
 	f.images[imgID] = info
 	return info
+}
+
+func (f *fakeRunner) PullImage(_ context.Context, app, deploymentID, ref string) (runner.PullResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pullReqs = append(f.pullReqs, runner.PullRequest{App: app, DeploymentID: deploymentID, Ref: ref})
+	if err := f.pullErr[deploymentID]; err != nil {
+		return runner.PullResponse{}, err
+	}
+	if resp, ok := f.pullResp[deploymentID]; ok {
+		if resp.OK && resp.Image == nil {
+			img := f.makeImageLocked(app, deploymentID)
+			resp.Image = &img
+		}
+		return resp, nil
+	}
+	// default success
+	img := f.makeImageLocked(app, deploymentID)
+	return runner.PullResponse{OK: true, Image: &img}, nil
 }
 
 func (f *fakeRunner) ImageInspect(_ context.Context, app, ref string) (runner.ImageInfo, error) {
@@ -1098,5 +1127,257 @@ func TestScheduleViaKick(t *testing.T) {
 	}
 	if s := h.store.getDeployment("kick00000001").Status; s != state.StatusLive {
 		t.Fatalf("want live via Kick scheduling, got %s", s)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// git / image source tests
+// ---------------------------------------------------------------------------
+
+// fakeGit is an injectable Git for tests: it records calls and either writes a
+// working tree or returns a classified failure output.
+type fakeGit struct {
+	mu          sync.Mutex
+	cloneCalls  []string // "url ref dst"
+	checkout    []string // "dir ref"
+	cloneOutput string
+	cloneErr    error
+	writeFiles  map[string]string // files to create in dst on a successful clone
+	checkoutErr error
+	checkoutOut string
+}
+
+func (g *fakeGit) Clone(_ context.Context, url, ref, dst string) (string, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.cloneCalls = append(g.cloneCalls, url+" "+ref+" "+dst)
+	if g.cloneErr != nil {
+		return g.cloneOutput, g.cloneErr
+	}
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		return "", err
+	}
+	files := g.writeFiles
+	if files == nil {
+		files = map[string]string{"Dockerfile": "FROM scratch\n"}
+	}
+	for name, body := range files {
+		full := filepath.Join(dst, name)
+		if derr := os.MkdirAll(filepath.Dir(full), 0o755); derr != nil {
+			return "", derr
+		}
+		if werr := os.WriteFile(full, []byte(body), 0o644); werr != nil {
+			return "", werr
+		}
+	}
+	return g.cloneOutput, nil
+}
+
+func (g *fakeGit) Checkout(_ context.Context, dir, ref string) (string, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.checkout = append(g.checkout, dir+" "+ref)
+	return g.checkoutOut, g.checkoutErr
+}
+
+func gitDeployment(app, id string, seq int, sourceRef string) state.Deployment {
+	return state.Deployment{
+		ID:         id,
+		App:        app,
+		Seq:        seq,
+		SourceKind: state.SourceGit,
+		SourceRef:  sourceRef,
+		Status:     state.StatusQueued,
+	}
+}
+
+func imageDeployment(app, id string, seq int, ref string) state.Deployment {
+	return state.Deployment{
+		ID:         id,
+		App:        app,
+		Seq:        seq,
+		SourceKind: state.SourceImage,
+		SourceRef:  ref,
+		Status:     state.StatusQueued,
+	}
+}
+
+func TestGitSourceReachesLive(t *testing.T) {
+	h := newHarness(t)
+	h.rec.cfg.Git = &fakeGit{}
+	h.store.putApp(baseApp("web"))
+	h.store.putDeployment(gitDeployment("web", "gitaaaaaaaa1", 1, "https://example.com/repo.git#main"))
+
+	d := h.driveToTerminal(t, "web", "gitaaaaaaaa1", 10)
+	if d.Status != state.StatusLive {
+		t.Fatalf("git deploy want live, got %s (diag=%+v)", d.Status, d.Diagnosis)
+	}
+	// The build must have been driven from a tarball placed in UploadDir.
+	fg := h.rec.cfg.Git.(*fakeGit)
+	if len(fg.cloneCalls) == 0 {
+		t.Fatalf("expected a clone call")
+	}
+}
+
+func TestGitCloneTimeoutDiagnosis(t *testing.T) {
+	h := newHarness(t)
+	h.rec.cfg.Git = &fakeGit{cloneErr: fmt.Errorf("boom"), cloneOutput: "fatal: unable to access: Connection timed out"}
+	h.store.putApp(baseApp("web"))
+	h.store.putDeployment(gitDeployment("web", "gittimeout01", 1, "https://github.com/x/y.git#main"))
+
+	d := h.driveToTerminal(t, "web", "gittimeout01", 5)
+	if d.Status != state.StatusFailed {
+		t.Fatalf("want failed, got %s", d.Status)
+	}
+	if d.Diagnosis == nil || d.Diagnosis.Stage != "source" || d.Diagnosis.Code != "clone_timeout" {
+		t.Fatalf("want source/clone_timeout, got %+v", d.Diagnosis)
+	}
+}
+
+func TestGitRepoNotFoundDiagnosis(t *testing.T) {
+	h := newHarness(t)
+	h.rec.cfg.Git = &fakeGit{cloneErr: fmt.Errorf("exit 128"), cloneOutput: "remote: Repository not found.\nfatal: repository not found"}
+	h.store.putApp(baseApp("web"))
+	h.store.putDeployment(gitDeployment("web", "gitnotfound1", 1, "https://github.com/x/missing.git"))
+
+	d := h.driveToTerminal(t, "web", "gitnotfound1", 5)
+	if d.Diagnosis == nil || d.Diagnosis.Code != "repo_not_found" {
+		t.Fatalf("want repo_not_found, got %+v", d.Diagnosis)
+	}
+}
+
+func TestGitCommitHashCheckedOut(t *testing.T) {
+	h := newHarness(t)
+	fg := &fakeGit{}
+	h.rec.cfg.Git = fg
+	h.store.putApp(baseApp("web"))
+	commit := "0123456789abcdef0123456789abcdef01234567"
+	h.store.putDeployment(gitDeployment("web", "gitcommit001", 1, "https://example.com/repo.git#"+commit))
+
+	d := h.driveToTerminal(t, "web", "gitcommit001", 10)
+	if d.Status != state.StatusLive {
+		t.Fatalf("want live, got %s (diag=%+v)", d.Status, d.Diagnosis)
+	}
+	if len(fg.checkout) == 0 {
+		t.Fatalf("expected a checkout for a commit hash ref")
+	}
+	// Clone must not have used --branch for a commit hash (ref recorded empty
+	// slot is fine; verify checkout carried the commit).
+	if !strings.Contains(fg.checkout[0], commit) {
+		t.Fatalf("checkout did not target the commit: %v", fg.checkout)
+	}
+}
+
+func TestImageSourcePullReachesLive(t *testing.T) {
+	h := newHarness(t)
+	h.store.putApp(baseApp("web"))
+	// External ref not present locally -> ImageInspect NotFound -> PullImage.
+	h.store.putDeployment(imageDeployment("web", "img000000001", 1, "nginx:1.27-alpine"))
+	h.runner.exposedPorts = []int{80}
+
+	d := h.driveToTerminal(t, "web", "img000000001", 10)
+	if d.Status != state.StatusLive {
+		t.Fatalf("image deploy want live, got %s (diag=%+v)", d.Status, d.Diagnosis)
+	}
+	h.runner.mu.Lock()
+	pulls := len(h.runner.pullReqs)
+	h.runner.mu.Unlock()
+	if pulls == 0 {
+		t.Fatalf("expected a PullImage call for an external image ref")
+	}
+}
+
+func TestImageSourcePullFailureDiagnosis(t *testing.T) {
+	h := newHarness(t)
+	h.store.putApp(baseApp("web"))
+	h.store.putDeployment(imageDeployment("web", "imgfail00001", 1, "nope:doesnotexist"))
+	h.runner.mu.Lock()
+	h.runner.pullResp["imgfail00001"] = runner.PullResponse{OK: false, Failure: &runner.Failure{Stage: "image", Code: "image_not_found", Message: "no such image"}}
+	h.runner.mu.Unlock()
+
+	d := h.driveToTerminal(t, "web", "imgfail00001", 5)
+	if d.Status != state.StatusFailed {
+		t.Fatalf("want failed, got %s", d.Status)
+	}
+	if d.Diagnosis == nil || d.Diagnosis.Stage != "image" || d.Diagnosis.Code != "image_not_found" {
+		t.Fatalf("want image/image_not_found, got %+v", d.Diagnosis)
+	}
+}
+
+func TestRollbackImageInspectStillWorks(t *testing.T) {
+	h := newHarness(t)
+	h.store.putApp(baseApp("web"))
+	// A rollback deployment references a local image ID that ImageInspect finds.
+	imgID := "sha256:web-rollbackimg"
+	h.runner.images[imgID] = runner.ImageInfo{ID: imgID, App: "web", DeploymentID: "prevdeploy01", ExposedPorts: []int{8080}}
+	d := imageDeployment("web", "rollback0001", 1, imgID)
+	h.store.putDeployment(d)
+
+	final := h.driveToTerminal(t, "web", "rollback0001", 10)
+	if final.Status != state.StatusLive {
+		t.Fatalf("rollback want live, got %s (diag=%+v)", final.Status, final.Diagnosis)
+	}
+	// No pull should have happened for a locally-present image.
+	h.runner.mu.Lock()
+	pulls := len(h.runner.pullReqs)
+	h.runner.mu.Unlock()
+	if pulls != 0 {
+		t.Fatalf("rollback must not pull, got %d pulls", pulls)
+	}
+}
+
+// TestRealGitCloneLocalBareRepo clones a real bare repository created in the
+// test's temp dir with the git binary. It is skipped when git is missing.
+func TestRealGitCloneLocalBareRepo(t *testing.T) {
+	gitBin, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("git binary not available")
+	}
+	_ = gitBin
+
+	ctx := context.Background()
+	tmp := t.TempDir()
+
+	// Create a work tree, commit a Dockerfile, then clone it bare.
+	work := filepath.Join(tmp, "work")
+	if err := os.MkdirAll(work, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runInDir := func(dir string, args ...string) {
+		t.Helper()
+		cmd := exec.CommandContext(ctx, "git", args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(),
+			"GIT_TERMINAL_PROMPT=0",
+			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@example.com",
+			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@example.com",
+		)
+		if out, cerr := cmd.CombinedOutput(); cerr != nil {
+			t.Fatalf("git %v: %v\n%s", args, cerr, out)
+		}
+	}
+	runInDir(work, "init", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(work, "Dockerfile"), []byte("FROM scratch\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(work, "app.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runInDir(work, "add", ".")
+	runInDir(work, "commit", "-q", "-m", "init")
+
+	bare := filepath.Join(tmp, "repo.git")
+	runInDir(tmp, "clone", "-q", "--bare", work, bare)
+
+	// Drive a git deployment through the real DefaultGit clone into a tarball,
+	// then a fake Build.
+	h := newHarness(t)
+	h.rec.cfg.Git = DefaultGit()
+	h.store.putApp(baseApp("web"))
+	h.store.putDeployment(gitDeployment("web", "realgit00001", 1, "file://"+bare+"#main"))
+
+	d := h.driveToTerminal(t, "web", "realgit00001", 10)
+	if d.Status != state.StatusLive {
+		t.Fatalf("real git clone deploy want live, got %s (diag=%+v)", d.Status, d.Diagnosis)
 	}
 }

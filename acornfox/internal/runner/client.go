@@ -27,6 +27,7 @@ const (
 const (
 	clientDefaultTimeout = 60 * time.Second
 	buildTimeout         = 25 * time.Minute
+	pullTimeout          = 10 * time.Minute
 )
 
 // Client implements API by calling a runner Server over a peer Unix socket.
@@ -133,6 +134,17 @@ func (c *Client) Build(ctx context.Context, req BuildRequest) (BuildResponse, er
 	defer cancel()
 	var out BuildResponse
 	err := c.call(ctx, c.long, PathBuild, req, clientLargeBound, &out)
+	return out, err
+}
+
+// PullImage implements API. It uses a 10 minute timeout; the peer client used
+// for builds (25 min) safely bounds it, and a large response bound leaves room
+// for a classified failure log excerpt.
+func (c *Client) PullImage(ctx context.Context, app, deploymentID, ref string) (PullResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, pullTimeout)
+	defer cancel()
+	var out PullResponse
+	err := c.call(ctx, c.long, PathImagePull, PullRequest{App: app, DeploymentID: deploymentID, Ref: ref}, clientLargeBound, &out)
 	return out, err
 }
 

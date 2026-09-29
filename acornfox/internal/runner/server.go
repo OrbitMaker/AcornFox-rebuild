@@ -41,6 +41,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST "+PathPing, s.handlePing)
 	s.mux.HandleFunc("GET "+PathPing, s.handlePing)
 	s.mux.HandleFunc("POST "+PathBuild, s.handleBuild)
+	s.mux.HandleFunc("POST "+PathImagePull, s.handleImagePull)
 	s.mux.HandleFunc("POST "+PathImageInspect, s.handleImageInspect)
 	s.mux.HandleFunc("POST "+PathImageList, s.handleImageList)
 	s.mux.HandleFunc("POST "+PathImageRemove, s.handleImageRemove)
@@ -173,6 +174,31 @@ func (s *Server) handleBuild(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp, err := s.api.Build(r.Context(), req)
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleImagePull(w http.ResponseWriter, r *http.Request) {
+	var req PullRequest
+	if err := decode(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "malformed request body")
+		return
+	}
+	if !validAppName(w, req.App) {
+		return
+	}
+	if !ValidDeploymentID(req.DeploymentID) {
+		writeError(w, http.StatusBadRequest, "invalid_request", "invalid deployment id")
+		return
+	}
+	if req.Ref == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "ref is required")
+		return
+	}
+	resp, err := s.api.PullImage(r.Context(), req.App, req.DeploymentID, req.Ref)
 	if err != nil {
 		writeAPIError(w, err)
 		return
