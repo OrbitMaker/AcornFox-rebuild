@@ -155,6 +155,7 @@ func runRunner(args ...string) int {
 		socket    = fs.String("socket", "/run/acornfox/runner.sock", "peer socket to serve on")
 		serverUID = fs.Int("server-uid", os.Getuid(), "uid of the acornfox server allowed to connect")
 		socketGID = fs.Int("socket-gid", 0, "group owner of the socket (0 = leave default)")
+		uploadDir = fs.String("upload-dir", "/var/lib/acornfox/uploads", "directory holding server uploads; builds may only read files under it")
 	)
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -170,7 +171,11 @@ func runRunner(args ...string) int {
 	api := runner.NewDocker(cli)
 	// The runner does not stage uploads itself; the server writes them under
 	// data-dir/uploads which the runner reads by absolute path.
-	handler := runner.NewServer(api, os.TempDir())
+	if !filepath.IsAbs(*uploadDir) {
+		fmt.Fprintln(os.Stderr, "-upload-dir must be absolute")
+		return 2
+	}
+	handler := runner.NewServer(api, filepath.Clean(*uploadDir))
 
 	ln, err := peer.Listen(*socket, uint32(*socketGID), uint32(*serverUID))
 	if err != nil {

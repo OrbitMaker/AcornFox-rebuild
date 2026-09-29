@@ -30,6 +30,7 @@ type Store interface {
 	SetCurrentDeployment(ctx context.Context, app, deploymentID string) error
 
 	// Deployments
+	GetDeployment(ctx context.Context, id string) (state.Deployment, error)
 	PendingDeployments(ctx context.Context, app string) ([]state.Deployment, error)
 	UpdateDeployment(ctx context.Context, id string, fn func(*state.Deployment) error) (state.Deployment, error)
 	KeptImageDeployments(ctx context.Context, app string) ([]state.Deployment, error)
@@ -237,7 +238,24 @@ func (r *Reconciler) round(ctx context.Context, app string) {
 	// 2.2.3 advance the single pending deployment.
 	if len(pending) == 1 {
 		d := &pending[0]
-		r.advance(ctx, appRec, d, env, volumes)
+		// Drive the deployment through as many stages as possible in this
+		// round. Stop when it is terminal, or when a step made no progress
+		// (runner unavailable, route retry): the next kick or tick resumes it.
+		for step := 0; step < 8; step++ {
+			before := d.Status
+			r.advance(ctx, appRec, d, env, volumes)
+			cur, err := st.GetDeployment(ctx, d.ID)
+			if err != nil {
+				break
+			}
+			*d = cur
+			if !state.IsPending(d.Status) || d.Status == before {
+				break
+			}
+			if v, err := st.ListVolumes(ctx, app); err == nil {
+				volumes = v // the build step may have added image VOLUME paths
+			}
+		}
 		// re-read app since SetCurrentDeployment may have changed it
 		if a2, err := st.GetApp(ctx, app); err == nil {
 			appRec = a2
@@ -620,7 +638,8 @@ func (r *Reconciler) doRoute(ctx context.Context, app state.App, d *state.Deploy
 		return
 	}
 	if err := r.cfg.Router.Sync(ctx, routes); err != nil {
-		r.event(ctx, app.Name, d.ID, "route", "路由同步失败，稍后重试")
+		r.log.Error("route sync", "app", app.Name, "deployment", d.ID, "err", err)
+		r.event(ctx, app.Name, d.ID, "route", "路由同步失败，稍后重试："+err.Error())
 		r.routeFailMu.Lock()
 		first, ok := r.routeFailSince[d.ID]
 		if !ok {

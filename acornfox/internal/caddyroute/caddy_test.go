@@ -141,6 +141,11 @@ func (f *fakeCaddy) handle(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(v)
 	case http.MethodPut, http.MethodPost:
+		// Like real Caddy: PUT creates and refuses an existing key; POST sets or replaces.
+		if _, exists := f.getPath(r.URL.Path); exists && r.Method == http.MethodPut {
+			http.Error(w, `{"error":"key already exists"}`, http.StatusConflict)
+			return
+		}
 		body, _ := io.ReadAll(r.Body)
 		var v any
 		if len(body) > 0 {

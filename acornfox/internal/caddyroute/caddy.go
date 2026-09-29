@@ -287,13 +287,16 @@ func (c *caddyRouter) putJSON(ctx context.Context, path string, v any) error {
 	return c.putRaw(ctx, path, payload)
 }
 
+// putRaw sets the object at path, creating or replacing it. Caddy's admin API
+// uses POST for "set or replace" on object keys; PUT means "create" and fails
+// with "key already exists" when the key is present.
 func (c *caddyRouter) putRaw(ctx context.Context, path string, payload []byte) error {
-	body, status, err := c.do(ctx, http.MethodPut, path, payload)
+	body, status, err := c.do(ctx, http.MethodPost, path, payload)
 	if err != nil {
 		return err
 	}
 	if status < 200 || status >= 300 {
-		return fmt.Errorf("caddy put %s: status %d: %s", path, status, strings.TrimSpace(string(body)))
+		return fmt.Errorf("caddy set %s: status %d: %s", path, status, strings.TrimSpace(string(body)))
 	}
 	return nil
 }

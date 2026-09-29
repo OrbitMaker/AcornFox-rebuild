@@ -121,6 +121,16 @@ func (s *fakeStore) PendingDeployments(_ context.Context, app string) ([]state.D
 	return out, nil
 }
 
+func (s *fakeStore) GetDeployment(_ context.Context, id string) (state.Deployment, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	d, ok := s.deployments[id]
+	if !ok {
+		return state.Deployment{}, state.ErrNotFound
+	}
+	return *d, nil
+}
+
 func (s *fakeStore) UpdateDeployment(_ context.Context, id string, fn func(*state.Deployment) error) (state.Deployment, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -638,6 +648,18 @@ func TestHappyPathToLive(t *testing.T) {
 	app := h.store.getApp("web")
 	if app.CurrentDeployment != "aaaaaaaaaaaa" {
 		t.Fatalf("current deployment not set: %q", app.CurrentDeployment)
+	}
+}
+
+// A single kick must carry a deployment all the way to live; waiting for the
+// periodic tick between stages made real deploys take a minute or more.
+func TestSingleRoundReachesLive(t *testing.T) {
+	h := newHarness(t)
+	h.store.putApp(baseApp("web"))
+	h.store.putDeployment(queued("web", "aaaaaaaaaaaa", 1))
+	d := h.driveToTerminal(t, "web", "aaaaaaaaaaaa", 1)
+	if d.Status != state.StatusLive {
+		t.Fatalf("want live after one round, got %s", d.Status)
 	}
 }
 
