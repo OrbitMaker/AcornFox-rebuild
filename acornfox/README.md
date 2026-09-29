@@ -4,7 +4,7 @@
 
 ## 当前状态
 
-迁移清单 M2 已完成（见[迁移清单](../docs/acornfox-rebuild-migration-plan.md)第 7 节）：运行时已收敛为核心加执行器。尚未提供安装方式（M3），因此还没有在真实主机上跑通核心与执行器的端到端流程。
+迁移清单 M2 已完成：运行时已收敛为核心加执行器。**下一步按 [v2 设计与迁移清单](../docs/acornfox-rebuild-migration-plan.md) 重建**：`acornfox server` + `acornfox runner` 两个服务，状态记在 AcornFox、运行交给 Docker、访问交给 Caddy。下文描述的是 M2 时的代码，执行层（`imageexecution`、`sourcebuildexecution`、`gatewayexecution` 等）将在 v2 的 N1 完成后删除。
 
 ## 运行时
 
