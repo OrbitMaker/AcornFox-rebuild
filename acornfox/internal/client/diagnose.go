@@ -12,6 +12,7 @@ const (
 	codePermissionDenied = "permission_denied"
 	codeServerDown       = "server_down"
 	codeVersionMismatch  = "version_mismatch"
+	codeForwardingOff    = "forwarding_disabled"
 	codeConnectFailed    = "connect_failed"
 )
 
@@ -61,6 +62,8 @@ func connectMessage(code string) (message, hint string) {
 		return "acornfox 服务未运行", "在服务器上执行 `systemctl status acornfox-server`"
 	case codeVersionMismatch:
 		return "CLI 与服务器 API 版本不兼容", "升级 CLI 或服务器"
+	case codeForwardingOff:
+		return "服务器禁止了 SSH 端口转发", "服务器 sshd 需要 `AllowTcpForwarding yes`"
 	default:
 		return "SSH 连接失败", "先在终端里手动 `ssh user@host` 排查"
 	}
@@ -92,6 +95,9 @@ func classifySSH(exitCode int, stderr string) string {
 
 	// OpenSSH client diagnostics.
 	switch {
+	case strings.Contains(low, "administratively prohibited"),
+		strings.Contains(low, "port forwarding is disabled"):
+		return codeForwardingOff
 	case strings.Contains(low, "could not resolve hostname"),
 		strings.Contains(low, "connection refused"),
 		strings.Contains(low, "connection timed out"),

@@ -1,9 +1,0 @@
-{
-  "extends": "./tsconfig.json",
-  "include": [
-    "src/core/**/*",
-    "src/shared/**/*",
-    "src/acornfox/csrf.ts",
-    "vite.core.config.ts"
-  ]
-}

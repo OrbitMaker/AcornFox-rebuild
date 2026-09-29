@@ -38,6 +38,11 @@ type app struct {
 	// selection overrides from global flags
 	flagTarget string
 	flagApp    string
+
+	// N3 `open` injection points (nil in production → real implementations).
+	openTunnel func(ctx context.Context, t client.Target, localPort int) (*client.Tunnel, error)
+	openURL    func(url string) error // browser opener
+	freePort   func() (int, error)    // pick a free local TCP port
 }
 
 // Main is the entry point invoked by cmd/acornfox for every non-server,
@@ -72,7 +77,7 @@ func mainWith(ctx context.Context, args []string, stdin io.Reader, stdout, stder
 		return a.out.usageError("%s", err.Error())
 	}
 	if len(rest) == 0 {
-		return a.out.usageError("需要一个子命令；可用：target deploy status apps logs env volume app set rollback stop start version")
+		return a.out.usageError("需要一个子命令；可用：target deploy status apps logs env volume app set rollback stop start open domain version")
 	}
 
 	cmd, cmdArgs := rest[0], rest[1:]
@@ -101,6 +106,10 @@ func mainWith(ctx context.Context, args []string, stdin io.Reader, stdout, stder
 		return a.cmdStop(ctx, cmdArgs)
 	case "start":
 		return a.cmdStart(ctx, cmdArgs)
+	case "open":
+		return a.cmdOpen(ctx, cmdArgs)
+	case "domain":
+		return a.cmdDomain(ctx, cmdArgs)
 	default:
 		return a.out.usageError("未知命令：%s", cmd)
 	}

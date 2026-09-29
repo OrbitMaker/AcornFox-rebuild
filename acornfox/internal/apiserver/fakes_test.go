@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"net"
 	"sort"
 	"sync"
 	"time"
@@ -26,6 +27,24 @@ type fakeStore struct {
 	events      map[string][]state.Event
 	nextPort    int
 	nextEventID int64
+
+	// N3 console + domains.
+	tokens   map[string]time.Time // token digest -> expiry
+	sessions map[string]*fakeSession
+	domains  map[string]state.Domain // name -> domain
+	clock    func() time.Time
+}
+
+// fakeSession mirrors the stored session, keyed by session secret digest.
+type fakeSession struct {
+	id         string
+	secret     string
+	csrfDigest string
+	created    time.Time
+	lastSeen   time.Time
+	idle       time.Time
+	absolute   time.Time
+	revoked    bool
 }
 
 func newFakeStore() *fakeStore {
@@ -37,7 +56,17 @@ func newFakeStore() *fakeStore {
 		volumes:     map[string][]state.Volume{},
 		events:      map[string][]state.Event{},
 		nextPort:    18810,
+		tokens:      map[string]time.Time{},
+		sessions:    map[string]*fakeSession{},
+		domains:     map[string]state.Domain{},
 	}
+}
+
+func (f *fakeStore) now() time.Time {
+	if f.clock != nil {
+		return f.clock().UTC()
+	}
+	return time.Now().UTC()
 }
 
 func (f *fakeStore) EnsureApp(_ context.Context, name string) (state.App, bool, error) {
@@ -343,3 +372,147 @@ func (r *fakeRunner) Logs(_ context.Context, _, name string, _ int) ([]string, e
 }
 
 var errRunnerDown = errors.New("runner down")
+
+// -------- N3 console + domains (fake) --------
+
+func (f *fakeStore) CreateConsoleToken(_ context.Context) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	token := randID() + randID() // 24 hex; enough for tests
+	f.tokens[token] = f.now().Add(state.ConsoleTokenTTL)
+	return token, nil
+}
+
+func (f *fakeStore) RedeemConsoleToken(_ context.Context, token string) (state.ConsoleSession, string, string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	expiry, ok := f.tokens[token]
+	if !ok {
+		return state.ConsoleSession{}, "", "", state.ErrNotFound
+	}
+	delete(f.tokens, token) // single use
+	now := f.now()
+	if !now.Before(expiry) {
+		return state.ConsoleSession{}, "", "", state.ErrNotFound
+	}
+	secret := randID() + randID()
+	csrf := state.ConsoleCSRFToken(secret)
+	fs := &fakeSession{
+		id:         randID() + randID()[:4],
+		secret:     secret,
+		csrfDigest: state.CSRFDigest(csrf),
+		created:    now,
+		lastSeen:   now,
+		idle:       now.Add(state.ConsoleSessionIdle),
+		absolute:   now.Add(state.ConsoleSessionAbsolute),
+	}
+	f.sessions[secret] = fs
+	return f.sessionView(fs), secret, csrf, nil
+}
+
+func (f *fakeStore) TouchConsoleSession(_ context.Context, secret string) (state.ConsoleSession, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	fs, ok := f.sessions[secret]
+	if !ok {
+		return state.ConsoleSession{}, state.ErrNotFound
+	}
+	now := f.now()
+	if fs.revoked || !now.Before(fs.idle) || !now.Before(fs.absolute) {
+		return state.ConsoleSession{}, state.ErrNotFound
+	}
+	fs.lastSeen = now
+	fs.idle = now.Add(state.ConsoleSessionIdle)
+	if fs.idle.After(fs.absolute) {
+		fs.idle = fs.absolute
+	}
+	return f.sessionView(fs), nil
+}
+
+func (f *fakeStore) RevokeConsoleSession(_ context.Context, secret string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if fs, ok := f.sessions[secret]; ok {
+		fs.revoked = true
+	}
+	return nil
+}
+
+func (f *fakeStore) sessionView(fs *fakeSession) state.ConsoleSession {
+	return state.ConsoleSession{
+		ID:              fs.id,
+		CSRFDigest:      fs.csrfDigest,
+		CreatedAt:       fs.created,
+		LastSeenAt:      fs.lastSeen,
+		IdleExpiresAt:   fs.idle,
+		AbsoluteExpires: fs.absolute,
+	}
+}
+
+func (f *fakeStore) AddDomain(_ context.Context, app, name string) (state.Domain, bool, error) {
+	if !state.ValidDomainName(name) {
+		return state.Domain{}, false, state.ErrInvalid
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.apps[app]; !ok {
+		return state.Domain{}, false, state.ErrNotFound
+	}
+	if d, ok := f.domains[name]; ok {
+		if d.App != app {
+			return state.Domain{}, false, state.ErrConflict
+		}
+		return d, false, nil
+	}
+	d := state.Domain{App: app, Name: name, Status: state.DomainPending, CreatedAt: f.now()}
+	f.domains[name] = d
+	return d, true, nil
+}
+
+func (f *fakeStore) RemoveDomain(_ context.Context, app, name string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	d, ok := f.domains[name]
+	if !ok {
+		return nil
+	}
+	if d.App != app {
+		return state.ErrNotFound
+	}
+	delete(f.domains, name)
+	return nil
+}
+
+func (f *fakeStore) ListDomains(_ context.Context, app string) ([]state.Domain, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := []state.Domain{}
+	for _, d := range f.domains {
+		if app == "" || d.App == app {
+			out = append(out, d)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
+// fakeHostProvider returns a fixed host view.
+type fakeHostProvider struct{ view apiserverHostView }
+
+// apiserverHostView aliases HostView so tests can build one without importing.
+type apiserverHostView = HostView
+
+func (p fakeHostProvider) Host(_ context.Context) HostView { return p.view }
+
+// fakeResolver returns fixed addresses (or an error) for LookupIPAddr.
+type fakeResolver struct {
+	addrs map[string][]net.IPAddr
+	err   error
+}
+
+func (r fakeResolver) LookupIPAddr(_ context.Context, host string) ([]net.IPAddr, error) {
+	if r.err != nil {
+		return nil, r.err
+	}
+	return r.addrs[host], nil
+}

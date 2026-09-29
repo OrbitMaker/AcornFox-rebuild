@@ -280,6 +280,61 @@ CREATE UNIQUE INDEX deployments_app_request_key_idx ON deployments (app, request
 CREATE INDEX deployments_app_created_idx ON deployments (app, created_at);
 `
 
+// migration0004 adds the N3 console and domain tables: one-time console login
+// tokens, browser sessions (only SHA-256 digests of secrets are stored) and
+// per-app custom domains. Timestamps use the same canonical UTC text as every
+// other table so lexical order equals chronological order.
+const migration0004 = `
+CREATE TABLE console_tokens (
+    token_digest TEXT PRIMARY KEY NOT NULL,
+    created_at   TEXT NOT NULL,
+    expires_at   TEXT NOT NULL,
+    CHECK (length(token_digest) = 64 AND token_digest NOT GLOB '*[^0-9a-f]*'),
+    CHECK (created_at GLOB '` + timePattern + `'),
+    CHECK (expires_at GLOB '` + timePattern + `'),
+    CHECK (expires_at >= created_at)
+);
+
+CREATE TABLE console_sessions (
+    id                  TEXT PRIMARY KEY NOT NULL,
+    session_digest      TEXT NOT NULL UNIQUE,
+    csrf_digest         TEXT NOT NULL,
+    created_at          TEXT NOT NULL,
+    last_seen_at        TEXT NOT NULL,
+    idle_expires_at     TEXT NOT NULL,
+    absolute_expires_at TEXT NOT NULL,
+    revoked_at          TEXT,
+    CHECK (length(id) = 16 AND id NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(session_digest) = 64 AND session_digest NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(csrf_digest) = 64 AND csrf_digest NOT GLOB '*[^0-9a-f]*'),
+    CHECK (created_at GLOB '` + timePattern + `'),
+    CHECK (last_seen_at GLOB '` + timePattern + `'),
+    CHECK (idle_expires_at GLOB '` + timePattern + `'),
+    CHECK (absolute_expires_at GLOB '` + timePattern + `'),
+    CHECK (revoked_at IS NULL OR revoked_at GLOB '` + timePattern + `'),
+    CHECK (last_seen_at >= created_at),
+    CHECK (absolute_expires_at >= created_at),
+    CHECK (idle_expires_at <= absolute_expires_at)
+);
+
+CREATE INDEX console_sessions_digest_idx ON console_sessions (session_digest) WHERE revoked_at IS NULL;
+
+CREATE TABLE app_domains (
+    app        TEXT NOT NULL REFERENCES apps(name) ON DELETE CASCADE,
+    name       TEXT NOT NULL,
+    status     TEXT NOT NULL,
+    diagnosis  TEXT NOT NULL DEFAULT '',
+    checked_at TEXT,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (name),
+    CHECK (status IN ('pending','ready','failed')),
+    CHECK (created_at GLOB '` + timePattern + `'),
+    CHECK (checked_at IS NULL OR checked_at GLOB '` + timePattern + `')
+);
+
+CREATE INDEX app_domains_app_idx ON app_domains (app, name);
+`
+
 // migrationList is the complete, ordered schema history. Never edit a shipped
 // entry; append a new one instead.
 func migrationList() []migration {
@@ -287,6 +342,7 @@ func migrationList() []migration {
 		{"0001_apps", migration0001},
 		{"0002_admin_auth", migration0002},
 		{"0003_source_git", migration0003},
+		{"0004_console_domains", migration0004},
 	}
 }
 

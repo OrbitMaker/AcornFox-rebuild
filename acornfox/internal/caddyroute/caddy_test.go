@@ -3,11 +3,14 @@ package caddyroute
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -50,7 +53,8 @@ func (f *fakeCaddy) servers() map[string]any {
 	return servers
 }
 
-// getPath descends the config by the admin path.
+// getPath descends the config by the admin path. Numeric segments index into
+// arrays; string segments index into maps.
 func (f *fakeCaddy) getPath(path string) (any, bool) {
 	if path == "/config/" || path == "/config" {
 		return f.config, true
@@ -59,15 +63,22 @@ func (f *fakeCaddy) getPath(path string) (any, bool) {
 	parts := splitPath(rel)
 	var cur any = f.config
 	for _, p := range parts {
-		m, ok := cur.(map[string]any)
-		if !ok {
+		switch node := cur.(type) {
+		case map[string]any:
+			v, ok := node[p]
+			if !ok {
+				return nil, false
+			}
+			cur = v
+		case []any:
+			idx, err := strconv.Atoi(p)
+			if err != nil || idx < 0 || idx >= len(node) {
+				return nil, false
+			}
+			cur = node[idx]
+		default:
 			return nil, false
 		}
-		v, ok := m[p]
-		if !ok {
-			return nil, false
-		}
-		cur = v
 	}
 	return cur, true
 }
@@ -91,49 +102,115 @@ func splitPath(rel string) []string {
 	return parts
 }
 
-// setPath creates intermediate maps and sets the value at path.
+// setPath creates intermediate maps and sets the value at path. Numeric final
+// segments set an array element by index; numeric intermediate segments index
+// into existing arrays.
 func (f *fakeCaddy) setPath(path string, val any) {
 	rel := path[len("/config/"):]
 	parts := splitPath(rel)
-	cur := f.config
+	var cur any = f.config
 	for i, p := range parts {
-		if i == len(parts)-1 {
-			cur[p] = val
+		last := i == len(parts)-1
+		switch node := cur.(type) {
+		case map[string]any:
+			if last {
+				node[p] = val
+				return
+			}
+			next, ok := node[p]
+			if !ok {
+				nm := map[string]any{}
+				node[p] = nm
+				cur = nm
+				continue
+			}
+			cur = next
+		case []any:
+			idx, err := strconv.Atoi(p)
+			if err != nil || idx < 0 || idx >= len(node) {
+				return
+			}
+			if last {
+				node[idx] = val
+				return
+			}
+			cur = node[idx]
+		default:
 			return
 		}
-		next, ok := cur[p].(map[string]any)
-		if !ok {
-			next = map[string]any{}
-			cur[p] = next
-		}
-		cur = next
 	}
 }
 
 func (f *fakeCaddy) deletePath(path string) {
 	rel := path[len("/config/"):]
 	parts := splitPath(rel)
-	cur := f.config
-	for i, p := range parts {
-		if i == len(parts)-1 {
-			delete(cur, p)
+	// Walk to the parent of the final segment, tracking it so we can rewrite an
+	// array (delete-by-index splices) or a map (delete key).
+	var parent any = f.config
+	for i := 0; i < len(parts)-1; i++ {
+		p := parts[i]
+		switch node := parent.(type) {
+		case map[string]any:
+			next, ok := node[p]
+			if !ok {
+				return
+			}
+			parent = next
+		case []any:
+			idx, err := strconv.Atoi(p)
+			if err != nil || idx < 0 || idx >= len(node) {
+				return
+			}
+			parent = node[idx]
+		default:
 			return
 		}
-		next, ok := cur[p].(map[string]any)
-		if !ok {
-			return
-		}
-		cur = next
 	}
+	last := parts[len(parts)-1]
+	switch node := parent.(type) {
+	case map[string]any:
+		delete(node, last)
+	case []any:
+		idx, err := strconv.Atoi(last)
+		if err != nil || idx < 0 || idx >= len(node) {
+			return
+		}
+		// Splice out the element; write the shortened slice back into its
+		// grandparent so the deletion is observed.
+		spliced := append(node[:idx], node[idx+1:]...)
+		f.setSlice(parts[:len(parts)-1], spliced)
+	}
+}
+
+// setSlice writes a slice value back at the given path parts (parent of a
+// deleted array element).
+func (f *fakeCaddy) setSlice(parts []string, val []any) {
+	if len(parts) == 0 {
+		return
+	}
+	f.setPath("/config/"+strings.Join(parts, "/"), val)
 }
 
 func (f *fakeCaddy) handle(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	// /id/<@id> resolves to the config path of the object tagged with that @id.
+	path := r.URL.Path
+	if strings.HasPrefix(path, "/id/") {
+		id := strings.TrimPrefix(path, "/id/")
+		resolved, ok := f.resolveID(id)
+		if !ok {
+			// Unknown @id: GET/DELETE => 404; PUT/POST would need a parent, also 404.
+			http.Error(w, "unknown id", http.StatusNotFound)
+			return
+		}
+		path = resolved
+	}
+
 	switch r.Method {
 	case http.MethodGet:
-		v, ok := f.getPath(r.URL.Path)
+		v, ok := f.getPath(path)
 		if !ok {
 			http.Error(w, "not found", http.StatusNotFound)
 			return
@@ -141,11 +218,6 @@ func (f *fakeCaddy) handle(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(v)
 	case http.MethodPut, http.MethodPost:
-		// Like real Caddy: PUT creates and refuses an existing key; POST sets or replaces.
-		if _, exists := f.getPath(r.URL.Path); exists && r.Method == http.MethodPut {
-			http.Error(w, `{"error":"key already exists"}`, http.StatusConflict)
-			return
-		}
 		body, _ := io.ReadAll(r.Body)
 		var v any
 		if len(body) > 0 {
@@ -154,23 +226,80 @@ func (f *fakeCaddy) handle(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		f.setPath(r.URL.Path, v)
+		// Array append: a path ending in "/..." appends elements to the array
+		// at the parent path (real Caddy semantics).
+		if strings.HasSuffix(path, "/...") {
+			parent := strings.TrimSuffix(path, "/...")
+			cur, _ := f.getPath(parent)
+			arr, _ := cur.([]any)
+			add, ok := v.([]any)
+			if !ok {
+				http.Error(w, "append expects array", http.StatusBadRequest)
+				return
+			}
+			arr = append(arr, add...)
+			f.setPath(parent, arr)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		// Like real Caddy: PUT creates and refuses an existing key; POST sets or replaces.
+		if _, exists := f.getPath(path); exists && r.Method == http.MethodPut {
+			http.Error(w, `{"error":"key already exists"}`, http.StatusConflict)
+			return
+		}
+		f.setPath(path, v)
 		w.WriteHeader(http.StatusOK)
 	case http.MethodDelete:
-		if _, ok := f.getPath(r.URL.Path); !ok {
+		if _, ok := f.getPath(path); !ok {
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
-		f.deletePath(r.URL.Path)
+		f.deletePath(path)
 		w.WriteHeader(http.StatusOK)
 	default:
 		http.Error(w, "method", http.StatusMethodNotAllowed)
 	}
 }
 
+// resolveID walks the config for an object (map) carrying "@id": id and returns
+// its /config/... path. Arrays are indexed positionally, matching how Caddy
+// addresses array elements.
+func (f *fakeCaddy) resolveID(id string) (string, bool) {
+	var walk func(node any, path string) (string, bool)
+	walk = func(node any, path string) (string, bool) {
+		switch n := node.(type) {
+		case map[string]any:
+			if v, ok := n["@id"]; ok {
+				if s, ok := v.(string); ok && s == id {
+					return path, true
+				}
+			}
+			// Deterministic key order for stable resolution.
+			keys := make([]string, 0, len(n))
+			for k := range n {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			for _, k := range keys {
+				if p, ok := walk(n[k], path+"/"+k); ok {
+					return p, true
+				}
+			}
+		case []any:
+			for i, e := range n {
+				if p, ok := walk(e, fmt.Sprintf("%s/%d", path, i)); ok {
+					return p, true
+				}
+			}
+		}
+		return "", false
+	}
+	return walk(f.config, "/config")
+}
+
 func TestSyncFromEmptyConfig(t *testing.T) {
 	f := startFakeCaddy(t, nil)
-	r := New(f.socket)
+	r := New(f.socket, HTTPSConfig{})
 	ctx := context.Background()
 
 	routes := []Route{
@@ -215,7 +344,7 @@ func TestSyncPreservesNonAfServers(t *testing.T) {
 		},
 	}
 	f := startFakeCaddy(t, initial)
-	r := New(f.socket)
+	r := New(f.socket, HTTPSConfig{})
 	ctx := context.Background()
 
 	if err := r.Sync(ctx, []Route{{App: "web", PublicPort: 18810, Upstream: "127.0.0.1:1"}}); err != nil {
@@ -237,7 +366,7 @@ func TestSyncPreservesNonAfServers(t *testing.T) {
 
 func TestSyncDeletesStaleAfServers(t *testing.T) {
 	f := startFakeCaddy(t, nil)
-	r := New(f.socket)
+	r := New(f.socket, HTTPSConfig{})
 	ctx := context.Background()
 
 	if err := r.Sync(ctx, []Route{
@@ -261,7 +390,7 @@ func TestSyncDeletesStaleAfServers(t *testing.T) {
 
 func TestSyncUpdatesChangedRoute(t *testing.T) {
 	f := startFakeCaddy(t, nil)
-	r := New(f.socket)
+	r := New(f.socket, HTTPSConfig{})
 	ctx := context.Background()
 
 	r.Sync(ctx, []Route{{App: "web", PublicPort: 18810, Upstream: "127.0.0.1:1"}})
@@ -292,7 +421,7 @@ func TestSyncSkipsUnchanged(t *testing.T) {
 		base.ServeHTTP(w, req)
 	})
 
-	r := New(f.socket)
+	r := New(f.socket, HTTPSConfig{})
 	ctx := context.Background()
 	routes := []Route{{App: "web", PublicPort: 18810, Upstream: "127.0.0.1:1"}}
 	if err := r.Sync(ctx, routes); err != nil {
@@ -320,7 +449,7 @@ func TestSyncSkipsUnchanged(t *testing.T) {
 
 func TestCurrentEmpty(t *testing.T) {
 	f := startFakeCaddy(t, nil)
-	r := New(f.socket)
+	r := New(f.socket, HTTPSConfig{})
 	cur, err := r.Current(context.Background())
 	if err != nil {
 		t.Fatalf("Current on empty: %v", err)
@@ -332,7 +461,7 @@ func TestCurrentEmpty(t *testing.T) {
 
 func TestSyncEmptyRoutesClearsAf(t *testing.T) {
 	f := startFakeCaddy(t, nil)
-	r := New(f.socket)
+	r := New(f.socket, HTTPSConfig{})
 	ctx := context.Background()
 	r.Sync(ctx, []Route{{App: "web", PublicPort: 18810, Upstream: "127.0.0.1:1"}})
 	if err := r.Sync(ctx, nil); err != nil {
@@ -363,5 +492,268 @@ func TestParseListenPort(t *testing.T) {
 		if got != cases[in] {
 			t.Errorf("parseListenPort(%q) = %d, want %d", in, got, cases[in])
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// N3: af-domains server and TLS automation policy
+// ---------------------------------------------------------------------------
+
+// tlsPolicies returns the raw apps.tls.automation.policies array (may be nil).
+func (f *fakeCaddy) tlsPolicies() []any {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	apps, _ := f.config["apps"].(map[string]any)
+	tls, _ := apps["tls"].(map[string]any)
+	auto, _ := tls["automation"].(map[string]any)
+	pol, _ := auto["policies"].([]any)
+	return pol
+}
+
+// afPolicy returns AcornFox's own policy (by @id), or nil.
+func (f *fakeCaddy) afPolicy() map[string]any {
+	for _, p := range f.tlsPolicies() {
+		m, ok := p.(map[string]any)
+		if !ok {
+			continue
+		}
+		if id, _ := m["@id"].(string); id == tlsPolicyID {
+			return m
+		}
+	}
+	return nil
+}
+
+func TestSyncCreatesDomainsServerInternalIssuer(t *testing.T) {
+	f := startFakeCaddy(t, nil)
+	r := New(f.socket, HTTPSConfig{HTTPPort: 18080, HTTPSPort: 18443, Issuer: "internal"})
+	ctx := context.Background()
+
+	routes := []Route{{
+		App: "notes", PublicPort: 18810, Upstream: "127.0.0.1:40001",
+		Domains: []string{"notes.acornfox.test"},
+	}}
+	if err := r.Sync(ctx, routes); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+
+	// af-domains server exists and listens on both ports.
+	srv, ok := f.servers()[domainsServer].(map[string]any)
+	if !ok {
+		t.Fatalf("af-domains server not created")
+	}
+	listen := srv["listen"].([]any)
+	if len(listen) != 2 {
+		t.Fatalf("af-domains listen = %v, want 2 ports", listen)
+	}
+	// Automatic HTTPS must NOT be disabled on the domains server.
+	if _, disabled := srv["automatic_https"]; disabled {
+		t.Errorf("af-domains must keep automatic HTTPS enabled")
+	}
+
+	// TLS policy with our @id, subjects, internal issuer.
+	pol := f.afPolicy()
+	if pol == nil {
+		t.Fatalf("af-tls-policy not created")
+	}
+	subs := pol["subjects"].([]any)
+	if len(subs) != 1 || subs[0] != "notes.acornfox.test" {
+		t.Errorf("policy subjects = %v", subs)
+	}
+	iss := pol["issuers"].([]any)[0].(map[string]any)
+	if iss["module"] != "internal" {
+		t.Errorf("issuer module = %v, want internal", iss["module"])
+	}
+
+	// Current reports the domain folded back onto the app.
+	cur, _ := r.Current(ctx)
+	if got := cur["notes"].Domains; len(got) != 1 || got[0] != "notes.acornfox.test" {
+		t.Errorf("Current domains = %v", got)
+	}
+}
+
+func TestSyncUpdatesDomainsAndPolicy(t *testing.T) {
+	f := startFakeCaddy(t, nil)
+	r := New(f.socket, HTTPSConfig{HTTPPort: 18080, HTTPSPort: 18443, Issuer: "internal"})
+	ctx := context.Background()
+
+	r.Sync(ctx, []Route{{App: "notes", PublicPort: 18810, Upstream: "127.0.0.1:40001", Domains: []string{"a.test"}}})
+	// Add a second domain and a second app with a domain.
+	if err := r.Sync(ctx, []Route{
+		{App: "notes", PublicPort: 18810, Upstream: "127.0.0.1:40001", Domains: []string{"a.test", "b.test"}},
+		{App: "blog", PublicPort: 18811, Upstream: "127.0.0.1:40002", Domains: []string{"c.test"}},
+	}); err != nil {
+		t.Fatalf("Sync update: %v", err)
+	}
+
+	srv := f.servers()[domainsServer].(map[string]any)
+	routes := srv["routes"].([]any)
+	if len(routes) != 2 {
+		t.Fatalf("af-domains routes = %d, want 2", len(routes))
+	}
+	pol := f.afPolicy()
+	subs := pol["subjects"].([]any)
+	if len(subs) != 3 {
+		t.Errorf("policy subjects = %v, want 3", subs)
+	}
+}
+
+func TestSyncDeletesDomainsServerAndPolicyWhenNoDomains(t *testing.T) {
+	f := startFakeCaddy(t, nil)
+	r := New(f.socket, HTTPSConfig{HTTPPort: 18080, HTTPSPort: 18443, Issuer: "internal"})
+	ctx := context.Background()
+
+	r.Sync(ctx, []Route{{App: "notes", PublicPort: 18810, Upstream: "127.0.0.1:40001", Domains: []string{"a.test"}}})
+	if _, ok := f.servers()[domainsServer]; !ok {
+		t.Fatalf("precondition: af-domains should exist")
+	}
+	// Second sync drops all domains (route keeps its per-app server).
+	if err := r.Sync(ctx, []Route{{App: "notes", PublicPort: 18810, Upstream: "127.0.0.1:40001"}}); err != nil {
+		t.Fatalf("Sync no domains: %v", err)
+	}
+	if _, ok := f.servers()[domainsServer]; ok {
+		t.Errorf("af-domains server should be deleted when no domains")
+	}
+	if f.afPolicy() != nil {
+		t.Errorf("af-tls-policy should be deleted when no domains")
+	}
+	// The per-app server survives.
+	if _, ok := f.servers()["af-notes"]; !ok {
+		t.Errorf("per-app server should survive domain removal")
+	}
+}
+
+func TestSyncPreservesForeignServersAndPolicies(t *testing.T) {
+	initial := map[string]any{
+		"apps": map[string]any{
+			"http": map[string]any{
+				"servers": map[string]any{
+					"user-site": map[string]any{"listen": []any{":8443"}},
+				},
+			},
+			"tls": map[string]any{
+				"automation": map[string]any{
+					"policies": []any{
+						map[string]any{
+							"subjects": []any{"foreign.example.com"},
+							"issuers":  []any{map[string]any{"module": "internal"}},
+						},
+					},
+				},
+			},
+		},
+	}
+	f := startFakeCaddy(t, initial)
+	r := New(f.socket, HTTPSConfig{HTTPPort: 18080, HTTPSPort: 18443, Issuer: "internal"})
+	ctx := context.Background()
+
+	if err := r.Sync(ctx, []Route{{App: "notes", PublicPort: 18810, Upstream: "127.0.0.1:40001", Domains: []string{"a.test"}}}); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	// Foreign server intact.
+	if _, ok := f.servers()["user-site"]; !ok {
+		t.Errorf("foreign server clobbered")
+	}
+	// Foreign policy still present alongside ours.
+	pols := f.tlsPolicies()
+	if len(pols) != 2 {
+		t.Fatalf("policies = %d, want 2 (foreign + ours)", len(pols))
+	}
+	var foreignFound bool
+	for _, p := range pols {
+		m := p.(map[string]any)
+		if subs, _ := m["subjects"].([]any); len(subs) == 1 && subs[0] == "foreign.example.com" {
+			foreignFound = true
+		}
+	}
+	if !foreignFound {
+		t.Errorf("foreign TLS policy was removed")
+	}
+
+	// Now remove our domains: foreign policy must remain, ours must go.
+	if err := r.Sync(ctx, []Route{{App: "notes", PublicPort: 18810, Upstream: "127.0.0.1:40001"}}); err != nil {
+		t.Fatalf("Sync no domains: %v", err)
+	}
+	pols = f.tlsPolicies()
+	if len(pols) != 1 {
+		t.Fatalf("after cleanup policies = %d, want 1 (foreign only)", len(pols))
+	}
+	if subs, _ := pols[0].(map[string]any)["subjects"].([]any); subs[0] != "foreign.example.com" {
+		t.Errorf("foreign policy lost after our cleanup: %v", subs)
+	}
+}
+
+func TestSyncDomainsIdempotentNoOp(t *testing.T) {
+	f := startFakeCaddy(t, nil)
+
+	var writes int
+	var mu sync.Mutex
+	base := f.srv.Handler
+	f.srv.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Method == http.MethodPut || req.Method == http.MethodPost || req.Method == http.MethodDelete {
+			mu.Lock()
+			writes++
+			mu.Unlock()
+		}
+		base.ServeHTTP(w, req)
+	})
+
+	r := New(f.socket, HTTPSConfig{HTTPPort: 18080, HTTPSPort: 18443, Issuer: "internal"})
+	ctx := context.Background()
+	routes := []Route{{App: "notes", PublicPort: 18810, Upstream: "127.0.0.1:40001", Domains: []string{"a.test", "b.test"}}}
+	if err := r.Sync(ctx, routes); err != nil {
+		t.Fatalf("Sync 1: %v", err)
+	}
+	mu.Lock()
+	afterFirst := writes
+	mu.Unlock()
+
+	// Identical sync: the servers are unchanged; only the TLS policy is
+	// re-PUT (idempotent by @id). Assert servers were not rewritten.
+	if err := r.Sync(ctx, routes); err != nil {
+		t.Fatalf("Sync 2: %v", err)
+	}
+	mu.Lock()
+	afterSecond := writes
+	mu.Unlock()
+	// At most one write (the policy PUT); the two af-* servers must be skipped.
+	if afterSecond-afterFirst > 1 {
+		t.Errorf("idempotent domains sync wrote %d extra requests, want <=1", afterSecond-afterFirst)
+	}
+}
+
+func TestSyncACMEEmailPolicy(t *testing.T) {
+	f := startFakeCaddy(t, nil)
+	r := New(f.socket, HTTPSConfig{Issuer: "acme", Email: "ops@example.com"})
+	ctx := context.Background()
+
+	if err := r.Sync(ctx, []Route{{App: "notes", PublicPort: 18810, Upstream: "127.0.0.1:40001", Domains: []string{"a.test"}}}); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	pol := f.afPolicy()
+	if pol == nil {
+		t.Fatalf("acme email policy not created")
+	}
+	iss := pol["issuers"].([]any)[0].(map[string]any)
+	if iss["module"] != "acme" || iss["email"] != "ops@example.com" {
+		t.Errorf("acme issuer = %v", iss)
+	}
+}
+
+func TestSyncACMENoEmailNoPolicy(t *testing.T) {
+	f := startFakeCaddy(t, nil)
+	// Default public ACME, no email: Caddy's defaults suffice, we own no policy.
+	r := New(f.socket, HTTPSConfig{})
+	ctx := context.Background()
+
+	if err := r.Sync(ctx, []Route{{App: "notes", PublicPort: 18810, Upstream: "127.0.0.1:40001", Domains: []string{"a.test"}}}); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if f.afPolicy() != nil {
+		t.Errorf("no policy expected for default public ACME without email")
+	}
+	// But the af-domains server is still created so the host is served.
+	if _, ok := f.servers()[domainsServer]; !ok {
+		t.Errorf("af-domains server should still be created")
 	}
 }

@@ -83,6 +83,9 @@ func (s *server) buildAppView(ctx context.Context, a state.App, detail bool) app
 	if vols, err := s.store.ListVolumes(ctx, a.Name); err == nil {
 		v.Volumes = vols
 	}
+	if doms, err := s.store.ListDomains(ctx, a.Name); err == nil {
+		v.Domains = doms
+	}
 	return v
 }
 

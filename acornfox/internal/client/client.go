@@ -359,3 +359,50 @@ func (c *Client) Start(ctx context.Context, app string) error {
 	_, err := c.do(ctx, http.MethodPost, path, nil, -1, "", nil)
 	return err
 }
+
+// ---- N3 API methods ----
+
+// ConsoleToken calls POST /v1/console/tokens on the trusted entry (Unix socket
+// reached over SSH). It returns the single-use token used to log in to the
+// console; it is only valid for state.ConsoleTokenTTL and must never be printed
+// except inside the login URL handed to the browser.
+func (c *Client) ConsoleToken(ctx context.Context) (string, error) {
+	var wire struct {
+		Token     string `json:"token"`
+		ExpiresIn int    `json:"expires_in"`
+	}
+	if _, err := c.doJSON(ctx, http.MethodPost, "/v1/console/tokens", nil, &wire); err != nil {
+		return "", err
+	}
+	return wire.Token, nil
+}
+
+// Domains calls GET /v1/apps/{app}/domains.
+func (c *Client) Domains(ctx context.Context, app string) ([]Domain, error) {
+	path := "/v1/apps/" + url.PathEscape(app) + "/domains"
+	var wrap struct {
+		Domains []Domain `json:"domains"`
+	}
+	if _, err := c.do(ctx, http.MethodGet, path, nil, -1, "", &wrap); err != nil {
+		return nil, err
+	}
+	return wrap.Domains, nil
+}
+
+// AddDomain calls POST /v1/apps/{app}/domains {"name"}. The returned Domain may
+// carry non-fatal Warnings (e.g. dns_mismatch) that the caller should surface.
+func (c *Client) AddDomain(ctx context.Context, app, name string) (Domain, error) {
+	path := "/v1/apps/" + url.PathEscape(app) + "/domains"
+	var d Domain
+	if _, err := c.doJSON(ctx, http.MethodPost, path, map[string]string{"name": name}, &d); err != nil {
+		return Domain{}, err
+	}
+	return d, nil
+}
+
+// RemoveDomain calls DELETE /v1/apps/{app}/domains/{name}.
+func (c *Client) RemoveDomain(ctx context.Context, app, name string) error {
+	path := "/v1/apps/" + url.PathEscape(app) + "/domains/" + url.PathEscape(name)
+	_, err := c.do(ctx, http.MethodDelete, path, nil, -1, "", nil)
+	return err
+}

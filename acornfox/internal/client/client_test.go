@@ -38,6 +38,9 @@ func TestMain(m *testing.M) {
 	case "stderr":
 		fakeSSHStderr()
 		return
+	case "listen":
+		fakeSSHListen()
+		return
 	}
 	os.Exit(m.Run())
 }

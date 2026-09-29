@@ -235,6 +235,39 @@ func (s *server) getDeployment(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// listDeployments implements GET /v1/apps/{app}/deployments?limit=N: the
+// version history, newest first. limit is clamped to 1..100 (default 20).
+func (s *server) listDeployments(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	app := r.PathValue("app")
+	if !state.ValidAppName(app) {
+		writeError(w, http.StatusBadRequest, "invalid_app", "应用名不合法")
+		return
+	}
+	limit := 20
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		v, err := strconv.Atoi(raw)
+		if err != nil || v < 1 || v > 100 {
+			writeError(w, http.StatusBadRequest, "invalid_limit", "limit 必须在 1..100 之间")
+			return
+		}
+		limit = v
+	}
+	if _, err := s.store.GetApp(ctx, app); err != nil {
+		s.mapStoreError(w, err)
+		return
+	}
+	deps, err := s.store.ListDeployments(ctx, app, limit)
+	if err != nil {
+		s.mapStoreError(w, err)
+		return
+	}
+	if deps == nil {
+		deps = []state.Deployment{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deployments": deps})
+}
+
 // parsePort validates the optional ?port= query parameter.
 func parsePort(raw string) (port int, ok bool, err error) {
 	if raw == "" {

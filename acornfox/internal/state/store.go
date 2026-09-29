@@ -40,7 +40,19 @@ type Store struct {
 	lockFile *os.File // held for the process lifetime; released on Close
 	minPort  int
 	maxPort  int
+	now      func() time.Time // injectable clock; nil means time.Now (used by tests)
 }
+
+// nowUTC returns the current time in UTC, honoring an injected clock.
+func (s *Store) nowUTC() time.Time {
+	if s.now != nil {
+		return s.now().UTC()
+	}
+	return time.Now().UTC()
+}
+
+// setClock replaces the store clock; used by tests to exercise expiry.
+func (s *Store) setClock(fn func() time.Time) { s.now = fn }
 
 // Open creates the parent directory (0700) and database file (0600), takes an
 // exclusive, non-blocking flock on Path+".lock" (ErrLocked if another process

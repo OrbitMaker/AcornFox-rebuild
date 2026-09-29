@@ -73,6 +73,7 @@ type appView struct {
 	Live              *state.Deployment  `json:"live,omitempty"`
 	Env               []envKeyView       `json:"env,omitempty"`
 	Volumes           []state.Volume     `json:"volumes,omitempty"`
+	Domains           []state.Domain     `json:"domains,omitempty"`
 }
 
 // appURL builds the public URL for an app: http://<public-host>:<PublicPort>.

@@ -29,6 +29,12 @@ type fakeAPI struct {
 	stopFn       func(ctx context.Context, app string) error
 	startFn      func(ctx context.Context, app string) error
 
+	// N3
+	consoleTokenFn func(ctx context.Context) (string, error)
+	domainsFn      func(ctx context.Context, app string) ([]client.Domain, error)
+	addDomainFn    func(ctx context.Context, app, name string) (client.Domain, error)
+	removeDomainFn func(ctx context.Context, app, name string) error
+
 	closed bool
 
 	// captured inputs for assertions
@@ -135,6 +141,34 @@ func (f *fakeAPI) Start(ctx context.Context, app string) error {
 }
 
 func (f *fakeAPI) Close() error { f.closed = true; return nil }
+
+func (f *fakeAPI) ConsoleToken(ctx context.Context) (string, error) {
+	if f.consoleTokenFn != nil {
+		return f.consoleTokenFn(ctx)
+	}
+	return "deadbeef", nil
+}
+
+func (f *fakeAPI) Domains(ctx context.Context, app string) ([]client.Domain, error) {
+	if f.domainsFn != nil {
+		return f.domainsFn(ctx, app)
+	}
+	return nil, nil
+}
+
+func (f *fakeAPI) AddDomain(ctx context.Context, app, name string) (client.Domain, error) {
+	if f.addDomainFn != nil {
+		return f.addDomainFn(ctx, app, name)
+	}
+	return client.Domain{App: app, Name: name, Status: "pending"}, nil
+}
+
+func (f *fakeAPI) RemoveDomain(ctx context.Context, app, name string) error {
+	if f.removeDomainFn != nil {
+		return f.removeDomainFn(ctx, app, name)
+	}
+	return nil
+}
 
 // harness wires a test invocation with an injected fake API, config dir and
 // working dir.

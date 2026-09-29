@@ -44,13 +44,13 @@ func TestOpenPermissionsAndMigrations(t *testing.T) {
 		t.Errorf("db mode = %o, want 600", fi.Perm())
 	}
 
-	// Both migrations recorded.
+	// Every migration recorded.
 	var n int
 	if err := s.db.QueryRow(`SELECT count(*) FROM _schema_migrations`).Scan(&n); err != nil {
 		t.Fatalf("count migrations: %v", err)
 	}
-	if n != 3 {
-		t.Errorf("migrations recorded = %d, want 3", n)
+	if want := len(migrationList()); n != want {
+		t.Errorf("migrations recorded = %d, want %d", n, want)
 	}
 	// Admin auth table present.
 	var tbl string

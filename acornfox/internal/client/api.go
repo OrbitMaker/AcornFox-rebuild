@@ -150,6 +150,11 @@ type Domain struct {
 	Name      string     `json:"name"`
 	Status    string     `json:"status"` // pending | ready | failed
 	Diagnosis *Diagnosis `json:"diagnosis,omitempty"`
+	// Warnings carries non-fatal diagnoses returned by AddDomain (e.g. a
+	// dns_mismatch when the name's A/AAAA record does not point at this server).
+	// Additive to the state.Domain shape: it only appears on the POST response
+	// and is surfaced so the CLI can print it. See N3 contract section 2.
+	Warnings []Diagnosis `json:"warnings,omitempty"`
 }
 
 // Raw is used for debugging/--json passthrough when needed.

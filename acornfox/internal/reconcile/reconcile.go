@@ -2,6 +2,7 @@ package reconcile
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -42,6 +43,10 @@ type Store interface {
 
 	// Events
 	AddEvent(ctx context.Context, e state.Event) error
+
+	// Domains (N3)
+	ListDomains(ctx context.Context, app string) ([]state.Domain, error)
+	SetDomainStatus(ctx context.Context, app, name, status string, diag *state.Diagnosis) error
 }
 
 // Config configures a Reconciler. Store, Runner and Router are required.
@@ -59,6 +64,20 @@ type Config struct {
 	// Git performs server-side clones for git-source deployments. Nil uses the
 	// system git binary (DefaultGit); tests inject a fake.
 	Git Git
+
+	// HTTPS configures the shared "af-domains" server maintained by the router.
+	HTTPS caddyroute.HTTPSConfig
+	// HTTPSCAFile is the PEM root(s) used to verify domain certificates during
+	// probing. Empty means use the system roots. For the internal Caddy CA
+	// (development), this points at pki/authorities/local/root.crt.
+	HTTPSCAFile string
+	// DomainProbe performs one TLS handshake against httpsAddr with SNI=name,
+	// verifying the presented chain against roots (system roots when nil) and
+	// that the certificate covers name. Nil uses DefaultDomainProbe.
+	DomainProbe func(ctx context.Context, httpsAddr, name string, roots *x509.CertPool) error
+	// DomainPendingBudget overrides state.DomainPendingBudget (tests set it
+	// small). Zero uses the default.
+	DomainPendingBudget time.Duration
 }
 
 // Default configuration values.
@@ -92,6 +111,11 @@ type Reconciler struct {
 	// routing failure tracking: deployment ID -> first failure time
 	routeFailMu    sync.Mutex
 	routeFailSince map[string]time.Time
+
+	// domain probing CA roots cache (from Config.HTTPSCAFile)
+	caOnce sync.Once
+	caPool *x509.CertPool
+	caErr  error
 }
 
 // worker owns one app's serial reconcile goroutine.
@@ -113,6 +137,12 @@ func New(cfg Config) *Reconciler {
 	}
 	if cfg.Probe == nil {
 		cfg.Probe = DefaultProbe
+	}
+	if cfg.DomainProbe == nil {
+		cfg.DomainProbe = DefaultDomainProbe
+	}
+	if cfg.DomainPendingBudget <= 0 {
+		cfg.DomainPendingBudget = state.DomainPendingBudget
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
@@ -277,6 +307,9 @@ func (r *Reconciler) round(ctx context.Context, app string) {
 
 	// route sync on change (always on first round)
 	r.syncRoutesIfChanged(ctx)
+
+	// N3: probe custom domains and update their status/diagnosis.
+	r.reconcileDomains(ctx, appRec, containers)
 
 	// 2.5 per-app GC.
 	r.appGC(ctx, app, pending)
@@ -1036,6 +1069,7 @@ func (r *Reconciler) desiredRoutes(ctx context.Context, thisApp string, override
 			App:        a.Name,
 			PublicPort: a.PublicPort,
 			Upstream:   fmt.Sprintf("127.0.0.1:%d", hostPort),
+			Domains:    r.appDomainNames(ctx, a.Name),
 		})
 	}
 	sort.Slice(routes, func(i, j int) bool { return routes[i].App < routes[j].App })
@@ -1085,6 +1119,7 @@ func (r *Reconciler) observedRoutes(ctx context.Context) ([]caddyroute.Route, er
 			App:        a.Name,
 			PublicPort: a.PublicPort,
 			Upstream:   fmt.Sprintf("127.0.0.1:%d", hostPort),
+			Domains:    r.appDomainNames(ctx, a.Name),
 		})
 	}
 	sort.Slice(routes, func(i, j int) bool { return routes[i].App < routes[j].App })
@@ -1183,7 +1218,29 @@ func routesEqual(current map[string]caddyroute.Route, want []caddyroute.Route) b
 	}
 	for _, rt := range want {
 		c, ok := current[rt.App]
-		if !ok || c != rt {
+		if !ok || !routeEqual(c, rt) {
+			return false
+		}
+	}
+	return true
+}
+
+// routeEqual compares two routes on the fields the reconciler controls,
+// treating Domains as an unordered set.
+func routeEqual(a, b caddyroute.Route) bool {
+	if a.App != b.App || a.PublicPort != b.PublicPort || a.Upstream != b.Upstream {
+		return false
+	}
+	if len(a.Domains) != len(b.Domains) {
+		return false
+	}
+	set := make(map[string]int, len(a.Domains))
+	for _, d := range a.Domains {
+		set[d]++
+	}
+	for _, d := range b.Domains {
+		set[d]--
+		if set[d] < 0 {
 			return false
 		}
 	}

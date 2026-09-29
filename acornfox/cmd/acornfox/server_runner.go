@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"os"
@@ -30,37 +31,59 @@ import (
 	"github.com/acornfox/acornfox/internal/state"
 )
 
-// runServer implements `acornfox server` (N1/N2). It opens the state store,
+// consoleFS holds the embedded console static assets. It is populated by
+// console_wiring.go (init) when the github.com/acornfox/acornfox/internal/console
+// package is present; otherwise it stays nil and the console listener serves a
+// small placeholder page. The wiring lives in a separate file so the server can
+// build before that package exists.
+var consoleFS fs.FS
+
+// runServer implements `acornfox server` (N1/N2/N3). It opens the state store,
 // builds a runner client, a Caddy router, the reconciler and the API, then
-// serves the API on every -listen address until SIGTERM/SIGINT. -listen may be
-// repeated (TCP loopback and/or unix sockets); -listen-group sets the group
-// owner of unix sockets (mode 0660) so only members can connect.
+// serves the trusted API on every -listen (unix sockets only) and the console
+// handler on -console-listen (loopback TCP) until SIGTERM/SIGINT.
+//
+// N3: -listen no longer accepts TCP addresses; the unauthenticated trusted API
+// is served only on unix sockets. The browser console is served separately on
+// -console-listen behind cookie sessions and CSRF.
 func runServer(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("server", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	fs_ := flag.NewFlagSet("server", flag.ContinueOnError)
+	fs_.SetOutput(stderr)
 	var listens listenList
-	fs.Var(&listens, "listen", "API listen address (repeatable): 127.0.0.1:PORT or unix:/path.sock")
+	fs_.Var(&listens, "listen", "trusted API unix socket (repeatable): unix:/path.sock")
 	var (
-		dataDir      = fs.String("data-dir", "/var/lib/acornfox", "state directory (holds acornfox.db and uploads/)")
-		listenGroup  = fs.String("listen-group", "", "group owner for unix socket listeners (mode 0660)")
-		runnerSocket = fs.String("runner-socket", "/run/acornfox/runner.sock", "runner peer socket path")
-		runnerUID    = fs.Int("runner-uid", os.Getuid(), "uid the runner process runs as")
-		caddyAdmin   = fs.String("caddy-admin", "/run/acornfox/caddy-admin.sock", "Caddy admin API unix socket")
-		publicHost   = fs.String("public-host", "", "host used in app URLs (e.g. the LAN IP)")
+		dataDir       = fs_.String("data-dir", "/var/lib/acornfox", "state directory (holds acornfox.db and uploads/)")
+		listenGroup   = fs_.String("listen-group", "", "group owner for unix socket listeners (mode 0660)")
+		consoleListen = fs_.String("console-listen", "127.0.0.1:18800", "browser console listener (loopback TCP only; empty disables it)")
+		runnerSocket  = fs_.String("runner-socket", "/run/acornfox/runner.sock", "runner peer socket path")
+		runnerUID     = fs_.Int("runner-uid", os.Getuid(), "uid the runner process runs as")
+		caddyAdmin    = fs_.String("caddy-admin", "/run/acornfox/caddy-admin.sock", "Caddy admin API unix socket")
+		publicHost    = fs_.String("public-host", "", "host used in app URLs (e.g. the LAN IP)")
+		httpPort      = fs_.Int("http-port", 80, "HTTP port of the shared af-domains server (ACME HTTP-01 and redirect)")
+		httpsPort     = fs_.Int("https-port", 443, "HTTPS port of the shared af-domains server")
+		httpsIssuer   = fs_.String("https-issuer", "", "certificate issuer: \"\"/acme = public ACME, internal = Caddy local CA (dev)")
+		httpsCAFile   = fs_.String("https-ca-file", "", "path to the CA root used to verify domain certificates (internal issuer)")
+		acmeEmail     = fs_.String("acme-email", "", "optional ACME account email")
 	)
-	if err := fs.Parse(args); err != nil {
+	if err := fs_.Parse(args); err != nil {
 		return 2
 	}
 	if len(listens) == 0 {
-		// Default preserves the N1 behaviour when -listen is omitted.
-		listens = listenList{"127.0.0.1:18800"}
+		// Default trusted entry is the unix socket per the N3 contract.
+		listens = listenList{"unix:/run/acornfox/api.sock"}
 	}
 
+	// -listen accepts unix sockets only. TCP would re-expose the
+	// unauthenticated API, so it is rejected with guidance to -console-listen.
 	for _, addr := range listens {
-		if err := apiserver.ValidateListen(addr); err != nil {
+		if err := validateTrustedListen(addr); err != nil {
 			fmt.Fprintln(stderr, "invalid -listen:", err)
 			return 2
 		}
+	}
+	if err := validateConsoleListen(*consoleListen); err != nil {
+		fmt.Fprintln(stderr, "invalid -console-listen:", err)
+		return 2
 	}
 
 	gid := -1
@@ -86,24 +109,40 @@ func runServer(args []string, stdout, stderr io.Writer) int {
 	}
 	defer st.Close()
 
+	httpsCfg := caddyroute.HTTPSConfig{
+		HTTPPort:  *httpPort,
+		HTTPSPort: *httpsPort,
+		Issuer:    *httpsIssuer,
+		Email:     *acmeEmail,
+	}
+
 	runnerClient := runner.NewClient(*runnerSocket, uint32(*runnerUID))
-	router := caddyroute.New(*caddyAdmin)
+	router := caddyroute.New(*caddyAdmin, httpsCfg)
 
 	rec := reconcile.New(reconcile.Config{
-		Store:      st,
-		Runner:     runnerClient,
-		Router:     router,
-		UploadDir:  uploadDir,
-		PublicHost: *publicHost,
+		Store:       st,
+		Runner:      runnerClient,
+		Router:      router,
+		UploadDir:   uploadDir,
+		PublicHost:  *publicHost,
+		HTTPS:       httpsCfg,
+		HTTPSCAFile: *httpsCAFile,
 	})
 
-	handler := apiserver.New(apiserver.Config{
+	apiCfg := apiserver.Config{
 		Store:      st,
 		Kicker:     rec,
 		Runner:     runnerClient,
 		UploadDir:  uploadDir,
 		PublicHost: *publicHost,
-	})
+		DataDir:    *dataDir,
+	}
+	trustedHandler := apiserver.New(apiCfg)
+
+	// The console handler shares the same dependencies plus the embedded assets.
+	consoleCfg := apiCfg
+	consoleCfg.ConsoleFS = consoleFS
+	consoleHandler := apiserver.NewConsole(consoleCfg)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
@@ -117,15 +156,18 @@ func runServer(args []string, stdout, stderr io.Writer) int {
 		}
 	}()
 
-	// Open every listener before serving.
+	// Open every trusted listener before serving.
 	var listeners []net.Listener
+	cleanup := func() {
+		for _, l := range listeners {
+			_ = l.Close()
+		}
+	}
 	for _, addr := range listens {
 		ln, err := listenAPI(addr, gid)
 		if err != nil {
 			fmt.Fprintln(stderr, "listen:", err)
-			for _, l := range listeners {
-				_ = l.Close()
-			}
+			cleanup()
 			stop()
 			<-recDone
 			return 1
@@ -133,13 +175,30 @@ func runServer(args []string, stdout, stderr io.Writer) int {
 		listeners = append(listeners, ln)
 	}
 
-	srv := &http.Server{Handler: handler}
-	serveErr := make(chan error, len(listeners))
+	trustedSrv := &http.Server{Handler: trustedHandler}
+	serveErr := make(chan error, len(listeners)+1)
 	for _, ln := range listeners {
-		go func(l net.Listener) { serveErr <- srv.Serve(l) }(ln)
+		go func(l net.Listener) { serveErr <- trustedSrv.Serve(l) }(ln)
 	}
 	for _, addr := range listens {
-		fmt.Fprintln(stdout, "acornfox server listening on", addr)
+		fmt.Fprintln(stdout, "acornfox server (trusted) listening on", addr)
+	}
+
+	// Open the console listener (loopback TCP) when enabled.
+	var consoleSrv *http.Server
+	if *consoleListen != "" {
+		cln, err := net.Listen("tcp", *consoleListen)
+		if err != nil {
+			fmt.Fprintln(stderr, "console listen:", err)
+			cleanup()
+			stop()
+			<-recDone
+			return 1
+		}
+		listeners = append(listeners, cln)
+		consoleSrv = &http.Server{Handler: consoleHandler}
+		go func() { serveErr <- consoleSrv.Serve(cln) }()
+		fmt.Fprintln(stdout, "acornfox server (console) listening on", *consoleListen)
 	}
 
 	select {
@@ -153,10 +212,50 @@ func runServer(args []string, stdout, stderr io.Writer) int {
 	// Graceful shutdown.
 	shCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	_ = srv.Shutdown(shCtx)
+	_ = trustedSrv.Shutdown(shCtx)
+	if consoleSrv != nil {
+		_ = consoleSrv.Shutdown(shCtx)
+	}
 	stop()
 	<-recDone
 	return 0
+}
+
+// validateTrustedListen rejects anything that is not an absolute unix socket
+// path (optionally "unix:"-prefixed). TCP addresses are refused because the
+// trusted API is unauthenticated; the browser console uses -console-listen.
+func validateTrustedListen(addr string) error {
+	if _, ok := stripUnix(addr); ok {
+		if err := apiserver.ValidateListen(addr); err != nil {
+			return err
+		}
+		return nil
+	}
+	return fmt.Errorf("-listen 只接受 unix socket（例如 unix:/run/acornfox/api.sock）；浏览器控制台请使用 -console-listen")
+}
+
+// validateConsoleListen accepts an empty value (console disabled) or a loopback
+// TCP address (127.0.0.1, ::1, localhost). Non-loopback is rejected so the
+// console is never bound to a public interface.
+func validateConsoleListen(addr string) error {
+	if addr == "" {
+		return nil
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("-console-listen 需要 host:port 形式的回环地址")
+	}
+	if port == "" {
+		return fmt.Errorf("-console-listen 缺少端口")
+	}
+	switch host {
+	case "127.0.0.1", "::1", "localhost":
+		return nil
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return nil
+	}
+	return fmt.Errorf("-console-listen 只允许回环地址（127.0.0.1、::1、localhost）")
 }
 
 // listenList is a repeatable string flag preserving order.

@@ -89,6 +89,10 @@ func (a *app) statusApp(ctx context.Context, api client.API, appName string) int
 	for _, v := range app.Volumes {
 		volumes = append(volumes, v.Path)
 	}
+	domains := make([]map[string]any, 0, len(app.Domains))
+	for _, d := range app.Domains {
+		domains = append(domains, map[string]any{"name": d.Name, "status": d.Status})
+	}
 	if a.out.json {
 		a.out.emitJSON(map[string]any{
 			"app":                app.Name,
@@ -102,6 +106,7 @@ func (a *app) statusApp(ctx context.Context, api client.API, appName string) int
 			"health_path":        app.HealthPath,
 			"volumes":            volumes,
 			"env":                envKeys,
+			"domains":            domains,
 		})
 		return exitOK
 	}
@@ -113,6 +118,11 @@ func (a *app) statusApp(ctx context.Context, api client.API, appName string) int
 	a.out.human("当前版本：%s", app.CurrentDeployment)
 	if len(volumes) > 0 {
 		a.out.human("数据卷：%s", strings.Join(volumes, ", "))
+	}
+	if len(app.Domains) > 0 {
+		for _, d := range app.Domains {
+			a.out.human("域名：%s（%s）", d.Name, d.Status)
+		}
 	}
 	if len(app.Env) > 0 {
 		keys := make([]string, 0, len(app.Env))

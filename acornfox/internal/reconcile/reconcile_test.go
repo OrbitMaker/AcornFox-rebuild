@@ -51,6 +51,7 @@ type fakeStore struct {
 	env         map[string][]state.EnvVar
 	volumes     map[string][]state.Volume
 	events      []state.Event
+	domains     map[string]*state.Domain // key: app+"/"+name
 }
 
 func newStore() *fakeStore {
@@ -59,6 +60,7 @@ func newStore() *fakeStore {
 		deployments: map[string]*state.Deployment{},
 		env:         map[string][]state.EnvVar{},
 		volumes:     map[string][]state.Volume{},
+		domains:     map[string]*state.Domain{},
 	}
 }
 
@@ -219,6 +221,40 @@ func (s *fakeStore) AddEvent(_ context.Context, e state.Event) error {
 	return nil
 }
 
+func (s *fakeStore) ListDomains(_ context.Context, app string) ([]state.Domain, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []state.Domain
+	for _, d := range s.domains {
+		if app == "" || d.App == app {
+			out = append(out, *d)
+		}
+	}
+	// deterministic order by name
+	for i := 0; i < len(out); i++ {
+		for j := i + 1; j < len(out); j++ {
+			if out[j].Name < out[i].Name {
+				out[i], out[j] = out[j], out[i]
+			}
+		}
+	}
+	return out, nil
+}
+
+func (s *fakeStore) SetDomainStatus(_ context.Context, app, name, status string, diag *state.Diagnosis) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	d, ok := s.domains[app+"/"+name]
+	if !ok {
+		return state.ErrNotFound
+	}
+	d.Status = status
+	d.Diagnosis = diag
+	now := time.Unix(1_700_000_000, 0)
+	d.CheckedAt = &now
+	return nil
+}
+
 // helpers
 func (s *fakeStore) putApp(a state.App) {
 	s.mu.Lock()
@@ -241,6 +277,17 @@ func (s *fakeStore) getApp(name string) state.App {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return *s.apps[name]
+}
+func (s *fakeStore) putDomain(d state.Domain) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cp := d
+	s.domains[d.App+"/"+d.Name] = &cp
+}
+func (s *fakeStore) getDomain(app, name string) state.Domain {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return *s.domains[app+"/"+name]
 }
 func (s *fakeStore) eventMessages() []string {
 	s.mu.Lock()

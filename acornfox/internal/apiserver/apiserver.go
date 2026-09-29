@@ -13,7 +13,9 @@ package apiserver
 import (
 	"context"
 	"errors"
+	"io/fs"
 	"log/slog"
+	"net"
 	"net/http"
 
 	"github.com/acornfox/acornfox/internal/runner"
@@ -56,6 +58,16 @@ type Store interface {
 	ListVolumes(ctx context.Context, app string) ([]state.Volume, error)
 
 	ListEvents(ctx context.Context, app, deploymentID string, afterID int64, limit int) ([]state.Event, error)
+
+	// N3 console sessions and domains.
+	CreateConsoleToken(ctx context.Context) (string, error)
+	RedeemConsoleToken(ctx context.Context, token string) (state.ConsoleSession, string, string, error)
+	TouchConsoleSession(ctx context.Context, sessionSecret string) (state.ConsoleSession, error)
+	RevokeConsoleSession(ctx context.Context, sessionSecret string) error
+
+	AddDomain(ctx context.Context, app, name string) (state.Domain, bool, error)
+	RemoveDomain(ctx context.Context, app, name string) error
+	ListDomains(ctx context.Context, app string) ([]state.Domain, error)
 }
 
 // Kicker triggers one reconcile round for an app. It is non-blocking.
@@ -80,6 +92,23 @@ type Config struct {
 	PublicHost     string       // host used in app URLs, e.g. the server's LAN IP
 	MaxUploadBytes int64        // per-upload cap; 0 => DefaultMaxUploadBytes
 	Logger         *slog.Logger // optional; defaults to slog.Default()
+
+	// N3 (console handler): optional dependencies. New() ignores ConsoleFS.
+	ConsoleFS   fs.FS        // static console assets; nil => a tiny placeholder page
+	HostMetrics HostProvider // host resource snapshot; nil => reads /proc + statfs of DataDir
+	Resolver    Resolver     // DNS lookups for domain warnings; nil => net.DefaultResolver
+	DataDir     string       // data directory whose filesystem is reported by GET /v1/host
+}
+
+// HostProvider returns a point-in-time host resource snapshot. It must return
+// available=false on any error instead of failing the request.
+type HostProvider interface {
+	Host(ctx context.Context) HostView
+}
+
+// Resolver looks up A/AAAA records for a hostname. net.Resolver satisfies it.
+type Resolver interface {
+	LookupIPAddr(ctx context.Context, host string) ([]net.IPAddr, error)
 }
 
 type server struct {
@@ -90,11 +119,17 @@ type server struct {
 	publicHost     string
 	maxUploadBytes int64
 	log            *slog.Logger
+
+	// N3
+	consoleFS   fs.FS
+	hostMetrics HostProvider
+	resolver    Resolver
+	dataDir     string
 }
 
-// New builds the N1 HTTP handler. It panics only on a nil required dependency,
-// which is a programmer error at wiring time.
-func New(cfg Config) http.Handler {
+// newServer validates the shared dependencies and builds the server value used
+// by both the trusted (New) and console (NewConsole) handlers.
+func newServer(cfg Config) *server {
 	if cfg.Store == nil {
 		panic("apiserver: Config.Store is nil")
 	}
@@ -115,7 +150,15 @@ func New(cfg Config) http.Handler {
 	if log == nil {
 		log = slog.Default()
 	}
-	s := &server{
+	resolver := cfg.Resolver
+	if resolver == nil {
+		resolver = net.DefaultResolver
+	}
+	hostMetrics := cfg.HostMetrics
+	if hostMetrics == nil {
+		hostMetrics = newProcHostProvider(cfg.DataDir)
+	}
+	return &server{
 		store:          cfg.Store,
 		kicker:         cfg.Kicker,
 		runner:         cfg.Runner,
@@ -123,9 +166,15 @@ func New(cfg Config) http.Handler {
 		publicHost:     cfg.PublicHost,
 		maxUploadBytes: max,
 		log:            log,
+		consoleFS:      cfg.ConsoleFS,
+		hostMetrics:    hostMetrics,
+		resolver:       resolver,
+		dataDir:        cfg.DataDir,
 	}
+}
 
-	mux := http.NewServeMux()
+// registerV1 installs the shared /v1 API routes used by both handlers.
+func (s *server) registerV1(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/apps/{app}/deployments", s.createDeployment)
 	mux.HandleFunc("POST /v1/apps/{app}/rollback", s.rollback)
 	mux.HandleFunc("GET /v1/deployments/{id}", s.getDeployment)
@@ -133,12 +182,29 @@ func New(cfg Config) http.Handler {
 	mux.HandleFunc("GET /v1/apps/{app}", s.getApp)
 	mux.HandleFunc("PATCH /v1/apps/{app}", s.patchApp)
 	mux.HandleFunc("GET /v1/apps/{app}/logs", s.appLogs)
+	mux.HandleFunc("GET /v1/apps/{app}/deployments", s.listDeployments)
 	mux.HandleFunc("PUT /v1/apps/{app}/env/{key}", s.putEnv)
 	mux.HandleFunc("DELETE /v1/apps/{app}/env/{key}", s.deleteEnv)
 	mux.HandleFunc("POST /v1/apps/{app}/volumes", s.addVolume)
+	mux.HandleFunc("GET /v1/apps/{app}/domains", s.listDomains)
+	mux.HandleFunc("POST /v1/apps/{app}/domains", s.addDomain)
+	mux.HandleFunc("DELETE /v1/apps/{app}/domains/{name}", s.removeDomain)
 	mux.HandleFunc("POST /v1/apps/{app}/stop", s.stopApp)
 	mux.HandleFunc("POST /v1/apps/{app}/start", s.startApp)
+	mux.HandleFunc("GET /v1/host", s.getHost)
 	mux.HandleFunc("GET /v1/status", s.status)
+}
+
+// New builds the trusted HTTP handler (Unix socket / loopback). It serves the
+// full /v1 API plus POST /v1/console/tokens, and is authenticated only by the
+// socket's group permission. It panics only on a nil required dependency, which
+// is a programmer error at wiring time.
+func New(cfg Config) http.Handler {
+	s := newServer(cfg)
+	mux := http.NewServeMux()
+	s.registerV1(mux)
+	// The trusted entry mints console login tokens; the console entry must not.
+	mux.HandleFunc("POST /v1/console/tokens", s.createConsoleToken)
 	return mux
 }
 
