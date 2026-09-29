@@ -108,8 +108,12 @@ func classifySSH(exitCode int, stderr string) string {
 
 	// Remote command not found: the shell prints "command not found" and exits
 	// 127; ssh relays that exit status.
+	// The shell message is localized (e.g. zh_CN "未找到命令"), so match the
+	// common forms and fall back to the exit status.
 	if strings.Contains(low, "command not found") ||
-		strings.Contains(low, "acornfox: not found") ||
+		strings.Contains(low, ": not found") ||
+		strings.Contains(stderr, "未找到命令") ||
+		strings.Contains(stderr, "找不到命令") ||
 		exitCode == 127 {
 		return codeAcornfoxMissing
 	}

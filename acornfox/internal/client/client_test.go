@@ -436,6 +436,8 @@ func TestSSHConnectDiagnoses(t *testing.T) {
 		{"auth", "user@host: Permission denied (publickey).", "255", codeAuthFailed},
 		{"hostkey", "Host key verification failed.", "255", codeHostKeyUnknown},
 		{"notfound", "bash: acornfox: command not found", "127", codeAcornfoxMissing},
+		{"notfound-zh", "bash: 行 1: acornfox: 未找到命令", "1", codeAcornfoxMissing},
+		{"notfound-dash", "sh: 1: acornfox: not found", "1", codeAcornfoxMissing},
 		{"proxy_perm", "acornfox proxy: permission denied", "13", codePermissionDenied},
 		{"proxy_down", "acornfox proxy: server not running", "14", codeServerDown},
 	}

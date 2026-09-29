@@ -83,6 +83,9 @@ func gitBinaryMissing(err error) bool {
 
 // Classification patterns for clone/checkout failures.
 var (
+	// The remote asked for credentials: the repository is private, or the
+	// platform refuses anonymous HTTPS clone (observed on Gitee in 2026-09).
+	gitAuthRequiredPattern = regexp.MustCompile(`(?i)(could not read username|terminal prompts disabled|authentication required)`)
 	gitRepoNotFoundPattern = regexp.MustCompile(`(?i)(repository not found|could not read from remote repository|does not exist|authentication failed|invalid credentials|access denied|403|remote: not found)`)
 	gitRefNotFoundPattern  = regexp.MustCompile(`(?i)(remote branch .* not found|couldn't find remote ref|reference is not a tree|pathspec .* did not match|unknown revision|did not match any)`)
 	gitTimeoutPattern      = regexp.MustCompile(`(?i)(timed out|timeout|connection timed out|operation too slow|failed to connect|could not resolve host)`)
@@ -154,7 +157,7 @@ func classifyGitClone(ctx context.Context, err error, output string) *state.Diag
 		return &state.Diagnosis{
 			Stage: "source", Code: "clone_timeout",
 			Message: "克隆仓库超时",
-			Hint:    "国内服务器访问 GitHub 常超时，可改用 Gitee/CNB 镜像，或直接 acornfox deploy 上传本地目录",
+			Hint:    "国内服务器访问 GitHub 常超时，可改用 CNB 等国内平台上的仓库，或在本地项目目录直接执行 acornfox deploy 上传",
 		}
 	}
 	if gitRefNotFoundPattern.MatchString(output) {
@@ -162,6 +165,13 @@ func classifyGitClone(ctx context.Context, err error, output string) *state.Diag
 			Stage: "source", Code: "ref_not_found",
 			Message: "找不到指定的分支或提交：\n" + trimGitOutput(output),
 			Hint:    "检查 --ref 指定的分支名或提交哈希是否存在",
+		}
+	}
+	if gitAuthRequiredPattern.MatchString(output) {
+		return &state.Diagnosis{
+			Stage: "source", Code: "auth_required",
+			Message: "该仓库要求登录才能克隆（私有仓库，或平台不允许匿名克隆，例如 Gitee）",
+			Hint:    "把代码下载到本地后在项目目录执行 acornfox deploy 上传；私有仓库支持计划在首发之后提供",
 		}
 	}
 	if gitRepoNotFoundPattern.MatchString(output) {

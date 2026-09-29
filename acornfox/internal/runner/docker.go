@@ -39,7 +39,7 @@ var ansiPattern = regexp.MustCompile(`\x1b\[[0-9;]*[A-Za-z]`)
 // Build classification heuristics mirror the N0 prototype.
 var (
 	missingModulePattern = regexp.MustCompile(`(?i)(ModuleNotFoundError|Cannot find module|no required module|not found: )`)
-	pullFailurePattern   = regexp.MustCompile(`(?i)(pull access denied|manifest unknown|manifest for .* not found|TLS handshake timeout|i/o timeout|dial tcp|context deadline exceeded|failed to resolve|no such host)`)
+	pullFailurePattern   = regexp.MustCompile(`(?i)(TLS handshake timeout|i/o timeout|dial tcp|context deadline exceeded|no such host|connection reset|connection refused|EOF)`)
 )
 
 // Docker implements API against a local Docker daemon. It only ever touches
@@ -358,7 +358,9 @@ func (d *Docker) PullImage(ctx context.Context, app, deploymentID, ref string) (
 const pullImageTimeout = 10 * time.Minute
 
 // pullNotFoundPattern matches "image not found / access denied" pull errors.
-var pullNotFoundPattern = regexp.MustCompile(`(?i)(manifest unknown|manifest for .* not found|not found|no such image|repository does not exist|pull access denied|unauthorized|access to the resource is denied)`)
+// Registry mirrors (e.g. DaoCloud) answer 403 for images they do not carry, so
+// 403/404 from a registry count as "not found or not available".
+var pullNotFoundPattern = regexp.MustCompile(`(?i)(manifest unknown|manifest for .* not found|not found|no such image|repository does not exist|pull access denied|unauthorized|access to the resource is denied|403 forbidden|404 not found)`)
 
 // classifyPull turns a pull error into a user-facing Failure, or nil when the
 // error is a daemon/transport problem the caller should surface as an error.
@@ -378,8 +380,8 @@ func classifyPull(ctx context.Context, err error) *Failure {
 	if cerrdefs.IsNotFound(err) || cerrdefs.IsUnauthorized(err) || pullNotFoundPattern.MatchString(msg) {
 		return &Failure{
 			Stage: "image", Code: "image_not_found",
-			Message: "找不到镜像或无权访问：" + msg,
-			Hint:    "检查镜像名与标签是否正确（公开镜像无需登录）",
+			Message: "找不到镜像，或镜像加速源不提供该镜像：" + msg,
+			Hint:    "检查镜像名与标签是否正确；若镜像确实存在，可能是加速源未收录，换用其他加速源或自行构建",
 		}
 	}
 	if pullFailurePattern.MatchString(msg) {

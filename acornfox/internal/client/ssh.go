@@ -240,7 +240,7 @@ func (d *sshDialer) classifyStartupFailure() *Error {
 		return connectError(codeConnectFailed, "")
 	}
 	// Give the process a moment to flush stderr / exit for accurate diagnosis.
-	d.conn.waitExit(500 * time.Millisecond)
+	d.conn.waitExit(2 * time.Second)
 	return connectError(classifySSH(d.conn.exitCode(), d.conn.stderr.String()), d.conn.stderr.String())
 }
 

@@ -342,6 +342,7 @@ func (r *Reconciler) doBuild(ctx context.Context, app state.App, d *state.Deploy
 		return
 	}
 	*d = updated
+	r.event(ctx, app.Name, d.ID, "build", buildStartMessage(d.SourceKind))
 	r.build(ctx, app, d, env)
 }
 
@@ -545,6 +546,7 @@ func (r *Reconciler) build(ctx context.Context, app state.App, d *state.Deployme
 		return
 	}
 	*d = updated
+	r.event(ctx, app.Name, d.ID, "build", "镜像就绪，启动容器")
 }
 
 // doStart creates and starts the container, then moves to checking.
@@ -616,6 +618,7 @@ func (r *Reconciler) doStart(ctx context.Context, app state.App, d *state.Deploy
 		return
 	}
 	*d = updated
+	r.event(ctx, app.Name, d.ID, "start", "容器已启动，等待应用响应")
 }
 
 // containerPort is the app's container port: explicit, else the image's first
@@ -727,6 +730,7 @@ healthy:
 		return
 	}
 	*d = updated
+	r.event(ctx, app.Name, d.ID, "health", "健康检查通过，切换流量")
 }
 
 // doRoute switches Caddy to the new container, with retry and a 5-minute budget.
@@ -1220,4 +1224,15 @@ func DefaultProbe(ctx context.Context, hostport, path string) error {
 		return fmt.Errorf("probe: status %d", resp.StatusCode)
 	}
 	return nil
+}
+
+func buildStartMessage(kind string) string {
+	switch kind {
+	case state.SourceGit:
+		return "拉取 Git 仓库并构建镜像"
+	case state.SourceImage:
+		return "准备镜像"
+	default:
+		return "开始构建镜像"
+	}
 }
