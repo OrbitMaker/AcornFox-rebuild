@@ -9,9 +9,19 @@ import "context"
 // Upstream ("127.0.0.1:<host port of the live container>"). Automatic HTTPS is
 // disabled for these servers in N1 (domains and certificates arrive in N3).
 type Route struct {
-	App        string `json:"app"`
-	PublicPort int    `json:"public_port"`
-	Upstream   string `json:"upstream"`
+	App        string   `json:"app"`
+	PublicPort int      `json:"public_port"`
+	Upstream   string   `json:"upstream"`
+	Domains    []string `json:"domains,omitempty"` // N3: served on the shared "af-domains" HTTPS server
+}
+
+// HTTPSConfig configures the shared "af-domains" server (N3). Domains of all
+// routes are host-matched there; Caddy obtains certificates automatically.
+type HTTPSConfig struct {
+	HTTPPort  int    // default 80 (ACME HTTP-01 and redirect)
+	HTTPSPort int    // default 443
+	Issuer    string // "" or "acme" = public ACME (Let's Encrypt/ZeroSSL); "internal" = Caddy local CA (development only)
+	Email     string // optional ACME account email
 }
 
 // Router is what the reconciler depends on.

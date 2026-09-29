@@ -89,6 +89,7 @@ type App struct {
 	Live              *Deployment `json:"live,omitempty"`
 	Env               []EnvKey    `json:"env,omitempty"`
 	Volumes           []Volume    `json:"volumes,omitempty"`
+	Domains           []Domain    `json:"domains,omitempty"`
 }
 
 type Status struct {
@@ -135,6 +136,20 @@ type API interface {
 	Stop(ctx context.Context, app string) error
 	Start(ctx context.Context, app string) error
 	Close() error // ends the SSH session
+
+	// N3
+	ConsoleToken(ctx context.Context) (string, error)                // POST /v1/console/tokens (trusted socket only)
+	Domains(ctx context.Context, app string) ([]Domain, error)       // GET  /v1/apps/{app}/domains
+	AddDomain(ctx context.Context, app, name string) (Domain, error) // POST /v1/apps/{app}/domains {"name"}
+	RemoveDomain(ctx context.Context, app, name string) error        // DELETE /v1/apps/{app}/domains/{name}
+}
+
+// Domain mirrors state.Domain on the wire.
+type Domain struct {
+	App       string     `json:"app"`
+	Name      string     `json:"name"`
+	Status    string     `json:"status"` // pending | ready | failed
+	Diagnosis *Diagnosis `json:"diagnosis,omitempty"`
 }
 
 // Raw is used for debugging/--json passthrough when needed.
