@@ -426,19 +426,15 @@ func runAcornFoxClean(ctx context.Context, args []string, stdout io.Writer, role
 		return writeUpgradeJSON(stdout, exitOK, map[string]any{"ok": true, "command": config.command, "receipt": receipt})
 	}
 	if config.command == "configure-assistant" || config.command == "disable-assistant" {
+		if config.command == "configure-assistant" {
+			return writeAcornFoxCleanError(stdout, exitIneligible, "assistant_retired")
+		}
 		var receipt install.AcornFoxAssistantConfigReceiptV1
 		var assistantErr error
-		if config.command == "configure-assistant" {
-			if deps.configureAssistant == nil {
-				return writeAcornFoxCleanError(stdout, exitIneligible, "assistant_configuration_ineligible")
-			}
-			receipt, assistantErr = deps.configureAssistant(ctx, config.deepSeekKeyFile)
-		} else {
-			if deps.disableAssistant == nil {
-				return writeAcornFoxCleanError(stdout, exitIneligible, "assistant_configuration_ineligible")
-			}
-			receipt, assistantErr = deps.disableAssistant(ctx)
+		if deps.disableAssistant == nil {
+			return writeAcornFoxCleanError(stdout, exitIneligible, "assistant_configuration_ineligible")
 		}
+		receipt, assistantErr = deps.disableAssistant(ctx)
 		if assistantErr != nil || receipt.Validate() != nil {
 			return writeAcornFoxCleanAssistantError(stdout, assistantErr)
 		}

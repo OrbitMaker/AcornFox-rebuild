@@ -173,7 +173,7 @@ func TestAcornFoxConfiguredRuntimeRealDocker(t *testing.T) {
 			return validateNetwork(raw)
 		}
 	}
-	newRuntime := func(restore bool) (*Provider, *application.AcornFoxRuntimeService) {
+	newRuntime := func(restore bool) (*Provider, contracts.AcornFoxRuntimeDriver) {
 		capacity, err := capacityprovider.New(capacityprovider.Config{DiskPath: root})
 		if err != nil {
 			t.Fatal(err)
@@ -213,7 +213,7 @@ func TestAcornFoxConfiguredRuntimeRealDocker(t *testing.T) {
 	}
 	fact := makeFact(1, configuration)
 	provider, service := newRuntime(false)
-	deploy := func(service *application.AcornFoxRuntimeService, fact contracts.AcornFoxRuntimeReleaseFact, key string, recreate bool) contracts.AcornFoxRuntimeObservation {
+	deploy := func(service contracts.AcornFoxRuntimeDriver, fact contracts.AcornFoxRuntimeReleaseFact, key string, recreate bool) contracts.AcornFoxRuntimeObservation {
 		if _, err := service.Deploy(ctx, contracts.AcornFoxRuntimeDeployRequest{Fact: fact, IdempotencyKey: key, Recreate: recreate}); err != nil {
 			t.Fatal(err)
 		}

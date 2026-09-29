@@ -183,7 +183,7 @@ func validateAcornFoxRecent0039SubstrateReceipt(receipt InactiveSubstrateReceipt
 			return ErrAcornFoxUpgradeConflict
 		}
 	}
-	if receipt.ReleaseTreeSHA256 != receipt.CandidateReceipt.TreeSHA256 || validateAcornFoxSubstrateInventory(receipt.CandidateReceipt, receipt.Entries, acornFoxRecent0039RequiredFiles(), acornFoxFixedSubstrateEntries(receipt.CandidateReceipt)) != nil {
+	if receipt.ReleaseTreeSHA256 != receipt.CandidateReceipt.TreeSHA256 || validateAcornFoxSubstrateInventory(receipt.CandidateReceipt, receipt.Entries, acornFoxRecent0039RequiredFiles(), acornFoxFrozen0040FixedSubstrateEntries(receipt.CandidateReceipt)) != nil {
 		return ErrAcornFoxUpgradeConflict
 	}
 	release, releaseErr := ComputeAcornFoxReleaseTreeSHA256(receipt.CandidateReceipt, receipt.Entries)

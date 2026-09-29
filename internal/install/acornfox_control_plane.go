@@ -557,7 +557,17 @@ func acornFoxMigrationRowsSHA256(rows []MigrationRow) string {
 // release validation needed here.  It is independent of the legacy 0024
 // manifest verifier, whose accepted product contract must not be widened.
 func loadAcornFoxControlPlaneMigrations(layout acornFoxInstallLayout, binding AcornFoxCandidateBindingV1) (acornFoxControlPlaneMigrations, error) {
-	if layout.validate() != nil || layout.mode != acornFoxInstallLayoutProduction || validateAcornFoxBinding(binding) != nil {
+	return loadAcornFoxControlPlaneMigrationsPolicy(layout, binding, false)
+}
+
+// This read-only variant is reserved for an already journal-bound installed
+// authority; candidate installation and migration retain the current policy.
+func loadAcornFoxInstalledControlPlaneMigrations(layout acornFoxInstallLayout, binding AcornFoxCandidateBindingV1) (acornFoxControlPlaneMigrations, error) {
+	return loadAcornFoxControlPlaneMigrationsPolicy(layout, binding, true)
+}
+
+func loadAcornFoxControlPlaneMigrationsPolicy(layout acornFoxInstallLayout, binding AcornFoxCandidateBindingV1, installed bool) (acornFoxControlPlaneMigrations, error) {
+	if layout.validate() != nil || layout.mode != acornFoxInstallLayoutProduction || (validateAcornFoxBinding(binding) != nil && (!installed || validateAcornFoxFrozen0040Binding(binding) != nil)) {
 		return acornFoxControlPlaneMigrations{}, ErrAcornFoxControlPlaneConflict
 	}
 	root, err := os.OpenRoot(layout.hostRootPath)
@@ -594,7 +604,14 @@ func loadAcornFoxControlPlaneMigrations(layout acornFoxInstallLayout, binding Ac
 		return acornFoxControlPlaneMigrations{}, ErrAcornFoxControlPlaneConflict
 	}
 	var manifest Manifest
-	if err := strictCanonicalJSON(manifestRaw, &manifest, "AcornFox manifest"); err != nil || validateAcornFoxCandidateManifest(manifest, binding) != nil {
+	if err := strictCanonicalJSON(manifestRaw, &manifest, "AcornFox manifest"); err != nil {
+		return acornFoxControlPlaneMigrations{}, ErrAcornFoxControlPlaneConflict
+	}
+	manifestErr := validateAcornFoxCandidateManifest(manifest, binding)
+	if installed && validateAcornFoxFrozen0040Binding(binding) == nil {
+		manifestErr = validateAcornFoxFrozen0040Manifest(manifest, binding)
+	}
+	if manifestErr != nil {
 		return acornFoxControlPlaneMigrations{}, ErrAcornFoxControlPlaneConflict
 	}
 	byPath := make(map[string]FileDigest, len(manifest.Files))

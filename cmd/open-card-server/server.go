@@ -15,7 +15,6 @@ import (
 
 	"github.com/open-card/open-card/internal/agenttransport"
 	"github.com/open-card/open-card/internal/application"
-	"github.com/open-card/open-card/internal/assistant"
 	"github.com/open-card/open-card/internal/contracts"
 	"github.com/open-card/open-card/internal/controllers"
 	"github.com/open-card/open-card/internal/domain"
@@ -104,7 +103,6 @@ type Server struct {
 	m4Webhooks                 *M4WebhookHTTPHandler
 	m4Logs                     *M4LogsHTTPHandler
 	m5Usage                    *M5UsageHTTPHandler
-	m6AI                       *M6AIHTTPHandler
 	systemStatusStore          systemStatusStore
 	systemStatusInstanceID     string
 	systemStatusNodeID         string
@@ -118,8 +116,6 @@ type Server struct {
 	acornFoxLogs               *AcornFoxLogsHTTPHandler
 	acornFoxPublicAccess       *AcornFoxPublicAccessHTTPHandler
 	acornFoxHostMetrics        http.Handler
-	acornFoxAssistant          *assistant.Handler
-	acornFoxAssistantActions   *AcornFoxAssistantActionsHTTPHandler
 	acornFoxWebSetup           *AcornFoxWebSetupHTTPHandler
 	acornFoxOperation          *AcornFoxOperationHTTPHandler
 	acornFoxAccessObservation  *AcornFoxAccessObservationHTTPHandler
@@ -190,7 +186,6 @@ func (s *Server) SetM4Operations(handler *M4OperationsHTTPHandler)     { s.m4Ope
 func (s *Server) SetM4Webhooks(handler *M4WebhookHTTPHandler)          { s.m4Webhooks = handler }
 func (s *Server) SetM4Logs(handler *M4LogsHTTPHandler)                 { s.m4Logs = handler }
 func (s *Server) SetM5Usage(handler *M5UsageHTTPHandler)               { s.m5Usage = handler }
-func (s *Server) SetM6AI(handler *M6AIHTTPHandler)                     { s.m6AI = handler }
 func (s *Server) SetSystemStatusStore(store systemStatusStore)         { s.systemStatusStore = store }
 func (s *Server) SetSystemStatusNode(instanceID, nodeID string) {
 	s.systemStatusInstanceID, s.systemStatusNodeID = instanceID, nodeID
@@ -284,6 +279,11 @@ func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
 		s.handleHealth(writer, request, request.URL.Path == "/readyz")
 		return
 	}
+	// Built-in assistant routes are retired; fail closed before session authentication.
+	if request.URL.Path == "/api/v1/acornfox/assistant" || strings.HasPrefix(request.URL.Path, "/api/v1/acornfox/assistant/") {
+		writeJSONError(writer, http.StatusNotFound, "not_found", "route not found")
+		return
+	}
 	// A clean install exposes no legacy API path, including unauthenticated
 	// aliases. Reject before session authentication so route discovery does not
 	// turn a known-absent route into an authentication-dependent response.
@@ -353,18 +353,6 @@ func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
 		}
 		request = withAPIVersion(request, version)
 	}
-	if strings.HasPrefix(request.URL.Path, assistant.HTTPBasePath+"/") {
-		identity, _ := controlPlaneIdentityFromContext(request.Context())
-		request = request.WithContext(assistant.WithActor(request.Context(), assistant.Actor{AdminID: identity.AdminID}))
-		if s.acornFoxAssistantActions.Handle(writer, request) {
-			return
-		}
-		if s.acornFoxAssistant.Handle(writer, request) {
-			return
-		}
-		writeJSONError(writer, http.StatusNotFound, "not_found", "route not found")
-		return
-	}
 	if request.URL.Path == "/api/v1/acornfox/host/metrics" {
 		if s.acornFoxHostMetrics == nil {
 			writeJSONError(writer, http.StatusServiceUnavailable, "unavailable", "host metrics unavailable")
@@ -422,7 +410,8 @@ func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
 	if s.m4Operations != nil && s.m4Operations.Handle(writer, request) {
 		return
 	}
-	if s.m6AI != nil && s.m6AI.Handle(writer, request) {
+	if request.URL.Path == "/api/v1/settings/ai" || strings.HasSuffix(request.URL.Path, "/ai/interventions") {
+		writeJSONError(writer, http.StatusNotFound, "not_found", "route not found")
 		return
 	}
 	if strings.HasPrefix(request.URL.Path, apiPrefix+"applications/") {

@@ -36,11 +36,21 @@ func (e EvidenceRef) Validate() error {
 	return nil
 }
 
+type ApplicationManagementState string
+
+const (
+	ApplicationManagementActive    ApplicationManagementState = "active"
+	ApplicationManagementArchiving ApplicationManagementState = "archiving"
+	ApplicationManagementArchived  ApplicationManagementState = "archived"
+)
+
 type Application struct {
-	ID        ID        `json:"id"`
-	Name      string    `json:"name"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID              ID                         `json:"id"`
+	Name            string                     `json:"name"`
+	ManagementState ApplicationManagementState `json:"management_state,omitempty"`
+	ArchivedAt      *time.Time                 `json:"archived_at,omitempty"`
+	CreatedAt       time.Time                  `json:"created_at"`
+	UpdatedAt       time.Time                  `json:"updated_at"`
 }
 
 func NewApplication(name string, now time.Time) (Application, error) {
@@ -52,7 +62,7 @@ func NewApplication(name string, now time.Time) (Application, error) {
 	if err != nil {
 		return Application{}, WrapError(ErrUnavailable, "generate application id", err)
 	}
-	return Application{ID: id, Name: name, CreatedAt: now.UTC(), UpdatedAt: now.UTC()}, nil
+	return Application{ID: id, Name: name, ManagementState: ApplicationManagementActive, CreatedAt: now.UTC(), UpdatedAt: now.UTC()}, nil
 }
 
 func (a Application) Validate() error {
@@ -1121,6 +1131,8 @@ const (
 	OperationRollback          OperationType = "rollback"
 	OperationRoute             OperationType = "route"
 	OperationDestroy           OperationType = "destroy"
+	OperationStop              OperationType = "stop"
+	OperationStart             OperationType = "start"
 )
 
 type Operation struct {
@@ -1162,7 +1174,7 @@ func (o Operation) Validate() error {
 		return ValidationError("operation target and idempotency key are required")
 	}
 	switch o.Type {
-	case OperationCreateApplication, OperationBuild, OperationObserve, OperationDeploy, OperationRestart, OperationRedeploy, OperationRollback, OperationRoute, OperationDestroy:
+	case OperationCreateApplication, OperationBuild, OperationObserve, OperationDeploy, OperationRestart, OperationRedeploy, OperationRollback, OperationRoute, OperationDestroy, OperationStop, OperationStart:
 	default:
 		return ValidationError("operation type is unsupported")
 	}

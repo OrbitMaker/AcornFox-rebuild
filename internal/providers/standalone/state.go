@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,7 +17,25 @@ import (
 	"github.com/open-card/open-card/internal/domain"
 )
 
-const durableRuntimeStateSchema = "1"
+const (
+	durableRuntimeStateSchema   = "1"
+	durableRuntimeStateSchemaV1 = "1"
+	durableRuntimeStateSchemaV2 = "2"
+	durableRuntimeStateSchemaV3 = "3"
+)
+
+func isLifecyclePhase(phase string) bool {
+	return phase == "pausing" || phase == "paused" || phase == "resuming"
+}
+
+func validPhase(phase string) bool {
+	switch phase {
+	case "pending", "active", "destroying", "destroyed", "replacing", "pausing", "paused", "resuming":
+		return true
+	default:
+		return false
+	}
+}
 
 type durableRuntimeAction struct {
 	IdentityHash        string    `json:"identity_hash"`
@@ -41,6 +60,7 @@ type durableRuntimeState struct {
 	Phase           string                   `json:"phase"`
 	Capacity        *contracts.CapacityLease `json:"capacity,omitempty"`
 	LeaseGeneration int                      `json:"lease_generation,omitempty"`
+	NetworkID       string                   `json:"network_id,omitempty"`
 	Actions         []durableRuntimeAction   `json:"actions,omitempty"`
 	CreatedAt       time.Time                `json:"created_at"`
 	UpdatedAt       time.Time                `json:"updated_at"`
@@ -75,7 +95,15 @@ func (p *Provider) durableSnapshot(state *runtimeState) durableRuntimeState {
 	}
 	sort.Slice(actions, func(i, j int) bool { return actions[i].IdentityHash < actions[j].IdentityHash })
 	spec := state.runtimeSpec()
-	return durableRuntimeState{SchemaVersion: runtimeStateSchema(spec), Deployment: state.deployment, Spec: spec, Fingerprint: state.fingerprint, Container: state.container, ContainerID: state.containerID, Phase: state.phase, Capacity: state.capacity, LeaseGeneration: state.leaseGeneration, Actions: actions, CreatedAt: state.createdAt.UTC(), UpdatedAt: state.updatedAt.UTC()}
+	schema := state.schemaVersion
+	if schema == "" {
+		schema = runtimeStateSchema(spec)
+	}
+	if isLifecyclePhase(state.phase) || schema == durableRuntimeStateSchemaV3 {
+		schema = durableRuntimeStateSchemaV3
+		state.schemaVersion = durableRuntimeStateSchemaV3
+	}
+	return durableRuntimeState{SchemaVersion: schema, Deployment: state.deployment, Spec: spec, Fingerprint: state.fingerprint, Container: state.container, ContainerID: state.containerID, Phase: state.phase, Capacity: state.capacity, LeaseGeneration: state.leaseGeneration, NetworkID: state.networkID, Actions: actions, CreatedAt: state.createdAt.UTC(), UpdatedAt: state.updatedAt.UTC()}
 }
 
 func (p *Provider) persistState(state *runtimeState) error {
@@ -174,7 +202,26 @@ func (p *Provider) readDurableState(id domain.ID) (durableRuntimeState, bool, er
 }
 
 func validateDurableRuntimeState(snapshot durableRuntimeState, config Config) error {
-	if snapshot.SchemaVersion != runtimeStateSchema(snapshot.Spec) || (snapshot.SchemaVersion != "1" && snapshot.SchemaVersion != "2") || snapshot.Phase != "pending" && snapshot.Phase != "active" && snapshot.Phase != "destroying" && snapshot.Phase != "destroyed" && snapshot.Phase != "replacing" {
+	if !validPhase(snapshot.Phase) {
+		return errors.New("standalone state schema or phase is unsupported")
+	}
+	switch snapshot.SchemaVersion {
+	case durableRuntimeStateSchemaV1, durableRuntimeStateSchemaV2:
+		if snapshot.SchemaVersion != runtimeStateSchema(snapshot.Spec) || isLifecyclePhase(snapshot.Phase) {
+			return errors.New("standalone state schema or phase is unsupported")
+		}
+	case durableRuntimeStateSchemaV3:
+		if snapshot.Phase == "active" || snapshot.Phase == "paused" || snapshot.Phase == "pausing" || snapshot.Phase == "resuming" || snapshot.Phase == "destroying" {
+			if !validContainerID(snapshot.ContainerID) {
+				return errors.New("schema 3 state requires valid full container ID")
+			}
+		}
+		if snapshot.Phase == "active" || snapshot.Phase == "paused" || snapshot.Phase == "pausing" || snapshot.Phase == "resuming" {
+			if !validContainerID(snapshot.NetworkID) {
+				return errors.New("schema 3 state requires valid full network ID")
+			}
+		}
+	default:
 		return errors.New("standalone state schema or phase is unsupported")
 	}
 	if err := snapshot.Deployment.Validate(); err != nil {
@@ -194,6 +241,9 @@ func validateDurableRuntimeState(snapshot durableRuntimeState, config Config) er
 		if action.IdentityHash == "" || !validRuntimeActionName(action.Action) || action.Fingerprint != snapshot.Fingerprint || (action.Status != "started" && action.Status != "succeeded" && action.Status != "cancelled") || action.At.IsZero() {
 			return errors.New("standalone state action is invalid")
 		}
+		if (action.Action == "stop" || action.Action == "start") && snapshot.SchemaVersion != durableRuntimeStateSchemaV3 {
+			return errors.New("lifecycle actions require schema version 3")
+		}
 		if action.Status == "cancelled" && action.Action != "recreate" {
 			return errors.New("standalone cancelled action is invalid")
 		}
@@ -201,6 +251,46 @@ func validateDurableRuntimeState(snapshot durableRuntimeState, config Config) er
 			return errors.New("standalone state action is duplicated")
 		}
 		seen[action.IdentityHash] = struct{}{}
+	}
+	if (snapshot.Phase == "active" || snapshot.Phase == "pausing") && snapshot.Deployment.Status != domain.DeploymentRuntimeReady {
+		return errors.New("active and pausing phases require deployment status runtime_ready")
+	}
+	if (snapshot.Phase == "paused" || snapshot.Phase == "resuming") && snapshot.Deployment.Status != domain.DeploymentPaused {
+		return errors.New("paused and resuming phases require deployment status paused")
+	}
+	if snapshot.Phase == "pausing" {
+		if snapshot.Deployment.Status == domain.DeploymentPaused {
+			return errors.New("pausing phase cannot have deployment status paused")
+		}
+		startedStopCount := 0
+		for _, action := range snapshot.Actions {
+			if action.Action == "stop" && action.Status == "started" {
+				startedStopCount++
+				if action.PreviousContainerID == "" || action.PreviousContainerID != snapshot.ContainerID {
+					return errors.New("pausing started action must bind exact snapshot container ID")
+				}
+			}
+		}
+		if startedStopCount != 1 {
+			return errors.New("pausing phase requires exactly one started stop action")
+		}
+	}
+	if snapshot.Phase == "resuming" {
+		if snapshot.Deployment.Status != domain.DeploymentPaused {
+			return errors.New("resuming phase requires prior deployment status paused")
+		}
+		startedStartCount := 0
+		for _, action := range snapshot.Actions {
+			if action.Action == "start" && action.Status == "started" {
+				startedStartCount++
+				if action.PreviousContainerID == "" || action.PreviousContainerID != snapshot.ContainerID {
+					return errors.New("resuming started action must bind exact snapshot container ID")
+				}
+			}
+		}
+		if startedStartCount != 1 {
+			return errors.New("resuming phase requires exactly one started start action")
+		}
 	}
 	if snapshot.Phase == "replacing" {
 		if snapshot.Capacity == nil || !validContainerID(snapshot.ContainerID) {
@@ -214,7 +304,26 @@ func validateDurableRuntimeState(snapshot durableRuntimeState, config Config) er
 }
 
 func (p *Provider) stateFromDurable(ctx context.Context, snapshot durableRuntimeState, operation contracts.OperationContext, capability contracts.Capability, action string) (*runtimeState, error) {
-	state := &runtimeState{configuration: copyRuntimeConfiguration(snapshot.Spec.Configuration), configDigest: snapshot.Spec.ConfigDigest, deployment: snapshot.Deployment, service: snapshot.Spec.ServiceName, image: snapshot.Spec.Image, container: snapshot.Container, containerID: snapshot.ContainerID, containerPort: snapshot.Spec.Port, fingerprint: snapshot.Fingerprint, phase: snapshot.Phase, capacity: snapshot.Capacity, leaseGeneration: snapshot.LeaseGeneration, resources: snapshot.Spec.Resources, createdAt: snapshot.CreatedAt, updatedAt: snapshot.UpdatedAt, actions: map[string]runtimeAction{}}
+	state := &runtimeState{
+		configuration:   copyRuntimeConfiguration(snapshot.Spec.Configuration),
+		configDigest:    snapshot.Spec.ConfigDigest,
+		deployment:      snapshot.Deployment,
+		service:         snapshot.Spec.ServiceName,
+		image:           snapshot.Spec.Image,
+		container:       snapshot.Container,
+		containerID:     snapshot.ContainerID,
+		containerPort:   snapshot.Spec.Port,
+		fingerprint:     snapshot.Fingerprint,
+		phase:           snapshot.Phase,
+		schemaVersion:   snapshot.SchemaVersion,
+		capacity:        snapshot.Capacity,
+		leaseGeneration: snapshot.LeaseGeneration,
+		networkID:       snapshot.NetworkID,
+		resources:       snapshot.Spec.Resources,
+		createdAt:       snapshot.CreatedAt,
+		updatedAt:       snapshot.UpdatedAt,
+		actions:         map[string]runtimeAction{},
+	}
 	for _, persisted := range snapshot.Actions {
 		state.actions[persisted.IdentityHash] = runtimeAction{identityHash: persisted.IdentityHash, action: persisted.Action, fingerprint: persisted.Fingerprint, status: persisted.Status, previousContainerID: persisted.PreviousContainerID, previousStartedAt: persisted.PreviousStartedAt, releaseAttempt: persisted.ReleaseAttempt, at: persisted.At}
 	}
@@ -229,14 +338,19 @@ func (p *Provider) stateFromDurable(ctx context.Context, snapshot durableRuntime
 	if state.phase == "destroyed" {
 		state.destroyed = true
 		if state.capacity != nil {
-			reconciler, ok := p.config.Capacity.(capacityActiveReconciler)
+			finalizer, ok := p.config.Capacity.(contracts.CapacityReleasedFinalizer)
 			if !ok {
-				return nil, p.failure(operation, capability, action, contracts.ErrUnavailable, "capacity provider cannot reconcile pending runtime release", contracts.RetryAfterReconnect, true, nil)
+				return nil, p.failure(operation, capability, action, contracts.ErrUnavailable, "capacity provider cannot finalize released runtime lease", contracts.RetryAfterReconnect, true, nil)
 			}
-			reconcileOp := operation
-			reconcileOp.IdempotencyKey = "runtime-reconcile-" + hash(state.deployment.ID.String())[:24]
-			if err := reconciler.ReconcileActive(ctx, *state.capacity, reconcileOp); err != nil {
+			finalizeOp := operation
+			finalizeOp.IdempotencyKey = "runtime-finalize-" + hash(state.deployment.ID.String())[:24]
+			if err := finalizer.FinalizeReleased(ctx, *state.capacity, finalizeOp); err != nil {
 				return nil, err
+			}
+			state.capacity = nil
+			state.updatedAt = p.config.Clock().UTC()
+			if persistErr := p.persistState(state); persistErr != nil {
+				return nil, p.failure(operation, capability, action, contracts.ErrUnavailable, "finalized destroyed runtime state could not be persisted", contracts.RetryBackoff, true, persistErr)
 			}
 		}
 		return state, nil
@@ -251,33 +365,33 @@ func (p *Provider) stateFromDurable(ctx context.Context, snapshot durableRuntime
 			if absent && state.phase == "destroying" {
 				state.destroyed, state.phase, state.port = true, "destroyed", 0
 				if state.capacity != nil {
-					reconciler, ok := p.config.Capacity.(capacityActiveReconciler)
+					finalizer, ok := p.config.Capacity.(contracts.CapacityReleasedFinalizer)
 					if !ok {
-						return nil, p.failure(operation, capability, action, contracts.ErrUnavailable, "capacity provider cannot reconcile pending runtime release", contracts.RetryAfterReconnect, true, nil)
+						return nil, p.failure(operation, capability, action, contracts.ErrUnavailable, "capacity provider cannot finalize released runtime lease", contracts.RetryAfterReconnect, true, nil)
 					}
-					reconcileOp := operation
-					reconcileOp.IdempotencyKey = "runtime-reconcile-" + hash(state.deployment.ID.String())[:24]
-					if reconcileErr := reconciler.ReconcileActive(ctx, *state.capacity, reconcileOp); reconcileErr != nil {
-						return nil, reconcileErr
+					finalizeOp := operation
+					finalizeOp.IdempotencyKey = "runtime-finalize-" + hash(state.deployment.ID.String())[:24]
+					if finalizeErr := finalizer.FinalizeReleased(ctx, *state.capacity, finalizeOp); finalizeErr != nil {
+						return nil, finalizeErr
 					}
+					state.capacity = nil
+				}
+				state.updatedAt = p.config.Clock().UTC()
+				if persistErr := p.persistState(state); persistErr != nil {
+					return nil, p.failure(operation, capability, action, contracts.ErrUnavailable, "finalized destroying runtime state could not be persisted", contracts.RetryBackoff, true, persistErr)
 				}
 				return state, nil
 			}
 			if absent && state.phase == "pending" {
 				if state.capacity != nil {
-					reconciler, ok := p.config.Capacity.(capacityActiveReconciler)
+					finalizer, ok := p.config.Capacity.(contracts.CapacityReleasedFinalizer)
 					if !ok {
-						return nil, p.failure(operation, capability, action, contracts.ErrUnavailable, "capacity provider cannot reconcile pending runtime lease", contracts.RetryAfterReconnect, true, nil)
+						return nil, p.failure(operation, capability, action, contracts.ErrUnavailable, "capacity provider cannot finalize released pending lease", contracts.RetryAfterReconnect, true, nil)
 					}
-					reconcileOp := operation
-					reconcileOp.IdempotencyKey = "runtime-reconcile-" + hash(state.deployment.ID.String())[:24]
-					if reconcileErr := reconciler.ReconcileActive(ctx, *state.capacity, reconcileOp); reconcileErr != nil {
-						return nil, reconcileErr
-					}
-					releaseOp := operation
-					releaseOp.IdempotencyKey = "runtime-pending-release-" + hash(state.deployment.ID.String(), fmt.Sprint(state.leaseGeneration))[:24]
-					if releaseErr := p.config.Capacity.Release(ctx, *state.capacity, releaseOp); releaseErr != nil {
-						return nil, releaseErr
+					finalizeOp := operation
+					finalizeOp.IdempotencyKey = "runtime-pending-finalize-" + hash(state.deployment.ID.String(), fmt.Sprint(state.leaseGeneration))[:24]
+					if finalizeErr := finalizer.FinalizeReleased(ctx, *state.capacity, finalizeOp); finalizeErr != nil {
+						return nil, finalizeErr
 					}
 					state.capacity = nil
 					state.leaseGeneration++
@@ -298,13 +412,91 @@ func (p *Provider) stateFromDurable(ctx context.Context, snapshot durableRuntime
 	if !ok {
 		return nil, p.failure(operation, capability, action, contracts.ErrConflict, "durable runtime facts do not match the immutable deployment", contracts.RetryNever, false, nil)
 	}
+	if snapshot.ContainerID != "" && facts.ID != snapshot.ContainerID {
+		return nil, p.failure(operation, capability, action, contracts.ErrConflict, "container identity changed from persisted state; name substitution is forbidden", contracts.RetryNever, false, nil)
+	}
 	state.port, state.containerID = port, facts.ID
+	if snapshot.SchemaVersion == durableRuntimeStateSchemaV3 && (snapshot.Phase == "active" || snapshot.Phase == "paused" || snapshot.Phase == "pausing" || snapshot.Phase == "resuming") {
+		currentNetID, netErr := p.verifyRuntimeNetworkTopology(ctx, facts, operation, capability, action)
+		if netErr != nil {
+			return nil, netErr
+		}
+		if currentNetID != snapshot.NetworkID {
+			return nil, p.failure(operation, capability, action, contracts.ErrConflict, "persisted network ID does not match current network", contracts.RetryNever, false, nil)
+		}
+		if facts.State.Running {
+			if guardErr := p.requireRuntimeNetworkGuard(ctx, operation, capability, action); guardErr != nil {
+				return nil, guardErr
+			}
+		}
+	}
 	if snapshot.Phase == "pending" {
 		if facts.State.Running {
 			state.phase, state.recovery = "active", runtimeRecoveryPendingRunning
 		} else {
 			state.phase, state.recovery = "pending", runtimeRecoveryPendingNotRunning
 		}
+	} else if snapshot.Phase == "paused" {
+		if facts.State.Running || facts.State.Status != "exited" {
+			return nil, p.failure(operation, capability, action, contracts.ErrConflict, "paused runtime container is not in exited status", contracts.RetryNever, false, nil)
+		}
+		state.phase, state.recovery = "paused", runtimeRecoveryPaused
+		state.deployment.Status = domain.DeploymentPaused
+		if state.capacity == nil {
+			return nil, p.failure(operation, capability, action, contracts.ErrConflict, "durable paused runtime state has no capacity lease", contracts.RetryNever, false, nil)
+		}
+		reconciler, ok := p.config.Capacity.(contracts.CapacityRetainedReconciler)
+		if !ok {
+			return nil, p.failure(operation, capability, action, contracts.ErrUnavailable, "capacity provider cannot reconcile retained runtime lease", contracts.RetryAfterReconnect, true, nil)
+		}
+		reconcileOp := operation
+		reconcileOp.IdempotencyKey = "runtime-reconcile-" + hash(state.deployment.ID.String())[:24]
+		if err := reconciler.ReconcileRetained(ctx, *state.capacity, reconcileOp); err != nil {
+			return nil, err
+		}
+		return state, nil
+	} else if snapshot.Phase == "pausing" {
+		state.phase, state.recovery = "pausing", runtimeRecoveryPausing
+		if state.capacity != nil {
+			reconciler, ok := p.config.Capacity.(contracts.CapacityRetainedReconciler)
+			if !ok {
+				return nil, p.failure(operation, capability, action, contracts.ErrUnavailable, "capacity provider cannot reconcile retained runtime lease", contracts.RetryAfterReconnect, true, nil)
+			}
+			reconcileOp := operation
+			reconcileOp.IdempotencyKey = "runtime-reconcile-" + hash(state.deployment.ID.String())[:24]
+			if err := reconciler.ReconcileRetained(ctx, *state.capacity, reconcileOp); err != nil {
+				return nil, err
+			}
+		}
+		return state, nil
+	} else if snapshot.Phase == "resuming" {
+		state.phase, state.recovery = "resuming", runtimeRecoveryResuming
+		if facts.State.Running {
+			if state.capacity != nil {
+				reconciler, ok := p.config.Capacity.(capacityActiveReconciler)
+				if !ok {
+					return nil, p.failure(operation, capability, action, contracts.ErrUnavailable, "capacity provider cannot reconcile active runtime lease", contracts.RetryAfterReconnect, true, nil)
+				}
+				reconcileOp := operation
+				reconcileOp.IdempotencyKey = "runtime-reconcile-" + hash(state.deployment.ID.String())[:24]
+				if err := reconciler.ReconcileActive(ctx, *state.capacity, reconcileOp); err != nil {
+					return nil, err
+				}
+			}
+		} else {
+			if state.capacity != nil {
+				reconciler, ok := p.config.Capacity.(contracts.CapacityRetainedReconciler)
+				if !ok {
+					return nil, p.failure(operation, capability, action, contracts.ErrUnavailable, "capacity provider cannot reconcile retained runtime lease", contracts.RetryAfterReconnect, true, nil)
+				}
+				reconcileOp := operation
+				reconcileOp.IdempotencyKey = "runtime-reconcile-" + hash(state.deployment.ID.String())[:24]
+				if err := reconciler.ReconcileRetained(ctx, *state.capacity, reconcileOp); err != nil {
+					return nil, err
+				}
+			}
+		}
+		return state, nil
 	} else {
 		state.phase, state.recovery = "active", runtimeRecoveryActive
 	}
@@ -334,6 +526,17 @@ func (p *Provider) stateFromDurable(ctx context.Context, snapshot durableRuntime
 // error when the daemon cannot answer the query.
 func (p *Provider) confirmContainerAbsent(ctx context.Context, container string) (bool, error) {
 	output, err := p.output(ctx, []string{"container", "ls", "--all", "--filter", "name=^/" + container + "$", "--format", "{{.Names}}"})
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(output) == "", nil
+}
+
+func (p *Provider) confirmContainerAbsentByID(ctx context.Context, containerID string) (bool, error) {
+	if !validContainerID(containerID) {
+		return false, errors.New("container id is invalid")
+	}
+	output, err := p.output(ctx, []string{"container", "ls", "--all", "--filter", "id=^" + containerID + "$", "--format", "{{.ID}}"})
 	if err != nil {
 		return false, err
 	}
@@ -377,8 +580,10 @@ func (p *Provider) Reconcile(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if err := p.restoreActive(ctx, snapshot, state); err != nil {
-			return err
+		if snapshot.Phase == "active" {
+			if err := p.restoreActive(ctx, snapshot, state); err != nil {
+				return err
+			}
 		}
 		p.mu.Lock()
 		if existing := p.states[state.deployment.ID]; existing == nil {
@@ -399,6 +604,7 @@ type inspectFacts struct {
 		RW          bool   `json:"RW"`
 	} `json:"Mounts"`
 	ID           string `json:"Id"`
+	Name         string `json:"Name"`
 	Image        string `json:"Image"`
 	RestartCount uint64 `json:"RestartCount"`
 	Config       struct {
@@ -415,6 +621,10 @@ type inspectFacts struct {
 		StartedAt string `json:"StartedAt"`
 	} `json:"State"`
 	NetworkSettings struct {
+		Ports map[string][]struct {
+			HostIP   string `json:"HostIp"`
+			HostPort string `json:"HostPort"`
+		} `json:"Ports"`
 		Networks map[string]struct {
 			NetworkID string `json:"NetworkID"`
 		} `json:"Networks"`
@@ -457,6 +667,20 @@ func (p *Provider) inspectFacts(ctx context.Context, container string) (inspectF
 		}
 		facts.imageConfiguration = imageConfig
 		facts.imageConfigurationVerified = true
+	}
+	if p.config.NetworkProfile == ApplicationLoopbackNetworkProfile && facts.State.Running && facts.State.Status != "paused" {
+		raw, err := p.output(ctx, []string{"network", "inspect", p.config.Network})
+		if err != nil {
+			return inspectFacts{}, err
+		}
+		network, err := p.validateApplicationNetwork([]byte(raw))
+		if err != nil {
+			return inspectFacts{}, err
+		}
+		attachment, ok := facts.NetworkSettings.Networks[p.config.Network]
+		if len(facts.NetworkSettings.Networks) != 1 || !ok || attachment.NetworkID != network.ID {
+			return inspectFacts{}, errors.New("application container network attachment is not the verified network")
+		}
 	}
 	return facts, nil
 }
@@ -518,6 +742,14 @@ func (facts inspectFacts) matchesConfiguration(config Config, deployment domain.
 	labels := facts.Config.Labels
 	valid := validContainerID(facts.ID) && facts.Image == spec.Image.Digest && labels["open-card.managed"] == "true" && labels["open-card.task-prefix"] == config.TaskPrefix && labels["open-card.deployment-id"] == deployment.ID.String() && labels["open-card.application-id"] == spec.ApplicationID.String() && labels["open-card.environment-id"] == spec.EnvironmentID.String() && labels["open-card.release-id"] == spec.ReleaseID.String() && labels["open-card.service"] == spec.ServiceName && labels["open-card.image-repository"] == spec.Image.Repository && labels["open-card.image-digest"] == spec.Image.Digest
 	valid = valid && facts.HostConfig.NetworkMode == config.Network && !facts.HostConfig.Privileged && len(facts.HostConfig.Binds) == 0 && facts.matchesConfiguredRuntime(config, spec) && len(facts.HostConfig.CapAdd) == 0 && len(facts.HostConfig.CapDrop) == 1 && facts.HostConfig.CapDrop[0] == "ALL" && len(facts.HostConfig.SecurityOpt) == 1 && facts.HostConfig.SecurityOpt[0] == "no-new-privileges=true" && facts.HostConfig.RestartPolicy.Name == "no" && facts.HostConfig.Memory == spec.Resources.MemoryBytes && facts.HostConfig.MemorySwap == spec.Resources.MemoryBytes && facts.HostConfig.CpuPeriod == 100000 && facts.HostConfig.CpuQuota == spec.Resources.CPUMillis*100 && facts.HostConfig.PidsLimit != nil && *facts.HostConfig.PidsLimit == spec.Resources.PIDs
+	if len(facts.NetworkSettings.Networks) > 1 {
+		return 0, false
+	}
+	if len(facts.NetworkSettings.Networks) == 1 {
+		if _, hasNet := facts.NetworkSettings.Networks[config.Network]; !hasNet {
+			return 0, false
+		}
+	}
 	if !valid {
 		return 0, false
 	}
@@ -532,6 +764,26 @@ func (facts inspectFacts) matchesConfiguration(config Config, deployment domain.
 	if _, err := fmt.Sscan(binding[0].HostPort, &port); err != nil || port < 1 || port > 65535 {
 		return 0, false
 	}
+	if config.NetworkProfile == ApplicationLoopbackNetworkProfile && facts.State.Running && facts.State.Status != "paused" {
+		key := fmt.Sprintf("%d/tcp", spec.Port)
+		actual := facts.NetworkSettings.Ports[key]
+		if len(actual) != 1 || actual[0].HostIP != "127.0.0.1" {
+			return 0, false
+		}
+		actualPort, err := strconv.Atoi(actual[0].HostPort)
+		if err != nil || actualPort != port {
+			return 0, false
+		}
+		for other, bindings := range facts.NetworkSettings.Ports {
+			if other != key && len(bindings) != 0 {
+				return 0, false
+			}
+		}
+		attachment, ok := facts.NetworkSettings.Networks[config.Network]
+		if len(facts.NetworkSettings.Networks) != 1 || !ok || !validContainerID(attachment.NetworkID) {
+			return 0, false
+		}
+	}
 	return port, true
 }
 
@@ -542,7 +794,7 @@ func (facts inspectFacts) matchesRunning(config Config, deployment domain.Deploy
 
 func validRuntimeActionName(value string) bool {
 	switch value {
-	case "deploy", "restart", "destroy", "recreate":
+	case "deploy", "restart", "destroy", "recreate", "stop", "start":
 		return true
 	default:
 		return false

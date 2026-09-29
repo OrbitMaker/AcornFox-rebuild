@@ -36,13 +36,13 @@ const (
 )
 
 var (
-	ErrChildRetained                = errors.New("darwinlaunch: child process remains retained in registry")
-	ErrUntrustedHost                = errors.New("darwinlaunch: running host process does not satisfy security requirements")
-	ErrUntrustedExecutable          = errors.New("darwinlaunch: executable does not satisfy security requirements")
-	ErrInvalidAction                = errors.New("darwinlaunch: invalid launcher action")
-	ErrExecutionFailed              = errors.New("darwinlaunch: native execution failed")
-	ErrAlreadyResumed               = errors.New("darwinlaunch: child already resumed")
-	ErrAlreadyAborted               = errors.New("darwinlaunch: child already aborted")
+	ErrChildRetained               = errors.New("darwinlaunch: child process remains retained in registry")
+	ErrUntrustedHost               = errors.New("darwinlaunch: running host process does not satisfy security requirements")
+	ErrUntrustedExecutable         = errors.New("darwinlaunch: executable does not satisfy security requirements")
+	ErrInvalidAction               = errors.New("darwinlaunch: invalid launcher action")
+	ErrExecutionFailed             = errors.New("darwinlaunch: native execution failed")
+	ErrAlreadyResumed              = errors.New("darwinlaunch: child already resumed")
+	ErrAlreadyAborted              = errors.New("darwinlaunch: child already aborted")
 	ErrTestDistributionUnavailable = errors.New("darwinlaunch: test distribution constructors are not available in production builds")
 )
 

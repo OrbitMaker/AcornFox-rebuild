@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	appcontracts "github.com/open-card/open-card/internal/application/contracts"
 )
 
 type responseShape int
@@ -30,6 +32,7 @@ const (
 	shapeLogs
 	shapePublicAccess
 	shapeHostMetrics
+	shapeHostMetricsRecent
 	shapeSourceMetadata
 	shapeDeploymentPlan
 	shapeDeliverySource
@@ -37,6 +40,19 @@ const (
 	shapeSourceUpdate
 	shapeFixCandidate
 	shapeFixCandidateList
+	shapeSourceUpload
+	shapeNativeImagePlan
+	shapeSourceBuildIntent
+	shapeNativeImageConfirm
+	shapeNativeImageOperation
+	shapeNativeImageLifecycle
+	shapeNativeImageDomainOperation
+	shapeNativeImageDomainCurrent
+	shapeManagedImageApps
+	shapeImageObservation
+	shapeImageLogObservation
+	shapeImageMetrics
+	shapeImageMetricsRecent
 )
 
 func (c *cli) callCommand(method, path string, body any, csrf bool, key string, timeout time.Duration, shape responseShape) error {
@@ -85,6 +101,58 @@ func (c *cli) performCall(state sessionState, method, path string, body any, csr
 	if err != nil {
 		return nil, err
 	}
+	if shape == shapeImageMetricsRecent {
+		recent, ok := value.(appcontracts.ImageMetricsRecentResult)
+		limit := appcontracts.ImageMetricsHistoryDefault
+		if parsed, err := url.ParseRequestURI(path); err == nil && parsed.Query().Get("limit") != "" {
+			limit, _ = strconv.Atoi(parsed.Query().Get("limit"))
+		}
+		parsed, err := url.ParseRequestURI(path)
+		segments := []string{}
+		if err == nil {
+			segments = strings.Split(strings.TrimPrefix(parsed.Path, "/"), "/")
+		}
+		if !ok || len(recent.Samples) > limit || len(segments) != 4 || recent.DeploymentID.String() != segments[1] {
+			return nil, invalidResponse("server response exceeded requested metrics scope")
+		}
+	}
+	if shape == shapeImageObservation || shape == shapeImageLogObservation {
+		observation, ok := value.(appcontracts.ImageObservationResult)
+		limit := appcontracts.ImageObservationLogTail
+		if parsed, err := url.ParseRequestURI(path); err == nil && parsed.Query().Get("tail") != "" {
+			limit, _ = strconv.Atoi(parsed.Query().Get("tail"))
+		}
+		if !ok || len(observation.Records) > limit || (shape == shapeImageObservation && len(observation.Records) != 0) {
+			return nil, invalidResponse("server response exceeded requested observation bounds")
+		}
+	}
+	if shape == shapeManagedImageApps {
+		list, ok := value.(appcontracts.ManagedImageApplicationList)
+		limit := 50
+		if parsed, err := url.ParseRequestURI(path); err == nil && parsed.Query().Get("limit") != "" {
+			limit, _ = strconv.Atoi(parsed.Query().Get("limit"))
+		}
+		if !ok || len(list.Items) > limit {
+			return nil, invalidResponse("server response exceeded requested image application limit")
+		}
+	}
+	if shape == shapeHostMetricsRecent {
+		recent, ok := value.(apiHostMetricsRecent)
+		if !ok {
+			return nil, invalidResponse("server response is invalid")
+		}
+		reqLimit := 60
+		if parsed, pErr := url.ParseRequestURI(path); pErr == nil {
+			if qLimit := parsed.Query().Get("limit"); qLimit != "" {
+				if n, nErr := strconv.Atoi(qLimit); nErr == nil && n >= 1 && n <= 360 {
+					reqLimit = n
+				}
+			}
+		}
+		if len(recent.Points) > reqLimit {
+			return nil, invalidResponse("server response exceeded requested limit")
+		}
+	}
 	return value, nil
 }
 
@@ -108,6 +176,22 @@ func expectedSuccessStatus(method, rawPath string, shape responseShape) (int, bo
 	switch method {
 	case http.MethodPost:
 		switch {
+		case len(segments) == 2 && segments[0] == "source-build" && (segments[1] == "prepare" || segments[1] == "approve") && noQuery && shape == shapeSourceBuildIntent:
+			return http.StatusCreated, true
+		case len(segments) == 2 && segments[0] == "source-build" && segments[1] == "run-plans" && noQuery && shape == shapeNativeImagePlan:
+			return http.StatusCreated, true
+		case len(segments) == 4 && segments[0] == "source-build" && segments[1] == "run-plans" && segments[3] == "confirm" && noQuery && shape == shapeNativeImageConfirm:
+			return http.StatusAccepted, true
+		case len(segments) == 3 && segments[0] == "image-deployments" && segments[2] == "lifecycle" && noQuery && shape == shapeNativeImageLifecycle:
+			return http.StatusOK, true
+		case len(segments) == 3 && segments[0] == "image-deployments" && segments[2] == "domain-commands" && noQuery && shape == shapeNativeImageDomainOperation:
+			return http.StatusAccepted, true
+		case len(segments) == 1 && segments[0] == "image-plans" && noQuery && shape == shapeNativeImagePlan:
+			return http.StatusCreated, true
+		case len(segments) == 3 && segments[0] == "image-plans" && segments[2] == "confirm" && noQuery && shape == shapeNativeImageConfirm:
+			return http.StatusOK, true
+		case len(segments) == 1 && segments[0] == "source-uploads" && noQuery && shape == shapeSourceUpload:
+			return http.StatusCreated, true
 		case len(segments) == 2 && segments[0] == "auth" && segments[1] == "login" && noQuery && shape == shapeSession:
 			return http.StatusOK, true
 		case len(segments) == 2 && segments[0] == "auth" && (segments[1] == "logout" || segments[1] == "password") && noQuery && shape == shapeSession:
@@ -133,7 +217,35 @@ func expectedSuccessStatus(method, rawPath string, shape responseShape) (int, bo
 		}
 	case http.MethodGet:
 		switch {
+		case len(segments) == 3 && segments[0] == "source-build" && segments[1] == "intents" && noQuery && shape == shapeSourceBuildIntent:
+			return http.StatusOK, true
+		case len(segments) == 3 && segments[0] == "source-build" && segments[1] == "run-plans" && noQuery && shape == shapeNativeImagePlan:
+			return http.StatusOK, true
+		case len(segments) == 3 && segments[0] == "image-deployments" && segments[2] == "metrics" && noQuery && shape == shapeImageMetrics:
+			return http.StatusOK, true
+		case len(segments) == 4 && segments[0] == "image-deployments" && segments[2] == "metrics" && segments[3] == "recent" && validImageMetricsRecentQuery(parsed.RawQuery) && shape == shapeImageMetricsRecent:
+			return http.StatusOK, true
+		case len(segments) == 3 && segments[0] == "image-deployments" && segments[2] == "observation" && noQuery && shape == shapeImageObservation:
+			return http.StatusOK, true
+		case len(segments) == 3 && segments[0] == "image-deployments" && segments[2] == "logs" && validImageObservationQuery(parsed.RawQuery) && shape == shapeImageLogObservation:
+			return http.StatusOK, true
+		case len(segments) == 1 && segments[0] == "image-apps" && validManagedImageAppsQuery(parsed.RawQuery) && shape == shapeManagedImageApps:
+			return http.StatusOK, true
+		case len(segments) == 2 && segments[0] == "image-lifecycle-operations" && noQuery && shape == shapeNativeImageLifecycle:
+			return http.StatusOK, true
+		case len(segments) == 2 && segments[0] == "image-domain-operations" && noQuery && shape == shapeNativeImageDomainOperation:
+			return http.StatusOK, true
+		case len(segments) == 3 && segments[0] == "image-deployments" && segments[2] == "domain" && noQuery && shape == shapeNativeImageDomainCurrent:
+			return http.StatusOK, true
+		case len(segments) == 2 && segments[0] == "image-plans" && noQuery && shape == shapeNativeImagePlan:
+			return http.StatusOK, true
+		case len(segments) == 2 && segments[0] == "operations" && noQuery && shape == shapeNativeImageOperation:
+			return http.StatusOK, true
+		case len(segments) == 2 && segments[0] == "source-uploads" && noQuery && shape == shapeSourceUpload:
+			return http.StatusOK, true
 		case len(segments) == 2 && segments[0] == "host" && segments[1] == "metrics" && noQuery && shape == shapeHostMetrics:
+			return http.StatusOK, true
+		case len(segments) == 3 && segments[0] == "host" && segments[1] == "metrics" && segments[2] == "recent" && validRecentQuery(parsed.RawQuery) && shape == shapeHostMetricsRecent:
 			return http.StatusOK, true
 		case len(segments) == 2 && segments[0] == "auth" && segments[1] == "session" && noQuery && shape == shapeSession:
 			return http.StatusOK, true
@@ -212,9 +324,44 @@ func validQuery(raw string, logs bool) bool {
 	return true
 }
 
+func validRecentQuery(raw string) bool {
+	if raw == "" {
+		return true
+	}
+	for _, part := range strings.Split(raw, "&") {
+		if part == "" {
+			return false
+		}
+	}
+	values, err := url.ParseQuery(raw)
+	if err != nil {
+		return false
+	}
+	for key, entries := range values {
+		if key != "limit" || len(entries) != 1 {
+			return false
+		}
+	}
+	limit, ok := values["limit"]
+	if !ok {
+		return true
+	}
+	value, err := strconv.Atoi(limit[0])
+	if err != nil || value < 1 || value > 360 || strconv.Itoa(value) != limit[0] {
+		return false
+	}
+	return true
+}
+
 func (c *cli) request(ctx context.Context, state sessionState, method, path string, body any, csrf bool, key string, timeout time.Duration) (*http.Response, error) {
 	var data io.Reader
-	if body != nil {
+	contentType := "application/json"
+	contentLength := int64(-1)
+	if upload, ok := body.(multipartPayload); ok {
+		data = upload.reader
+		contentType = upload.contentType
+		contentLength = upload.size
+	} else if body != nil {
 		encoded, err := json.Marshal(body)
 		if err != nil {
 			return nil, err
@@ -227,17 +374,20 @@ func (c *cli) request(ctx context.Context, state sessionState, method, path stri
 	}
 	request.Header.Set("Accept", "application/json")
 	if body != nil {
-		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Content-Type", contentType)
+	}
+	if contentLength >= 0 {
+		request.ContentLength = contentLength
 	}
 	if state.Session != "" {
-		request.AddCookie(&http.Cookie{Name: "__Host-acornfox_session", Value: state.Session})
+		request.AddCookie(&http.Cookie{Name: sessionCookieName(state), Value: state.Session})
 	}
 	if path == "/auth/login" {
 		request.Header.Set("Origin", state.Origin)
 	}
 	if csrf {
 		request.Header.Set("Origin", state.Origin)
-		request.AddCookie(&http.Cookie{Name: "__Host-acornfox_csrf", Value: state.CSRF})
+		request.AddCookie(&http.Cookie{Name: csrfCookieName(state), Value: state.CSRF})
 		request.Header.Set("X-AcornFox-CSRF", state.CSRF)
 	}
 	if key != "" {
@@ -335,4 +485,68 @@ func responseExpiry(value apiSession, requireAuthenticated bool) (time.Time, err
 		return idleAt, nil
 	}
 	return abs, nil
+}
+
+func validManagedImageAppsQuery(raw string) bool {
+	if raw == "" {
+		return true
+	}
+	values, err := url.ParseQuery(raw)
+	if err != nil || len(values) != 1 || len(values["limit"]) != 1 || strings.Contains(raw, "&") {
+		return false
+	}
+	limit := values.Get("limit")
+	value, err := strconv.Atoi(limit)
+	return err == nil && value >= 1 && value <= 100 && strconv.Itoa(value) == limit
+}
+
+func validImageObservationQuery(raw string) bool {
+	if raw == "" {
+		return true
+	}
+	for _, part := range strings.Split(raw, "&") {
+		if part == "" {
+			return false
+		}
+	}
+	query, err := url.ParseQuery(raw)
+	if err != nil {
+		return false
+	}
+	for key, entries := range query {
+		if len(entries) != 1 || entries[0] == "" {
+			return false
+		}
+		switch key {
+		case "tail":
+			value, err := strconv.Atoi(entries[0])
+			if err != nil || value < 1 || value > appcontracts.ImageObservationLogTail || strconv.Itoa(value) != entries[0] {
+				return false
+			}
+		case "since":
+			since, err := time.Parse(time.RFC3339Nano, entries[0])
+			now := time.Now().UTC()
+			if err != nil || since.Before(now.Add(-32*time.Minute)) {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func validImageMetricsRecentQuery(raw string) bool {
+	if raw == "" {
+		return true
+	}
+	if strings.Contains(raw, "&") {
+		return false
+	}
+	values, err := url.ParseQuery(raw)
+	if err != nil || len(values) != 1 || len(values["limit"]) != 1 {
+		return false
+	}
+	limit, err := strconv.Atoi(values["limit"][0])
+	return err == nil && limit >= 1 && limit <= appcontracts.ImageMetricsHistorySamples && strconv.Itoa(limit) == values["limit"][0]
 }

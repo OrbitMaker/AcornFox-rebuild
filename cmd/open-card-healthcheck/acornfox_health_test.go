@@ -5,13 +5,10 @@ import (
 	"context"
 	"errors"
 	"io"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"os/user"
 	"reflect"
-	"strconv"
 	"strings"
 	"testing"
 
@@ -167,7 +164,6 @@ func acornFoxLocalFixture(t *testing.T) (acornFoxLocalDependencies, *[]string) {
 			return nil, os.ErrNotExist
 		},
 		dataSpace: func() bool { return true },
-		assistant: func(context.Context) bool { return true },
 	}, visited
 }
 
@@ -185,68 +181,16 @@ func TestAcornFoxLocalChecksUseExactServicesAndEndpoints(t *testing.T) {
 	}
 }
 
-func TestAcornFoxAssistantHealthAcceptsAbsentOrConfiguredDisabled(t *testing.T) {
-	for _, configured := range []bool{false, true} {
-		called := 0
-		ok := acornFoxAssistantHealthy(context.Background(), func(_ context.Context, path string, args ...string) ([]byte, error) {
-			called++
-			return []byte("Id=acornfox-pi-worker.service\nLoadState=loaded\nUnitFileState=disabled\nActiveState=inactive\nSubState=dead\n"), nil
-		}, func() (bool, error) { return configured, nil }, func(path string) (os.FileInfo, error) {
-			if path != acornFoxPIWorkerSocket {
-				t.Fatal(path)
-			}
-			return nil, os.ErrNotExist
-		}, func(string) (*user.User, error) { t.Fatal("user lookup reached"); return nil, nil }, func(string) (*user.Group, error) { t.Fatal("group lookup reached"); return nil, nil })
-		if !ok || called != 1 {
-			t.Fatalf("configured=%t ok=%t calls=%d", configured, ok, called)
+func TestAcornFoxHealthOmitsAssistantWorker(t *testing.T) {
+	for _, name := range acornFoxLocalCheckNames() {
+		if strings.Contains(name, "assistant") || strings.Contains(name, "worker") {
+			t.Fatalf("unexpected assistant/worker check name in health checks: %s", name)
 		}
 	}
-}
-
-func TestAcornFoxAssistantHealthEnabledRequiresExactSocket(t *testing.T) {
-	temporary, err := os.CreateTemp("/tmp", "afpi-socket-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	path := temporary.Name()
-	if err := temporary.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(path); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Remove(path) })
-	listener, err := net.Listen("unix", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer listener.Close()
-	if err := os.Chmod(path, 0660); err != nil {
-		t.Fatal(err)
-	}
-	info, err := os.Lstat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	stat, ok := healthStat(info)
-	if !ok {
-		t.Fatal("socket owner unavailable")
-	}
-	uid, gid := strconv.Itoa(int(stat.Uid)), strconv.Itoa(int(stat.Gid))
-	command := func(context.Context, string, ...string) ([]byte, error) {
-		return []byte("Id=acornfox-pi-worker.service\nLoadState=loaded\nUnitFileState=enabled\nActiveState=active\nSubState=running\n"), nil
-	}
-	lstat := func(got string) (os.FileInfo, error) {
-		if got != acornFoxPIWorkerSocket {
-			t.Fatal(got)
+	for _, unit := range acornFoxHealthUnits {
+		if strings.Contains(unit, "pi") || strings.Contains(unit, "worker") {
+			t.Fatalf("unexpected pi/worker unit in health check units: %s", unit)
 		}
-		return os.Lstat(path)
-	}
-	if !acornFoxAssistantHealthy(context.Background(), command, func() (bool, error) { return true, nil }, lstat, func(string) (*user.User, error) { return &user.User{Uid: uid}, nil }, func(string) (*user.Group, error) { return &user.Group{Gid: gid}, nil }) {
-		t.Fatal("exact enabled worker socket was rejected")
-	}
-	if acornFoxAssistantHealthy(context.Background(), command, func() (bool, error) { return false, nil }, lstat, func(string) (*user.User, error) { return &user.User{Uid: uid}, nil }, func(string) (*user.Group, error) { return &user.Group{Gid: gid}, nil }) {
-		t.Fatal("unconfigured enabled worker was accepted")
 	}
 }
 

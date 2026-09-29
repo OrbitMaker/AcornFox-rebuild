@@ -1,4 +1,6 @@
 node_modules/
 dist/
+dist-core/
+dist-stub/
 .env.local
 src/api/generated-schema.ts

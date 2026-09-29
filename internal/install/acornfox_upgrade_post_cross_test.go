@@ -16,7 +16,11 @@ func newAcornFoxPostCrossFixture(t *testing.T) (*acornFoxUpgrade, acornFoxProduc
 	t.Helper()
 	u, p, request, base := upgradeFixture(t)
 	provisionUpgradeAssistantConfig(t, p)
-	u.services = &acornFoxUpgradePIServiceFake{acornFoxUpgradeServiceFake: base, enabled: true}
+	services := &retirementServices{
+		acornFoxUpgradePIServiceFake: &acornFoxUpgradePIServiceFake{acornFoxUpgradeServiceFake: base, enabled: true},
+		p:                            p,
+	}
+	u.services = services
 	if _, err := u.upgrade(context.Background(), request); err != nil {
 		t.Fatal(err)
 	}

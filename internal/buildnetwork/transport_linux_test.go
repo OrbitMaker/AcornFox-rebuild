@@ -5,12 +5,43 @@ package buildnetwork
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestNativeManagerUsesFixedSourceIdentityAndEmbeddedWorker(t *testing.T) {
+	legacy, native := legacyManagerIdentity(), nativeManagerIdentity()
+	if legacy.clientUser != "acornfox" || legacy.workerExecutable != "/opt/acornfox/current/bin/buildkitd" || legacy.native {
+		t.Fatal("legacy manager identity changed")
+	}
+	if native.clientUser != "acornfox-build" || native.workerExecutable != "/opt/acornfox/current/embedded/bin/buildkitd" || !native.native {
+		t.Fatal("Native Source identity or embedded BuildKit path is not fixed")
+	}
+	if _, err := newProductionManager(managerIdentity{clientUser: "untrusted", workerExecutable: native.workerExecutable, native: true}); !errors.Is(err, ErrPolicy) {
+		t.Fatal("arbitrary policy client identity reached the privileged manager")
+	}
+}
+
+func TestNativeManagerCannotClaimLegacyState(t *testing.T) {
+	if !stateProfileMatches(false, "") || stateProfileMatches(true, "") {
+		t.Fatal("Native manager adopted a legacy state or legacy compatibility regressed")
+	}
+	if !stateProfileMatches(true, "native") || stateProfileMatches(false, "native") || stateProfileMatches(true, "unknown") {
+		t.Fatal("manager accepted a state from another policy executor profile")
+	}
+	legacy, err := json.Marshal(state{Schema: 1})
+	if err != nil || strings.Contains(string(legacy), `"profile"`) {
+		t.Fatal("legacy state gained a new serialized profile field")
+	}
+	native, err := json.Marshal(state{Schema: 1, Profile: "native"})
+	if err != nil || !strings.Contains(string(native), `"profile":"native"`) {
+		t.Fatal("Native state lost its durable profile marker")
+	}
+}
 
 func TestUnixAttestationBindsPeerAndRequest(t *testing.T) {
 	// Unix socket paths are bounded by the kernel; test names can exceed that

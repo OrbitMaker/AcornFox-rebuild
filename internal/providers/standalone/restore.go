@@ -37,18 +37,12 @@ func (p *Provider) restoreActive(ctx context.Context, snapshot durableRuntimeSta
 	if !facts.State.Running && facts.State.Status != "exited" {
 		return fail("runtime state is not eligible for restoration")
 	}
-	if p.config.ExistingNetworkValidator == nil || p.config.RestoreActiveGuard(ctx) != nil {
-		return fail("runtime network guard is not ready for restoration")
+	networkID, netErr := p.verifyRuntimeNetwork(ctx, facts, operation, contracts.CapabilityRuntimeRestart, "restore")
+	if netErr != nil {
+		return netErr
 	}
-	// Read the validated network identity, not only the container's original
-	// NetworkMode: Docker can attach a second unguarded network afterward.
-	// This path cannot create a missing network.
-	rawNetwork, err := p.output(ctx, []string{"network", "inspect", p.config.Network})
-	var networks []struct {
-		ID string `json:"Id"`
-	}
-	if err != nil || p.config.ExistingNetworkValidator([]byte(rawNetwork)) != nil || json.Unmarshal([]byte(rawNetwork), &networks) != nil || len(networks) != 1 || !validContainerID(networks[0].ID) || !facts.matchesRestoreNetwork(p.config.Network, networks[0].ID) {
-		return fail("runtime network attachments are missing or changed")
+	if snapshot.SchemaVersion == durableRuntimeStateSchemaV3 && snapshot.NetworkID != "" && networkID != snapshot.NetworkID {
+		return fail("runtime network identity changed before restoration")
 	}
 	if facts.State.Running {
 		return nil
@@ -59,7 +53,7 @@ func (p *Provider) restoreActive(ctx context.Context, snapshot durableRuntimeSta
 	}
 	facts, err = p.inspectFacts(ctx, snapshot.ContainerID)
 	port, matches = facts.matchesRunning(p.config, snapshot.Deployment, snapshot.Spec)
-	if err != nil || !matches || facts.ID != snapshot.ContainerID || port != snapshot.Capacity.HostPort || !facts.matchesRestoreNetwork(p.config.Network, networks[0].ID) {
+	if err != nil || !matches || facts.ID != snapshot.ContainerID || port != snapshot.Capacity.HostPort || !facts.matchesRestoreNetwork(p.config.Network, networkID) {
 		return fail("restored runtime is not verified running")
 	}
 	// No lifecycle or health success is fabricated in the durable record. Normal
@@ -67,7 +61,91 @@ func (p *Provider) restoreActive(ctx context.Context, snapshot durableRuntimeSta
 	return nil
 }
 
+// Application tasks require a real owned NAT network readback. Legacy worker
+// and external networks retain their mandatory live RestoreActiveGuard.
+func (p *Provider) requireRuntimeNetworkGuard(ctx context.Context, operation contracts.OperationContext, capability contracts.Capability, action string) error {
+	if p.config.NetworkProfile == ApplicationLoopbackNetworkProfile {
+		if _, err := p.inspectApplicationRuntimeNetwork(ctx, operation, capability, action); err != nil {
+			return err
+		}
+		// No isolated-worker firewall guard is required by this ordinary NAT profile.
+		// An explicitly configured extra guard is still honored below.
+		if p.config.RestoreActiveGuard == nil {
+			return nil
+		}
+	}
+	if p.config.RestoreActiveGuard == nil {
+		return p.failure(operation, capability, action, contracts.ErrConflict, "runtime network guard is required", contracts.RetryNever, false, nil)
+	}
+	if err := p.config.RestoreActiveGuard(ctx); err != nil {
+		return p.failure(operation, capability, action, contracts.ErrConflict, "runtime network guard is not ready", contracts.RetryBackoff, true, err)
+	}
+	return nil
+}
+
+// verifyRuntimeNetworkTopology validates the configured profile and exact single
+// attachment identity. It never creates or replaces a missing network.
+func (p *Provider) verifyRuntimeNetworkTopology(ctx context.Context, facts inspectFacts, operation contracts.OperationContext, capability contracts.Capability, action string) (string, error) {
+	if p.config.NetworkProfile == ApplicationLoopbackNetworkProfile {
+		netID, err := p.inspectApplicationRuntimeNetwork(ctx, operation, capability, action)
+		if err != nil {
+			return "", err
+		}
+		if !facts.matchesRestoreNetwork(p.config.Network, netID) {
+			return "", p.failure(operation, capability, action, contracts.ErrConflict, "application network attachments are missing, extra or mismatched", contracts.RetryNever, false, nil)
+		}
+		return netID, nil
+	}
+	if p.config.ExistingNetworkValidator == nil {
+		return "", p.failure(operation, capability, action, contracts.ErrConflict, "runtime network validator is missing", contracts.RetryNever, false, nil)
+	}
+	if facts.NetworkSettings.Networks == nil || len(facts.NetworkSettings.Networks) == 0 {
+		return "", p.failure(operation, capability, action, contracts.ErrConflict, "runtime network attachments are missing or empty", contracts.RetryNever, false, nil)
+	}
+	rawNetwork, err := p.output(ctx, []string{"network", "inspect", p.config.Network})
+	if err != nil {
+		return "", p.failure(operation, capability, action, contracts.ErrConflict, "runtime network inspect failed", contracts.RetryAfterReconnect, true, err)
+	}
+	if err := p.config.ExistingNetworkValidator([]byte(rawNetwork)); err != nil {
+		return "", p.failure(operation, capability, action, contracts.ErrConflict, "runtime network validator rejected network", contracts.RetryNever, false, err)
+	}
+	var networks []struct {
+		ID string `json:"Id"`
+	}
+	if err := json.Unmarshal([]byte(rawNetwork), &networks); err != nil || len(networks) != 1 || !validContainerID(networks[0].ID) {
+		return "", p.failure(operation, capability, action, contracts.ErrConflict, "runtime network topology is invalid", contracts.RetryNever, false, err)
+	}
+	netID := networks[0].ID
+	if !facts.matchesRestoreNetwork(p.config.Network, netID) {
+		return "", p.failure(operation, capability, action, contracts.ErrConflict, "runtime network attachments are missing, extra or mismatched", contracts.RetryNever, false, nil)
+	}
+	return netID, nil
+}
+
+// verifyRuntimeNetwork performs both network topology verification and live guard verification.
+func (p *Provider) verifyRuntimeNetwork(ctx context.Context, facts inspectFacts, operation contracts.OperationContext, capability contracts.Capability, action string) (string, error) {
+	if err := p.requireRuntimeNetworkGuard(ctx, operation, capability, action); err != nil {
+		return "", err
+	}
+	return p.verifyRuntimeNetworkTopology(ctx, facts, operation, capability, action)
+}
+
 func (facts inspectFacts) matchesRestoreNetwork(name, id string) bool {
 	attachment, exists := facts.NetworkSettings.Networks[name]
 	return exists && len(facts.NetworkSettings.Networks) == 1 && attachment.NetworkID == id
+}
+
+// Reuse the same managed bridge/NAT validator used by deploy and operative
+// running-container inspection. Network mutations and permissive callbacks are
+// deliberately absent from lifecycle/recovery verification.
+func (p *Provider) inspectApplicationRuntimeNetwork(ctx context.Context, operation contracts.OperationContext, capability contracts.Capability, action string) (string, error) {
+	raw, err := p.output(ctx, []string{"network", "inspect", p.config.Network})
+	if err != nil {
+		return "", p.failure(operation, capability, action, contracts.ErrConflict, "application runtime network inspect failed", contracts.RetryAfterReconnect, true, err)
+	}
+	network, err := p.validateApplicationNetwork([]byte(raw))
+	if err != nil {
+		return "", p.failure(operation, capability, action, contracts.ErrConflict, "application runtime network differs from the owned NAT profile", contracts.RetryNever, false, err)
+	}
+	return network.ID, nil
 }

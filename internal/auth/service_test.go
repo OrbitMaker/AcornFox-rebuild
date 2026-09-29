@@ -25,14 +25,14 @@ type memoryStore struct {
 
 func (s *memoryStore) ActiveAdminCredential(context.Context) (domain.AdminCredential, error) {
 	if s.credential.ID.Empty() || s.credential.DisabledAt != nil {
-		return domain.AdminCredential{}, postgres.ErrNotFound
+		return domain.AdminCredential{}, ErrNotFound
 	}
 	return s.credential, nil
 }
 
 func (s *memoryStore) RotateAdminCredential(_ context.Context, id domain.ID, expected int64, scheme, hash string, now time.Time) (domain.AdminCredential, error) {
 	if s.credential.ID != id || s.credential.CredentialVersion != expected || s.credential.DisabledAt != nil {
-		return domain.AdminCredential{}, postgres.ErrCredentialVersionConflict
+		return domain.AdminCredential{}, ErrCredentialVersionConflict
 	}
 	s.credential.PasswordHashScheme, s.credential.PasswordHash = scheme, hash
 	s.credential.CredentialVersion++
@@ -51,7 +51,7 @@ func (s *memoryStore) CreateAdminSession(_ context.Context, session domain.Admin
 func (s *memoryStore) ActiveAdminSessionByDigest(_ context.Context, digest domain.AuthDigest, now time.Time) (domain.AdminSession, error) {
 	session, ok := s.sessions[digest]
 	if !ok || session.RevokedAt != nil || !now.Before(session.IdleExpiresAt) || !now.Before(session.AbsoluteExpiresAt) || session.CredentialVersion != s.credential.CredentialVersion {
-		return domain.AdminSession{}, postgres.ErrNotFound
+		return domain.AdminSession{}, ErrNotFound
 	}
 	return session, nil
 }
@@ -68,7 +68,7 @@ func (s *memoryStore) TouchAdminSession(_ context.Context, id domain.ID, credent
 			return session, nil
 		}
 	}
-	return domain.AdminSession{}, postgres.ErrNotFound
+	return domain.AdminSession{}, ErrNotFound
 }
 
 func (s *memoryStore) RevokeAdminSession(_ context.Context, id domain.ID, now time.Time) error {
@@ -79,7 +79,7 @@ func (s *memoryStore) RevokeAdminSession(_ context.Context, id domain.ID, now ti
 			return nil
 		}
 	}
-	return postgres.ErrNotFound
+	return ErrNotFound
 }
 
 func (s *memoryStore) UpsertAdminLoginRateLimit(_ context.Context, record domain.AdminLoginRateLimit) error {
@@ -93,9 +93,35 @@ func (s *memoryStore) UpsertAdminLoginRateLimit(_ context.Context, record domain
 func (s *memoryStore) AdminLoginRateLimit(_ context.Context, _ domain.ID, source domain.AuthDigest) (domain.AdminLoginRateLimit, error) {
 	record, ok := s.rates[source]
 	if !ok {
-		return domain.AdminLoginRateLimit{}, postgres.ErrNotFound
+		return domain.AdminLoginRateLimit{}, ErrNotFound
 	}
 	return record, nil
+}
+
+func (s *memoryStore) RecordAdminLoginFailure(_ context.Context, adminID domain.ID, source domain.AuthDigest, now time.Time) (domain.AdminLoginRateLimit, error) {
+	if s.rates == nil {
+		s.rates = map[domain.AuthDigest]domain.AdminLoginRateLimit{}
+	}
+	var existing *domain.AdminLoginRateLimit
+	if rec, ok := s.rates[source]; ok {
+		existing = &rec
+	}
+	next := domain.TransitionAdminLoginRateLimit(existing, adminID, source, now)
+	s.rates[source] = next
+	return next, nil
+}
+
+func (s *memoryStore) CreateAdminSessionIfLoginAllowed(ctx context.Context, session domain.AdminSession, source domain.AuthDigest, now time.Time) error {
+	if s.credential.ID != session.AdminID || s.credential.DisabledAt != nil {
+		return ErrNotFound
+	}
+	if s.credential.CredentialVersion != session.CredentialVersion {
+		return ErrCredentialVersionConflict
+	}
+	if rec, ok := s.rates[source]; ok && rec.IsLocked(now) {
+		return ErrRateLimited
+	}
+	return s.CreateAdminSession(ctx, session)
 }
 
 func newTestService(t *testing.T, store Store, now *time.Time) *Service {
@@ -132,19 +158,31 @@ func TestLocalServiceConstructorStrictness(t *testing.T) {
 		t.Fatal("NewService unexpectedly accepted HTTP origin")
 	}
 
-	// NewLocalService accepts exact http://127.0.0.1:8080
+	// NewLocalService accepts valid loopback origins with explicit host and port
+	validLocalOrigins := []string{
+		"http://127.0.0.1:8080",
+		"http://127.0.0.1:9090",
+		"http://[::1]:8080",
+	}
+	for _, validOrigin := range validLocalOrigins {
+		s, err := NewLocalService(Config{Store: &memoryStore{}, Origin: validOrigin})
+		if err != nil {
+			t.Fatalf("NewLocalService rejected valid loopback origin %q: %v", validOrigin, err)
+		}
+		if err := s.RequireOrigin(validOrigin); err != nil {
+			t.Fatalf("RequireOrigin rejected valid origin %q: %v", validOrigin, err)
+		}
+	}
+
 	service, err := NewLocalService(Config{Store: &memoryStore{}, Origin: "http://127.0.0.1:8080"})
 	if err != nil {
 		t.Fatalf("NewLocalService rejected exact http://127.0.0.1:8080: %v", err)
-	}
-	if err := service.RequireOrigin("http://127.0.0.1:8080"); err != nil {
-		t.Fatalf("RequireOrigin rejected exact loopback origin: %v", err)
 	}
 	if err := service.RequireOrigin("http://localhost:8080"); !errors.Is(err, ErrOriginDenied) {
 		t.Fatalf("expected ErrOriginDenied for localhost, got %v", err)
 	}
 
-	// NewLocalService rejects non-exact loopback origins (including empty, whitespace, padded)
+	// NewLocalService rejects invalid loopback origins (including empty, whitespace, missing port, public IPs, path/query/fragment)
 	invalidLocalOrigins := []string{
 		"",
 		" ",
@@ -152,15 +190,14 @@ func TestLocalServiceConstructorStrictness(t *testing.T) {
 		"http://127.0.0.1:8080 ",
 		"http://localhost:8080",
 		"http://127.0.0.1:8080\n",
-		"http://127.0.0.2:8080",
-		"http://127.0.0.1:80",
-		"http://127.0.0.1:8081",
+		"http://192.168.1.1:8080",
+		"http://127.0.0.1",
 		"http://127.0.0.1:8080/",
 		"http://127.0.0.1:8080/path",
 		"http://127.0.0.1:8080?query=1",
 		"http://user:pass@127.0.0.1:8080",
 		"https://127.0.0.1:8080",
-		"http://[::1]:8080",
+		"http://127.0.0.1:70000",
 	}
 	for _, invalidOrigin := range invalidLocalOrigins {
 		if _, err := NewLocalService(Config{Store: &memoryStore{}, Origin: invalidOrigin}); err == nil {
@@ -342,5 +379,17 @@ func validateAuthServiceDSN(t *testing.T, dsn string) {
 	}
 	if database := strings.TrimPrefix(parsed.EscapedPath(), "/"); !strings.HasPrefix(database, "open_card_g2authsvc_") {
 		t.Fatal("task-scoped auth service database name must use open_card_g2authsvc_ prefix")
+	}
+}
+
+func TestAuthNeutralSentinelsIdentity(t *testing.T) {
+	if !errors.Is(ErrNotFound, domain.ErrObjectNotFound) {
+		t.Fatal("auth.ErrNotFound must equal domain.ErrObjectNotFound")
+	}
+	if !errors.Is(ErrCredentialVersionConflict, domain.ErrCredentialVersionConflict) {
+		t.Fatal("auth.ErrCredentialVersionConflict must equal domain.ErrCredentialVersionConflict")
+	}
+	if got := authenticationStoreError(errors.New(ErrNotFound.Error())); !errors.Is(got, ErrAuthenticationUnavailable) {
+		t.Fatalf("unrelated error with same text mapped to %v, want %v", got, ErrAuthenticationUnavailable)
 	}
 }

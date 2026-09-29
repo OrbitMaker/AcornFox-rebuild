@@ -299,7 +299,7 @@ func TestAcornFoxAssistantRejectsInvalidKeyBeforeHostEffects(t *testing.T) {
 	}
 }
 
-func TestAcornFoxAssistantHostScriptsProvisionAccountAndKeepWorkerOptional(t *testing.T) {
+func TestAcornFoxHostScriptsRetainLegacyAccountWithoutWorker(t *testing.T) {
 	for _, name := range []string{"install-host.sh", "host-preflight.sh"} {
 		raw, err := os.ReadFile(filepath.Join("..", "..", "scripts", "acornfox", name))
 		if err != nil {
@@ -317,11 +317,10 @@ func TestAcornFoxAssistantHostScriptsProvisionAccountAndKeepWorkerOptional(t *te
 		t.Fatal(err)
 	}
 	text := string(raw)
-	for _, required := range []string{"systemctl disable --now acornfox-pi-worker.service", "systemctl is-enabled --quiet acornfox-pi-worker.service", "systemctl is-active --quiet acornfox-pi-worker.service", "! -e /run/acornfox-pi/worker.sock"} {
-		if !strings.Contains(text, required) {
-			t.Fatalf("install-host is missing %q", required)
-		}
+	if strings.Contains(text, "acornfox-pi-worker.service") {
+		t.Fatal("new install must not manage a retired worker unit")
 	}
+
 	if strings.Contains(text, "enable acornfox-pi-worker.service") || strings.Contains(text, "start acornfox-pi-worker.service") {
 		t.Fatal("fresh host install starts the optional worker")
 	}

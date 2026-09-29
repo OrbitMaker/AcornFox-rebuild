@@ -1,5 +1,11 @@
 import type { components } from "../api/acornfox-generated-schema";
 import { resolveCsrfToken } from "./csrf";
+import {
+  AcornFoxRequestError,
+  createCoreAuthClient,
+} from "../shared/auth-transport";
+
+export { AcornFoxRequestError };
 
 export type AcornFoxSchemas = components["schemas"];
 export type Application = AcornFoxSchemas["Application"];
@@ -30,23 +36,6 @@ export function expectedSuccessStatus(path: string, method = "GET"): number {
   if (/\/apps\/[^/]+\/deliveries$/.test(path) && normalized === "POST")
     return 202;
   return 200;
-}
-
-export class AcornFoxRequestError extends Error {
-  constructor(
-    public readonly status: number | undefined,
-    public readonly code: string,
-    message: string,
-  ) {
-    super(message);
-    this.name = "AcornFoxRequestError";
-  }
-  get kind(): "authentication" | "unavailable" | "conflict" | "failed" {
-    if (this.status === 401 || this.status === 429) return "authentication";
-    if (this.status === 503 || this.status === undefined) return "unavailable";
-    if (this.status === 409) return "conflict";
-    return "failed";
-  }
 }
 
 export interface AcornFoxClient {
@@ -214,10 +203,11 @@ function source(value: unknown): SourceRevision {
       "immutable",
     ],
   );
+  if (row.kind === "upload" && row.commit !== undefined && text(row.commit) !== "") invalid();
   return {
     id: text(row.id),
     application_id: text(row.application_id),
-    kind: enumValue(row.kind, ["git_https"]),
+    kind: enumValue(row.kind, ["git_https", "upload"]),
     locator_sha256: text(row.locator_sha256),
     ref: maybeText(row.ref),
     commit: maybeText(row.commit),
@@ -293,6 +283,40 @@ function requested(
     disk_reservation_bytes: integer(row.disk_reservation_bytes),
   };
 }
+function runtimeConfiguration(value: unknown): AcornFoxSchemas["RuntimeConfiguration"] {
+  const row = exact(value, [], ["entrypoint", "command", "environment", "volumes"]);
+  const argumentsOf = (value: unknown): string[] => {
+    if (!Array.isArray(value) || value.length > 64) invalid();
+    return value.map((entry) => { const result = text(entry); if (!result || result.length > 4096 || result.includes("\0")) invalid(); return result; });
+  };
+  const result: AcornFoxSchemas["RuntimeConfiguration"] = {};
+  if (row.entrypoint !== undefined) result.entrypoint = argumentsOf(row.entrypoint);
+  if (row.command !== undefined) result.command = argumentsOf(row.command);
+  if (row.environment !== undefined) {
+    if (!Array.isArray(row.environment) || row.environment.length > 128) invalid();
+    const names = new Set<string>();
+    result.environment = row.environment.map((value) => {
+      const item = exact(value, ["name"], ["name", "kind", "value"]);
+      const name = text(item.name), literal = item.value === undefined ? "" : text(item.value);
+      if (!/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(name) || names.has(name) || literal.length > 8192 || literal.includes("\0")) invalid();
+      names.add(name);
+      return { name, kind: enumValue(item.kind ?? "literal", ["literal"]), value: literal };
+    });
+  }
+  if (row.volumes !== undefined) {
+    if (!Array.isArray(row.volumes) || row.volumes.length > 16) invalid();
+    const names = new Set<string>(), paths = new Set<string>();
+    result.volumes = row.volumes.map((value) => {
+      const item = exact(value, ["name", "mount_path", "size_bytes"], ["name", "mount_path", "size_bytes", "read_only"]);
+      const name = text(item.name), mount = text(item.mount_path), size = integer(item.size_bytes);
+      if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$/.test(name) || names.has(name) || paths.has(mount) || !mount.startsWith("/") || mount === "/" || mount.length > 512 || size < 1 || size > 1125899906842624) invalid();
+      names.add(name); paths.add(mount);
+      return { name, mount_path: mount, size_bytes: size, read_only: item.read_only === undefined ? false : flag(item.read_only) };
+    });
+  }
+  return result;
+}
+
 function desired(value: unknown): NonNullable<DeliveryStatus["desired"]> {
   const row = exact(
     value,
@@ -314,6 +338,7 @@ function desired(value: unknown): NonNullable<DeliveryStatus["desired"]> {
       "image",
       "resources",
       "container_port",
+      "schema_version", "configuration", "config_digest",
       "accepted_at",
       "immutable",
     ],
@@ -325,13 +350,23 @@ function desired(value: unknown): NonNullable<DeliveryStatus["desired"]> {
     (!Number.isInteger(port) || port < 0 || port > 65535)
   )
     invalid();
+  const configured = row.schema_version !== undefined || row.configuration !== undefined || row.config_digest !== undefined;
+  const resources = requested(row.resources);
+  let configuration: AcornFoxSchemas["RuntimeConfiguration"] | undefined;
+  let configDigest: string | undefined;
+  if (configured) {
+    if (row.schema_version !== 2 || row.configuration === undefined || row.config_digest === undefined) invalid();
+    configuration = runtimeConfiguration(row.configuration); configDigest = text(row.config_digest);
+    if (!/^sha256:[0-9a-f]{64}$/.test(configDigest) || resources.cpu_millis < 10 || resources.memory_bytes < 6291456 || resources.pids < 1 || resources.disk_reservation_bytes < 1 || (configuration.volumes ?? []).reduce((sum, volume) => sum + volume.size_bytes, 0) > resources.disk_reservation_bytes) invalid();
+  }
   return {
+    ...(configured ? { schema_version: 2 as const, configuration, config_digest: configDigest } : {}),
     application_id: text(row.application_id),
     environment_id: text(row.environment_id),
     release_id: text(row.release_id),
     service_name: text(row.service_name),
     image: { repository: text(image.repository), digest: text(image.digest) },
-    resources: requested(row.resources),
+    resources,
     ...(port === undefined ? {} : { container_port: port }),
     accepted_at: dateTime(row.accepted_at),
     immutable: flag(row.immutable),
@@ -656,27 +691,13 @@ export function createAcornFoxClient(
   }
   const json = (body: unknown) => JSON.stringify(body);
   const write = { csrf: true, idempotency: true };
-  const none = () => undefined;
+  const coreAuth = createCoreAuthClient(fetcher, onAuthenticationFailure);
   return {
-    login: (password) =>
-      password
-        ? request("/auth/login", session, {
-            method: "POST",
-            body: json({ password }),
-          })
-        : inputError("请输入管理员密码。"),
-    logout: () =>
-      request("/auth/logout", none, { method: "POST" }, { csrf: true }),
-    session: () => request("/auth/session", session),
+    login: (password) => coreAuth.login(password),
+    logout: () => coreAuth.logout(),
+    session: () => coreAuth.session(),
     changePassword: (current_password, new_password) =>
-      current_password && new_password
-        ? request(
-            "/auth/password",
-            none,
-            { method: "POST", body: json({ current_password, new_password }) },
-            { csrf: true },
-          )
-        : inputError("当前密码和新密码不能为空。"),
+      coreAuth.changePassword(current_password, new_password),
     apps: () => request("/apps", applicationList),
     app: (id) => request(`/apps/${pathPart(id)}`, application),
     createApp: async ({ name, repositoryUrl, ref }) => {

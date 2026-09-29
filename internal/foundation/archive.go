@@ -51,6 +51,7 @@ type ArchiveEntry struct {
 // unbounded only when the corresponding limit is intentionally omitted; the
 // package defaults use finite limits through DefaultArchiveLimits.
 type ArchiveLimits struct {
+	MaxFileBytes     int64
 	MaxFiles         int64
 	MaxUnpackedBytes int64
 	IgnoreHidden     bool
@@ -104,7 +105,7 @@ func (e *ArchiveError) Unwrap() error { return ErrArchiveRejected }
 // every entry is safe. Any single violation returns an error and the caller
 // must not extract partial results.
 func InspectArchive(entries []ArchiveEntry, limits ArchiveLimits) (ArchiveReport, error) {
-	if limits.MaxFiles < 0 || limits.MaxUnpackedBytes < 0 {
+	if limits.MaxFiles < 0 || limits.MaxUnpackedBytes < 0 || limits.MaxFileBytes < 0 {
 		return ArchiveReport{}, &ArchiveError{Violation: ViolationInvalidPath, Message: "limits must be non-negative"}
 	}
 	report := ArchiveReport{Decisions: make([]ArchiveDecision, 0, len(entries))}
@@ -131,6 +132,9 @@ func InspectArchive(entries []ArchiveEntry, limits ArchiveLimits) (ArchiveReport
 			continue
 		}
 		if entry.Kind == ArchiveRegular {
+			if limits.MaxFileBytes > 0 && entry.Size > limits.MaxFileBytes {
+				return ArchiveReport{}, archiveReject(normalized, ViolationTooLarge)
+			}
 			report.FileCount++
 			if limits.MaxFiles > 0 && report.FileCount > limits.MaxFiles {
 				return ArchiveReport{}, archiveReject(normalized, ViolationTooManyFiles)

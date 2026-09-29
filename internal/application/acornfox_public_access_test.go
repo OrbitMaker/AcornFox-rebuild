@@ -242,7 +242,7 @@ func (fixture *acornFoxPublicAccessFixture) request(enabled bool, key string) Ac
 	return AcornFoxPublicAccessRequest{ApplicationID: fixture.applicationID, DeploymentID: fixture.deploymentID, Enabled: enabled, IdempotencyKey: key}
 }
 
-func (fixture *acornFoxPublicAccessFixture) BeginAcornFoxPublicAccess(_ context.Context, fact contracts.AcornFoxPublicAccessFact, _ contracts.AcornFoxPublicRouteIntent, _ bool, key, digest string, _ time.Time) (contracts.AcornFoxPublicAccessFact, bool, error) {
+func (fixture *acornFoxPublicAccessFixture) BeginAcornFoxPublicAccess(_ context.Context, fact contracts.AcornFoxPublicAccessFact, _ contracts.AcornFoxPublicRouteIntent, _ bool, key, digest string, _ domain.ID, _ time.Time) (contracts.AcornFoxPublicAccessFact, bool, error) {
 	fixture.mu.Lock()
 	defer fixture.mu.Unlock()
 	fixture.beginCalls++

@@ -12,7 +12,7 @@ func verifiedAcornFoxUpgradePredecessor(raw []byte, digest string) (VerifiedAcor
 	if err != nil {
 		return VerifiedAcornFoxBindingV1{}, err
 	}
-	if validateAcornFoxBinding(binding) != nil && validateAcornFoxRecent0039Binding(binding) != nil && validateAcornFoxLegacyPredecessorBinding(binding) != nil {
+	if validateAcornFoxBinding(binding) != nil && validateAcornFoxFrozen0040Binding(binding) != nil && validateAcornFoxRecent0039Binding(binding) != nil && validateAcornFoxLegacyPredecessorBinding(binding) != nil {
 		return VerifiedAcornFoxBindingV1{}, ErrAcornFoxUpgradeConflict
 	}
 	return VerifiedAcornFoxBindingV1{binding: cloneAcornFoxBinding(binding), digest: digest}, nil

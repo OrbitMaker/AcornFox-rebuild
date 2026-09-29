@@ -17,14 +17,14 @@ const (
 )
 
 var (
-	ErrUnsupportedPlatform          = errors.New("darwinlaunch: verified native launch layer is supported only on Darwin with cgo")
-	ErrChildRetained                = errors.New("darwinlaunch: child process remains retained in registry")
-	ErrUntrustedHost                = errors.New("darwinlaunch: running host process does not satisfy security requirements")
-	ErrUntrustedExecutable          = errors.New("darwinlaunch: executable does not satisfy security requirements")
-	ErrInvalidAction                = errors.New("darwinlaunch: invalid launcher action")
-	ErrExecutionFailed              = errors.New("darwinlaunch: native execution failed")
-	ErrAlreadyResumed               = errors.New("darwinlaunch: child already resumed")
-	ErrAlreadyAborted               = errors.New("darwinlaunch: child already aborted")
+	ErrUnsupportedPlatform         = errors.New("darwinlaunch: verified native launch layer is supported only on Darwin with cgo")
+	ErrChildRetained               = errors.New("darwinlaunch: child process remains retained in registry")
+	ErrUntrustedHost               = errors.New("darwinlaunch: running host process does not satisfy security requirements")
+	ErrUntrustedExecutable         = errors.New("darwinlaunch: executable does not satisfy security requirements")
+	ErrInvalidAction               = errors.New("darwinlaunch: invalid launcher action")
+	ErrExecutionFailed             = errors.New("darwinlaunch: native execution failed")
+	ErrAlreadyResumed              = errors.New("darwinlaunch: child already resumed")
+	ErrAlreadyAborted              = errors.New("darwinlaunch: child already aborted")
 	ErrTestDistributionUnavailable = errors.New("darwinlaunch: test distribution constructors are not available in production builds")
 )
 
@@ -76,10 +76,10 @@ func (e *ChildRetainedError) Unwrap() error {
 
 type PreparedChild struct{}
 
-func (p *PreparedChild) PID() int                         { return 0 }
-func (p *PreparedChild) ParentLifecycle() *os.File        { return nil }
-func (p *PreparedChild) Resume() (*OwnedChild, error)     { return nil, ErrUnsupportedPlatform }
-func (p *PreparedChild) Abort(ctx context.Context) error  { return ErrUnsupportedPlatform }
+func (p *PreparedChild) PID() int                        { return 0 }
+func (p *PreparedChild) ParentLifecycle() *os.File       { return nil }
+func (p *PreparedChild) Resume() (*OwnedChild, error)    { return nil, ErrUnsupportedPlatform }
+func (p *PreparedChild) Abort(ctx context.Context) error { return ErrUnsupportedPlatform }
 
 type OwnedChild struct{}
 
@@ -112,7 +112,7 @@ func CheckProcessSStop(pid int) (int, error) {
 func injectKillDenial(pid int)     {}
 func injectWaitpidFailure(pid int) {}
 func clearFaultInjections()        {}
-func activeChildCount() int       { return 0 }
+func activeChildCount() int        { return 0 }
 func getStaticCodeSigningInfo(path string) (string, string, error) {
 	return "", "", ErrUnsupportedPlatform
 }

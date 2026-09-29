@@ -34,6 +34,7 @@ func acornFoxCrossSchemaManifestFixture(t *testing.T) (acornFoxFixture, Manifest
 	}
 	oldManifest.Files = files
 	old.manifestRaw = acornFoxUpgradeJSON(oldManifest)
+	old.binding.SchemaVersion = AcornFoxCandidateBindingV1Schema
 	old.binding.MigrationVersion = AcornFoxLegacyPredecessorMigration
 	old.binding.ManifestSHA256 = sha256Hex(old.manifestRaw)
 	old.binding.NMinusOne = nil
@@ -138,9 +139,10 @@ func containsString(values []string, want string) bool {
 
 func TestAcornFoxRecent0039PredecessorPolicyIsFrozen(t *testing.T) {
 	predecessor := newAcornFoxFixture(t, "1.2.2-test.1", nil)
+	predecessor.binding.SchemaVersion = AcornFoxCandidateBindingV1Schema
 	predecessor.binding.MigrationVersion = AcornFoxLegacyPredecessorMigration
 	refreshAcornFoxBinding(t, &predecessor)
-	recent := newAcornFoxFixture(t, "1.2.3-test.1", &predecessor)
+	recent := acornFoxFixtureForPolicy(t, "1.2.3-test.1", &predecessor, 1, acornFoxRecent0039RequiredFiles(), "0039")
 	var manifest Manifest
 	if err := strictCanonicalJSON(recent.manifestRaw, &manifest, "0039 fixture"); err != nil {
 		t.Fatal(err)
@@ -187,66 +189,9 @@ func TestAcornFoxRecent0039PredecessorPolicyIsFrozen(t *testing.T) {
 
 func TestAcornFoxRecent0039ReceiptsAreExact(t *testing.T) {
 	prepared := newAcornFoxProductionPreparedFixture(t)
-	bindingRaw, err := os.ReadFile(filepath.Join(prepared.state, "bindings", prepared.binding+".json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	binding, err := parseAcornFoxCandidateBindingV1(bindingRaw, prepared.binding)
-	if err != nil {
-		t.Fatal(err)
-	}
-	manifestPath := filepath.Join(prepared.host, "opt/acornfox/releases", binding.ReleaseID, "manifest.json")
-	manifestRaw, err := os.ReadFile(manifestPath)
-	var manifest Manifest
-	if err != nil || strictCanonicalJSON(manifestRaw, &manifest, "current manifest") != nil {
-		t.Fatal("manifest unavailable", err)
-	}
-	manifest.MigrationVersion = acornFoxRecentPredecessorMigration
-	manifest.Compatibility.MinDataVersion, manifest.Compatibility.MaxDataVersion = 39, 39
-	manifestFiles := manifest.Files[:0]
-	for _, file := range manifest.Files {
-		if file.Path != "migrations/control-plane/0040_acornfox_fix_candidates.sql" {
-			manifestFiles = append(manifestFiles, file)
-		}
-	}
-	manifest.Files = manifestFiles
-	manifestRaw = acornFoxUpgradeJSON(manifest)
-	binding.MigrationVersion = acornFoxRecentPredecessorMigration
-	binding.ManifestSHA256 = sha256Hex(manifestRaw)
-	bindingRaw = acornFoxUpgradeJSON(binding)
-	bindingSHA := sha256Hex(bindingRaw)
-	substrate := prepared.published.receipt
-	substrate.CandidateReceipt.MigrationVersion = acornFoxRecentPredecessorMigration
-	substrate.CandidateReceipt.ManifestSHA256 = binding.ManifestSHA256
-	substrate.CandidateReceipt.BindingSHA256 = bindingSHA
-	substrate.CandidateReceipt.FileCount--
-	entries := substrate.Entries[:0]
-	manifestEntryPath := "opt/acornfox/releases/" + binding.ReleaseID + "/manifest.json"
-	migration40Path := "opt/acornfox/releases/" + binding.ReleaseID + "/migrations/control-plane/0040_acornfox_fix_candidates.sql"
-	for _, entry := range substrate.Entries {
-		if entry.Path == migration40Path {
-			continue
-		}
-		if entry.Path == manifestEntryPath {
-			entry.SHA256 = sha256Hex(manifestRaw)
-			entry.Size = int64(len(manifestRaw))
-		}
-		entries = append(entries, entry)
-	}
-	substrate.Entries = entries
-	releaseTree, err := ComputeAcornFoxReleaseTreeSHA256(substrate.CandidateReceipt, substrate.Entries)
-	if err != nil {
-		t.Fatal(err)
-	}
-	substrate.CandidateReceipt.TreeSHA256 = releaseTree
-	substrate.ReleaseTreeSHA256 = releaseTree
-	substrate.InstalledTreeSHA256, err = ComputeAcornFoxSubstrateTreeSHA256(substrate.Entries)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if validateAcornFoxRecent0039SubstrateReceipt(substrate, binding, bindingSHA) != nil {
-		t.Fatal("0039 substrate receipt rejected")
-	}
+	fixture := acornFoxFixtureForPolicy(t, "1.2.3-test.1", nil, 1, acornFoxRecent0039RequiredFiles(), "0039")
+	binding, bindingSHA := fixture.binding, fixture.bindingSHA
+	substrate, _ := historicalSubstrateForTest(t, fixture)
 	source, err := acornFoxRecent0039ExpectedEntries(prepared.layout, substrate)
 	if err != nil {
 		t.Fatal(err)

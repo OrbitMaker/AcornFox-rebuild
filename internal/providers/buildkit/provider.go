@@ -211,7 +211,7 @@ func (c Config) normalized() (Config, error) {
 		c.ControlledEgressPolicyRaw = nil
 	}
 	if hasProduction {
-		if c.Address != "unix://"+buildnetwork.BuildkitSocketPath || c.Command != "/opt/acornfox/current/bin/buildctl" {
+		if c.Address != "unix://"+buildnetwork.BuildkitSocketPath || (c.Command != "/opt/acornfox/current/bin/buildctl" && c.Command != "/opt/acornfox/current/embedded/bin/buildctl") {
 			return Config{}, fmt.Errorf("production buildkit must use the attested worker socket and installed buildctl")
 		}
 		_, digest, err := buildnetwork.ParsePolicy(c.ProductionNetworkPolicyRaw)

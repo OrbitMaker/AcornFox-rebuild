@@ -1,5 +1,7 @@
 # ADR-0009: PostgreSQL outbox and leased task queue
 
+> 2026-09-26 scope update: the new single-machine thin core targets SQLite. The behavioral guarantees below remain required; PostgreSQL locking SQL is not the target implementation. See the [thin-core migration plan](../acornfox-thin-core-migration-plan.md) for serialized short writes, durable execution generations, transactional outbox and migration. Historical PostgreSQL test results do not establish SQLite acceptance.
+
 - Status: Accepted; G9 Spike passed
 - Gate: G9 / S1
 

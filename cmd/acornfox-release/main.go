@@ -35,6 +35,15 @@ func main() {
 }
 
 func run(ctx context.Context, args []string, out, diagnostic io.Writer) error {
+	if len(args) > 0 && args[0] == "native-full-manifest" {
+		return runNativeFullManifest(ctx, args[1:], out, diagnostic)
+	}
+	if len(args) > 0 && args[0] == "native-partial-build" {
+		return runNativePartial(ctx, args[1:], out, diagnostic)
+	}
+	if len(args) > 0 && args[0] == "native-product-build" {
+		return runNativeProduct(ctx, args[1:], out, diagnostic)
+	}
 	if len(args) == 0 || args[0] != "build" {
 		return errors.New("usage: acornfox-release build --source DIR --decision FILE --decision-sha256 SHA --source-policy FILE --toolchain FILE --runtime-inputs FILE --license-inputs FILE --runtime-root DIR --license-root DIR --cache DIR --npm-cache DIR --scratch DIR --output DIR [--predecessor-binding FILE --predecessor-sha256 SHA]")
 	}
@@ -56,22 +65,8 @@ func run(ctx context.Context, args []string, out, diagnostic io.Writer) error {
 	if (o.predecessorBinding == "") != (o.predecessorSHA == "") {
 		return errors.New("predecessor-binding and predecessor-sha256 must be provided together")
 	}
-	read := func(path string) ([]byte, error) {
-		file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
-		if err != nil {
-			return nil, err
-		}
-		defer file.Close()
-		info, err := file.Stat()
-		if err != nil || !info.Mode().IsRegular() || info.Size() > 1<<20 {
-			return nil, errors.New("invalid release input file")
-		}
-		raw, err := io.ReadAll(io.LimitReader(file, (1<<20)+1))
-		if err != nil || len(raw) > 1<<20 {
-			return nil, errors.New("invalid release input bytes")
-		}
-		return raw, nil
-	}
+	read := readBuildInput
+
 	var predecessorRaw []byte
 	if o.predecessorBinding != "" {
 		var err error
@@ -290,4 +285,146 @@ func (p *tempParent) close() {
 	if e == nil && x == nil && current.IsDir() && current.Mode()&os.ModeSymlink == 0 && os.SameFile(opened, current) {
 		_ = os.Remove(p.path)
 	}
+}
+
+func readBuildInput(path string) ([]byte, error) {
+	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Size() > 1<<20 {
+		return nil, errors.New("invalid release input file")
+	}
+	raw, err := io.ReadAll(io.LimitReader(file, (1<<20)+1))
+	if err != nil || len(raw) > 1<<20 {
+		return nil, errors.New("invalid release input bytes")
+	}
+	return raw, nil
+}
+
+func runNativePartial(ctx context.Context, args []string, out, diagnostic io.Writer) error {
+	return runNativeProfile(ctx, args, out, diagnostic, "native_partial")
+}
+
+func runNativeProduct(ctx context.Context, args []string, out, diagnostic io.Writer) error {
+	return runNativeProfile(ctx, args, out, diagnostic, "native_product")
+}
+
+func runNativeProfile(ctx context.Context, args []string, out, diagnostic io.Writer, profile string) error {
+	var source, inputs, inputsSHA, policyPath, toolsPath, cache, npmCache, npmCLI, scratch, output string
+	if profile != "native_partial" && profile != "native_product" {
+		return errors.New("unsupported Native product build profile")
+	}
+	fs := flag.NewFlagSet(profile+"-build", flag.ContinueOnError)
+	fs.SetOutput(diagnostic)
+	for _, item := range []struct {
+		name  string
+		value *string
+	}{
+		{"source", &source}, {"native-inputs", &inputs}, {"native-inputs-sha256", &inputsSHA}, {"source-policy", &policyPath}, {"toolchain", &toolsPath}, {"cache", &cache}, {"npm-cache", &npmCache}, {"npm-cli", &npmCLI}, {"scratch", &scratch}, {"output", &output},
+	} {
+		fs.StringVar(item.value, item.name, "", item.name)
+	}
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return errors.New("unexpected positional arguments")
+	}
+	for _, v := range []string{source, inputs, inputsSHA, policyPath, toolsPath, cache, npmCache, npmCLI, scratch, output} {
+		if v == "" {
+			return errors.New("all native-partial build input and output flags are required")
+		}
+	}
+	if !filepath.IsAbs(output) || filepath.Clean(output) != output {
+		return errors.New("output must be an absolute clean path")
+	}
+	for _, path := range []string{scratch, cache, npmCache, filepath.Dir(output)} {
+		if err := privateDirectory(path); err != nil {
+			return err
+		}
+	}
+	for _, path := range []*string{&source, &scratch, &cache, &npmCache} {
+		canonical, err := filepath.EvalSymlinks(*path)
+		if err != nil {
+			return err
+		}
+		*path, err = filepath.Abs(canonical)
+		if err != nil {
+			return err
+		}
+	}
+	parent, err := filepath.EvalSymlinks(filepath.Dir(output))
+	if err != nil {
+		return err
+	}
+	output = filepath.Join(parent, filepath.Base(output))
+	if _, err := os.Lstat(output); !errors.Is(err, os.ErrNotExist) {
+		return errors.New("output must not already exist")
+	}
+	if within(source, output) || within(source, scratch) || within(cache, output) || within(npmCache, output) {
+		return errors.New("build output and scratch must be outside source and dependency caches")
+	}
+	raw, err := readBuildInput(inputs)
+	if err != nil {
+		return err
+	}
+	witness, err := acornfoxrelease.ParseNativeBuildInputsV1(raw, inputsSHA)
+	if err != nil {
+		return err
+	}
+	if witness.Profile() != profile {
+		return errors.New("native build command and pinned profile differ")
+	}
+	raw, err = readBuildInput(policyPath)
+	if err != nil {
+		return err
+	}
+	policy, err := acornfoxrelease.ParseNativeSourcePolicyV1(witness, raw)
+	if err != nil {
+		return err
+	}
+	raw, err = readBuildInput(toolsPath)
+	if err != nil {
+		return err
+	}
+	tools, err := acornfoxrelease.ParseNativeToolchainInputsV1(witness, raw)
+	if err != nil {
+		return err
+	}
+	plan, err := acornfoxrelease.PrepareNativeBuildPlanV1(ctx, witness, policy, tools, source, cache, npmCLI)
+	if err != nil {
+		return fmt.Errorf("prepare native %s: %w", profile, err)
+	}
+	defer plan.Close()
+	goParent, err := newTempParent(scratch, "native-go-")
+	if err != nil {
+		return err
+	}
+	defer goParent.close()
+	webParent, err := newTempParent(scratch, "native-web-")
+	if err != nil {
+		return err
+	}
+	defer webParent.close()
+	var receipt any
+	if profile == "native_product" {
+		product, buildErr := acornfoxrelease.BuildNativeProductV1(ctx, plan, goParent.path, webParent.path, npmCache, output)
+		if buildErr != nil {
+			return fmt.Errorf("build native product: %w", buildErr)
+		}
+		receipt = product
+	} else {
+		partial, buildErr := acornfoxrelease.BuildNativePartialV1(ctx, plan, goParent.path, webParent.path, npmCache, output)
+		if buildErr != nil {
+			return fmt.Errorf("build native partial: %w", buildErr)
+		}
+		receipt = partial
+	}
+	return json.NewEncoder(out).Encode(struct {
+		Output  string `json:"output"`
+		Receipt any    `json:"receipt"`
+	}{output, receipt})
 }

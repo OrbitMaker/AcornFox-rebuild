@@ -40,40 +40,26 @@ func TestAcornFoxAssistantCLIIsClosedAndDoesNotEchoKeyPath(t *testing.T) {
 
 func TestAcornFoxAssistantCLIDispatchAndRedaction(t *testing.T) {
 	withAcornFoxIdentity(t)
-	const keyPath = "/root/deepseek-secret"
-	for _, command := range []string{"configure-assistant", "disable-assistant"} {
-		t.Run(command, func(t *testing.T) {
-			calls := 0
-			deps := upgradeDependencies{acornFoxClean: acornFoxCleanDependencies{
-				euid: func() int { return 0 },
-				configureAssistant: func(_ context.Context, got string) (install.AcornFoxAssistantConfigReceiptV1, error) {
-					calls++
-					if got != keyPath {
-						t.Fatal("key path was not passed privately")
-					}
-					return install.AcornFoxAssistantConfigReceiptV1{SchemaVersion: 1, State: "ASSISTANT_ENABLED", Configured: true, Enabled: true}, nil
-				},
-				disableAssistant: func(context.Context) (install.AcornFoxAssistantConfigReceiptV1, error) {
-					calls++
-					return install.AcornFoxAssistantConfigReceiptV1{SchemaVersion: 1, State: "ASSISTANT_DISABLED", Configured: true}, nil
-				},
-			}}
-			args := []string{command}
-			if command == "configure-assistant" {
-				args = append(args, "--deepseek-key-file", keyPath)
-			}
-			var output bytes.Buffer
-			if code := runWithDependencies(context.Background(), args, &output, &bytes.Buffer{}, deps); code != exitOK || calls != 1 {
-				t.Fatalf("code=%d calls=%d output=%q", code, calls, output.String())
-			}
-			if strings.Contains(output.String(), keyPath) || strings.Contains(output.String(), "deepseek-secret") {
-				t.Fatalf("key path leaked: %q", output.String())
-			}
-			result := cleanJSON(t, output.Bytes())
-			if result["ok"] != true || result["command"] != command {
-				t.Fatalf("result=%#v", result)
-			}
-		})
+	calls := 0
+	deps := upgradeDependencies{acornFoxClean: acornFoxCleanDependencies{
+		euid: func() int { return 0 },
+		disableAssistant: func(context.Context) (install.AcornFoxAssistantConfigReceiptV1, error) {
+			calls++
+			return install.AcornFoxAssistantConfigReceiptV1{SchemaVersion: 1, State: "ASSISTANT_DISABLED", Configured: true}, nil
+		},
+	}}
+	var output bytes.Buffer
+	if code := runWithDependencies(context.Background(), []string{"disable-assistant"}, &output, &bytes.Buffer{}, deps); code != exitOK || calls != 1 {
+		t.Fatalf("code=%d calls=%d output=%q", code, calls, output.String())
+	}
+	result := cleanJSON(t, output.Bytes())
+	if result["ok"] != true || result["command"] != "disable-assistant" {
+		t.Fatalf("result=%#v", result)
+	}
+
+	output.Reset()
+	if code := runWithDependencies(context.Background(), []string{"configure-assistant", "--deepseek-key-file", "/root/deepseek-secret"}, &output, &bytes.Buffer{}, deps); code != exitIneligible || cleanJSON(t, output.Bytes())["code"] != "assistant_retired" {
+		t.Fatalf("code=%d output=%q", code, output.String())
 	}
 }
 
@@ -85,10 +71,10 @@ func TestAcornFoxAssistantCLIMapsPrivateFailures(t *testing.T) {
 		text string
 	}{{install.ErrAcornFoxAssistantConfigConflict, exitConflict, "assistant_configuration_conflict"}, {install.ErrAcornFoxAssistantConfigUnknown, exitRecovery, "assistant_configuration_unknown"}, {errors.New("secret canary"), exitIneligible, "assistant_configuration_ineligible"}} {
 		var output bytes.Buffer
-		deps := upgradeDependencies{acornFoxClean: acornFoxCleanDependencies{euid: func() int { return 0 }, configureAssistant: func(context.Context, string) (install.AcornFoxAssistantConfigReceiptV1, error) {
+		deps := upgradeDependencies{acornFoxClean: acornFoxCleanDependencies{euid: func() int { return 0 }, disableAssistant: func(context.Context) (install.AcornFoxAssistantConfigReceiptV1, error) {
 			return install.AcornFoxAssistantConfigReceiptV1{}, test.err
 		}}}
-		if code := runWithDependencies(context.Background(), []string{"configure-assistant", "--deepseek-key-file", "/root/key"}, &output, &bytes.Buffer{}, deps); code != test.code || cleanJSON(t, output.Bytes())["code"] != test.text || strings.Contains(output.String(), "canary") {
+		if code := runWithDependencies(context.Background(), []string{"disable-assistant"}, &output, &bytes.Buffer{}, deps); code != test.code || cleanJSON(t, output.Bytes())["code"] != test.text || strings.Contains(output.String(), "canary") {
 			t.Fatalf("code=%d output=%q", code, output.String())
 		}
 	}

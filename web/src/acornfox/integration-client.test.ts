@@ -220,3 +220,11 @@ describe("AcornFox integration client", () => {
     await expect(empty.accessObservation("app_1", "dep_1")).resolves.toEqual({ availability: "not_observed" });
   });
 });
+
+it("accepts local upload plans without inventing a repository URL", async () => {
+  const local = { ...deploymentPlanFixture, source_type: "upload", repository_url: "", commit: "", ref: "upload_1" };
+  const api = createAcornFoxIntegrationClient(async () => json(local));
+  await expect(api.deploymentPlan("app", "source")).resolves.toMatchObject({ sourceType: "upload", repositoryUrl: "", commit: "" });
+  const bad = createAcornFoxIntegrationClient(async () => json({ ...local, repository_url: "upload://private" }));
+  await expect(bad.deploymentPlan("app", "source")).rejects.toMatchObject({ code: "invalid_response" });
+});

@@ -206,7 +206,7 @@ func newAcornFoxDeliveryFixture(t *testing.T) *acornFoxDeliveryFixture {
 	return fixture
 }
 
-func (f *acornFoxDeliveryFixture) BeginAcornFoxDelivery(_ context.Context, key, digest string, _ time.Time) (AcornFoxDeliveryResult, bool, error) {
+func (f *acornFoxDeliveryFixture) BeginAcornFoxDelivery(_ context.Context, _ domain.ID, key, digest string, _ time.Time) (AcornFoxDeliveryResult, bool, error) {
 	if prior, ok := f.requests[key]; ok {
 		if prior.digest != digest {
 			return AcornFoxDeliveryResult{}, false, ErrIdempotencyConflict
@@ -220,7 +220,7 @@ func (f *acornFoxDeliveryFixture) BeginAcornFoxDelivery(_ context.Context, key, 
 	return AcornFoxDeliveryResult{}, false, nil
 }
 
-func (f *acornFoxDeliveryFixture) ReplayAcornFoxDelivery(_ context.Context, key, digest string) (AcornFoxDeliveryResult, bool, error) {
+func (f *acornFoxDeliveryFixture) ReplayAcornFoxDelivery(_ context.Context, _ domain.ID, key, digest string) (AcornFoxDeliveryResult, bool, error) {
 	prior, ok := f.requests[key]
 	if !ok {
 		return AcornFoxDeliveryResult{}, false, nil

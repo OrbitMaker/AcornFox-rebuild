@@ -2,8 +2,6 @@ import type { PublishingSnapshot, PublishEvent } from '../domain/publishing';
 import type { DomainAccessSnapshot } from '../features/domains/domainAccess';
 import type { ApplicationOperationsFact, OperationRequest } from '../features/operations/operationsView';
 import type { ApplicationUsageFact } from '../features/usage/usageFacts';
-import type { AIInterventionViewFact } from '../features/ai-interventions/aiInterventions';
-import type { AIServiceSettingsFact } from '../features/settings/ai/AIServiceSettings';
 import type { AuthClient } from '../features/auth/auth';
 
 export type SourceKind = 'git' | 'folder' | 'archive' | 'unknown';
@@ -232,9 +230,6 @@ export type ApplicationUsageResult =
   | { status: 'available'; facts: ApplicationUsageFact }
   | { status: 'unavailable'; message: string };
 
-export type AIInterventionResult = { status: 'available'; facts: AIInterventionViewFact } | { status: 'unavailable'; message: string };
-export type AISettingsResult = { status: 'available'; settings: AIServiceSettingsFact } | { status: 'unavailable'; message: string };
-
 export type SystemStatusNodeReadiness = 'ready' | 'not_ready' | 'unconfigured';
 export type SystemStatusPlatformDomain = 'unconfigured' | 'pending' | 'failed' | 'ready';
 export type SystemStatusWebhooks = 'configured' | 'unconfigured';
@@ -285,8 +280,6 @@ export interface ApiClient extends AuthClient {
   subscribeToPublishEvents(operationId: string, listener: PublishEventListener, onStateChange?: (state: PublishConnectionState) => void): () => void;
   getApplicationOperations(applicationId: string, signal?: AbortSignal): Promise<ApplicationOperationsResult>;
   getApplicationUsage(applicationId: string, mode: 'normal' | 'operations', signal?: AbortSignal): Promise<ApplicationUsageResult>;
-  getAIInterventions(applicationId: string, mode: 'ordinary' | 'operator', signal?: AbortSignal): Promise<AIInterventionResult>;
-  getAISettings(signal?: AbortSignal): Promise<AISettingsResult>;
   getSystemStatus(signal?: AbortSignal): Promise<SystemStatusResult>;
   requestApplicationOperation(applicationId: string, request: OperationRequest, signal?: AbortSignal): Promise<OperationRequestResult>;
 }

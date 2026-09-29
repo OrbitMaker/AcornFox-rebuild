@@ -152,6 +152,7 @@ type leaseRecord struct {
 	lease     contracts.CapacityLease
 	listener  net.Listener
 	activated bool
+	retained  bool
 	released  bool
 	expired   bool
 	timer     *time.Timer
@@ -165,7 +166,11 @@ type operationRecord struct {
 	err         error
 }
 
-var _ contracts.CapacityProvider = (*Provider)(nil)
+var (
+	_ contracts.CapacityProvider           = (*Provider)(nil)
+	_ contracts.CapacityRetainedReconciler = (*Provider)(nil)
+	_ contracts.CapacityReleasedFinalizer  = (*Provider)(nil)
+)
 
 // New constructs a local capacity provider.  The zero Reader uses real Linux
 // host observations; tests should inject ReaderFunc or another Reader.
@@ -240,7 +245,7 @@ func (p *Provider) Preflight(ctx context.Context, request contracts.CapacityRequ
 		return snapshot, evidence, err
 	}
 	if request.HostPorts == 1 {
-		listener, listenErr := p.listen(ctx)
+		listener, _, listenErr := p.listenUnreservedLocked(ctx, "")
 		if listenErr != nil {
 			if operationErr := contextError(ctx, request.Operation, p.config.Clock); operationErr != nil {
 				return contracts.CapacitySnapshot{}, contracts.Evidence{}, operationErr
@@ -300,19 +305,12 @@ func (p *Provider) Reserve(ctx context.Context, request contracts.CapacityReques
 	var listener net.Listener
 	var hostPort int
 	if request.HostPorts == 1 {
-		listener, err = p.listen(ctx)
+		listener, hostPort, err = p.listenUnreservedLocked(ctx, "")
 		if err != nil {
 			if operationErr := contextError(ctx, request.Operation, p.config.Clock); operationErr != nil {
 				return contracts.CapacityLease{}, operationErr
 			}
 			err = p.capacityError(request.Operation, contracts.CapabilityCapacityReserve, "reserve", []string{"port"}, evidence)
-			p.operations[opKey] = operationRecord{fingerprint: fingerprint, evidence: evidence, err: err}
-			return contracts.CapacityLease{}, err
-		}
-		hostPort, err = loopbackPort(listener)
-		if err != nil {
-			_ = listener.Close()
-			err = p.unavailableError(request.Operation, contracts.CapabilityCapacityReserve, "reserve", "loopback listener was invalid", err)
 			p.operations[opKey] = operationRecord{fingerprint: fingerprint, evidence: evidence, err: err}
 			return contracts.CapacityLease{}, err
 		}
@@ -426,8 +424,20 @@ func (p *Provider) ReconcileActive(ctx context.Context, lease contracts.Capacity
 		if record.released || !record.activated || activeLeaseFingerprint(record.lease) != fingerprint {
 			return p.conflict(operation, contracts.CapabilityCapacityReserve, action)
 		}
+		record.retained = false
 		p.operations[opKey] = operationRecord{fingerprint: fingerprint}
 		return nil
+	}
+
+	// Reject duplicate host port reservations from different leases (active or retained).
+	if lease.HostPort > 0 {
+		for _, record := range p.leases {
+			if !record.released && record.lease.ID != lease.ID && record.lease.HostPort == lease.HostPort {
+				err := p.conflict(operation, contracts.CapabilityCapacityReserve, action)
+				p.operations[opKey] = operationRecord{fingerprint: fingerprint, err: err}
+				return err
+			}
+		}
 	}
 
 	// Reconciliation is intentionally independent of the current host snapshot.
@@ -435,6 +445,58 @@ func (p *Provider) ReconcileActive(ctx context.Context, lease contracts.Capacity
 	// has fallen since it was first started; subsequent snapshots floor the
 	// remaining availability at zero.
 	p.leases[lease.ID] = &leaseRecord{lease: lease, activated: true}
+	p.operations[opKey] = operationRecord{fingerprint: fingerprint}
+	return nil
+}
+
+// ReconcileRetained restores accounting for a stopped container workload whose
+// resources and host port remain reserved while the application is paused.
+// The caller (standalone runtime provider) must first verify the stopped container facts.
+func (p *Provider) ReconcileRetained(ctx context.Context, lease contracts.CapacityLease, operation contracts.OperationContext) error {
+	const action = "reconcile_retained"
+	if err := p.validateOperation(ctx, operation, contracts.CapabilityCapacityReserve, action); err != nil {
+		return err
+	}
+	if err := p.validateRetainedLease(lease); err != nil {
+		return p.argumentError(operation, contracts.CapabilityCapacityReserve, action, err.Error())
+	}
+	fingerprint := activeLeaseFingerprint(lease)
+	opKey := operationKey(action, operation.IdempotencyKey)
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if previous, ok := p.operations[opKey]; ok {
+		if previous.fingerprint != fingerprint {
+			return p.conflict(operation, contracts.CapabilityCapacityReserve, action)
+		}
+		return previous.err
+	}
+	if record, ok := p.leases[lease.ID]; ok {
+		if record.released || !record.activated || activeLeaseFingerprint(record.lease) != fingerprint {
+			return p.conflict(operation, contracts.CapabilityCapacityReserve, action)
+		}
+		p.operations[opKey] = operationRecord{fingerprint: fingerprint}
+		return nil
+	}
+
+	// Reject duplicate host port reservations from different leases.
+	if lease.HostPort > 0 {
+		for _, record := range p.leases {
+			if !record.released && record.lease.ID != lease.ID && record.lease.HostPort == lease.HostPort {
+				err := p.conflict(operation, contracts.CapabilityCapacityReserve, action)
+				p.operations[opKey] = operationRecord{fingerprint: fingerprint, err: err}
+				return err
+			}
+		}
+	}
+
+	// Reconciliation is intentionally independent of the current host snapshot.
+	// A retained workload remains an actual reservation even if host availability
+	// has fallen since it was first started; subsequent snapshots floor the
+	// remaining availability at zero.
+	p.leases[lease.ID] = &leaseRecord{lease: lease, activated: true, retained: true}
+	p.operations[opKey] = operationRecord{fingerprint: fingerprint}
+	return nil
 	p.operations[opKey] = operationRecord{fingerprint: fingerprint}
 	return nil
 }
@@ -479,6 +541,50 @@ func (p *Provider) Release(ctx context.Context, lease contracts.CapacityLease, o
 			record.listener = nil
 		}
 		record.released = true
+	}
+	p.operations[opKey] = operationRecord{fingerprint: fingerprint}
+	return nil
+}
+
+// FinalizeReleased idempotently settles a capacity lease for an absent or destroyed
+// container without activating it or re-reserving its host port. If the record does
+// not exist, it is idempotently treated as released without error or side effect.
+func (p *Provider) FinalizeReleased(ctx context.Context, lease contracts.CapacityLease, operation contracts.OperationContext) error {
+	const action = "finalize_released"
+	if err := p.validateOperation(ctx, operation, contracts.CapabilityCapacityReserve, action); err != nil {
+		return err
+	}
+	if err := p.validateRetainedLease(lease); err != nil {
+		return p.argumentError(operation, contracts.CapabilityCapacityReserve, action, err.Error())
+	}
+	fingerprint := activeLeaseFingerprint(lease)
+	opKey := operationKey(action, operation.IdempotencyKey)
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if previous, ok := p.operations[opKey]; ok {
+		if previous.fingerprint != fingerprint {
+			return p.conflict(operation, contracts.CapabilityCapacityReserve, action)
+		}
+		return previous.err
+	}
+
+	record, ok := p.leases[lease.ID]
+	if ok {
+		if activeLeaseFingerprint(record.lease) != fingerprint {
+			return p.conflict(operation, contracts.CapabilityCapacityReserve, action)
+		}
+		if !record.released {
+			if record.timer != nil {
+				record.timer.Stop()
+				record.timer = nil
+			}
+			if record.listener != nil {
+				_ = record.listener.Close()
+				record.listener = nil
+			}
+			record.released = true
+		}
 	}
 	p.operations[opKey] = operationRecord{fingerprint: fingerprint}
 	return nil
@@ -562,6 +668,42 @@ func (p *Provider) listen(ctx context.Context) (net.Listener, error) {
 	return listener, nil
 }
 
+const maxPortAllocationAttempts = 32
+
+func (p *Provider) hostPortInUseLocked(port int, exceptLeaseID string) bool {
+	if port <= 0 {
+		return false
+	}
+	for _, record := range p.leases {
+		if !record.released && record.lease.HostPort == port && record.lease.ID != exceptLeaseID {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *Provider) listenUnreservedLocked(ctx context.Context, exceptLeaseID string) (net.Listener, int, error) {
+	for attempt := 0; attempt < maxPortAllocationAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, 0, err
+		}
+		listener, err := p.listen(ctx)
+		if err != nil {
+			return nil, 0, err
+		}
+		port, err := loopbackPort(listener)
+		if err != nil {
+			_ = listener.Close()
+			return nil, 0, err
+		}
+		if !p.hostPortInUseLocked(port, exceptLeaseID) {
+			return listener, port, nil
+		}
+		_ = listener.Close()
+	}
+	return nil, 0, errors.New("capacity host port allocation exceeded maximum retry attempts")
+}
+
 func loopbackPort(listener net.Listener) (int, error) {
 	address, ok := listener.Addr().(*net.TCPAddr)
 	if !ok || address == nil || address.IP == nil || !address.IP.IsLoopback() || address.Port < 1 || address.Port > 65535 {
@@ -627,23 +769,31 @@ func (p *Provider) validateRequest(ctx context.Context, request contracts.Capaci
 	return nil
 }
 
-func (p *Provider) validateActiveLease(lease contracts.CapacityLease) error {
+func validateLeaseBase(lease contracts.CapacityLease, kind string) error {
 	if strings.TrimSpace(lease.ID) == "" {
 		return errors.New("capacity lease id is required")
 	}
 	if lease.Scope != contracts.CapacityRuntime {
-		return errors.New("only runtime capacity leases can be reconciled")
+		return fmt.Errorf("only runtime capacity leases can be %s", kind)
 	}
 	if err := validateResources(lease.Resources); err != nil {
 		return errors.New("capacity resources must not be negative")
 	}
 	if lease.Resources.CPUMillis <= 0 || lease.Resources.MemoryBytes <= 0 || lease.Resources.DiskBytes <= 0 {
-		return errors.New("active runtime capacity resources must be positive")
+		return fmt.Errorf("%s runtime capacity resources must be positive", kind)
 	}
 	if lease.HostPort < 0 || lease.HostPort > 65535 {
 		return errors.New("capacity host port is invalid")
 	}
 	return nil
+}
+
+func (p *Provider) validateActiveLease(lease contracts.CapacityLease) error {
+	return validateLeaseBase(lease, "active")
+}
+
+func (p *Provider) validateRetainedLease(lease contracts.CapacityLease) error {
+	return validateLeaseBase(lease, "retained")
 }
 
 func (p *Provider) validateOperation(ctx context.Context, operation contracts.OperationContext, capability contracts.Capability, action string) error {

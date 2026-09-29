@@ -72,6 +72,12 @@ func RootlessProfile() []byte {
 	return []byte("abi <abi/4.0>,\ninclude <tunables/global>\nprofile acornfox-rootlesskit /opt/acornfox/{current,releases/*}/bin/rootlesskit flags=(unconfined) {\n  userns,\n}\n")
 }
 
+// NativeRootlessProfile matches the full unified release's embedded member.
+// The legacy profile remains byte-for-byte unchanged for its installed unit.
+func NativeRootlessProfile() []byte {
+	return []byte("abi <abi/4.0>,\ninclude <tunables/global>\nprofile acornfox-rootlesskit /opt/acornfox/{current,releases/*}/embedded/bin/rootlesskit flags=(unconfined) {\n  userns,\n}\n")
+}
+
 // Rules are fixed generated input, never shell or nft fragments supplied by an
 // application. The outer netns belongs to the initial user namespace, so a
 // rootless BuildKit child cannot change these rules.

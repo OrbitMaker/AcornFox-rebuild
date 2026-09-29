@@ -86,8 +86,8 @@ func newCheckFixtureWithHandler(t *testing.T, handler *checkHandler) hostFixture
 		AllowedHosts: []string{host},
 	}
 	initial := HostInstallation{
-		Version:         "1.0.0",
-		SlotSHA256:      strings.Repeat("1", 64),
+		Version:        "1.0.0",
+		SlotSHA256:     strings.Repeat("1", 64),
 		BackendBinding: strings.Repeat("a", 64),
 	}
 	f := hostFake{path: filepath.Join(t.TempDir(), "world.json")}
@@ -746,8 +746,8 @@ func TestHostCheckAndSelectCookieJarAndHeaderIsolation(t *testing.T) {
 		AllowedHosts: []string{host},
 	}
 	initial := HostInstallation{
-		Version:         "1.0.0",
-		SlotSHA256:      strings.Repeat("1", 64),
+		Version:        "1.0.0",
+		SlotSHA256:     strings.Repeat("1", 64),
 		BackendBinding: strings.Repeat("a", 64),
 	}
 	fake := hostFake{path: filepath.Join(t.TempDir(), "world.json")}
@@ -871,8 +871,8 @@ func TestHostCheckAndSelectTimeoutDuringHeadersAndBody(t *testing.T) {
 			AllowedHosts: []string{host},
 		}
 		initial := HostInstallation{
-			Version:         "1.0.0",
-			SlotSHA256:      strings.Repeat("1", 64),
+			Version:        "1.0.0",
+			SlotSHA256:     strings.Repeat("1", 64),
 			BackendBinding: strings.Repeat("a", 64),
 		}
 		fake := hostFake{path: filepath.Join(t.TempDir(), "world.json")}

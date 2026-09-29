@@ -39,6 +39,19 @@ const (
 	RetryUserAction     RetryClass = "user_action"
 )
 
+var (
+	// ErrObjectNotFound is the neutral shared sentinel for absent resources across
+	// auth, application, and persistence boundaries.
+	ErrObjectNotFound = errors.New("application object not found")
+
+	// ErrCredentialVersionConflict is the neutral shared sentinel for concurrent
+	// credential version mismatch during rotation.
+	ErrCredentialVersionConflict = errors.New("administrator credential version conflict")
+
+	// ErrRateLimited is the neutral shared sentinel for rate limited authentication attempts.
+	ErrRateLimited = errors.New("authentication rate limited")
+)
+
 // DomainError is safe to serialize after its message has been redacted by the
 // caller. Cause is intentionally not serialized by the default JSON shape.
 type DomainError struct {

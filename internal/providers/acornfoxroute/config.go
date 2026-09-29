@@ -12,10 +12,12 @@ import (
 )
 
 const (
-	SubtreeID      = "acornfox-app-routes"
-	AdminURL       = "http://127.0.0.1:2020"
-	PermissionPath = "/internal/acornfox/tls/allow"
-	PermissionURL  = "http://127.0.0.1:18481" + PermissionPath
+	SubtreeID             = "acornfox-app-routes"
+	AdminURL              = "http://127.0.0.1:2020"
+	NativeAdminSocketPath = "/run/acornfox/edge-admin/admin.sock"
+	nativeAdminListen     = "unix//run/acornfox/edge-admin/admin.sock|0660"
+	PermissionPath        = "/internal/acornfox/tls/allow"
+	PermissionURL         = "http://127.0.0.1:18481" + PermissionPath
 )
 
 type object = map[string]any
@@ -58,32 +60,61 @@ func proxy(target string) object {
 const EdgeGracePeriod = "5s"
 
 func InitialConfig(origin string, resolvers []string) ([]byte, error) {
-	return initialConfig(origin, resolvers, EdgeGracePeriod)
+	return initialConfig(origin, resolvers, EdgeGracePeriod, false)
+}
+
+// CustomOnlyInitialConfig publishes approved application hosts while the Core
+// console remains local. Its Caddy Admin listener is a protected Unix socket.
+func CustomOnlyInitialConfig(resolvers []string) ([]byte, error) {
+	return initialConfig("", resolvers, EdgeGracePeriod, true)
 }
 
 // LegacyInitialConfig preserves the exact persisted pre-drain profile. It is
 // only a validation input; new runtime generation uses the bounded profile.
 func LegacyInitialConfig(origin string, resolvers []string) ([]byte, error) {
-	return initialConfig(origin, resolvers, "")
+	return initialConfig(origin, resolvers, "", false)
 }
 
-func initialConfig(origin string, resolvers []string, grace string) ([]byte, error) {
-	host, err := AuthorizedRoot(origin)
-	if err != nil {
-		return nil, err
+func initialConfig(origin string, resolvers []string, grace string, customOnly bool) ([]byte, error) {
+	host := ""
+	if customOnly {
+		if origin != "" {
+			return nil, errPolicy
+		}
+	} else {
+		var err error
+		host, err = AuthorizedRoot(origin)
+		if err != nil {
+			return nil, err
+		}
 	}
 	unavailable := func(match object) object {
 		return object{"match": []object{match}, "handle": []object{{"handler": "static_response", "status_code": 404}}, "terminal": true}
 	}
-	consoleProxy := proxy("127.0.0.1:8080")
-	// The internal Caddy site matches Host 127.0.0.1. Preserving the public
-	// console Host would miss that site and return Caddy's empty default 200.
-	// Only this hop overrides Host; Origin, CSRF and application Hosts remain.
-	consoleProxy["headers"].(object)["request"].(object)["set"] = object{"Host": []string{"127.0.0.1"}}
-	console := object{"match": []object{{"host": []string{host}}}, "handle": []object{consoleProxy}, "terminal": true}
 	appRoutes := object{"handle": []object{emptySubtree()}}
+	routes := []object{appRoutes, {"handle": []object{{"handler": "static_response", "status_code": 404}}}}
+	policies := []object{{"on_demand": true, "issuers": []object{{"module": "acme"}}}}
+	certificates := object{}
+	adminListen := "127.0.0.1:2020"
+	if customOnly {
+		adminListen = nativeAdminListen
+	} else {
+		consoleProxy := proxy("127.0.0.1:8080")
+		// The internal Caddy site matches Host 127.0.0.1. Preserving the public
+		// console Host would miss that site and return Caddy's empty default 200.
+		// Only this hop overrides Host; Origin, CSRF and application Hosts remain.
+		consoleProxy["headers"].(object)["request"].(object)["set"] = object{"Host": []string{"127.0.0.1"}}
+		console := object{"match": []object{{"host": []string{host}}}, "handle": []object{consoleProxy}, "terminal": true}
+		routes = append([]object{
+			unavailable(object{"host": []string{host}, "path": []string{"/internal", "/internal/*", "/config", "/config/*", "/id", "/id/*", "/load", "/stop", "/healthz", "/readyz"}}),
+			unavailable(object{"host": []string{host}, "path": []string{"/api", "/api/*"}, "not": []object{{"path": []string{"/api/v1/acornfox/*"}}}}),
+			console,
+		}, routes...)
+		certificates["automate"] = []string{host}
+		policies = append([]object{{"subjects": []string{host}, "issuers": []object{{"module": "acme"}}}}, policies...)
+	}
 	config := object{
-		"admin":   object{"listen": "127.0.0.1:2020", "config": object{"persist": false}},
+		"admin":   object{"listen": adminListen, "config": object{"persist": false}},
 		"storage": object{"module": "file_system", "root": "/var/lib/acornfox/edge/data"},
 		"apps": object{
 			"http": object{"servers": object{
@@ -91,20 +122,13 @@ func initialConfig(origin string, resolvers []string, grace string) ([]byte, err
 					{"match": []object{{"path": []string{"/healthz"}}}, "handle": []object{{"handler": "static_response", "status_code": 200}}, "terminal": true},
 					{"handle": []object{{"handler": "static_response", "status_code": 404}}},
 				}},
-				"public_https": object{"listen": []string{":443"}, "tls_connection_policies": []object{{}}, "strict_sni_host": true, "routes": []object{
-					unavailable(object{"host": []string{host}, "path": []string{"/internal", "/internal/*", "/config", "/config/*", "/id", "/id/*", "/load", "/stop", "/healthz", "/readyz"}}),
-					unavailable(object{"host": []string{host}, "path": []string{"/api", "/api/*"}, "not": []object{{"path": []string{"/api/v1/acornfox/*"}}}}),
-					console, appRoutes, {"handle": []object{{"handler": "static_response", "status_code": 404}}},
-				}},
+				"public_https": object{"listen": []string{":443"}, "tls_connection_policies": []object{{}}, "strict_sni_host": true, "routes": routes},
 			}},
 			"tls": object{
-				"certificates": object{"automate": []string{host}},
+				"certificates": certificates,
 				"resolvers":    append([]string{}, resolvers...),
 				"automation": object{
-					"policies": []object{
-						{"subjects": []string{host}, "issuers": []object{{"module": "acme"}}},
-						{"on_demand": true, "issuers": []object{{"module": "acme"}}},
-					},
+					"policies":  policies,
 					"on_demand": object{"permission": object{"module": "http", "endpoint": PermissionURL}},
 				},
 			},

@@ -114,3 +114,37 @@ func TestGeneratedConsoleHostReachesTheInternalSite(t *testing.T) {
 		})
 	}
 }
+
+func TestCustomOnlyConfigHasNoPublicConsoleOrRoot(t *testing.T) {
+	raw, err := CustomOnlyInitialConfig([]string{"223.5.5.5:53"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var config object
+	if err := json.Unmarshal(raw, &config); err != nil {
+		t.Fatal(err)
+	}
+	if config["admin"].(map[string]any)["listen"] != nativeAdminListen {
+		t.Fatal("custom-only Caddy Admin did not use the protected Unix address")
+	}
+	apps := config["apps"].(map[string]any)
+	servers := apps["http"].(map[string]any)["servers"].(map[string]any)
+	routes := servers["public_https"].(map[string]any)["routes"].([]any)
+	if len(routes) != 2 || routes[0].(map[string]any)["handle"].([]any)[0].(map[string]any)["@id"] != SubtreeID {
+		t.Fatal("custom-only profile changed the owned application subtree")
+	}
+	tls := apps["tls"].(map[string]any)
+	if _, exists := tls["certificates"].(map[string]any)["automate"]; exists {
+		t.Fatal("custom-only profile would issue a public console certificate")
+	}
+	policies := tls["automation"].(map[string]any)["policies"].([]any)
+	if len(policies) != 1 || policies[0].(map[string]any)["on_demand"] != true {
+		t.Fatal("custom-only profile lost on-demand certificate permission")
+	}
+	if _, err := InitialConfig("", nil); err == nil {
+		t.Fatal("legacy public-console profile accepted an empty root")
+	}
+	if generatedConsoleProxy(t)["handler"] != "reverse_proxy" {
+		t.Fatal("old public-console profile changed")
+	}
+}

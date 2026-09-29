@@ -230,7 +230,7 @@ func sealCandidateArtifactsV1(tree *CandidateTreeStageV1, taskRoot string, prede
 		return failWith("archive")
 	}
 	bundle := []byte(archiveSHA + "  " + archiveName + "\n" + sha256Text(manifestRaw) + "  release/manifest.json\n")
-	binding := install.AcornFoxCandidateBindingV1{SchemaVersion: install.AcornFoxCandidateBindingV1Schema, Product: Product, Version: treeReceipt.Version, ReleaseID: treeReceipt.ReleaseID, SourceRepository: treeReceipt.SourceRepository, SourceCommit: treeReceipt.SourceCommit, Architecture: Architecture, MigrationVersion: Migration, ManifestSHA256: sha256Text(manifestRaw), ArchiveSHA256: archiveSHA, BundleManifestSHA256: sha256Text(bundle), NMinusOne: nMinusOne}
+	binding := install.AcornFoxCandidateBindingV1{SchemaVersion: install.AcornFoxCandidateBindingCurrentSchema, Product: Product, Version: treeReceipt.Version, ReleaseID: treeReceipt.ReleaseID, SourceRepository: treeReceipt.SourceRepository, SourceCommit: treeReceipt.SourceCommit, Architecture: Architecture, MigrationVersion: Migration, ManifestSHA256: sha256Text(manifestRaw), ArchiveSHA256: archiveSHA, BundleManifestSHA256: sha256Text(bundle), NMinusOne: nMinusOne}
 	bindingRaw, err := json.Marshal(binding)
 	if err != nil {
 		return fail()
@@ -644,7 +644,7 @@ func verifyArtifactSemantics(root string, manifest []byte, receipt CandidateArti
 		return false
 	}
 	var binding install.AcornFoxCandidateBindingV1
-	if strictCandidateJSON(bindingRaw, &binding) != nil || binding.SchemaVersion != install.AcornFoxCandidateBindingV1Schema || binding.Product != Product || binding.Version != receipt.Version || binding.ReleaseID != receipt.ReleaseID || binding.SourceRepository != receipt.SourceRepository || binding.SourceCommit != receipt.SourceCommit || binding.Architecture != Architecture || binding.MigrationVersion != Migration || binding.ManifestSHA256 != receipt.ManifestSHA256 || binding.ArchiveSHA256 != receipt.ArchiveSHA256 || binding.BundleManifestSHA256 != receipt.BundleSHA256 || (binding.NMinusOne != nil) != (receipt.PredecessorBindingSHA256 != "") {
+	if strictCandidateJSON(bindingRaw, &binding) != nil || binding.SchemaVersion != install.AcornFoxCandidateBindingCurrentSchema || binding.Product != Product || binding.Version != receipt.Version || binding.ReleaseID != receipt.ReleaseID || binding.SourceRepository != receipt.SourceRepository || binding.SourceCommit != receipt.SourceCommit || binding.Architecture != Architecture || binding.MigrationVersion != Migration || binding.ManifestSHA256 != receipt.ManifestSHA256 || binding.ArchiveSHA256 != receipt.ArchiveSHA256 || binding.BundleManifestSHA256 != receipt.BundleSHA256 || (binding.NMinusOne != nil) != (receipt.PredecessorBindingSHA256 != "") {
 		return false
 	}
 	predecessorRaw, err := readCandidatePredecessor(root, receipt)

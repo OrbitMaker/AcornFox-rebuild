@@ -37,6 +37,10 @@ func run(args []string, in io.Reader, out, errOut io.Writer, env func(string) st
 		return c.fail("usage", 0, "usage", "command is required")
 	}
 	if err := c.command(clean); err != nil {
+		var reported reportedCLIResult
+		if errors.As(err, &reported) {
+			return reported.code
+		}
 		var responseErr apiError
 		if errors.As(err, &responseErr) {
 			return c.fail(responseErr.class(), responseErr.status, responseErr.Code, responseErr.Message)

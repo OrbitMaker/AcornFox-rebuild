@@ -30,8 +30,24 @@ import (
 const statePath = RunRoot + "/state.json"
 const workerUnit = "acornfox-buildkit.service"
 
+// These are two fixed installed identities, not caller-supplied paths or users.
+// The Native release carries BuildKit in embedded/bin; the legacy package did not.
+type managerIdentity struct {
+	clientUser       string
+	workerExecutable string
+	native           bool
+}
+
+func legacyManagerIdentity() managerIdentity {
+	return managerIdentity{"acornfox", "/opt/acornfox/current/bin/buildkitd", false}
+}
+func nativeManagerIdentity() managerIdentity {
+	return managerIdentity{"acornfox-build", "/opt/acornfox/current/embedded/bin/buildkitd", true}
+}
+
 type state struct {
 	Schema               int    `json:"schema"`
+	Profile              string `json:"profile,omitempty"`
 	Token                string `json:"token"`
 	PolicyDigest         string `json:"policy_digest"`
 	ImplementationDigest string `json:"implementation_digest"`
@@ -46,14 +62,16 @@ type state struct {
 }
 
 type Manager struct {
-	policy    []byte
-	digest    string
-	serverUID uint32
-	serverGID int
-	workerUID uint32
-	lock      *os.File
-	state     state
-	mu        sync.Mutex
+	policy           []byte
+	digest           string
+	serverUID        uint32
+	serverGID        int
+	workerUID        uint32
+	workerExecutable string
+	native           bool
+	lock             *os.File
+	state            state
+	mu               sync.Mutex
 }
 
 func ReadInstalledPolicy() ([]byte, string, error) {
@@ -87,6 +105,19 @@ func readRootFile(path string, limit int64) ([]byte, error) {
 }
 
 func NewProductionManager() (*Manager, error) {
+	return newProductionManager(legacyManagerIdentity())
+}
+
+// NewNativeProductionManager serves only the separately owned Native Source
+// adapter. It retains the same root network manager and rootless BuildKit worker.
+func NewNativeProductionManager() (*Manager, error) {
+	return newProductionManager(nativeManagerIdentity())
+}
+
+func newProductionManager(identity managerIdentity) (*Manager, error) {
+	if identity != legacyManagerIdentity() && identity != nativeManagerIdentity() {
+		return nil, ErrPolicy
+	}
 	if os.Geteuid() != 0 {
 		return nil, errors.New("build network manager requires host root")
 	}
@@ -102,7 +133,7 @@ func NewProductionManager() (*Manager, error) {
 	if err != nil {
 		return nil, err
 	}
-	server, err := user.Lookup("acornfox")
+	server, err := user.Lookup(identity.clientUser)
 	if err != nil {
 		return nil, err
 	}
@@ -130,6 +161,9 @@ func NewProductionManager() (*Manager, error) {
 	if !ok || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || st.Uid != 0 || info.Mode().Perm()&0022 != 0 {
 		return nil, ErrPolicy
 	}
+	if identity.native && (int(st.Gid) != gid || info.Mode().Perm() != 0750) {
+		return nil, ErrPolicy
+	}
 	lock, err := os.OpenFile(RunRoot+"/lock", os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0600)
 	if err != nil {
 		return nil, err
@@ -138,7 +172,7 @@ func NewProductionManager() (*Manager, error) {
 		lock.Close()
 		return nil, err
 	}
-	return &Manager{policy: raw, digest: digest, serverUID: uint32(suid), serverGID: gid, workerUID: uint32(wuid), lock: lock}, nil
+	return &Manager{policy: raw, digest: digest, serverUID: uint32(suid), serverGID: gid, workerUID: uint32(wuid), workerExecutable: identity.workerExecutable, native: identity.native, lock: lock}, nil
 }
 
 func (m *Manager) Close() error {
@@ -196,7 +230,7 @@ func (m *Manager) loadState() error {
 	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
-	if decoder.Decode(&m.state) != nil || m.state.Schema != 1 || !fingerprintPattern.MatchString(m.state.Token) || m.state.PolicyDigest != m.digest || m.state.ImplementationDigest != implementationDigest() {
+	if decoder.Decode(&m.state) != nil || m.state.Schema != 1 || !stateProfileMatches(m.native, m.state.Profile) || !fingerprintPattern.MatchString(m.state.Token) || m.state.PolicyDigest != m.digest || m.state.ImplementationDigest != implementationDigest() {
 		return ErrPolicy
 	}
 	var extra any
@@ -204,6 +238,15 @@ func (m *Manager) loadState() error {
 		return ErrPolicy
 	}
 	return nil
+}
+
+// A legacy state has no profile field. Only a Native manager may adopt a
+// Native state; neither cleanup path may claim the other profile's resources.
+func stateProfileMatches(native bool, profile string) bool {
+	if native {
+		return profile == "native"
+	}
+	return profile == ""
 }
 
 func namespaceIdentity() (uint64, uint64, error) {
@@ -389,9 +432,13 @@ func requireUnusedSubnet(ctx context.Context) error {
 	return nil
 }
 
-func loadRootlessProfile(ctx context.Context) error {
+func (m *Manager) loadRootlessProfile(ctx context.Context) error {
 	profile, err := readRootFile("/etc/acornfox/rootlesskit.apparmor", 65536)
-	if err != nil || !bytes.Equal(profile, RootlessProfile()) {
+	want := RootlessProfile()
+	if m.native {
+		want = NativeRootlessProfile()
+	}
+	if err != nil || !bytes.Equal(profile, want) {
 		return ErrPolicy
 	}
 	if enabled, err := os.ReadFile("/sys/module/apparmor/parameters/enabled"); err == nil && strings.TrimSpace(string(enabled)) == "Y" {
@@ -422,7 +469,7 @@ func (m *Manager) Prepare(ctx context.Context) error {
 		if err = m.verifyKernel(ctx); err != nil {
 			return err
 		}
-		return loadRootlessProfile(ctx)
+		return m.loadRootlessProfile(ctx)
 	} else if !os.IsNotExist(err) {
 		return err
 	}
@@ -456,10 +503,13 @@ func (m *Manager) Prepare(ctx context.Context) error {
 		return err
 	}
 	m.state = state{Schema: 1, Token: hex.EncodeToString(token), PolicyDigest: m.digest, ImplementationDigest: implementationDigest()}
+	if m.native {
+		m.state.Profile = "native"
+	}
 	if err := m.writeState(); err != nil {
 		return err
 	}
-	if err := loadRootlessProfile(ctx); err != nil {
+	if err := m.loadRootlessProfile(ctx); err != nil {
 		return err
 	}
 	if _, err := ip(ctx, "netns", "add", Namespace); err != nil {
@@ -591,7 +641,7 @@ func (m *Manager) verifyWorker(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	installed, err := os.Stat("/opt/acornfox/current/bin/buildkitd")
+	installed, err := os.Stat(m.workerExecutable)
 	if err != nil || !os.SameFile(exe, installed) {
 		return ErrPolicy
 	}

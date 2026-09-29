@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 var ErrGitSource = errors.New("acornfox git source is invalid")
@@ -57,10 +58,17 @@ func verifyGitSource(ctx context.Context, root string, witness Witness, policy S
 	return verifyGitSourceWithDependencies(ctx, root, witness, policy, toolchain, run, exec.LookPath, hashTrustedExecutable)
 }
 func verifyGitSourceWithDependencies(ctx context.Context, root string, witness Witness, policy SourcePolicyV1, toolchain ToolchainInputsV1, run commandRunner, lookup executableResolver, hash executableHasher) error {
+	if !witness.Valid() {
+		return ErrGitSource
+	}
+	return verifyGitSourceIdentity(ctx, root, sourceIdentityFromWitness(witness), policy, toolchain, run, lookup, hash)
+}
+
+func verifyGitSourceIdentity(ctx context.Context, root string, identity sourceIdentity, policy SourcePolicyV1, toolchain ToolchainInputsV1, run commandRunner, lookup executableResolver, hash executableHasher) error {
 	canonical, canonicalErr := CanonicalSourcePolicyV1(policy)
 	toolchainRaw, toolchainErr := CanonicalToolchainInputsV1(toolchain)
 	root, rootErr := cleanGitRoot(root)
-	if ctx == nil || ctx.Err() != nil || run == nil || lookup == nil || hash == nil || rootErr != nil || !witness.Valid() || canonicalErr != nil || toolchainErr != nil || sha256Text(canonical) != witness.decision.SourcePolicySHA256 || sha256Text(toolchainRaw) != witness.decision.ToolchainSHA256 {
+	if ctx == nil || ctx.Err() != nil || run == nil || lookup == nil || hash == nil || rootErr != nil || !identity.valid() || canonicalErr != nil || toolchainErr != nil || sha256Text(canonical) != identity.policySHA || sha256Text(toolchainRaw) != identity.toolchainSHA {
 		return ErrGitSource
 	}
 	git, err := bindExecutable("git", toolchain.GitBinarySHA256, run, lookup, hash)
@@ -81,7 +89,7 @@ func verifyGitSourceWithDependencies(ctx context.Context, root string, witness W
 		return ErrGitSource
 	}
 	commit, e := call("rev-parse", "HEAD^{commit}")
-	if e != nil || commit != witness.decision.SourceCommit {
+	if e != nil || commit != identity.commit {
 		return ErrGitSource
 	}
 	if _, e = call("symbolic-ref", "-q", "HEAD"); !hasExitCode(e, 1) {
@@ -96,18 +104,18 @@ func verifyGitSourceWithDependencies(ctx context.Context, root string, witness W
 		return ErrGitSource
 	}
 	origin, e := call("remote", "get-url", "--all", "origin")
-	if e != nil || !onlyExpectedRemoteURL(origin, witness.decision.SourceRepository) {
+	if e != nil || !onlyExpectedRemoteURL(origin, identity.repository) {
 		return ErrGitSource
 	}
 	pushOrigin, e := call("remote", "get-url", "--push", "--all", "origin")
-	if e != nil || !onlyExpectedRemoteURL(pushOrigin, witness.decision.SourceRepository) {
+	if e != nil || !onlyExpectedRemoteURL(pushOrigin, identity.repository) {
 		return ErrGitSource
 	}
 	raw, e := git.Run(ctx, gitReadArgs("ls-files", "-z", "--stage"), root, gitReadEnv())
 	if e != nil {
 		return ErrGitSource
 	}
-	tree, e := git.Run(ctx, gitReadArgs("ls-tree", "-r", "-z", witness.decision.SourceCommit), root, gitReadEnv())
+	tree, e := git.Run(ctx, gitReadArgs("ls-tree", "-r", "-z", identity.commit), root, gitReadEnv())
 	if e != nil || !gitIndexMatches(raw, tree, policy.Files, ctx, root, git) {
 		return ErrGitSource
 	}
@@ -115,7 +123,7 @@ func verifyGitSourceWithDependencies(ctx context.Context, root string, witness W
 		return ErrGitSource
 	}
 	commit, e = call("rev-parse", "HEAD^{commit}")
-	if e != nil || commit != witness.decision.SourceCommit {
+	if e != nil || commit != identity.commit {
 		return ErrGitSource
 	}
 	if _, e = call("symbolic-ref", "-q", "HEAD"); !hasExitCode(e, 1) {
@@ -282,6 +290,7 @@ func readGitBlobBatch(ctx context.Context, root string, git boundExecutable, obj
 		"GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0",
 		"GIT_OPTIONAL_LOCKS=0", "GIT_NO_REPLACE_OBJECTS=1",
 	}
+	command.WaitDelay = 250 * time.Millisecond
 	command.Stdin = strings.NewReader(request.String())
 	command.Stderr = io.Discard
 	stdout, err := command.StdoutPipe()
@@ -291,13 +300,17 @@ func readGitBlobBatch(ctx context.Context, root string, git boundExecutable, obj
 	if err = command.Start(); err != nil {
 		return nil, ErrGitSource
 	}
+	// A descendant may inherit the pipe after Git is killed. Closing our
+	// read end on cancellation also bounds the synchronous batch parser.
+	stopRead := context.AfterFunc(ctx, func() { _ = stdout.Close() })
+	defer stopRead()
 	digests, parseErr := parseGitBlobBatch(bufio.NewReaderSize(stdout, 64<<10), objectIDs)
 	if parseErr != nil && command.Process != nil {
 		_ = command.Process.Kill()
 	}
 	waitErr := command.Wait()
 	after, hashErr := git.hash(git.path)
-	if parseErr != nil || waitErr != nil || hashErr != nil || after != git.digest {
+	if ctx.Err() != nil || parseErr != nil || waitErr != nil || hashErr != nil || after != git.digest {
 		return nil, ErrGitSource
 	}
 	return digests, nil

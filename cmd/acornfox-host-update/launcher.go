@@ -31,7 +31,6 @@ var (
 		"acornfox-edge.service",
 		"acornfox-healthcheck.timer",
 		"acornfox-healthcheck.service",
-		"acornfox-pi-worker.service",
 	}
 
 	ErrLauncherProbeTimeout = errors.New("launcher: local probe timed out")

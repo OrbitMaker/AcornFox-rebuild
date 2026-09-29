@@ -34,6 +34,8 @@ const (
 	CapabilityRuntimeObserve  Capability = "runtime.observe"
 	CapabilityRuntimeLogs     Capability = "runtime.logs"
 	CapabilityRuntimeRestart  Capability = "runtime.restart"
+	CapabilityRuntimeStop     Capability = "runtime.stop"
+	CapabilityRuntimeStart    Capability = "runtime.start"
 	CapabilityRuntimeScale    Capability = "runtime.scale"
 	CapabilityRuntimeRollback Capability = "runtime.rollback"
 	CapabilityRuntimeDestroy  Capability = "runtime.destroy"
@@ -381,6 +383,14 @@ type CapacityProvider interface {
 	Release(context.Context, CapacityLease, OperationContext) error
 }
 
+type CapacityRetainedReconciler interface {
+	ReconcileRetained(context.Context, CapacityLease, OperationContext) error
+}
+
+type CapacityReleasedFinalizer interface {
+	FinalizeReleased(context.Context, CapacityLease, OperationContext) error
+}
+
 type NetworkMode string
 
 const (
@@ -477,6 +487,16 @@ type RestartRequest struct {
 	ServiceName  string           `json:"service_name"`
 	Operation    OperationContext `json:"operation"`
 }
+type StopRequest struct {
+	DeploymentID domain.ID        `json:"deployment_id"`
+	ServiceName  string           `json:"service_name"`
+	Operation    OperationContext `json:"operation"`
+}
+type StartRequest struct {
+	DeploymentID domain.ID        `json:"deployment_id"`
+	ServiceName  string           `json:"service_name"`
+	Operation    OperationContext `json:"operation"`
+}
 type ScaleRequest struct {
 	DeploymentID domain.ID        `json:"deployment_id"`
 	ServiceName  string           `json:"service_name"`
@@ -532,6 +552,13 @@ type RuntimeDriver interface {
 	Scale(ctx context.Context, request ScaleRequest) error
 	Rollback(ctx context.Context, request RollbackRequest) (domain.Deployment, error)
 	Destroy(ctx context.Context, request DestroyRequest) error
+}
+
+// LifecycleRuntimeDriver is an optional narrow extension for runtime drivers supporting
+// recoverable stop and start semantics without destroying containers or releasing resources.
+type LifecycleRuntimeDriver interface {
+	Stop(ctx context.Context, request StopRequest) error
+	Start(ctx context.Context, request StartRequest) error
 }
 
 type VolumeSpec struct {

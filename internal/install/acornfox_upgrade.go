@@ -82,8 +82,20 @@ func (i acornFoxUpgradeImage) identity() AcornFoxBuildIdentityV1 {
 	return AcornFoxBuildIdentityV1{SchemaVersion: 1, Product: AcornFoxV1Product, LayoutVersion: 1, Role: "upgrade", Version: c.Version, ReleaseID: c.ReleaseID, SourceCommit: c.SourceCommit}
 }
 func (i acornFoxUpgradeImage) validate(layout acornFoxInstallLayout, requireSetupToken bool) error {
-	b, e := ParseAcornFoxCandidateBindingV1(i.Binding, i.Repo.BindingSHA256)
-	if e != nil || i.Substrate.Validate() != nil || i.Repo.Validate() != nil || i.Live.Validate() != nil || i.Activation.Validate() != nil || i.ControlPlane.validateMigration(b.binding.MigrationVersion) != nil || i.Runtime.validateExisting(requireSetupToken) != nil {
+	b, isFrozen, e := parseAcornFoxUpgradeImageBinding(i.Binding, i.Repo.BindingSHA256)
+	if e != nil {
+		return ErrAcornFoxUpgradeConflict
+	}
+	if isFrozen {
+		if validateAcornFoxFrozen0040SubstrateReceipt(i.Substrate, b, i.Repo.BindingSHA256) != nil {
+			return ErrAcornFoxUpgradeConflict
+		}
+	} else {
+		if i.Substrate.Validate() != nil {
+			return ErrAcornFoxUpgradeConflict
+		}
+	}
+	if i.Repo.Validate() != nil || i.Live.Validate() != nil || i.Activation.Validate() != nil || i.ControlPlane.validateMigration(b.MigrationVersion) != nil || i.Runtime.validateExisting(requireSetupToken) != nil {
 		return ErrAcornFoxUpgradeConflict
 	}
 	if len(i.DatabaseEnv) != 0 {
@@ -93,10 +105,15 @@ func (i acornFoxUpgradeImage) validate(layout acornFoxInstallLayout, requireSetu
 		}
 	}
 	c := i.Substrate.CandidateReceipt
-	if i.Repo.Phase != AcornFoxRepoPreparedFinal || i.Repo.NeedsRecovery || i.Repo.LayoutSHA256 != layout.evidence() || i.Repo.BindingSHA256 != c.BindingSHA256 || c.ReleaseID != b.binding.ReleaseID || c.SourceCommit != b.binding.SourceCommit || i.Repo.SubstrateReceiptSHA256 != sha256Hex(acornFoxUpgradeJSON(i.Substrate)) || i.Live.BindingSHA256 != c.BindingSHA256 || i.Live.LayoutSHA256 != layout.evidence() || i.Live.OwnershipEvidence != "host_uid_gid_verified" || i.Live.SubstrateReceiptSHA256 != i.Repo.SubstrateReceiptSHA256 || i.Live.LiveTreeSHA256 != i.Repo.LiveTreeSHA256 || i.Live.StaticSetSHA256 != i.Repo.StaticSetSHA256 || i.Live.OwnershipPlanSHA256 != i.Repo.OwnershipPlanSHA256 || i.Repo.ActivationSHA256 != sha256Hex(acornFoxUpgradeJSON(i.Activation)) {
+	if i.Repo.Phase != AcornFoxRepoPreparedFinal || i.Repo.NeedsRecovery || i.Repo.LayoutSHA256 != layout.evidence() || i.Repo.BindingSHA256 != c.BindingSHA256 || c.ReleaseID != b.ReleaseID || c.SourceCommit != b.SourceCommit || i.Repo.SubstrateReceiptSHA256 != sha256Hex(acornFoxUpgradeJSON(i.Substrate)) || i.Live.BindingSHA256 != c.BindingSHA256 || i.Live.LayoutSHA256 != layout.evidence() || i.Live.OwnershipEvidence != "host_uid_gid_verified" || i.Live.SubstrateReceiptSHA256 != i.Repo.SubstrateReceiptSHA256 || i.Live.LiveTreeSHA256 != i.Repo.LiveTreeSHA256 || i.Live.StaticSetSHA256 != i.Repo.StaticSetSHA256 || i.Live.OwnershipPlanSHA256 != i.Repo.OwnershipPlanSHA256 || i.Repo.ActivationSHA256 != sha256Hex(acornFoxUpgradeJSON(i.Activation)) {
 		return ErrAcornFoxUpgradeConflict
 	}
-	entries, e := acornFoxLiveExpectedEntriesForLayout(layout, &PublishedAcornFoxSubstrateV1{receipt: i.Substrate})
+	var entries []SubstrateEntry
+	if isFrozen {
+		entries, e = acornFoxFrozen0040ExpectedEntries(layout, i.Substrate)
+	} else {
+		entries, e = acornFoxLiveExpectedEntriesForLayout(layout, &PublishedAcornFoxSubstrateV1{receipt: i.Substrate})
+	}
 	if e != nil {
 		return ErrAcornFoxUpgradeConflict
 	}
@@ -423,7 +440,7 @@ func (u *acornFoxUpgrade) upgrade(ctx context.Context, request AcornFoxUpgradeRe
 	if prior.Repo.BindingSHA256 != request.CurrentBindingSHA256 {
 		return empty, ErrAcornFoxUpgradeConflict
 	}
-	piEnabled, e := u.capturePIEnabled(ctx, s, old.binding.MigrationVersion)
+	piEnabled, e := u.capturePIEnabled(ctx, s, old.binding)
 	if e != nil {
 		return empty, e
 	}

@@ -2,18 +2,15 @@
 Description=AcornFox control-plane server
 Wants=network-online.target acornfox-buildkit.service
 Requires=acornfox-upgrade-safe.target
-After=network-online.target acornfox-buildkit.service acornfox-upgrade-safe.target acornfox-pi-worker.service
+After=network-online.target acornfox-buildkit.service acornfox-upgrade-safe.target
 
 [Service]
 Type=simple
 User=acornfox
 Group=acornfox
-RuntimeDirectory=acornfox-assistant
-RuntimeDirectoryMode=0750
 SupplementaryGroups=acornfox-buildkit
 WorkingDirectory=/opt/acornfox/current
 Environment=ACORNFOX_RUNTIME_MODE=clean
-Environment=ACORNFOX_ASSISTANT_ENABLED=true
 Environment=ACORNFOX_SERVER_ADDR=127.0.0.1:18481
 EnvironmentFile=/etc/acornfox/runtime/server.env
 LoadCredential=server.key:/etc/acornfox/runtime/server.key
@@ -45,7 +42,7 @@ AmbientCapabilities=
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
-ReadWritePaths=/run/acornfox-assistant /var/lib/acornfox/uploads /var/lib/acornfox/workspaces /var/lib/acornfox/build-work /var/lib/acornfox/oci /var/lib/acornfox/secrets /var/lib/acornfox/secret-materials /var/log/acornfox/server
+ReadWritePaths=/var/lib/acornfox/uploads /var/lib/acornfox/workspaces /var/lib/acornfox/build-work /var/lib/acornfox/oci /var/lib/acornfox/secrets /var/lib/acornfox/secret-materials /var/log/acornfox/server
 BindReadOnlyPaths=-/run/acornfox-buildkit -/run/acornfox-build-policy
 UMask=0077
 

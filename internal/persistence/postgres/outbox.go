@@ -13,22 +13,8 @@ import (
 	"github.com/open-card/open-card/internal/compatibility"
 )
 
-// OutboxEvent is the persistence-shaped event record. Sequence is the
-// aggregate-local sequence retained by the original M0 schema; StreamSequence
-// is the global replay cursor added by migration 0004.
-type OutboxEvent struct {
-	ID               string
-	AggregateType    string
-	AggregateID      string
-	AggregateVersion int64
-	Sequence         int64
-	StreamSequence   int64
-	EventType        string
-	Payload          json.RawMessage
-	CreatedAt        time.Time
-	PublishedAt      *time.Time
-	PayloadVersion   string
-}
+// OutboxEvent aliases the neutral persistence-shaped event record from the application layer.
+type OutboxEvent = application.OutboxEvent
 
 // AppendOutboxEvent appends one event and allocates a global stream sequence.
 // Aggregate sequence allocation is serialized by a transaction-scoped

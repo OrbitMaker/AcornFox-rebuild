@@ -122,6 +122,8 @@ type Sampler struct {
 	previous *rawSample
 	failed   bool
 	start    sync.Once
+	history  *historyRing
+	done     chan struct{}
 }
 
 func NewSampler(config Config) *Sampler {
@@ -146,7 +148,7 @@ func NewSampler(config Config) *Sampler {
 	if config.StaleAfter <= 0 {
 		config.StaleAfter = DefaultStaleAfter
 	}
-	return &Sampler{reader: reader, os: config.OS, now: now, logicalCores: cores, interval: config.SampleInterval, staleAfter: config.StaleAfter}
+	return &Sampler{reader: reader, os: config.OS, now: now, logicalCores: cores, interval: config.SampleInterval, staleAfter: config.StaleAfter, history: newHistoryRing()}
 }
 
 // Start schedules an immediate sample and then samples until ctx is done.
@@ -159,7 +161,13 @@ func (s *Sampler) Start(ctx context.Context) {
 		ctx = context.Background()
 	}
 	s.start.Do(func() {
+		s.mu.Lock()
+		s.done = make(chan struct{})
+		doneChan := s.done
+		s.mu.Unlock()
+
 		go func() {
+			defer close(doneChan)
 			s.sample(ctx)
 			ticker := time.NewTicker(s.interval)
 			defer ticker.Stop()
@@ -173,6 +181,17 @@ func (s *Sampler) Start(ctx context.Context) {
 			}
 		}()
 	})
+}
+
+// Done returns a channel that is closed when the background sampling worker exits.
+// If Start was never called or the sampler is nil, Done returns nil.
+func (s *Sampler) Done() <-chan struct{} {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.done
 }
 
 // Sample is available for controlled startup and tests. HTTP handlers must use
@@ -195,6 +214,11 @@ func (s *Sampler) sample(ctx context.Context) {
 	defer s.mu.Unlock()
 	if err != nil {
 		s.latest, s.previous, s.failed = nil, nil, true
+		failedAt := time.Now().UTC()
+		if s.now != nil {
+			failedAt = s.now().UTC()
+		}
+		s.recordFailureLocked(failedAt)
 		return
 	}
 	recorded := &recordedSample{raw: value}
@@ -210,6 +234,7 @@ func (s *Sampler) sample(ctx context.Context) {
 		copy.network = &network
 	}
 	s.previous = &copy
+	s.recordSuccessLocked(recorded)
 }
 
 func (s *Sampler) collect() (rawSample, error) {

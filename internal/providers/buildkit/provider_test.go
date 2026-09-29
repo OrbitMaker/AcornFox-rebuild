@@ -685,6 +685,11 @@ func TestProductionExecutionPolicyAllowsNetworkedRUNThroughAttestedWorker(t *tes
 			}
 		})
 	}
+	native := config
+	native.Command = "/opt/acornfox/current/embedded/bin/buildctl"
+	if _, err := New(native); err != nil {
+		t.Fatalf("fixed Native embedded buildctl rejected: %v", err)
+	}
 	provider, err := New(config)
 	if err != nil {
 		t.Fatal(err)

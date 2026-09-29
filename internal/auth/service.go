@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/url"
 	"strconv"
 	"strings"
@@ -21,7 +22,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/open-card/open-card/internal/domain"
-	"github.com/open-card/open-card/internal/persistence/postgres"
 )
 
 const (
@@ -42,10 +42,14 @@ var (
 	// credential or session. HTTP callers use it to return a retryable 503
 	// without clearing a browser's potentially still-valid cookies.
 	ErrAuthenticationUnavailable = errors.New("authentication persistence unavailable")
-	ErrRateLimited               = errors.New("authentication rate limited")
+	ErrRateLimited               = domain.ErrRateLimited
 	ErrOriginDenied              = errors.New("request origin denied")
 	ErrCSRFInvalid               = errors.New("csrf validation failed")
 	ErrPasswordPolicy            = errors.New("password does not meet the required policy")
+
+	// Neutral shared sentinels aliased from domain.
+	ErrNotFound                  = domain.ErrObjectNotFound
+	ErrCredentialVersionConflict = domain.ErrCredentialVersionConflict
 )
 
 type Store interface {
@@ -57,6 +61,8 @@ type Store interface {
 	RevokeAdminSession(context.Context, domain.ID, time.Time) error
 	UpsertAdminLoginRateLimit(context.Context, domain.AdminLoginRateLimit) error
 	AdminLoginRateLimit(context.Context, domain.ID, domain.AuthDigest) (domain.AdminLoginRateLimit, error)
+	RecordAdminLoginFailure(ctx context.Context, adminID domain.ID, sourceDigest domain.AuthDigest, now time.Time) (domain.AdminLoginRateLimit, error)
+	CreateAdminSessionIfLoginAllowed(ctx context.Context, session domain.AdminSession, sourceDigest domain.AuthDigest, now time.Time) error
 }
 
 type Config struct {
@@ -110,10 +116,27 @@ func newServiceInternal(config Config, allowTestParameters bool, allowLocalLoopb
 	}
 	var origin string
 	if allowLocalLoopback {
-		if config.Origin != ExactLocalLoopbackOrigin {
-			return nil, errors.New("local auth origin must be exact " + ExactLocalLoopbackOrigin)
+		trimmed := strings.TrimSpace(config.Origin)
+		if trimmed == "" || trimmed != config.Origin {
+			return nil, errors.New("local auth origin must not contain leading or trailing whitespace")
 		}
-		origin = ExactLocalLoopbackOrigin
+		parsed, err := url.Parse(trimmed)
+		if err != nil || parsed.Scheme != "http" || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+			return nil, errors.New("local auth origin must be an exact loopback HTTP origin")
+		}
+		host, portStr, err := net.SplitHostPort(parsed.Host)
+		if err != nil {
+			return nil, errors.New("local auth origin must include explicit host and port")
+		}
+		ip := net.ParseIP(host)
+		if ip == nil || !ip.IsLoopback() {
+			return nil, errors.New("local auth origin must use a loopback IP address")
+		}
+		port, err := strconv.Atoi(portStr)
+		if err != nil || port < 1 || port > 65535 {
+			return nil, errors.New("local auth origin port is invalid")
+		}
+		origin = parsed.String()
 	} else {
 		trimmed := strings.TrimSpace(config.Origin)
 		if trimmed != "" {
@@ -165,15 +188,13 @@ func (s *Service) Login(ctx context.Context, origin, password, source string) (L
 	sourceDigest := digestSource(source)
 	if limit, limitErr := s.store.AdminLoginRateLimit(ctx, credential.ID, sourceDigest); limitErr == nil && limit.LockedUntil != nil && now.Before(*limit.LockedUntil) {
 		return LoginResult{}, ErrRateLimited
-	} else if limitErr != nil && !errors.Is(limitErr, postgres.ErrNotFound) {
+	} else if limitErr != nil && !errors.Is(limitErr, ErrNotFound) {
 		return LoginResult{}, ErrAuthenticationUnavailable
 	}
 	valid, verifyErr := verifyPassword(password, credential.PasswordHash, s.minIterations)
 	if verifyErr != nil || !valid {
-		if err := s.recordLoginFailure(ctx, credential.ID, sourceDigest, now); err != nil {
+		if err := s.recordLoginFailure(ctx, credential.ID, sourceDigest, s.now()); err != nil {
 			return LoginResult{}, err
-		} else if errors.Is(err, ErrRateLimited) {
-			return LoginResult{}, ErrRateLimited
 		}
 		return LoginResult{}, ErrAuthenticationFailed
 	}
@@ -189,8 +210,25 @@ func (s *Service) Login(ctx context.Context, origin, password, source string) (L
 	if err != nil {
 		return LoginResult{}, err
 	}
-	session := domain.AdminSession{ID: id, AdminID: credential.ID, SessionDigest: sessionDigest, CSRFDigest: csrfDigest, CredentialVersion: credential.CredentialVersion, CreatedAt: now, LastSeenAt: now, IdleExpiresAt: now.Add(domain.AdminSessionIdleTimeout), AbsoluteExpiresAt: now.Add(domain.AdminSessionAbsoluteTimeout)}
-	if err := s.store.CreateAdminSession(ctx, session); err != nil {
+	postVerifyNow := s.now()
+	session := domain.AdminSession{
+		ID:                id,
+		AdminID:           credential.ID,
+		SessionDigest:     sessionDigest,
+		CSRFDigest:        csrfDigest,
+		CredentialVersion: credential.CredentialVersion,
+		CreatedAt:         postVerifyNow,
+		LastSeenAt:        postVerifyNow,
+		IdleExpiresAt:     postVerifyNow.Add(domain.AdminSessionIdleTimeout),
+		AbsoluteExpiresAt: postVerifyNow.Add(domain.AdminSessionAbsoluteTimeout),
+	}
+	if err := s.store.CreateAdminSessionIfLoginAllowed(ctx, session, sourceDigest, postVerifyNow); err != nil {
+		if errors.Is(err, ErrRateLimited) {
+			return LoginResult{}, ErrRateLimited
+		}
+		if errors.Is(err, ErrCredentialVersionConflict) || errors.Is(err, ErrNotFound) {
+			return LoginResult{}, ErrAuthenticationFailed
+		}
 		return LoginResult{}, ErrAuthenticationUnavailable
 	}
 	return LoginResult{SessionToken: sessionToken, CSRFTok: csrfToken, Session: session}, nil
@@ -298,31 +336,14 @@ func (s *Service) VerifyPasswordHash(password, encoded string) (bool, error) {
 }
 
 func (s *Service) recordLoginFailure(ctx context.Context, adminID domain.ID, source domain.AuthDigest, now time.Time) error {
-	record, err := s.store.AdminLoginRateLimit(ctx, adminID, source)
-	if err != nil && !errors.Is(err, postgres.ErrNotFound) {
-		return err
-	}
-	if err != nil || now.After(record.WindowExpiresAt) {
-		record = domain.AdminLoginRateLimit{AdminID: adminID, SourceDigest: source, WindowStartedAt: now, WindowExpiresAt: now.Add(domain.AdminLoginFailureWindow), FailureCount: 1, LastFailureAt: now, UpdatedAt: now}
-	} else {
-		record.FailureCount++
-		if record.FailureCount > domain.AdminLoginMaxFailureAttempts {
-			record.FailureCount = domain.AdminLoginMaxFailureAttempts
+	record, err := s.store.RecordAdminLoginFailure(ctx, adminID, source, now)
+	if err != nil {
+		if errors.Is(err, ErrRateLimited) {
+			return ErrRateLimited
 		}
-		record.LastFailureAt, record.UpdatedAt = now, now
-	}
-	if record.FailureCount == domain.AdminLoginMaxFailureAttempts {
-		lockedAt := now
-		record.LockedAt = &lockedAt
-		lockedUntil := now.Add(domain.AdminLoginLockoutDuration)
-		record.LockedUntil = &lockedUntil
-	} else {
-		record.LockedAt, record.LockedUntil = nil, nil
-	}
-	if err := s.store.UpsertAdminLoginRateLimit(ctx, record); err != nil {
 		return ErrAuthenticationUnavailable
 	}
-	if record.FailureCount == domain.AdminLoginMaxFailureAttempts {
+	if record.LockedUntil != nil && now.Before(*record.LockedUntil) {
 		return ErrRateLimited
 	}
 	return nil
@@ -345,7 +366,7 @@ func (s *Service) session(ctx context.Context, token string) (domain.AdminSessio
 }
 
 func authenticationStoreError(err error) error {
-	if errors.Is(err, postgres.ErrNotFound) {
+	if errors.Is(err, ErrNotFound) {
 		return ErrAuthenticationFailed
 	}
 	return ErrAuthenticationUnavailable

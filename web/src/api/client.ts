@@ -12,8 +12,6 @@ import type {
   ApplicationSummary,
   ApplicationOperationsResult,
   ApplicationUsageResult,
-  AIInterventionResult,
-  AISettingsResult,
   CreateApplicationSource,
   CreateApplicationInput,
   CreateApplicationResponse,
@@ -45,8 +43,6 @@ import type {
 } from './types';
 import { CSRF_COOKIE_NAME, CSRF_HEADER_NAME, type AuthLoginInput, type AuthSession, type PasswordChangeInput } from '../features/auth/auth';
 import type { ApplicationUsageFact, UsageAnomaly, UsageMeasurement, UsageResourceMeasurements, UsageServiceFact, UsageTrendPoint } from '../features/usage/usageFacts';
-import type { AIActionFact, AIInterventionFact, AIInterventionStatus, AIInterventionViewFact, AIPlanFact, AIRisk } from '../features/ai-interventions/aiInterventions';
-import type { AIServiceSettingsFact } from '../features/settings/ai/AIServiceSettings';
 import type { DomainAccessSnapshot } from '../features/domains/domainAccess';
 import type {
   ApplicationOperationsFact,
@@ -712,13 +708,6 @@ function usageUnavailable(): ApplicationUsageResult {
   return { status: 'unavailable', message: '用量事实 API 尚未由控制面组合，不能以示例数据代替真实观察。' };
 }
 
-function isAIRisk(value: unknown): value is AIRisk { return value === 'R0' || value === 'R1' || value === 'R2' || value === 'R3'; }
-function isAIStatus(value: unknown): value is AIInterventionStatus { return value === 'manual_fallback' || value === 'awaiting_confirmation' || value === 'controller_handoff' || value === 'running' || value === 'succeeded' || value === 'failed' || value === 'rolled_back'; }
-function asAIAction(value: unknown): AIActionFact { if (!isRecord(value) || typeof value.tool_id !== 'string' || typeof value.tool_version !== 'string' || !isAIRisk(value.risk) || typeof value.expected_result !== 'string' || typeof value.validation_id !== 'string') throw new Error('AI plan contained an invalid action'); return { toolId: value.tool_id, toolVersion: value.tool_version, risk: value.risk, expectedResult: value.expected_result, validationId: value.validation_id }; }
-function asAIPlan(value: unknown): AIPlanFact | undefined { if (value === undefined) return undefined; if (!isRecord(value) || typeof value.id !== 'string' || value.schema_version !== '1.0' || typeof value.policy_version !== 'string' || !finiteNonNegative(value.confidence) || typeof value.requires_user_confirmation !== 'boolean' || !Array.isArray(value.assumptions) || !Array.isArray(value.actions)) throw new Error('AI plan did not match the strict schema'); return { id: value.id, schemaVersion: '1.0', policyVersion: value.policy_version, confidence: value.confidence, requiresUserConfirmation: value.requires_user_confirmation, assumptions: value.assumptions.filter((item): item is string => typeof item === 'string'), actions: value.actions.map(asAIAction) }; }
-function asAIIntervention(value: unknown): AIInterventionFact { if (!isRecord(value) || typeof value.id !== 'string' || typeof value.application_id !== 'string' || typeof value.task_type !== 'string' || !isAIStatus(value.status) || typeof value.reason !== 'string' || typeof value.summary !== 'string' || typeof value.suggestion !== 'string' || typeof value.requires_user_action !== 'boolean' || typeof value.controller_handoff !== 'boolean' || typeof value.rolled_back !== 'boolean' || typeof value.created_at !== 'string') throw new Error('AI intervention fact is invalid'); return { id: value.id, applicationId: value.application_id, taskType: value.task_type, status: value.status, reason: value.reason, summary: value.summary, suggestion: value.suggestion, requiresUserAction: value.requires_user_action, controllerHandoff: value.controller_handoff, provider: typeof value.provider === 'string' ? value.provider : undefined, model: typeof value.model === 'string' ? value.model : undefined, profile: typeof value.profile === 'string' ? value.profile : undefined, contextManifestDigest: typeof value.context_manifest_digest === 'string' ? value.context_manifest_digest : undefined, plan: asAIPlan(value.plan), evidence: Array.isArray(value.evidence) ? value.evidence.map((item) => isRecord(item) && typeof item.id === 'string' ? item.id : '').filter(Boolean) : [], tokens: finiteNonNegative(value.tokens) ? value.tokens : 0, durationMs: finiteNonNegative(value.duration_ms) ? value.duration_ms : 0, rolledBack: value.rolled_back, ruleCandidateId: typeof value.rule_candidate_id === 'string' ? value.rule_candidate_id : undefined, createdAt: value.created_at }; }
-function asAIInterventionView(value: unknown): AIInterventionViewFact { if (!isRecord(value) || typeof value.version !== 'string' || (value.mode !== 'ordinary' && value.mode !== 'operator') || (value.ai_status !== 'disabled' && value.ai_status !== 'unavailable' && value.ai_status !== 'available') || !Array.isArray(value.items)) throw new Error('AI intervention view is invalid'); const count = (name: string) => finiteNonNegative(value[name]) ? value[name] as number : 0; return { version: value.version, mode: value.mode, aiStatus: value.ai_status, items: value.items.map(asAIIntervention), successCount: count('success_count'), failureCount: count('failure_count'), rollbackCount: count('rollback_count'), candidateCount: count('candidate_count'), totalTokens: count('total_tokens'), totalDurationMs: count('total_duration_ms') }; }
-function asAISettings(value: unknown): AIServiceSettingsFact { if (!isRecord(value) || typeof value.version !== 'string' || typeof value.enabled !== 'boolean' || (value.status !== 'disabled' && value.status !== 'unavailable' && value.status !== 'available') || (value.profile !== 'china' && value.profile !== 'global' && value.profile !== 'local' && value.profile !== 'disabled') || typeof value.provider !== 'string' || typeof value.model !== 'string' || !Array.isArray(value.data_scopes) || !finiteNonNegative(value.max_tokens) || !finiteNonNegative(value.max_duration_ms) || !finiteNonNegative(value.cooldown_seconds) || typeof value.cache_enabled !== 'boolean' || typeof value.external_calls !== 'boolean') throw new Error('AI service settings are invalid'); return { version: value.version, enabled: value.enabled, status: value.status, profile: value.profile, provider: value.provider, model: value.model, dataScopes: value.data_scopes.filter((item): item is string => typeof item === 'string'), maxTokens: value.max_tokens, maxDurationMs: value.max_duration_ms, cooldownSeconds: value.cooldown_seconds, cacheEnabled: value.cache_enabled, externalCalls: value.external_calls }; }
 function asSystemStatus(value: unknown): SystemStatusFact {
   if (!isRecord(value) || !isRecord(value.node) || !isRecord(value.platform_domain) || !isRecord(value.webhooks) || !isRecord(value.backup) || !isRecord(value.alerts)) throw new Error('System status response is invalid');
   const node = value.node;
@@ -739,8 +728,6 @@ function asSystemStatus(value: unknown): SystemStatusFact {
     alerts: { status: 'not_installed' },
   };
 }
-function aiUnavailable(): AIInterventionResult { return { status: 'unavailable', message: 'AI 已关闭或尚未组合；标准发布与运维继续使用确定性流程。' }; }
-function aiSettingsUnavailable(): AISettingsResult { return { status: 'unavailable', message: 'AI 服务设置尚未由控制面组合。' }; }
 
 function operationIdempotencyKey(applicationId: string): string {
   const suffix = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
@@ -1175,18 +1162,6 @@ export class RestApiClient implements ApiClient {
     return { status: 'available', facts: asApplicationUsageFact(await this.json(response, 'Unable to load usage facts')) };
   }
 
-  async getAIInterventions(applicationId: string, mode: 'ordinary' | 'operator', signal?: AbortSignal): Promise<AIInterventionResult> {
-    const response = await this.request(`/applications/${encodeURIComponent(applicationId)}/ai/interventions?mode=${encodeURIComponent(mode)}`, { signal });
-    if (response.status === 404 || response.status === 501 || response.status === 503) return aiUnavailable();
-    return { status: 'available', facts: asAIInterventionView(await this.json(response, 'Unable to load AI intervention facts')) };
-  }
-
-  async getAISettings(signal?: AbortSignal): Promise<AISettingsResult> {
-    const response = await this.request('/settings/ai', { signal });
-    if (response.status === 404 || response.status === 501 || response.status === 503) return aiSettingsUnavailable();
-    return { status: 'available', settings: asAISettings(await this.json(response, 'Unable to load AI service settings')) };
-  }
-
   async getSystemStatus(signal?: AbortSignal): Promise<SystemStatusResult> {
     const response = await this.request('/settings/system-status', { signal });
     return { status: 'available', facts: asSystemStatus(await this.json(response, 'Unable to load system status')) };
@@ -1442,10 +1417,6 @@ export class StubApiClient implements ApiClient {
     this.requireAuthentication();
     return usageUnavailable();
   }
-
-  async getAIInterventions(): Promise<AIInterventionResult> { this.requireAuthentication(); return aiUnavailable(); }
-
-  async getAISettings(): Promise<AISettingsResult> { this.requireAuthentication(); return aiSettingsUnavailable(); }
 
   async getSystemStatus(): Promise<SystemStatusResult> {
     this.requireAuthentication();

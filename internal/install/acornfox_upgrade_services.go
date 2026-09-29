@@ -124,7 +124,7 @@ func (acornFoxRealUpgradeServices) Run(ctx context.Context, verb, unit string) e
 		_, e := acornFoxUpgradeCommand(ctx, "/usr/bin/systemctl", verb)
 		return e
 	case "start", "stop":
-	case "disable":
+	case "disable", "enable":
 		if unit != "acornfox-pi-worker.service" {
 			return ErrAcornFoxUpgradeConflict
 		}

@@ -2,26 +2,21 @@ package install
 
 import (
 	"archive/tar"
-	"bufio"
-	"bytes"
 	"compress/gzip"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"hash"
 	"io"
+
+	"github.com/open-card/open-card/internal/artifactio"
 )
 
-const acornFoxArchiveStreamBuffer = 32 * 1024
+const acornFoxArchiveStreamBuffer = artifactio.StreamBufferSize
 
 // acornFoxExactArchiveReader is deliberately both an io.Reader and an
 // io.ByteReader. gzip uses the latter to avoid read-ahead, which lets finish
 // distinguish the first gzip member from trailing compressed bytes.
 type acornFoxExactArchiveReader struct {
-	reader    io.Reader
-	remaining int64
-	hash      hash.Hash
+	inner *artifactio.ExactArchiveReader
 }
 
 // acornFoxArchiveSink is package-private so only a verified installation leaf
@@ -36,59 +31,47 @@ type acornFoxArchiveMember interface {
 	Close() error
 }
 
+type sinkAdapter struct {
+	acornFoxArchiveSink
+}
+
+func (s sinkAdapter) OpenMember(name string, mode uint32) (artifactio.ArchiveMember, error) {
+	return s.acornFoxArchiveSink.OpenMember(name, mode)
+}
+
 func newAcornFoxExactArchiveReader(reader io.Reader, size int64) (*acornFoxExactArchiveReader, error) {
-	if reader == nil || size < 1 || size > acornFoxArchiveMaxBytes {
+	inner, err := artifactio.NewExactArchiveReader(reader, size, acornFoxArchiveMaxBytes)
+	if err != nil {
 		return nil, errors.New("AcornFox archive size is invalid")
 	}
-	// Keep compressed-byte accounting above the buffer: prefetched trailer
-	// bytes remain unread here and are still rejected by finish. Buffering
-	// avoids a file syscall for each byte requested by the flate decoder.
-	return &acornFoxExactArchiveReader{reader: bufio.NewReaderSize(reader, acornFoxArchiveStreamBuffer), remaining: size, hash: sha256.New()}, nil
+	return &acornFoxExactArchiveReader{inner: inner}, nil
 }
 
 func (r *acornFoxExactArchiveReader) Read(target []byte) (int, error) {
-	if r.remaining == 0 {
-		return 0, io.EOF
-	}
-	if int64(len(target)) > r.remaining {
-		target = target[:r.remaining]
-	}
-	n, err := r.reader.Read(target)
-	if n > 0 {
-		r.remaining -= int64(n)
-		_, _ = r.hash.Write(target[:n])
-	}
-	return n, err
+	return r.inner.Read(target)
 }
 
 func (r *acornFoxExactArchiveReader) ReadByte() (byte, error) {
-	var one [1]byte
-	n, err := r.Read(one[:])
-	if n == 1 {
-		return one[0], nil
-	}
-	return 0, err
+	return r.inner.ReadByte()
 }
 
 func (r *acornFoxExactArchiveReader) finish(expectedSHA256 string) error {
-	if r.remaining != 0 {
-		return errors.New("AcornFox archive is shorter than declared size")
-	}
-	var extra [1]byte
-	n, err := r.reader.Read(extra[:])
-	if n != 0 {
-		return errors.New("AcornFox archive is longer than declared size")
-	}
+	err := r.inner.Finish(expectedSHA256)
 	if err == nil {
-		return errors.New("AcornFox archive reader made no progress")
+		return nil
 	}
-	if err != nil && err != io.EOF {
+	switch err.Error() {
+	case "archive is shorter than declared size":
+		return errors.New("AcornFox archive is shorter than declared size")
+	case "archive is longer than declared size":
+		return errors.New("AcornFox archive is longer than declared size")
+	case "archive reader made no progress":
+		return errors.New("AcornFox archive reader made no progress")
+	case "archive sha256 mismatch":
+		return errors.New("AcornFox archive sha256 mismatch")
+	default:
 		return fmt.Errorf("read AcornFox archive tail: %w", err)
 	}
-	if hex.EncodeToString(r.hash.Sum(nil)) != expectedSHA256 {
-		return errors.New("AcornFox archive sha256 mismatch")
-	}
-	return nil
 }
 
 func verifyAcornFoxArchive(reader io.Reader, size int64, expectedSHA256 string, rawManifest []byte, manifest Manifest, sink acornFoxArchiveSink) error {
@@ -175,61 +158,24 @@ func verifyAcornFoxArchiveTree(reader *gzip.Reader, rawManifest []byte, manifest
 }
 
 func verifyAcornFoxArchiveMember(reader io.Reader, size int64, want []byte, expectedSHA256 string, sink acornFoxArchiveSink, name string, mode uint32) error {
-	buffer := make([]byte, acornFoxArchiveStreamBuffer)
-	var member acornFoxArchiveMember
+	var artSink artifactio.ArchiveSink
 	if sink != nil {
-		var err error
-		member, err = sink.OpenMember(name, mode)
-		if err != nil {
-			return err
-		}
+		artSink = sinkAdapter{sink}
 	}
-	closed := false
-	defer func() {
-		if member != nil && !closed {
-			_ = member.Close()
-		}
-	}()
-	hash := sha256.New()
-	for offset, remaining := int64(0), size; remaining > 0; {
-		chunk := int64(len(buffer))
-		if chunk > remaining {
-			chunk = remaining
-		}
-		if _, err := io.ReadFull(reader, buffer[:chunk]); err != nil {
-			return errors.New("AcornFox archive member is truncated")
-		}
-		if want != nil && !bytes.Equal(buffer[:chunk], want[offset:offset+chunk]) {
-			return errors.New("AcornFox archive member content differs")
-		}
-		if _, err := hash.Write(buffer[:chunk]); err != nil {
-			return err
-		}
-		if member != nil {
-			if written, err := member.Write(buffer[:chunk]); err != nil || written != int(chunk) {
-				if err != nil {
-					return err
-				}
-				return io.ErrShortWrite
-			}
-		}
-		offset += chunk
-		remaining -= chunk
+	err := artifactio.VerifyArchiveMember(reader, size, want, expectedSHA256, artSink, name, mode)
+	if err == nil {
+		return nil
 	}
-	if want != nil && size != int64(len(want)) {
+	switch err.Error() {
+	case "archive member is truncated":
+		return errors.New("AcornFox archive member is truncated")
+	case "archive member content differs":
+		return errors.New("AcornFox archive member content differs")
+	case "archive manifest size mismatch":
 		return errors.New("AcornFox archive manifest size mismatch")
-	}
-	if expectedSHA256 != "" && hex.EncodeToString(hash.Sum(nil)) != expectedSHA256 {
+	case "archive member checksum mismatch":
 		return errors.New("AcornFox archive member checksum mismatch")
+	default:
+		return err
 	}
-	if member != nil {
-		if err := member.Sync(); err != nil {
-			return err
-		}
-		if err := member.Close(); err != nil {
-			return err
-		}
-		closed = true
-	}
-	return nil
 }

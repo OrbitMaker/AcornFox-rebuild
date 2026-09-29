@@ -1,5 +1,6 @@
 import { AcornFoxRequestError } from "./client";
 import { resolveCsrfToken } from "./csrf";
+import { createCoreAuthClient } from "../shared/auth-transport";
 
 const base = "/api/v1/acornfox";
 
@@ -47,6 +48,7 @@ export type DeploymentPlanPort = {
 };
 
 export type DeploymentPlan = {
+  sourceType?: "upload";
   applicationId: string;
   sourceRevisionId: string;
   repositoryUrl: string;
@@ -277,14 +279,17 @@ function arrayOfStrings(value: unknown): string[] {
   return value.map(string);
 }
 function deploymentPlan(value: unknown): DeploymentPlan {
-  const row = exact(value, [
-    "application_id", "source_revision_id", "repository_url", "ref", "commit", "dockerfile", "ports",
-    "port_selection", "healthcheck", "environment", "gaps", "warnings", "required_actions", "ready_to_deploy",
-  ]);
+  const required = ["application_id", "source_revision_id", "repository_url", "ref", "commit", "dockerfile", "ports", "port_selection", "healthcheck", "environment", "gaps", "warnings", "required_actions", "ready_to_deploy"];
+  const row = exact(value, required, [...required, "source_type"]);
   const repositoryUrl = string(row.repository_url);
-  let parsed: URL;
-  try { parsed = new URL(repositoryUrl); } catch { invalid(); }
-  if (parsed.protocol !== "https:" || !parsed.host) invalid();
+  const sourceType = row.source_type === undefined ? undefined : enumValue(row.source_type, ["upload"]);
+  if (sourceType === "upload") {
+    if (repositoryUrl !== "" || string(row.commit) !== "") invalid();
+  } else {
+    let parsed: URL;
+    try { parsed = new URL(repositoryUrl); } catch { invalid(); }
+    if (parsed.protocol !== "https:" || !parsed.host || !string(row.ref) || !string(row.commit)) invalid();
+  }
   const dockerfileRow = exact(row.dockerfile, ["status", "path", "stage_count"], ["status", "path", "digest", "stage_count", "final_stage", "workdir", "entrypoint", "command"]);
   const finalStage = dockerfileRow.final_stage === undefined ? undefined : (() => {
     const stage = exact(dockerfileRow.final_stage, ["name", "index", "from"], ["name", "index", "from", "platform"]);
@@ -332,6 +337,7 @@ function deploymentPlan(value: unknown): DeploymentPlan {
     return { name: string(item.name), redacted, ...(environmentValue === undefined ? {} : { value: environmentValue }) };
   });
   const plan: DeploymentPlan = {
+    ...(sourceType === undefined ? {} : { sourceType }),
     applicationId: string(row.application_id),
     sourceRevisionId: string(row.source_revision_id),
     repositoryUrl,
@@ -554,15 +560,10 @@ export function createAcornFoxIntegrationClient(fetcher: Fetcher = fetch): Acorn
       return invalid();
     }
   }
+  const coreAuth = createCoreAuthClient(fetcher);
   return {
-    setupState: () => request("/setup", (value) => enumValue(exact(value, ["state"]).state, ["initialized", "uninitialized", "unavailable"])),
-    setup: ({ setupToken, password }) => {
-      if (!setupToken || !password) throw new AcornFoxRequestError(422, "invalid_input", "初始化令牌和管理员密码不能为空。");
-      return request("/setup", (value) => {
-        const row = exact(value, ["initialized"]);
-        return row.initialized === true ? undefined : invalid();
-      }, { method: "POST", body: JSON.stringify({ setup_token: setupToken, password }) }, 201);
-    },
+    setupState: () => coreAuth.setupState(),
+    setup: (input) => coreAuth.setup(input),
     hostMetrics: (signal) => request("/host/metrics", host, { signal }),
     sourceMetadata: (applicationId, sourceRevisionId) => request(`/apps/${pathPart(applicationId)}/sources/${pathPart(sourceRevisionId)}/metadata`, sourceMetadata),
     deploymentPlan: (applicationId, sourceRevisionId) => request(`/apps/${pathPart(applicationId)}/sources/${pathPart(sourceRevisionId)}/deployment-plan`, deploymentPlan),

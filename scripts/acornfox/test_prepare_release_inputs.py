@@ -29,7 +29,6 @@ class TestPrepareReleaseInputsDetailed(unittest.TestCase):
         test_args = [
             "prepare-release-inputs.py",
             "--architecture", "arm64",
-            "--pi-archive", "/fake/pi.tar.gz",
             "/fake/src", "/fake/rt", "/fake/lic", "/fake/ctrl", "0.8.0-rc.1"
         ]
         with patch.object(sys, "argv", test_args):
@@ -45,7 +44,6 @@ class TestPrepareReleaseInputsDetailed(unittest.TestCase):
         test_args = [
             "prepare-release-inputs.py",
             "--architecture", "amd64",
-            "--pi-archive", "/fake/pi.tar.gz",
             "/fake/src", "/fake/rt", "/fake/lic", "/fake/ctrl", "0.8.0-rc.1"
         ]
         with patch.object(sys, "argv", test_args):
@@ -62,7 +60,6 @@ class TestPrepareReleaseInputsDetailed(unittest.TestCase):
         test_args = [
             "prepare-release-inputs.py",
             "--architecture", "arm64",
-            "--pi-archive", "/fake/pi.tar.gz",
             "/fake/src", "/fake/rt", "/fake/lic", "/fake/ctrl", "0.8.0-rc.1"
         ]
         with patch.object(sys, "argv", test_args):
@@ -73,29 +70,9 @@ class TestPrepareReleaseInputsDetailed(unittest.TestCase):
                             prep.main()
                         self.assertEqual(str(ctx.exception), "sentinel_passed_arch_check")
 
-    def test_pi_manifests_both_architectures_load_and_validate(self):
-        repo_root = SCRIPT_PATH.parents[2]
-        # Verify both amd64 and arm64 manifest specs load correctly from real repo assets
-        for arch in ("amd64", "arm64"):
-            manifest = prep.load_pi_manifest(repo_root, arch)
-            self.assertEqual(manifest["schema_version"], 1)
-            self.assertEqual(manifest["version"], "0.85.1")
-            self.assertEqual(len(manifest["files"]), 218)
-            spec = prep.PI_SPECS[arch]
-            self.assertEqual(manifest["archive_sha256"], spec["archive_sha256"])
-            self.assertEqual(sum(f["size"] for f in manifest["files"]), spec["total_bytes"])
-
-    def test_verify_pi_archive_wrong_hash_rejected(self):
-        repo_root = SCRIPT_PATH.parents[2]
-        import tempfile
-        with tempfile.NamedTemporaryFile("wb", suffix=".tar.gz") as tf:
-            tf.write(b"corrupted archive data")
-            tf.flush()
-            fake_archive = pathlib.Path(tf.name)
-            for arch in ("amd64", "arm64"):
-                with self.assertRaises(ValueError) as ctx:
-                    prep.verify_pi_archive(repo_root, fake_archive, arch)
-                self.assertIn("pi archive sha256 mismatch", str(ctx.exception))
+    def test_targets_have_no_pi_worker(self):
+        self.assertNotIn("acornfox-pi-worker", prep.TARGETS)
+        self.assertNotIn("open-card-pi-worker", prep.TARGETS)
 
 if __name__ == "__main__":
     unittest.main()

@@ -9,73 +9,35 @@ import (
 	"strings"
 	"time"
 
+	"github.com/open-card/open-card/internal/application"
 	"github.com/open-card/open-card/internal/domain"
 )
 
-// TaskState is the durable task lifecycle stored in task_leases.
-type TaskState string
+// TaskState aliases the neutral durable task lifecycle from the application layer.
+type TaskState = application.TaskState
 
 const (
-	TaskReady     TaskState = "ready"
-	TaskLeased    TaskState = "leased"
-	TaskCompleted TaskState = "completed"
-	TaskFailed    TaskState = "failed"
-	TaskCancelled TaskState = "cancelled"
+	TaskReady     = application.TaskReady
+	TaskLeased    = application.TaskLeased
+	TaskCompleted = application.TaskCompleted
+	TaskFailed    = application.TaskFailed
+	TaskCancelled = application.TaskCancelled
 )
 
-// Task is the persistence projection returned to workers. Payload is copied on
-// read so callers cannot mutate a value retained by a repository cache (there
-// is intentionally no cache today, but the ownership rule keeps the API
-// stable).
-type Task struct {
-	ID                domain.ID
-	OperationID       domain.ID
-	LeaseOwner        string
-	LeaseUntil        *time.Time
-	Attempt           int
-	MaxAttempts       int
-	State             TaskState
-	Payload           json.RawMessage
-	CreatedAt         time.Time
-	UpdatedAt         time.Time
-	LastAgentSequence uint64
-}
+// Task aliases the neutral persistence task projection from the application layer.
+type Task = application.Task
 
-// LeasePolicy supplies worker lease semantics. The caller normally passes a
-// 30-second Duration; the repository does not hide that engineering parameter
-// in a package constant.
-type LeasePolicy struct {
-	Duration    time.Duration
-	MaxAttempts int
-}
+// LeasePolicy aliases the neutral worker lease semantics from the application layer.
+type LeasePolicy = application.LeasePolicy
 
-// ClaimTaskRequest is the input to ClaimTask. Now is explicit so takeover and
-// expiry tests are deterministic and all workers evaluate the same clock
-// boundary.
-type ClaimTaskRequest struct {
-	Owner string
-	Now   time.Time
-	// Kinds limits a shared durable queue consumer to the exact payload kinds
-	// it owns. An empty slice preserves the generic worker behavior. Agent and
-	// control-plane workers must use disjoint non-empty sets so one consumer
-	// cannot terminally reject another consumer's task.
-	Kinds []string
-	LeasePolicy
-}
+// ClaimTaskRequest aliases the neutral claim request input from the application layer.
+type ClaimTaskRequest = application.ClaimTaskRequest
 
-// TaskMutationRequest supplies owner-checked state transition parameters.
-type TaskMutationRequest struct {
-	TaskID domain.ID
-	Owner  string
-	Now    time.Time
-	LeasePolicy
-}
+// TaskMutationRequest aliases the neutral state transition parameters from the application layer.
+type TaskMutationRequest = application.TaskMutationRequest
 
-// FailTaskRequest adds a redacted, bounded failure reason to a lease mutation.
-type FailTaskRequest struct {
-	TaskMutationRequest
-	Reason string
-}
+// FailTaskRequest aliases the neutral failure request from the application layer.
+type FailTaskRequest = application.FailTaskRequest
 
 // ClaimTask atomically selects one ready or expired leased task using
 // FOR UPDATE SKIP LOCKED, takes/renews its lease, and increments attempt.

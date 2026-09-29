@@ -28,7 +28,14 @@ func (f *fixCandidateHTTPFixture) ReadSourceForAI(context.Context, domain.ID, do
 
 func (f *fixCandidateHTTPFixture) Create(_ context.Context, request application.AcornFoxFixCandidateCreateRequest) (application.AcornFoxFixCandidate, error) {
 	f.request = request
-	return f.value, nil
+	value := f.value
+	if !request.OwnerAdminID.Empty() {
+		value.OwnerAdminID = request.OwnerAdminID
+	}
+	if !request.ApplicationID.Empty() {
+		value.ApplicationID = request.ApplicationID
+	}
+	return value, nil
 }
 
 func (f *fixCandidateHTTPFixture) MatchSource(_ context.Context, _, _, source, _ domain.ID) (application.AcornFoxFixCandidate, error) {

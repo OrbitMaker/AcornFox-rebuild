@@ -14,8 +14,10 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/open-card/open-card/internal/auth"
+	"github.com/open-card/open-card/internal/domain"
 	"github.com/open-card/open-card/internal/install"
 	"github.com/open-card/open-card/internal/persistence/postgres"
+	"github.com/open-card/open-card/internal/persistence/sqlite"
 )
 
 type adminFailReader struct{}
@@ -293,7 +295,7 @@ func TestAdminBootstrapAndResetOnTaskScopedPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 	originalService := newAdminAuthService
-	newAdminAuthService = func(store *postgres.Store) (*auth.Service, error) {
+	newAdminAuthService = func(store auth.Store) (*auth.Service, error) {
 		return auth.NewService(auth.Config{Store: store, Random: adminFailReader{}})
 	}
 	t.Cleanup(func() { newAdminAuthService = originalService })
@@ -348,5 +350,174 @@ func TestReadRootOnlyPasswordRejectsSymlinkAndOpenPermissions(t *testing.T) {
 	}
 	if _, err := readRootOnlyPassword(link); err == nil {
 		t.Fatal("password symlink was accepted")
+	}
+}
+
+type fakeAdminCredentialStore struct {
+	exists     bool
+	credential domain.AdminCredential
+}
+
+func (f *fakeAdminCredentialStore) AdministratorExists(context.Context) (bool, error) {
+	return f.exists, nil
+}
+
+func (f *fakeAdminCredentialStore) ActiveAdminCredential(context.Context) (domain.AdminCredential, error) {
+	if !f.exists || f.credential.DisabledAt != nil {
+		return domain.AdminCredential{}, auth.ErrNotFound
+	}
+	return f.credential, nil
+}
+
+func (f *fakeAdminCredentialStore) CreateAdminCredential(_ context.Context, c domain.AdminCredential) error {
+	if f.exists {
+		return errors.New("admin already exists")
+	}
+	f.exists = true
+	f.credential = c
+	return nil
+}
+
+func (f *fakeAdminCredentialStore) RotateAdminCredential(_ context.Context, id domain.ID, expectedVersion int64, scheme, hash string, now time.Time) (domain.AdminCredential, error) {
+	if !f.exists || f.credential.ID != id || f.credential.CredentialVersion != expectedVersion {
+		return domain.AdminCredential{}, auth.ErrCredentialVersionConflict
+	}
+	f.credential.PasswordHashScheme = scheme
+	f.credential.PasswordHash = hash
+	f.credential.CredentialVersion++
+	f.credential.UpdatedAt = now
+	return f.credential, nil
+}
+
+func (f *fakeAdminCredentialStore) CreateAdminSession(context.Context, domain.AdminSession) error {
+	return errors.New("unexpected call to CreateAdminSession in credential test")
+}
+func (f *fakeAdminCredentialStore) ActiveAdminSessionByDigest(context.Context, domain.AuthDigest, time.Time) (domain.AdminSession, error) {
+	return domain.AdminSession{}, errors.New("unexpected call to ActiveAdminSessionByDigest in credential test")
+}
+func (f *fakeAdminCredentialStore) TouchAdminSession(context.Context, domain.ID, int64, time.Time) (domain.AdminSession, error) {
+	return domain.AdminSession{}, errors.New("unexpected call to TouchAdminSession in credential test")
+}
+func (f *fakeAdminCredentialStore) RevokeAdminSession(context.Context, domain.ID, time.Time) error {
+	return errors.New("unexpected call to RevokeAdminSession in credential test")
+}
+func (f *fakeAdminCredentialStore) UpsertAdminLoginRateLimit(context.Context, domain.AdminLoginRateLimit) error {
+	return errors.New("unexpected call to UpsertAdminLoginRateLimit in credential test")
+}
+func (f *fakeAdminCredentialStore) AdminLoginRateLimit(context.Context, domain.ID, domain.AuthDigest) (domain.AdminLoginRateLimit, error) {
+	return domain.AdminLoginRateLimit{}, errors.New("unexpected call to AdminLoginRateLimit in credential test")
+}
+func (f *fakeAdminCredentialStore) RecordAdminLoginFailure(context.Context, domain.ID, domain.AuthDigest, time.Time) (domain.AdminLoginRateLimit, error) {
+	return domain.AdminLoginRateLimit{}, errors.New("unexpected call to RecordAdminLoginFailure in credential test")
+}
+func (f *fakeAdminCredentialStore) CreateAdminSessionIfLoginAllowed(context.Context, domain.AdminSession, domain.AuthDigest, time.Time) error {
+	return errors.New("unexpected call to CreateAdminSessionIfLoginAllowed in credential test")
+}
+
+func TestApplyCredentialWithNarrowStoreWithoutDB(t *testing.T) {
+	ctx := context.Background()
+	store := &fakeAdminCredentialStore{}
+	now := time.Date(2026, 9, 26, 10, 0, 0, 0, time.UTC)
+
+	// Reset before bootstrap must fail with administrator does not exist
+	if err := applyCredential(ctx, store, "reset-password", []byte("valid-length-password-12345"), now); err == nil || !strings.Contains(err.Error(), "bootstrap first") {
+		t.Fatalf("expected bootstrap first error, got: %v", err)
+	}
+
+	// Bootstrap creates initial administrator with version 1
+	pass := []byte("first-bootstrap-password-12345")
+	if err := applyCredential(ctx, store, "bootstrap", pass, now); err != nil {
+		t.Fatalf("bootstrap failed: %v", err)
+	}
+	if !store.exists || store.credential.CredentialVersion != 1 || store.credential.PasswordHash == "" {
+		t.Fatalf("unexpected state after bootstrap: exists=%v version=%d", store.exists, store.credential.CredentialVersion)
+	}
+
+	// Reset password rotates to version 2 and updates password hash
+	oldHash := store.credential.PasswordHash
+	newPass := []byte("second-rotated-password-12345")
+	if err := applyCredential(ctx, store, "reset-password", newPass, now.Add(time.Minute)); err != nil {
+		t.Fatalf("reset password failed: %v", err)
+	}
+	if store.credential.CredentialVersion != 2 || store.credential.PasswordHash == oldHash {
+		t.Fatalf("expected version 2 with updated hash after reset, got version=%d sameHash=%v", store.credential.CredentialVersion, store.credential.PasswordHash == oldHash)
+	}
+}
+
+func secureTestDir(t *testing.T, sub ...string) string {
+	t.Helper()
+	temp := t.TempDir()
+	if err := os.Chmod(temp, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if len(sub) > 0 {
+		full := filepath.Join(append([]string{temp}, sub...)...)
+		if err := os.MkdirAll(full, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(full, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		return full
+	}
+	return temp
+}
+
+func TestAdminApplyCredentialWithRealSQLiteStore(t *testing.T) {
+	dataDir := secureTestDir(t, "sqlite_admin_test")
+	store, err := sqlite.Open(sqlite.Config{
+		DataDirectory: dataDir,
+		DBName:        "acornfox.db",
+	})
+	if err != nil {
+		t.Fatalf("Open sqlite store: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	now := time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
+
+	// 1. Initial bootstrap
+	initialPass := []byte("sqlite-admin-initial-password-12345")
+	if err := applyCredential(ctx, store, "bootstrap", initialPass, now); err != nil {
+		t.Fatalf("bootstrap against sqlite store failed: %v", err)
+	}
+
+	exists, err := store.AdministratorExists(ctx)
+	if err != nil || !exists {
+		t.Fatalf("expected administrator to exist after bootstrap: exists=%v err=%v", exists, err)
+	}
+
+	cred, err := store.ActiveAdminCredential(ctx)
+	if err != nil || cred.CredentialVersion != 1 {
+		t.Fatalf("unexpected cred after bootstrap: %+v err=%v", cred, err)
+	}
+
+	// 2. Reset password
+	newPass := []byte("sqlite-admin-rotated-password-67890")
+	if err := applyCredential(ctx, store, "reset-password", newPass, now.Add(time.Minute)); err != nil {
+		t.Fatalf("reset-password against sqlite store failed: %v", err)
+	}
+
+	credRotated, err := store.ActiveAdminCredential(ctx)
+	if err != nil || credRotated.CredentialVersion != 2 {
+		t.Fatalf("expected credential version 2 after reset: %+v err=%v", credRotated, err)
+	}
+
+	// 3. Close and reopen to verify persistence
+	_ = store.Close()
+
+	reopenedStore, err := sqlite.Open(sqlite.Config{
+		DataDirectory: dataDir,
+		DBName:        "acornfox.db",
+	})
+	if err != nil {
+		t.Fatalf("reopen sqlite store: %v", err)
+	}
+	defer reopenedStore.Close()
+
+	credReopened, err := reopenedStore.ActiveAdminCredential(ctx)
+	if err != nil || credReopened.CredentialVersion != 2 {
+		t.Fatalf("expected credential version 2 after reopen: %+v err=%v", credReopened, err)
 	}
 }

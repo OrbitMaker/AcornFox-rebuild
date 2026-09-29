@@ -22,6 +22,7 @@ type AcornFoxPublicAccessRecoveryCommand struct {
 	RequestedEnabled              bool
 	RouteID                       domain.ID
 	Phase                         string
+	ManagementCommandID           domain.ID
 }
 
 // ClaimAcornFoxPublicAccessRecoveryCommands bounds restart work and changes a
@@ -36,36 +37,53 @@ func (s *Store) ClaimAcornFoxPublicAccessRecoveryCommands(ctx context.Context, l
 		return nil, e
 	}
 	defer func() { _ = tx.Rollback() }()
-	rows, e := tx.QueryContext(ctx, `SELECT application_id,deployment_id,idempotency_key,request_digest,requested_enabled,COALESCE(route_id,''),phase FROM acornfox_public_access_commands WHERE phase IN ('applying','reconcile_required') ORDER BY created_at LIMIT $1 FOR UPDATE SKIP LOCKED`, limit)
+	rows, e := tx.QueryContext(ctx, `SELECT application_id,deployment_id,idempotency_key,request_digest,requested_enabled,COALESCE(route_id,''),phase,COALESCE(management_command_id,'') FROM acornfox_public_access_commands WHERE phase IN ('applying','reconcile_required') ORDER BY created_at LIMIT $1 FOR UPDATE SKIP LOCKED`, limit)
 	if e != nil {
 		return nil, e
 	}
-	out := []AcornFoxPublicAccessRecoveryCommand{}
+	candidates := []AcornFoxPublicAccessRecoveryCommand{}
 	for rows.Next() {
 		var x AcornFoxPublicAccessRecoveryCommand
-		var rid string
-		if e = rows.Scan(&x.ApplicationID, &x.DeploymentID, &x.IdempotencyKey, &x.RequestDigest, &x.RequestedEnabled, &rid, &x.Phase); e != nil {
+		var rid, mid string
+		if e = rows.Scan(&x.ApplicationID, &x.DeploymentID, &x.IdempotencyKey, &x.RequestDigest, &x.RequestedEnabled, &rid, &x.Phase, &mid); e != nil {
 			rows.Close()
 			return nil, e
 		}
 		x.RouteID = domain.ID(rid)
-		out = append(out, x)
+		x.ManagementCommandID = domain.ID(mid)
+		candidates = append(candidates, x)
 	}
-	// pgx does not permit a second statement on this transaction while the
-	// candidate cursor is still active.  Closing it here also makes the lock
-	// boundary explicit: the rows remain locked until commit, while all
-	// ownership reads below use the same bounded snapshot safely.
 	if e = rows.Close(); e != nil {
 		return nil, e
 	}
-	for _, x := range out {
+	out := []AcornFoxPublicAccessRecoveryCommand{}
+	for _, x := range candidates {
 		if e = afpaAssert(ctx, tx, x.ApplicationID, x.DeploymentID); e != nil {
 			return nil, e
 		}
-		// A surviving command is allowed to recover only the deterministic route
-		// that belongs to its own deployment.  Do this check before changing an
-		// applying command into reconcile_required: a corrupted command row must
-		// fail closed rather than acquire recovery ownership of another route.
+		var appState string
+		if err := tx.QueryRowContext(ctx, `SELECT management_state FROM applications WHERE id=$1 FOR UPDATE`, x.ApplicationID.String()).Scan(&appState); err != nil {
+			return nil, err
+		}
+		var depState string
+		if err := tx.QueryRowContext(ctx, `SELECT state FROM deployments WHERE id=$1 FOR UPDATE`, x.DeploymentID.String()).Scan(&depState); err != nil {
+			return nil, err
+		}
+		var activeMgmtID string
+		activeErr := tx.QueryRowContext(ctx, `SELECT id FROM acornfox_management_commands WHERE application_id=$1 AND phase NOT IN ('completed', 'failed') FOR UPDATE`, x.ApplicationID.String()).Scan(&activeMgmtID)
+		if activeErr == nil {
+			if x.ManagementCommandID.Empty() || x.ManagementCommandID.String() != activeMgmtID {
+				_, _ = tx.ExecContext(ctx, `UPDATE acornfox_public_access_commands SET phase='failed', failure_code='locked_by_management', updated_at=$3 WHERE application_id=$1 AND deployment_id=$2 AND idempotency_key=$4`, x.ApplicationID.String(), x.DeploymentID.String(), m3Now(s, now), x.IdempotencyKey)
+				continue
+			}
+		} else if depState == "paused" && x.RequestedEnabled {
+			_, _ = tx.ExecContext(ctx, `UPDATE acornfox_public_access_commands SET phase='failed', failure_code='deployment_paused', updated_at=$3 WHERE application_id=$1 AND deployment_id=$2 AND idempotency_key=$4`, x.ApplicationID.String(), x.DeploymentID.String(), m3Now(s, now), x.IdempotencyKey)
+			continue
+		} else if appState != "active" {
+			_, _ = tx.ExecContext(ctx, `UPDATE acornfox_public_access_commands SET phase='failed', failure_code='app_not_active', updated_at=$3 WHERE application_id=$1 AND deployment_id=$2 AND idempotency_key=$4`, x.ApplicationID.String(), x.DeploymentID.String(), m3Now(s, now), x.IdempotencyKey)
+			continue
+		}
+
 		if x.RequestedEnabled && x.RouteID.Empty() {
 			return nil, domain.NewError(domain.ErrConflict, "public access recovery route is missing")
 		}
@@ -80,6 +98,7 @@ func (s *Store) ClaimAcornFoxPublicAccessRecoveryCommands(ctx context.Context, l
 				return nil, domain.NewError(domain.ErrConflict, "public access recovery route is missing")
 			}
 		}
+		out = append(out, x)
 	}
 	for _, item := range out {
 		if item.Phase != "applying" {
@@ -129,7 +148,7 @@ func afpaConflict(message string) error {
 }
 
 // Begin persists the M3 desired route before Caddy is asked to project it.
-func (s *Store) BeginAcornFoxPublicAccess(ctx context.Context, fact contracts.AcornFoxPublicAccessFact, intent contracts.AcornFoxPublicRouteIntent, enabled bool, key, digest string, now time.Time) (contracts.AcornFoxPublicAccessFact, bool, error) {
+func (s *Store) BeginAcornFoxPublicAccess(ctx context.Context, fact contracts.AcornFoxPublicAccessFact, intent contracts.AcornFoxPublicRouteIntent, enabled bool, key, digest string, managementCommandID domain.ID, now time.Time) (contracts.AcornFoxPublicAccessFact, bool, error) {
 	if s.requireDB() != nil || fact.Validate() != nil || !afpaValid(key, digest) {
 		return contracts.AcornFoxPublicAccessFact{}, false, domain.ValidationError("public access command invalid")
 	}
@@ -147,6 +166,50 @@ func (s *Store) BeginAcornFoxPublicAccess(ctx context.Context, fact contracts.Ac
 	if e = afpaAssert(ctx, tx, fact.ApplicationID, fact.DeploymentID); e != nil {
 		return fail(e)
 	}
+	var appManagementState string
+	if err := tx.QueryRowContext(ctx, `SELECT management_state FROM applications WHERE id=$1 FOR UPDATE`, fact.ApplicationID.String()).Scan(&appManagementState); err != nil {
+		return fail(err)
+	}
+	if appManagementState != "active" && managementCommandID.Empty() {
+		return fail(domain.NewError(domain.ErrConflict, "application is archiving or archived; public access cannot be modified"))
+	}
+	var depState string
+	if err := tx.QueryRowContext(ctx, `SELECT state FROM deployments WHERE id=$1 FOR UPDATE`, fact.DeploymentID.String()).Scan(&depState); err != nil {
+		return fail(err)
+	}
+	if depState == "paused" && managementCommandID.Empty() {
+		return fail(domain.NewError(domain.ErrConflict, "deployment is paused; public access is locked"))
+	}
+	var activeMgmtID, activeMgmtAction, activeMgmtPhase string
+	err := tx.QueryRowContext(ctx, `SELECT id, action, phase FROM acornfox_management_commands WHERE application_id=$1 AND phase NOT IN ('completed', 'failed') FOR UPDATE`, fact.ApplicationID.String()).Scan(&activeMgmtID, &activeMgmtAction, &activeMgmtPhase)
+	if err == nil {
+		if managementCommandID.Empty() || managementCommandID.String() != activeMgmtID {
+			return fail(domain.NewError(domain.ErrConflict, "application management operation in progress; public access is locked"))
+		}
+		var targetStatus, targetRoutePhase string
+		if err := tx.QueryRowContext(ctx, `SELECT status, route_phase FROM acornfox_management_targets WHERE command_id=$1 AND deployment_id=$2 FOR UPDATE`, activeMgmtID, fact.DeploymentID.String()).Scan(&targetStatus, &targetRoutePhase); err != nil {
+			return fail(domain.NewError(domain.ErrConflict, "management command target is missing or invalid"))
+		}
+		if activeMgmtAction == "stop" || activeMgmtAction == "archive" {
+			if enabled {
+				return fail(domain.NewError(domain.ErrConflict, "cannot enable route during stop or archive"))
+			}
+		} else if activeMgmtAction == "start" {
+			if !enabled {
+				return fail(domain.NewError(domain.ErrConflict, "cannot disable route during start route restore"))
+			}
+		}
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return fail(err)
+	}
+
+	if !managementCommandID.Empty() && !enabled {
+		_, err = tx.ExecContext(ctx, `UPDATE acornfox_public_access_commands SET phase='failed', failure_code='superseded_by_management', updated_at=$3 WHERE application_id=$1 AND deployment_id=$2 AND phase IN ('applying', 'reconcile_required') AND (management_command_id IS NULL OR management_command_id != $4)`, fact.ApplicationID.String(), fact.DeploymentID.String(), now, managementCommandID.String())
+		if err != nil {
+			return fail(err)
+		}
+	}
+
 	routeID := afpaID("route", fact.ApplicationID.String(), fact.DeploymentID.String())
 	var oldDigest, phase, status, host sql.NullString
 	e = tx.QueryRowContext(ctx, `SELECT request_digest,phase,result_status,result_hostname FROM acornfox_public_access_commands WHERE application_id=$1 AND deployment_id=$2 AND idempotency_key=$3 FOR UPDATE`, fact.ApplicationID.String(), fact.DeploymentID.String(), key).Scan(&oldDigest, &phase, &status, &host)
@@ -198,7 +261,11 @@ func (s *Store) BeginAcornFoxPublicAccess(ctx context.Context, fact contracts.Ac
 		}
 	}
 	routeRef := nullableAFPARouteID(routeID)
-	_, e = tx.ExecContext(ctx, `INSERT INTO acornfox_public_access_commands(application_id,deployment_id,idempotency_key,request_digest,requested_enabled,route_id,phase,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,'applying',$7,$7)`, fact.ApplicationID.String(), fact.DeploymentID.String(), key, digest, enabled, routeRef, now)
+	var mgmtRef any
+	if !managementCommandID.Empty() {
+		mgmtRef = managementCommandID.String()
+	}
+	_, e = tx.ExecContext(ctx, `INSERT INTO acornfox_public_access_commands(application_id,deployment_id,idempotency_key,request_digest,requested_enabled,route_id,phase,management_command_id,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,'applying',$7,$8,$8)`, fact.ApplicationID.String(), fact.DeploymentID.String(), key, digest, enabled, routeRef, mgmtRef, now)
 	if e != nil {
 		return fail(domain.NewError(domain.ErrConflict, "public access command conflict"))
 	}

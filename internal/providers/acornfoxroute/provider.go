@@ -10,10 +10,13 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/open-card/open-card/internal/application"
@@ -25,8 +28,9 @@ var errPolicy = errors.New("invalid AcornFox public route policy")
 // RouteState contains an already persisted, owned route, including disabled
 // records needed to prove ownership when removing a prior Caddy projection.
 type RouteState struct {
-	Intent  contracts.AcornFoxPublicRouteIntent
-	Enabled bool
+	Intent   contracts.AcornFoxPublicRouteIntent
+	Approval *contracts.AcornFoxApprovedHostnameRoute
+	Enabled  bool
 }
 
 // Source serializes writers across processes for the entire callback. It must
@@ -39,22 +43,103 @@ type Source interface {
 
 type Config struct {
 	AuthorizedRoot string
-	Source         Source
+	CustomOnly     bool
+	// AdminUnixSocket is trusted composition input, never a request field.
+	// The expected non-root owner/group must match the protected socket.
+	AdminUnixSocket string
+	AdminSocketUID  uint32
+	AdminSocketGID  uint32
+	Source          Source
 }
 type Provider struct {
-	root   string
-	source Source
-	client *http.Client
-	mu     sync.Mutex
+	root            string
+	source          Source
+	client          *http.Client
+	mu              sync.Mutex
+	adminSocketPath string
+	adminSocketUID  uint32
+	adminSocketGID  uint32
+	adminSocketInfo os.FileInfo
 }
 
 func New(c Config) (*Provider, error) {
-	root, err := AuthorizedRoot("https://" + c.AuthorizedRoot)
-	if err != nil || root != c.AuthorizedRoot || c.Source == nil {
+	root := c.AuthorizedRoot
+	if c.CustomOnly {
+		if root != "" {
+			return nil, errPolicy
+		}
+	} else {
+		validated, err := AuthorizedRoot("https://" + root)
+		if err != nil || validated != root {
+			return nil, errPolicy
+		}
+	}
+	if c.Source == nil {
 		return nil, errPolicy
 	}
-	client := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{Proxy: nil, DialContext: (&net.Dialer{Timeout: 2 * time.Second}).DialContext, ResponseHeaderTimeout: 3 * time.Second, MaxResponseHeaderBytes: 8192}, CheckRedirect: func(*http.Request, []*http.Request) error { return errPolicy }}
-	return &Provider{root: root, source: c.Source, client: client}, nil
+	dialer := &net.Dialer{Timeout: 2 * time.Second}
+	transport := &http.Transport{Proxy: nil, DialContext: dialer.DialContext, ResponseHeaderTimeout: 3 * time.Second, MaxResponseHeaderBytes: 8192}
+	var adminSocketInfo os.FileInfo
+	if c.AdminUnixSocket != "" {
+		var err error
+		adminSocketInfo, err = verifyAdminUnixSocket(c.AdminUnixSocket, c.AdminSocketUID, c.AdminSocketGID)
+		if err != nil {
+			return nil, errPolicy
+		}
+		transport.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+			before, err := verifyAdminUnixSocket(c.AdminUnixSocket, c.AdminSocketUID, c.AdminSocketGID)
+			if err != nil || !os.SameFile(adminSocketInfo, before) {
+				return nil, errPolicy
+			}
+			conn, err := dialer.DialContext(ctx, "unix", c.AdminUnixSocket)
+			if err != nil {
+				return nil, err
+			}
+			after, err := verifyAdminUnixSocket(c.AdminUnixSocket, c.AdminSocketUID, c.AdminSocketGID)
+			if err != nil || !os.SameFile(adminSocketInfo, after) || !os.SameFile(before, after) {
+				conn.Close()
+				return nil, errPolicy
+			}
+			return conn, nil
+		}
+	} else if c.AdminSocketUID != 0 || c.AdminSocketGID != 0 || c.CustomOnly {
+		// The custom-only role must not silently use loopback TCP Admin.
+		return nil, errPolicy
+	}
+	client := &http.Client{Timeout: 5 * time.Second, Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return errPolicy }}
+	return &Provider{root: root, source: c.Source, client: client, adminSocketPath: c.AdminUnixSocket, adminSocketUID: c.AdminSocketUID, adminSocketGID: c.AdminSocketGID, adminSocketInfo: adminSocketInfo}, nil
+}
+
+func verifyAdminUnixSocket(path string, uid, gid uint32) (os.FileInfo, error) {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path || uid == 0 || gid == 0 {
+		return nil, errPolicy
+	}
+	parent := filepath.Dir(path)
+	for current := parent; ; current = filepath.Dir(current) {
+		info, err := os.Lstat(current)
+		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return nil, errPolicy
+		}
+		owner, ok := info.Sys().(*syscall.Stat_t)
+		if !ok || uint32(owner.Uid) != uid && owner.Uid != 0 || info.Mode().Perm()&0o022 != 0 && !(owner.Uid == 0 && info.Mode()&os.ModeSticky != 0) {
+			return nil, errPolicy
+		}
+		if current == parent && (uint32(owner.Uid) != uid || uint32(owner.Gid) != gid || info.Mode().Perm() != 0o750 || info.Mode()&os.ModeSetgid == 0) {
+			return nil, errPolicy
+		}
+		if current == "/" {
+			break
+		}
+	}
+	info, err := os.Lstat(path)
+	if err != nil || info.Mode()&os.ModeSocket == 0 || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o660 {
+		return nil, errPolicy
+	}
+	owner, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || uint32(owner.Uid) != uid || uint32(owner.Gid) != gid {
+		return nil, errPolicy
+	}
+	return info, nil
 }
 func (p *Provider) Close() { p.client.CloseIdleConnections() }
 
@@ -66,7 +151,23 @@ func ValidateIntent(root string, i contracts.AcornFoxPublicRouteIntent) error {
 	if err != nil || i.Validate() != nil || host != i.Hostname || i.Port < 1024 {
 		return errPolicy
 	}
-	switch i.Port {
+	return validateLocalPort(i.Port)
+}
+
+// ValidateApprovedHostnameRoute is separate from the generated-host policy.
+// The exact approval must also appear in the durable Source.WithRoutes row;
+// this structural check alone never authorizes a Caddy write.
+func ValidateApprovedHostnameRoute(root string, approval contracts.AcornFoxApprovedHostnameRoute) error {
+	if approval.Validate() != nil || approval.Route.Port < 1024 || approval.Route.Hostname == root ||
+		approval.Route.Hostname == "apps."+root ||
+		strings.HasSuffix(approval.Route.Hostname, ".apps."+root) {
+		return errPolicy
+	}
+	return validateLocalPort(approval.Route.Port)
+}
+
+func validateLocalPort(port int) error {
+	switch port {
 	case 2019, 2020, 5432, 8080, 8092, 18481, 18482:
 		return errPolicy
 	}
@@ -77,18 +178,125 @@ func route(i contracts.AcornFoxPublicRouteIntent) object {
 	return object{"@id": "acornfox-route-" + hex.EncodeToString(sum[:]), "match": []object{{"host": []string{i.Hostname}}}, "handle": []object{proxy(net.JoinHostPort("127.0.0.1", strconv.Itoa(i.Port)))}, "terminal": true}
 }
 func (p *Provider) EnsureAcornFoxPublicRoute(ctx context.Context, i contracts.AcornFoxPublicRouteIntent, key string) error {
-	return p.project(ctx, &i, true, key)
+	return p.project(ctx, &i, nil, true, key)
 }
 func (p *Provider) RemoveAcornFoxPublicRoute(ctx context.Context, i contracts.AcornFoxPublicRouteIntent, key string) error {
-	return p.project(ctx, &i, false, key)
+	return p.project(ctx, &i, nil, false, key)
 }
-func (p *Provider) Reconcile(ctx context.Context) error { return p.project(ctx, nil, false, "") }
+func (p *Provider) EnsureAcornFoxApprovedHostnameRoute(ctx context.Context, approval contracts.AcornFoxApprovedHostnameRoute, key string) error {
+	return p.project(ctx, &approval.Route, &approval, true, key)
+}
+func (p *Provider) RemoveAcornFoxApprovedHostnameRoute(ctx context.Context, approval contracts.AcornFoxApprovedHostnameRoute, key string) error {
+	return p.project(ctx, &approval.Route, &approval, false, key)
+}
+func (p *Provider) Reconcile(ctx context.Context) error { return p.project(ctx, nil, nil, false, "") }
 
-func (p *Provider) project(ctx context.Context, requested *contracts.AcornFoxPublicRouteIntent, enabled bool, key string) error {
+// ObserveApprovedHostnameRoute reads only the owned Caddy subtree. False is a
+// verified absence of this exact Core-approved route, never a network error,
+// foreign-route collision, malformed response, or missing durable approval.
+func (p *Provider) ObserveApprovedHostnameRoute(ctx context.Context, approval contracts.AcornFoxApprovedHostnameRoute) (bool, error) {
+	if ctx == nil || ctx.Err() != nil {
+		return false, application.ErrAcornFoxPublicAccessUnavailable
+	}
+	if ValidateApprovedHostnameRoute(p.root, approval) != nil {
+		return false, application.ErrAcornFoxPublicAccessOwnershipConflict
+	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if ctx.Err() != nil {
+		return false, application.ErrAcornFoxPublicAccessUnavailable
+	}
+	present := false
+	err := p.source.WithRoutes(ctx, func(states []RouteState, checkLock func() error) error {
+		if checkLock == nil {
+			return application.ErrAcornFoxPublicAccessConflict
+		}
+		if len(states) > 1024 {
+			return application.ErrAcornFoxPublicAccessUnavailable
+		}
+		owned := map[string][]byte{}
+		seen := map[string]bool{}
+		found := false
+		targetID := route(approval.Route)["@id"].(string)
+		for _, state := range states {
+			intent := state.Intent
+			if state.Approval == nil && ValidateIntent(p.root, intent) != nil ||
+				state.Approval != nil && (state.Approval.Route != intent || ValidateApprovedHostnameRoute(p.root, *state.Approval) != nil) ||
+				seen[intent.Hostname] {
+				return application.ErrAcornFoxPublicAccessOwnershipConflict
+			}
+			seen[intent.Hostname] = true
+			item := route(intent)
+			id := item["@id"].(string)
+			if _, duplicate := owned[id]; duplicate {
+				return application.ErrAcornFoxPublicAccessOwnershipConflict
+			}
+			raw, _ := json.Marshal(item)
+			owned[id] = raw
+			if state.Approval != nil && intent == approval.Route && *state.Approval == approval {
+				found = true
+			}
+		}
+		if !found {
+			return application.ErrAcornFoxPublicAccessOwnershipConflict
+		}
+		body, tag, err := p.call(ctx, http.MethodGet, nil, "")
+		if err != nil {
+			return err
+		}
+		var current struct {
+			ID      string            `json:"@id"`
+			Handler string            `json:"handler"`
+			Routes  []json.RawMessage `json:"routes"`
+		}
+		if tag == "" || decode(body, &current) != nil || current.ID != SubtreeID || current.Handler != "subroute" || current.Routes == nil {
+			return application.ErrAcornFoxPublicAccessOwnershipConflict
+		}
+		seenIDs := map[string]bool{}
+		for _, raw := range current.Routes {
+			var item map[string]any
+			if decode(raw, &item) != nil {
+				return application.ErrAcornFoxPublicAccessOwnershipConflict
+			}
+			id, ok := item["@id"].(string)
+			if !ok || seenIDs[id] {
+				return application.ErrAcornFoxPublicAccessOwnershipConflict
+			}
+			seenIDs[id] = true
+			normalized, _ := json.Marshal(item)
+			if !bytes.Equal(normalized, owned[id]) {
+				return application.ErrAcornFoxPublicAccessOwnershipConflict
+			}
+			if id == targetID {
+				present = true
+			}
+		}
+		if err := checkLock(); err != nil {
+			return application.ErrAcornFoxPublicAccessConflict
+		}
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, application.ErrAcornFoxPublicAccessOwnershipConflict) || errors.Is(err, application.ErrAcornFoxPublicAccessConflict) {
+			return false, err
+		}
+		return false, application.ErrAcornFoxPublicAccessUnavailable
+	}
+	return present, nil
+}
+
+func (p *Provider) project(ctx context.Context, requested *contracts.AcornFoxPublicRouteIntent, approved *contracts.AcornFoxApprovedHostnameRoute, enabled bool, key string) error {
 	if ctx == nil || ctx.Err() != nil {
 		return application.ErrAcornFoxPublicAccessUnavailable
 	}
-	if requested != nil && (strings.TrimSpace(key) == "" || ValidateIntent(p.root, *requested) != nil) {
+	if requested != nil {
+		if strings.TrimSpace(key) == "" || approved == nil && ValidateIntent(p.root, *requested) != nil ||
+			approved != nil && (approved.Route != *requested || ValidateApprovedHostnameRoute(p.root, *approved) != nil) {
+			return application.ErrAcornFoxPublicAccessOwnershipConflict
+		}
+	} else if approved != nil {
 		return application.ErrAcornFoxPublicAccessOwnershipConflict
 	}
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -113,17 +321,24 @@ func (p *Provider) project(ctx context.Context, requested *contracts.AcornFoxPub
 		sort.Slice(states, func(i, j int) bool { return states[i].Intent.Hostname < states[j].Intent.Hostname })
 		for _, state := range states {
 			i := state.Intent
-			if ValidateIntent(p.root, i) != nil || seen[i.Hostname] {
+			if state.Approval == nil && ValidateIntent(p.root, i) != nil ||
+				state.Approval != nil && (state.Approval.Route != i || ValidateApprovedHostnameRoute(p.root, *state.Approval) != nil) ||
+				seen[i.Hostname] {
 				return application.ErrAcornFoxPublicAccessOwnershipConflict
 			}
 			seen[i.Hostname] = true
 			item := route(i)
 			raw, _ := json.Marshal(item)
-			owned[item["@id"].(string)] = raw
+			id := item["@id"].(string)
+			if _, duplicate := owned[id]; duplicate {
+				return application.ErrAcornFoxPublicAccessOwnershipConflict
+			}
+			owned[id] = raw
 			if state.Enabled {
 				desired = append(desired, item)
 			}
-			if requested != nil && i == *requested && state.Enabled == enabled {
+			if requested != nil && i == *requested && state.Enabled == enabled &&
+				(approved == nil && state.Approval == nil || approved != nil && state.Approval != nil && *approved == *state.Approval) {
 				found = true
 			}
 		}
@@ -188,6 +403,12 @@ func (p *Provider) project(ctx context.Context, requested *contracts.AcornFoxPub
 	return nil
 }
 func (p *Provider) call(ctx context.Context, method string, body []byte, tag string) ([]byte, string, error) {
+	if p.adminSocketPath != "" {
+		current, err := verifyAdminUnixSocket(p.adminSocketPath, p.adminSocketUID, p.adminSocketGID)
+		if err != nil || !os.SameFile(p.adminSocketInfo, current) {
+			return nil, "", application.ErrAcornFoxPublicAccessUnavailable
+		}
+	}
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	request, err := http.NewRequestWithContext(ctx, method, AdminURL+"/id/"+SubtreeID, bytes.NewReader(body))

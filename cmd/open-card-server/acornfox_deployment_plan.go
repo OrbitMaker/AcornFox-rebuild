@@ -16,6 +16,7 @@ type acornFoxDockerfileImporter interface {
 }
 
 type acornFoxDeploymentPlanResponse struct {
+	SourceType       string                                    `json:"source_type,omitempty"`
 	ApplicationID    domain.ID                                 `json:"application_id"`
 	SourceRevisionID domain.ID                                 `json:"source_revision_id"`
 	RepositoryURL    string                                    `json:"repository_url"`
@@ -97,6 +98,11 @@ func projectAcornFoxDeploymentPlan(source domain.SourceRevision, definition cont
 		Gaps:            append([]string{}, definition.Gaps...),
 		Warnings:        append([]string{}, definition.Warnings...),
 		RequiredActions: acornFoxDeploymentPlanActions(definition),
+	}
+	if source.Kind == domain.SourceUpload {
+		plan.SourceType = "upload"
+		plan.RepositoryURL = ""
+		plan.Commit = ""
 	}
 	plan.ReadyToDeploy = definition.Status == contracts.AcornFoxDockerfileReady && plan.PortSelection.SelectedPort != nil
 	return plan

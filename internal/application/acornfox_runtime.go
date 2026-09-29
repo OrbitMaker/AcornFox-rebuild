@@ -17,6 +17,32 @@ type AcornFoxRuntimeService struct {
 
 var _ contracts.AcornFoxRuntimeDriver = (*AcornFoxRuntimeService)(nil)
 
+type acornFoxLifecycleRuntimeService struct {
+	*AcornFoxRuntimeService
+	lifecycle acornFoxLifecycleDriver
+}
+
+type acornFoxRetainedRuntimeService struct {
+	*AcornFoxRuntimeService
+	retained acornFoxRetainedVolumeDriver
+}
+
+type acornFoxLifecycleAndRetainedRuntimeService struct {
+	*AcornFoxRuntimeService
+	lifecycle acornFoxLifecycleDriver
+	retained  acornFoxRetainedVolumeDriver
+}
+
+var (
+	_ contracts.AcornFoxRuntimeDriver          = (*acornFoxLifecycleRuntimeService)(nil)
+	_ contracts.AcornFoxLifecycleDriver        = (*acornFoxLifecycleRuntimeService)(nil)
+	_ contracts.AcornFoxRuntimeDriver          = (*acornFoxRetainedRuntimeService)(nil)
+	_ contracts.AcornFoxRetainedVolumeObserver = (*acornFoxRetainedRuntimeService)(nil)
+	_ contracts.AcornFoxRuntimeDriver          = (*acornFoxLifecycleAndRetainedRuntimeService)(nil)
+	_ contracts.AcornFoxLifecycleDriver        = (*acornFoxLifecycleAndRetainedRuntimeService)(nil)
+	_ contracts.AcornFoxRetainedVolumeObserver = (*acornFoxLifecycleAndRetainedRuntimeService)(nil)
+)
+
 type acornFoxLegacyRuntimeDriver interface {
 	Deploy(context.Context, contracts.DeployRequest) (domain.Deployment, error)
 	Recreate(context.Context, contracts.DeployRequest) (domain.Deployment, error)
@@ -25,11 +51,44 @@ type acornFoxLegacyRuntimeDriver interface {
 	Destroy(context.Context, contracts.DestroyRequest) error
 }
 
-func NewAcornFoxRuntimeService(driver acornFoxLegacyRuntimeDriver) (*AcornFoxRuntimeService, error) {
+type acornFoxLifecycleDriver interface {
+	Stop(context.Context, contracts.StopRequest) error
+	Start(context.Context, contracts.StartRequest) error
+}
+
+type acornFoxRetainedVolumeDriver interface {
+	ObserveRetainedVolumes(context.Context, contracts.RuntimeSpec) ([]contracts.AcornFoxRetainedVolumeReceipt, error)
+	RetainedVolumeObservationSupported() bool
+}
+
+func NewAcornFoxRuntimeService(driver acornFoxLegacyRuntimeDriver) (contracts.AcornFoxRuntimeDriver, error) {
 	if driver == nil {
 		return nil, fmt.Errorf("runtime driver is unavailable")
 	}
-	return &AcornFoxRuntimeService{driver: driver}, nil
+	base := &AcornFoxRuntimeService{driver: driver}
+	lifecycle, hasLifecycle := driver.(acornFoxLifecycleDriver)
+	retained, hasRetainedRaw := driver.(acornFoxRetainedVolumeDriver)
+	hasRetained := hasRetainedRaw && retained.RetainedVolumeObservationSupported()
+	if hasLifecycle && hasRetained {
+		return &acornFoxLifecycleAndRetainedRuntimeService{
+			AcornFoxRuntimeService: base,
+			lifecycle:              lifecycle,
+			retained:               retained,
+		}, nil
+	}
+	if hasLifecycle {
+		return &acornFoxLifecycleRuntimeService{
+			AcornFoxRuntimeService: base,
+			lifecycle:              lifecycle,
+		}, nil
+	}
+	if hasRetained {
+		return &acornFoxRetainedRuntimeService{
+			AcornFoxRuntimeService: base,
+			retained:               retained,
+		}, nil
+	}
+	return base, nil
 }
 
 func (service *AcornFoxRuntimeService) Deploy(ctx context.Context, request contracts.AcornFoxRuntimeDeployRequest) (contracts.AcornFoxRuntimeDeployment, error) {
@@ -145,6 +204,106 @@ func (service *AcornFoxRuntimeService) Destroy(ctx context.Context, request cont
 		return err
 	}
 	return service.driver.Destroy(ctx, contracts.DestroyRequest{DeploymentID: deploymentID, Operation: operation})
+}
+
+func (service *acornFoxLifecycleRuntimeService) Stop(ctx context.Context, request contracts.AcornFoxRuntimeActionRequest) error {
+	if service == nil {
+		return fmt.Errorf("runtime service is unavailable")
+	}
+	return stopLifecycle(service.AcornFoxRuntimeService, service.lifecycle, ctx, request)
+}
+
+func (service *acornFoxLifecycleRuntimeService) Start(ctx context.Context, request contracts.AcornFoxRuntimeActionRequest) error {
+	if service == nil {
+		return fmt.Errorf("runtime service is unavailable")
+	}
+	return startLifecycle(service.AcornFoxRuntimeService, service.lifecycle, ctx, request)
+}
+
+func (service *acornFoxRetainedRuntimeService) ObserveRetainedVolumes(ctx context.Context, fact contracts.AcornFoxRuntimeReleaseFact) ([]contracts.AcornFoxRetainedVolumeReceipt, error) {
+	if service == nil {
+		return nil, fmt.Errorf("runtime service is unavailable")
+	}
+	return observeRetained(service.retained, ctx, fact)
+}
+
+func (service *acornFoxLifecycleAndRetainedRuntimeService) Stop(ctx context.Context, request contracts.AcornFoxRuntimeActionRequest) error {
+	if service == nil {
+		return fmt.Errorf("runtime service is unavailable")
+	}
+	return stopLifecycle(service.AcornFoxRuntimeService, service.lifecycle, ctx, request)
+}
+
+func (service *acornFoxLifecycleAndRetainedRuntimeService) Start(ctx context.Context, request contracts.AcornFoxRuntimeActionRequest) error {
+	if service == nil {
+		return fmt.Errorf("runtime service is unavailable")
+	}
+	return startLifecycle(service.AcornFoxRuntimeService, service.lifecycle, ctx, request)
+}
+
+func (service *acornFoxLifecycleAndRetainedRuntimeService) ObserveRetainedVolumes(ctx context.Context, fact contracts.AcornFoxRuntimeReleaseFact) ([]contracts.AcornFoxRetainedVolumeReceipt, error) {
+	if service == nil {
+		return nil, fmt.Errorf("runtime service is unavailable")
+	}
+	return observeRetained(service.retained, ctx, fact)
+}
+
+func stopLifecycle(base *AcornFoxRuntimeService, lifecycle acornFoxLifecycleDriver, ctx context.Context, request contracts.AcornFoxRuntimeActionRequest) error {
+	if base == nil || lifecycle == nil {
+		return fmt.Errorf("runtime service is unavailable")
+	}
+	if err := request.Validate(); err != nil {
+		return err
+	}
+	fact := request.Fact
+	deploymentID, err := contracts.AcornFoxRuntimeDeploymentID(fact)
+	if err != nil {
+		return err
+	}
+	operation, err := base.operation(fact, "stop", request.IdempotencyKey)
+	if err != nil {
+		return err
+	}
+	return lifecycle.Stop(ctx, contracts.StopRequest{DeploymentID: deploymentID, ServiceName: fact.ServiceName, Operation: operation})
+}
+
+func startLifecycle(base *AcornFoxRuntimeService, lifecycle acornFoxLifecycleDriver, ctx context.Context, request contracts.AcornFoxRuntimeActionRequest) error {
+	if base == nil || lifecycle == nil {
+		return fmt.Errorf("runtime service is unavailable")
+	}
+	if err := request.Validate(); err != nil {
+		return err
+	}
+	fact := request.Fact
+	deploymentID, err := contracts.AcornFoxRuntimeDeploymentID(fact)
+	if err != nil {
+		return err
+	}
+	operation, err := base.operation(fact, "start", request.IdempotencyKey)
+	if err != nil {
+		return err
+	}
+	return lifecycle.Start(ctx, contracts.StartRequest{DeploymentID: deploymentID, ServiceName: fact.ServiceName, Operation: operation})
+}
+
+func observeRetained(retained acornFoxRetainedVolumeDriver, ctx context.Context, fact contracts.AcornFoxRuntimeReleaseFact) ([]contracts.AcornFoxRetainedVolumeReceipt, error) {
+	if retained == nil {
+		return nil, fmt.Errorf("retained volume observer is unavailable")
+	}
+	if fact.Configuration == nil || len(fact.Configuration.Volumes) == 0 {
+		return nil, nil
+	}
+	spec := contracts.RuntimeSpec{
+		ApplicationID: fact.ApplicationID,
+		EnvironmentID: fact.EnvironmentID,
+		ReleaseID:     fact.ReleaseID,
+		ServiceName:   fact.ServiceName,
+		Image:         fact.Image,
+		Port:          fact.ContainerPort,
+		Configuration: fact.Configuration,
+		ConfigDigest:  fact.ConfigDigest,
+	}
+	return retained.ObserveRetainedVolumes(ctx, spec)
 }
 
 func (service *AcornFoxRuntimeService) operation(fact contracts.AcornFoxRuntimeReleaseFact, action, callerKey string) (contracts.OperationContext, error) {

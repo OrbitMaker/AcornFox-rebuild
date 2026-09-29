@@ -8,7 +8,9 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
 	"os"
@@ -91,7 +93,7 @@ func (f *registryFixture) handler(t *testing.T, requireAuth string) http.Handler
 			writer.WriteHeader(http.StatusUnauthorized)
 			return
 		}
-		if request.URL.Path == "/v2/"+testRepositoryPath+"/manifests/stable" {
+		if request.URL.Path == "/v2/"+testRepositoryPath+"/manifests/stable" || request.URL.Path == "/v2/"+testRepositoryPath+"/manifests/"+f.indexDigest {
 			if serveOther {
 				writer.Header().Set("Docker-Content-Digest", f.otherDigest)
 				writer.Header().Set("Content-Type", ociIndexMediaType)
@@ -429,5 +431,500 @@ func TestResolveRejectsNonAMD64ImageConfig(t *testing.T) {
 	var providerErr *contracts.ProviderError
 	if !errors.As(err, &providerErr) || providerErr.Code != contracts.ErrConflict {
 		t.Fatalf("expected platform conflict, got %v", err)
+	}
+}
+
+func TestAnonymousChallenge_RetryAndSuppliedDigest(t *testing.T) {
+	fixture := newRegistryFixture(t, "amd64")
+	var serverURL string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/token" {
+			q := r.URL.Query()
+			if q.Get("scope") != "repository:"+testRepositoryPath+":pull" {
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{"token": "test-anon-bearer-token-12345"})
+			return
+		}
+		authHeader := r.Header.Get("Authorization")
+		if authHeader != "Bearer test-anon-bearer-token-12345" {
+			w.Header().Set("Www-Authenticate", `Bearer realm="`+serverURL+`/token",service="test",scope="repository:`+testRepositoryPath+`:pull"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		fixture.handler(t, "Bearer test-anon-bearer-token-12345").ServeHTTP(w, r)
+	}))
+	defer server.Close()
+	serverURL = server.URL
+
+	provider := newProvider(t, server.URL, nil)
+
+	// 1. Tag resolution with anonymous challenge retry
+	tagReq := baseRequest("anon-resolve-tag")
+	tagResult, err := provider.Resolve(context.Background(), tagReq)
+	if err != nil {
+		t.Fatalf("anonymous resolve with tag failed: %v", err)
+	}
+	if tagResult.Image.Digest != fixture.manifestDigest {
+		t.Fatalf("expected resolved child manifest digest %s, got %s", fixture.manifestDigest, tagResult.Image.Digest)
+	}
+	if tagResult.Image.ResolvedTag != "stable" {
+		t.Fatalf("expected resolved tag stable, got %s", tagResult.Image.ResolvedTag)
+	}
+	// Check token is not leaked into evidence
+	if strings.Contains(tagResult.Evidence.Summary, "test-anon-bearer-token-12345") || strings.Contains(tagResult.Evidence.Digest, "test-anon-bearer-token-12345") {
+		t.Fatalf("token leaked into evidence: %+v", tagResult.Evidence)
+	}
+
+	// 2. Supplied immutable sha256 index digest resolution
+	digestReq := contracts.ImageResolveRequest{
+		Repository: tagReq.Repository,
+		Tag:        fixture.indexDigest,
+		Operation:  contracts.OperationContext{IdempotencyKey: "anon-resolve-digest"},
+	}
+	digestResult, err := provider.Resolve(context.Background(), digestReq)
+	if err != nil {
+		t.Fatalf("anonymous resolve with index digest failed: %v", err)
+	}
+	if digestResult.Image.Digest != fixture.manifestDigest {
+		t.Fatalf("expected child manifest digest %s, got %s", fixture.manifestDigest, digestResult.Image.Digest)
+	}
+	if digestResult.Image.ResolvedTag != "" {
+		t.Fatalf("expected empty resolved tag for supplied digest, got %q", digestResult.Image.ResolvedTag)
+	}
+}
+
+func TestAnonymousChallenge_MaliciousRealmAndScopeRejection(t *testing.T) {
+	var challengeHeader string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Www-Authenticate", challengeHeader)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer server.Close()
+
+	provider := newProvider(t, server.URL, nil)
+
+	// 1. Malicious realm (external / non-loopback origin)
+	challengeHeader = `Bearer realm="http://evil.com/token",service="test",scope="repository:` + testRepositoryPath + `:pull"`
+	_, err := provider.Resolve(context.Background(), baseRequest("malicious-realm"))
+	if err == nil {
+		t.Fatalf("expected error on malicious realm, got nil")
+	}
+
+	// 2. Malicious scope (push scope)
+	challengeHeader = `Bearer realm="` + server.URL + `/token",service="test",scope="repository:` + testRepositoryPath + `:push"`
+	_, err = provider.Resolve(context.Background(), baseRequest("malicious-scope"))
+	if err == nil {
+		t.Fatalf("expected error on push scope, got nil")
+	}
+
+	// 3. Ambiguous token response (different token and access_token)
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/token" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"token":        "first-token",
+				"access_token": "second-token",
+			})
+			return
+		}
+		w.Header().Set("Www-Authenticate", `Bearer realm="`+r.Host+`/token",service="test",scope="repository:`+testRepositoryPath+`:pull"`)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer tokenServer.Close()
+
+	challengeHeader = `Bearer realm="` + tokenServer.URL + `/token",service="test",scope="repository:` + testRepositoryPath + `:pull"`
+	_, err = provider.Resolve(context.Background(), baseRequest("ambiguous-token"))
+	if err == nil {
+		t.Fatalf("expected error on ambiguous token response, got nil")
+	}
+}
+
+type syntheticRoundTripper struct {
+	roundTrip func(req *http.Request) (*http.Response, error)
+}
+
+func (s *syntheticRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return s.roundTrip(req)
+}
+
+func TestGHCRBlobRedirect_PermittedAndStrippedAuth(t *testing.T) {
+	validConfig := []byte(`{"architecture":"amd64","os":"linux"}`)
+	validConfigDigest := digestBytes(validConfig)
+	manifest := []byte(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"` + validConfigDigest + `","size":` + itoa(len(validConfig)) + `},"layers":[]}`)
+	manifestDigest := digestBytes(manifest)
+
+	var cdnAuthHeader, cdnProxyAuth, cdnCookie string
+	var serveTampered bool
+
+	transport := &syntheticRoundTripper{
+		roundTrip: func(req *http.Request) (*http.Response, error) {
+			// Manifest request to ghcr.io
+			if req.URL.Host == "ghcr.io" && req.URL.Path == "/v2/myorg/myapp/manifests/latest" {
+				resp := &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(bytes.NewReader(manifest)),
+					Request:    req,
+				}
+				resp.Header.Set("Content-Type", ociManifestMediaType)
+				resp.Header.Set("Docker-Content-Digest", manifestDigest)
+				return resp, nil
+			}
+
+			// Blob request to ghcr.io -> returns 307 redirect to pkg-containers.githubusercontent.com
+			if req.URL.Host == "ghcr.io" && req.URL.Path == "/v2/myorg/myapp/blobs/"+validConfigDigest {
+				resp := &http.Response{
+					StatusCode: http.StatusTemporaryRedirect,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(bytes.NewReader(nil)),
+					Request:    req,
+				}
+				resp.Header.Set("Location", "https://pkg-containers.githubusercontent.com/ghcr1/blobs/"+validConfigDigest+"?signature=signed_secret_query")
+				return resp, nil
+			}
+
+			// CDN blob request to pkg-containers.githubusercontent.com
+			if req.URL.Host == "pkg-containers.githubusercontent.com" && strings.HasPrefix(req.URL.Path, "/ghcr1/blobs/"+validConfigDigest) {
+				cdnAuthHeader = req.Header.Get("Authorization")
+				cdnProxyAuth = req.Header.Get("Proxy-Authorization")
+				cdnCookie = req.Header.Get("Cookie")
+
+				blobContent := validConfig
+				if serveTampered {
+					blobContent = []byte(`{"architecture":"amd64","os":"linux","tampered":true}`)
+				}
+
+				resp := &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(bytes.NewReader(blobContent)),
+					Request:    req,
+				}
+				resp.Header.Set("Content-Type", "application/octet-stream")
+				return resp, nil
+			}
+
+			return &http.Response{
+				StatusCode: http.StatusNotFound,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(bytes.NewReader(nil)),
+				Request:    req,
+			}, nil
+		},
+	}
+
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cdnURL, _ := url.Parse("https://pkg-containers.githubusercontent.com/")
+	jar.SetCookies(cdnURL, []*http.Cookie{{Name: "test_cookie", Value: "must_not_reach_cdn", Secure: true}})
+	client := &http.Client{Transport: transport, Jar: jar}
+	provider, err := New(Config{HTTPClient: client})
+	if err != nil {
+		t.Fatalf("New provider failed: %v", err)
+	}
+
+	// 1. Successful resolve: follows redirect to pkg-containers.githubusercontent.com, strips auth, returns verified digest
+	resolveReq := contracts.ImageResolveRequest{
+		Repository: "ghcr.io/myorg/myapp",
+		Tag:        "latest",
+		Operation:  contracts.OperationContext{IdempotencyKey: "ghcr-cdn-success"},
+	}
+	res, err := provider.Resolve(context.Background(), resolveReq)
+	if err != nil {
+		t.Fatalf("expected successful resolve with CDN redirect, got: %v", err)
+	}
+	if res.Image.Digest != manifestDigest {
+		t.Fatalf("expected manifest digest %s, got %s", manifestDigest, res.Image.Digest)
+	}
+	if cdnAuthHeader != "" {
+		t.Fatalf("expected Authorization stripped on CDN hop, got %q", cdnAuthHeader)
+	}
+	if cdnProxyAuth != "" || cdnCookie != "" {
+		t.Fatalf("expected Proxy-Authorization and Cookie stripped on CDN hop")
+	}
+
+	// 2. Tampered blob bytes: fails digest verification with ErrConflict
+	serveTampered = true
+	tamperedReq := contracts.ImageResolveRequest{
+		Repository: "ghcr.io/myorg/myapp",
+		Tag:        "latest",
+		Operation:  contracts.OperationContext{IdempotencyKey: "ghcr-cdn-tampered"},
+	}
+	_, err = provider.Resolve(context.Background(), tamperedReq)
+	if err == nil {
+		t.Fatalf("expected error on tampered CDN blob, got nil")
+	}
+	var provErr *contracts.ProviderError
+	if !errors.As(err, &provErr) || provErr.Code != contracts.ErrConflict {
+		t.Fatalf("expected ErrConflict on tampered blob bytes, got: %v", err)
+	}
+}
+
+func TestGHCRBlobRedirect_Denials(t *testing.T) {
+	validConfig := []byte(`{"architecture":"amd64","os":"linux"}`)
+	validConfigDigest := digestBytes(validConfig)
+	manifest := []byte(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"` + validConfigDigest + `","size":` + itoa(len(validConfig)) + `},"layers":[]}`)
+
+	denialCases := []struct {
+		name        string
+		reqPath     string
+		redirectLoc string
+	}{
+		{
+			name:        "arbitrary target host rejected",
+			reqPath:     "/v2/myorg/myapp/blobs/" + validConfigDigest,
+			redirectLoc: "https://evil-cdn.example.com/blobs/" + validConfigDigest,
+		},
+		{
+			name:        "manifest redirect to CDN rejected",
+			reqPath:     "/v2/myorg/myapp/manifests/latest",
+			redirectLoc: "https://pkg-containers.githubusercontent.com/manifests/latest",
+		},
+		{
+			name:        "userinfo in CDN redirect rejected",
+			reqPath:     "/v2/myorg/myapp/blobs/" + validConfigDigest,
+			redirectLoc: "https://user:pass@pkg-containers.githubusercontent.com/blobs/" + validConfigDigest,
+		},
+		{
+			name:        "non-443 port in CDN redirect rejected",
+			reqPath:     "/v2/myorg/myapp/blobs/" + validConfigDigest,
+			redirectLoc: "https://pkg-containers.githubusercontent.com:8443/blobs/" + validConfigDigest,
+		},
+		{
+			name:        "scheme downgrade in CDN redirect rejected",
+			reqPath:     "/v2/myorg/myapp/blobs/" + validConfigDigest,
+			redirectLoc: "http://pkg-containers.githubusercontent.com/blobs/" + validConfigDigest,
+		},
+	}
+
+	for _, tc := range denialCases {
+		t.Run(tc.name, func(t *testing.T) {
+			transport := &syntheticRoundTripper{
+				roundTrip: func(req *http.Request) (*http.Response, error) {
+					if req.URL.Host == "ghcr.io" && req.URL.Path == tc.reqPath {
+						resp := &http.Response{
+							StatusCode: http.StatusTemporaryRedirect,
+							Header:     make(http.Header),
+							Body:       io.NopCloser(bytes.NewReader(nil)),
+							Request:    req,
+						}
+						resp.Header.Set("Location", tc.redirectLoc)
+						return resp, nil
+					}
+					if req.URL.Host == "ghcr.io" && req.URL.Path == "/v2/myorg/myapp/manifests/latest" {
+						resp := &http.Response{
+							StatusCode: http.StatusOK,
+							Header:     make(http.Header),
+							Body:       io.NopCloser(bytes.NewReader(manifest)),
+							Request:    req,
+						}
+						resp.Header.Set("Content-Type", ociManifestMediaType)
+						resp.Header.Set("Docker-Content-Digest", digestBytes(manifest))
+						return resp, nil
+					}
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     make(http.Header),
+						Body:       io.NopCloser(bytes.NewReader(validConfig)),
+						Request:    req,
+					}, nil
+				},
+			}
+
+			client := &http.Client{Transport: transport}
+			provider, err := New(Config{HTTPClient: client})
+			if err != nil {
+				t.Fatalf("New provider failed: %v", err)
+			}
+
+			resolveReq := contracts.ImageResolveRequest{
+				Repository: "ghcr.io/myorg/myapp",
+				Tag:        "latest",
+				Operation:  contracts.OperationContext{IdempotencyKey: "denial-" + tc.name},
+			}
+			_, err = provider.Resolve(context.Background(), resolveReq)
+			if err == nil {
+				t.Fatalf("expected redirect denial for case %q, but got nil", tc.name)
+			}
+		})
+	}
+}
+
+func TestResolveAndPullReadFailuresKeepCauseAndNeverStore(t *testing.T) {
+	for _, kind := range []string{"layer-timeout", "layer-cancel", "metadata-timeout", "layer-digest"} {
+		t.Run(kind, func(t *testing.T) {
+			fixture := newRegistryFixture(t, "amd64")
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			original := fixture.handler(t, "")
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				target := "/v2/" + testRepositoryPath + "/blobs/" + fixture.layerDigest
+				if kind == "metadata-timeout" {
+					target = "/v2/" + testRepositoryPath + "/manifests/stable"
+				}
+				if req.URL.Path != target {
+					original.ServeHTTP(w, req)
+					return
+				}
+				if kind == "layer-digest" {
+					_, _ = w.Write([]byte("complete-but-wrong-layer"))
+					return
+				}
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte("partial-body"))
+				w.(http.Flusher).Flush()
+				if kind == "layer-cancel" {
+					cancel()
+				}
+				<-req.Context().Done()
+			}))
+			defer server.Close()
+			store := newFakeImageStore()
+			provider := newProvider(t, server.URL, store)
+			provider.config.HTTPClient.Timeout = 50 * time.Millisecond
+			_, err := provider.ResolveAndPull(ctx, baseRequest("read-failure-"+kind))
+			var pe *contracts.ProviderError
+			if !errors.As(err, &pe) {
+				t.Fatalf("expected provider error, got %v", err)
+			}
+			want := contracts.ErrTimeout
+			if kind == "layer-cancel" {
+				want = contracts.ErrCancelled
+			}
+			if kind == "layer-digest" {
+				want = contracts.ErrConflict
+			}
+			if pe.Code != want {
+				t.Fatalf("%s: code=%s want=%s", kind, pe.Code, want)
+			}
+			if kind == "layer-cancel" && !errors.Is(err, context.Canceled) {
+				t.Fatal("cancellation cause lost")
+			}
+			if strings.Contains(kind, "timeout") {
+				var timeout net.Error
+				if !errors.Is(err, context.DeadlineExceeded) && !(errors.As(err, &timeout) && timeout.Timeout()) {
+					t.Fatal("timeout cause lost")
+				}
+			}
+			if kind == "layer-digest" && pe.Cause != nil {
+				t.Fatal("complete wrong digest fabricated a transport cause")
+			}
+			store.mu.Lock()
+			calls := len(store.archives)
+			store.mu.Unlock()
+			if calls != 0 {
+				t.Fatal("unverified input reached StoreOCI")
+			}
+			entries, readErr := os.ReadDir(provider.config.TempRoot)
+			if readErr != nil || len(entries) != 0 {
+				t.Fatalf("temporary workspace leaked: entries=%d err=%v", len(entries), readErr)
+			}
+		})
+	}
+}
+
+func TestRegistryRequestTimeoutCauseIsPrivateAndUnwraps(t *testing.T) {
+	cause := &url.Error{Op: "Get", URL: "https://cdn.example/secret-path?token=private-token", Err: &net.DNSError{Err: "private-token", IsTimeout: true}}
+	client := &http.Client{Transport: &syntheticRoundTripper{roundTrip: func(*http.Request) (*http.Response, error) { return nil, cause }}}
+	provider, err := New(Config{HTTPClient: client})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, _ := url.Parse("https://ghcr.io")
+	_, err = provider.request(context.Background(), &httpSession{client: provider.config.HTTPClient, baseURL: base}, http.MethodGet, "/v2/stefanprodan/podinfo/manifests/stable", "")
+	var pe *contracts.ProviderError
+	if !errors.As(err, &pe) || pe.Code != contracts.ErrTimeout || !errors.Is(err, cause) {
+		t.Fatalf("timeout classification/cause lost: %v", err)
+	}
+	encoded, marshalErr := json.Marshal(pe)
+	if marshalErr != nil {
+		t.Fatal(marshalErr)
+	}
+	for _, text := range []string{pe.Error(), string(encoded)} {
+		if strings.Contains(text, "cdn.example") || strings.Contains(text, "secret-path") || strings.Contains(text, "private-token") || strings.Contains(text, "token=") {
+			t.Fatalf("cause leaked through public error: %s", text)
+		}
+	}
+}
+
+func TestResolveAndPullSameKeyRetriesCompletedRetryableFailure(t *testing.T) {
+	fixture := newRegistryFixture(t, "amd64")
+	original := fixture.handler(t, "")
+	var mu sync.Mutex
+	layerReads, wrongLayer := 0, false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != "/v2/"+testRepositoryPath+"/blobs/"+fixture.layerDigest {
+			original.ServeHTTP(w, req)
+			return
+		}
+		mu.Lock()
+		layerReads++
+		first, wrong := layerReads == 1, wrongLayer
+		mu.Unlock()
+		if first {
+			_, _ = w.Write([]byte("partial-layer"))
+			w.(http.Flusher).Flush()
+			<-req.Context().Done()
+			return
+		}
+		if wrong {
+			_, _ = w.Write([]byte("fully-read-wrong-layer"))
+			return
+		}
+		original.ServeHTTP(w, req)
+	}))
+	defer server.Close()
+	store := newFakeImageStore()
+	provider := newProvider(t, server.URL, store)
+	provider.config.HTTPClient.Timeout = 50 * time.Millisecond
+	request := baseRequest("retry-same-key")
+	_, err := provider.ResolveAndPull(context.Background(), request)
+	var pe *contracts.ProviderError
+	if !errors.As(err, &pe) || pe.Code != contracts.ErrTimeout || !pe.Retryable {
+		t.Fatalf("expected retryable read timeout, got %v", err)
+	}
+	result, err := provider.ResolveAndPull(context.Background(), request)
+	if err != nil || result.Image.Digest != fixture.manifestDigest {
+		t.Fatalf("same-key retry did not really succeed: %v", err)
+	}
+	if replay, err := provider.ResolveAndPull(context.Background(), request); err != nil || replay.Image.Digest != result.Image.Digest {
+		t.Fatalf("successful replay changed result: %v", err)
+	}
+	changed := request
+	changed.Tag = "another-tag"
+	if _, err := provider.ResolveAndPull(context.Background(), changed); !errors.As(err, &pe) || pe.Code != contracts.ErrConflict {
+		t.Fatalf("same-key different request accepted: %v", err)
+	}
+	mu.Lock()
+	if layerReads != 2 {
+		t.Errorf("success/fingerprint replay downloaded again: reads=%d", layerReads)
+	}
+	wrongLayer = true
+	mu.Unlock()
+	permanent := baseRequest("permanent-checksum-conflict")
+	for i := 0; i < 2; i++ {
+		_, err := provider.ResolveAndPull(context.Background(), permanent)
+		if !errors.As(err, &pe) || pe.Code != contracts.ErrConflict || pe.Retryable {
+			t.Fatalf("complete checksum conflict should remain permanent: %v", err)
+		}
+	}
+	mu.Lock()
+	if layerReads != 3 {
+		t.Errorf("nonretryable failure was reexecuted: reads=%d", layerReads)
+	}
+	mu.Unlock()
+	store.mu.Lock()
+	if len(store.archives) != 1 {
+		t.Errorf("expected exactly one verified StoreOCI call, got %d", len(store.archives))
+	}
+	store.mu.Unlock()
+	entries, readErr := os.ReadDir(provider.config.TempRoot)
+	if readErr != nil || len(entries) != 0 {
+		t.Fatalf("temporary workspaces leaked: %d, %v", len(entries), readErr)
 	}
 }

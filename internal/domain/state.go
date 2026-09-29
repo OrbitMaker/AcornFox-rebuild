@@ -57,6 +57,7 @@ const (
 	DeploymentRollingBack  DeploymentStatus = "rolling_back"
 	DeploymentRolledBack   DeploymentStatus = "rolled_back"
 	DeploymentStopped      DeploymentStatus = "stopped"
+	DeploymentPaused       DeploymentStatus = "paused"
 	DeploymentUnknown      DeploymentStatus = "unknown"
 )
 
@@ -67,7 +68,7 @@ func (s DeploymentStatus) valid() bool {
 	case DeploymentPending, DeploymentPreparing, DeploymentDeploying,
 		DeploymentRuntimeReady, DeploymentDegraded, DeploymentServing, DeploymentFailed,
 		DeploymentRollingBack, DeploymentRolledBack, DeploymentStopped,
-		DeploymentUnknown:
+		DeploymentPaused, DeploymentUnknown:
 		return true
 	default:
 		return false
@@ -83,11 +84,13 @@ func (s DeploymentStatus) CanTransition(to DeploymentStatus) bool {
 	case DeploymentDeploying:
 		return to == DeploymentRuntimeReady || to == DeploymentDegraded || to == DeploymentFailed || to == DeploymentRollingBack || to == DeploymentStopped || to == DeploymentUnknown
 	case DeploymentRuntimeReady:
-		return to == DeploymentServing || to == DeploymentDegraded || to == DeploymentFailed || to == DeploymentRollingBack || to == DeploymentStopped || to == DeploymentUnknown
+		return to == DeploymentServing || to == DeploymentDegraded || to == DeploymentFailed || to == DeploymentRollingBack || to == DeploymentStopped || to == DeploymentPaused || to == DeploymentUnknown
 	case DeploymentDegraded:
-		return to == DeploymentRuntimeReady || to == DeploymentServing || to == DeploymentFailed || to == DeploymentRollingBack || to == DeploymentStopped || to == DeploymentUnknown
+		return to == DeploymentRuntimeReady || to == DeploymentServing || to == DeploymentFailed || to == DeploymentRollingBack || to == DeploymentStopped || to == DeploymentPaused || to == DeploymentUnknown
 	case DeploymentServing:
-		return to == DeploymentFailed || to == DeploymentRollingBack || to == DeploymentStopped || to == DeploymentUnknown
+		return to == DeploymentFailed || to == DeploymentRollingBack || to == DeploymentStopped || to == DeploymentPaused || to == DeploymentUnknown
+	case DeploymentPaused:
+		return to == DeploymentRuntimeReady || to == DeploymentStopped || to == DeploymentFailed || to == DeploymentUnknown
 	case DeploymentFailed:
 		return to == DeploymentRollingBack || to == DeploymentRolledBack || to == DeploymentStopped
 	case DeploymentRollingBack:
@@ -95,7 +98,7 @@ func (s DeploymentStatus) CanTransition(to DeploymentStatus) bool {
 	case DeploymentRolledBack:
 		return to == DeploymentStopped
 	case DeploymentUnknown:
-		return to == DeploymentPreparing || to == DeploymentDeploying || to == DeploymentRuntimeReady || to == DeploymentDegraded || to == DeploymentFailed || to == DeploymentRollingBack || to == DeploymentStopped
+		return to == DeploymentPreparing || to == DeploymentDeploying || to == DeploymentRuntimeReady || to == DeploymentDegraded || to == DeploymentFailed || to == DeploymentRollingBack || to == DeploymentStopped || to == DeploymentPaused
 	default:
 		return false
 	}

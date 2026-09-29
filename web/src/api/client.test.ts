@@ -333,21 +333,6 @@ describe('RestApiClient', () => {
     expect([...new Headers(request?.headers).keys()]).toEqual([]);
   });
 
-  it('keeps M6 intervention and settings facts explicit without claiming external AI', async () => {
-    const requests: Array<{ url: string; headers: Headers }> = [];
-    const client = new RestApiClient({ baseUrl: '/api/v1', fetchImpl: async (input, init) => {
-      requests.push({ url: String(input), headers: new Headers(init?.headers) });
-      if (String(input).endsWith('/settings/ai')) return new Response(JSON.stringify({ version: 'ai-v1', enabled: false, status: 'disabled', profile: 'disabled', provider: '', model: '', data_scopes: [], max_tokens: 128, max_duration_ms: 1000, cooldown_seconds: 60, cache_enabled: true, external_calls: false }), { status: 200 });
-      return new Response(JSON.stringify({ version: 'ai-v1', mode: 'operator', ai_status: 'available', success_count: 0, failure_count: 1, rollback_count: 1, candidate_count: 0, total_tokens: 12, total_duration_ms: 20, items: [{ id: 'airec-1', application_id: 'app-live', task_type: 'build_failure_diagnosis', status: 'rolled_back', reason: 'rule miss', summary: 'verification failed', suggestion: 'review candidate', requires_user_action: true, controller_handoff: false, evidence: [], tokens: 12, duration_ms: 20, rolled_back: true, created_at: '2026-08-25T00:00:00Z' }] }), { status: 200 });
-    } });
-    const interventions = await client.getAIInterventions('app-live', 'operator');
-    const settings = await client.getAISettings();
-    expect(interventions.status === 'available' && interventions.facts.items[0]?.status).toBe('rolled_back');
-    expect(settings.status === 'available' && settings.settings.externalCalls).toBe(false);
-    expect([...requests[0].headers.keys()]).toEqual([]);
-    expect([...requests[1].headers.keys()]).toEqual([]);
-  });
-
   it('implements the 9038b2a application, domain, access and upload routes', async () => {
     Object.defineProperty(globalThis, 'document', { configurable: true, value: { cookie: `${CSRF_COOKIE_NAME}=csrf-value` } });
     const requests: Array<{ url: string; method: string; init: RequestInit }> = [];

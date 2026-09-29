@@ -92,7 +92,12 @@ func acornFoxUpgradeParent(path string) string {
 	return parent
 }
 func acornFoxUpgradeTemp(path string) string {
-	return acornFoxUpgradeParent(path) + "/.acornfox-upgrade-" + sha256Hex([]byte(path))[:32]
+	parent := acornFoxUpgradeParent(path)
+	basename := ".acornfox-upgrade-" + sha256Hex([]byte(path))[:32]
+	if parent == "." {
+		return basename
+	}
+	return parent + "/" + basename
 }
 func (u *acornFoxUpgrade) atomicFile(s *TaskAcornFoxRepoStore, root *os.Root, path string, old, next []byte, mode os.FileMode) error {
 	return u.atomicFileOwned(s, root, path, old, next, mode, acornFoxInstallPrincipal{})
@@ -440,6 +445,22 @@ func (u *acornFoxUpgrade) openSubstrate(root *os.Root, image acornFoxUpgradeImag
 		}
 		return h, nil
 	}
+	if isFrozen0040(image) {
+		binding, err := verifiedAcornFoxUpgradePredecessor(image.Binding, image.Repo.BindingSHA256)
+		if err != nil || validateAcornFoxFrozen0040SubstrateReceipt(image.Substrate, binding.binding, binding.digest) != nil {
+			root.Close()
+			return nil, ErrAcornFoxUpgradeConflict
+		}
+		for _, entry := range image.Substrate.Entries {
+			if entry.Kind == SubstrateEntryFile {
+				if _, err := acornFoxLiveReadSource(root, h, entry); err != nil {
+					root.Close()
+					return nil, ErrAcornFoxUpgradeConflict
+				}
+			}
+		}
+		return h, nil
+	}
 	if e := h.Verify(); e != nil {
 		root.Close()
 		return nil, ErrAcornFoxUpgradeConflict
@@ -624,7 +645,9 @@ func (u *acornFoxUpgrade) imageFiles(s *TaskAcornFoxRepoStore, j acornFoxUpgrade
 	files := map[string][]byte{}
 	modes := map[string]os.FileMode{}
 	entries, e := acornFoxLiveExpectedEntriesForLayout(u.layout, h)
-	if image.Substrate.CandidateReceipt.MigrationVersion == AcornFoxLegacyPredecessorMigration {
+	if isFrozen0040(image) {
+		entries, e = acornFoxFrozen0040ExpectedEntries(u.layout, image.Substrate)
+	} else if image.Substrate.CandidateReceipt.MigrationVersion == AcornFoxLegacyPredecessorMigration {
 		entries, e = acornFoxLegacy0034ExpectedEntries(u.layout, image.Substrate)
 	} else if image.Substrate.CandidateReceipt.MigrationVersion == acornFoxRecentPredecessorMigration && AcornFoxV1MigrationVersion != acornFoxRecentPredecessorMigration {
 		entries, e = acornFoxRecent0039ExpectedEntries(u.layout, image.Substrate)

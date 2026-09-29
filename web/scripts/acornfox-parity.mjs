@@ -59,7 +59,7 @@ function successStatuses(operation, operationId) {
 
 function parityScope(operation, operationId) {
   const scope = operation["x-acornfox-parity"] ?? "legacy_cli";
-  if (!["legacy_cli", "integration_cli", "integration_ui", "assistant_ui_only", "candidate_cli", "cli_only"].includes(scope))
+  if (!["legacy_cli", "integration_cli", "integration_ui", "candidate_cli", "cli_only"].includes(scope))
     fail(`${operationId} has invalid x-acornfox-parity ${JSON.stringify(scope)}`);
   return scope;
 }
@@ -82,8 +82,8 @@ try {
         successStatuses: successStatuses(operation, operation.operationId),
         proof: proofClass(document, pathItem, operation, method, operation.operationId),
         parity: parityScope(operation, operation.operationId),
-        cli: parityScope(operation, operation.operationId) !== "integration_ui" && parityScope(operation, operation.operationId) !== "assistant_ui_only",
-        webClient: parityScope(operation, operation.operationId) === "legacy_cli" ? "legacy" : parityScope(operation, operation.operationId) === "candidate_cli" ? "candidate" : parityScope(operation, operation.operationId) === "cli_only" ? "none" : parityScope(operation, operation.operationId) === "assistant_ui_only" ? "assistant" : "integration",
+        cli: parityScope(operation, operation.operationId) !== "integration_ui",
+        webClient: parityScope(operation, operation.operationId) === "legacy_cli" ? "legacy" : parityScope(operation, operation.operationId) === "candidate_cli" ? "candidate" : parityScope(operation, operation.operationId) === "cli_only" ? "none" : "integration",
       });
     }
   }
@@ -91,16 +91,16 @@ try {
   if (new Set(operations.map((item) => item.operationId)).size !== operations.length)
     fail("operationIds must be unique");
 
-  const sourceRequestType = document.components?.schemas?.CreateApplicationRequest?.properties?.source?.properties?.type?.enum;
-  const sourceRevisionKind = document.components?.schemas?.SourceRevision?.properties?.kind?.enum;
-  if (JSON.stringify(sourceRequestType) !== JSON.stringify(["public_git"]))
-    fail("CreateApplicationRequest.source.type must remain exactly public_git");
-  if (JSON.stringify(sourceRevisionKind) !== JSON.stringify(["git_https"]))
-    fail("SourceRevision.kind must remain exactly git_https");
+  const sourceSchema = document.components?.schemas?.CreateApplicationRequest?.properties?.source;
+  const sourceRequestTypes = (sourceSchema?.oneOf ?? [sourceSchema]).flatMap((item) => item?.properties?.type?.enum ?? []);
+  const sourceRevisionKinds = document.components?.schemas?.SourceRevision?.properties?.kind?.enum;
+  if (JSON.stringify(sourceRequestTypes) !== JSON.stringify(["public_git", "upload"])) fail("request source kinds must be public_git and upload");
+  if (JSON.stringify(sourceRevisionKinds) !== JSON.stringify(["git_https", "upload"])) fail("response source kinds must be git_https and upload");
+  const sourceRequestType = [sourceRequestTypes[0]], sourceRevisionKind = [sourceRevisionKinds[0]];
 
   writeFileSync(
     matrixPath,
-    `${JSON.stringify({ sourceRequestType: sourceRequestType[0], sourceRevisionKind: sourceRevisionKind[0], operations })}\n`,
+    `${JSON.stringify({ sourceRequestType: sourceRequestType[0], sourceRevisionKind: sourceRevisionKind[0], sourceRequestTypes, sourceRevisionKinds, operations })}\n`,
     { mode: 0o600 },
   );
   const environment = { ...process.env, ACORNFOX_PARITY_MATRIX: matrixPath };
@@ -109,7 +109,7 @@ try {
     env: environment,
     stdio: "inherit",
   });
-  execFileSync(vitestPath, ["run", "src/acornfox/parity.test.ts"], {
+  execFileSync(vitestPath, ["run", "src/acornfox/parity.test.ts", "--maxWorkers=2", "--minWorkers=1"], {
     cwd: webRoot,
     env: environment,
     stdio: "inherit",
@@ -117,10 +117,9 @@ try {
   const cliOperations = operations.filter((operation) => operation.cli).length;
   const legacyWebOperations = operations.filter((operation) => operation.webClient === "legacy").length;
   const integrationWebOperations = operations.filter((operation) => operation.webClient === "integration").length;
-  const assistantWebOperations = operations.filter((operation) => operation.webClient === "assistant").length;
   const candidateWebOperations = operations.filter((operation) => operation.webClient === "candidate").length;
   const cliOnlyOperations = operations.filter((operation) => operation.webClient === "none").length;
-  console.log(`AcornFox parity passed: ${cliOperations} CLI, ${legacyWebOperations} legacy-Web, ${integrationWebOperations} integration-Web, ${assistantWebOperations} assistant-Web, ${candidateWebOperations} candidate-Web, ${cliOnlyOperations} CLI-only, and ${operations.length} declared operations.`);
+  console.log(`AcornFox parity passed: ${cliOperations} CLI, ${legacyWebOperations} legacy-Web, ${integrationWebOperations} integration-Web, ${candidateWebOperations} candidate-Web, ${cliOnlyOperations} CLI-only, and ${operations.length} declared operations.`);
 } finally {
   rmSync(matrixDirectory, { recursive: true, force: true });
 }

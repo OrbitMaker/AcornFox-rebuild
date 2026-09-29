@@ -1,8 +1,14 @@
 package main
 
-import "errors"
+import (
+	"errors"
+	"log"
+)
 
 func validateFeatureHierarchy(database, m1, m2, m3, m4, m4Rollout, m5, m6 bool) error {
+	if m6 {
+		log.Print("warning: built-in M6 AI has been retired and is ignored")
+	}
 	if m1 && !database {
 		return errors.New("M1 requires PostgreSQL")
 	}
@@ -20,9 +26,6 @@ func validateFeatureHierarchy(database, m1, m2, m3, m4, m4Rollout, m5, m6 bool) 
 	}
 	if m5 && (!database || !m4) {
 		return errors.New("M5 requires PostgreSQL and M4 observations")
-	}
-	if m6 && (!database || !m4 || !m5) {
-		return errors.New("M6 requires PostgreSQL, M4 observations, and M5 usage aggregates")
 	}
 	return nil
 }

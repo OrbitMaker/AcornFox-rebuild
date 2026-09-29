@@ -1,7 +1,6 @@
 import { readFileSync } from "node:fs";
 import { createAcornFoxClient, type AcornFoxClient, type AcornFoxSchemas } from "./client";
 import { createAcornFoxIntegrationClient, type AcornFoxIntegrationClient } from "./integration-client";
-import { createAcornFoxAssistantClient, type AcornFoxAssistantClient } from "./assistant-client";
 import { candidatePublishKey, createFixCandidateClient, type FixCandidateClient } from "./fix-candidate-client";
 import { candidateFixture } from "./fix-candidate.fixture";
 
@@ -17,9 +16,9 @@ type Operation = {
     | "session-read"
     | "csrf-session-mutation"
     | "csrf-idempotency-mutation";
-  parity: "legacy_cli" | "integration_cli" | "integration_ui" | "assistant_ui_only" | "candidate_cli" | "cli_only";
+  parity: "legacy_cli" | "integration_cli" | "integration_ui" | "candidate_cli" | "cli_only";
   cli: boolean;
-  webClient: "legacy" | "integration" | "assistant" | "candidate" | "none";
+  webClient: "legacy" | "integration" | "candidate" | "none";
 };
 type Matrix = {
   sourceRequestType: "public_git";
@@ -109,20 +108,6 @@ function payload(operationId: string, sourceRevisionKind: string): unknown {
       return { operation_id: "operation", operation_type: "observe", status: "verified", task_id: "task", deployment_id: "deployment", accepted_at: "2030-01-01T00:00:00Z", updated_at: "2030-01-01T00:00:01Z", evidence: { kind: "response_observation", verdict: "unhealthy", observed_at: "2030-01-01T00:00:01Z", http_status: 500 } };
     case "getAcornFoxExternalAccessObservation":
       return { availability: "not_observed" };
-    case "listAcornFoxAssistantSessions":
-      return { sessions: [] };
-    case "createAcornFoxAssistantSession":
-      return { session_id: "session", scope: { kind: "host" }, created_at: "2030-01-01T00:00:00Z", updated_at: "2030-01-01T00:00:00Z" };
-    case "submitAcornFoxAssistantRun":
-      return { run: { run_id: "run", session_id: "session", status: "accepted", created_at: "2030-01-01T00:00:00Z", updated_at: "2030-01-01T00:00:00Z" }, replay: false };
-    case "getAcornFoxAssistantEvents":
-      return { status: "ok", oldest_cursor: 0, latest_cursor: 0, events: [] };
-    case "abortAcornFoxAssistantSessionRuns":
-      return { aborted: 0 };
-    case "listAcornFoxAssistantActions":
-      return { actions: [] };
-    case "decideAcornFoxAssistantAction":
-      return { proposal_id: "proposal", session_id: "session", run_id: "run", action: "restart", target: { application_id: "app", deployment_id: "deployment", target_release_id: "release", target_release_version: 1, application_name: "App" }, state: "accepted", expires_at: "2030-01-01T00:10:00Z", operation_id: "operation", verification: { state: "pending" }, created_at: "2030-01-01T00:00:00Z", updated_at: "2030-01-01T00:00:01Z" };
     default:
       throw new Error(`missing test payload for ${operationId}`);
   }
@@ -139,12 +124,6 @@ type IntegrationOperation = {
   method: string;
   pathTemplate: string;
   invoke: (api: AcornFoxIntegrationClient) => Promise<unknown>;
-};
-type AssistantOperation = {
-  operationId: string;
-  method: string;
-  pathTemplate: string;
-  invoke: (api: AcornFoxAssistantClient) => Promise<unknown>;
 };
 
 const webOperations: WebOperation[] = [
@@ -177,15 +156,6 @@ const integrationOperations: IntegrationOperation[] = [
   { operationId: "getAcornFoxDeliverySource", method: "GET", pathTemplate: "/api/v1/acornfox/apps/{applicationId}/deliveries/{deploymentId}/source", invoke: (api) => api.deploymentSource("app", "deployment") },
   { operationId: "getAcornFoxOperationResult", method: "GET", pathTemplate: "/api/v1/acornfox/apps/{applicationId}/operations/{operationId}", invoke: (api) => api.operationResult("app", "operation") },
   { operationId: "getAcornFoxExternalAccessObservation", method: "GET", pathTemplate: "/api/v1/acornfox/apps/{applicationId}/deliveries/{deploymentId}/access-observation", invoke: (api) => api.accessObservation("app", "deployment") },
-];
-const assistantOperations: AssistantOperation[] = [
-  { operationId: "listAcornFoxAssistantSessions", method: "GET", pathTemplate: "/api/v1/acornfox/assistant/sessions", invoke: (api) => api.sessions() },
-  { operationId: "createAcornFoxAssistantSession", method: "POST", pathTemplate: "/api/v1/acornfox/assistant/sessions", invoke: (api) => api.createSession({ kind: "host" }) },
-  { operationId: "submitAcornFoxAssistantRun", method: "POST", pathTemplate: "/api/v1/acornfox/assistant/sessions/{sessionId}/runs", invoke: (api) => api.submitRun("session", "show host facts", "retry-key") },
-  { operationId: "getAcornFoxAssistantEvents", method: "GET", pathTemplate: "/api/v1/acornfox/assistant/sessions/{sessionId}/events", invoke: (api) => api.events("session", 0) },
-  { operationId: "abortAcornFoxAssistantSessionRuns", method: "POST", pathTemplate: "/api/v1/acornfox/assistant/sessions/{sessionId}/abort", invoke: (api) => api.abort("session") },
-  { operationId: "listAcornFoxAssistantActions", method: "GET", pathTemplate: "/api/v1/acornfox/assistant/sessions/{sessionId}/actions", invoke: (api) => api.actions("session") },
-  { operationId: "decideAcornFoxAssistantAction", method: "POST", pathTemplate: "/api/v1/acornfox/assistant/sessions/{sessionId}/actions/{proposalId}/decision", invoke: (api) => api.decideAction("session", "proposal", true) },
 ];
 
 // These payloads also compile against the generated OpenAPI DTOs. Runtime
@@ -270,7 +240,7 @@ describe("AcornFox OpenAPI parity", () => {
       "getAcornFoxDeliverySource", "getAcornFoxDeploymentPlan", "getAcornFoxExternalAccessObservation", "getAcornFoxHostMetrics", "getAcornFoxOperationResult", "getAcornFoxSetupState", "getAcornFoxSourceMetadata", "initializeAcornFoxAdministrator", "updateAcornFoxSourceRevision",
     ]);
     expect(integrationOperations).toHaveLength(integration.length);
-    expect(contract.operations.filter((operation) => operation.webClient === "none").map((operation) => operation.operationId)).toEqual(["createAcornFoxFixCandidate", "reportAcornFoxExternalAccessObservation"]);
+    expect(contract.operations.filter((operation) => operation.webClient === "none").map((operation) => operation.operationId)).toEqual(["createAcornFoxFixCandidate", "createAcornFoxSourceUpload", "getAcornFoxSourceUpload", "reportAcornFoxExternalAccessObservation"]);
     const contractByID = new Map(integration.map((operation) => [operation.operationId, operation]));
 
     for (const declared of integrationOperations) {
@@ -302,48 +272,6 @@ describe("AcornFox OpenAPI parity", () => {
         "csrf-session-mutation": [true, false],
         "csrf-idempotency-mutation": [true, true],
       }[operation!.proof]).toEqual([hasCSRF, hasKey]);
-    }
-  });
-
-  it.skipIf(!matrix)("derives assistant-client coverage, status, and proof from fresh OpenAPI", async () => {
-    const contract = matrix!;
-    const assistant = contract.operations.filter((operation) => operation.webClient === "assistant");
-    expect(assistant.map((operation) => operation.operationId).sort()).toEqual([
-      "abortAcornFoxAssistantSessionRuns", "createAcornFoxAssistantSession", "decideAcornFoxAssistantAction", "getAcornFoxAssistantEvents", "listAcornFoxAssistantActions", "listAcornFoxAssistantSessions", "submitAcornFoxAssistantRun",
-    ]);
-    expect(assistantOperations).toHaveLength(assistant.length);
-    const contractByID = new Map(assistant.map((operation) => [operation.operationId, operation]));
-
-    for (const declared of assistantOperations) {
-      const operation = contractByID.get(declared.operationId);
-      expect(operation).toBeDefined();
-      expect(declared.method).toBe(operation!.method);
-      expect(declared.pathTemplate).toBe(operation!.pathTemplate);
-      const seen: { url: string; init: RequestInit }[] = [];
-      Object.defineProperty(globalThis, "document", { configurable: true, value: { cookie: "__Host-acornfox_csrf=csrf" } });
-      const api = createAcornFoxAssistantClient(async (input, init) => {
-        seen.push({ url: String(input), init: init ?? {} });
-        const body = payload(declared.operationId, contract.sourceRevisionKind);
-        const status = declared.operationId === "submitAcornFoxAssistantRun" || declared.operationId === "decideAcornFoxAssistantAction" ? 202 : operation!.successStatuses[0]!;
-        expect(operation!.successStatuses).toContain(status);
-        return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
-      });
-      await declared.invoke(api);
-      expect(seen).toHaveLength(1);
-      const request = seen[0]!;
-      expect(actualTemplate(request.url, declared.pathTemplate)).toBe(operation!.pathTemplate);
-      expect((request.init.method ?? "GET").toUpperCase()).toBe(operation!.method);
-      expect(request.init.credentials).toBe("include");
-      const headers = new Headers(request.init.headers);
-      const hasCSRF = headers.get("X-AcornFox-CSRF") === "csrf";
-      expect({
-        "session-read": false,
-        "csrf-session-mutation": true,
-        "anonymous-login": false,
-        "anonymous-setup-read": false,
-        "anonymous-setup-mutation": true,
-        "csrf-idempotency-mutation": true,
-      }[operation!.proof]).toBe(hasCSRF);
     }
   });
 

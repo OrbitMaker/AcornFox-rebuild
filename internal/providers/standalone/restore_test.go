@@ -83,6 +83,9 @@ func TestInstalledReconcileResumesOnlyVerifiedActiveContainers(t *testing.T) {
 			}
 			if tc.phase != "" {
 				snapshot.Phase = tc.phase
+				if tc.phase == "destroyed" {
+					snapshot.Capacity = nil
+				}
 			}
 			if tc.unfinished {
 				snapshot.Actions[0].Status = "started"

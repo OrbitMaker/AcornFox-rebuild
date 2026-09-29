@@ -2,6 +2,9 @@ package standalone
 
 import (
 	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -117,4 +120,44 @@ func (p *Provider) persistRuntimeVolumeReceipt(claim runtimeVolumeClaim, state s
 		}
 	}
 	return syncRuntimeStateDirectory(p.config.WorkRoot)
+}
+
+// RetainedVolumeObservationSupported reports true only if the provider has a valid VolumeProvider configured.
+func (p *Provider) RetainedVolumeObservationSupported() bool {
+	return p != nil && p.config.Volumes != nil
+}
+
+// ObserveRetainedVolumes verifies durable volume receipts and inspects daemon facts for each volume
+// in the configuration. It returns verified receipts without exposing sensitive host paths.
+func (p *Provider) ObserveRetainedVolumes(ctx context.Context, spec contracts.RuntimeSpec) ([]contracts.AcornFoxRetainedVolumeReceipt, error) {
+	if spec.Configuration == nil || len(spec.Configuration.Volumes) == 0 {
+		return nil, nil
+	}
+	var out []contracts.AcornFoxRetainedVolumeReceipt
+	for _, v := range spec.Configuration.Volumes {
+		claim := runtimeVolumeClaimFor(p.config.TaskPrefix, spec, v)
+		recorded, err := p.readRuntimeVolumeReceipt(claim)
+		if err != nil {
+			return nil, err
+		}
+		if recorded != "accepted" {
+			return nil, fmt.Errorf("retained volume %s is not accepted", v.Name)
+		}
+		op := contracts.OperationContext{IdempotencyKey: "retained-volume-observe-" + hash(claim.Volume.Name)[:24]}
+		if err := p.inspectRuntimeVolume(ctx, claim.Volume, op); err != nil {
+			return nil, fmt.Errorf("retained volume %s daemon inspect failed: %w", v.Name, err)
+		}
+		raw := runtimeVolumeReceiptBytes(claim, "accepted")
+		h := sha256.Sum256(raw)
+		digest := "sha256:" + hex.EncodeToString(h[:])
+		out = append(out, contracts.AcornFoxRetainedVolumeReceipt{
+			ApplicationID:     claim.ApplicationID,
+			LogicalName:       claim.LogicalName,
+			ManagedVolumeName: claim.Volume.Name,
+			VolumeDriver:      "local",
+			ReceiptDigest:     digest,
+			VerifiedAt:        p.config.Clock().UTC(),
+		})
+	}
+	return out, nil
 }

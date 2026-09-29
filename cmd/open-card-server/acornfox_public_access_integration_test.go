@@ -79,7 +79,7 @@ func TestAcornFoxPublicAccessPostgresRecoveryAndM3Truth(t *testing.T) {
 	intent := contracts.AcornFoxPublicRouteIntent{ApplicationID: fixture.app, DeploymentID: fixture.dep, Hostname: host, ServiceName: endpoint.ServiceName, Port: endpoint.Port}
 	digest := dns10Digest(fixture.app, fixture.dep, true, host)
 	key := "dns10-enable"
-	if _, replay, err := store.BeginAcornFoxPublicAccess(ctx, dns10Fact(fixture.app, fixture.dep, host, true, contracts.AcornFoxLocalRouteDesired), intent, true, key, digest, fixture.now); err != nil || replay {
+	if _, replay, err := store.BeginAcornFoxPublicAccess(ctx, dns10Fact(fixture.app, fixture.dep, host, true, contracts.AcornFoxLocalRouteDesired), intent, true, key, digest, "", fixture.now); err != nil || replay {
 		t.Fatalf("begin enable replay=%v err=%v", replay, err)
 	}
 	assertDNS10RouteFacts(t, ctx, db, fixture.app, fixture.dep, "active", endpoint.Port)
@@ -102,7 +102,7 @@ func TestAcornFoxPublicAccessPostgresRecoveryAndM3Truth(t *testing.T) {
 	if router.ensure != 1 || router.apply != 1 {
 		t.Fatalf("recovery Ensure calls=%d want 1", router.ensure)
 	}
-	if _, replay, err := store.BeginAcornFoxPublicAccess(ctx, dns10Fact(fixture.app, fixture.dep, host, true, contracts.AcornFoxLocalRouteDesired), intent, true, key, digest, fixture.now); err != nil || !replay {
+	if _, replay, err := store.BeginAcornFoxPublicAccess(ctx, dns10Fact(fixture.app, fixture.dep, host, true, contracts.AcornFoxLocalRouteDesired), intent, true, key, digest, "", fixture.now); err != nil || !replay {
 		t.Fatalf("same-key replay=%v err=%v", replay, err)
 	}
 	activeRebuild := &dns10Router{}
@@ -123,7 +123,7 @@ func TestAcornFoxPublicAccessPostgresRecoveryAndM3Truth(t *testing.T) {
 			observedDisabled = true
 		}
 	}}
-	if _, replay, err := store.BeginAcornFoxPublicAccess(ctx, dns10Fact(fixture.app, fixture.dep, host, false, contracts.AcornFoxLocalRouteDisabled), intent, false, disableKey, disableDigest, fixture.now); err != nil || replay {
+	if _, replay, err := store.BeginAcornFoxPublicAccess(ctx, dns10Fact(fixture.app, fixture.dep, host, false, contracts.AcornFoxLocalRouteDisabled), intent, false, disableKey, disableDigest, "", fixture.now); err != nil || replay {
 		t.Fatalf("begin disable replay=%v err=%v", replay, err)
 	}
 	_ = db.Close()
@@ -200,7 +200,7 @@ func TestAcornFoxPublicAccessRecoveryRequiredAndActiveConflict(t *testing.T) {
 	intent := contracts.AcornFoxPublicRouteIntent{ApplicationID: fixture.app, DeploymentID: fixture.dep, Hostname: host, ServiceName: endpoint.ServiceName, Port: endpoint.Port}
 	req := application.AcornFoxPublicAccessRequest{ApplicationID: fixture.app, DeploymentID: fixture.dep, Enabled: true, IdempotencyKey: "active-1"}
 	digest := dns10Digest(req.ApplicationID, req.DeploymentID, req.Enabled, host)
-	if _, _, err := store.BeginAcornFoxPublicAccess(ctx, dns10Fact(fixture.app, fixture.dep, host, true, contracts.AcornFoxLocalRouteDesired), intent, true, req.IdempotencyKey, digest, fixture.now); err != nil {
+	if _, _, err := store.BeginAcornFoxPublicAccess(ctx, dns10Fact(fixture.app, fixture.dep, host, true, contracts.AcornFoxLocalRouteDesired), intent, true, req.IdempotencyKey, digest, "", fixture.now); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.MarkAcornFoxPublicAccessReconcileRequired(ctx, fixture.app, fixture.dep, req.IdempotencyKey, digest, fixture.now); err != nil {
@@ -210,7 +210,7 @@ func TestAcornFoxPublicAccessRecoveryRequiredAndActiveConflict(t *testing.T) {
 	if err != nil || len(items) != 1 || items[0].Phase != "reconcile_required" {
 		t.Fatalf("recovery claim=%+v err=%v", items, err)
 	}
-	if _, _, err := store.BeginAcornFoxPublicAccess(ctx, dns10Fact(fixture.app, fixture.dep, host, true, contracts.AcornFoxLocalRouteDesired), intent, true, "active-2", dns10Digest(fixture.app, fixture.dep, true, host), fixture.now); err == nil {
+	if _, _, err := store.BeginAcornFoxPublicAccess(ctx, dns10Fact(fixture.app, fixture.dep, host, true, contracts.AcornFoxLocalRouteDesired), intent, true, "active-2", dns10Digest(fixture.app, fixture.dep, true, host), "", fixture.now); err == nil {
 		t.Fatalf("different-key active command err=%v", err)
 	}
 }

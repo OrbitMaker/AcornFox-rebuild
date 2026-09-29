@@ -17,6 +17,9 @@ import (
 func newTestManager(t *testing.T, limits Limits) *Manager {
 	t.Helper()
 	root := t.TempDir()
+	if err := os.Chmod(root, 0700); err != nil {
+		t.Fatal(err)
+	}
 	manager, err := New(Config{Root: root, Limits: limits, Clock: func() time.Time { return time.Unix(1_700_000_000, 0).UTC() }})
 	if err != nil {
 		t.Fatal(err)

@@ -486,11 +486,15 @@ func TestRestartGroupServiceRestartsOnlyOwnedServiceAndReplaysIdempotently(t *te
 	if restarts != 1 {
 		t.Fatalf("restart replay repeated or omitted side effect: %#v", docker.callsSnapshot())
 	}
+	baseline := len(docker.callsSnapshot())
 	bad := request
 	bad.ServiceName = "missing"
 	bad.Operation.IdempotencyKey = "restart-group-missing"
 	if err := provider.RestartGroupService(context.Background(), bad); err == nil {
 		t.Fatal("unknown service restart was accepted")
+	}
+	if got := countCalls(docker.callsSnapshot()[baseline:], "restart"); got != 0 {
+		t.Fatalf("unknown-service rejection caused Docker restart side effects: %#v", docker.callsSnapshot()[baseline:])
 	}
 }
 

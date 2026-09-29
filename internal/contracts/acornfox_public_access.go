@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"net"
 	"strings"
 
 	"github.com/open-card/open-card/internal/domain"
@@ -70,6 +71,30 @@ type AcornFoxPublicRouteIntent struct {
 	Hostname      string    `json:"hostname"`
 	ServiceName   string    `json:"service_name"`
 	Port          int       `json:"port"`
+}
+
+// AcornFoxApprovedHostnameRoute is a Core-persisted custom-domain approval,
+// not a caller-selected proxy target. A projector must match this exact value
+// to a Source.WithRoutes row before touching Caddy. EndpointVersion fences the
+// inspected deployment/port fact; Core owns its construction and durability.
+type AcornFoxApprovedHostnameRoute struct {
+	Route           AcornFoxPublicRouteIntent `json:"route"`
+	Endpoint        AcornFoxRoutableEndpoint  `json:"endpoint"`
+	ApprovalID      domain.ID                 `json:"approval_id"`
+	EndpointVersion string                    `json:"endpoint_version"`
+}
+
+func (approval AcornFoxApprovedHostnameRoute) Validate() error {
+	host := approval.Route.Hostname
+	if approval.Route.Validate() != nil || approval.Endpoint.Validate() != nil ||
+		approval.Endpoint.ApplicationID != approval.Route.ApplicationID || approval.Endpoint.DeploymentID != approval.Route.DeploymentID ||
+		approval.Endpoint.ServiceName != approval.Route.ServiceName || approval.Endpoint.Port != approval.Route.Port ||
+		approval.ApprovalID.Empty() || !IsSHA256Digest(approval.EndpointVersion) ||
+		!strings.Contains(host, ".") || net.ParseIP(host) != nil || host == "localhost" ||
+		strings.HasSuffix(host, ".localhost") || strings.HasSuffix(host, ".local") || strings.HasSuffix(host, ".internal") {
+		return fmt.Errorf("AcornFox approved hostname route is invalid")
+	}
+	return nil
 }
 
 func (intent AcornFoxPublicRouteIntent) Validate() error {

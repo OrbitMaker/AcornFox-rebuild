@@ -100,107 +100,16 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/acornfox/assistant/sessions": {
+    "/api/v1/acornfox/host/metrics/recent": {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        get: operations["listAcornFoxAssistantSessions"];
-        put?: never;
-        post: operations["createAcornFoxAssistantSession"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/acornfox/assistant/sessions/{sessionId}/runs": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                sessionId: components["parameters"]["AssistantSessionId"];
-            };
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["submitAcornFoxAssistantRun"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/acornfox/assistant/sessions/{sessionId}/events": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                sessionId: components["parameters"]["AssistantSessionId"];
-            };
-            cookie?: never;
-        };
-        get: operations["getAcornFoxAssistantEvents"];
+        get: operations["getAcornFoxHostMetricsRecent"];
         put?: never;
         post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/acornfox/assistant/sessions/{sessionId}/abort": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                sessionId: components["parameters"]["AssistantSessionId"];
-            };
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["abortAcornFoxAssistantSessionRuns"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/acornfox/assistant/sessions/{sessionId}/actions": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                sessionId: components["parameters"]["AssistantSessionId"];
-            };
-            cookie?: never;
-        };
-        get: operations["listAcornFoxAssistantActions"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/acornfox/assistant/sessions/{sessionId}/actions/{proposalId}/decision": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                sessionId: components["parameters"]["AssistantSessionId"];
-                proposalId: components["parameters"]["AssistantProposalId"];
-            };
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["decideAcornFoxAssistantAction"];
         delete?: never;
         options?: never;
         head?: never;
@@ -641,101 +550,6 @@ export interface components {
             /** @enum {boolean} */
             initialized: true;
         };
-        AssistantScope: {
-            /** @enum {string} */
-            kind: "host" | "app";
-            app_id?: string;
-        };
-        AssistantSession: {
-            session_id: string;
-            scope: components["schemas"]["AssistantScope"];
-            /** Format: date-time */
-            created_at: string;
-            /** Format: date-time */
-            updated_at: string;
-        };
-        AssistantSessionListResponse: {
-            sessions: components["schemas"]["AssistantSession"][];
-        };
-        AssistantSessionCreateRequest: {
-            scope: components["schemas"]["AssistantScope"];
-        };
-        AssistantRun: {
-            run_id: string;
-            session_id: string;
-            /** @enum {string} */
-            status: "accepted" | "running" | "completed" | "failed" | "aborted" | "unknown";
-            /** Format: date-time */
-            created_at: string;
-            /** Format: date-time */
-            updated_at: string;
-        };
-        AssistantRunSubmitRequest: {
-            idempotency_key: string;
-            message: string;
-        };
-        AssistantRunSubmitResponse: {
-            run: components["schemas"]["AssistantRun"];
-            replay: boolean;
-        };
-        AssistantEvent: {
-            cursor: number;
-            run_id?: string;
-            /** @enum {string} */
-            type: "run.accepted" | "run.started" | "assistant.delta" | "assistant.message" | "run.completed" | "run.failed" | "run.aborted" | "run.unknown";
-            /** Format: date-time */
-            occurred_at: string;
-            text?: string;
-        };
-        AssistantEventSnapshot: {
-            /** @enum {string} */
-            status: "ok" | "slow_consumer" | "expired";
-            oldest_cursor: number;
-            latest_cursor: number;
-            events: components["schemas"]["AssistantEvent"][];
-        };
-        AssistantAbortResponse: {
-            aborted: number;
-        };
-        AssistantActionTarget: {
-            application_id: string;
-            deployment_id: string;
-            target_release_id: string;
-            /** Format: int64 */
-            target_release_version: number;
-            application_name: string;
-        };
-        AssistantActionVerification: {
-            /** @enum {string} */
-            state: "pending" | "verified" | "failed";
-            verdict?: string;
-            /** Format: date-time */
-            observed_at?: string;
-        };
-        AssistantActionProposal: {
-            proposal_id: string;
-            session_id: string;
-            run_id: string;
-            /** @enum {string} */
-            action: "restart" | "redeploy";
-            target: components["schemas"]["AssistantActionTarget"];
-            /** @enum {string} */
-            state: "pending" | "rejected" | "expired" | "executing" | "accepted" | "unknown" | "verified" | "failed";
-            /** Format: date-time */
-            expires_at: string;
-            operation_id?: string;
-            verification: components["schemas"]["AssistantActionVerification"];
-            /** Format: date-time */
-            created_at: string;
-            /** Format: date-time */
-            updated_at: string;
-        };
-        AssistantActionListResponse: {
-            actions: components["schemas"]["AssistantActionProposal"][];
-        };
-        AssistantActionDecisionRequest: {
-            approve: boolean;
-        };
         AuthSessionResponse: {
             authenticated: boolean;
             /** Format: date-time */
@@ -887,9 +701,14 @@ export interface components {
             retries?: number;
         };
         DeploymentPlan: {
+            /**
+             * @description Only present for a local uploaded source. Absent preserves the Git response.
+             * @enum {string}
+             */
+            source_type?: "upload";
             application_id: string;
             source_revision_id: string;
-            /** Format: uri */
+            /** @description HTTPS repository for Git sources. Empty for uploaded projects. */
             repository_url: string;
             ref: string;
             commit: string;
@@ -910,6 +729,9 @@ export interface components {
         SourceUpdateRequest: {
             base_source_revision_id: string;
             ref: string;
+        } | {
+            base_source_revision_id: string;
+            upload_id: string;
         };
         SourceUpdateResponse: {
             source_revision_id: string;
@@ -1182,6 +1004,19 @@ export interface components {
             disk?: components["schemas"]["HostMetricsDisk"];
             network?: components["schemas"]["HostMetricsNetwork"];
         };
+        HostMetricsRecentResponse: {
+            /** @enum {integer} */
+            schema_version: 1;
+            /** @enum {string} */
+            availability: "available" | "warming_up" | "unavailable" | "unsupported";
+            /** Format: date-time */
+            generated_at: string;
+            /** @enum {integer} */
+            capacity: 360;
+            /** @enum {integer} */
+            retention_seconds: 1800;
+            points: components["schemas"]["HostMetricsResponse"][];
+        };
         ProbeDeliveryRequest: {
             /** @enum {string} */
             protocol: "tcp" | "http";
@@ -1438,10 +1273,6 @@ export interface components {
         SourceRevisionId: string;
         CandidateId: string;
         OperationId: string;
-        AssistantSessionId: string;
-        AssistantProposalId: string;
-        AssistantAfter: number;
-        LastEventID: string;
         DeploymentId: string;
         IdempotencyKey: string;
         LogSource: "build" | "runtime";
@@ -1629,243 +1460,34 @@ export interface operations {
                     "application/json": components["schemas"]["HostMetricsResponse"];
                 };
             };
-            401: components["responses"]["AuthenticationFailed"];
-            503: components["responses"]["TemporarilyUnavailable"];
-        };
-    };
-    listAcornFoxAssistantSessions: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Administrator-owned assistant sessions only. */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["AssistantSessionListResponse"];
-                };
-            };
-            401: components["responses"]["AuthenticationFailed"];
-            503: components["responses"]["TemporarilyUnavailable"];
-        };
-    };
-    createAcornFoxAssistantSession: {
-        parameters: {
-            query?: never;
-            header: {
-                /** @description Must equal the non-HttpOnly CSRF cookie (__Host-acornfox_csrf under public HTTPS or acornfox_local_csrf under local loopback) and use the allowed Origin. */
-                "X-AcornFox-CSRF": components["parameters"]["CSRFToken"];
-            };
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["AssistantSessionCreateRequest"];
-            };
-        };
-        responses: {
-            /** @description Assistant session created. This does not start an assistant run. */
-            201: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["AssistantSession"];
-                };
-            };
             400: components["responses"]["InvalidRequest"];
             401: components["responses"]["AuthenticationFailed"];
-            429: components["responses"]["TemporarilyUnavailable"];
             503: components["responses"]["TemporarilyUnavailable"];
         };
     };
-    submitAcornFoxAssistantRun: {
-        parameters: {
-            query?: never;
-            header: {
-                /** @description Must equal the non-HttpOnly CSRF cookie (__Host-acornfox_csrf under public HTTPS or acornfox_local_csrf under local loopback) and use the allowed Origin. */
-                "X-AcornFox-CSRF": components["parameters"]["CSRFToken"];
-            };
-            path: {
-                sessionId: components["parameters"]["AssistantSessionId"];
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["AssistantRunSubmitRequest"];
-            };
-        };
-        responses: {
-            /** @description Idempotent replay of the same accepted assistant run; no second run was submitted. */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["AssistantRunSubmitResponse"];
-                };
-            };
-            /** @description Assistant run accepted. Completion is represented only by later run events and does not verify an application operation. */
-            202: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["AssistantRunSubmitResponse"];
-                };
-            };
-            400: components["responses"]["InvalidRequest"];
-            401: components["responses"]["AuthenticationFailed"];
-            404: components["responses"]["NotFound"];
-            409: components["responses"]["IdempotencyConflict"];
-            429: components["responses"]["TemporarilyUnavailable"];
-            503: components["responses"]["TemporarilyUnavailable"];
-        };
-    };
-    getAcornFoxAssistantEvents: {
+    getAcornFoxHostMetricsRecent: {
         parameters: {
             query?: {
-                after?: components["parameters"]["AssistantAfter"];
+                /** @description Maximum number of recent observations to return (1-360, default 60) */
+                limit?: number;
             };
-            header?: {
-                "Last-Event-ID"?: components["parameters"]["LastEventID"];
-            };
-            path: {
-                sessionId: components["parameters"]["AssistantSessionId"];
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description JSON event snapshot or a continuing SSE stream when Accept is text/event-stream. */
-            200: {
-                headers: {
-                    "X-AcornFox-Assistant-Cursor-Status"?: "ok" | "slow_consumer" | "expired";
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["AssistantEventSnapshot"];
-                    "text/event-stream": string;
-                };
-            };
-            400: components["responses"]["InvalidRequest"];
-            401: components["responses"]["AuthenticationFailed"];
-            404: components["responses"]["NotFound"];
-            /** @description Cursor expired. A JSON snapshot supplies the oldest and latest retained cursor for a bounded retry. */
-            409: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["AssistantEventSnapshot"];
-                };
-            };
-            503: components["responses"]["TemporarilyUnavailable"];
-        };
-    };
-    abortAcornFoxAssistantSessionRuns: {
-        parameters: {
-            query?: never;
-            header: {
-                /** @description Must equal the non-HttpOnly CSRF cookie (__Host-acornfox_csrf under public HTTPS or acornfox_local_csrf under local loopback) and use the allowed Origin. */
-                "X-AcornFox-CSRF": components["parameters"]["CSRFToken"];
-            };
-            path: {
-                sessionId: components["parameters"]["AssistantSessionId"];
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Abort was requested for this session's active and queued runs only. */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["AssistantAbortResponse"];
-                };
-            };
-            400: components["responses"]["InvalidRequest"];
-            401: components["responses"]["AuthenticationFailed"];
-            404: components["responses"]["NotFound"];
-            503: components["responses"]["TemporarilyUnavailable"];
-        };
-    };
-    listAcornFoxAssistantActions: {
-        parameters: {
-            query?: never;
             header?: never;
-            path: {
-                sessionId: components["parameters"]["AssistantSessionId"];
-            };
+            path?: never;
             cookie?: never;
         };
         requestBody?: never;
         responses: {
-            /** @description Administrator-owned session-scoped action proposals. verified is action evidence only and does not claim application health or public reachability. */
+            /** @description Bounded host telemetry history up to 30 minutes */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["AssistantActionListResponse"];
-                };
-            };
-            401: components["responses"]["AuthenticationFailed"];
-            404: components["responses"]["NotFound"];
-            503: components["responses"]["TemporarilyUnavailable"];
-        };
-    };
-    decideAcornFoxAssistantAction: {
-        parameters: {
-            query?: never;
-            header: {
-                /** @description Must equal the non-HttpOnly CSRF cookie (__Host-acornfox_csrf under public HTTPS or acornfox_local_csrf under local loopback) and use the allowed Origin. */
-                "X-AcornFox-CSRF": components["parameters"]["CSRFToken"];
-            };
-            path: {
-                sessionId: components["parameters"]["AssistantSessionId"];
-                proposalId: components["parameters"]["AssistantProposalId"];
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["AssistantActionDecisionRequest"];
-            };
-        };
-        responses: {
-            /** @description Proposal was rejected or was already terminal; no new action was accepted. */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["AssistantActionProposal"];
-                };
-            };
-            /** @description Proposal action was accepted, is executing, or has an unknown execution acknowledgement. Completion remains separate action evidence. */
-            202: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["AssistantActionProposal"];
+                    "application/json": components["schemas"]["HostMetricsRecentResponse"];
                 };
             };
             400: components["responses"]["InvalidRequest"];
             401: components["responses"]["AuthenticationFailed"];
-            404: components["responses"]["NotFound"];
-            409: components["responses"]["IdempotencyConflict"];
             503: components["responses"]["TemporarilyUnavailable"];
         };
     };

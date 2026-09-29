@@ -36,12 +36,28 @@ type GoBinaryReceiptV1 struct {
 	Files              []FileEntryV1 `json:"files"`
 }
 
-func (r GoBinaryReceiptV1) Validate() error {
-	if r.SchemaVersion != 1 || r.Product != Product || r.Architecture != Architecture || !commitText.MatchString(r.SourceCommit) || !digestText.MatchString(r.DecisionSHA256) || !digestText.MatchString(r.SourcePolicySHA256) || !digestText.MatchString(r.ToolchainSHA256) || !digestText.MatchString(r.TreeSHA256) || validateEntries(r.Files) != nil || len(r.Files) != len(fixedTargets) {
+func (r GoBinaryReceiptV1) Validate() error { return r.validate(false) }
+
+func (r GoBinaryReceiptV1) validate(native bool) error {
+	return r.validateBuildProfile(native, false)
+}
+
+func (r GoBinaryReceiptV1) validateBuildProfile(native, product bool) error {
+	targets := fixedTargets
+	if native {
+		targets = nativeFixedTargets
+	}
+	if product {
+		if !native {
+			return ErrGoStage
+		}
+		targets = nativeProductFixedTargets
+	}
+	if r.SchemaVersion != 1 || r.Product != Product || r.Architecture != Architecture || !commitText.MatchString(r.SourceCommit) || !digestText.MatchString(r.DecisionSHA256) || !digestText.MatchString(r.SourcePolicySHA256) || !digestText.MatchString(r.ToolchainSHA256) || !digestText.MatchString(r.TreeSHA256) || validateEntries(r.Files) != nil || len(r.Files) != len(targets) {
 		return ErrGoStage
 	}
 	want := map[string]bool{}
-	for _, target := range fixedTargets {
+	for _, target := range targets {
 		want["bin/"+target.name] = true
 	}
 	for _, file := range r.Files {
@@ -58,15 +74,20 @@ func (r GoBinaryReceiptV1) Validate() error {
 }
 
 type GoBinaryStageV1 struct {
-	root      string
-	parent    string
-	parentPin *directoryPin
-	stagePin  *directoryPin
-	receipt   GoBinaryReceiptV1
-	closed    bool
+	root          string
+	parent        string
+	parentPin     *directoryPin
+	stagePin      *directoryPin
+	receipt       GoBinaryReceiptV1
+	closed        bool
+	nativePartial bool
+	nativeProduct bool
 }
 
 func BuildGoBinariesV1(ctx context.Context, plan GoBuildPlanV1, taskRoot string) (*GoBinaryStageV1, error) {
+	if plan.nativePartial {
+		return nil, ErrGoStage
+	}
 	return buildGoBinariesV1(ctx, plan, taskRoot, plan.goExecutable.run, nil)
 }
 
@@ -84,7 +105,7 @@ func buildGoBinariesV1(ctx context.Context, plan GoBuildPlanV1, taskRoot string,
 		return nil, ErrGoStage
 	}
 	stagePin, err := pinDirectory(stageRoot)
-	stage := &GoBinaryStageV1{root: stageRoot, parent: taskRoot, parentPin: parentPin, stagePin: stagePin}
+	stage := &GoBinaryStageV1{root: stageRoot, parent: taskRoot, parentPin: parentPin, stagePin: stagePin, nativePartial: plan.nativePartial, nativeProduct: plan.nativeProduct}
 	if err != nil || os.Chmod(stageRoot, 0o700) != nil {
 		return nil, cleanupFailedStage(stage, ErrGoStage)
 	}
@@ -143,14 +164,14 @@ func buildGoBinariesV1(ctx context.Context, plan GoBuildPlanV1, taskRoot string,
 		return fail(err)
 	}
 	stage.receipt = GoBinaryReceiptV1{SchemaVersion: 1, Product: Product, Architecture: Architecture, SourceCommit: plan.sourceCommit, DecisionSHA256: plan.decisionSHA256, SourcePolicySHA256: plan.sourcePolicySHA256, ToolchainSHA256: plan.toolchainSHA256, TreeSHA256: sha256Text(tree), Files: files}
-	if stage.receipt.Validate() != nil || !stage.valid() {
+	if stage.receipt.validateBuildProfile(stage.nativePartial, stage.nativeProduct) != nil || !stage.valid() {
 		return fail(ErrGoStage)
 	}
 	return stage, nil
 }
 
 func (stage *GoBinaryStageV1) Receipt() (GoBinaryReceiptV1, error) {
-	if stage == nil || stage.closed || !stage.valid() {
+	if stage == nil || stage.closed || stage.nativePartial || !stage.valid() {
 		return GoBinaryReceiptV1{}, ErrGoStage
 	}
 	copy := stage.receipt
@@ -174,10 +195,10 @@ func (stage *GoBinaryStageV1) Close() error {
 }
 
 func (stage *GoBinaryStageV1) valid() bool {
-	if stage == nil || stage.closed || stage.receipt.Validate() != nil || !stage.parentPin.validAt(stage.parent) || !stage.stagePin.validAt(stage.root) {
+	if stage == nil || stage.closed || stage.receipt.validateBuildProfile(stage.nativePartial, stage.nativeProduct) != nil || !stage.parentPin.validAt(stage.parent) || !stage.stagePin.validAt(stage.root) {
 		return false
 	}
-	files, err := inspectReceiptTree(stage.root, stage.receipt)
+	files, err := inspectReceiptTreeBuildProfile(stage.root, stage.receipt, stage.nativePartial, stage.nativeProduct)
 	if err != nil {
 		return false
 	}
@@ -286,7 +307,7 @@ func buildStageEnvironment(base []string, goCache, tmp string) ([]string, error)
 
 func inspectBinaryTree(stageRoot string, plan GoBuildPlanV1) ([]FileEntryV1, error) {
 	entries, err := os.ReadDir(filepath.Join(stageRoot, "bin"))
-	if err != nil || len(entries) != len(fixedTargets) {
+	if err != nil || len(entries) != len(plan.targets) {
 		return nil, ErrGoStage
 	}
 	files := make([]FileEntryV1, 0, len(entries))
@@ -303,7 +324,15 @@ func inspectBinaryTree(stageRoot string, plan GoBuildPlanV1) ([]FileEntryV1, err
 }
 
 func inspectReceiptTree(stageRoot string, receipt GoBinaryReceiptV1) ([]FileEntryV1, error) {
-	if receipt.Validate() != nil {
+	return inspectReceiptTreeProfile(stageRoot, receipt, false)
+}
+
+func inspectReceiptTreeProfile(stageRoot string, receipt GoBinaryReceiptV1, native bool) ([]FileEntryV1, error) {
+	return inspectReceiptTreeBuildProfile(stageRoot, receipt, native, false)
+}
+
+func inspectReceiptTreeBuildProfile(stageRoot string, receipt GoBinaryReceiptV1, native, product bool) ([]FileEntryV1, error) {
+	if receipt.validateBuildProfile(native, product) != nil {
 		return nil, ErrGoStage
 	}
 	entries, err := os.ReadDir(filepath.Join(stageRoot, "bin"))

@@ -224,10 +224,21 @@ func buildReleaseCandidateTreeForTest(plan GoBuildPlanV1, goStage *GoBinaryStage
 	return buildCandidateTreeV1(plan, goStage, webStage, runtimeRoot, runtime, licenseRoot, license, taskRoot, &metadata, false)
 }
 
-func TestPublicCandidateBuilderRequiresPinnedPiDigests(t *testing.T) {
+func TestPublicCandidateBuilderHasNoPiRuntime(t *testing.T) {
 	plan, goStage, webStage, runtimeRoot, runtime, licenseRoot, license := candidateTreeFixture(t)
-	if stage, err := BuildCandidateTreeV1(plan, goStage, webStage, runtimeRoot, runtime, licenseRoot, license, buildTaskRoot(t)); err == nil || stage != nil {
-		t.Fatal("public candidate builder accepted synthetic Pi digests")
+	stage, err := BuildCandidateTreeV1(plan, goStage, webStage, runtimeRoot, runtime, licenseRoot, license, buildTaskRoot(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stage.Close()
+	receipt, err := stage.Receipt()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range receipt.Files {
+		if strings.HasPrefix(file.Path, "pi/") || file.Path == "bin/acornfox-pi-worker" || file.Path == "systemd/acornfox-pi-worker.service" {
+			t.Fatalf("retired runtime in candidate: %s", file.Path)
+		}
 	}
 }
 
@@ -290,7 +301,7 @@ func candidateRuntimeFixturePaths() []string {
 		goFiles["bin/"+target.name] = true
 	}
 	return installerFixturePaths(func(path string) bool {
-		return strings.HasPrefix(path, "bin/") && !goFiles[path] || strings.HasPrefix(path, "pi/") && path != "pi/extensions/acornfox-tools.ts" && path != "pi/UPSTREAM-ASSETS.json"
+		return strings.HasPrefix(path, "bin/") && !goFiles[path]
 	})
 }
 

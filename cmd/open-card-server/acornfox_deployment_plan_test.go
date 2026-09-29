@@ -146,3 +146,21 @@ func TestAcornFoxDeploymentPlanReportsMissingDockerfile(t *testing.T) {
 		t.Fatalf("plan=%+v", plan)
 	}
 }
+
+func TestAcornFoxUploadedPlanKeepsStorageLocatorPrivate(t *testing.T) {
+	source := domain.SourceRevision{ID: "src_local", ApplicationID: "app_local", Kind: domain.SourceUpload, Locator: "upload://private-id", Ref: "private-id"}
+	plan := projectAcornFoxDeploymentPlan(source, contracts.AcornFoxDockerfileDefinition{Status: contracts.AcornFoxDockerfileWaitingLater})
+	raw, err := json.Marshal(plan)
+	if err != nil || plan.SourceType != "upload" || plan.RepositoryURL != "" || plan.Commit != "" || strings.Contains(string(raw), "upload://") {
+		t.Fatal("local plan exposed storage locator", err)
+	}
+	source.Kind = domain.SourceGitHTTPS
+	source.Locator = "https://github.com/acme/app.git"
+	source.Ref = "main"
+	source.Commit = strings.Repeat("a", 40)
+	git := projectAcornFoxDeploymentPlan(source, contracts.AcornFoxDockerfileDefinition{Status: contracts.AcornFoxDockerfileWaitingLater})
+	raw, _ = json.Marshal(git)
+	if strings.Contains(string(raw), "source_type") || git.RepositoryURL != source.Locator {
+		t.Fatal("Git plan compatibility changed")
+	}
+}

@@ -13,6 +13,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	appcontracts "github.com/open-card/open-card/internal/application/contracts"
+	"github.com/open-card/open-card/internal/domain"
 )
 
 func TestSessionStateUsesOwnerOnlyAtomicFileAndRejectsSymlink(t *testing.T) {
@@ -965,5 +968,638 @@ func TestRequestUsesPerOperationBudgetWithoutExpandingOrdinaryCalls(t *testing.T
 	}
 	if original.Timeout != ordinaryBudget {
 		t.Fatal("per-operation client copy mutated the shared client's timeout")
+	}
+}
+
+func TestNativeImageCommandsUseRealAPIAndExplicitConfirmation(t *testing.T) {
+	now := time.Now().UTC()
+	digest := "sha256:" + strings.Repeat("a", 64)
+	plan := appcontracts.ImagePlan{
+		ID: "plan_native", AdminID: "admin_native", AppName: "demo", Status: appcontracts.ImagePlanStatusNeedsInput,
+		CanonicalInput:     appcontracts.CanonicalExecutionInput{AppName: "demo", Repository: "registry-1.docker.io/library/nginx", ResolvedRef: "latest"},
+		ResolvedImage:      appcontracts.ResolvedImage{Repository: "registry-1.docker.io/library/nginx", Digest: digest, OS: "linux", Architecture: "amd64"},
+		ResolverProvenance: appcontracts.ResolverProvenance{Provider: "registryhttp", Digest: digest, ResolvedAt: now},
+		MissingInputs:      []string{"container_port"}, CreatedAt: now, UpdatedAt: now,
+	}
+	var err error
+	plan.PlanDigest, err = appcontracts.ComputePlanDigest(plan.CanonicalInput, digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	confirmed := appcontracts.ConfirmImagePlanResult{ApplicationID: "app_native", EnvironmentID: "env_native", OperationID: "op_native", TaskID: "task_native", PlanID: plan.ID, PlanDigest: plan.PlanDigest, Status: "pending", CreatedAt: now}
+	op := appcontracts.ImageOperationDetailWithResult{ImageOperationDetail: appcontracts.ImageOperationDetail{OperationID: "op_native", ApplicationID: "app_native", EnvironmentID: "env_native", OperationType: "deploy_image", State: "unknown", PlanID: plan.ID, PlanDigest: plan.PlanDigest, TaskID: "task_native", Reason: "needs_action: budget exhausted", ActionRequired: true, CreatedAt: now, UpdatedAt: now}}
+	requests := 0
+	var server *httptest.Server
+	server = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if session, err := r.Cookie("__Host-acornfox_session"); err != nil || session.Value != "session" {
+			t.Error("missing session")
+		}
+		if r.Method == http.MethodPost {
+			csrf, err := r.Cookie("__Host-acornfox_csrf")
+			if err != nil || csrf.Value != "csrf" || r.Header.Get("X-AcornFox-CSRF") != "csrf" || r.Header.Get("Origin") != server.URL {
+				t.Error("POST omitted mandatory CSRF proof")
+			}
+		}
+		switch r.Method + " " + r.URL.Path {
+		case "POST " + apiBase + "/image-plans":
+			var input appcontracts.ImagePlanInput
+			if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+				t.Error(err)
+			}
+			if input.Image != "nginx:latest" || input.AppName != "demo" || input.Port != 0 || input.Environment["MODE"] != "demo" || input.Environment["LANG"] != "C" {
+				t.Errorf("incorrect image input: %+v", input)
+			}
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(plan)
+		case "GET " + apiBase + "/image-plans/plan_native":
+			_ = json.NewEncoder(w).Encode(plan)
+		case "POST " + apiBase + "/image-plans/plan_native/confirm":
+			var input appcontracts.ConfirmImagePlanInput
+			if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+				t.Error(err)
+			}
+			if input.PlanID != domain.ID("plan_native") || input.PlanDigest != plan.PlanDigest || input.IdempotencyKey != "confirm-key" || r.Header.Get("Idempotency-Key") != "confirm-key" {
+				t.Error("confirmation changed explicit input")
+			}
+			_ = json.NewEncoder(w).Encode(confirmed)
+		case "GET " + apiBase + "/operations/op_native":
+			_ = json.NewEncoder(w).Encode(op)
+		default:
+			t.Errorf("unexpected Native request %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	root := t.TempDir()
+	env := func(key string) string {
+		if key == "XDG_STATE_HOME" {
+			return root
+		}
+		return ""
+	}
+	if err := saveState(env, sessionState{Origin: server.URL, Session: "session", CSRF: "csrf", ExpiresAt: now.Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	c := &cli{in: strings.NewReader(""), out: &out, err: io.Discard, env: env, client: server.Client(), json: true}
+	for _, args := range [][]string{
+		{"image", "plan", "--image", "nginx:latest", "--name", "demo", "--env", "MODE=demo", "--env", "LANG=C"},
+		{"image", "plan", "get", "plan_native"},
+		{"image", "confirm", "plan_native", "--digest", plan.PlanDigest, "--idempotency-key", "confirm-key"},
+		{"image", "operation", "op_native"},
+	} {
+		out.Reset()
+		if err := c.command(args); err != nil {
+			t.Fatalf("%v: %v", args, err)
+		}
+		if out.Len() == 0 {
+			t.Fatal("real API result omitted")
+		}
+		if args[1] == "confirm" && !strings.Contains(out.String(), `"status":"pending"`) {
+			t.Fatal("confirmation was presented as deployed")
+		}
+		if args[1] == "operation" && (!strings.Contains(out.String(), `"action_required":true`) || !strings.Contains(out.String(), "needs_action")) {
+			t.Fatal("durable diagnostic omitted")
+		}
+	}
+	if requests != 4 {
+		t.Fatalf("unexpected automatic request count: %d", requests)
+	}
+	if err := c.command([]string{"image", "confirm", "plan_native", "--digest", plan.PlanDigest}); err == nil {
+		t.Fatal("confirmation silently generated an idempotency key")
+	}
+	if requests != 4 {
+		t.Fatal("missing explicit key reached server")
+	}
+	// Internally valid responses for another identity must never be emitted.
+	for _, kind := range []string{"plan", "operation", "confirm-plan", "confirm-digest"} {
+		args := []string{"image", "plan", "get", "plan_native"}
+		plan.ID, op.OperationID, confirmed.PlanID, confirmed.PlanDigest = "plan_native", "op_native", "plan_native", plan.PlanDigest
+		switch kind {
+		case "plan":
+			plan.ID = "plan_other"
+		case "operation":
+			op.OperationID = "op_other"
+			args = []string{"image", "operation", "op_native"}
+		case "confirm-plan", "confirm-digest":
+			args = []string{"image", "confirm", "plan_native", "--digest", plan.PlanDigest, "--idempotency-key", "confirm-key"}
+			if kind == "confirm-plan" {
+				confirmed.PlanID = "plan_other"
+			} else {
+				confirmed.PlanDigest = digest
+			}
+		}
+		out.Reset()
+		err := c.command(args)
+		var apiErr apiError
+		if !errors.As(err, &apiErr) || !apiErr.contract || out.Len() != 0 {
+			t.Fatalf("%s mismatch accepted: output=%q err=%v", kind, out.String(), err)
+		}
+		if strings.HasPrefix(kind, "confirm") && !strings.Contains(apiErr.Message, "same --idempotency-key") {
+			t.Fatal("uncertain confirmation lost same-key guidance")
+		}
+	}
+	if requests != 8 {
+		t.Fatalf("identity mismatch triggered unexpected retries: %d", requests)
+	}
+
+}
+
+func TestNativeImageConfirmationFailureKeepsKeyAndRejectsWrongSuccessStatus(t *testing.T) {
+	for _, status := range []int{http.StatusServiceUnavailable, http.StatusCreated, 0} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			calls := 0
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				if r.URL.Path != apiBase+"/image-plans/plan_native/confirm" || r.Header.Get("Idempotency-Key") != "same-key" {
+					t.Error("confirmation retry identity changed")
+				}
+				w.WriteHeader(status)
+				_, _ = io.WriteString(w, `{"code":"unavailable","message":"retry later"}`)
+			}))
+			defer server.Close()
+			if status == 0 {
+				server.Close()
+			}
+			root := t.TempDir()
+			env := func(key string) string {
+				if key == "XDG_STATE_HOME" {
+					return root
+				}
+				return ""
+			}
+			if err := saveState(env, sessionState{Origin: server.URL, Session: "session", CSRF: "csrf", ExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+				t.Fatal(err)
+			}
+			c := &cli{out: io.Discard, err: io.Discard, env: env, client: server.Client()}
+			err := c.command([]string{"image", "confirm", "plan_native", "--digest", "sha256:" + strings.Repeat("a", 64), "--idempotency-key", "same-key"})
+			var apiErr apiError
+			if !errors.As(err, &apiErr) || !strings.Contains(apiErr.Message, "same --idempotency-key") || (status != 0 && calls != 1) || (status == 0 && calls != 0) {
+				t.Fatalf("error=%v calls=%d", err, calls)
+			}
+			if status == 0 && !apiErr.network {
+				t.Fatal("network error mapping changed")
+			}
+			if status == http.StatusCreated && !apiErr.contract {
+				t.Fatal("incorrect confirmation status accepted")
+			}
+			if status == http.StatusServiceUnavailable && apiErr.class() != "unavailable" {
+				t.Fatal("structured error mapping changed")
+			}
+		})
+	}
+}
+
+func TestSourceBuildCLIKeepsFourExplicitPhasesAndOriginalIdentity(t *testing.T) {
+	now := time.Now().UTC()
+	sourceDigest := "sha256:" + strings.Repeat("a", 64)
+	manifestDigest := "sha256:" + strings.Repeat("b", 64)
+	prepared := appcontracts.SourceBuildPublicIntent{IntentID: "spi_original", Stage: appcontracts.SourceBuildPrepare, State: "pending", ApplicationID: "app_original", OperationID: "op_prepare"}
+	preparedRead := prepared
+	preparedRead.State, preparedRead.SourceRevisionID, preparedRead.SourceDigest, preparedRead.DefinitionStatus = "prepared", "src_original", sourceDigest, "ready"
+	built := appcontracts.SourceBuildPublicIntent{IntentID: "sbi_original", Stage: appcontracts.SourceBuildBuild, State: "pending", ApplicationID: prepared.ApplicationID, OperationID: "op_build", PrepareIntentID: prepared.IntentID, SourceRevisionID: preparedRead.SourceRevisionID, SourceDigest: sourceDigest, PlanID: "bplan_original", BuildID: "build_original"}
+	builtRead := built
+	builtRead.State, builtRead.ArtifactID = "succeeded", "art_original"
+	builtRead.Image = &domain.ImageDigest{Repository: "ghcr.io/acme/source", Digest: manifestDigest}
+	canonical := appcontracts.CanonicalExecutionInput{AppName: "original-app", Repository: builtRead.Image.Repository, ResolvedRef: manifestDigest, Port: 8080, Resources: appcontracts.RuntimeRequestedResources{CPUMillis: 500, MemoryBytes: 128 << 20, DiskReservationBytes: 1 << 30, PIDs: 64}}
+	planDigest, err := appcontracts.ComputePlanDigest(canonical, manifestDigest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runPlan := appcontracts.ImagePlan{ID: "ipl_original", AdminID: "admin_original", AppName: canonical.AppName, Status: appcontracts.ImagePlanStatusPlanned, PlanDigest: planDigest, CanonicalInput: canonical, ResolvedImage: appcontracts.ResolvedImage{Repository: canonical.Repository, Digest: manifestDigest, Architecture: "amd64", OS: "linux"}, ResolverProvenance: appcontracts.ResolverProvenance{Provider: "source-build", EvidenceRef: builtRead.ArtifactID.String(), Digest: manifestDigest, ResolvedAt: now}, CreatedAt: now, UpdatedAt: now}
+	confirmed := appcontracts.ConfirmImagePlanResult{ApplicationID: prepared.ApplicationID, EnvironmentID: "env_original", OperationID: "op_run", TaskID: "task_run", PlanID: runPlan.ID, PlanDigest: planDigest, Status: "pending", CreatedAt: now}
+	requests := 0
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.Method == http.MethodPost {
+			if r.Header.Get("Origin") != "https://"+r.Host || r.Header.Get("X-AcornFox-CSRF") != "csrf" {
+				t.Error("source mutation omitted original CSRF/origin")
+			}
+			if cookie, err := r.Cookie("__Host-acornfox_csrf"); err != nil || cookie.Value != "csrf" {
+				t.Error("source mutation omitted CSRF cookie")
+			}
+			if cookie, err := r.Cookie("__Host-acornfox_session"); err != nil || cookie.Value != "session" {
+				t.Error("source mutation omitted authenticated session cookie")
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method + " " + r.URL.Path {
+		case "POST " + apiBase + "/source-build/prepare":
+			var body appcontracts.CreateSourcePrepareIntentInput
+			if json.NewDecoder(r.Body).Decode(&body) != nil || body.IdempotencyKey != "key-prepare" || r.Header.Get("Idempotency-Key") != body.IdempotencyKey || body.Repository != "https://github.com/acme/source" || body.Commit != strings.Repeat("c", 40) || body.TimeoutSeconds != 120 {
+				t.Error("prepare changed original public Git input/key")
+			}
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(prepared)
+		case "GET " + apiBase + "/source-build/intents/spi_original":
+			_ = json.NewEncoder(w).Encode(preparedRead)
+		case "POST " + apiBase + "/source-build/approve":
+			var body appcontracts.SourceBuildPublicApprovalInput
+			if json.NewDecoder(r.Body).Decode(&body) != nil || body.IdempotencyKey != "key-build" || r.Header.Get("Idempotency-Key") != body.IdempotencyKey || body.PrepareIntentID != prepared.IntentID || body.SourceRevisionID != preparedRead.SourceRevisionID || body.SourceDigest != sourceDigest || body.ContextPath != "." || body.DockerfilePath != "Dockerfile" || body.Resources.CPUMillis != 500 || body.Resources.MemoryBytes != 512<<20 || body.Resources.PIDs != 0 || body.Resources.DiskBytes != 1<<30 || body.Resources.TimeoutSeconds != 120 || body.Resources.ConcurrencySlot != 1 {
+				t.Error("build approval changed Core-supported fixed contract")
+			}
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(built)
+		case "GET " + apiBase + "/source-build/intents/sbi_original":
+			_ = json.NewEncoder(w).Encode(builtRead)
+		case "POST " + apiBase + "/source-build/run-plans":
+			var body appcontracts.SourceRunPlanInput
+			if json.NewDecoder(r.Body).Decode(&body) != nil || body.BuildIntentID != built.IntentID || body.ArtifactID != builtRead.ArtifactID || body.Port != 8080 || body.IdempotencyKey != "key-run-plan" || r.Header.Get("Idempotency-Key") != body.IdempotencyKey {
+				t.Error("run plan invented a different app/artifact/key")
+			}
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(runPlan)
+		case "GET " + apiBase + "/source-build/run-plans/ipl_original":
+			_ = json.NewEncoder(w).Encode(runPlan)
+		case "POST " + apiBase + "/source-build/run-plans/ipl_original/confirm":
+			var body appcontracts.ConfirmImagePlanInput
+			if json.NewDecoder(r.Body).Decode(&body) != nil || body.PlanID != runPlan.ID || body.PlanDigest != runPlan.PlanDigest || body.IdempotencyKey != "key-run-confirm" || r.Header.Get("Idempotency-Key") != body.IdempotencyKey {
+				t.Error("run confirmation changed reviewed plan/key")
+			}
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(confirmed)
+		default:
+			t.Errorf("unexpected source command route: %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	root := t.TempDir()
+	env := func(key string) string {
+		if key == "XDG_STATE_HOME" {
+			return root
+		}
+		return ""
+	}
+	if err := saveState(env, sessionState{Origin: server.URL, Session: "session", CSRF: "csrf", ExpiresAt: now.Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	c := &cli{out: &out, err: io.Discard, env: env, client: server.Client(), json: true}
+	for _, args := range [][]string{
+		{"source-build", "prepare", "--name", "original-app", "--repository", "https://github.com/acme/source", "--commit", strings.Repeat("c", 40), "--idempotency-key", "key-prepare"},
+		{"source-build", "get", "spi_original"},
+		{"source-build", "build-confirm", "spi_original", "--source-revision", "src_original", "--source-digest", sourceDigest, "--service", "web", "--repository", "ghcr.io/acme/source", "--disk-bytes", "1073741824", "--timeout-seconds", "120", "--idempotency-key", "key-build"},
+		{"source-build", "get", "sbi_original"},
+		{"source-build", "run-plan", "sbi_original", "--artifact", "art_original", "--port", "8080", "--idempotency-key", "key-run-plan"},
+		{"source-build", "run-plan", "get", "ipl_original"},
+		{"source-build", "run-confirm", "ipl_original", "--digest", planDigest, "--idempotency-key", "key-run-confirm"},
+	} {
+		out.Reset()
+		if err := c.command(args); err != nil {
+			t.Fatalf("%v: %v", args, err)
+		}
+		if out.Len() == 0 {
+			t.Fatal("source command emitted no typed API result")
+		}
+	}
+	if requests != 7 {
+		t.Fatalf("source phases auto-dispatched or dropped: %d", requests)
+	}
+	if err := c.command([]string{"source-build", "run-confirm", "ipl_original", "--digest", planDigest}); err == nil || requests != 7 {
+		t.Fatal("missing explicit confirmation key reached API")
+	}
+	if err := c.command([]string{"source-build", "prepare", "--name", "original-app", "--repository", "https://LOCALHOST.../acme/source", "--commit", strings.Repeat("c", 40), "--idempotency-key", "alias-key"}); err == nil || requests != 7 {
+		t.Fatal("canonical private-host alias reached the API")
+	}
+	prepared.PrepareIntentID = "sbi_forged"
+	out.Reset()
+	err = c.command([]string{"source-build", "prepare", "--name", "original-app", "--repository", "https://github.com/acme/source", "--commit", strings.Repeat("c", 40), "--idempotency-key", "key-prepare"})
+	var contractErr apiError
+	if !errors.As(err, &contractErr) || !contractErr.contract || out.Len() != 0 || requests != 8 {
+		t.Fatal("prepare response carrying build-only authority was accepted")
+	}
+}
+
+func TestSourceBuildRunConfirmUnknownKeepsExactKey(t *testing.T) {
+	wantDigest := "sha256:" + strings.Repeat("a", 64)
+	calls, status := 0, http.StatusServiceUnavailable
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.Method != http.MethodPost || r.URL.Path != apiBase+"/source-build/run-plans/ipl_original/confirm" || r.Header.Get("Idempotency-Key") != "original-key" {
+			t.Error("unknown retry changed exact route, method or key")
+		}
+		var body appcontracts.ConfirmImagePlanInput
+		if json.NewDecoder(r.Body).Decode(&body) != nil || body.PlanID != "ipl_original" || body.PlanDigest != wantDigest || body.IdempotencyKey != "original-key" {
+			t.Error("unknown retry changed original confirm body")
+		}
+		w.WriteHeader(status)
+		if status == http.StatusServiceUnavailable {
+			_, _ = io.WriteString(w, `{"code":"unavailable","message":"retry later"}`)
+			return
+		}
+		if status == http.StatusConflict {
+			_, _ = io.WriteString(w, `{"code":"conflict","message":"original key is in progress"}`)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(appcontracts.ConfirmImagePlanResult{ApplicationID: "app_original", EnvironmentID: "env_original", OperationID: "op_original", TaskID: "task_original", PlanID: "ipl_original", PlanDigest: "sha256:" + strings.Repeat("b", 64), Status: "pending", CreatedAt: time.Now().UTC()})
+	}))
+	defer server.Close()
+	root := t.TempDir()
+	env := func(key string) string {
+		if key == "XDG_STATE_HOME" {
+			return root
+		}
+		return ""
+	}
+	if err := saveState(env, sessionState{Origin: server.URL, Session: "session", CSRF: "csrf", ExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	c := &cli{out: &out, err: io.Discard, env: env, client: server.Client(), json: true}
+	args := []string{"source-build", "run-confirm", "ipl_original", "--digest", wantDigest, "--idempotency-key", "original-key"}
+	for _, nextStatus := range []int{http.StatusConflict, http.StatusAccepted, http.StatusAccepted} {
+		out.Reset()
+		err := c.command(args)
+		var apiErr apiError
+		if !errors.As(err, &apiErr) || out.Len() != 0 {
+			t.Fatalf("uncertain source confirm mishandled: %+v output=%q", err, out.String())
+		}
+		if status == http.StatusConflict {
+			if !strings.Contains(apiErr.Message, "exact same body and --idempotency-key") || strings.Contains(apiErr.Message, "outcome is unknown") {
+				t.Fatal("409 overstated completion or lost original-body guidance")
+			}
+		} else if !strings.Contains(apiErr.Message, "same --idempotency-key") || apiErr.contract != (status == http.StatusAccepted) {
+			t.Fatal("unknown/contract response lost same-key guidance")
+		}
+		status = nextStatus
+	}
+	if calls != 3 {
+		t.Fatalf("source CLI retried automatically: %d", calls)
+	}
+}
+
+func TestNativeImageAppsUsesBoundedPublicListAndStrictLimit(t *testing.T) {
+	active := &appcontracts.ManagedImageCommandSummary{OperationID: "op_stop", Action: appcontracts.ImageLifecycleStop, State: "unknown"}
+	item := appcontracts.ManagedImageApplicationSummary{ApplicationID: "app_saved", Name: "saved", EnvironmentID: "env_saved", PlanID: "plan_saved", PlanDigest: "sha256:" + strings.Repeat("a", 64), DeployOperationID: "op_deploy", DeployState: "succeeded", DeploymentID: "dep_saved", DeploymentState: "running", UpdatedAt: time.Now().UTC(), ActiveCommand: active, LastCommand: active}
+	failed := appcontracts.ManagedImageApplicationSummary{ApplicationID: "app_failed", Name: "failed", EnvironmentID: "env_failed", PlanID: "plan_failed", PlanDigest: item.PlanDigest, DeployOperationID: "op_failed", DeployState: "failed", UpdatedAt: item.UpdatedAt}
+	requests := 0
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.Method != http.MethodGet || r.URL.Path != apiBase+"/image-apps" || r.Header.Get("Accept") != "application/json" || r.Header.Get("X-AcornFox-CSRF") != "" {
+			t.Errorf("wrong list transport: %s %s", r.Method, r.URL.Path)
+		}
+		if cookie, err := r.Cookie("__Host-acornfox_session"); err != nil || cookie.Value != "session" {
+			t.Error("list omitted normal authentication")
+		}
+		if r.URL.RawQuery != "" && r.URL.RawQuery != "limit=1" && r.URL.RawQuery != "limit=2" {
+			t.Error("noncanonical query reached server")
+		}
+		if requests == 4 {
+			_, _ = io.WriteString(w, `{"items":[],"truncated":false,"private_plan":{"environment":"secret"}}`)
+			return
+		}
+		list := appcontracts.ManagedImageApplicationList{Items: []appcontracts.ManagedImageApplicationSummary{item, failed}}
+		if r.URL.RawQuery == "limit=1" {
+			list.Items = list.Items[:1]
+			list.Truncated = true
+		}
+		_ = json.NewEncoder(w).Encode(list)
+	}))
+	defer server.Close()
+	root := t.TempDir()
+	env := func(key string) string {
+		if key == "XDG_STATE_HOME" {
+			return root
+		}
+		return ""
+	}
+	if err := saveState(env, sessionState{Origin: server.URL, Session: "session", CSRF: "csrf", ExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	c := &cli{out: &out, err: io.Discard, env: env, client: server.Client(), json: true}
+	if err := c.command([]string{"image", "apps"}); err != nil {
+		t.Fatal(err)
+	}
+	var list appcontracts.ManagedImageApplicationList
+	if err := json.Unmarshal(out.Bytes(), &list); err != nil || len(list.Items) != 2 || list.Items[0].ActiveCommand.OperationID != "op_stop" || list.Items[1].DeployState != "failed" {
+		t.Fatalf("public saved results lost: %v", err)
+	}
+	out.Reset()
+	if err := c.command([]string{"image", "apps", "--limit", "1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(out.Bytes(), &list); err != nil || len(list.Items) != 1 || !list.Truncated {
+		t.Fatal("bounded/truncated response lost")
+	}
+	out.Reset()
+	c.json = false
+	if err := c.command([]string{"image", "apps", "--limit", "2"}); err != nil || !strings.Contains(out.String(), "saved") {
+		t.Fatal("normal human output omitted saved application")
+	}
+	for _, raw := range []string{"0", "101", "01", "+1", "invalid"} {
+		if err := c.command([]string{"image", "apps", "--limit", raw}); err == nil {
+			t.Fatalf("bad limit accepted: %q", raw)
+		}
+	}
+	if requests != 3 {
+		t.Fatal("invalid limit sent a request")
+	}
+	out.Reset()
+	var apiErr apiError
+	if err := c.command([]string{"image", "apps"}); !errors.As(err, &apiErr) || !apiErr.contract || out.Len() != 0 {
+		t.Fatal("private extra response field accepted")
+	}
+	if _, ok := expectedSuccessStatus(http.MethodGet, "/apps", shapeManagedImageApps); ok {
+		t.Fatal("Native image list accepted legacy apps path")
+	}
+}
+
+func TestNativeImageObservationAndLogsUseReadOnlyBoundedAPI(t *testing.T) {
+	now := time.Now().UTC()
+	digest := "sha256:" + strings.Repeat("a", 64)
+	observation := appcontracts.ImageObservationResult{State: appcontracts.ImageLifecycleResult{Running: true, VerifiedIdentity: true, ContainerID: "container_actual", ImageID: digest, ManifestDigest: digest, HostPort: 45165, ContainerPort: 9898, EndpointReady: false, ObservedAt: now.Add(100 * time.Millisecond)}}
+	requests := 0
+	since := now.Add(-time.Minute).Format(time.RFC3339Nano)
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.Method != http.MethodGet || r.Header.Get("Accept") != "application/json" || r.Header.Get("X-AcornFox-CSRF") != "" {
+			t.Error("observation did not use normal authenticated read transport")
+		}
+		if cookie, err := r.Cookie("__Host-acornfox_session"); err != nil || cookie.Value != "session" {
+			t.Error("observation omitted session")
+		}
+		if requests == 3 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = io.WriteString(w, `{"code":"observation_unavailable","message":"observation unavailable"}`)
+			return
+		}
+		value := observation
+		switch r.URL.Path {
+		case apiBase + "/image-deployments/dep_actual/observation":
+			if r.URL.RawQuery != "" {
+				t.Error("status sent logs query")
+			}
+		case apiBase + "/image-deployments/dep_actual/logs":
+			if r.URL.Query().Get("tail") != "2" || r.URL.Query().Get("since") != since {
+				t.Error("bounded logs arguments changed")
+			}
+			value.Records = []appcontracts.ImageObservationLog{{Stream: "stdout", Data: "safe log line"}}
+			value.SourceLimited = true
+		default:
+			t.Errorf("wrong observation path %s", r.URL.Path)
+		}
+		_ = json.NewEncoder(w).Encode(value)
+	}))
+	defer server.Close()
+	root := t.TempDir()
+	env := func(key string) string {
+		if key == "XDG_STATE_HOME" {
+			return root
+		}
+		return ""
+	}
+	if err := saveState(env, sessionState{Origin: server.URL, Session: "session", CSRF: "csrf", ExpiresAt: now.Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	var out, notes bytes.Buffer
+	c := &cli{out: &out, err: &notes, env: env, client: server.Client(), json: false}
+	if err := c.command([]string{"image", "status", "dep_actual"}); err != nil || !strings.Contains(notes.String(), "not probed") {
+		t.Fatalf("status/not-probed semantics lost: %v", err)
+	}
+	out.Reset()
+	c.json = true
+	if err := c.command([]string{"image", "logs", "dep_actual", "--tail", "2", "--since", since}); err != nil {
+		t.Fatal(err)
+	}
+	var actual appcontracts.ImageObservationResult
+	if err := json.Unmarshal(out.Bytes(), &actual); err != nil || actual.State.EndpointReady || !actual.SourceLimited || len(actual.Records) != 1 || actual.Records[0].Data != "safe log line" {
+		t.Fatal("real limited logs/state result lost")
+	}
+	for _, args := range [][]string{{"image", "logs", "dep_actual", "--tail", "65"}, {"image", "logs", "dep_actual", "--tail", "01"}, {"image", "logs", "dep_actual", "--since", "invalid"}, {"image", "logs", "dep_actual", "--since", now.Add(-time.Hour).Format(time.RFC3339)}, {"image", "logs", "dep_actual", "--tail", "1", "--tail", "2"}, {"image", "status", "dep_actual", "--since", since}} {
+		if err := c.command(args); err == nil {
+			t.Fatalf("invalid observation argument accepted: %v", args)
+		}
+	}
+	if requests != 2 {
+		t.Fatal("invalid observation bounds sent an extra request")
+	}
+	var apiErr apiError
+	if err := c.command([]string{"image", "status", "dep_actual"}); !errors.As(err, &apiErr) || apiErr.Code != "observation_unavailable" || apiErr.class() != "unavailable" {
+		t.Fatal("real structured observation failure lost")
+	}
+	bad := observation
+	bad.Records = []appcontracts.ImageObservationLog{{Stream: "stdout", Data: strings.Repeat("x", appcontracts.ImageObservationLogBytes+1)}}
+	encoded, _ := json.Marshal(bad)
+	if _, err := decodeResponse(bytes.NewReader(encoded), shapeImageLogObservation); err == nil {
+		t.Fatal("oversized logs decoded")
+	}
+}
+
+func TestNativeImageMetricsAndRecentReadOnlyTransport(t *testing.T) {
+	now := time.Now().UTC()
+	digest := "sha256:" + strings.Repeat("a", 64)
+	cpu, oldCPU := uint64(5), uint64(100)
+	state := appcontracts.ImageLifecycleResult{Running: true, VerifiedIdentity: true, ContainerID: "metric_cid", ImageID: digest, ManifestDigest: digest, HostPort: 45165, ContainerPort: 9898, EndpointReady: false, ObservedAt: now}
+	current := appcontracts.ImageMetricsResult{State: state, Available: true, SampledAt: now, ProcessStartedAt: now.Add(-5 * time.Second), CPUUsageMillis: &cpu}
+	start := now.Add(-20 * time.Second)
+	segment := now.Add(-4 * time.Second)
+	firstProcess := now.Add(-time.Minute)
+	secondProcess := now.Add(-5 * time.Second)
+	recent := appcontracts.ImageMetricsRecentResult{DeploymentID: "dep_metric", ContainerID: state.ContainerID, HistoryEpoch: now.Add(-time.Minute), HistoryStart: &start, SegmentStart: &segment, CurrentSegmentID: 2, Scheduled: true, StaleAfterSeconds: 250, Stale: false, RecordingStatus: "recording", Samples: []appcontracts.ImageMetricsHistoryPoint{{SegmentID: 1, ContainerID: state.ContainerID, ProcessStartedAt: &firstProcess, ObservedAt: start, Available: true, CPUUsageMillis: &oldCPU}, {SegmentID: 2, ContainerID: state.ContainerID, ProcessStartedAt: &secondProcess, ObservedAt: segment, Available: true, CPUUsageMillis: &cpu}}}
+	requests := 0
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.Method != http.MethodGet || r.Header.Get("Accept") != "application/json" || r.Header.Get("X-AcornFox-CSRF") != "" {
+			t.Fatal("metrics call changed normal read transport")
+		}
+		if cookie, err := r.Cookie("__Host-acornfox_session"); err != nil || cookie.Value != "session" {
+			t.Error("metrics call omitted session")
+		}
+		switch requests {
+		case 1:
+			if r.URL.Path != apiBase+"/image-deployments/dep_metric/metrics" || r.URL.RawQuery != "" {
+				t.Error("current metrics path/query invalid")
+			}
+			_ = json.NewEncoder(w).Encode(current)
+		case 2:
+			if r.URL.Path != apiBase+"/image-deployments/dep_metric/metrics/recent" || r.URL.RawQuery != "limit=2" {
+				t.Error("recent metrics path/query invalid")
+			}
+			_ = json.NewEncoder(w).Encode(recent)
+		case 3:
+			if r.URL.Path != apiBase+"/image-deployments/dep_metric/metrics/recent" || r.URL.RawQuery != "limit=1" {
+				t.Error("request-bound recent fixture route changed")
+			}
+			_ = json.NewEncoder(w).Encode(recent) // Deliberately exceeds requested one point.
+		case 4:
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = io.WriteString(w, `{"code":"metrics_unavailable","message":"metrics unavailable"}`)
+		default:
+			t.Error("invalid metrics argument sent a request")
+		}
+	}))
+	defer server.Close()
+	root := t.TempDir()
+	env := func(key string) string {
+		if key == "XDG_STATE_HOME" {
+			return root
+		}
+		return ""
+	}
+	if err := saveState(env, sessionState{Origin: server.URL, Session: "session", CSRF: "csrf", ExpiresAt: now.Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	c := &cli{out: &out, err: io.Discard, env: env, client: server.Client(), json: true}
+	if err := c.command([]string{"image", "metrics", "dep_metric"}); err != nil {
+		t.Fatal(err)
+	}
+	var gotCurrent appcontracts.ImageMetricsResult
+	if err := json.Unmarshal(out.Bytes(), &gotCurrent); err != nil || gotCurrent.CPUUsageMillis == nil || *gotCurrent.CPUUsageMillis != cpu || gotCurrent.MemoryUsageBytes != nil {
+		t.Fatal("current metric nil/observed values were changed")
+	}
+	out.Reset()
+	if err := c.command([]string{"image", "metrics-recent", "dep_metric", "--limit", "2"}); err != nil {
+		t.Fatal(err)
+	}
+	var gotRecent appcontracts.ImageMetricsRecentResult
+	if err := json.Unmarshal(out.Bytes(), &gotRecent); err != nil || len(gotRecent.Samples) != 2 || gotRecent.StaleAfterSeconds != 250 || gotRecent.Samples[1].SegmentID != 2 || gotRecent.Samples[1].CPUPercent != nil || gotRecent.Samples[1].CPUUsageMillis == nil || *gotRecent.Samples[1].CPUUsageMillis != cpu {
+		t.Fatal("recent segment/rate/actual freshness budget changed")
+	}
+	for _, args := range [][]string{{"image", "metrics-recent", "dep_metric", "--limit", "0"}, {"image", "metrics-recent", "dep_metric", "--limit", "361"}, {"image", "metrics-recent", "dep_metric", "--limit", "02"}, {"image", "metrics-recent", "dep_metric", "--limit", "2", "--limit", "3"}, {"image", "metrics", "dep_metric", "--limit", "2"}} {
+		if err := c.command(args); err == nil {
+			t.Fatalf("invalid metrics argument accepted: %v", args)
+		}
+	}
+	if requests != 2 {
+		t.Fatal("bad metrics bounds reached server")
+	}
+	var apiErr apiError
+	out.Reset()
+	if err := c.command([]string{"image", "metrics-recent", "dep_metric", "--limit", "1"}); !errors.As(err, &apiErr) || !apiErr.contract || out.Len() != 0 {
+		t.Fatal("server exceeded requested sample count")
+	}
+	if err := c.command([]string{"image", "metrics", "dep_metric"}); !errors.As(err, &apiErr) || apiErr.Code != "metrics_unavailable" || apiErr.class() != "unavailable" {
+		t.Fatal("real structured metrics error lost")
+	}
+	outside := appcontracts.ImageMetricsRecentResult{DeploymentID: "dep_metric", ContainerID: state.ContainerID, HistoryEpoch: now, Scheduled: false, SelectionLimited: true, StaleAfterSeconds: 30, Stale: true, RecordingStatus: "not_selected", Reason: "outside_sampling_selection", Samples: []appcontracts.ImageMetricsHistoryPoint{}}
+	encoded, _ := json.Marshal(outside)
+	if _, err := decodeResponse(bytes.NewReader(encoded), shapeImageMetricsRecent); err != nil {
+		t.Fatal("outside32 sampling was treated as zero/invalid", err)
+	}
+	unavailable := recent
+	unavailable.RecordingStatus = "stale"
+	unavailable.Stale = true
+	unavailable.Reason = "not_running"
+	unavailable.Samples = append([]appcontracts.ImageMetricsHistoryPoint(nil), recent.Samples...)
+	unavailable.Samples[1] = appcontracts.ImageMetricsHistoryPoint{SegmentID: 2, ContainerID: state.ContainerID, ObservedAt: segment, Available: false, UnavailableReason: "not_running"}
+	encoded, _ = json.Marshal(unavailable)
+	if _, err := decodeResponse(bytes.NewReader(encoded), shapeImageMetricsRecent); err != nil {
+		t.Fatal("unavailable sample was forged as zero", err)
+	}
+	bad := recent
+	bad.DeploymentID = "dep_other"
+	encoded, _ = json.Marshal(bad)
+	if _, err := decodeResponse(bytes.NewReader(encoded), shapeImageMetricsRecent); err != nil {
+		t.Fatal("typed recent fixture invalid", err)
+	}
+	if _, err := decodeResponse(bytes.NewReader(bytes.Repeat([]byte(" "), appcontracts.ImageMetricsJSONBytes+1)), shapeImageMetrics); err == nil {
+		t.Fatal("4KiB current response bound lost")
+	}
+	if _, err := decodeResponse(bytes.NewReader(bytes.Repeat([]byte(" "), appcontracts.ImageMetricsHistoryJSONBytes+1)), shapeImageMetricsRecent); err == nil {
+		t.Fatal("256KiB recent response bound lost")
 	}
 }

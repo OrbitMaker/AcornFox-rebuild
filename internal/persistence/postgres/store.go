@@ -39,10 +39,10 @@ var (
 	ErrNotFound            = application.ErrNotFound
 	ErrIdempotencyConflict = application.ErrIdempotencyConflict
 
-	ErrIdempotencyInProgress = errors.New("idempotency request is already in progress")
-	ErrIdempotencyCorrupt    = errors.New("idempotency record is corrupt")
-	ErrOutcomeUnknown        = errors.New("transaction outcome is unknown")
-	ErrLeaseLost             = errors.New("task lease is not owned or has expired")
+	ErrIdempotencyInProgress = application.ErrIdempotencyInProgress
+	ErrIdempotencyCorrupt    = application.ErrIdempotencyCorrupt
+	ErrOutcomeUnknown        = application.ErrOutcomeUnknown
+	ErrLeaseLost             = application.ErrLeaseLost
 	ErrMaxAttempts           = errors.New("task has reached its maximum attempts")
 )
 
@@ -485,14 +485,7 @@ func applicationNameDigest(name string) string {
 }
 
 func decodeCreateApplicationResult(response []byte) (application.CreateApplicationResult, error) {
-	if len(response) == 0 {
-		return application.CreateApplicationResult{}, ErrIdempotencyCorrupt
-	}
-	var result application.CreateApplicationResult
-	if err := json.Unmarshal(response, &result); err != nil || result.Application.ID.Empty() || result.EnvironmentID.Empty() || result.OperationID.Empty() || result.Event.ID == "" || result.Event.Sequence == 0 {
-		return application.CreateApplicationResult{}, fmt.Errorf("%w: invalid stored response", ErrIdempotencyCorrupt)
-	}
-	return result, nil
+	return application.DecodeCreateApplicationResult(response)
 }
 
 func preparedSourceID(source *domain.SourceRevision) domain.ID {

@@ -32,8 +32,8 @@ type AcornFoxDockerfileImporter interface {
 // must reserve a command before a provider call, so a replay never builds or
 // queues a second deployment.
 type AcornFoxDeliveryIdempotencyStore interface {
-	BeginAcornFoxDelivery(context.Context, string, string, time.Time) (AcornFoxDeliveryResult, bool, error)
-	ReplayAcornFoxDelivery(context.Context, string, string) (AcornFoxDeliveryResult, bool, error)
+	BeginAcornFoxDelivery(context.Context, domain.ID, string, string, time.Time) (AcornFoxDeliveryResult, bool, error)
+	ReplayAcornFoxDelivery(context.Context, domain.ID, string, string) (AcornFoxDeliveryResult, bool, error)
 	FailAcornFoxDelivery(context.Context, string, string, string, time.Time) error
 }
 
@@ -166,7 +166,7 @@ func (service *AcornFoxDeliveryService) Create(ctx context.Context, request Acor
 	now := service.now()
 	digest := acornFoxDeliveryDigest("create", request.ApplicationID.String(), request.SourceRevisionID.String(), fmt.Sprint(request.ContainerPort), strings.TrimSpace(service.Config.TargetRepository), strings.TrimSpace(service.Config.StorageKeyPrefix))
 	digest = configuredAcornFoxRequestDigest(request, digest)
-	if replay, found, err := service.Idempotency.BeginAcornFoxDelivery(ctx, request.IdempotencyKey, digest, now); err != nil {
+	if replay, found, err := service.Idempotency.BeginAcornFoxDelivery(ctx, request.ApplicationID, request.IdempotencyKey, digest, now); err != nil {
 		return AcornFoxDeliveryResult{}, err
 	} else if found {
 		return replay, nil
@@ -194,7 +194,7 @@ func (service *AcornFoxDeliveryService) CreateVerifiedCandidate(ctx context.Cont
 	now := service.now()
 	digest := acornFoxDeliveryDigest("verified-candidate", request.ApplicationID.String(), request.SourceRevisionID.String(), fmt.Sprint(request.ContainerPort), expectedImage.Repository, expectedImage.Digest, strings.TrimSpace(service.Config.TargetRepository), strings.TrimSpace(service.Config.StorageKeyPrefix))
 	digest = configuredAcornFoxRequestDigest(request, digest)
-	if replay, found, err := service.Idempotency.BeginAcornFoxDelivery(ctx, request.IdempotencyKey, digest, now); err != nil {
+	if replay, found, err := service.Idempotency.BeginAcornFoxDelivery(ctx, request.ApplicationID, request.IdempotencyKey, digest, now); err != nil {
 		return AcornFoxDeliveryResult{}, err
 	} else if found {
 		return replay, nil
@@ -217,7 +217,7 @@ func (service *AcornFoxDeliveryService) ReplayVerifiedCandidate(ctx context.Cont
 	}
 	digest := acornFoxDeliveryDigest("verified-candidate", request.ApplicationID.String(), request.SourceRevisionID.String(), fmt.Sprint(request.ContainerPort), expectedImage.Repository, expectedImage.Digest, strings.TrimSpace(service.Config.TargetRepository), strings.TrimSpace(service.Config.StorageKeyPrefix))
 	digest = configuredAcornFoxRequestDigest(request, digest)
-	return service.Idempotency.ReplayAcornFoxDelivery(ctx, request.IdempotencyKey, digest)
+	return service.Idempotency.ReplayAcornFoxDelivery(ctx, request.ApplicationID, request.IdempotencyKey, digest)
 }
 
 func (service *AcornFoxDeliveryService) create(ctx context.Context, request AcornFoxDeliveryCreateRequest, expectedImage *domain.ImageDigest, now time.Time, commit func(AcornFoxQueuedTask, AcornFoxDeliveryResult) error) (AcornFoxDeliveryResult, error) {
@@ -386,7 +386,7 @@ func (service *AcornFoxDeliveryService) action(ctx context.Context, request Acor
 	}
 	now := service.now()
 	digest := acornFoxDeliveryDigest(action, request.ApplicationID.String(), request.DeploymentID.String())
-	if replay, found, err := service.Idempotency.BeginAcornFoxDelivery(ctx, request.IdempotencyKey, digest, now); err != nil {
+	if replay, found, err := service.Idempotency.BeginAcornFoxDelivery(ctx, request.ApplicationID, request.IdempotencyKey, digest, now); err != nil {
 		return AcornFoxDeliveryResult{}, err
 	} else if found {
 		return replay, nil
@@ -414,7 +414,7 @@ func (service *AcornFoxDeliveryService) Probe(ctx context.Context, request Acorn
 	}
 	now := service.now()
 	digest := acornFoxDeliveryDigest("probe", request.ApplicationID.String(), request.DeploymentID.String(), string(request.Protocol), request.HTTPPath)
-	if replay, found, err := service.Idempotency.BeginAcornFoxDelivery(ctx, request.IdempotencyKey, digest, now); err != nil {
+	if replay, found, err := service.Idempotency.BeginAcornFoxDelivery(ctx, request.ApplicationID, request.IdempotencyKey, digest, now); err != nil {
 		return AcornFoxDeliveryResult{}, err
 	} else if found {
 		return replay, nil

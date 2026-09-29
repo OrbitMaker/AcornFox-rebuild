@@ -35,7 +35,12 @@ type adminValidationFunc func(commandConfig, install.ActiveDatabase) error
 type adminResolveFunc func(commandConfig) (install.ActiveDatabase, error)
 type adminLstatFunc func(string) (os.FileInfo, error)
 
-var newAdminAuthService = func(store *postgres.Store) (*auth.Service, error) {
+type adminCredentialStore interface {
+	auth.Store
+	auth.WebSetupStore
+}
+
+var newAdminAuthService = func(store auth.Store) (*auth.Service, error) {
 	return auth.NewService(auth.Config{Store: store})
 }
 
@@ -163,15 +168,15 @@ func resolveActiveDatabase(config commandConfig) (install.ActiveDatabase, error)
 	return resolved, nil
 }
 
-func applyCredential(ctx context.Context, store *postgres.Store, command string, password []byte, now time.Time) error {
+func applyCredential(ctx context.Context, store adminCredentialStore, command string, password []byte, now time.Time) error {
 	service, err := newAdminAuthService(store)
 	if err != nil {
 		return err
 	}
 	switch command {
 	case "bootstrap":
-		var exists bool
-		if err := store.DB().QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM admin_credentials)`).Scan(&exists); err != nil {
+		exists, err := store.AdministratorExists(ctx)
+		if err != nil {
 			return fmt.Errorf("inspect administrator records: %w", err)
 		}
 		if exists {
@@ -203,7 +208,7 @@ func applyCredential(ctx context.Context, store *postgres.Store, command string,
 		}
 		credential, err := store.ActiveAdminCredential(ctx)
 		if err != nil {
-			if errors.Is(err, postgres.ErrNotFound) {
+			if errors.Is(err, auth.ErrNotFound) {
 				return errors.New("administrator does not exist; bootstrap first")
 			}
 			return err

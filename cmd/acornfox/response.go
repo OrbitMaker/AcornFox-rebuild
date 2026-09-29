@@ -2,9 +2,15 @@ package main
 
 import (
 	"bytes"
+	"encoding/hex"
 	"encoding/json"
+	appcontracts "github.com/open-card/open-card/internal/application/contracts"
+	"github.com/open-card/open-card/internal/contracts"
+	"github.com/open-card/open-card/internal/domain"
 	"io"
+	"math"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -75,15 +81,18 @@ type apiResources struct {
 	DiskReservationBytes *int64 `json:"disk_reservation_bytes"`
 }
 type apiRelease struct {
-	ApplicationID string       `json:"application_id"`
-	EnvironmentID string       `json:"environment_id"`
-	ReleaseID     string       `json:"release_id"`
-	ServiceName   string       `json:"service_name"`
-	Image         apiImage     `json:"image"`
-	Resources     apiResources `json:"resources"`
-	ContainerPort *int         `json:"container_port,omitempty"`
-	AcceptedAt    time.Time    `json:"accepted_at"`
-	Immutable     *bool        `json:"immutable"`
+	SchemaVersion *int                                    `json:"schema_version,omitempty"`
+	Configuration *contracts.AcornFoxRuntimeConfiguration `json:"configuration,omitempty"`
+	ConfigDigest  *string                                 `json:"config_digest,omitempty"`
+	ApplicationID string                                  `json:"application_id"`
+	EnvironmentID string                                  `json:"environment_id"`
+	ReleaseID     string                                  `json:"release_id"`
+	ServiceName   string                                  `json:"service_name"`
+	Image         apiImage                                `json:"image"`
+	Resources     apiResources                            `json:"resources"`
+	ContainerPort *int                                    `json:"container_port,omitempty"`
+	AcceptedAt    time.Time                               `json:"accepted_at"`
+	Immutable     *bool                                   `json:"immutable"`
 }
 type apiLimits struct {
 	CPUMillis   *int64 `json:"cpu_millis"`
@@ -205,6 +214,7 @@ type apiDeploymentPlanEnvironment struct {
 	Redacted bool   `json:"redacted,omitempty"`
 }
 type apiDeploymentPlan struct {
+	SourceType       *string                        `json:"source_type,omitempty"`
 	ApplicationID    string                         `json:"application_id"`
 	SourceRevisionID string                         `json:"source_revision_id"`
 	RepositoryURL    string                         `json:"repository_url"`
@@ -257,6 +267,14 @@ type apiHostMetrics struct {
 	Memory            *apiHostMemory  `json:"memory,omitempty"`
 	Disk              *apiHostDisk    `json:"disk,omitempty"`
 	Network           *apiHostNetwork `json:"network,omitempty"`
+}
+type apiHostMetricsRecent struct {
+	SchemaVersion    int              `json:"schema_version"`
+	Availability     string           `json:"availability"`
+	GeneratedAt      time.Time        `json:"generated_at"`
+	Capacity         int              `json:"capacity"`
+	RetentionSeconds int              `json:"retention_seconds"`
+	Points           []apiHostMetrics `json:"points"`
 }
 type apiOperationEvidence struct {
 	Kind       string    `json:"kind"`
@@ -329,8 +347,15 @@ type apiFixCandidates struct {
 }
 
 func decodeResponse(body io.Reader, shape responseShape) (any, error) {
-	data, err := io.ReadAll(io.LimitReader(body, maxResponseBytes+1))
-	if err != nil || len(data) == 0 || len(data) > maxResponseBytes {
+	limit := maxResponseBytes
+	if shape == shapeImageMetrics {
+		limit = appcontracts.ImageMetricsJSONBytes
+	}
+	if shape == shapeImageMetricsRecent {
+		limit = appcontracts.ImageMetricsHistoryJSONBytes
+	}
+	data, err := io.ReadAll(io.LimitReader(body, int64(limit)+1))
+	if err != nil || len(data) == 0 || len(data) > limit {
 		return nil, invalidResponse("server response is invalid")
 	}
 	if !requiredResponseFields(data, shape) {
@@ -340,6 +365,42 @@ func decodeResponse(body io.Reader, shape responseShape) (any, error) {
 		return nil, invalidResponse("server response does not match the AcornFox API contract")
 	}
 	switch shape {
+	case shapeImageMetrics:
+		var v appcontracts.ImageMetricsResult
+		return decodeTyped(data, &v, validateImageMetrics)
+	case shapeImageMetricsRecent:
+		var v appcontracts.ImageMetricsRecentResult
+		return decodeTyped(data, &v, validateImageMetricsRecent)
+	case shapeImageObservation, shapeImageLogObservation:
+		var v appcontracts.ImageObservationResult
+		return decodeTyped(data, &v, validateImageObservation)
+	case shapeManagedImageApps:
+		var v appcontracts.ManagedImageApplicationList
+		return decodeTyped(data, &v, validateManagedImageApps)
+	case shapeNativeImageLifecycle:
+		var v appcontracts.ImageLifecycleOperation
+		return decodeTyped(data, &v, validateNativeImageLifecycle)
+	case shapeNativeImageDomainOperation:
+		var v appcontracts.ImagePublicAccessOperation
+		return decodeTyped(data, &v, validateNativeImageDomainOperation)
+	case shapeNativeImageDomainCurrent:
+		var v appcontracts.ImagePublicAccessCurrent
+		return decodeTyped(data, &v, validateNativeImageDomainCurrent)
+	case shapeNativeImagePlan:
+		var v appcontracts.ImagePlan
+		return decodeTyped(data, &v, validateNativeImagePlan)
+	case shapeSourceBuildIntent:
+		var v appcontracts.SourceBuildPublicIntent
+		return decodeTyped(data, &v, validateSourceBuildIntent)
+	case shapeNativeImageConfirm:
+		var v appcontracts.ConfirmImagePlanResult
+		return decodeTyped(data, &v, validateNativeImageConfirm)
+	case shapeNativeImageOperation:
+		var v appcontracts.ImageOperationDetailWithResult
+		return decodeTyped(data, &v, validateNativeImageOperation)
+	case shapeSourceUpload:
+		var v apiSourceUpload
+		return decodeTyped(data, &v, validateSourceUpload)
 	case shapeSession:
 		var v apiSession
 		return decodeTyped(data, &v, validateSession)
@@ -376,6 +437,9 @@ func decodeResponse(body io.Reader, shape responseShape) (any, error) {
 	case shapeHostMetrics:
 		var v apiHostMetrics
 		return decodeTyped(data, &v, validateHostMetrics)
+	case shapeHostMetricsRecent:
+		var v apiHostMetricsRecent
+		return decodeTyped(data, &v, validateHostMetricsRecent)
 	case shapeSourceMetadata:
 		var v apiSourceMetadata
 		return decodeTyped(data, &v, validateSourceMetadata)
@@ -417,6 +481,57 @@ func optionalNonNullableNull(data []byte, shape responseShape) bool {
 		}
 		return false
 	}
+	if shape == shapeImageMetrics {
+		return nullField(object, "unavailable_reason", "sampled_at", "process_started_at", "limits")
+	}
+	if shape == shapeImageMetricsRecent {
+		if nullField(object, "history_start", "segment_start", "reason") {
+			return true
+		}
+		var points []map[string]json.RawMessage
+		if json.Unmarshal(object["samples"], &points) != nil {
+			return true
+		}
+		for _, point := range points {
+			if nullField(point, "process_started_at", "unavailable_reason", "limits") {
+				return true
+			}
+		}
+		return false
+	}
+	if shape == shapeImageObservation || shape == shapeImageLogObservation {
+		return nullField(object, "records")
+	}
+	if shape == shapeManagedImageApps {
+		var items []map[string]json.RawMessage
+		if json.Unmarshal(object["items"], &items) != nil {
+			return true
+		}
+		for _, item := range items {
+			if nullField(item, "deployment_id", "deployment_state", "active_command", "last_command") {
+				return true
+			}
+		}
+		return false
+	}
+	if shape == shapeNativeImageLifecycle {
+		return nullField(object, "result")
+	}
+	if shape == shapeNativeImageDomainOperation {
+		return nullField(object, "reason", "result")
+	}
+	if shape == shapeNativeImageDomainCurrent {
+		if nullField(object, "operation") {
+			return true
+		}
+		return optionalNonNullableNull(object["operation"], shapeNativeImageDomainOperation)
+	}
+	if shape == shapeNativeImageOperation {
+		return nullField(object, "reason", "action_required", "result")
+	}
+	if shape == shapeSourceBuildIntent {
+		return nullField(object, "prepare_intent_id", "source_revision_id", "source_digest", "definition_status", "plan_id", "build_id", "artifact_id", "image", "reason", "action_required")
+	}
 	if shape == shapeSource {
 		return nullField(object, "ref", "commit")
 	}
@@ -437,7 +552,7 @@ func optionalNonNullableNull(data []byte, shape responseShape) bool {
 		return nullField(object, "repository_url")
 	}
 	if shape == shapeDeploymentPlan {
-		if nullField(object, "selected_port") {
+		if nullField(object, "selected_port", "source_type") {
 			return true
 		}
 		raw, present := object["port_selection"]
@@ -464,20 +579,53 @@ func optionalNonNullableNull(data []byte, shape responseShape) bool {
 	if shape == shapeFixCandidate {
 		return nullField(object, "matched_source_revision_id", "matched_commit")
 	}
-	if shape == shapeHostMetrics {
-		if nullField(object, "observed_at", "cpu", "memory", "disk", "network") {
-			return true
-		}
-		for _, name := range []string{"cpu", "network"} {
-			raw, ok := object[name]
-			if !ok {
-				continue
-			}
-			var nested map[string]json.RawMessage
-			if json.Unmarshal(raw, &nested) != nil {
+	if shape == shapeHostMetrics || shape == shapeHostMetricsRecent {
+		checkItemNulls := func(item map[string]json.RawMessage) bool {
+			if nullField(item, "schema_version", "availability", "stale_after_seconds", "observed_at", "cpu", "memory", "disk", "network") {
 				return true
 			}
-			if name == "cpu" && nullField(nested, "usage_percent") || name == "network" && nullField(nested, "rx_bytes_per_second", "tx_bytes_per_second") {
+			for _, name := range []string{"cpu", "memory", "disk", "network"} {
+				raw, ok := item[name]
+				if !ok || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+					continue
+				}
+				var nested map[string]json.RawMessage
+				if json.Unmarshal(raw, &nested) != nil {
+					return true
+				}
+				switch name {
+				case "cpu":
+					if nullField(nested, "logical_cores", "usage_percent") {
+						return true
+					}
+				case "memory":
+					if nullField(nested, "total_bytes", "available_bytes", "used_bytes") {
+						return true
+					}
+				case "disk":
+					if nullField(nested, "mountpoint", "total_bytes", "free_bytes", "used_bytes") {
+						return true
+					}
+				case "network":
+					if nullField(nested, "interface", "rx_bytes_per_second", "tx_bytes_per_second") {
+						return true
+					}
+				}
+			}
+			return false
+		}
+		if shape == shapeHostMetrics {
+			return checkItemNulls(object)
+		}
+		if nullField(object, "schema_version", "availability", "generated_at", "capacity", "retention_seconds", "points") {
+			return true
+		}
+		var points []map[string]json.RawMessage
+		if json.Unmarshal(object["points"], &points) != nil {
+			return true
+		}
+		for _, pt := range points {
+			if checkItemNulls(pt) {
 				return true
 			}
 		}
@@ -486,7 +634,7 @@ func optionalNonNullableNull(data []byte, shape responseShape) bool {
 	if shape != shapeStatus {
 		return false
 	}
-	for field, prohibited := range map[string][]string{"desired": {"container_port"}, "runtime": {"container_id", "internal_address"}, "response": {"latency_ms", "error_code"}} {
+	for field, prohibited := range map[string][]string{"desired": {"container_port", "schema_version", "configuration", "config_digest"}, "runtime": {"container_id", "internal_address"}, "response": {"latency_ms", "error_code"}} {
 		raw, present := object[field]
 		if !present || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
 			continue
@@ -505,6 +653,155 @@ func requiredResponseFields(data []byte, shape responseShape) bool {
 	}
 	keys, nullable := []string{}, map[string]bool{}
 	switch shape {
+	case shapeImageMetrics:
+		keys = []string{"state", "available"}
+		var state map[string]json.RawMessage
+		if json.Unmarshal(object["state"], &state) != nil || state == nil {
+			return false
+		}
+		for _, field := range []string{"running", "verified_identity", "container_id", "image_id", "manifest_digest", "host_port", "container_port", "endpoint_ready", "observed_at"} {
+			if raw, ok := state[field]; !ok || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+				return false
+			}
+		}
+		var available bool
+		if json.Unmarshal(object["available"], &available) != nil {
+			return false
+		}
+		if available {
+			for _, field := range []string{"sampled_at", "process_started_at"} {
+				if raw, ok := object[field]; !ok || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+					return false
+				}
+			}
+		} else {
+			if raw, ok := object["unavailable_reason"]; !ok || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+				return false
+			}
+		}
+		if !validMetricLimitsObject(object["limits"]) {
+			return false
+		}
+	case shapeImageMetricsRecent:
+		keys = []string{"deployment_id", "container_id", "history_epoch", "current_segment_id", "scheduled", "selection_limited", "stale_after_seconds", "stale", "recording_status", "samples"}
+		var points []map[string]json.RawMessage
+		if json.Unmarshal(object["samples"], &points) != nil || points == nil {
+			return false
+		}
+		for _, point := range points {
+			for _, field := range []string{"segment_id", "container_id", "observed_at", "available"} {
+				if raw, ok := point[field]; !ok || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+					return false
+				}
+			}
+			var available bool
+			if json.Unmarshal(point["available"], &available) != nil {
+				return false
+			}
+			if available {
+				if raw, ok := point["process_started_at"]; !ok || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+					return false
+				}
+			} else {
+				if raw, ok := point["unavailable_reason"]; !ok || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+					return false
+				}
+			}
+			if !validMetricLimitsObject(point["limits"]) {
+				return false
+			}
+		}
+	case shapeImageObservation, shapeImageLogObservation:
+		keys = []string{"state", "source_limited"}
+		var state map[string]json.RawMessage
+		if json.Unmarshal(object["state"], &state) != nil || state == nil {
+			return false
+		}
+		for _, field := range []string{"running", "verified_identity", "container_id", "image_id", "manifest_digest", "host_port", "container_port", "endpoint_ready", "observed_at"} {
+			if raw, ok := state[field]; !ok || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+				return false
+			}
+		}
+		if raw, present := object["records"]; present {
+			var records []map[string]json.RawMessage
+			if json.Unmarshal(raw, &records) != nil || records == nil {
+				return false
+			}
+			for _, record := range records {
+				for _, field := range []string{"stream", "data"} {
+					if value, ok := record[field]; !ok || bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+						return false
+					}
+				}
+			}
+		}
+	case shapeManagedImageApps:
+		keys = []string{"items", "truncated"}
+		var items []map[string]json.RawMessage
+		if json.Unmarshal(object["items"], &items) != nil || items == nil {
+			return false
+		}
+		for _, item := range items {
+			for _, field := range []string{"application_id", "name", "environment_id", "plan_id", "plan_digest", "deploy_operation_id", "deploy_state", "updated_at"} {
+				if raw, ok := item[field]; !ok || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+					return false
+				}
+			}
+			for _, field := range []string{"active_command", "last_command"} {
+				if raw, ok := item[field]; ok {
+					var command map[string]json.RawMessage
+					if json.Unmarshal(raw, &command) != nil || command == nil {
+						return false
+					}
+					for _, required := range []string{"operation_id", "action", "state"} {
+						if value, present := command[required]; !present || bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+							return false
+						}
+					}
+				}
+			}
+		}
+	case shapeNativeImageLifecycle:
+		keys = []string{"operation_id", "task_id", "deployment_id", "release_id", "application_id", "environment_id", "deploy_operation_id", "plan_id", "plan_digest", "manifest_digest", "container_id", "image_id", "host_port", "container_port", "action", "state", "created_at", "recovery_required"}
+		if raw, present := object["result"]; present {
+			var result map[string]json.RawMessage
+			if json.Unmarshal(raw, &result) != nil || result == nil {
+				return false
+			}
+			for _, field := range []string{"running", "verified_identity", "container_id", "image_id", "manifest_digest", "host_port", "container_port", "endpoint_ready", "observed_at"} {
+				value, ok := result[field]
+				if !ok || bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+					return false
+				}
+			}
+		}
+	case shapeNativeImageDomainOperation:
+		keys = []string{"operation_id", "task_id", "approval_id", "deployment_id", "hostname", "action", "state", "created_at"}
+		if raw, present := object["result"]; present {
+			var result map[string]json.RawMessage
+			if json.Unmarshal(raw, &result) != nil || result == nil {
+				return false
+			}
+			if value, ok := result["observed_at"]; !ok || bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+				return false
+			}
+		}
+	case shapeNativeImageDomainCurrent:
+		keys = []string{"operation", "desired_public", "local_route_state", "deployment_status", "availability"}
+		if !requiredResponseFields(object["operation"], shapeNativeImageDomainOperation) {
+			return false
+		}
+
+	case shapeNativeImagePlan:
+		keys = []string{"id", "admin_id", "app_name", "status", "plan_digest", "canonical_input", "resolved_image", "resolver_provenance", "created_at", "updated_at"}
+	case shapeSourceBuildIntent:
+		keys = []string{"intent_id", "stage", "state", "application_id", "operation_id"}
+	case shapeNativeImageConfirm:
+		keys = []string{"application_id", "environment_id", "operation_id", "task_id", "plan_id", "plan_digest", "status", "created_at"}
+	case shapeNativeImageOperation:
+		keys = []string{"operation_id", "application_id", "environment_id", "operation_type", "state", "plan_id", "plan_digest", "task_id", "created_at", "updated_at"}
+	case shapeSourceUpload:
+		keys = []string{"id", "kind", "status", "digest", "bytes", "file_count", "expires_at"}
 	case shapeSession:
 		keys = []string{"authenticated", "idle_expires_at", "absolute_expires_at"}
 	case shapeApps:
@@ -532,6 +829,20 @@ func requiredResponseFields(data []byte, shape responseShape) bool {
 		keys = []string{"desired_public", "url", "endpoint", "components", "status"}
 	case shapeHostMetrics:
 		keys = []string{"schema_version", "availability", "stale_after_seconds"}
+		if !checkHostMetricsFieldPresence(object) {
+			return false
+		}
+	case shapeHostMetricsRecent:
+		keys = []string{"schema_version", "availability", "generated_at", "capacity", "retention_seconds", "points"}
+		var points []map[string]json.RawMessage
+		if json.Unmarshal(object["points"], &points) != nil {
+			return false
+		}
+		for _, pt := range points {
+			if !checkHostMetricsFieldPresence(pt) {
+				return false
+			}
+		}
 	case shapeSourceMetadata:
 		keys = []string{"source_revision_id", "availability"}
 	case shapeDeploymentPlan:
@@ -608,7 +919,7 @@ func validateCreateApp(v *apiCreateApp) bool {
 	return validateApplication(&v.Application) && nonempty(v.SourceRevisionID, v.OperationID)
 }
 func validateSource(v *apiSource) bool {
-	return v.Immutable != nil && v.Kind == "git_https" && nonempty(v.ID, v.ApplicationID, v.LocatorSHA256, v.ContentDigest) && validTime(v.CreatedAt)
+	return v.Immutable != nil && (v.Kind == "git_https" || (v.Kind == "upload" && v.Commit == "")) && nonempty(v.ID, v.ApplicationID, v.LocatorSHA256, v.ContentDigest) && validTime(v.CreatedAt)
 }
 func validateSources(v *apiSources) bool {
 	for i := range v.Items {
@@ -633,12 +944,25 @@ func validateDeployments(v *apiDeployments) bool {
 	return true
 }
 func validateCommand(v *apiCommand) bool {
-	return nonempty(v.DeploymentID, v.OperationID, v.TaskID, v.Status)
+	return nonempty(v.DeploymentID, v.OperationID, v.TaskID) && v.Status == "accepted"
 }
 func validateResources(v apiResources) bool {
 	return v.CPUMillis != nil && v.MemoryBytes != nil && v.Pids != nil && v.DiskReservationBytes != nil && *v.CPUMillis >= 0 && *v.MemoryBytes >= 0 && *v.Pids >= 0 && *v.DiskReservationBytes >= 0
 }
 func validateRelease(v *apiRelease) bool {
+	if v.SchemaVersion != nil || v.Configuration != nil || v.ConfigDigest != nil {
+		if v.SchemaVersion == nil || *v.SchemaVersion != 2 || v.Configuration == nil || v.ConfigDigest == nil || !validateResources(v.Resources) || len(v.Configuration.Secrets) > 0 {
+			return false
+		}
+		port := 0
+		if v.ContainerPort != nil {
+			port = *v.ContainerPort
+		}
+		digest, err := contracts.CanonicalAcornFoxRuntimeConfigDigest(*v.Configuration, contracts.AcornFoxRuntimeRequestedResources{CPUMillis: *v.Resources.CPUMillis, MemoryBytes: *v.Resources.MemoryBytes, PIDs: *v.Resources.Pids, DiskReservationBytes: *v.Resources.DiskReservationBytes}, port)
+		if err != nil || digest != *v.ConfigDigest {
+			return false
+		}
+	}
 	return v.Immutable != nil && nonempty(v.ApplicationID, v.EnvironmentID, v.ReleaseID, v.ServiceName, v.Image.Repository, v.Image.Digest) && validateResources(v.Resources) && validTime(v.AcceptedAt) && (v.ContainerPort == nil || (*v.ContainerPort >= 0 && *v.ContainerPort <= 65535))
 }
 func validateRuntime(v *apiRuntime) bool {
@@ -688,11 +1012,15 @@ func validateSourceMetadata(v *apiSourceMetadata) bool {
 	return err == nil && parsed.Scheme == "https" && parsed.Host != ""
 }
 func validateDeploymentPlan(v *apiDeploymentPlan) bool {
-	if !nonempty(v.ApplicationID, v.SourceRevisionID, v.RepositoryURL, v.Ref, v.Commit, v.Dockerfile.Path) || !validCLIHash(v.Dockerfile.Digest) && v.Dockerfile.Digest != "" {
+	if !nonempty(v.ApplicationID, v.SourceRevisionID, v.Dockerfile.Path) || (!validCLIHash(v.Dockerfile.Digest) && v.Dockerfile.Digest != "") {
 		return false
 	}
-	parsed, err := url.Parse(v.RepositoryURL)
-	if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+	if v.SourceType == nil {
+		parsed, err := url.Parse(v.RepositoryURL)
+		if err != nil || parsed.Scheme != "https" || parsed.Host == "" || !nonempty(v.Ref, v.Commit) {
+			return false
+		}
+	} else if *v.SourceType != "upload" || v.RepositoryURL != "" || v.Commit != "" {
 		return false
 	}
 	if v.Dockerfile.Status != "ready" && v.Dockerfile.Status != "waiting_later" && v.Dockerfile.Status != "unsupported" {
@@ -735,6 +1063,97 @@ func validateDeliverySource(v *apiDeliverySource) bool {
 	}
 	return true
 }
+func checkHostMetricsFieldPresence(item map[string]json.RawMessage) bool {
+	if _, ok := item["schema_version"]; !ok {
+		return false
+	}
+	availRaw, ok := item["availability"]
+	if !ok {
+		return false
+	}
+	var avail string
+	if json.Unmarshal(availRaw, &avail) != nil {
+		return false
+	}
+	if _, ok := item["stale_after_seconds"]; !ok {
+		return false
+	}
+
+	if avail == "unavailable" || avail == "unsupported" {
+		if _, has := item["cpu"]; has {
+			return false
+		}
+		if _, has := item["memory"]; has {
+			return false
+		}
+		if _, has := item["disk"]; has {
+			return false
+		}
+		if _, has := item["network"]; has {
+			return false
+		}
+		return true
+	}
+
+	if avail == "warming_up" {
+		_, hasObs := item["observed_at"]
+		_, hasCPU := item["cpu"]
+		_, hasMem := item["memory"]
+		_, hasDisk := item["disk"]
+		_, hasNet := item["network"]
+		if !hasObs && !hasCPU && !hasMem && !hasDisk && !hasNet {
+			return true
+		}
+		if !hasObs || !hasCPU || !hasMem || !hasDisk {
+			return false
+		}
+	}
+
+	if avail == "available" {
+		if _, has := item["observed_at"]; !has {
+			return false
+		}
+		if _, has := item["cpu"]; !has {
+			return false
+		}
+		if _, has := item["memory"]; !has {
+			return false
+		}
+		if _, has := item["disk"]; !has {
+			return false
+		}
+	}
+
+	if raw, has := item["cpu"]; has {
+		var cpuMap map[string]json.RawMessage
+		if json.Unmarshal(raw, &cpuMap) != nil || cpuMap["logical_cores"] == nil {
+			return false
+		}
+		if avail == "available" && cpuMap["usage_percent"] == nil {
+			return false
+		}
+	}
+	if raw, has := item["memory"]; has {
+		var memMap map[string]json.RawMessage
+		if json.Unmarshal(raw, &memMap) != nil || memMap["total_bytes"] == nil || memMap["available_bytes"] == nil || memMap["used_bytes"] == nil {
+			return false
+		}
+	}
+	if raw, has := item["disk"]; has {
+		var diskMap map[string]json.RawMessage
+		if json.Unmarshal(raw, &diskMap) != nil || diskMap["mountpoint"] == nil || diskMap["total_bytes"] == nil || diskMap["free_bytes"] == nil || diskMap["used_bytes"] == nil {
+			return false
+		}
+	}
+	if raw, has := item["network"]; has {
+		var netMap map[string]json.RawMessage
+		if json.Unmarshal(raw, &netMap) != nil || netMap["interface"] == nil {
+			return false
+		}
+	}
+	return true
+}
+
 func validateHostMetrics(v *apiHostMetrics) bool {
 	if v.SchemaVersion != 1 || v.StaleAfterSeconds < 1 || !(v.Availability == "available" || v.Availability == "warming_up" || v.Availability == "unavailable" || v.Availability == "unsupported") {
 		return false
@@ -742,22 +1161,77 @@ func validateHostMetrics(v *apiHostMetrics) bool {
 	if v.Availability == "unavailable" || v.Availability == "unsupported" {
 		return v.CPU == nil && v.Memory == nil && v.Disk == nil && v.Network == nil
 	}
+	if v.Availability == "warming_up" {
+		if v.ObservedAt == nil && v.CPU == nil && v.Memory == nil && v.Disk == nil && v.Network == nil {
+			return true
+		}
+		if !validTimePointer(v.ObservedAt) || v.CPU == nil || v.Memory == nil || v.Disk == nil {
+			return false
+		}
+		if v.CPU.LogicalCores < 1 || (v.CPU.UsagePercent != nil && (*v.CPU.UsagePercent < 0 || *v.CPU.UsagePercent > 100)) {
+			return false
+		}
+		if v.Memory.TotalBytes <= 0 || v.Memory.AvailableBytes < 0 || v.Memory.UsedBytes < 0 || v.Memory.AvailableBytes > v.Memory.TotalBytes || v.Memory.UsedBytes > v.Memory.TotalBytes {
+			return false
+		}
+		if v.Disk.Mountpoint != "/" || v.Disk.TotalBytes <= 0 || v.Disk.FreeBytes < 0 || v.Disk.UsedBytes < 0 || v.Disk.FreeBytes > v.Disk.TotalBytes || v.Disk.UsedBytes > v.Disk.TotalBytes {
+			return false
+		}
+		if v.Network != nil && (!nonempty(v.Network.Interface) || len(v.Network.Interface) > 15 || (v.Network.RXBytesPerSecond != nil && *v.Network.RXBytesPerSecond < 0) || (v.Network.TXBytesPerSecond != nil && *v.Network.TXBytesPerSecond < 0)) {
+			return false
+		}
+		return true
+	}
+	// Available requires strictly valid complete metrics
 	if !validTimePointer(v.ObservedAt) || v.CPU == nil || v.Memory == nil || v.Disk == nil {
 		return false
 	}
-	if v.CPU.LogicalCores < 1 || (v.CPU.UsagePercent != nil && (*v.CPU.UsagePercent < 0 || *v.CPU.UsagePercent > 100)) {
+	if v.CPU.LogicalCores < 1 || v.CPU.UsagePercent == nil || *v.CPU.UsagePercent < 0 || *v.CPU.UsagePercent > 100 {
 		return false
 	}
-	if v.Memory.TotalBytes < 0 || v.Memory.AvailableBytes < 0 || v.Memory.UsedBytes < 0 || v.Memory.AvailableBytes > v.Memory.TotalBytes || v.Memory.UsedBytes > v.Memory.TotalBytes {
+	if v.Memory.TotalBytes <= 0 || v.Memory.AvailableBytes < 0 || v.Memory.UsedBytes < 0 || v.Memory.AvailableBytes > v.Memory.TotalBytes || v.Memory.UsedBytes > v.Memory.TotalBytes {
 		return false
 	}
-	if v.Disk.Mountpoint != "/" || v.Disk.TotalBytes < 0 || v.Disk.FreeBytes < 0 || v.Disk.UsedBytes < 0 || v.Disk.FreeBytes > v.Disk.TotalBytes || v.Disk.UsedBytes > v.Disk.TotalBytes {
+	if v.Disk.Mountpoint != "/" || v.Disk.TotalBytes <= 0 || v.Disk.FreeBytes < 0 || v.Disk.UsedBytes < 0 || v.Disk.FreeBytes > v.Disk.TotalBytes || v.Disk.UsedBytes > v.Disk.TotalBytes {
 		return false
 	}
-	if v.Network == nil {
-		return true
+	if v.Network != nil && (!nonempty(v.Network.Interface) || len(v.Network.Interface) > 15 || (v.Network.RXBytesPerSecond != nil && *v.Network.RXBytesPerSecond < 0) || (v.Network.TXBytesPerSecond != nil && *v.Network.TXBytesPerSecond < 0)) {
+		return false
 	}
-	return v.Network.Interface != "" && (v.Network.RXBytesPerSecond == nil || *v.Network.RXBytesPerSecond >= 0) && (v.Network.TXBytesPerSecond == nil || *v.Network.TXBytesPerSecond >= 0)
+	return true
+}
+
+func validateHostMetricsRecent(v *apiHostMetricsRecent) bool {
+	if v.SchemaVersion != 1 || v.Capacity != 360 || v.RetentionSeconds != 1800 || !validTime(v.GeneratedAt) {
+		return false
+	}
+	if !(v.Availability == "available" || v.Availability == "warming_up" || v.Availability == "unavailable" || v.Availability == "unsupported") {
+		return false
+	}
+	if v.Points == nil || len(v.Points) > 360 {
+		return false
+	}
+	minValidTime := v.GeneratedAt.Add(-30 * time.Minute).Add(-5 * time.Second)
+	maxValidTime := v.GeneratedAt.Add(2 * time.Second)
+
+	var lastTime *time.Time
+	for i := range v.Points {
+		pt := &v.Points[i]
+		if !validateHostMetrics(pt) {
+			return false
+		}
+		if pt.ObservedAt == nil || !validTime(*pt.ObservedAt) {
+			return false
+		}
+		if pt.ObservedAt.Before(minValidTime) || pt.ObservedAt.After(maxValidTime) {
+			return false
+		}
+		if lastTime != nil && pt.ObservedAt.Before(*lastTime) {
+			return false
+		}
+		lastTime = pt.ObservedAt
+	}
+	return true
 }
 func validateOperationResult(v *apiOperationResult) bool {
 	if !nonempty(v.OperationID, v.OperationType) || !validTime(v.AcceptedAt) || !validTime(v.UpdatedAt) || v.UpdatedAt.Before(v.AcceptedAt) {
@@ -851,3 +1325,398 @@ func validCLIHash(value string) bool {
 	return true
 }
 func validTimePointer(value *time.Time) bool { return value != nil && validTime(*value) }
+
+func validImageDigest(value string) bool {
+	if len(value) != 71 || !strings.HasPrefix(value, "sha256:") || value != strings.ToLower(value) {
+		return false
+	}
+	_, err := hex.DecodeString(value[7:])
+	return err == nil
+}
+func validateNativeImageConfirm(v *appcontracts.ConfirmImagePlanResult) bool {
+	return nonempty(v.ApplicationID.String(), v.EnvironmentID.String(), v.OperationID.String(), v.TaskID.String(), v.PlanID.String()) &&
+		validImageDigest(v.PlanDigest) && v.Status == "pending" && validTime(v.CreatedAt)
+}
+func validateNativeImageOperation(v *appcontracts.ImageOperationDetailWithResult) bool {
+	if !nonempty(v.OperationID.String(), v.ApplicationID.String(), v.EnvironmentID.String(), v.PlanID.String(), v.TaskID.String()) ||
+		v.OperationType != "deploy_image" || !validImageDigest(v.PlanDigest) || !validTime(v.CreatedAt) || !validTime(v.UpdatedAt) {
+		return false
+	}
+	switch v.State {
+	case "pending", "leased", "running", "unknown", "cancelling", "succeeded", "failed", "cancelled", "rolling_back", "rolled_back":
+	default:
+		return false
+	}
+	if (v.Reason != "" || v.ActionRequired) && v.State != "failed" && v.State != "unknown" {
+		return false
+	}
+	if r := v.Result; r != nil {
+		if r.DeploymentID.Empty() || r.ReleaseID.Empty() {
+			return false
+		}
+		switch r.Status {
+		case "deploying", "running", "failed", "stopped":
+		default:
+			return false
+		}
+		if r.HostPort < 0 || r.HostPort > 65535 || r.ContainerPort < 0 || r.ContainerPort > 65535 {
+			return false
+		}
+		if r.Endpoint != "" {
+			// Native image endpoints are addresses on the server machine.
+			if r.Status != "running" || r.HostPort == 0 || r.HostIP != "127.0.0.1" || r.Endpoint != "http://127.0.0.1:"+strconv.Itoa(r.HostPort) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func validateNativeImagePlan(p *appcontracts.ImagePlan) bool {
+	if appcontracts.ValidatePlanConsistency(*p) != nil || !validTime(p.CreatedAt) || !validTime(p.UpdatedAt) {
+		return false
+	}
+	for _, env := range p.CanonicalInput.Environment {
+		// Apply the same non-secret environment contract as the Native plan service.
+		variable := contracts.RuntimeEnvironmentVariable{Name: env.Name, Value: env.Value, Kind: contracts.RuntimeEnvironmentKind(env.Kind)}
+		if variable.Kind != contracts.RuntimeEnvironmentLiteral || variable.Validate() != nil {
+			return false
+		}
+	}
+	return true
+}
+
+func validateSourceBuildIntent(v *appcontracts.SourceBuildPublicIntent) bool {
+	if !nonempty(v.IntentID.String(), v.ApplicationID.String(), v.OperationID.String()) {
+		return false
+	}
+	switch v.Stage {
+	case appcontracts.SourceBuildPrepare:
+		if v.State != "pending" && v.State != "running" && v.State != "waiting" && v.State != "prepared" && v.State != "failed" {
+			return false
+		}
+		if !v.PrepareIntentID.Empty() || !v.PlanID.Empty() || !v.BuildID.Empty() || !v.ArtifactID.Empty() || v.Image != nil {
+			return false
+		}
+		if v.State == "prepared" && (v.SourceRevisionID.Empty() || !validImageDigest(v.SourceDigest)) {
+			return false
+		}
+	case appcontracts.SourceBuildBuild:
+		if v.State != "pending" && v.State != "running" && v.State != "waiting" && v.State != "succeeded" && v.State != "failed" {
+			return false
+		}
+		if v.PrepareIntentID.Empty() || v.SourceRevisionID.Empty() || !validImageDigest(v.SourceDigest) || v.PlanID.Empty() || v.BuildID.Empty() {
+			return false
+		}
+		if v.State == "succeeded" {
+			if v.ArtifactID.Empty() || v.Image == nil || v.Image.Validate() != nil {
+				return false
+			}
+		} else if !v.ArtifactID.Empty() || v.Image != nil {
+			return false
+		}
+	default:
+		return false
+	}
+	if v.DefinitionStatus != "" && v.DefinitionStatus != string(contracts.AcornFoxDockerfileReady) && v.DefinitionStatus != string(contracts.AcornFoxDockerfileWaitingLater) && v.DefinitionStatus != string(contracts.AcornFoxDockerfileUnsupported) {
+		return false
+	}
+	if v.SourceDigest != "" && !validImageDigest(v.SourceDigest) {
+		return false
+	}
+	if v.ActionRequired && v.Reason == "" && !(v.Stage == appcontracts.SourceBuildPrepare && v.State == "prepared" && v.DefinitionStatus != "ready") {
+		return false
+	}
+	if v.Reason != "" && !v.ActionRequired {
+		return false
+	}
+	return true
+}
+
+func validateNativeImageLifecycle(v *appcontracts.ImageLifecycleOperation) bool {
+	if !nonempty(v.OperationID.String(), v.TaskID.String(), v.DeploymentID.String(), v.ReleaseID.String(), v.ApplicationID.String(), v.EnvironmentID.String(), v.DeployOperationID.String(), v.PlanID.String(), v.ContainerID) || v.OperationID == v.DeployOperationID || !validImageDigest(v.PlanDigest) || !validImageDigest(v.ManifestDigest) || !validImageDigest(v.ImageID) || !validTime(v.CreatedAt) || v.HostPort <= 0 || v.HostPort > 65535 || v.ContainerPort <= 0 || v.ContainerPort > 65535 {
+		return false
+	}
+	switch v.Action {
+	case appcontracts.ImageLifecycleStop, appcontracts.ImageLifecycleStart, appcontracts.ImageLifecycleRestart:
+	default:
+		return false
+	}
+	switch v.State {
+	case "pending", "running", "succeeded", "failed", "cancelled":
+		if v.RecoveryRequired {
+			return false
+		}
+	case "unknown":
+		if !v.RecoveryRequired {
+			return false
+		}
+	default:
+		return false
+	}
+	if v.State != "succeeded" {
+		return v.Result == nil
+	}
+	r := v.Result
+	if r == nil || !r.VerifiedIdentity || r.ContainerID != v.ContainerID || r.ImageID != v.ImageID || r.ManifestDigest != v.ManifestDigest || !validTime(r.ObservedAt) || r.ObservedAt.Before(v.CreatedAt) {
+		return false
+	}
+	if v.Action == appcontracts.ImageLifecycleStop {
+		return !r.Running && !r.EndpointReady && (r.HostPort == 0 || r.HostPort == v.HostPort) && (r.ContainerPort == 0 || r.ContainerPort == v.ContainerPort)
+	}
+	return r.Running && r.EndpointReady && r.HostPort == v.HostPort && r.ContainerPort == v.ContainerPort
+}
+
+func validateNativeImageDomainOperation(v *appcontracts.ImagePublicAccessOperation) bool {
+	if !nonempty(v.OperationID.String(), v.TaskID.String(), v.ApprovalID.String(), v.DeploymentID.String()) || appcontracts.ValidateImagePublicHostname(v.Hostname) != nil || !validTime(v.CreatedAt) {
+		return false
+	}
+	if v.Action != appcontracts.ImagePublicAccessEnsure && v.Action != appcontracts.ImagePublicAccessRemove {
+		return false
+	}
+	switch v.State {
+	case "pending", "running":
+		return v.Reason == "" && v.Result == nil
+	case "unknown":
+		return v.Reason == "local route outcome requires reconciliation" && v.Result == nil
+	case "failed":
+		return v.Reason == "local route command failed" && v.Result == nil
+	case "succeeded":
+		return v.Reason == "" && v.Result != nil && validTime(v.Result.ObservedAt) && !v.Result.ObservedAt.Before(v.CreatedAt) && (v.Result.CertificateFingerprint == "" && v.Result.CertificateExpiresAt == nil || validImageDigest(v.Result.CertificateFingerprint) && validTimePointer(v.Result.CertificateExpiresAt) && v.Result.CertificateExpiresAt.After(v.Result.ObservedAt))
+	default:
+		return false
+	}
+}
+
+func validateNativeImageDomainCurrent(v *appcontracts.ImagePublicAccessCurrent) bool {
+	if !validateNativeImageDomainOperation(&v.Operation) {
+		return false
+	}
+	switch v.DeploymentStatus {
+	case "running", "stopped", "deploying", "failed":
+	default:
+		return false
+	}
+	switch v.LocalRouteState {
+	case "desired", "configured", "disabled", "reconcile_required":
+	default:
+		return false
+	}
+	expected := "pending"
+	if v.LocalRouteState == "disabled" {
+		expected = "disabled"
+	} else if v.DeploymentStatus != "running" || v.LocalRouteState == "reconcile_required" || v.Operation.State == "unknown" || v.Operation.State == "failed" {
+		expected = "degraded"
+	} else if v.DesiredPublic && v.LocalRouteState == "configured" && v.Operation.State == "succeeded" {
+		expected = "unverified"
+	}
+	return v.Availability == expected
+}
+
+func validateManagedImageApps(list *appcontracts.ManagedImageApplicationList) bool {
+	if list.Items == nil || len(list.Items) > 100 {
+		return false
+	}
+	seen := map[domain.ID]bool{}
+	validState := func(state string) bool {
+		switch state {
+		case "pending", "running", "unknown", "succeeded", "failed", "cancelled":
+			return true
+		}
+		return false
+	}
+	for _, item := range list.Items {
+		if seen[item.ApplicationID] || item.Name == "" || !validTime(item.UpdatedAt) || !validImageDigest(item.PlanDigest) || !validState(item.DeployState) {
+			return false
+		}
+		seen[item.ApplicationID] = true
+		for _, id := range []domain.ID{item.ApplicationID, item.EnvironmentID, item.PlanID, item.DeployOperationID} {
+			if _, err := requireID(id.String(), "image identity"); err != nil {
+				return false
+			}
+		}
+		if item.DeploymentID.Empty() != (item.DeploymentState == "") {
+			return false
+		}
+		if !item.DeploymentID.Empty() {
+			if _, err := requireID(item.DeploymentID.String(), "deployment identity"); err != nil {
+				return false
+			}
+			switch item.DeploymentState {
+			case "deploying", "running", "failed", "stopped":
+			default:
+				return false
+			}
+		}
+		for _, command := range []*appcontracts.ManagedImageCommandSummary{item.ActiveCommand, item.LastCommand} {
+			if command == nil {
+				continue
+			}
+			if item.DeploymentID.Empty() || command.OperationID == item.DeployOperationID || !validState(command.State) {
+				return false
+			}
+			if _, err := requireID(command.OperationID.String(), "command identity"); err != nil {
+				return false
+			}
+			switch command.Action {
+			case appcontracts.ImageLifecycleStop, appcontracts.ImageLifecycleStart, appcontracts.ImageLifecycleRestart:
+			default:
+				return false
+			}
+		}
+		if c := item.ActiveCommand; c != nil && c.State != "pending" && c.State != "running" && c.State != "unknown" {
+			return false
+		}
+	}
+	return true
+}
+
+func validateImageObservation(v *appcontracts.ImageObservationResult) bool {
+	// Core/role enforce host-local sample freshness. The CLI checks a well-formed,
+	// nonzero timestamp without assuming its clock exactly matches the server.
+	if !validTime(v.State.ObservedAt) || v.Validate(v.State.ObservedAt) != nil || !validImageDigest(v.State.ImageID) || !validImageDigest(v.State.ManifestDigest) {
+		return false
+	}
+	_, err := requireID(v.State.ContainerID, "container identity")
+	return err == nil
+}
+
+func validMetricLimitsObject(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return true
+	}
+	var object map[string]json.RawMessage
+	if json.Unmarshal(raw, &object) != nil || object == nil {
+		return false
+	}
+	for _, field := range []string{"cpu_millis", "memory_bytes", "pids"} {
+		if value, ok := object[field]; !ok || bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			return false
+		}
+	}
+	return true
+}
+func validMetricValue(percent *float64, usage *uint64, rx, tx *uint64, limits *appcontracts.ImageMetricLimits) bool {
+	if percent != nil && (usage == nil || math.IsNaN(*percent) || math.IsInf(*percent, 0) || *percent < 0) {
+		return false
+	}
+	if (rx == nil) != (tx == nil) {
+		return false
+	}
+	return limits == nil || (limits.CPUMillis >= 0 && limits.MemoryBytes >= 0 && limits.PIDs >= 0)
+}
+func validateImageMetrics(v *appcontracts.ImageMetricsResult) bool {
+	if !validTime(v.State.ObservedAt) || !validImageDigest(v.State.ImageID) || !validImageDigest(v.State.ManifestDigest) {
+		return false
+	}
+	if _, err := requireID(v.State.ContainerID, "container identity"); err != nil {
+		return false
+	}
+	// Server validates the ten-second sample window on its own clock. Use the
+	// observation/sample time for structural validation across small host skew.
+	at := v.State.ObservedAt
+	if v.SampledAt.After(at) {
+		at = v.SampledAt
+	}
+	now := time.Now().UTC()
+	if at.Before(now.Add(-20*time.Second)) || at.After(now.Add(2*time.Minute)) {
+		return false
+	}
+	return v.Validate(at) == nil && (v.Available || v.MemoryLimitBytes == nil) && validMetricValue(v.CPUPercent, v.CPUUsageMillis, v.NetworkRxBytes, v.NetworkTxBytes, v.Limits)
+}
+func validateImageMetricsRecent(v *appcontracts.ImageMetricsRecentResult) bool {
+	if v.DeploymentID.Empty() || v.ContainerID == "" || !validTime(v.HistoryEpoch) || v.Samples == nil || len(v.Samples) > appcontracts.ImageMetricsHistorySamples {
+		return false
+	}
+	if _, err := requireID(v.DeploymentID.String(), "deployment identity"); err != nil {
+		return false
+	}
+	if _, err := requireID(v.ContainerID, "container identity"); err != nil {
+		return false
+	}
+	now := time.Now().UTC()
+	if v.HistoryEpoch.After(now.Add(2*time.Minute)) || (v.StaleAfterSeconds != 30 && (v.StaleAfterSeconds < 40 || v.StaleAfterSeconds > 250 || (v.StaleAfterSeconds-40)%15 != 0)) {
+		return false
+	}
+	if (v.HistoryStart == nil) != (len(v.Samples) == 0) || (v.SegmentStart == nil) != (len(v.Samples) == 0) {
+		return false
+	}
+	if v.HistoryStart != nil && (!validTime(*v.HistoryStart) || v.HistoryStart.Before(v.HistoryEpoch)) {
+		return false
+	}
+	if v.SegmentStart != nil && (!validTime(*v.SegmentStart) || v.SegmentStart.Before(v.HistoryEpoch)) {
+		return false
+	}
+	if len(v.Samples) == 0 {
+		if v.CurrentSegmentID != 0 || !v.Stale {
+			return false
+		}
+		switch v.RecordingStatus {
+		case "not_selected":
+			return !v.Scheduled && v.Reason == "outside_sampling_selection"
+		case "warming_up":
+			return v.Scheduled && (v.Reason == "first_sample_pending" || v.Reason == "read_failed")
+		case "stale":
+			return v.Scheduled && (v.Reason == "sample_expired" || v.Reason == "read_failed")
+		default:
+			return false
+		}
+	}
+	if !v.Scheduled || v.CurrentSegmentID == 0 || v.CurrentSegmentID != v.Samples[len(v.Samples)-1].SegmentID || v.HistoryStart.After(v.Samples[0].ObservedAt) || v.SegmentStart.After(v.Samples[len(v.Samples)-1].ObservedAt) {
+		return false
+	}
+	switch v.RecordingStatus {
+	case "recording":
+		if v.Stale || v.Reason != "" || !v.Samples[len(v.Samples)-1].Available || v.Samples[len(v.Samples)-1].ContainerID != v.ContainerID {
+			return false
+		}
+	case "stale":
+		if !v.Stale || (v.Reason != "sample_expired" && v.Reason != "read_failed" && v.Reason != "not_running" && v.Reason != "read_unavailable" && v.Reason != "runtime_changed") {
+			return false
+		}
+		last := v.Samples[len(v.Samples)-1]
+		if v.Reason == "not_running" || v.Reason == "read_unavailable" {
+			if last.ContainerID != v.ContainerID || last.Available || last.UnavailableReason != v.Reason {
+				return false
+			}
+		}
+		if v.Reason == "runtime_changed" && last.ContainerID == v.ContainerID && last.UnavailableReason != "runtime_changed" {
+			return false
+		}
+	default:
+		return false
+	}
+	var previous *appcontracts.ImageMetricsHistoryPoint
+	for i := range v.Samples {
+		point := &v.Samples[i]
+		if point.SegmentID == 0 || point.SegmentID > v.CurrentSegmentID || !validTime(point.ObservedAt) || point.ObservedAt.Before(v.HistoryEpoch) || point.ObservedAt.Before(now.Add(-32*time.Minute)) || point.ObservedAt.After(now.Add(2*time.Minute)) {
+			return false
+		}
+		if _, err := requireID(point.ContainerID, "container identity"); err != nil {
+			return false
+		}
+		if previous != nil {
+			if !point.ObservedAt.After(previous.ObservedAt) || point.SegmentID < previous.SegmentID {
+				return false
+			}
+			if point.SegmentID == previous.SegmentID && point.ContainerID != previous.ContainerID {
+				return false
+			}
+			if point.SegmentID == previous.SegmentID && point.ProcessStartedAt != nil && previous.ProcessStartedAt != nil && !point.ProcessStartedAt.Equal(*previous.ProcessStartedAt) {
+				return false
+			}
+		}
+		if point.Available {
+			if point.UnavailableReason != "" || point.ProcessStartedAt == nil || !validTime(*point.ProcessStartedAt) || point.ProcessStartedAt.After(point.ObservedAt) || (point.CPUUsageMillis == nil && point.MemoryUsageBytes == nil && point.NetworkRxBytes == nil && point.PIDsCurrent == nil) {
+				return false
+			}
+		} else if (point.UnavailableReason != "not_running" && point.UnavailableReason != "read_unavailable" && point.UnavailableReason != "runtime_changed") || point.ProcessStartedAt != nil || point.CPUPercent != nil || point.CPUUsageMillis != nil || point.MemoryUsageBytes != nil || point.MemoryLimitBytes != nil || point.NetworkRxBytes != nil || point.NetworkTxBytes != nil || point.PIDsCurrent != nil || point.Limits != nil {
+			return false
+		}
+		if !validMetricValue(point.CPUPercent, point.CPUUsageMillis, point.NetworkRxBytes, point.NetworkTxBytes, point.Limits) {
+			return false
+		}
+		previous = point
+	}
+	return true
+}

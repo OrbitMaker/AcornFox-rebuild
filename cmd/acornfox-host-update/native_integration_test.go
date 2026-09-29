@@ -327,13 +327,13 @@ func makeTestSignedBundle(t *testing.T, version, fromBinding string, seq uint64,
 	controllerContent := launcherContent
 
 	contents := map[string][]byte{
-		"launcher/acornfox-host-launcher":              launcherContent,
-		"controller/acornfox-host-update":              controllerContent,
-		"backend/candidate/candidate-binding.json":      bindingBytes,
-		"backend/candidate/candidate-binding.sha256":    []byte(toBinding + "\n"),
-		"backend/candidate/release-manifest.json":       manifestBytes,
-		"backend/candidate/bundle-manifest.sha256":      bundleManifestBytes,
-		"backend/candidate/build-record.json":           []byte(`{"schema_version":1}`),
+		"launcher/acornfox-host-launcher":                              launcherContent,
+		"controller/acornfox-host-update":                              controllerContent,
+		"backend/candidate/candidate-binding.json":                     bindingBytes,
+		"backend/candidate/candidate-binding.sha256":                   []byte(toBinding + "\n"),
+		"backend/candidate/release-manifest.json":                      manifestBytes,
+		"backend/candidate/bundle-manifest.sha256":                     bundleManifestBytes,
+		"backend/candidate/build-record.json":                          []byte(`{"schema_version":1}`),
 		"backend/candidate/acornfox-" + version + "-production.tar.gz": archiveBytes,
 	}
 
@@ -547,9 +547,9 @@ func TestNN1N2PipelineExecution(t *testing.T) {
 	}
 
 	initial := desktopupdate.HostInstallation{
-		Version:        "1.0.0",
-		SlotSHA256:     slotN,
-		BackendBinding: bindingN,
+		Version:         "1.0.0",
+		SlotSHA256:      slotN,
+		BackendBinding:  bindingN,
 		AppliedSequence: 0,
 	}
 

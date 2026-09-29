@@ -373,7 +373,7 @@ func acornFoxRuntimeAuthority(ctx context.Context, store *TaskAcornFoxRepoStore,
 	if err != nil {
 		return bad()
 	}
-	binding, err := ParseAcornFoxCandidateBindingV1(bindingRaw, j.BindingSHA256)
+	binding, err := verifiedAcornFoxInstalled0040Binding(bindingRaw, j.BindingSHA256)
 	if err != nil {
 		return bad()
 	}
@@ -413,7 +413,7 @@ func acornFoxRuntimeAuthority(ctx context.Context, store *TaskAcornFoxRepoStore,
 	if err != nil || cp.BindingSHA256 != j.BindingSHA256 || cp.ReleaseID != id.ReleaseID || cp.SourceCommit != id.SourceCommit {
 		return bad()
 	}
-	migrations, err := loadAcornFoxControlPlaneMigrations(store.layout, binding.binding)
+	migrations, err := loadAcornFoxInstalledControlPlaneMigrations(store.layout, binding.binding)
 	if err != nil || cp.MigrationRowsSHA256 != acornFoxMigrationRowsSHA256(migrations.rows) {
 		return bad()
 	}

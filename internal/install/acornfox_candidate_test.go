@@ -33,11 +33,24 @@ func TestIsAcornFoxV1WebAssetPathUsesInstallerPolicy(t *testing.T) {
 }
 
 func newAcornFoxFixture(t *testing.T, version string, predecessor *acornFoxFixture) acornFoxFixture {
+	return acornFoxFixtureForPolicy(t, version, predecessor, AcornFoxCandidateBindingCurrentSchema, AcornFoxV1RequiredFiles())
+}
+
+func acornFoxFixtureForPolicy(t *testing.T, version string, predecessor *acornFoxFixture, schema int, requiredFiles []AcornFoxV1PackageFile, historicMigration ...string) acornFoxFixture {
 	t.Helper()
+	migration, dataVersion := AcornFoxV1MigrationVersion, AcornFoxV1DataVersion
+	if len(historicMigration) > 0 {
+		migration = historicMigration[0]
+		if migration == "0039" {
+			dataVersion = 39
+		} else {
+			t.Fatalf("unsupported historical fixture migration %s", migration)
+		}
+	}
 	binding := AcornFoxCandidateBindingV1{
-		SchemaVersion: AcornFoxCandidateBindingV1Schema, Product: AcornFoxV1Product, Version: version,
+		SchemaVersion: schema, Product: AcornFoxV1Product, Version: version,
 		ReleaseID: "release-" + version, SourceRepository: "https://github.com/acornfox/acornfox",
-		SourceCommit: strings.Repeat("a", 40), Architecture: AcornFoxV1Architecture, MigrationVersion: AcornFoxV1MigrationVersion,
+		SourceCommit: strings.Repeat("a", 40), Architecture: AcornFoxV1Architecture, MigrationVersion: migration,
 		ManifestSHA256: acornFoxFixtureDigest("b"), ArchiveSHA256: acornFoxFixtureDigest("c"), BundleManifestSHA256: acornFoxFixtureDigest("d"),
 	}
 	if predecessor != nil {
@@ -47,9 +60,9 @@ func newAcornFoxFixture(t *testing.T, version string, predecessor *acornFoxFixtu
 			BundleManifestSHA256: predecessor.binding.BundleManifestSHA256, BindingSHA256: predecessor.bindingSHA,
 		}
 	}
-	files := make([]FileDigest, 0, len(AcornFoxV1RequiredFiles())+1)
+	files := make([]FileDigest, 0, len(requiredFiles)+1)
 	contents := map[string][]byte{}
-	for _, required := range AcornFoxV1RequiredFiles() {
+	for _, required := range requiredFiles {
 		contents[required.Path] = []byte("content: " + required.Path + "\n")
 		files = append(files, FileDigest{Path: required.Path, SHA256: sha256Hex(contents[required.Path]), Mode: required.Mode})
 	}
@@ -57,9 +70,9 @@ func newAcornFoxFixture(t *testing.T, version string, predecessor *acornFoxFixtu
 	files = append(files, FileDigest{Path: "web/dist/assets/app-12345678.js", SHA256: sha256Hex(contents["web/dist/assets/app-12345678.js"]), Mode: 0o644})
 	manifest := Manifest{
 		SchemaVersion: ManifestSchemaVersion, Product: AcornFoxV1Product, Version: binding.Version, ReleaseID: binding.ReleaseID,
-		Architecture: AcornFoxV1Architecture, MigrationVersion: AcornFoxV1MigrationVersion, SourceCommit: binding.SourceCommit,
+		Architecture: AcornFoxV1Architecture, MigrationVersion: migration, SourceCommit: binding.SourceCommit,
 		Protocol: AgentProtocolVersion, ConfigDir: AcornFoxV1ConfigDir, DataDir: AcornFoxV1DataDir,
-		Compatibility: Compatibility{MinDataVersion: AcornFoxV1DataVersion, MaxDataVersion: AcornFoxV1DataVersion, MinAgentProtocol: PreviousAgentProtocol, MaxAgentProtocol: AgentProtocolVersion}, Files: files,
+		Compatibility: Compatibility{MinDataVersion: dataVersion, MaxDataVersion: dataVersion, MinAgentProtocol: PreviousAgentProtocol, MaxAgentProtocol: AgentProtocolVersion}, Files: files,
 	}
 	if binding.NMinusOne != nil {
 		n := binding.NMinusOne
@@ -170,32 +183,12 @@ func TestAcornFoxLegacy0034BindingIsPredecessorOnly(t *testing.T) {
 	}
 }
 
-func TestAcornFoxPackagePinsPiWorkerAndCompleteUpstreamAssetInventory(t *testing.T) {
+func TestAcornFoxPackageHasNoPiWorkerOrPiDirectory(t *testing.T) {
 	required := AcornFoxV1RequiredFiles()
-	want := map[string]uint32{
-		"bin/acornfox-pi-worker":             0o755,
-		"systemd/acornfox-pi-worker.service": 0o644,
-		"pi/pi":                              0o755,
-		"pi/package.json":                    0o644,
-		"pi/theme/dark.json":                 0o644,
-		"pi/photon_rs_bg.wasm":               0o644,
-		"pi/extensions/acornfox-tools.ts":    0o644,
-		"pi/UPSTREAM-ASSETS.json":            0o644,
-	}
-	piFiles := 0
 	for _, file := range required {
-		if strings.HasPrefix(file.Path, "pi/") && file.Path != "pi/extensions/acornfox-tools.ts" && file.Path != "pi/UPSTREAM-ASSETS.json" {
-			piFiles++
+		if strings.HasPrefix(file.Path, "pi/") || file.Path == "bin/acornfox-pi-worker" || file.Path == "systemd/acornfox-pi-worker.service" {
+			t.Fatalf("unexpected pi/worker entry in schema2 package: %s", file.Path)
 		}
-		if mode, ok := want[file.Path]; ok {
-			if file.Mode != mode {
-				t.Fatalf("%s mode = %o", file.Path, file.Mode)
-			}
-			delete(want, file.Path)
-		}
-	}
-	if piFiles != 218 || len(want) != 0 {
-		t.Fatalf("Pi file count/missing = %d/%#v", piFiles, want)
 	}
 }
 
@@ -612,6 +605,7 @@ func TestAcornFoxCandidateBindingRejectsGitHubAliases(t *testing.T) {
 
 func TestAcornFoxRecent0039BindingIsPinnedPredecessorOnly(t *testing.T) {
 	old := newAcornFoxFixture(t, "1.2.3-test.1", nil)
+	old.binding.SchemaVersion = AcornFoxCandidateBindingV1Schema
 	old.binding.MigrationVersion = "0039"
 	old.binding.NMinusOne = &AcornFoxNMinusOneV1{Version: "1.2.2-test.1", MigrationVersion: "0039", SourceCommit: strings.Repeat("a", 40), ReleaseManifestSHA256: strings.Repeat("b", 64), ArchiveSHA256: strings.Repeat("c", 64), BundleManifestSHA256: strings.Repeat("d", 64), BindingSHA256: strings.Repeat("e", 64)}
 	refreshAcornFoxBinding(t, &old)
@@ -638,5 +632,23 @@ func TestAcornFoxRecent0039BindingIsPinnedPredecessorOnly(t *testing.T) {
 	refreshAcornFoxBinding(t, &old)
 	if err := ParseAcornFoxPredecessorBindingV1(old.bindingRaw, old.bindingSHA); err == nil {
 		t.Fatal("unlisted predecessor schema accepted")
+	}
+}
+
+func TestAcornFoxFrozen0040Schema1BindingIsPredecessorOnly(t *testing.T) {
+	old := newAcornFoxFixture(t, "1.2.3-test.1", nil)
+	old.binding.SchemaVersion = AcornFoxCandidateBindingV1Schema
+	refreshAcornFoxBinding(t, &old)
+
+	if _, err := ParseAcornFoxCandidateBindingV1(old.bindingRaw, old.bindingSHA); err == nil {
+		t.Fatal("frozen 0040 schema1 binding accepted as new candidate binding")
+	}
+	if err := ParseAcornFoxPredecessorBindingV1(old.bindingRaw, old.bindingSHA); err != nil {
+		t.Fatalf("frozen 0040 schema1 predecessor rejected: %v", err)
+	}
+
+	next := newAcornFoxFixture(t, "1.2.4-test.1", &old)
+	if _, err := VerifyAcornFoxCandidateArtifactsV1(next.input(old.bindingRaw)); err != nil {
+		t.Fatalf("successor artifacts rejected frozen 0040 schema1 predecessor: %v", err)
 	}
 }

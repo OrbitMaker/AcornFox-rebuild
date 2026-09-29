@@ -208,6 +208,72 @@ func TestAcornFoxRuntimeRecreateDelegatesProviderFailureWithoutLocalRetry(t *tes
 	driver.mu.Unlock()
 }
 
+func TestAcornFoxRuntimeLifecycleRejectsUnsupportedDriver(t *testing.T) {
+	driver := &acornFoxRuntimeStub{} // does not implement acornFoxLifecycleDriver
+	service, err := NewAcornFoxRuntimeService(driver)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := any(service).(contracts.AcornFoxLifecycleDriver); ok {
+		t.Fatal("expected service wrapping unsupported driver to NOT implement AcornFoxLifecycleDriver")
+	}
+}
+
+func TestAcornFoxRuntimeLifecycleStopAndStartNarrowDelegation(t *testing.T) {
+	fact := acornFoxRuntimeFact(t)
+	driver := &acornFoxLifecycleStub{}
+	service, err := NewAcornFoxRuntimeService(driver)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lifecycle, ok := any(service).(contracts.AcornFoxLifecycleDriver)
+	if !ok {
+		t.Fatal("expected service wrapping lifecycle driver to implement AcornFoxLifecycleDriver")
+	}
+	dep, err := service.Deploy(context.Background(), contracts.AcornFoxRuntimeDeployRequest{Fact: fact, IdempotencyKey: "deploy-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Stop
+	if err := lifecycle.Stop(context.Background(), contracts.AcornFoxRuntimeActionRequest{Fact: fact, IdempotencyKey: "stop-1"}); err != nil {
+		t.Fatal(err)
+	}
+	wantStopKey, err := contracts.AcornFoxRuntimeOperationID(fact, "stop", "stop-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if driver.lastStop.Operation.IdempotencyKey != wantStopKey || driver.lastStop.DeploymentID != dep.DeploymentID || driver.stopMutations != 1 {
+		t.Fatalf("Stop was not correctly delegated: key=%q mutations=%d", driver.lastStop.Operation.IdempotencyKey, driver.stopMutations)
+	}
+	if err := lifecycle.Stop(context.Background(), contracts.AcornFoxRuntimeActionRequest{Fact: fact, IdempotencyKey: "stop-1"}); err != nil || driver.stopMutations != 1 {
+		t.Fatalf("Stop replay should be idempotent: mutations=%d err=%v", driver.stopMutations, err)
+	}
+
+	// Start
+	if err := lifecycle.Start(context.Background(), contracts.AcornFoxRuntimeActionRequest{Fact: fact, IdempotencyKey: "start-1"}); err != nil {
+		t.Fatal(err)
+	}
+	wantStartKey, err := contracts.AcornFoxRuntimeOperationID(fact, "start", "start-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if driver.lastStart.Operation.IdempotencyKey != wantStartKey || driver.lastStart.DeploymentID != dep.DeploymentID || driver.startMutations != 1 {
+		t.Fatalf("Start was not correctly delegated: key=%q mutations=%d", driver.lastStart.Operation.IdempotencyKey, driver.startMutations)
+	}
+	if err := lifecycle.Start(context.Background(), contracts.AcornFoxRuntimeActionRequest{Fact: fact, IdempotencyKey: "start-1"}); err != nil || driver.startMutations != 1 {
+		t.Fatalf("Start replay should be idempotent: mutations=%d err=%v", driver.startMutations, err)
+	}
+
+	// Empty idempotency key rejected
+	if err := lifecycle.Stop(context.Background(), contracts.AcornFoxRuntimeActionRequest{Fact: fact}); err == nil {
+		t.Fatal("empty stop key should be rejected")
+	}
+	if err := lifecycle.Start(context.Background(), contracts.AcornFoxRuntimeActionRequest{Fact: fact}); err == nil {
+		t.Fatal("empty start key should be rejected")
+	}
+}
+
 func acornFoxRuntimeFact(t *testing.T) contracts.AcornFoxRuntimeReleaseFact {
 	t.Helper()
 	release, err := domain.NewRelease("app_1", "sg_1", 1, "sha256:"+strings.Repeat("c", 64), map[string]domain.ImageDigest{"web": {Repository: "registry.open-card.test/apps/web", Digest: acornFoxRuntimeTestDigest}}, time.Unix(1, 0).UTC())
@@ -358,4 +424,109 @@ func acornFoxRuntimeNotFound() error { return &contracts.ProviderError{Code: con
 func acornFoxRuntimeErrorCode(err error, code contracts.ErrorCode) bool {
 	var providerErr *contracts.ProviderError
 	return errors.As(err, &providerErr) && providerErr.Code == code
+}
+
+type acornFoxLifecycleStub struct {
+	acornFoxRuntimeStub
+	stopMutations  int
+	startMutations int
+	lastStop       contracts.StopRequest
+	lastStart      contracts.StartRequest
+}
+
+func (driver *acornFoxLifecycleStub) Stop(_ context.Context, request contracts.StopRequest) error {
+	driver.mu.Lock()
+	defer driver.mu.Unlock()
+	driver.lastStop = request
+	if driver.states == nil {
+		return acornFoxRuntimeNotFound()
+	}
+	if _, ok := driver.states[request.DeploymentID]; !ok {
+		return acornFoxRuntimeNotFound()
+	}
+	if _, seen := driver.actions[request.Operation.IdempotencyKey]; !seen {
+		if driver.actions == nil {
+			driver.actions = map[string]struct{}{}
+		}
+		driver.actions[request.Operation.IdempotencyKey] = struct{}{}
+		driver.stopMutations++
+	}
+	return nil
+}
+
+func (driver *acornFoxLifecycleStub) Start(_ context.Context, request contracts.StartRequest) error {
+	driver.mu.Lock()
+	defer driver.mu.Unlock()
+	driver.lastStart = request
+	if driver.states == nil {
+		return acornFoxRuntimeNotFound()
+	}
+	if _, ok := driver.states[request.DeploymentID]; !ok {
+		return acornFoxRuntimeNotFound()
+	}
+	if _, seen := driver.actions[request.Operation.IdempotencyKey]; !seen {
+		if driver.actions == nil {
+			driver.actions = map[string]struct{}{}
+		}
+		driver.actions[request.Operation.IdempotencyKey] = struct{}{}
+		driver.startMutations++
+	}
+	return nil
+}
+
+type acornFoxRetainedStub struct {
+	acornFoxRuntimeStub
+	volumesSupported bool
+	observedReceipts []contracts.AcornFoxRetainedVolumeReceipt
+}
+
+func (driver *acornFoxRetainedStub) RetainedVolumeObservationSupported() bool {
+	return driver.volumesSupported
+}
+
+func (driver *acornFoxRetainedStub) ObserveRetainedVolumes(_ context.Context, _ contracts.RuntimeSpec) ([]contracts.AcornFoxRetainedVolumeReceipt, error) {
+	return driver.observedReceipts, nil
+}
+
+func TestAcornFoxRuntimeRetainedVolumeObserverCapabilityAssertion(t *testing.T) {
+	// 1. Driver without volume capability marker is NOT wrapped
+	baseDriver := &acornFoxRuntimeStub{}
+	service1, err := NewAcornFoxRuntimeService(baseDriver)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := any(service1).(contracts.AcornFoxRetainedVolumeObserver); ok {
+		t.Fatal("base driver should NOT implement AcornFoxRetainedVolumeObserver")
+	}
+
+	// 2. Driver with volumesSupported=false (e.g. Volumes==nil) is NOT wrapped
+	unsupportedDriver := &acornFoxRetainedStub{volumesSupported: false}
+	service2, err := NewAcornFoxRuntimeService(unsupportedDriver)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := any(service2).(contracts.AcornFoxRetainedVolumeObserver); ok {
+		t.Fatal("driver with volumesSupported=false should NOT implement AcornFoxRetainedVolumeObserver")
+	}
+
+	// 3. Driver with volumesSupported=true IS wrapped
+	supportedDriver := &acornFoxRetainedStub{
+		volumesSupported: true,
+		observedReceipts: []contracts.AcornFoxRetainedVolumeReceipt{
+			{ApplicationID: "app_1", LogicalName: "data", ManagedVolumeName: "vol-1", ReceiptDigest: "sha256:" + strings.Repeat("a", 64)},
+		},
+	}
+	service3, err := NewAcornFoxRuntimeService(supportedDriver)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observer, ok := any(service3).(contracts.AcornFoxRetainedVolumeObserver)
+	if !ok {
+		t.Fatal("driver with volumesSupported=true SHOULD implement AcornFoxRetainedVolumeObserver")
+	}
+	fact := acornFoxRuntimeFact(t)
+	got, err := observer.ObserveRetainedVolumes(context.Background(), fact)
+	if err != nil || len(got) != 0 {
+		t.Fatalf("expected empty for fact with no volumes, got=%v err=%v", got, err)
+	}
 }

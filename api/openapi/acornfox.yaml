@@ -69,103 +69,33 @@ paths:
       security: [{AdministratorSession: []}]
       responses:
         '200': {description: Read-only host telemetry snapshot. Missing optional metric groups are not zero values., content: {application/json: {schema: {$ref: '#/components/schemas/HostMetricsResponse'}}}}
+        '400': {$ref: '#/components/responses/InvalidRequest'}
         '401': {$ref: '#/components/responses/AuthenticationFailed'}
         '503': {$ref: '#/components/responses/TemporarilyUnavailable'}
-  /api/v1/acornfox/assistant/sessions:
+  /api/v1/acornfox/host/metrics/recent:
     get:
-      operationId: listAcornFoxAssistantSessions
-      x-acornfox-parity: assistant_ui_only
+      operationId: getAcornFoxHostMetricsRecent
+      x-acornfox-parity: integration_cli
       security: [{AdministratorSession: []}]
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 360
+            default: 60
+          description: Maximum number of recent observations to return (1-360, default 60)
       responses:
-        '200': {description: Administrator-owned assistant sessions only., content: {application/json: {schema: {$ref: '#/components/schemas/AssistantSessionListResponse'}}}}
-        '401': {$ref: '#/components/responses/AuthenticationFailed'}
-        '503': {$ref: '#/components/responses/TemporarilyUnavailable'}
-    post:
-      operationId: createAcornFoxAssistantSession
-      x-acornfox-parity: assistant_ui_only
-      security: [{AdministratorSession: []}]
-      parameters: [{$ref: '#/components/parameters/CSRFToken'}]
-      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/AssistantSessionCreateRequest'}}}}
-      responses:
-        '201': {description: Assistant session created. This does not start an assistant run., content: {application/json: {schema: {$ref: '#/components/schemas/AssistantSession'}}}}
+        '200': {description: Bounded host telemetry history up to 30 minutes, content: {application/json: {schema: {$ref: '#/components/schemas/HostMetricsRecentResponse'}}}}
         '400': {$ref: '#/components/responses/InvalidRequest'}
         '401': {$ref: '#/components/responses/AuthenticationFailed'}
-        '429': {$ref: '#/components/responses/TemporarilyUnavailable'}
-        '503': {$ref: '#/components/responses/TemporarilyUnavailable'}
-  /api/v1/acornfox/assistant/sessions/{sessionId}/runs:
-    parameters: [{$ref: '#/components/parameters/AssistantSessionId'}]
-    post:
-      operationId: submitAcornFoxAssistantRun
-      x-acornfox-parity: assistant_ui_only
-      security: [{AdministratorSession: []}]
-      parameters: [{$ref: '#/components/parameters/CSRFToken'}]
-      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/AssistantRunSubmitRequest'}}}}
-      responses:
-        '200': {description: Idempotent replay of the same accepted assistant run; no second run was submitted., content: {application/json: {schema: {$ref: '#/components/schemas/AssistantRunSubmitResponse'}}}}
-        '202': {description: Assistant run accepted. Completion is represented only by later run events and does not verify an application operation., content: {application/json: {schema: {$ref: '#/components/schemas/AssistantRunSubmitResponse'}}}}
-        '400': {$ref: '#/components/responses/InvalidRequest'}
-        '401': {$ref: '#/components/responses/AuthenticationFailed'}
-        '404': {$ref: '#/components/responses/NotFound'}
-        '409': {$ref: '#/components/responses/IdempotencyConflict'}
-        '429': {$ref: '#/components/responses/TemporarilyUnavailable'}
-        '503': {$ref: '#/components/responses/TemporarilyUnavailable'}
-  /api/v1/acornfox/assistant/sessions/{sessionId}/events:
-    parameters: [{$ref: '#/components/parameters/AssistantSessionId'}]
-    get:
-      operationId: getAcornFoxAssistantEvents
-      x-acornfox-parity: assistant_ui_only
-      security: [{AdministratorSession: []}]
-      parameters: [{$ref: '#/components/parameters/AssistantAfter'}, {$ref: '#/components/parameters/LastEventID'}]
-      responses:
-        '200': {description: JSON event snapshot or a continuing SSE stream when Accept is text/event-stream., headers: {X-AcornFox-Assistant-Cursor-Status: {schema: {type: string, enum: [ok, slow_consumer, expired]}}}, content: {application/json: {schema: {$ref: '#/components/schemas/AssistantEventSnapshot'}}, text/event-stream: {schema: {type: string}}}}
-        '400': {$ref: '#/components/responses/InvalidRequest'}
-        '401': {$ref: '#/components/responses/AuthenticationFailed'}
-        '404': {$ref: '#/components/responses/NotFound'}
-        '409': {description: Cursor expired. A JSON snapshot supplies the oldest and latest retained cursor for a bounded retry., content: {application/json: {schema: {$ref: '#/components/schemas/AssistantEventSnapshot'}}}}
-        '503': {$ref: '#/components/responses/TemporarilyUnavailable'}
-  /api/v1/acornfox/assistant/sessions/{sessionId}/abort:
-    parameters: [{$ref: '#/components/parameters/AssistantSessionId'}]
-    post:
-      operationId: abortAcornFoxAssistantSessionRuns
-      x-acornfox-parity: assistant_ui_only
-      security: [{AdministratorSession: []}]
-      parameters: [{$ref: '#/components/parameters/CSRFToken'}]
-      responses:
-        '200': {description: Abort was requested for this session's active and queued runs only., content: {application/json: {schema: {$ref: '#/components/schemas/AssistantAbortResponse'}}}}
-        '400': {$ref: '#/components/responses/InvalidRequest'}
-        '401': {$ref: '#/components/responses/AuthenticationFailed'}
-        '404': {$ref: '#/components/responses/NotFound'}
-        '503': {$ref: '#/components/responses/TemporarilyUnavailable'}
-  /api/v1/acornfox/assistant/sessions/{sessionId}/actions:
-    parameters: [{$ref: '#/components/parameters/AssistantSessionId'}]
-    get:
-      operationId: listAcornFoxAssistantActions
-      x-acornfox-parity: assistant_ui_only
-      security: [{AdministratorSession: []}]
-      responses:
-        '200': {description: "Administrator-owned session-scoped action proposals. verified is action evidence only and does not claim application health or public reachability.", content: {application/json: {schema: {$ref: '#/components/schemas/AssistantActionListResponse'}}}}
-        '401': {$ref: '#/components/responses/AuthenticationFailed'}
-        '404': {$ref: '#/components/responses/NotFound'}
-        '503': {$ref: '#/components/responses/TemporarilyUnavailable'}
-  /api/v1/acornfox/assistant/sessions/{sessionId}/actions/{proposalId}/decision:
-    parameters: [{$ref: '#/components/parameters/AssistantSessionId'}, {$ref: '#/components/parameters/AssistantProposalId'}]
-    post:
-      operationId: decideAcornFoxAssistantAction
-      x-acornfox-parity: assistant_ui_only
-      security: [{AdministratorSession: []}]
-      parameters: [{$ref: '#/components/parameters/CSRFToken'}]
-      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/AssistantActionDecisionRequest'}}}}
-      responses:
-        '200': {description: Proposal was rejected or was already terminal; no new action was accepted., content: {application/json: {schema: {$ref: '#/components/schemas/AssistantActionProposal'}}}}
-        '202': {description: "Proposal action was accepted, is executing, or has an unknown execution acknowledgement. Completion remains separate action evidence.", content: {application/json: {schema: {$ref: '#/components/schemas/AssistantActionProposal'}}}}
-        '400': {$ref: '#/components/responses/InvalidRequest'}
-        '401': {$ref: '#/components/responses/AuthenticationFailed'}
-        '404': {$ref: '#/components/responses/NotFound'}
-        '409': {$ref: '#/components/responses/IdempotencyConflict'}
         '503': {$ref: '#/components/responses/TemporarilyUnavailable'}
   /api/v1/acornfox/source-uploads:
     post:
       operationId: createAcornFoxSourceUpload
+      x-acornfox-parity: cli_only
       security: [{AdministratorSession: []}]
       parameters: [{$ref: '#/components/parameters/IdempotencyKey'}, {$ref: '#/components/parameters/CSRFToken'}]
       requestBody:
@@ -190,6 +120,7 @@ paths:
     parameters: [{name: uploadId, in: path, required: true, schema: {type: string}}]
     get:
       operationId: getAcornFoxSourceUpload
+      x-acornfox-parity: cli_only
       security: [{AdministratorSession: []}]
       responses:
         '200': {description: Upload metadata without storage paths, content: {application/json: {schema: {$ref: '#/components/schemas/SourceUploadResponse'}}}}
@@ -520,10 +451,6 @@ components:
     SourceRevisionId: {name: sourceRevisionId, in: path, required: true, schema: {type: string, minLength: 1}}
     CandidateId: {name: candidateId, in: path, required: true, schema: {type: string, pattern: '^candidate_[0-9a-f]{32}$'}}
     OperationId: {name: operationId, in: path, required: true, schema: {type: string, minLength: 1}}
-    AssistantSessionId: {name: sessionId, in: path, required: true, schema: {type: string, minLength: 1}}
-    AssistantProposalId: {name: proposalId, in: path, required: true, schema: {type: string, minLength: 1}}
-    AssistantAfter: {name: after, in: query, required: false, schema: {type: integer, minimum: 0}}
-    LastEventID: {name: Last-Event-ID, in: header, required: false, schema: {type: string, pattern: '^[0-9]+$'}}
     DeploymentId: {name: deploymentId, in: path, required: true, schema: {type: string, minLength: 1}}
     IdempotencyKey: {name: Idempotency-Key, in: header, required: true, schema: {type: string, minLength: 1}}
     LogSource: {name: source, in: query, required: true, schema: {type: string, enum: [build, runtime]}}
@@ -582,81 +509,6 @@ components:
       required: [initialized]
       additionalProperties: false
       properties: {initialized: {type: boolean, enum: [true]}}
-    AssistantScope:
-      type: object
-      required: [kind]
-      additionalProperties: false
-      properties: {kind: {type: string, enum: [host, app]}, app_id: {type: string}}
-    AssistantSession:
-      type: object
-      required: [session_id, scope, created_at, updated_at]
-      additionalProperties: false
-      properties: {session_id: {type: string}, scope: {$ref: '#/components/schemas/AssistantScope'}, created_at: {type: string, format: date-time}, updated_at: {type: string, format: date-time}}
-    AssistantSessionListResponse:
-      type: object
-      required: [sessions]
-      additionalProperties: false
-      properties: {sessions: {type: array, items: {$ref: '#/components/schemas/AssistantSession'}}}
-    AssistantSessionCreateRequest:
-      type: object
-      required: [scope]
-      additionalProperties: false
-      properties: {scope: {$ref: '#/components/schemas/AssistantScope'}}
-    AssistantRun:
-      type: object
-      required: [run_id, session_id, status, created_at, updated_at]
-      additionalProperties: false
-      properties: {run_id: {type: string}, session_id: {type: string}, status: {type: string, enum: [accepted, running, completed, failed, aborted, unknown]}, created_at: {type: string, format: date-time}, updated_at: {type: string, format: date-time}}
-    AssistantRunSubmitRequest:
-      type: object
-      required: [idempotency_key, message]
-      additionalProperties: false
-      properties: {idempotency_key: {type: string, minLength: 1, maxLength: 128}, message: {type: string, minLength: 1, maxLength: 65536}}
-    AssistantRunSubmitResponse:
-      type: object
-      required: [run, replay]
-      additionalProperties: false
-      properties: {run: {$ref: '#/components/schemas/AssistantRun'}, replay: {type: boolean}}
-    AssistantEvent:
-      type: object
-      required: [cursor, type, occurred_at]
-      additionalProperties: false
-      properties: {cursor: {type: integer, minimum: 1}, run_id: {type: string}, type: {type: string, enum: [run.accepted, run.started, assistant.delta, assistant.message, run.completed, run.failed, run.aborted, run.unknown]}, occurred_at: {type: string, format: date-time}, text: {type: string, maxLength: 65536}}
-    AssistantEventSnapshot:
-      type: object
-      required: [status, oldest_cursor, latest_cursor, events]
-      additionalProperties: false
-      properties: {status: {type: string, enum: [ok, slow_consumer, expired]}, oldest_cursor: {type: integer, minimum: 0}, latest_cursor: {type: integer, minimum: 0}, events: {type: array, items: {$ref: '#/components/schemas/AssistantEvent'}}}
-    AssistantAbortResponse:
-      type: object
-      required: [aborted]
-      additionalProperties: false
-      properties: {aborted: {type: integer, minimum: 0}}
-    AssistantActionTarget:
-      type: object
-      required: [application_id, deployment_id, target_release_id, target_release_version, application_name]
-      additionalProperties: false
-      properties: {application_id: {type: string}, deployment_id: {type: string}, target_release_id: {type: string}, target_release_version: {type: integer, format: int64, minimum: 1}, application_name: {type: string, maxLength: 128}}
-    AssistantActionVerification:
-      type: object
-      required: [state]
-      additionalProperties: false
-      properties: {state: {type: string, enum: [pending, verified, failed]}, verdict: {type: string, maxLength: 256}, observed_at: {type: string, format: date-time}}
-    AssistantActionProposal:
-      type: object
-      required: [proposal_id, session_id, run_id, action, target, state, expires_at, verification, created_at, updated_at]
-      additionalProperties: false
-      properties: {proposal_id: {type: string}, session_id: {type: string}, run_id: {type: string}, action: {type: string, enum: [restart, redeploy]}, target: {$ref: '#/components/schemas/AssistantActionTarget'}, state: {type: string, enum: [pending, rejected, expired, executing, accepted, unknown, verified, failed]}, expires_at: {type: string, format: date-time}, operation_id: {type: string}, verification: {$ref: '#/components/schemas/AssistantActionVerification'}, created_at: {type: string, format: date-time}, updated_at: {type: string, format: date-time}}
-    AssistantActionListResponse:
-      type: object
-      required: [actions]
-      additionalProperties: false
-      properties: {actions: {type: array, items: {$ref: '#/components/schemas/AssistantActionProposal'}}}
-    AssistantActionDecisionRequest:
-      type: object
-      required: [approve]
-      additionalProperties: false
-      properties: {approve: {type: boolean}}
     AuthSessionResponse:
       type: object
       required: [authenticated, idle_expires_at, absolute_expires_at]
@@ -803,9 +655,10 @@ components:
       required: [application_id, source_revision_id, repository_url, ref, commit, dockerfile, ports, port_selection, healthcheck, environment, gaps, warnings, required_actions, ready_to_deploy]
       additionalProperties: false
       properties:
+        source_type: {type: string, enum: [upload], description: Only present for a local uploaded source. Absent preserves the Git response.}
         application_id: {type: string}
         source_revision_id: {type: string}
-        repository_url: {type: string, format: uri}
+        repository_url: {type: string, description: HTTPS repository for Git sources. Empty for uploaded projects.}
         ref: {type: string}
         commit: {type: string}
         dockerfile: {$ref: '#/components/schemas/DeploymentPlanDockerfile'}
@@ -823,10 +676,15 @@ components:
       additionalProperties: false
       properties: {items: {type: array, items: {$ref: '#/components/schemas/SourceRevision'}}, next_cursor: {type: string, nullable: true}}
     SourceUpdateRequest:
-      type: object
-      required: [base_source_revision_id, ref]
-      additionalProperties: false
-      properties: {base_source_revision_id: {type: string, minLength: 1}, ref: {type: string, minLength: 1}}
+      oneOf:
+        - type: object
+          required: [base_source_revision_id, ref]
+          additionalProperties: false
+          properties: {base_source_revision_id: {type: string, minLength: 1}, ref: {type: string, minLength: 1}}
+        - type: object
+          required: [base_source_revision_id, upload_id]
+          additionalProperties: false
+          properties: {base_source_revision_id: {type: string, minLength: 1}, upload_id: {type: string, minLength: 1}}
     SourceUpdateResponse:
       type: object
       required: [source_revision_id, status]
@@ -1070,6 +928,19 @@ components:
         memory: {$ref: '#/components/schemas/HostMetricsMemory'}
         disk: {$ref: '#/components/schemas/HostMetricsDisk'}
         network: {$ref: '#/components/schemas/HostMetricsNetwork'}
+    HostMetricsRecentResponse:
+      type: object
+      required: [schema_version, availability, generated_at, capacity, retention_seconds, points]
+      additionalProperties: false
+      properties:
+        schema_version: {type: integer, enum: [1]}
+        availability: {type: string, enum: [available, warming_up, unavailable, unsupported]}
+        generated_at: {type: string, format: date-time}
+        capacity: {type: integer, enum: [360]}
+        retention_seconds: {type: integer, enum: [1800]}
+        points:
+          type: array
+          items: {$ref: '#/components/schemas/HostMetricsResponse'}
     ProbeDeliveryRequest:
       type: object
       required: [protocol]

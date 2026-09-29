@@ -1,8 +1,8 @@
 # 构建随包容器运行工具
 
-首版已完成的运行时输入覆盖 Ubuntu 24.04 的原生 Linux amd64 和 Linux arm64：BuildKit `0.32.2`、RootlessKit `3.1.0`、Caddy `2.11.4` 和 Pi `0.85.1` 都取自各自官方发布，归档 URL 和摘要见 `release/runtime-inputs.json`。该历史归档清单也含未进入 AcornFox 首版的 Buildx；实际 runtime 输入包含五个原有 `bin/` 文件以及所选架构官方 Pi 归档的完整 218 文件树。Pi 最终位于 `/opt/acornfox/current/pi/**`，不在安装或运行时下载，也不裁成单独 executable。
+当前 binding schema 2 候选只携带容器运行工具：BuildKit、RootlessKit、Caddy 和按下文构建的 runc；不携带 Pi、助手执行程序或助手 systemd 单元。固定版本和历史归档来源见 `release/runtime-inputs.json`，构建时应以当前容器工具清单为准。
 
-Linux amd64 选择 `internal/pibundle/assets-v0.85.1-linux-x64.json`，Linux arm64 选择 `internal/pibundle/assets-v0.85.1-linux-arm64.json`。每个固定资产清单分别锁定官方归档 SHA-256、250 个 tar members、218 个普通文件的路径、mode、size、逐文件 SHA，以及解包后的 `runtime_root/pi/**`；候选包携带对应清单为 `pi/UPSTREAM-ASSETS.json`。Pi 的两个归档摘要都来自其官方 `SHA256SUMS`，不是旧 M7 归档的来源记录。
+历史 schema 1 包曾包含 Pi 0.85.1 的 218 文件树。`internal/pibundle/assets-v0.85.1-linux-x64.json` 与 arm64 清单保留用于验证已有安装及回退；它们不再是新包的运行依赖。不要为新候选下载或装配 `runtime_root/pi/**`。
 
 `buildkitd`、`buildctl`、`rootlesskit`、`caddy` 保留官方归档原字节。**不要复制官方 BuildKit 归档中的静态 `buildkit-runc` 到本版输入目录。** 本版使用下面的动态构建，同样保留 seccomp 支持。构建身份、编译器和系统包版本、输入及输出摘要见 `release/acornfox-runc-build-v1.json`。
 

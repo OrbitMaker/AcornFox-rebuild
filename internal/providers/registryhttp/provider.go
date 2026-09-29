@@ -35,6 +35,10 @@ const (
 	maxMetadataSize = 16 << 20
 	maxBlobSize     = 4 << 30
 
+	ghcrHost        = "ghcr.io"
+	ghcrCDNHost     = "pkg-containers.githubusercontent.com"
+	maxRedirectHops = 3
+
 	ociManifestMediaType        = "application/vnd.oci.image.manifest.v1+json"
 	ociIndexMediaType           = "application/vnd.oci.image.index.v1+json"
 	dockerManifestMediaType     = "application/vnd.docker.distribution.manifest.v2+json"
@@ -202,14 +206,16 @@ func (p *Provider) execute(ctx context.Context, request contracts.ImageResolveRe
 }
 
 type httpSession struct {
-	baseURL    *url.URL
-	client     *http.Client
-	resolver   contracts.BuildSecretResolver
-	material   *contracts.BuildSecretMaterial
-	authHeader string
-	authBytes  []byte
-	operation  contracts.OperationContext
-	workspace  string
+	baseURL      *url.URL
+	client       *http.Client
+	resolver     contracts.BuildSecretResolver
+	material     *contracts.BuildSecretMaterial
+	authHeader   string
+	authBytes    []byte
+	operation    contracts.OperationContext
+	workspace    string
+	repository   string
+	tokenRetried bool
 }
 
 func (s *httpSession) Close() {
@@ -240,7 +246,7 @@ func (p *Provider) newSession(ctx context.Context, request contracts.ImageResolv
 	if err != nil {
 		return nil, p.failure(request.Operation, contracts.ErrUnavailable, mode, "registry HTTP workspace could not be created", nil)
 	}
-	session := &httpSession{baseURL: base, client: p.config.HTTPClient, operation: request.Operation, workspace: workspace}
+	session := &httpSession{baseURL: base, client: p.config.HTTPClient, operation: request.Operation, workspace: workspace, repository: request.Repository}
 	cleanupFailure := func(providerErr error) (*httpSession, error) {
 		session.Close()
 		return nil, providerErr
@@ -308,6 +314,22 @@ func isLoopbackHost(host string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
+func isGHCRBlobRequest(u *url.URL) bool {
+	if u == nil || u.Scheme != "https" || !strings.EqualFold(u.Hostname(), ghcrHost) {
+		return false
+	}
+	path := strings.TrimPrefix(u.Path, "/v2/")
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) < 2 {
+		return false
+	}
+	if parts[len(parts)-2] != "blobs" {
+		return false
+	}
+	digest := parts[len(parts)-1]
+	return validDigest(digest)
+}
+
 func (p *Provider) resolveImage(ctx context.Context, session *httpSession, request contracts.ImageResolveRequest, pull bool) (domain.ImageDigest, pulledImage, error) {
 	tagManifest, tagDigest, mediaType, err := p.getManifest(ctx, session, request.Repository, request.Tag)
 	if err != nil {
@@ -333,6 +355,9 @@ func (p *Provider) resolveImage(ctx context.Context, session *httpSession, reque
 	}
 	if !validDigest(selectedDigest) {
 		return domain.ImageDigest{}, pulledImage{}, p.failure(request.Operation, contracts.ErrValidation, "resolve", "registry returned an invalid manifest digest", nil)
+	}
+	if validDigest(request.Tag) && tagDigest != request.Tag {
+		return domain.ImageDigest{}, pulledImage{}, p.failure(request.Operation, contracts.ErrConflict, "resolve", "registry manifest digest does not match requested digest", nil)
 	}
 	if !bytes.Equal(tagManifest, selectedManifest) && digestBytes(selectedManifest) != selectedDigest {
 		return domain.ImageDigest{}, pulledImage{}, p.failure(request.Operation, contracts.ErrConflict, "resolve", "registry manifest digest verification failed", nil)
@@ -360,7 +385,11 @@ func (p *Provider) resolveImage(ctx context.Context, session *httpSession, reque
 	if err != nil {
 		return domain.ImageDigest{}, pulledImage{}, p.failure(request.Operation, contracts.ErrValidation, "resolve", "registry image digest is invalid", nil)
 	}
-	image.ResolvedTag = request.Tag
+	if !validDigest(request.Tag) {
+		image.ResolvedTag = request.Tag
+	} else {
+		image.ResolvedTag = ""
+	}
 	pulled := pulledImage{Manifest: selectedManifest, ManifestMediaType: selectedMediaType, ConfigDigest: selectedDoc.Config.Digest, Config: configBytes}
 	if !pull {
 		return image, pulled, nil
@@ -475,20 +504,37 @@ func (p *Provider) downloadBlob(ctx context.Context, session *httpSession, repos
 	tmp := filepath.Join(session.workspace, strings.TrimPrefix(digest, "sha256:")+".blob")
 	file, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
-		return "", 0, p.failure(session.operation, contracts.ErrUnavailable, "resolve_and_pull", "registry layer workspace could not be created", nil)
+		return "", 0, p.failure(session.operation, contracts.ErrUnavailable, "resolve_and_pull", "registry layer workspace could not be created", err)
 	}
 	hash := sha256.New()
 	reader := io.TeeReader(io.LimitReader(resp.Body, maxBlobSize+1), hash)
 	size, copyErr := io.Copy(file, reader)
-	if syncErr := file.Sync(); copyErr == nil {
-		copyErr = syncErr
-	}
-	if closeErr := file.Close(); copyErr == nil {
-		copyErr = closeErr
-	}
-	if copyErr != nil || size > maxBlobSize || "sha256:"+hex.EncodeToString(hash.Sum(nil)) != digest {
+	syncErr := file.Sync()
+	closeErr := file.Close()
+	if copyErr != nil {
 		_ = os.Remove(tmp)
-		return "", 0, p.failure(session.operation, contracts.ErrConflict, "resolve_and_pull", "registry layer verification failed", nil)
+		var pathErr *os.PathError
+		if errors.Is(copyErr, io.ErrShortWrite) || (errors.As(copyErr, &pathErr) && pathErr.Op == "write") {
+			return "", 0, p.failure(session.operation, contracts.ErrUnavailable, "resolve_and_pull", "registry layer workspace write failed", copyErr)
+		}
+		failure := p.classify(session.operation, "resolve_and_pull", copyErr)
+		failure.Message = "registry layer response read failed"
+		return "", 0, failure
+	}
+	if syncErr != nil || closeErr != nil {
+		_ = os.Remove(tmp)
+		if syncErr != nil {
+			return "", 0, p.failure(session.operation, contracts.ErrUnavailable, "resolve_and_pull", "registry layer workspace sync failed", syncErr)
+		}
+		return "", 0, p.failure(session.operation, contracts.ErrUnavailable, "resolve_and_pull", "registry layer workspace close failed", closeErr)
+	}
+	if size > maxBlobSize {
+		_ = os.Remove(tmp)
+		return "", 0, p.failure(session.operation, contracts.ErrValidation, "resolve_and_pull", "registry layer response is too large", nil)
+	}
+	if "sha256:"+hex.EncodeToString(hash.Sum(nil)) != digest {
+		_ = os.Remove(tmp)
+		return "", 0, p.failure(session.operation, contracts.ErrConflict, "resolve_and_pull", "registry layer digest verification failed", nil)
 	}
 	return tmp, size, nil
 }
@@ -608,7 +654,12 @@ func (p *Provider) get(ctx context.Context, session *httpSession, path, accept s
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxMetadataSize+1))
-	if err != nil || len(body) > maxMetadataSize {
+	if err != nil {
+		failure := p.classify(session.operation, "registry_http", err)
+		failure.Message = "registry metadata response read failed"
+		return nil, "", "", failure
+	}
+	if len(body) > maxMetadataSize {
 		return nil, "", "", p.failure(session.operation, contracts.ErrValidation, "registry_http", "registry response is too large", nil)
 	}
 	return body, resp.Header.Get("Content-Type"), resp.Header.Get("Docker-Content-Digest"), nil
@@ -630,15 +681,45 @@ func (p *Provider) request(ctx context.Context, session *httpSession, method, pa
 	}
 	resp, err := session.client.Do(req)
 	if err != nil {
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return nil, p.failure(session.operation, contracts.ErrTimeout, "registry_http", "registry request timed out", nil)
-		}
-		if errors.Is(ctx.Err(), context.Canceled) {
-			return nil, p.failure(session.operation, contracts.ErrCancelled, "registry_http", "registry request was cancelled", nil)
-		}
-		return nil, p.failure(session.operation, contracts.ErrUnavailable, "registry_http", "registry request failed", nil)
+		return nil, p.classify(session.operation, "registry_http", err)
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		if resp.StatusCode == http.StatusUnauthorized && session.authHeader == "" && !session.tokenRetried {
+			session.tokenRetried = true
+			if challengeErr := p.handleAnonymousChallenge(ctx, session, session.repository, resp); challengeErr != nil {
+				_ = resp.Body.Close()
+				return nil, challengeErr
+			}
+			_ = resp.Body.Close()
+
+			reqRetry, err := http.NewRequestWithContext(ctx, method, u.String(), nil)
+			if err != nil {
+				return nil, p.failure(session.operation, contracts.ErrValidation, "registry_http", "registry retry request could not be constructed", nil)
+			}
+			if accept != "" {
+				reqRetry.Header.Set("Accept", accept)
+			}
+			if session.authHeader != "" {
+				reqRetry.Header.Set("Authorization", session.authHeader)
+			}
+			respRetry, err := session.client.Do(reqRetry)
+			if err != nil {
+				return nil, p.classify(session.operation, "registry_http", err)
+			}
+			if respRetry.StatusCode < http.StatusOK || respRetry.StatusCode >= http.StatusMultipleChoices {
+				_ = respRetry.Body.Close()
+				code := contracts.ErrUnavailable
+				if respRetry.StatusCode == http.StatusUnauthorized || respRetry.StatusCode == http.StatusForbidden {
+					code = contracts.ErrUnauthorized
+				}
+				if respRetry.StatusCode == http.StatusNotFound {
+					code = contracts.ErrNotFound
+				}
+				return nil, p.failure(session.operation, code, "registry_http", "registry returned an unsuccessful response", nil)
+			}
+			return respRetry, nil
+		}
+
 		_ = resp.Body.Close()
 		code := contracts.ErrUnavailable
 		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
@@ -699,18 +780,54 @@ func normalizeConfig(config Config) (Config, error) {
 			client.Timeout = config.Timeout
 		}
 	}
+	// Registry authentication is explicit; ambient cookies must never be sent to blob storage.
+	client.Jar = nil
 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		if len(via) == 0 {
 			return nil
 		}
+		if len(via) > maxRedirectHops {
+			return errHTTPBoundary
+		}
 		previous := via[len(via)-1].URL
-		if !strings.EqualFold(previous.Scheme, req.URL.Scheme) || !strings.EqualFold(previous.Host, req.URL.Host) {
-			return errHTTPBoundary
+		initial := via[0].URL
+
+		// 1. Same-host redirect
+		if strings.EqualFold(previous.Host, req.URL.Host) {
+			if !strings.EqualFold(previous.Scheme, req.URL.Scheme) {
+				return errHTTPBoundary
+			}
+			if req.URL.Scheme == "http" && !isLoopbackHost(req.URL.Hostname()) {
+				return errHTTPBoundary
+			}
+			if req.URL.User != nil || req.URL.Fragment != "" {
+				return errHTTPBoundary
+			}
+			return nil
 		}
-		if req.URL.Scheme == "http" && !isLoopbackHost(req.URL.Hostname()) {
-			return errHTTPBoundary
+
+		// 2. Cross-host redirect permitted ONLY for validated GHCR content-addressed blobs to EXACT pkg-containers.githubusercontent.com
+		if isGHCRBlobRequest(initial) {
+			if req.URL.Scheme != "https" {
+				return errHTTPBoundary
+			}
+			if !strings.EqualFold(req.URL.Hostname(), ghcrCDNHost) {
+				return errHTTPBoundary
+			}
+			if port := req.URL.Port(); port != "" && port != "443" {
+				return errHTTPBoundary
+			}
+			if req.URL.User != nil || req.URL.Fragment != "" {
+				return errHTTPBoundary
+			}
+			// Strip sensitive headers on CDN hops: never send registry bearer to CDN or return auth to registry after CDN
+			req.Header.Del("Authorization")
+			req.Header.Del("Proxy-Authorization")
+			req.Header.Del("Cookie")
+			return nil
 		}
-		return nil
+
+		return errHTTPBoundary
 	}
 	config.HTTPClient = client
 	return config, nil
@@ -748,14 +865,15 @@ func (p *Provider) failure(operation contracts.OperationContext, code contracts.
 		Details: map[string]string{"evidence_ref": "ev_" + hex.EncodeToString(digest[:])[:32]}}
 }
 
-func (p *Provider) classify(operation contracts.OperationContext, action string, err error) error {
+func (p *Provider) classify(operation contracts.OperationContext, action string, err error) *contracts.ProviderError {
 	if errors.Is(err, context.Canceled) {
 		return p.failure(operation, contracts.ErrCancelled, action, "registry operation was cancelled", err)
 	}
-	if errors.Is(err, context.DeadlineExceeded) {
+	var timeout net.Error
+	if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &timeout) && timeout.Timeout()) {
 		return p.failure(operation, contracts.ErrTimeout, action, "registry operation timed out", err)
 	}
-	return p.failure(operation, contracts.ErrUnavailable, action, "registry HTTP operation failed", nil)
+	return p.failure(operation, contracts.ErrUnavailable, action, "registry HTTP operation failed", err)
 }
 
 func (p *Provider) begin(key, fingerprint string) (*operationRecord, bool, error) {
@@ -765,8 +883,20 @@ func (p *Provider) begin(key, fingerprint string) (*operationRecord, bool, error
 		if previous.fingerprint != fingerprint {
 			return nil, false, errors.New("idempotency key was reused for a different registry operation")
 		}
-		return previous, false, nil
+		// A completed retryable failure may run again under the same immutable
+		// request. In-flight calls, success and permanent failures still replay.
+		select {
+		case <-previous.done:
+			var failure *contracts.ProviderError
+			if !errors.As(previous.err, &failure) || !failure.Retryable {
+				return previous, false, nil
+			}
+		default:
+			return previous, false, nil
+		}
 	}
+	// finish only writes its own record pointer under this same mutex. Replacing
+	// a completed record cannot let its result overwrite the new attempt.
 	record := &operationRecord{fingerprint: fingerprint, done: make(chan struct{})}
 	p.operations[key] = record
 	return record, true, nil
@@ -807,7 +937,7 @@ func cloneResult(result contracts.ImageResolveResult) contracts.ImageResolveResu
 }
 
 func requestFingerprint(request contracts.ImageResolveRequest) (string, error) {
-	if err := validateRepository(request.Repository); err != nil || !validTag(request.Tag) {
+	if err := validateRepository(request.Repository); err != nil || (!validTag(request.Tag) && !validDigest(request.Tag)) {
 		return "", errInvalidRegistry
 	}
 	secret := ""

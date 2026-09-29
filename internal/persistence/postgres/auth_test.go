@@ -233,3 +233,189 @@ func authTestSession(now time.Time) domain.AdminSession {
 }
 
 func pointerAuthTime(value time.Time) *time.Time { return &value }
+
+func TestPostgresAtomicRateLimitAndSessionGatingParity(t *testing.T) {
+	dsn := strings.TrimSpace(os.Getenv("OPEN_CARD_AUTH_TEST_DATABASE_URL"))
+	if dsn == "" {
+		t.Skip("OPEN_CARD_AUTH_TEST_DATABASE_URL is required for task-scoped PostgreSQL")
+	}
+	validateAuthTestDSN(t, dsn)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	resetAuthTestSchema(t, ctx, db)
+	applyControlPlaneMigrations(t, ctx, db)
+
+	store := NewStore(db)
+	now := time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
+	adminID := domain.ID("admin_pg_parity")
+	sourceDigest := domain.AuthDigest(strings.Repeat("c", 64))
+
+	// 1. Create admin credential
+	if err := store.CreateAdminCredential(ctx, domain.AdminCredential{
+		ID:                 adminID,
+		PasswordHashScheme: "argon2id-v1",
+		PasswordHash:       "$argon2id$v=19$m=65536,t=3,p=1$c2FsdA$ZGlnaWVzdA",
+		CredentialVersion:  1,
+		CreatedAt:          now,
+		UpdatedAt:          now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Test concurrent RecordAdminLoginFailure absent-row race and atomic increments
+	results := make(chan error, 5)
+	for i := 0; i < 5; i++ {
+		stepTime := now.Add(time.Duration(i) * time.Minute)
+		go func(tStep time.Time) {
+			_, err := store.RecordAdminLoginFailure(ctx, adminID, sourceDigest, tStep)
+			results <- err
+		}(stepTime)
+	}
+	for i := 0; i < 5; i++ {
+		if err := <-results; err != nil {
+			t.Fatalf("concurrent RecordAdminLoginFailure failed: %v", err)
+		}
+	}
+
+	// Read back authoritative state: must be locked after 5 failures
+	rec, err := store.AdminLoginRateLimit(ctx, adminID, sourceDigest)
+	if err != nil {
+		t.Fatalf("read back rate limit: %v", err)
+	}
+	if rec.FailureCount != 5 || !rec.IsLocked(now.Add(5*time.Minute)) {
+		t.Fatalf("expected locked rate limit after 5 failures: %+v", rec)
+	}
+
+	// 3. Test CreateAdminSessionIfLoginAllowed when source is locked
+	sess := domain.AdminSession{
+		ID:                domain.ID("sess_pg_parity"),
+		AdminID:           adminID,
+		SessionDigest:     domain.AuthDigest(strings.Repeat("d", 64)),
+		CSRFDigest:        domain.AuthDigest(strings.Repeat("e", 64)),
+		CredentialVersion: 1,
+		CreatedAt:         now.Add(6 * time.Minute),
+		LastSeenAt:        now.Add(6 * time.Minute),
+		IdleExpiresAt:     now.Add(6 * time.Minute).Add(domain.AdminSessionIdleTimeout),
+		AbsoluteExpiresAt: now.Add(6 * time.Minute).Add(domain.AdminSessionAbsoluteTimeout),
+	}
+	err = store.CreateAdminSessionIfLoginAllowed(ctx, sess, sourceDigest, now.Add(6*time.Minute))
+	if !errors.Is(err, domain.ErrRateLimited) {
+		t.Fatalf("want ErrRateLimited when source locked, got: %v", err)
+	}
+
+	// 4. Test CreateAdminSessionIfLoginAllowed with mismatched credential version on unlocked source
+	otherSource := domain.AuthDigest(strings.Repeat("f", 64))
+	staleSess := sess
+	staleSess.CredentialVersion = 2
+	err = store.CreateAdminSessionIfLoginAllowed(ctx, staleSess, otherSource, now.Add(6*time.Minute))
+	if !errors.Is(err, domain.ErrCredentialVersionConflict) {
+		t.Fatalf("want ErrCredentialVersionConflict for stale version, got: %v", err)
+	}
+
+	// 5. Successful session creation on unlocked source with valid version
+	validSess := sess
+	err = store.CreateAdminSessionIfLoginAllowed(ctx, validSess, otherSource, now.Add(6*time.Minute))
+	if err != nil {
+		t.Fatalf("expected session creation success, got: %v", err)
+	}
+}
+
+func TestPostgresCreateSessionSharesAdvisoryLockWithFailureRecording(t *testing.T) {
+	dsn := strings.TrimSpace(os.Getenv("OPEN_CARD_AUTH_TEST_DATABASE_URL"))
+	if dsn == "" {
+		t.Skip("OPEN_CARD_AUTH_TEST_DATABASE_URL is required for task-scoped PostgreSQL")
+	}
+	validateAuthTestDSN(t, dsn)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	resetAuthTestSchema(t, ctx, db)
+	applyControlPlaneMigrations(t, ctx, db)
+
+	store := NewStore(db)
+	now := time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
+	adminID := domain.ID("admin_lock_share")
+	sourceDigest := domain.AuthDigest(strings.Repeat("7", 64))
+
+	if err := store.CreateAdminCredential(ctx, domain.AdminCredential{
+		ID:                 adminID,
+		PasswordHashScheme: "argon2id-v1",
+		PasswordHash:       "$argon2id$v=19$m=65536,t=3,p=1$c2FsdA$ZGlnaWVzdA",
+		CredentialVersion:  1,
+		CreatedAt:          now,
+		UpdatedAt:          now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Begin external transaction and acquire the advisory xact lock explicitly
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext($1::text), hashtext($2::text))`, adminID.String(), sourceDigest.String()); err != nil {
+		t.Fatal(err)
+	}
+
+	sessionResult := make(chan error, 1)
+	sess := domain.AdminSession{
+		ID:                domain.ID("sess_shared_lock"),
+		AdminID:           adminID,
+		SessionDigest:     domain.AuthDigest(strings.Repeat("8", 64)),
+		CSRFDigest:        domain.AuthDigest(strings.Repeat("9", 64)),
+		CredentialVersion: 1,
+		CreatedAt:         now,
+		LastSeenAt:        now,
+		IdleExpiresAt:     now.Add(domain.AdminSessionIdleTimeout),
+		AbsoluteExpiresAt: now.Add(domain.AdminSessionAbsoluteTimeout),
+	}
+
+	go func() {
+		sessionResult <- store.CreateAdminSessionIfLoginAllowed(ctx, sess, sourceDigest, now)
+	}()
+
+	// Verify CreateAdminSessionIfLoginAllowed blocks while the lock is held
+	select {
+	case err := <-sessionResult:
+		t.Fatalf("session creation did not block on held advisory lock: %v", err)
+	case <-time.After(150 * time.Millisecond):
+		// Expected: blocked waiting for advisory lock
+	}
+
+	// Inside the transaction holding the lock, commit a rate-limit lockout
+	lockedAt := now
+	lockedUntil := now.Add(domain.AdminLoginLockoutDuration)
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO admin_login_rate_limits
+			(admin_id, source_digest, window_started_at, window_expires_at, failure_count, last_failure_at, locked_at, locked_until, updated_at)
+		VALUES ($1, $2, $3, $4, 5, $5, $6, $7, $8)
+	`, adminID.String(), sourceDigest.String(), now, now.Add(domain.AdminLoginFailureWindow), now, lockedAt, lockedUntil, now); err != nil {
+		t.Fatal(err)
+	}
+
+	// Commit transaction, releasing advisory lock
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Now CreateAdminSessionIfLoginAllowed unblocks, observes the committed lock, and must return ErrRateLimited
+	select {
+	case err := <-sessionResult:
+		if !errors.Is(err, domain.ErrRateLimited) {
+			t.Fatalf("expected ErrRateLimited after lock committed, got: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("session creation timed out after advisory lock released")
+	}
+}

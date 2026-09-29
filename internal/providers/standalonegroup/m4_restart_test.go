@@ -91,27 +91,3 @@ func TestM4RestartGroupRejectsMismatchedOwnershipWithoutDockerEffects(t *testing
 		t.Fatalf("ownership rejection caused Docker restart side effects: %#v", docker.callsSnapshot()[baseline:])
 	}
 }
-
-func TestM4RestartGroupServiceRejectsUnknownServiceWithoutDockerEffects(t *testing.T) {
-	docker := &fakeDocker{containers: map[string]fakeContainer{}, failRun: map[string]error{}, logs: map[string]string{}}
-	provider := newGroupProvider(t, docker, &fakeVolumes{})
-	spec := groupSpec("rel_m4_restart_service_ownership", contracts.RuntimeRolloutPolicy{Mode: contracts.RuntimeRolloutInitial})
-	deployment, err := provider.DeployGroup(context.Background(), deployRequest("m4-restart-service-deploy", "dep_m4_restart_service", spec))
-	if err != nil {
-		t.Fatal(err)
-	}
-	baseline := len(docker.callsSnapshot())
-	request := contracts.RestartGroupServiceRequest{
-		DeploymentID:   deployment.ID,
-		ServiceGroupID: spec.ServiceGroupID,
-		ReleaseID:      spec.ReleaseID,
-		ServiceName:    "container-supplied-by-caller",
-		Operation:      contracts.OperationContext{IdempotencyKey: "m4-restart-service-unknown"},
-	}
-	if err := provider.RestartGroupService(context.Background(), request); err == nil {
-		t.Fatal("service restart accepted a service not present in the immutable group")
-	}
-	if got := countCalls(docker.callsSnapshot()[baseline:], "restart"); got != 0 {
-		t.Fatalf("unknown-service rejection caused Docker restart side effects: %#v", docker.callsSnapshot()[baseline:])
-	}
-}

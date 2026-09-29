@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
@@ -33,11 +34,23 @@ func (h *AcornFoxSourceUpdateHTTPHandler) Handle(w http.ResponseWriter, r *http.
 		return
 	}
 	var input struct {
-		BaseSourceRevisionID domain.ID `json:"base_source_revision_id"`
-		Ref                  string    `json:"ref"`
+		BaseSourceRevisionID domain.ID       `json:"base_source_revision_id"`
+		Ref                  json.RawMessage `json:"ref"`
+		UploadID             json.RawMessage `json:"upload_id"`
 	}
 	if err := decodeJSON(r, &input); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid_request", "request body is invalid")
+		return
+	}
+	var ref string
+	var uploadID domain.ID
+	if len(input.UploadID) > 0 {
+		if len(input.Ref) > 0 || json.Unmarshal(input.UploadID, &uploadID) != nil || uploadID.Empty() {
+			writeJSONError(w, http.StatusUnprocessableEntity, "validation_failed", "choose exactly one Git ref or upload ID")
+			return
+		}
+	} else if json.Unmarshal(input.Ref, &ref) != nil {
+		writeJSONError(w, http.StatusUnprocessableEntity, "validation_failed", "Git ref or upload ID is required")
 		return
 	}
 	key := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
@@ -45,7 +58,7 @@ func (h *AcornFoxSourceUpdateHTTPHandler) Handle(w http.ResponseWriter, r *http.
 		writeJSONError(w, http.StatusUnprocessableEntity, "validation_failed", "Idempotency-Key is required")
 		return
 	}
-	result, err := h.Service.Update(r.Context(), application.AcornFoxSourceUpdateRequest{ApplicationID: applicationID, BaseSourceRevisionID: input.BaseSourceRevisionID, Ref: input.Ref, IdempotencyKey: key})
+	result, err := h.Service.Update(r.Context(), application.AcornFoxSourceUpdateRequest{ApplicationID: applicationID, BaseSourceRevisionID: input.BaseSourceRevisionID, Ref: ref, UploadID: uploadID, IdempotencyKey: key})
 	if err != nil {
 		switch {
 		case errors.Is(err, application.ErrAcornFoxSourceUpdateInProgress):

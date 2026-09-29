@@ -33,12 +33,29 @@ func (u *acornFoxUpgrade) capture(ctx context.Context, s *TaskAcornFoxRepoStore,
 	if e != nil {
 		return image, e
 	}
-	pub, e := newAcornFoxSubstratePublisherForLayout(u.layout)
-	if e != nil {
-		return image, e
+	var sub *PublishedAcornFoxSubstrateV1
+	frozen := validateAcornFoxFrozen0040Binding(installed.binding) == nil
+	if frozen {
+		// Keep current-candidate Reopen strict. An installed predecessor is
+		// read only through its journal-bound historical package policy.
+		raw, readErr := u.read(s.root, acornFoxSubstrateReceipt, 0600, acornFoxUpgradeMaxJournal)
+		var receipt InactiveSubstrateReceiptV1
+		if readErr != nil || strictCanonicalJSON(raw, &receipt, "frozen 0040 substrate") != nil || sha256Hex(raw) != j.SubstrateReceiptSHA256 {
+			return image, ErrAcornFoxUpgradeConflict
+		}
+		root, openErr := s.root.OpenRoot(".")
+		if openErr != nil {
+			return image, openErr
+		}
+		sub, e = u.openSubstrate(root, acornFoxUpgradeImage{Binding: binding, Repo: j, Substrate: receipt})
+	} else {
+		pub, openErr := newAcornFoxSubstratePublisherForLayout(u.layout)
+		if openErr != nil {
+			return image, openErr
+		}
+		defer pub.Close()
+		sub, e = pub.Reopen(j.BindingSHA256)
 	}
-	defer pub.Close()
-	sub, e := pub.Reopen(j.BindingSHA256)
 	if e != nil {
 		return image, e
 	}
@@ -52,6 +69,9 @@ func (u *acornFoxUpgrade) capture(ctx context.Context, s *TaskAcornFoxRepoStore,
 		return image, e
 	}
 	entries, e := acornFoxLiveExpectedEntriesForLayout(u.layout, sub)
+	if frozen {
+		entries, e = acornFoxFrozen0040ExpectedEntries(u.layout, sub.receipt)
+	}
 	if e != nil {
 		return image, e
 	}
@@ -398,7 +418,23 @@ type acornFoxUpgradeLegacyPIState interface {
 	PILegacyAbsent(context.Context) (bool, error)
 }
 
-func (u *acornFoxUpgrade) capturePIEnabled(ctx context.Context, store *TaskAcornFoxRepoStore, migration string) (bool, error) {
+func (u *acornFoxUpgrade) capturePIEnabled(ctx context.Context, store *TaskAcornFoxRepoStore, oldBinding AcornFoxCandidateBindingV1) (bool, error) {
+	if oldBinding.SchemaVersion >= AcornFoxCandidateBindingV2Schema {
+		if services, ok := u.services.(acornFoxUpgradeLegacyPIState); ok {
+			absent, err := services.PILegacyAbsent(ctx)
+			if err != nil {
+				return false, err
+			}
+			if !absent {
+				return false, ErrAcornFoxUpgradeConflict
+			}
+		}
+		if !acornFoxSocketAbsent(store) {
+			return false, ErrAcornFoxUpgradeConflict
+		}
+		return false, nil
+	}
+	migration := oldBinding.MigrationVersion
 	if migration == AcornFoxLegacyPredecessorMigration {
 		configured, err := acornFoxAssistantConfigurationState(store.hostRoot, store)
 		if err != nil || configured {
@@ -563,7 +599,7 @@ func (u *acornFoxUpgrade) forward(ctx context.Context, s *TaskAcornFoxRepoStore,
 	if e := applyAcornFoxUpgradeAssistantConfig(s, *j, true); e != nil {
 		return e
 	}
-	if e := u.ensureLegacyPIDisabled(ctx, *j); e != nil {
+	if e := u.ensureLegacyWorkerAbsent(ctx, s, *j); e != nil {
 		return e
 	}
 	if j.CrossSchema != nil {
@@ -589,10 +625,13 @@ func (u *acornFoxUpgrade) forward(ctx context.Context, s *TaskAcornFoxRepoStore,
 	if e := u.phase(s, j, "SWITCHED"); e != nil {
 		return e
 	}
+	if e := u.retireWorkerUnit(ctx, s, *j); e != nil {
+		return e
+	}
 	if e := u.verifyImage(s, *j, true); e != nil {
 		return e
 	}
-	if e := u.start(ctx, j.PIEnabled); e != nil {
+	if e := u.start(ctx, false); e != nil {
 		return e
 	}
 	if e := u.healthy(ctx, *j, true); e != nil {
@@ -624,7 +663,8 @@ func (u *acornFoxUpgrade) restore(ctx context.Context, s *TaskAcornFoxRepoStore,
 	if err = u.phase(s, j, "ROLLING_BACK"); err != nil {
 		return err
 	}
-	if err = u.stop(ctx, j.PIEnabled, j.isLocal()); err != nil {
+	stopWorker := u.shouldStopWorkerOnRestore(s, *j)
+	if err = u.stop(ctx, stopWorker, j.isLocal()); err != nil {
 		return err
 	}
 	if err = u.copyNextSubstrate(s, *j); err != nil {
@@ -639,7 +679,7 @@ func (u *acornFoxUpgrade) restore(ctx context.Context, s *TaskAcornFoxRepoStore,
 	if err = applyAcornFoxUpgradeAssistantConfig(s, *j, false); err != nil {
 		return err
 	}
-	if err = u.ensureLegacyPIDisabled(ctx, *j); err != nil {
+	if err = u.ensureLegacyWorkerAbsent(ctx, s, *j); err != nil {
 		return err
 	}
 	if err = u.removeCrossSchemaDatabaseArtifacts(s, *j); err != nil {
@@ -651,31 +691,224 @@ func (u *acornFoxUpgrade) restore(ctx context.Context, s *TaskAcornFoxRepoStore,
 	if err = u.pointer(s, u.layout.activePath(), "activations/"+j.Next.Activation.ActivationID, "activations/"+j.Old.Activation.ActivationID); err != nil {
 		return err
 	}
+	if err = u.restoreWorkerUnit(ctx, s, *j); err != nil {
+		return err
+	}
 	return u.verifyImage(s, *j, false)
 }
 
-func (u *acornFoxUpgrade) ensureLegacyPIDisabled(ctx context.Context, journal acornFoxUpgradeJournal) error {
+func (u *acornFoxUpgrade) ensureLegacyWorkerAbsent(ctx context.Context, store *TaskAcornFoxRepoStore, journal acornFoxUpgradeJournal) error {
 	if journal.CrossSchema == nil || journal.CrossSchema.OldMigrationVersion != AcornFoxLegacyPredecessorMigration {
 		return nil
+	}
+	state, ok := u.services.(acornFoxUpgradeLegacyPIState)
+	if !ok {
+		return ErrAcornFoxUpgradeConflict
+	}
+	absent, err := state.PILegacyAbsent(ctx)
+	if err != nil {
+		return err
+	}
+	if !absent || !acornFoxSocketAbsent(store) {
+		return ErrAcornFoxUpgradeConflict
+	}
+	return nil
+}
+
+func (u *acornFoxUpgrade) shouldStopWorkerOnRestore(s *TaskAcornFoxRepoStore, j acornFoxUpgradeJournal) bool {
+	if !j.PIEnabled {
+		return false
+	}
+	const unitPath = "etc/systemd/system/acornfox-pi-worker.service"
+	if s != nil && s.hostRoot != nil {
+		if _, err := s.hostRoot.Lstat(unitPath); errors.Is(err, os.ErrNotExist) && acornFoxSocketAbsent(s) && imageHasWorkerUnit(j.Old) && isSchema2Image(j.Next) {
+			return false
+		}
+	}
+	return true
+}
+
+func (u *acornFoxUpgrade) retireWorkerUnit(ctx context.Context, s *TaskAcornFoxRepoStore, j acornFoxUpgradeJournal) error {
+	const unitPath = "etc/systemd/system/acornfox-pi-worker.service"
+	const wantsPath = "etc/systemd/system/multi-user.target.wants/acornfox-pi-worker.service"
+
+	if !imageHasWorkerUnit(j.Old) {
+		if _, err := s.hostRoot.Lstat(unitPath); !errors.Is(err, os.ErrNotExist) {
+			return ErrAcornFoxUpgradeConflict
+		}
+		if _, err := s.hostRoot.Lstat(wantsPath); !errors.Is(err, os.ErrNotExist) {
+			return ErrAcornFoxUpgradeConflict
+		}
+		if !acornFoxSocketAbsent(s) {
+			return ErrAcornFoxUpgradeConflict
+		}
+		if legacy, ok := u.services.(acornFoxUpgradeLegacyPIState); ok {
+			absent, err := legacy.PILegacyAbsent(ctx)
+			if err != nil || !absent {
+				return ErrAcornFoxUpgradeConflict
+			}
+		}
+		return nil
+	}
+
+	liveInfo, err := s.hostRoot.Lstat(unitPath)
+	if errors.Is(err, os.ErrNotExist) {
+		if _, err := s.hostRoot.Lstat(wantsPath); !errors.Is(err, os.ErrNotExist) {
+			return ErrAcornFoxUpgradeConflict
+		}
+		if !acornFoxSocketAbsent(s) {
+			return ErrAcornFoxUpgradeConflict
+		}
+		if legacy, ok := u.services.(acornFoxUpgradeLegacyPIState); ok {
+			absent, err := legacy.PILegacyAbsent(ctx)
+			if err != nil || !absent {
+				return ErrAcornFoxUpgradeConflict
+			}
+		}
+		return nil
+	}
+	if err != nil {
+		return ErrAcornFoxUpgradeConflict
+	}
+
+	oldSub, err := u.locateSubstrate(s, j, j.Old)
+	if err != nil {
+		return err
+	}
+	defer oldSub.Close()
+
+	var unitEntry *SubstrateEntry
+	for index := range j.Old.Substrate.Entries {
+		if j.Old.Substrate.Entries[index].Path == unitPath {
+			unitEntry = &j.Old.Substrate.Entries[index]
+			break
+		}
+	}
+	if unitEntry == nil {
+		return ErrAcornFoxUpgradeConflict
+	}
+
+	if !acornFoxProductionEntryMatches(s.hostRoot, s, unitPath, *unitEntry) {
+		return ErrAcornFoxUpgradeConflict
+	}
+
+	if err := u.services.Run(ctx, "disable", "acornfox-pi-worker.service"); err != nil {
+		return err
+	}
+	if _, err := s.hostRoot.Lstat(wantsPath); !errors.Is(err, os.ErrNotExist) {
+		return ErrAcornFoxUpgradeConflict
+	}
+	if err := syncAcornFoxWorkerWants(s); err != nil {
+		return err
+	}
+	if !acornFoxSocketAbsent(s) {
+		return ErrAcornFoxUpgradeConflict
+	}
+
+	nowInfo, err := s.hostRoot.Lstat(unitPath)
+	if err != nil || !os.SameFile(liveInfo, nowInfo) || !acornFoxProductionEntryMatches(s.hostRoot, s, unitPath, *unitEntry) {
+		return ErrAcornFoxUpgradeConflict
+	}
+	if err := s.hostRoot.Remove(unitPath); err != nil {
+		return err
+	}
+	if err := acornFoxLiveSyncDir(s.hostRoot, "etc/systemd/system"); err != nil {
+		return err
 	}
 	if err := u.services.Run(ctx, "daemon-reload", ""); err != nil {
 		return err
 	}
-	if err := u.services.Run(ctx, "disable", "acornfox-pi-worker.service"); err != nil {
-		return err
+	if legacy, ok := u.services.(acornFoxUpgradeLegacyPIState); ok {
+		absent, err := legacy.PILegacyAbsent(ctx)
+		if err != nil || !absent {
+			return ErrAcornFoxUpgradeConflict
+		}
 	}
-	state, ok := u.services.(acornFoxUpgradePIState)
-	if !ok {
-		return ErrAcornFoxUpgradeConflict
+	return nil
+}
+
+func (u *acornFoxUpgrade) restoreWorkerUnit(ctx context.Context, s *TaskAcornFoxRepoStore, j acornFoxUpgradeJournal) error {
+	const unitPath = "etc/systemd/system/acornfox-pi-worker.service"
+	const wantsPath = "etc/systemd/system/multi-user.target.wants/acornfox-pi-worker.service"
+
+	if !imageHasWorkerUnit(j.Old) {
+		return nil
 	}
-	enabled, err := state.PIEnabled(ctx)
+
+	oldSub, err := u.locateSubstrate(s, j, j.Old)
 	if err != nil {
 		return err
 	}
-	if enabled {
+	defer oldSub.Close()
+
+	var unitEntry *SubstrateEntry
+	for index := range j.Old.Substrate.Entries {
+		if j.Old.Substrate.Entries[index].Path == unitPath {
+			unitEntry = &j.Old.Substrate.Entries[index]
+			break
+		}
+	}
+	if unitEntry == nil {
 		return ErrAcornFoxUpgradeConflict
 	}
+	expectedBytes, err := acornFoxLiveReadSource(oldSub.root, oldSub, *unitEntry)
+	if err != nil {
+		return err
+	}
+
+	principal := acornFoxLivePrincipalForEntry(u.layout, *unitEntry)
+	if err := u.atomicFileOwned(s, s.hostRoot, unitPath, nil, expectedBytes, 0o644, principal); err != nil {
+		return err
+	}
+	if err := acornFoxLiveSyncDir(s.hostRoot, "etc/systemd/system"); err != nil {
+		return err
+	}
+	if err := u.services.Run(ctx, "daemon-reload", ""); err != nil {
+		return err
+	}
+	if j.PIEnabled {
+		if err := u.services.Run(ctx, "enable", "acornfox-pi-worker.service"); err != nil {
+			return err
+		}
+		info, err := s.hostRoot.Lstat(wantsPath)
+		if err != nil {
+			return ErrAcornFoxUpgradeConflict
+		}
+		if !validAcornFoxWorkerWants(s, info) {
+			return ErrAcornFoxUpgradeConflict
+		}
+		if err := syncAcornFoxWorkerWants(s); err != nil {
+			return err
+		}
+	} else {
+		info, err := s.hostRoot.Lstat(wantsPath)
+		if err == nil {
+			if !validAcornFoxWorkerWants(s, info) {
+				return ErrAcornFoxUpgradeConflict
+			}
+			if err := s.hostRoot.Remove(wantsPath); err != nil {
+				return err
+			}
+			if err := acornFoxLiveSyncDir(s.hostRoot, "etc/systemd/system/multi-user.target.wants"); err != nil {
+				return err
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
 	return nil
+}
+
+func acornFoxSocketAbsent(store *TaskAcornFoxRepoStore) bool {
+	if store == nil || store.hostRoot == nil {
+		return false
+	}
+	for _, path := range []string{"run/acornfox-pi/worker.sock", "run/acornfox-assistant/tools.sock"} {
+		if _, err := store.hostRoot.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			return false
+		}
+	}
+	return true
 }
 
 func (u *acornFoxUpgrade) applySetupCredential(s *TaskAcornFoxRepoStore, j acornFoxUpgradeJournal, next bool) error {
@@ -1339,4 +1572,29 @@ func (u *acornFoxUpgrade) removeCrossSchemaDatabaseArtifacts(s *TaskAcornFoxRepo
 		return ErrAcornFoxUpgradeUnknown
 	}
 	return nil
+}
+
+func validAcornFoxWorkerWants(store *TaskAcornFoxRepoStore, info os.FileInfo) bool {
+	if store == nil || info == nil || info.Mode()&os.ModeSymlink == 0 || acornFoxRepoNlink(info) != 1 {
+		return false
+	}
+	principal, ok := store.layout.owner(AcornFoxLiveRootRole)
+	if !ok || !acornFoxLiveObservedOwner(store, info, principal) {
+		return false
+	}
+	target, err := store.hostRoot.Readlink("etc/systemd/system/multi-user.target.wants/acornfox-pi-worker.service")
+	return err == nil && (target == "../acornfox-pi-worker.service" || target == "/etc/systemd/system/acornfox-pi-worker.service")
+}
+
+func syncAcornFoxWorkerWants(store *TaskAcornFoxRepoStore) error {
+	const path = "etc/systemd/system/multi-user.target.wants"
+	info, err := store.hostRoot.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	principal, ok := store.layout.owner(AcornFoxLiveRootRole)
+	if err != nil || !ok || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0022 != 0 || !acornFoxLiveObservedOwner(store, info, principal) {
+		return ErrAcornFoxUpgradeConflict
+	}
+	return acornFoxLiveSyncDir(store.hostRoot, path)
 }

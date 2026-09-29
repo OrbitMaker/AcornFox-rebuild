@@ -10,9 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"os/user"
 	"runtime"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -58,9 +56,6 @@ func productionAcornFoxHealthDependencies() acornFoxHealthDependencies {
 			return probeAcornFoxLocal(ctx, acornFoxLocalDependencies{
 				command: acornFoxHealthCommand, client: client, lstat: os.Lstat,
 				dataSpace: acornFoxDataSpaceAvailable,
-				assistant: func(ctx context.Context) bool {
-					return acornFoxAssistantHealthy(ctx, acornFoxHealthCommand, install.InspectProductionAcornFoxAssistantConfigurationV1, os.Lstat, user.Lookup, user.LookupGroup)
-				},
 			})
 		},
 	}
@@ -166,7 +161,7 @@ func acornFoxHealthEnvironment(env []string) bool {
 func acornFoxLocalCheckNames() []string {
 	names := []string{"upgrade_not_pending", "data_space_available"}
 	names = append(names, acornFoxHealthUnits...)
-	return append(names, "assistant_worker", "control_plane_health", "control_plane_ready", "edge_loopback_health")
+	return append(names, "control_plane_health", "control_plane_ready", "edge_loopback_health")
 }
 
 type acornFoxLocalDependencies struct {
@@ -174,7 +169,6 @@ type acornFoxLocalDependencies struct {
 	client    *http.Client
 	lstat     func(string) (os.FileInfo, error)
 	dataSpace func() bool
-	assistant func(context.Context) bool
 }
 
 func probeAcornFoxLocal(ctx context.Context, deps acornFoxLocalDependencies) []acornFoxLocalCheck {
@@ -183,7 +177,7 @@ func probeAcornFoxLocal(ctx context.Context, deps acornFoxLocalDependencies) []a
 	for i, name := range names {
 		checks[i].Name = name
 	}
-	if ctx == nil || ctx.Err() != nil || deps.command == nil || deps.client == nil || deps.lstat == nil || deps.dataSpace == nil || deps.assistant == nil {
+	if ctx == nil || ctx.Err() != nil || deps.command == nil || deps.client == nil || deps.lstat == nil || deps.dataSpace == nil {
 		return checks
 	}
 	_, markerErr := deps.lstat(acornFoxUpgradeMarker)
@@ -202,84 +196,12 @@ func probeAcornFoxLocal(ctx context.Context, deps acornFoxLocalDependencies) []a
 		checks[i+2].OK = err == nil && acornFoxUnitRunning(raw, unit)
 	}
 	start := 2 + len(acornFoxHealthUnits)
-	checks[start].OK = deps.assistant(ctx)
-	start++
 	for i, target := range []string{"http://127.0.0.1:18481/healthz", "http://127.0.0.1:18481/readyz", "http://127.0.0.1:18482/healthz"} {
 		checks[start+i].OK = acornFoxHTTPHealthy(ctx, deps.client, target, i < 2)
 	}
 	_, markerErr = deps.lstat(acornFoxUpgradeMarker)
 	checks[0].OK = errors.Is(markerErr, os.ErrNotExist)
 	return checks
-}
-
-func acornFoxAssistantHealthy(ctx context.Context, command func(context.Context, string, ...string) ([]byte, error), inspect func() (bool, error), lstat func(string) (os.FileInfo, error), lookupUser func(string) (*user.User, error), lookupGroup func(string) (*user.Group, error)) bool {
-	if ctx == nil || ctx.Err() != nil || command == nil || inspect == nil || lstat == nil || lookupUser == nil || lookupGroup == nil {
-		return false
-	}
-	configured, err := inspect()
-	if err != nil {
-		return false
-	}
-	raw, err := command(ctx, "/usr/bin/systemctl", "show", "--no-pager", "--property=Id,LoadState,UnitFileState,ActiveState,SubState", "acornfox-pi-worker.service")
-	if err != nil || len(raw) > 4096 {
-		return false
-	}
-	properties := map[string]string{}
-	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
-		name, value, ok := strings.Cut(line, "=")
-		if !ok {
-			return false
-		}
-		if _, exists := properties[name]; exists {
-			return false
-		}
-		properties[name] = value
-	}
-	if len(properties) != 5 || properties["Id"] != "acornfox-pi-worker.service" || properties["LoadState"] != "loaded" {
-		return false
-	}
-	disabled := properties["UnitFileState"] == "disabled" && properties["ActiveState"] == "inactive" && properties["SubState"] == "dead"
-	if disabled {
-		_, socketErr := lstat(acornFoxPIWorkerSocket)
-		return errors.Is(socketErr, os.ErrNotExist)
-	}
-	if !configured || properties["UnitFileState"] != "enabled" || properties["ActiveState"] != "active" || properties["SubState"] != "running" {
-		return false
-	}
-	account, accountErr := lookupUser("acornfox-pi")
-	group, groupErr := lookupGroup("acornfox")
-	uid, uidErr := strconv.Atoi(userField(account, true))
-	gid, gidErr := strconv.Atoi(groupField(group))
-	info, socketErr := lstat(acornFoxPIWorkerSocket)
-	stat, ok := healthStat(info)
-	return accountErr == nil && groupErr == nil && uidErr == nil && gidErr == nil && socketErr == nil && ok && info.Mode()&os.ModeSocket != 0 && info.Mode().Perm() == 0660 && int(stat.Uid) == uid && int(stat.Gid) == gid
-}
-
-const acornFoxPIWorkerSocket = "/run/acornfox-pi/worker.sock"
-
-func userField(account *user.User, uid bool) string {
-	if account == nil {
-		return ""
-	}
-	if uid {
-		return account.Uid
-	}
-	return account.Gid
-}
-
-func groupField(group *user.Group) string {
-	if group == nil {
-		return ""
-	}
-	return group.Gid
-}
-
-func healthStat(info os.FileInfo) (*syscall.Stat_t, bool) {
-	if info == nil {
-		return nil, false
-	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	return stat, ok
 }
 
 func acornFoxUnitRunning(raw []byte, unit string) bool {

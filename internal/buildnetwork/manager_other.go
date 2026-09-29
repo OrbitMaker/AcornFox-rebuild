@@ -15,6 +15,9 @@ func ReadInstalledPolicy() ([]byte, string, error) {
 func NewProductionManager() (*Manager, error) {
 	return nil, errors.New("installed build network requires Linux")
 }
+func NewNativeProductionManager() (*Manager, error) {
+	return nil, errors.New("installed build network requires Linux")
+}
 func (*Manager) Close() error { return nil }
 func (*Manager) Serve(context.Context) error {
 	return errors.New("installed build network requires Linux")

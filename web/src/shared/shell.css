@@ -1,0 +1,956 @@
+/* -------------------------------------------------------------
+   AcornFox Shared Desktop Shell & Auth Tokens and Styles
+   Shared between Thin Core Shell and Full Business Product
+   ------------------------------------------------------------- */
+
+:root {
+  --bg-main: #212121;
+  --bg-surface: #171717;
+  --bg-card: #2a2a2a;
+  --bg-hover: #343434;
+  --border: rgba(255, 255, 255, 0.1);
+  --border-light: rgba(255, 255, 255, 0.18);
+  --text-main: #ececec;
+  --text-muted: #b4b4b4;
+  --text-faint: #737373;
+  --accent-green: #10a37f;
+  --accent-green-subtle: rgba(16, 163, 127, 0.15);
+  --accent-warn: #f59e0b;
+  --accent-warn-subtle: rgba(245, 158, 11, 0.15);
+  --accent-error: #ef4444;
+  --accent-error-subtle: rgba(239, 68, 68, 0.15);
+  --font-stack: -apple-system, BlinkMacSystemFont, "Söhne", "Inter", "SF Pro Text", "PingFang SC", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  -webkit-tap-highlight-color: transparent;
+}
+
+html, body {
+  width: 100%;
+  height: 100%;
+  background-color: var(--bg-main);
+  color: var(--text-main);
+  font-family: var(--font-stack);
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+button, input, select, textarea {
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.app-viewport {
+  width: 100vw;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+}
+
+/* -------------------------------------------------------------
+   macOS 极简顶部菜单栏 (44px)
+   ------------------------------------------------------------- */
+.macos-menubar {
+  height: 44px;
+  padding: 0 24px;
+  border-bottom: 1px solid var(--border);
+  background: rgba(26, 26, 26, 0.82);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  user-select: none;
+  z-index: 100;
+  flex-shrink: 0;
+}
+
+.menubar-left {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+}
+
+.brand-mark-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  padding: 4px 6px;
+  border-radius: 6px;
+  transition: background-color 0.15s ease;
+}
+
+.brand-mark-btn:hover {
+  background: var(--bg-hover);
+}
+
+.openai-spark-icon {
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  background: var(--accent-green);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #ffffff;
+  flex-shrink: 0;
+}
+
+.brand-title {
+  font-size: 14px;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+  color: var(--text-main);
+}
+
+.menubar-items {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.menu-item-link {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  font-size: 13px;
+  font-weight: 500;
+  padding: 5px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.menu-item-link:hover {
+  background: var(--bg-hover);
+  color: var(--text-main);
+}
+
+.menu-item-link.is-active {
+  background: var(--bg-card);
+  color: #ffffff;
+}
+
+.menubar-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.tray-badge-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent-green);
+  box-shadow: 0 0 8px rgba(16, 163, 127, 0.6);
+}
+
+.tray-badge-dot.is-warn {
+  background: var(--accent-warn);
+  box-shadow: 0 0 8px rgba(245, 158, 11, 0.6);
+}
+
+.tray-badge-dot.is-error {
+  background: var(--accent-error);
+  box-shadow: 0 0 8px rgba(239, 68, 68, 0.6);
+}
+
+.tray-status-label {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.tray-icon-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.tray-icon-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-main);
+}
+
+.tray-icon-btn.is-active {
+  background: var(--bg-card);
+  color: #ffffff;
+}
+
+.tray-clock-text {
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+  padding: 4px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.tray-clock-text:hover {
+  background: var(--bg-hover);
+  color: var(--text-main);
+}
+
+.user-avatar-btn {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: #3c3c3c;
+  border: 1px solid var(--border-light);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 600;
+  color: #ffffff;
+  cursor: pointer;
+  transition: transform 0.15s ease;
+}
+
+.user-avatar-btn:hover {
+  transform: scale(1.08);
+}
+
+/* -------------------------------------------------------------
+   控制中心下拉抽屉
+   ------------------------------------------------------------- */
+.control-center-flyout {
+  position: absolute;
+  top: 50px;
+  right: 18px;
+  width: 320px;
+  background: rgba(30, 30, 30, 0.94);
+  backdrop-filter: blur(28px);
+  -webkit-backdrop-filter: blur(28px);
+  border: 1px solid var(--border-light);
+  border-radius: 16px;
+  padding: 16px;
+  box-shadow: 0 20px 48px rgba(0, 0, 0, 0.6);
+  z-index: 200;
+  opacity: 0;
+  transform: translateY(-8px) scale(0.98);
+  pointer-events: none;
+  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.control-center-flyout.is-open {
+  opacity: 1;
+  transform: translateY(0) scale(1);
+  pointer-events: auto;
+}
+
+.cc-title-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-main);
+}
+
+.cc-status-pill {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 9999px;
+  background: var(--accent-green-subtle);
+  color: var(--accent-green);
+}
+
+.cc-status-pill.is-warn {
+  background: var(--accent-warn-subtle);
+  color: var(--accent-warn);
+}
+
+.cc-status-pill.is-error {
+  background: var(--accent-error-subtle);
+  color: var(--accent-error);
+}
+
+.cc-tile-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.cc-tile {
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.cc-tile-icon {
+  width: 20px;
+  height: 20px;
+  color: var(--accent-green);
+  margin-bottom: 2px;
+}
+
+.cc-tile-icon svg {
+  width: 100%;
+  height: 100%;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  fill: none;
+}
+
+.cc-tile-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-main);
+}
+
+.cc-tile-sub {
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.cc-info-box {
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+.cc-footer-action {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.cc-btn-link {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  font-size: 11px;
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.cc-btn-link:hover {
+  color: #ffffff;
+}
+
+/* -------------------------------------------------------------
+   全屏舞台区 (Stage) 与桌面
+   ------------------------------------------------------------- */
+.stage {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
+  background-color: var(--bg-main);
+  color: var(--text-main);
+}
+
+.desktop-view {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  padding: 40px 80px;
+  transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+  z-index: 1;
+  overflow-y: auto;
+}
+
+.app-grid-container {
+  width: 100%;
+  max-width: 820px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.app-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 32px 28px;
+  width: 100%;
+  margin-bottom: 40px;
+}
+
+@media (max-width: 768px) {
+  .app-grid {
+    grid-template-columns: repeat(2, 1fr);
+    gap: 20px;
+  }
+}
+
+.app-card-btn {
+  background: transparent;
+  border: none;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  outline: none;
+  group: app;
+}
+
+.app-icon-squircle {
+  width: 84px;
+  height: 84px;
+  border-radius: 20px;
+  background: linear-gradient(145deg, #2c2c2c, #1f1f1f);
+  border: 1px solid var(--border-light);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-main);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.1);
+  transition: all 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.app-icon-squircle svg {
+  width: 38px;
+  height: 38px;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  fill: none;
+}
+
+.app-card-btn:hover .app-icon-squircle {
+  transform: translateY(-6px) scale(1.04);
+  box-shadow: 0 18px 32px rgba(0, 0, 0, 0.6), inset 0 1px 0 rgba(255, 255, 255, 0.2);
+  border-color: rgba(255, 255, 255, 0.3);
+}
+
+.app-card-btn:active .app-icon-squircle {
+  transform: translateY(-2px) scale(0.98);
+}
+
+.app-name-text {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-main) !important;
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 120px;
+}
+
+.app-status-badge {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 9999px;
+  font-weight: 500;
+}
+
+.badge-ok {
+  background: var(--accent-green-subtle);
+  color: var(--accent-green);
+}
+
+.badge-warn {
+  background: var(--accent-warn-subtle);
+  color: var(--accent-warn);
+}
+
+.badge-error {
+  background: var(--accent-error-subtle);
+  color: var(--accent-error);
+}
+
+.badge-unknown, .badge-pending {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-muted);
+}
+
+.new-app-card .app-icon-squircle {
+  background: transparent;
+  border: 1.5px dashed var(--border-light);
+  box-shadow: none;
+  color: var(--text-faint);
+}
+
+.new-app-card:hover .app-icon-squircle {
+  border-color: var(--text-main);
+  color: var(--text-main);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.af-footnote {
+  color: var(--text-faint) !important;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+/* -------------------------------------------------------------
+   底部悬浮胶囊 Dock 栏
+   ------------------------------------------------------------- */
+.floating-dock {
+  position: fixed;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  height: 60px;
+  padding: 0 16px;
+  background: rgba(36, 36, 36, 0.82);
+  backdrop-filter: blur(28px);
+  -webkit-backdrop-filter: blur(28px);
+  border: 1px solid var(--border-light);
+  border-radius: 30px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  box-shadow: 0 20px 48px rgba(0, 0, 0, 0.6), inset 0 1px 0 rgba(255, 255, 255, 0.15);
+  z-index: 90;
+}
+
+.dock-btn {
+  background: transparent;
+  border: none;
+  height: 44px;
+  padding: 0 14px;
+  border-radius: 22px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-muted);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.dock-btn svg {
+  width: 18px;
+  height: 18px;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  fill: none;
+}
+
+.dock-btn:hover {
+  background: var(--bg-hover);
+  color: #ffffff;
+  transform: translateY(-2px);
+}
+
+.dock-btn.is-active {
+  background: var(--bg-card);
+  color: #ffffff;
+}
+
+.dock-separator {
+  width: 1px;
+  height: 18px;
+  background: var(--border);
+}
+
+/* -------------------------------------------------------------
+   登录与设置卡片 (WebOS 视觉)
+   ------------------------------------------------------------- */
+.webos-login-wrap {
+  width: 100vw;
+  height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-main);
+}
+
+.webos-login-card {
+  width: 380px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-light);
+  border-radius: 20px;
+  padding: 36px 32px;
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+}
+
+.webos-login-logo {
+  width: 56px;
+  height: 56px;
+  border-radius: 16px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--accent-green);
+  margin-bottom: 16px;
+}
+
+.webos-login-card .af-brand {
+  color: var(--text-main) !important;
+  font-size: 20px;
+  font-weight: 680;
+  text-decoration: none;
+}
+
+.webos-login-card .af-kicker {
+  color: var(--text-muted) !important;
+  font-size: 12px;
+  margin-top: 2px;
+}
+
+.webos-login-card #login-title,
+.webos-login-card #setup-title {
+  color: var(--text-main) !important;
+  font-size: 18px;
+  margin: 8px 0 16px;
+}
+
+.webos-form-field {
+  width: 100%;
+  text-align: left;
+  margin-bottom: 20px;
+}
+
+.webos-form-field label {
+  display: block;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-muted);
+  margin-bottom: 8px;
+}
+
+.webos-input {
+  width: 100%;
+  padding: 10px 14px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  color: var(--text-main);
+  font-size: 14px;
+  outline: none;
+  transition: border-color 0.15s ease;
+}
+
+.webos-input:focus {
+  border-color: var(--accent-green);
+}
+
+.webos-btn-primary {
+  width: 100%;
+  padding: 11px;
+  background: #ffffff;
+  color: #000000;
+  border: none;
+  border-radius: 10px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.webos-btn-primary:hover:not(:disabled) {
+  background: #e5e5e5;
+}
+
+.webos-btn-primary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-ghost {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.btn-ghost:hover {
+  background: var(--bg-hover);
+  color: var(--text-main);
+  border-color: var(--border-light);
+}
+
+.btn-white {
+  background: #ffffff;
+  color: #000000;
+  border: none;
+  border-radius: 8px;
+  padding: 8px 16px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.btn-white:hover {
+  background: #e5e5e5;
+}
+
+.af-recovery {
+  color: var(--text-faint) !important;
+  font-size: 11px;
+  margin-top: 16px;
+}
+
+.af-recovery code {
+  background: rgba(0, 0, 0, 0.3);
+  padding: 2px 5px;
+  border-radius: 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.af-source-link {
+  display: inline-block;
+  color: var(--text-faint) !important;
+  font-size: 11px;
+  margin-top: 10px;
+  text-decoration: none;
+}
+
+.af-source-link:hover {
+  color: var(--text-muted) !important;
+  text-decoration: underline;
+}
+
+.af-note {
+  font-size: 12px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  margin-bottom: 12px;
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-muted);
+}
+
+.af-note--error {
+  background: var(--accent-error-subtle);
+  color: var(--accent-error);
+  border: 1px solid rgba(239, 68, 68, 0.25);
+}
+
+.af-note--warn {
+  background: var(--accent-warn-subtle);
+  color: var(--accent-warn);
+  border: 1px solid rgba(245, 158, 11, 0.25);
+}
+
+.af-badge {
+  font-size: 11px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-muted);
+}
+
+/* -------------------------------------------------------------
+   账户设置页面样式
+   ------------------------------------------------------------- */
+.af-form-page {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-light);
+  border-radius: 18px;
+  padding: 32px;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.4);
+}
+
+.af-form label {
+  display: block;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+
+.af-form input {
+  width: 100%;
+  padding: 10px 14px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  color: var(--text-main);
+  font-size: 14px;
+  outline: none;
+  transition: border-color 0.15s ease;
+}
+
+.af-form input:focus {
+  border-color: var(--accent-green);
+}
+
+.af-form button {
+  padding: 11px;
+  background: #ffffff;
+  color: #000000;
+  border: none;
+  border-radius: 10px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.af-form button:hover:not(:disabled) {
+  background: #e5e5e5;
+}
+
+.af-form button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* -------------------------------------------------------------
+   全局 Toast (解决 is-visible vs is-active 不一致问题)
+   ------------------------------------------------------------- */
+.toast-capsule {
+  position: fixed;
+  bottom: 32px;
+  left: 50%;
+  transform: translateX(-50%) translateY(40px);
+  background: #ffffff;
+  color: #000000;
+  font-size: 13px;
+  font-weight: 500;
+  padding: 10px 24px;
+  border-radius: 9999px;
+  box-shadow: 0 16px 36px rgba(0, 0, 0, 0.5);
+  opacity: 0;
+  pointer-events: none;
+  transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+  z-index: 1100;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.toast-capsule.is-active,
+.toast-capsule.is-visible {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+
+.toast-capsule svg {
+  width: 16px;
+  height: 16px;
+  stroke: currentColor;
+  stroke-width: 2.5;
+  fill: none;
+}
+
+/* -------------------------------------------------------------
+   平滑过渡与浅色主题 (Light Mode) 变量与覆盖
+   ------------------------------------------------------------- */
+html, body, .macos-menubar, .desktop-view, .app-icon-squircle, .floating-dock,
+.control-center-flyout, .toast-capsule {
+  transition: background-color 0.28s ease, color 0.28s ease, border-color 0.28s ease, box-shadow 0.28s ease;
+}
+
+html[data-theme="light"] {
+  --bg-main: #f5f5f7;
+  --bg-surface: #ffffff;
+  --bg-card: #ffffff;
+  --bg-hover: #ebebeb;
+  --border: rgba(0, 0, 0, 0.08);
+  --border-light: rgba(0, 0, 0, 0.14);
+  --text-main: #1d1d1f;
+  --text-muted: #6e6e73;
+  --text-faint: #86868b;
+  --accent-green-subtle: rgba(16, 163, 127, 0.1);
+  --accent-warn-subtle: rgba(245, 158, 11, 0.1);
+  --accent-error-subtle: rgba(239, 68, 68, 0.1);
+}
+
+html[data-theme="light"] .macos-menubar {
+  background: rgba(255, 255, 255, 0.85);
+  border-bottom-color: rgba(0, 0, 0, 0.08);
+}
+
+html[data-theme="light"] .control-center-flyout {
+  background: rgba(255, 255, 255, 0.94);
+  border-color: rgba(0, 0, 0, 0.12);
+  box-shadow: 0 20px 48px rgba(0, 0, 0, 0.12);
+}
+
+html[data-theme="light"] .cc-tile {
+  background: #f7f7f7;
+  border-color: rgba(0, 0, 0, 0.06);
+}
+
+html[data-theme="light"] .cc-info-box {
+  background: #fbfbfb;
+  border-color: rgba(0, 0, 0, 0.06);
+}
+
+html[data-theme="light"] .floating-dock {
+  background: rgba(255, 255, 255, 0.85);
+  border-color: rgba(0, 0, 0, 0.1);
+  box-shadow: 0 16px 36px rgba(0, 0, 0, 0.1);
+}
+
+html[data-theme="light"] .app-icon-squircle {
+  background: #ffffff;
+  border-color: rgba(0, 0, 0, 0.1);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.06);
+}
+
+html[data-theme="light"] .webos-login-card,
+html[data-theme="light"] .af-form-page {
+  background: #ffffff;
+  border-color: rgba(0, 0, 0, 0.1);
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.08);
+}
+
+html[data-theme="light"] .webos-input,
+html[data-theme="light"] .af-form input {
+  background: #f5f5f7;
+  border-color: rgba(0, 0, 0, 0.1);
+}
+
+html[data-theme="light"] .webos-btn-primary,
+html[data-theme="light"] .af-form button {
+  background: #171717;
+  color: #ffffff;
+}
+
+html[data-theme="light"] .webos-btn-primary:hover:not(:disabled),
+html[data-theme="light"] .af-form button:hover:not(:disabled) {
+  background: #333333;
+}
+
+html[data-theme="light"] .toast-capsule {
+  background: rgba(255, 255, 255, 0.96);
+  border-color: rgba(0, 0, 0, 0.1);
+  color: #1d1d1f;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.12);
+}

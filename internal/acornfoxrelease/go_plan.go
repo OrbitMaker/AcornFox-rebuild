@@ -35,6 +35,8 @@ type GoBuildTargetV1 struct {
 // step may perform. Preparing it only inspects Git and the local Go cache.
 type GoBuildPlanV1 struct {
 	valid               bool
+	nativePartial       bool
+	nativeProduct       bool
 	decisionSHA256      string
 	sourcePolicySHA256  string
 	toolchainSHA256     string
@@ -68,7 +70,6 @@ var fixedTargets = []struct{ name, path, identity string }{
 	{"acornfox-admin", "./cmd/open-card-admin", "acornfox"},
 	{"acornfox-upgrade", "./cmd/open-card-upgrade", "acornfox"},
 	{"acornfox-healthcheck", "./cmd/open-card-healthcheck", "acornfox"},
-	{"acornfox-pi-worker", "./cmd/acornfox-pi-worker", ""},
 }
 
 type goCommandRunner func(context.Context, string, []string, string, []string) ([]byte, error)
@@ -153,18 +154,26 @@ func prepareGoBuildPlanV1(ctx context.Context, witness Witness, policy SourcePol
 }
 
 func prepareGoBuildPlanWithDependencies(ctx context.Context, witness Witness, policy SourcePolicyV1, toolchain ToolchainInputsV1, root, taskCacheRoot, npmCLIPath string, run goCommandRunner, lookup executableResolver, hash executableHasher) (GoBuildPlanV1, error) {
-	if ctx == nil || ctx.Err() != nil || run == nil || lookup == nil || hash == nil || !witness.Valid() {
+	if !witness.Valid() {
+		return GoBuildPlanV1{}, ErrGoPlan
+	}
+	identity := sourceIdentityFromWitness(witness)
+	return prepareGoBuildPlanIdentity(ctx, identity, false, witness.decision.RuntimeInputSHA256, witness.decision.LicenseInputSHA256, sealedTargets(witness), policy, toolchain, root, taskCacheRoot, npmCLIPath, run, lookup, hash)
+}
+
+func prepareGoBuildPlanIdentity(ctx context.Context, identity sourceIdentity, native bool, runtimeSHA, licenseSHA string, targets []GoBuildTargetV1, policy SourcePolicyV1, toolchain ToolchainInputsV1, root, taskCacheRoot, npmCLIPath string, run goCommandRunner, lookup executableResolver, hash executableHasher) (GoBuildPlanV1, error) {
+	if ctx == nil || ctx.Err() != nil || run == nil || lookup == nil || hash == nil || !identity.valid() {
 		return GoBuildPlanV1{}, ErrGoPlan
 	}
 	ctx, cancel := context.WithTimeout(ctx, maxGoPlanObservation)
 	defer cancel()
 	sourceRaw, sourceErr := CanonicalSourcePolicyV1(policy)
 	toolchainRaw, toolchainErr := CanonicalToolchainInputsV1(toolchain)
-	decisionSHA, decisionErr := witness.SHA256()
-	if sourceErr != nil || toolchainErr != nil || decisionErr != nil || sha256Text(sourceRaw) != witness.decision.SourcePolicySHA256 || sha256Text(toolchainRaw) != witness.decision.ToolchainSHA256 {
+	decisionSHA := identity.inputSHA
+	if sourceErr != nil || toolchainErr != nil || sha256Text(sourceRaw) != identity.policySHA || sha256Text(toolchainRaw) != identity.toolchainSHA {
 		return GoBuildPlanV1{}, ErrGoPlan
 	}
-	if err := VerifyGitSourceV1(ctx, root, witness, policy, toolchain); err != nil {
+	if err := verifyGitSourceIdentity(ctx, root, identity, policy, toolchain, localCommand, exec.LookPath, hashTrustedExecutable); err != nil {
 		return GoBuildPlanV1{}, ErrGoPlan
 	}
 	root, cache, env, err := sealedGoEnvironment(root, taskCacheRoot)
@@ -190,6 +199,20 @@ func prepareGoBuildPlanWithDependencies(ctx context.Context, witness Witness, po
 		return GoBuildPlanV1{}, ErrGoPlan
 	}
 	packages := fixedPackagePaths(policy.ModulePath)
+	nativeProduct := false
+	if native {
+		partialPackages := nativePackagePaths(policy.ModulePath)
+		productPackages := nativeProductPackagePaths(policy.ModulePath)
+		switch {
+		case nativeTargetsMatch(targets, partialPackages, policy.ModulePath):
+			packages = partialPackages
+		case nativeProductTargetsMatch(targets, productPackages, policy.ModulePath):
+			packages = productPackages
+			nativeProduct = true
+		default:
+			return GoBuildPlanV1{}, ErrGoPlan
+		}
+	}
 	listArgs := append([]string{"list", "-mod=readonly", "-buildvcs=false", "-deps", "-json"}, packages...)
 	listRaw, err := goExecutable.Run(ctx, listArgs, root, env)
 	if err != nil || len(listRaw) == 0 || len(listRaw) > maxGoListBytes || !verifyGoListClosure(listRaw, policy, root, cache.modPath) || !cache.valid() {
@@ -199,7 +222,7 @@ func prepareGoBuildPlanWithDependencies(ctx context.Context, witness Witness, po
 	if err != nil || string(verified) != "all modules verified\n" || !cache.valid() {
 		return GoBuildPlanV1{}, ErrGoPlan
 	}
-	if err := VerifyGitSourceV1(ctx, root, witness, policy, toolchain); err != nil {
+	if err := verifyGitSourceIdentity(ctx, root, identity, policy, toolchain, localCommand, exec.LookPath, hashTrustedExecutable); err != nil {
 		return GoBuildPlanV1{}, ErrGoPlan
 	}
 	nodeExecutable, err := bindExecutable("node", toolchain.NodeBinarySHA256, run, lookup, hash)
@@ -218,19 +241,20 @@ func prepareGoBuildPlanWithDependencies(ctx context.Context, witness Witness, po
 	if err != nil || strings.TrimSpace(string(npmVersion)) != toolchain.NPMVersion {
 		return GoBuildPlanV1{}, ErrGoPlan
 	}
-	targets := sealedTargets(witness)
 	transferred = true
 	return GoBuildPlanV1{
 		valid:               true,
+		nativePartial:       native,
+		nativeProduct:       nativeProduct,
 		decisionSHA256:      decisionSHA,
 		sourcePolicySHA256:  sha256Text(sourceRaw),
 		toolchainSHA256:     sha256Text(toolchainRaw),
-		runtimeInputSHA256:  witness.decision.RuntimeInputSHA256,
-		licenseInputSHA256:  witness.decision.LicenseInputSHA256,
+		runtimeInputSHA256:  runtimeSHA,
+		licenseInputSHA256:  licenseSHA,
 		module:              policy.ModulePath,
-		sourceCommit:        witness.decision.SourceCommit,
-		releaseVersion:      witness.decision.Version,
-		sourceRepositoryURL: witness.decision.SourceRepository,
+		sourceCommit:        identity.commit,
+		releaseVersion:      identity.version,
+		sourceRepositoryURL: identity.repository,
 		baseFlags:           GoBaseFlags(),
 		environment:         append([]string(nil), env...),
 		packages:            append([]string(nil), packages...),
@@ -589,7 +613,17 @@ func sealedTargets(witness Witness) []GoBuildTargetV1 {
 func (p GoBuildPlanV1) Valid() bool {
 	sourceRaw, sourceErr := CanonicalSourcePolicyV1(p.sourcePolicy)
 	toolchainRaw, toolchainErr := CanonicalToolchainInputsV1(p.toolchain)
-	return p.valid && len(p.targets) == len(fixedTargets) && len(p.packages) == len(fixedTargets) && p.decisionSHA256 != "" && p.sourcePolicySHA256 != "" && p.toolchainSHA256 != "" && digestText.MatchString(p.runtimeInputSHA256) && digestText.MatchString(p.licenseInputSHA256) && p.module != "" && p.sourceCommit != "" && p.sourceRoot != "" && sourceErr == nil && toolchainErr == nil && sha256Text(sourceRaw) == p.sourcePolicySHA256 && sha256Text(toolchainRaw) == p.toolchainSHA256 && VerifySourceTree(p.sourceRoot, p.sourcePolicy) == nil && p.goExecutable.path != "" && p.goExecutable.digest == p.toolchain.GoBinarySHA256 && p.nodeExecutable.path != "" && p.nodeExecutable.digest == p.toolchain.NodeBinarySHA256 && p.npmCLI.valid() && p.cache.valid()
+	profileValid := len(p.targets) == len(fixedTargets) && len(p.packages) == len(fixedTargets) && digestText.MatchString(p.runtimeInputSHA256) && digestText.MatchString(p.licenseInputSHA256)
+	if p.nativePartial {
+		targetsMatch := nativeTargetsMatch(p.targets, p.packages, p.module)
+		if p.nativeProduct {
+			targetsMatch = nativeProductTargetsMatch(p.targets, p.packages, p.module)
+		}
+		profileValid = targetsMatch && p.runtimeInputSHA256 == "" && p.licenseInputSHA256 == "" && digestText.MatchString(p.decisionSHA256) && commitText.MatchString(p.sourceCommit) && versionText.MatchString(p.releaseVersion) && validGitHubRepository(p.sourceRepositoryURL)
+	} else if p.nativeProduct {
+		profileValid = false
+	}
+	return p.valid && profileValid && p.decisionSHA256 != "" && p.sourcePolicySHA256 != "" && p.toolchainSHA256 != "" && p.module != "" && p.sourceCommit != "" && p.sourceRoot != "" && sourceErr == nil && toolchainErr == nil && sha256Text(sourceRaw) == p.sourcePolicySHA256 && sha256Text(toolchainRaw) == p.toolchainSHA256 && VerifySourceTree(p.sourceRoot, p.sourcePolicy) == nil && p.goExecutable.path != "" && p.goExecutable.digest == p.toolchain.GoBinarySHA256 && p.nodeExecutable.path != "" && p.nodeExecutable.digest == p.toolchain.NodeBinarySHA256 && p.npmCLI.valid() && p.cache.valid()
 }
 func (p GoBuildPlanV1) Targets() []GoBuildTargetV1 { return copyTargets(p.targets, p.Valid()) }
 func (p GoBuildPlanV1) Packages() []string {

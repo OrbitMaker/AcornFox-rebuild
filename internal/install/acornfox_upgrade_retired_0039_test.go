@@ -16,142 +16,89 @@ import (
 func frozen0039ImageForTest(t *testing.T, u *acornFoxUpgrade, s *TaskAcornFoxRepoStore, j acornFoxUpgradeJournal, current acornFoxUpgradeImage, predecessor *acornFoxUpgradeImage, env []byte) acornFoxUpgradeImage {
 	t.Helper()
 	var image acornFoxUpgradeImage
-	if json.Unmarshal(acornFoxUpgradeJSON(current), &image) != nil {
-		t.Fatal("copy image")
-	}
-	var binding AcornFoxCandidateBindingV1
-	if json.Unmarshal(image.Binding, &binding) != nil {
-		t.Fatal("binding")
-	}
-	raw, err := u.imageManifest(s, j, current)
-	if err != nil {
+	if err := json.Unmarshal(acornFoxUpgradeJSON(current), &image); err != nil {
 		t.Fatal(err)
 	}
-	var manifest Manifest
-	if json.Unmarshal(raw, &manifest) != nil {
-		t.Fatal("manifest")
+	var currentBinding AcornFoxCandidateBindingV1
+	if err := json.Unmarshal(current.Binding, &currentBinding); err != nil {
+		t.Fatal(err)
 	}
-	binding.MigrationVersion = "0039"
-	manifest.MigrationVersion = "0039"
-	manifest.Compatibility.MinDataVersion = 39
-	manifest.Compatibility.MaxDataVersion = 39
-	binding.NMinusOne = nil
-	manifest.NMinusOne = nil
+	var prior *acornFoxFixture
 	if predecessor != nil {
 		var b AcornFoxCandidateBindingV1
-		json.Unmarshal(predecessor.Binding, &b)
-		binding.NMinusOne = &AcornFoxNMinusOneV1{Version: b.Version, MigrationVersion: b.MigrationVersion, SourceCommit: b.SourceCommit, ReleaseManifestSHA256: b.ManifestSHA256, ArchiveSHA256: b.ArchiveSHA256, BundleManifestSHA256: b.BundleManifestSHA256, BindingSHA256: predecessor.Repo.BindingSHA256}
-		n := binding.NMinusOne
-		manifest.NMinusOne = &NMinusOne{Version: n.Version, MigrationVersion: n.MigrationVersion, SourceCommit: n.SourceCommit, ReleaseManifestSHA256: n.ReleaseManifestSHA256, ArchiveSHA256: n.ArchiveSHA256, BundleManifestSHA256: n.BundleManifestSHA256}
-	}
-	files := manifest.Files[:0]
-	for _, f := range manifest.Files {
-		if !strings.HasSuffix(f.Path, "/0040_acornfox_fix_candidates.sql") {
-			files = append(files, f)
+		if err := json.Unmarshal(predecessor.Binding, &b); err != nil {
+			t.Fatal(err)
 		}
+		prior = &acornFoxFixture{binding: b, bindingRaw: predecessor.Binding, bindingSHA: predecessor.Repo.BindingSHA256}
 	}
-	manifest.Files = files
-	raw = acornFoxUpgradeJSON(manifest)
-	binding.ManifestSHA256 = sha256Hex(raw)
-	image.Binding = acornFoxUpgradeJSON(binding)
-	digest := sha256Hex(image.Binding)
-	c := &image.Substrate.CandidateReceipt
-	c.BindingSHA256 = digest
-	c.MigrationVersion = "0039"
-	c.ManifestSHA256 = binding.ManifestSHA256
-	c.FileCount--
-	c.PredecessorBindingSHA256 = ""
-	if predecessor != nil {
-		c.PredecessorBindingSHA256 = predecessor.Repo.BindingSHA256
-	}
-	entries := image.Substrate.Entries[:0]
-	for _, e := range image.Substrate.Entries {
-		if strings.HasSuffix(e.Path, "/0040_acornfox_fix_candidates.sql") {
-			continue
-		}
-		if e.Path == "opt/acornfox/releases/"+binding.ReleaseID+"/manifest.json" {
-			e.SHA256 = binding.ManifestSHA256
-			e.Size = int64(len(raw))
-		}
-		entries = append(entries, e)
-	}
-	image.Substrate.Entries = entries
-	image.Substrate.ReleaseTreeSHA256, err = ComputeAcornFoxReleaseTreeSHA256(*c, entries)
-	if err != nil {
-		t.Fatal(err)
-	}
-	c.TreeSHA256 = image.Substrate.ReleaseTreeSHA256
-	image.Substrate.InstalledTreeSHA256, err = ComputeAcornFoxSubstrateTreeSHA256(entries)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if validateAcornFoxRecent0039SubstrateReceipt(image.Substrate, binding, digest) != nil {
-		t.Fatal("frozen substrate")
-	}
+	fixture := acornFoxFixtureForPolicy(t, currentBinding.Version, prior, AcornFoxCandidateBindingV1Schema, acornFoxRecent0039RequiredFiles(), "0039")
+	image.Binding = bytes.Clone(fixture.bindingRaw)
+	image.Substrate, _ = historicalSubstrateForTest(t, fixture)
 	source, err := acornFoxRecent0039ExpectedEntries(u.layout, image.Substrate)
 	if err != nil {
 		t.Fatal(err)
 	}
-	liveEntries := []AcornFoxLiveEntryV1{}
-	for _, e := range source {
-		if acornFoxProductionSharedParent(e.Path) {
-			continue
-		}
-		le, err := acornFoxLiveEntryForLayout(u.layout, e)
-		if err != nil {
-			t.Fatal(err)
-		}
-		liveEntries = append(liveEntries, le)
+	image.Repo.BindingSHA256 = fixture.bindingSHA
+	image.Repo.SubstrateReceiptSHA256 = sha256Hex(acornFoxUpgradeJSON(image.Substrate))
+	image.Live, err = acornFoxLiveMakeReceiptForLayout(u.layout, image.Repo, &PublishedAcornFoxSubstrateV1{receipt: image.Substrate}, source)
+	if err != nil {
+		t.Fatal(err)
 	}
-	image.Live.Entries = liveEntries
-	image.Live.BindingSHA256 = digest
-	image.Live.SubstrateReceiptSHA256 = sha256Hex(acornFoxUpgradeJSON(image.Substrate))
-	image.Live.LiveTreeSHA256, _ = acornFoxLiveDigest(liveEntries)
-	image.Live.OwnershipPlanSHA256, _ = acornFoxLiveOwnershipDigest(liveEntries)
-	image.Live.StaticSetSHA256, _ = acornFoxLiveStaticDigest(liveEntries)
-	image.Repo.BindingSHA256 = digest
-	image.Repo.SubstrateReceiptSHA256 = image.Live.SubstrateReceiptSHA256
 	image.Repo.LiveTreeSHA256 = image.Live.LiveTreeSHA256
 	image.Repo.StaticSetSHA256 = image.Live.StaticSetSHA256
 	image.Repo.OwnershipPlanSHA256 = image.Live.OwnershipPlanSHA256
-	image.Activation.BindingSHA256 = digest
-	image.Activation.ActivationID, _ = AcornFoxRepoActivationID(digest)
-	image.Activation.SubstrateReceiptSHA256 = image.Live.SubstrateReceiptSHA256
-	image.Activation.LiveTreeSHA256 = image.Live.LiveTreeSHA256
-	image.Activation.StaticSetSHA256 = image.Live.StaticSetSHA256
-	image.Activation.OwnershipPlanSHA256 = image.Live.OwnershipPlanSHA256
-	image.Activation.ReleaseTreeSHA256 = image.Substrate.ReleaseTreeSHA256
-	image.Activation.TransactionID = "acornfox-layout-" + digest[:12]
+	image.Repo.TransactionID = "acornfox-layout-" + fixture.bindingSHA[:12]
+	image.Activation, _, err = acornFoxRepoActivationForLayout(u.layout, image.Repo, image.Live, &PublishedAcornFoxSubstrateV1{receipt: image.Substrate})
+	if err != nil {
+		t.Fatal(err)
+	}
 	image.Repo.ActivationSHA256 = sha256Hex(acornFoxUpgradeJSON(image.Activation))
-	image.Repo.TransactionID = "acornfox-layout-" + digest[:12]
-	image.Repo.ActivePointerSHA256 = acornFoxRepoEvidence("acornfox-repo-active-v1\x00", digest, image.Repo.ActivationSHA256)
-	image.Repo.CurrentPointerSHA256 = acornFoxRepoEvidence("acornfox-repo-current-v1\x00", digest, image.Repo.ActivationSHA256)
-	for index := range image.Repo.History {
-		image.Repo.History[index].EvidenceSHA256 = acornFoxRepoPhaseEvidence(image.Repo, image.Repo.History[index].To)
+	image.Repo.ActivePointerSHA256 = acornFoxRepoEvidence("acornfox-repo-active-v1\x00", fixture.bindingSHA, image.Repo.ActivationSHA256)
+	image.Repo.CurrentPointerSHA256 = acornFoxRepoEvidence("acornfox-repo-current-v1\x00", fixture.bindingSHA, image.Repo.ActivationSHA256)
+	for i := range image.Repo.History {
+		image.Repo.History[i].EvidenceSHA256 = acornFoxRepoPhaseEvidence(image.Repo, image.Repo.History[i].To)
 	}
-
-	image.ControlPlane.BindingSHA256 = digest
+	image.ControlPlane.BindingSHA256 = fixture.bindingSHA
 	image.ControlPlane.MigrationVersion = "0039"
-	sub, err := u.locateSubstrate(s, j, current)
-	if err != nil {
+	var manifest Manifest
+	if err := json.Unmarshal(fixture.manifestRaw, &manifest); err != nil {
 		t.Fatal(err)
 	}
-	migrations, err := loadAcornFoxUpgradeMigrations(sub, current.Repo.BindingSHA256)
-	sub.Close()
-	if err != nil {
-		t.Fatal(err)
+	rows := []MigrationRow{}
+	for _, name := range acornFoxRecent0039Migrations {
+		for _, file := range manifest.Files {
+			if file.Path == "migrations/control-plane/"+name {
+				rows = append(rows, MigrationRow{Version: strings.TrimSuffix(name, ".sql"), Checksum: file.SHA256})
+			}
+		}
 	}
-	image.ControlPlane.MigrationRowsSHA256 = acornFoxMigrationRowsSHA256(migrations.rows[:39])
-
+	image.ControlPlane.MigrationRowsSHA256 = acornFoxMigrationRowsSHA256(rows)
 	image.DatabaseEnv = bytes.Clone(env)
-	image.Runtime, err = acornFoxUpgradeRebind(image.Runtime, binding, digest, image.Runtime.SetupToken)
+	image.Runtime, err = acornFoxUpgradeRebind(current.Runtime, fixture.binding, fixture.bindingSHA, current.Runtime.SetupToken)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if validateAcornFoxRecent0039UpgradeImage(image, u.layout) != nil {
-		t.Fatalf("frozen image: repo=%v live=%v activation=%v cp=%v runtime=%v env=%t", image.Repo.Validate(), validateAcornFoxRecent0039LiveReceiptForLayout(u.layout, image.Substrate, binding, digest, image.Live), image.Activation.Validate(), image.ControlPlane.validateMigration("0039"), image.Runtime.validate(), validAcornFoxBoundControlPlaneEnvironment(image.DatabaseEnv, image.ControlPlane, acornFoxControlPlaneDatabase))
+	if err := validateAcornFoxRecent0039UpgradeImage(image, u.layout); err != nil {
+		t.Fatal("historical 0039 image", err)
 	}
 	return image
+}
+
+func fixtureForHistoricalImage(t *testing.T, image acornFoxUpgradeImage) acornFoxFixture {
+	t.Helper()
+	var b AcornFoxCandidateBindingV1
+	if err := json.Unmarshal(image.Binding, &b); err != nil {
+		t.Fatal(err)
+	}
+	var prior *acornFoxFixture
+	if n := b.NMinusOne; n != nil {
+		prior = &acornFoxFixture{bindingSHA: n.BindingSHA256, binding: AcornFoxCandidateBindingV1{Version: n.Version, MigrationVersion: n.MigrationVersion, SourceCommit: n.SourceCommit, ManifestSHA256: n.ReleaseManifestSHA256, ArchiveSHA256: n.ArchiveSHA256, BundleManifestSHA256: n.BundleManifestSHA256}}
+	}
+	f := acornFoxFixtureForPolicy(t, b.Version, prior, 1, acornFoxRecent0039RequiredFiles(), "0039")
+	if f.bindingSHA != image.Repo.BindingSHA256 {
+		t.Fatal("historical fixture binding differs")
+	}
+	return f
 }
 
 func TestAcornFoxRetired0039ValidationPreservesOriginalJournal(t *testing.T) {
@@ -246,34 +193,63 @@ func materializeFrozen0039ForTest(t *testing.T, u *acornFoxUpgrade, s *TaskAcorn
 		old, next acornFoxUpgradeImage
 		path      string
 	}{{current.Old, frozen.Old, "upgrade/old-state"}, {current.Next, frozen.Next, "."}} {
-		raw, err := u.imageManifest(s, current, item.old)
-		if err != nil {
+		fixture := fixtureForHistoricalImage(t, item.next)
+		raw := fixture.manifestRaw
+		var m Manifest
+		if err := json.Unmarshal(raw, &m); err != nil {
 			t.Fatal(err)
 		}
-		var m Manifest
-		json.Unmarshal(raw, &m)
 		var b AcornFoxCandidateBindingV1
-		json.Unmarshal(item.next.Binding, &b)
-		m.MigrationVersion = "0039"
-		m.Compatibility.MinDataVersion = 39
-		m.Compatibility.MaxDataVersion = 39
-		m.NMinusOne = nil
-		if n := b.NMinusOne; n != nil {
-			m.NMinusOne = &NMinusOne{Version: n.Version, MigrationVersion: n.MigrationVersion, SourceCommit: n.SourceCommit, ReleaseManifestSHA256: n.ReleaseManifestSHA256, ArchiveSHA256: n.ArchiveSHA256, BundleManifestSHA256: n.BundleManifestSHA256}
+		if err := json.Unmarshal(item.next.Binding, &b); err != nil {
+			t.Fatal(err)
 		}
-		filtered := m.Files[:0]
-		for _, f := range m.Files {
-			if !strings.HasSuffix(f.Path, "/0040_acornfox_fix_candidates.sql") {
-				filtered = append(filtered, f)
-			}
-		}
-		m.Files = filtered
-		raw = acornFoxUpgradeJSON(m)
-		if sha256Hex(raw) != b.ManifestSHA256 {
-			t.Fatal("manifest rewrite mismatch")
-		}
+		_, contents := fixtureManifestAndContents(t, fixture)
 		prefix := "opt/acornfox/releases/" + b.ReleaseID
 		for _, root := range []string{p.host, filepath.Join(p.state, item.path, acornFoxSubstrateRootfs)} {
+			for _, file := range m.Files {
+				target := filepath.Join(root, prefix, file.Path)
+				if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(target, contents[file.Path], os.FileMode(file.Mode)); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(target, os.FileMode(file.Mode)); err != nil {
+					t.Fatal(err)
+				}
+				info, _ := os.Lstat(target)
+				p.owners.set(info, acornFoxInstallPrincipal{})
+				for parent := filepath.Dir(target); strings.HasPrefix(parent, filepath.Join(root, prefix)); parent = filepath.Dir(parent) {
+					info, _ := os.Lstat(parent)
+					p.owners.set(info, acornFoxInstallPrincipal{})
+				}
+			}
+			unit := filepath.Join(root, "etc/systemd/system/acornfox-pi-worker.service")
+			if err := os.WriteFile(unit, contents["systemd/acornfox-pi-worker.service"], 0644); err != nil {
+				t.Fatal(err)
+			}
+			info, _ := os.Lstat(unit)
+			p.owners.set(info, acornFoxInstallPrincipal{})
+			if root == p.host && frozen.PIEnabled {
+				wants := filepath.Join(p.host, "etc/systemd/system/multi-user.target.wants/acornfox-pi-worker.service")
+				if err := os.MkdirAll(filepath.Dir(wants), 0755); err != nil {
+					t.Fatal(err)
+				}
+				parentInfo, err := os.Lstat(filepath.Dir(wants))
+				if err != nil {
+					t.Fatal(err)
+				}
+				p.owners.set(parentInfo, acornFoxInstallPrincipal{})
+				_ = os.Remove(wants)
+				if err := os.Symlink("../acornfox-pi-worker.service", wants); err != nil {
+					t.Fatal(err)
+				}
+				wantsInfo, err := os.Lstat(wants)
+				if err != nil {
+					t.Fatal(err)
+				}
+				p.owners.set(wantsInfo, acornFoxInstallPrincipal{})
+			}
 			if err := os.WriteFile(filepath.Join(root, prefix, "manifest.json"), raw, 0644); err != nil {
 				t.Fatal(err)
 			}
@@ -328,7 +304,10 @@ func TestAcornFoxRetired0039DetachedSuccessorRecoveryAfterJournalAndRename(t *te
 		t.Run(point, func(t *testing.T) {
 			u, p, request, base := upgradeFixture(t)
 			provisionUpgradeAssistantConfig(t, p)
-			u.services = &acornFoxUpgradePIServiceFake{acornFoxUpgradeServiceFake: base, enabled: true}
+			u.services = &retirementServices{
+				acornFoxUpgradePIServiceFake: &acornFoxUpgradePIServiceFake{acornFoxUpgradeServiceFake: base, enabled: true},
+				p:                            p,
+			}
 			if _, err := u.upgrade(context.Background(), request); err != nil {
 				t.Fatal(err)
 			}
@@ -606,12 +585,17 @@ func TestAcornFoxRetired0039RecoveryChildProcess(t *testing.T) {
 	u := newAcornFoxUpgrade(layout)
 	u.ownership = owners.edge()
 	u.self = acornFoxSelfVerifier{path: input.Self, uid: os.Getuid(), gid: os.Getgid()}
-	u.services = &acornFoxUpgradePIServiceFake{acornFoxUpgradeServiceFake: &acornFoxUpgradeServiceFake{}, enabled: true}
+	pFixture := acornFoxProductionPreparedFixture{host: input.Host, owners: owners}
+	services := &retirementServices{
+		acornFoxUpgradePIServiceFake: &acornFoxUpgradePIServiceFake{acornFoxUpgradeServiceFake: &acornFoxUpgradeServiceFake{}, enabled: true},
+		p:                            pFixture,
+	}
+	u.services = services
 	if store, err := u.openStore(); err == nil {
 		journal, loadErr := u.load(store)
 		store.Close()
 		if loadErr == nil && journal.isLocal() {
-			u.services = &acornFoxUpgradeServiceFake{forbidEdge: true}
+			services.acornFoxUpgradeServiceFake.forbidEdge = true
 		}
 	}
 	receipt, handled, err := u.recoverMode(context.Background(), input.Expected, input.Prepare)

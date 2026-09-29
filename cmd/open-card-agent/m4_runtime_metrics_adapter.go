@@ -29,7 +29,11 @@ func (a m4GroupRuntimeMetricsAdapter) ReadGroupRuntimeMetrics(ctx context.Contex
 			millicores = int64(value)
 		}
 	}
-	return standalonegroup.RuntimeMetrics{ContainerID: metrics.ContainerID, Status: metrics.Status, Healthy: metrics.Healthy, RestartCount: metrics.RestartCount, CPUMillicores: millicores, MemoryBytes: nonNegativeM4Metric(metrics.MemoryUsageBytes), DiskBytes: metrics.WritableLayerBytes, NetworkRxBytes: nonNegativeM4Metric(metrics.NetworkRxBytes), NetworkTxBytes: nonNegativeM4Metric(metrics.NetworkTxBytes), PIDsCurrent: nonNegativeM4Metric(metrics.PIDsCurrent), ChangedPaths: int64(metrics.ChangedPathCount), CgroupVerified: metrics.CgroupVerified, Limits: metrics.AppliedLimits, ExitReason: metrics.ExitReason, ObservedAt: metrics.ObservedAt}, nil
+	changedPaths := int64(0)
+	if metrics.ChangedPathCount != nil {
+		changedPaths = int64(*metrics.ChangedPathCount)
+	}
+	return standalonegroup.RuntimeMetrics{ContainerID: metrics.ContainerID, Status: metrics.Status, Healthy: metrics.Healthy, RestartCount: metrics.RestartCount, CPUMillicores: millicores, MemoryBytes: nonNegativeM4Metric(metrics.MemoryUsageBytes), DiskBytes: metrics.WritableLayerBytes, NetworkRxBytes: nonNegativeM4Metric(metrics.NetworkRxBytes), NetworkTxBytes: nonNegativeM4Metric(metrics.NetworkTxBytes), PIDsCurrent: nonNegativeM4Metric(metrics.PIDsCurrent), ChangedPaths: changedPaths, CgroupVerified: metrics.CgroupVerified, Limits: metrics.AppliedLimits, ExitReason: metrics.ExitReason, ObservedAt: metrics.ObservedAt}, nil
 }
 
 func nonNegativeM4Metric(value uint64) int64 {

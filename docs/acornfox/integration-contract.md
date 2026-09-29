@@ -1,9 +1,9 @@
-# Console and assistant integration
+# Console and API integration
 
-The console preserves the 18 existing AcornFox API response contracts. Additional setup,
-host, source, operation, assistant, and action endpoints are declared in
+The console preserves existing Git response contracts and recognizes uploaded sources and immutable runtime settings. Additional setup,
+host, source, operation, fix-candidate, and public access endpoints are declared in
 `api/openapi/acornfox.yaml`; `npm --prefix web run test:acornfox-parity` checks the
-CLI and both browser clients against that inventory.
+CLI and browser clients against that inventory.
 
 ## Installation and host facts
 
@@ -20,34 +20,19 @@ source details follow the exact release/build/source linkage. Source updates imp
 new immutable revision; they do not deploy it. Operation results refer to the exact
 requested operation and require independent execution evidence for verification.
 
-## Assistant ownership
+## External AI and retired built-in assistant
 
-The browser talks only to Go. Go owns authentication, immutable session scope,
-durable messages and events, idempotency, cancellation, and execution policy. The
-independent unprivileged worker runs pinned Pi 0.85.1 over stdio RPC, using DeepSeek
-`deepseek-v4-flash` with thinking disabled. Its model key is a systemd credential.
-See `assistant-operations.md` for root configuration commands.
+In accordance with `docs/acornfox-external-ai-only-plan.md`, the single-machine AcornFox product retires the built-in AI assistant, chat interface, model runtime configuration, and assistant action endpoints. Instead, users interact via external AI clients driving the AcornFox CLI.
 
-A revocable per-run capability grants access to the protected Unix tool socket.
-The trusted extension exposes factual host/application/source/deployment/log/operation
-reads and a controlled HTTP probe. A separate read-only tool returns administrator-client external-access observations, preserving their reported provenance and expiry. It also prepares restart and redeploy proposals.
-There is no generic shell tool and no model-accessible approval endpoint.
-
-A user confirms a proposal through the authenticated console. Go revalidates the exact
-target and uses one persistent execution key. An uncertain acknowledgement remains
-unknown; recovery checks the original action instead of creating a replacement.
-Verification establishes the requested operation fact, not overall application health.
-
-Messages survive page navigation and panel collapse. Reconnecting replays SSE events
-without posting another prompt. The default global concurrency is one; queued work
-remains accepted. Process restart marks unfinished runs unknown rather than replaying
-them. Completed replies replace their transient deltas in bounded event retention.
+All built-in assistant HTTP endpoints (`/api/v1/acornfox/assistant/...`) and legacy M6 AI routes are retired and return 404/410. Dedicated assistant chat components, types, and client libraries have been removed from the server and console web app. Deterministic verification engines—including fix candidate validation (`fix-candidate`) and external access observation—remain fully operational and accessible via the API and CLI.
 
 ## Release boundary
 
-The candidate includes the complete pinned Pi resource tree, worker, trusted extension,
-and the closed control-plane migration set. Fresh installations leave the optional worker
-disabled. Same-schema upgrade and rollback preserve its prior enabled state.
+Current binding-schema-2 candidates omit Pi, its worker binary, extension and systemd unit.
+The control-plane migration set remains 0040. Historical schema-1 packages and manifests
+are recognized only as installed predecessors. Successful upgrade retires the old worker;
+failed upgrade restores its original enabled state. Historical configuration and session
+records are retained, and the existing OS role is retained for layout-v1 compatibility.
 
 Cross-schema upgrade is limited to the two authenticated predecessor pairs 0034 to 0040
 and 0039 to 0040. The 0034 path first verifies the historical six-account receipts and
@@ -145,7 +130,7 @@ delivery, assistant and M6 fake-runner behavior remains outside this lane.
 
 Candidate creation is asynchronous. The server reserves a stable candidate identity and
 returns `202 preparing` before entering a single-worker, eight-item queue; each item has a
-20-minute execution deadline independent of the HTTP or Pi callback deadline. Owner-scoped
+20-minute execution deadline independent of the HTTP request deadline. Owner-scoped
 item reads and the latest-50 list expose `preparing`, `failed`, `validated`, and
 `source_matched` facts. Request cancellation after durable acceptance does not cancel the
 job. Graceful shutdown cancels and joins candidate work; startup converts any preparing row
@@ -165,3 +150,13 @@ share one PostgreSQL cross-process gate; deletion rechecks active work, ordinary
 references, other candidate receipts and the ImageStore retention protections. Shared or
 uncertain images are retained. Only fixed candidate identifiers and failure-stage codes
 are logged for execution failures; raw errors, patches and credentials are excluded.
+
+
+## External AI and local projects
+
+The API-only CLI can check and upload a local directory, read its deployment plan,
+submit a new immutable source to the same application, and send an explicit runtime
+configuration. It reports request acceptance separately from running application
+state. See [the external-AI CLI workflow](cli.md). Uploaded sources do not expose
+an `upload://` storage reference as a repository URL. Git plan responses keep their
+existing shape; local plans use `source_type: upload` with an empty repository URL.

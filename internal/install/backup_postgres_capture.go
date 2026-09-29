@@ -584,3 +584,26 @@ func (f PlatformBackupCapturedFactsV1) ReleaseDatabase() (PlatformBackupReleaseD
 	}
 	return PlatformBackupReleaseDatabaseV1{DatabaseV1: DatabaseV1{Name: f.CurrentDatabase, Migration: f.SchemaMigrations[len(f.SchemaMigrations)-1].Version[:4], SchemaMigrationsSHA256: digest}, CurrentDatabase: f.CurrentDatabase, SchemaMigrationsCount: int64(len(f.SchemaMigrations)), SchemaMigrationsRowsSHA256: digest}, nil
 }
+
+// SnapshotRows is a read-only cursor. Callers must promptly Close it; it carries
+// no transaction/connection/commit methods or identifier field. Query text is
+// trusted internal code; this interface is not an arbitrary-SQL sandbox.
+type SnapshotRows interface {
+	Next() bool
+	Scan(...any) error
+	Err() error
+	Close() error
+}
+
+// ReadRows reuses the existing BEGIN REPEATABLE READ READ ONLY transaction.
+// SQL belongs to the offline tool's fixed catalog/mapping code, never CLI input.
+func (s *PlatformBackupSnapshot) ReadRows(ctx context.Context, query string, args ...any) (SnapshotRows, error) {
+	if s == nil || s.tx == nil || s.closed {
+		return nil, ErrPostgresOutcomeUnknown
+	}
+	rows, err := s.tx.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, ErrPostgresOutcomeUnknown
+	}
+	return rows, nil
+}

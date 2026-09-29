@@ -6,15 +6,18 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 )
 
 type openAPIParityMatrix struct {
-	SourceRequestType  string                   `json:"sourceRequestType"`
-	SourceRevisionKind string                   `json:"sourceRevisionKind"`
-	Operations         []openAPIParityOperation `json:"operations"`
+	SourceRequestTypes  []string                 `json:"sourceRequestTypes"`
+	SourceRevisionKinds []string                 `json:"sourceRevisionKinds"`
+	SourceRequestType   string                   `json:"sourceRequestType"`
+	SourceRevisionKind  string                   `json:"sourceRevisionKind"`
+	Operations          []openAPIParityOperation `json:"operations"`
 }
 
 type openAPIParityOperation struct {
@@ -52,6 +55,9 @@ func TestAcornFoxOpenAPIParity(t *testing.T) {
 	if matrix.SourceRequestType != "public_git" || matrix.SourceRevisionKind != "git_https" {
 		t.Fatalf("source vocabulary=%q/%q", matrix.SourceRequestType, matrix.SourceRevisionKind)
 	}
+	if !reflect.DeepEqual(matrix.SourceRequestTypes, []string{"public_git", "upload"}) || !reflect.DeepEqual(matrix.SourceRevisionKinds, []string{"git_https", "upload"}) {
+		t.Fatal("source families differ from declared contract")
+	}
 	validSource := `{"id":"source","application_id":"app","kind":"git_https","locator_sha256":"sha256:locator","content_digest":"sha256:content","created_at":"2030-01-01T00:00:00Z","immutable":true}`
 	if _, err := decodeResponse(strings.NewReader(validSource), shapeSource); err != nil {
 		t.Fatalf("git_https source rejected: %v", err)
@@ -61,6 +67,8 @@ func TestAcornFoxOpenAPIParity(t *testing.T) {
 	}
 
 	operations := []cliParityOperation{
+		{"createAcornFoxSourceUpload", http.MethodPost, "/source-uploads", shapeSourceUpload, multipartPayload{strings.NewReader(""), "multipart/form-data; boundary=parity", 0}},
+		{"getAcornFoxSourceUpload", http.MethodGet, "/source-uploads/upload", shapeSourceUpload, nil},
 		{"loginAcornFoxAdministrator", http.MethodPost, "/auth/login", shapeSession, map[string]string{"password": "secret"}},
 		{"logoutAcornFoxAdministrator", http.MethodPost, "/auth/logout", shapeSession, nil},
 		{"getAcornFoxAdministratorSession", http.MethodGet, "/auth/session", shapeSession, nil},
@@ -101,15 +109,8 @@ func TestAcornFoxOpenAPIParity(t *testing.T) {
 		t.Fatal("OpenAPI matrix contains duplicate operation IDs")
 	}
 	noCLI := map[string]string{
-		"getAcornFoxSetupState":             "integration_ui",
-		"initializeAcornFoxAdministrator":   "integration_ui",
-		"listAcornFoxAssistantSessions":     "assistant_ui_only",
-		"createAcornFoxAssistantSession":    "assistant_ui_only",
-		"submitAcornFoxAssistantRun":        "assistant_ui_only",
-		"getAcornFoxAssistantEvents":        "assistant_ui_only",
-		"abortAcornFoxAssistantSessionRuns": "assistant_ui_only",
-		"listAcornFoxAssistantActions":      "assistant_ui_only",
-		"decideAcornFoxAssistantAction":     "assistant_ui_only",
+		"getAcornFoxSetupState":           "integration_ui",
+		"initializeAcornFoxAdministrator": "integration_ui",
 	}
 	cliCount := 0
 	for _, operation := range matrix.Operations {
@@ -119,9 +120,6 @@ func TestAcornFoxOpenAPIParity(t *testing.T) {
 		}
 		expectedParity, ok := noCLI[operation.OperationID]
 		expectedClient := "integration"
-		if expectedParity == "assistant_ui_only" {
-			expectedClient = "assistant"
-		}
 		if !ok || operation.Parity != expectedParity || operation.WebClient != expectedClient {
 			t.Fatalf("operation has no CLI parity classification: %+v", operation)
 		}

@@ -40,7 +40,7 @@ TOKEN_COUNTS = {
     "/etc/os-release": 7,
     "/usr/bin/grep": 14,
     "/usr/bin/uname": 1,
-    "/usr/bin/systemctl": 48,
+    "/usr/bin/systemctl": 49,
     "/usr/bin/docker": 1,
     "/usr/lib/postgresql/16/bin/postgres": 1,
     "/usr/lib/postgresql/16/bin/psql": 1,

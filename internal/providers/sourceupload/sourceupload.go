@@ -151,7 +151,7 @@ func (s *Session) WriteArchive(filename string, content io.Reader) error {
 	if err != nil {
 		return ErrStorage
 	}
-	bytes, digest, writeErr := s.copyFile(file, content)
+	bytes, digest, writeErr := s.copyFile(file, content, s.manager.limits.MaxTotalBytes)
 	closeErr := file.Close()
 	if writeErr != nil || closeErr != nil {
 		_ = os.Remove(path)
@@ -297,7 +297,7 @@ func (m *Manager) Discard(id domain.ID) error {
 	return nil
 }
 
-func (s *Session) copyFile(destination *os.File, source io.Reader) (int64, string, error) {
+func (s *Session) copyFile(destination *os.File, source io.Reader, maximum ...int64) (int64, string, error) {
 	if source == nil {
 		return 0, "", ErrInvalidUpload
 	}
@@ -306,6 +306,9 @@ func (s *Session) copyFile(destination *os.File, source io.Reader) (int64, strin
 		return 0, "", ErrLimitExceeded
 	}
 	limit := s.manager.limits.MaxFileBytes
+	if len(maximum) == 1 {
+		limit = maximum[0]
+	}
 	if remaining < limit {
 		limit = remaining
 	}

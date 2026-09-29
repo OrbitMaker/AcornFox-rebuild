@@ -533,6 +533,16 @@ func (p *Provider) extractGitArchive(ctx context.Context, gitDir, commit, stage 
 }
 
 func (p *Provider) materializeUpload(stage, locator string) (string, error) {
+	limits := p.limits
+	if limits.MaxFiles > 10000 {
+		limits.MaxFiles = 10000
+	}
+	if limits.MaxUnpackedBytes > 100<<20 {
+		limits.MaxUnpackedBytes = 100 << 20
+	}
+	if limits.MaxFileBytes <= 0 || limits.MaxFileBytes > 32<<20 {
+		limits.MaxFileBytes = 32 << 20
+	}
 	if strings.HasPrefix(locator, "upload://") {
 		stored, err := p.storedUploadPath(locator)
 		if err != nil {
@@ -540,7 +550,7 @@ func (p *Provider) materializeUpload(stage, locator string) (string, error) {
 		}
 		files := filepath.Join(stored, "files")
 		if info, statErr := os.Lstat(files); statErr == nil && info.IsDir() && info.Mode()&fs.ModeSymlink == 0 {
-			if err := copyDirectory(files, stage, p.limits); err != nil {
+			if err := copyDirectory(files, stage, limits); err != nil {
 				return "", err
 			}
 			return locator, nil
@@ -562,7 +572,7 @@ func (p *Provider) materializeUpload(stage, locator string) (string, error) {
 				archive = filepath.Join(stored, name)
 			}
 		}
-		if archive == "" || extractArchive(archive, stage, p.limits) != nil {
+		if archive == "" || extractArchive(archive, stage, limits) != nil {
 			return "", errUploadRejected
 		}
 		return locator, nil

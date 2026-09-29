@@ -507,3 +507,378 @@ func activeRuntimeLease(id string, cpu, memory, disk int64, hostPort int) contra
 		ExpiresAt: time.Unix(1, 0).UTC(),
 	}
 }
+
+func TestReconcileRetainedRestoresAccountingWithoutPortAllocation(t *testing.T) {
+	var allocatorCalls int
+	provider := capacityProvider(t, fixedReader(hostCapacity()), func(config *Config) {
+		config.PortAllocator = PortAllocatorFunc(func(context.Context) (net.Listener, error) {
+			allocatorCalls++
+			return nil, errors.New("reconcile retained must not allocate a port")
+		})
+	})
+	lease := activeRuntimeLease("cap_retained_test", 1_200, 1_200, 1_200, 49152)
+	if err := provider.ReconcileRetained(context.Background(), lease, contracts.OperationContext{IdempotencyKey: "retained-one"}); err != nil {
+		t.Fatal(err)
+	}
+	if allocatorCalls != 0 || provider.ActiveLeaseCount() != 1 {
+		t.Fatalf("reconcile retained allocated a port or failed to retain accounting: calls=%d active=%d", allocatorCalls, provider.ActiveLeaseCount())
+	}
+
+	snapshot, _, err := provider.Preflight(context.Background(), capacityRequest(contracts.CapacityRuntime, "retained-snapshot", 0, 0, 0, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.AvailableCPUMillis != 800 || snapshot.AvailableMemoryBytes != 800 || snapshot.AvailableDiskBytes != 800 {
+		t.Fatalf("retained lease was not reflected in capacity snapshot: %#v", snapshot)
+	}
+	_, err = provider.Reserve(context.Background(), capacityRequest(contracts.CapacityRuntime, "retained-overcommit", 801, 801, 801, 0))
+	providerErrorCode(t, err, contracts.ErrCapacity)
+
+	// Idempotent retry with same key and different key
+	if err := provider.ReconcileRetained(context.Background(), lease, contracts.OperationContext{IdempotencyKey: "retained-one"}); err != nil {
+		t.Fatalf("same retained lease replay should succeed: %v", err)
+	}
+	if err := provider.ReconcileRetained(context.Background(), lease, contracts.OperationContext{IdempotencyKey: "retained-replay"}); err != nil {
+		t.Fatalf("same retained lease with new key should succeed: %v", err)
+	}
+
+	// Release returns capacity
+	if err := provider.Release(context.Background(), lease, contracts.OperationContext{IdempotencyKey: "retained-release"}); err != nil {
+		t.Fatal(err)
+	}
+	if provider.ActiveLeaseCount() != 0 {
+		t.Fatalf("released retained lease remained active: %d", provider.ActiveLeaseCount())
+	}
+}
+
+func TestReconcileRetainedRejectsDuplicatePortAcrossDifferentLeases(t *testing.T) {
+	provider := capacityProvider(t, fixedReader(hostCapacity()), nil)
+	first := activeRuntimeLease("cap_retained_port_1", 500, 500, 500, 49200)
+	second := activeRuntimeLease("cap_retained_port_2", 500, 500, 500, 49200) // duplicate port!
+
+	if err := provider.ReconcileRetained(context.Background(), first, contracts.OperationContext{IdempotencyKey: "retained-port-1"}); err != nil {
+		t.Fatal(err)
+	}
+	err := provider.ReconcileRetained(context.Background(), second, contracts.OperationContext{IdempotencyKey: "retained-port-2"})
+	providerErrorCode(t, err, contracts.ErrConflict)
+}
+
+func TestReconcileRetainedRestoresWhenHostAvailabilityLowerAndFloorsAvailable(t *testing.T) {
+	provider := capacityProvider(t, fixedReader(HostCapacity{
+		TotalCPUMillis:       2_000,
+		AvailableCPUMillis:   500, // lower than retained lease requirement of 1,000!
+		TotalMemoryBytes:     2_000,
+		AvailableMemoryBytes: 500,
+		TotalDiskBytes:       2_000,
+		AvailableDiskBytes:   500,
+	}), nil)
+	lease := activeRuntimeLease("cap_retained_low_host", 1_000, 1_000, 1_000, 49200)
+
+	// Available is lower than lease, but retained restore must still succeed!
+	if err := provider.ReconcileRetained(context.Background(), lease, contracts.OperationContext{IdempotencyKey: "reconcile-low"}); err != nil {
+		t.Fatalf("reconcile retained must succeed even when host availability dropped: %v", err)
+	}
+	if provider.ActiveLeaseCount() != 1 {
+		t.Fatalf("expected count 1, got %d", provider.ActiveLeaseCount())
+	}
+
+	// Snapshot floors available at 0
+	snapshot, _, err := provider.Preflight(context.Background(), capacityRequest(contracts.CapacityRuntime, "preflight-floored", 0, 0, 0, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.AvailableCPUMillis != 0 || snapshot.AvailableMemoryBytes != 0 || snapshot.AvailableDiskBytes != 0 {
+		t.Fatalf("expected floored available at 0: %#v", snapshot)
+	}
+
+	// New Reserve must be rejected due to zero remaining capacity
+	_, err = provider.Reserve(context.Background(), capacityRequest(contracts.CapacityRuntime, "reserve-over", 1, 1, 1, 0))
+	providerErrorCode(t, err, contracts.ErrCapacity)
+
+	// Same key replay is stable
+	if err := provider.ReconcileRetained(context.Background(), lease, contracts.OperationContext{IdempotencyKey: "reconcile-low"}); err != nil {
+		t.Fatalf("same key replay failed: %v", err)
+	}
+
+	// Different lease same port conflicts
+	diffLease := activeRuntimeLease("cap_diff_lease", 100, 100, 100, 49200)
+	err = provider.ReconcileRetained(context.Background(), diffLease, contracts.OperationContext{IdempotencyKey: "diff-port-conflict"})
+	providerErrorCode(t, err, contracts.ErrConflict)
+}
+
+func TestReconcileRetainedRejectsInvalidLeases(t *testing.T) {
+	provider := capacityProvider(t, fixedReader(hostCapacity()), nil)
+
+	invalidScope := activeRuntimeLease("cap_retained_build", 500, 500, 500, 0)
+	invalidScope.Scope = contracts.CapacityBuild
+	providerErrorCode(t, provider.ReconcileRetained(context.Background(), invalidScope, contracts.OperationContext{IdempotencyKey: "retained-scope"}), contracts.ErrInvalidArgument)
+
+	zeroCPU := activeRuntimeLease("cap_retained_zero", 0, 500, 500, 0)
+	providerErrorCode(t, provider.ReconcileRetained(context.Background(), zeroCPU, contracts.OperationContext{IdempotencyKey: "retained-zero"}), contracts.ErrInvalidArgument)
+
+	negMem := activeRuntimeLease("cap_retained_neg", 500, -10, 500, 0)
+	providerErrorCode(t, provider.ReconcileRetained(context.Background(), negMem, contracts.OperationContext{IdempotencyKey: "retained-neg"}), contracts.ErrInvalidArgument)
+
+	invalidPort := activeRuntimeLease("cap_retained_badport", 500, 500, 500, 70000)
+	providerErrorCode(t, provider.ReconcileRetained(context.Background(), invalidPort, contracts.OperationContext{IdempotencyKey: "retained-badport"}), contracts.ErrInvalidArgument)
+}
+
+func TestReconcileRetainedPromotesToActiveUponReconcileActive(t *testing.T) {
+	provider := capacityProvider(t, fixedReader(hostCapacity()), nil)
+	lease := activeRuntimeLease("cap_retained_promote", 600, 600, 600, 49201)
+
+	if err := provider.ReconcileRetained(context.Background(), lease, contracts.OperationContext{IdempotencyKey: "retained-op"}); err != nil {
+		t.Fatal(err)
+	}
+	if provider.ActiveLeaseCount() != 1 {
+		t.Fatalf("expected 1 active lease: %d", provider.ActiveLeaseCount())
+	}
+
+	// Workload resumes and calls ReconcileActive
+	if err := provider.ReconcileActive(context.Background(), lease, contracts.OperationContext{IdempotencyKey: "resume-op"}); err != nil {
+		t.Fatalf("promoting retained lease to active failed: %v", err)
+	}
+	if provider.ActiveLeaseCount() != 1 {
+		t.Fatalf("promoted lease double counted: %d", provider.ActiveLeaseCount())
+	}
+}
+
+func TestReconcileBidirectionalPortConflictBetweenActiveAndRetained(t *testing.T) {
+	provider := capacityProvider(t, fixedReader(hostCapacity()), nil)
+	activeLease := activeRuntimeLease("cap_active_first", 500, 500, 500, 49205)
+	retainedLease := activeRuntimeLease("cap_retained_second", 500, 500, 500, 49205) // duplicate port
+
+	// Case 1: active first, then retained conflicts
+	if err := provider.ReconcileActive(context.Background(), activeLease, contracts.OperationContext{IdempotencyKey: "active-first"}); err != nil {
+		t.Fatal(err)
+	}
+	err := provider.ReconcileRetained(context.Background(), retainedLease, contracts.OperationContext{IdempotencyKey: "retained-conflict"})
+	providerErrorCode(t, err, contracts.ErrConflict)
+
+	// Case 2: fresh provider with retained first, then active conflicts
+	provider2 := capacityProvider(t, fixedReader(hostCapacity()), nil)
+	if err := provider2.ReconcileRetained(context.Background(), retainedLease, contracts.OperationContext{IdempotencyKey: "retained-first"}); err != nil {
+		t.Fatal(err)
+	}
+	err2 := provider2.ReconcileActive(context.Background(), activeLease, contracts.OperationContext{IdempotencyKey: "active-conflict"})
+	providerErrorCode(t, err2, contracts.ErrConflict)
+}
+
+func TestReconcileRetainedRejectsUnactivatedOrFingerprintMismatch(t *testing.T) {
+	provider := capacityProvider(t, fixedReader(hostCapacity()), nil)
+	// Reserve a lease (unactivated)
+	reserved, err := provider.Reserve(context.Background(), capacityRequest(contracts.CapacityRuntime, "unactivated-reserve", 500, 500, 500, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Calling ReconcileRetained with same ID must fail because it's not activated
+	err = provider.ReconcileRetained(context.Background(), reserved, contracts.OperationContext{IdempotencyKey: "reconcile-unactivated"})
+	providerErrorCode(t, err, contracts.ErrConflict)
+
+	// Now activate a lease and test fingerprint mismatch
+	activated := activeRuntimeLease("cap_activated_mismatch", 500, 500, 500, 49210)
+	if err := provider.ReconcileRetained(context.Background(), activated, contracts.OperationContext{IdempotencyKey: "reconcile-ok"}); err != nil {
+		t.Fatal(err)
+	}
+	mismatch := activated
+	mismatch.Resources.CPUMillis = 501
+	err = provider.ReconcileRetained(context.Background(), mismatch, contracts.OperationContext{IdempotencyKey: "reconcile-mismatch"})
+	providerErrorCode(t, err, contracts.ErrConflict)
+}
+
+type sequencePortAllocator struct {
+	mu     sync.Mutex
+	ports  []int
+	index  int
+	closed []int
+}
+
+type trackClosedListener struct {
+	net.Listener
+	port    int
+	onClose func(int)
+}
+
+func (l *trackClosedListener) Close() error {
+	if l.onClose != nil {
+		l.onClose(l.port)
+	}
+	return l.Listener.Close()
+}
+
+func (a *sequencePortAllocator) Listen(ctx context.Context) (net.Listener, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.index >= len(a.ports) {
+		return nil, errors.New("sequence port allocator exhausted")
+	}
+	port := a.ports[a.index]
+	a.index++
+	rawListener, err := (&net.ListenConfig{}).Listen(ctx, "tcp4", "127.0.0.1:0")
+	if err != nil {
+		return nil, err
+	}
+	// Wrap with custom port for deterministic testing
+	return &trackClosedListener{
+		Listener: rawListener,
+		port:     port,
+		onClose: func(p int) {
+			a.mu.Lock()
+			a.closed = append(a.closed, p)
+			a.mu.Unlock()
+		},
+	}, nil
+}
+
+func (a *sequencePortAllocator) loopbackPort(l net.Listener) (int, error) {
+	if tl, ok := l.(*trackClosedListener); ok {
+		return tl.port, nil
+	}
+	return loopbackPort(l)
+}
+
+func TestReserveAvoidsRetainedHostPortUsingBoundedRetry(t *testing.T) {
+	const retainedPort = 49250
+	const freshPort = 49251
+
+	allocatorCalls := 0
+	closedPorts := make([]int, 0)
+	var mu sync.Mutex
+
+	provider := capacityProvider(t, fixedReader(hostCapacity()), func(config *Config) {
+		config.PortAllocator = PortAllocatorFunc(func(ctx context.Context) (net.Listener, error) {
+			mu.Lock()
+			allocatorCalls++
+			port := freshPort
+			if allocatorCalls == 1 {
+				port = retainedPort // First attempt collides with retained port
+			}
+			mu.Unlock()
+			raw, err := (&net.ListenConfig{}).Listen(ctx, "tcp4", "127.0.0.1:0")
+			if err != nil {
+				return nil, err
+			}
+			// Use fixed loopback port for deterministic test
+			fake := FixedPortAllocator{Port: port}
+			l, err := fake.Listen(ctx)
+			_ = raw.Close()
+			if err != nil {
+				return nil, err
+			}
+			return &trackClosedListener{
+				Listener: l,
+				port:     port,
+				onClose: func(p int) {
+					mu.Lock()
+					closedPorts = append(closedPorts, p)
+					mu.Unlock()
+				},
+			}, nil
+		})
+	})
+
+	// 1. Reconcile a retained lease holding retainedPort (e.g. paused container)
+	retained := activeRuntimeLease("cap_retained_busy", 500, 500, 500, retainedPort)
+	if err := provider.ReconcileRetained(context.Background(), retained, contracts.OperationContext{IdempotencyKey: "reconcile-busy"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Reserve a new port: allocator first yields retainedPort, then freshPort
+	lease, err := provider.Reserve(context.Background(), capacityRequest(contracts.CapacityRuntime, "reserve-fresh", 100, 100, 100, 1))
+	if err != nil {
+		t.Fatalf("Reserve failed: %v", err)
+	}
+
+	// Must get freshPort, not retainedPort
+	if lease.HostPort != freshPort {
+		t.Fatalf("Reserve took retained port: got=%d want=%d", lease.HostPort, freshPort)
+	}
+	// The colliding listener for retainedPort must have been closed immediately
+	mu.Lock()
+	defer mu.Unlock()
+	if len(closedPorts) == 0 || closedPorts[0] != retainedPort {
+		t.Fatalf("colliding port listener was not closed: %v", closedPorts)
+	}
+}
+
+func TestReserveExceedsRetryAttemptsFailsBoundedWithoutLeak(t *testing.T) {
+	const busyPort = 49260
+	closedCount := 0
+	var mu sync.Mutex
+
+	provider := capacityProvider(t, fixedReader(hostCapacity()), func(config *Config) {
+		config.PortAllocator = PortAllocatorFunc(func(ctx context.Context) (net.Listener, error) {
+			fake := FixedPortAllocator{Port: busyPort}
+			l, err := fake.Listen(ctx)
+			if err != nil {
+				return nil, err
+			}
+			return &trackClosedListener{
+				Listener: l,
+				port:     busyPort,
+				onClose: func(int) {
+					mu.Lock()
+					closedCount++
+					mu.Unlock()
+				},
+			}, nil
+		})
+	})
+
+	// Occupy busyPort with active lease
+	active := activeRuntimeLease("cap_active_busy", 500, 500, 500, busyPort)
+	if err := provider.ReconcileActive(context.Background(), active, contracts.OperationContext{IdempotencyKey: "reconcile-active"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Attempt Reserve: allocator always yields busyPort, must fail bounded
+	_, err := provider.Reserve(context.Background(), capacityRequest(contracts.CapacityRuntime, "reserve-fail", 100, 100, 100, 1))
+	providerErrorCode(t, err, contracts.ErrCapacity)
+
+	mu.Lock()
+	defer mu.Unlock()
+	// All retried listeners must have been closed (no leak)
+	if closedCount != maxPortAllocationAttempts {
+		t.Fatalf("expected %d closed attempts, got %d", maxPortAllocationAttempts, closedCount)
+	}
+}
+
+func TestFinalizeReleasedIdempotentWithoutReactivatingOrClaimingPort(t *testing.T) {
+	provider := capacityProvider(t, fixedReader(hostCapacity()), nil)
+	lease := activeRuntimeLease("cap_missing_lease", 500, 500, 500, 49270)
+
+	// 1. Finalize non-existent lease -> idempotent success, does NOT insert active lease or claim port
+	if err := provider.FinalizeReleased(context.Background(), lease, contracts.OperationContext{IdempotencyKey: "finalize-missing"}); err != nil {
+		t.Fatalf("finalize missing lease should succeed: %v", err)
+	}
+	if provider.ActiveLeaseCount() != 0 {
+		t.Fatalf("finalize missing lease created an active lease: count=%d", provider.ActiveLeaseCount())
+	}
+
+	// 2. Now add a real retained lease
+	retained := activeRuntimeLease("cap_real_retained", 500, 500, 500, 49270)
+	if err := provider.ReconcileRetained(context.Background(), retained, contracts.OperationContext{IdempotencyKey: "reconcile-real"}); err != nil {
+		t.Fatal(err)
+	}
+	if provider.ActiveLeaseCount() != 1 {
+		t.Fatalf("expected 1 active lease: %d", provider.ActiveLeaseCount())
+	}
+
+	// 3. Finalize the real retained lease -> transitions to released
+	if err := provider.FinalizeReleased(context.Background(), retained, contracts.OperationContext{IdempotencyKey: "finalize-real"}); err != nil {
+		t.Fatalf("finalize real retained lease failed: %v", err)
+	}
+	if provider.ActiveLeaseCount() != 0 {
+		t.Fatalf("finalized lease remained active: count=%d", provider.ActiveLeaseCount())
+	}
+
+	// 4. Mismatched fingerprint on existing lease is rejected
+	activeAgain := activeRuntimeLease("cap_fingerprint_test", 500, 500, 500, 49271)
+	if err := provider.ReconcileActive(context.Background(), activeAgain, contracts.OperationContext{IdempotencyKey: "reconcile-fp"}); err != nil {
+		t.Fatal(err)
+	}
+	mismatch := activeAgain
+	mismatch.Resources.CPUMillis = 501
+	err := provider.FinalizeReleased(context.Background(), mismatch, contracts.OperationContext{IdempotencyKey: "finalize-mismatch"})
+	providerErrorCode(t, err, contracts.ErrConflict)
+}

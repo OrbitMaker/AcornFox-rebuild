@@ -373,9 +373,9 @@ func TestDebugStatus(t *testing.T) {
 		MaxArtifactSize: 104857600,
 	}
 	initial := desktopupdate.HostInstallation{
-		Version:        "1.0.0",
-		SlotSHA256:     pinned.ID(),
-		BackendBinding: bindingID,
+		Version:         "1.0.0",
+		SlotSHA256:      pinned.ID(),
+		BackendBinding:  bindingID,
 		AppliedSequence: 0,
 	}
 	ctrl, err := desktopupdate.NewHostController(desktopupdate.HostControllerOptions{

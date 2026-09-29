@@ -33,6 +33,12 @@ type ControllerTask struct {
 	DeploymentID domain.ID
 }
 
+type ManagementAuthorization struct {
+	CommandID domain.ID
+	TargetID  domain.ID
+	Action    string
+}
+
 type EnqueueControllerTaskRequest struct {
 	Operation            domain.Operation
 	Deployment           *domain.Deployment
@@ -41,6 +47,7 @@ type EnqueueControllerTaskRequest struct {
 	Payload              json.RawMessage
 	MaxAttempts          int
 	InitialPublishStatus domain.PublishStatus
+	ManagementAuth       *ManagementAuthorization
 }
 
 type AgentEventRequest struct {
@@ -329,6 +336,20 @@ func (s *Store) EnqueueControllerTaskAndCompletePublish(ctx context.Context, req
 func (s *Store) enqueueControllerTaskTx(ctx context.Context, tx *sql.Tx, request EnqueueControllerTaskRequest) (application.Event, error) {
 	if err := request.Operation.Validate(); err != nil {
 		return application.Event{}, err
+	}
+	var appManagementState string
+	if err := tx.QueryRowContext(ctx, `SELECT management_state FROM applications WHERE id=$1 FOR UPDATE`, request.Operation.ApplicationID.String()).Scan(&appManagementState); err == nil {
+		if appManagementState != "active" {
+			authorized := false
+			if request.ManagementAuth != nil && !request.ManagementAuth.CommandID.Empty() && !request.ManagementAuth.TargetID.Empty() {
+				var count int
+				_ = tx.QueryRowContext(ctx, `SELECT count(*) FROM acornfox_management_targets WHERE id = $1 AND command_id = $2`, request.ManagementAuth.TargetID.String(), request.ManagementAuth.CommandID.String()).Scan(&count)
+				authorized = count > 0
+			}
+			if !authorized {
+				return application.Event{}, domain.NewError(domain.ErrConflict, "application is archiving or archived; generic tasks are rejected")
+			}
+		}
 	}
 	if request.Operation.Status != domain.OperationPending {
 		return application.Event{}, domain.ValidationError("new controller operation must be pending")
@@ -1122,6 +1143,14 @@ func (s *Store) FinishControllerTask(ctx context.Context, request FinishControll
 		case ControllerTaskSucceeded:
 			if operation.Type == domain.OperationDestroy || candidateCleanup {
 				if err := value.Transition(domain.DeploymentStopped, request.Now); err != nil {
+					return rollback(err)
+				}
+			} else if operation.Type == domain.OperationStop {
+				if err := value.Transition(domain.DeploymentPaused, request.Now); err != nil {
+					return rollback(err)
+				}
+			} else if operation.Type == domain.OperationStart {
+				if err := value.Transition(domain.DeploymentRuntimeReady, request.Now); err != nil {
 					return rollback(err)
 				}
 			} else if value.Status == domain.DeploymentDeploying {

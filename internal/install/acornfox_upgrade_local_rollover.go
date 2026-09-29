@@ -52,7 +52,13 @@ func (r acornFoxLocalRollover) previous(j acornFoxUpgradeJournal) (acornFoxUpgra
 		return previous, ErrAcornFoxUpgradeConflict
 	}
 	// Reject nesting before validation can recurse.
-	if !acornFoxLocalRolloverEligible(previous, j.Old.Repo.BindingSHA256) || !acornFoxPlainLocal(j) || previous.LayoutSHA256 != j.LayoutSHA256 || previous.PIEnabled != j.PIEnabled || !bytes.Equal(acornFoxUpgradeJSON(acornFoxLocalCurrent(previous)), acornFoxUpgradeJSON(j.Old)) || !bytes.Equal(j.Old.DatabaseEnv, j.Next.DatabaseEnv) || j.Old.ControlPlane.DatabaseIdentitySHA256 != j.Next.ControlPlane.DatabaseIdentitySHA256 {
+	if !acornFoxLocalRolloverEligible(previous, j.Old.Repo.BindingSHA256) || !acornFoxPlainLocal(j) || previous.LayoutSHA256 != j.LayoutSHA256 || !bytes.Equal(acornFoxUpgradeJSON(acornFoxLocalCurrent(previous)), acornFoxUpgradeJSON(j.Old)) || !bytes.Equal(j.Old.DatabaseEnv, j.Next.DatabaseEnv) || j.Old.ControlPlane.DatabaseIdentitySHA256 != j.Next.ControlPlane.DatabaseIdentitySHA256 {
+		return previous, ErrAcornFoxUpgradeConflict
+	}
+	if !isSchema2Image(j.Old) && previous.PIEnabled != j.PIEnabled {
+		return previous, ErrAcornFoxUpgradeConflict
+	}
+	if isSchema2Image(j.Old) && j.PIEnabled {
 		return previous, ErrAcornFoxUpgradeConflict
 	}
 	retiring := acornFoxLocalNonCurrent(previous)
@@ -322,9 +328,9 @@ func (u *acornFoxUpgrade) reconstructLocalRolloverPrefix(s *TaskAcornFoxRepoStor
 		return result, ErrAcornFoxUpgradeConflict
 	}
 	current := acornFoxLocalCurrent(previous)
-	old, err := ParseAcornFoxCandidateBindingV1(current.Binding, current.Repo.BindingSHA256)
-	if err != nil {
-		return result, err
+	old, err := verifiedAcornFoxUpgradePredecessor(current.Binding, current.Repo.BindingSHA256)
+	if err != nil || old.binding.MigrationVersion != AcornFoxV1MigrationVersion || (old.binding.SchemaVersion != AcornFoxCandidateBindingV1Schema && old.binding.SchemaVersion != AcornFoxCandidateBindingV2Schema) {
+		return result, ErrAcornFoxUpgradeConflict
 	}
 	sha := intent.NextBindingSHA256
 	stage, err := u.openStageRoot(s, sha)
@@ -342,7 +348,7 @@ func (u *acornFoxUpgrade) reconstructLocalRolloverPrefix(s *TaskAcornFoxRepoStor
 		stage.Close()
 		return result, ErrAcornFoxUpgradeConflict
 	}
-	b := AcornFoxCandidateBindingV1{SchemaVersion: 1, Product: c.Product, Version: c.Version, ReleaseID: c.ReleaseID, SourceRepository: old.binding.SourceRepository, SourceCommit: c.SourceCommit, Architecture: c.Architecture, MigrationVersion: c.MigrationVersion, ManifestSHA256: c.ManifestSHA256, ArchiveSHA256: c.ArchiveSHA256, BundleManifestSHA256: c.BundleManifestSHA256, NMinusOne: &AcornFoxNMinusOneV1{Version: old.binding.Version, MigrationVersion: old.binding.MigrationVersion, SourceCommit: old.binding.SourceCommit, ReleaseManifestSHA256: old.binding.ManifestSHA256, ArchiveSHA256: old.binding.ArchiveSHA256, BundleManifestSHA256: old.binding.BundleManifestSHA256, BindingSHA256: old.digest}}
+	b := AcornFoxCandidateBindingV1{SchemaVersion: AcornFoxCandidateBindingCurrentSchema, Product: c.Product, Version: c.Version, ReleaseID: c.ReleaseID, SourceRepository: old.binding.SourceRepository, SourceCommit: c.SourceCommit, Architecture: c.Architecture, MigrationVersion: c.MigrationVersion, ManifestSHA256: c.ManifestSHA256, ArchiveSHA256: c.ArchiveSHA256, BundleManifestSHA256: c.BundleManifestSHA256, NMinusOne: &AcornFoxNMinusOneV1{Version: old.binding.Version, MigrationVersion: old.binding.MigrationVersion, SourceCommit: old.binding.SourceCommit, ReleaseManifestSHA256: old.binding.ManifestSHA256, ArchiveSHA256: old.binding.ArchiveSHA256, BundleManifestSHA256: old.binding.BundleManifestSHA256, BindingSHA256: old.digest}}
 	bindingRaw := acornFoxUpgradeJSON(b)
 	binding, err := ParseAcornFoxCandidateBindingV1(bindingRaw, sha)
 	if err != nil {
@@ -359,7 +365,11 @@ func (u *acornFoxUpgrade) reconstructLocalRolloverPrefix(s *TaskAcornFoxRepoStor
 	if err != nil {
 		return result, err
 	}
-	pending := acornFoxUpgradeJournal{SchemaVersion: 1, Phase: "PREPARED", LayoutSHA256: previous.LayoutSHA256, PIEnabled: previous.PIEnabled, LocalRollover: acornFoxNewLocalRollover(previous), Old: current, Next: next}
+	piEnabled := previous.PIEnabled
+	if isSchema2Image(current) {
+		piEnabled = false
+	}
+	pending := acornFoxUpgradeJournal{SchemaVersion: 1, Phase: "PREPARED", LayoutSHA256: previous.LayoutSHA256, PIEnabled: piEnabled, LocalRollover: acornFoxNewLocalRollover(previous), Old: current, Next: next}
 	full := acornFoxUpgradeJSON(pending)
 	if pending.validate(u.layout) != nil || sha256Hex(full) != intent.PendingJournalSHA256 || !bytes.HasPrefix(full, prefix) {
 		return result, ErrAcornFoxUpgradeConflict

@@ -20,8 +20,8 @@ type acornFoxPostgresAdapter struct{ store *postgres.Store }
 
 const acornFoxDeliveryRecoveryLease = 6 * time.Minute
 
-func (a acornFoxPostgresAdapter) BeginAcornFoxDelivery(ctx context.Context, key, digest string, now time.Time) (application.AcornFoxDeliveryResult, bool, error) {
-	raw, replay, err := a.store.ReservePublish(ctx, strings.TrimSpace(key), "sha256:"+strings.TrimPrefix(digest, "sha256:"), now)
+func (a acornFoxPostgresAdapter) BeginAcornFoxDelivery(ctx context.Context, appID domain.ID, key, digest string, now time.Time) (application.AcornFoxDeliveryResult, bool, error) {
+	raw, replay, err := a.store.ReserveAcornFoxPublish(ctx, appID, strings.TrimSpace(key), "sha256:"+strings.TrimPrefix(digest, "sha256:"), now)
 	if errors.Is(err, postgres.ErrIdempotencyInProgress) {
 		err = a.store.AbandonExpiredAcornFoxPublish(ctx, strings.TrimSpace(key), "sha256:"+strings.TrimPrefix(digest, "sha256:"), now, acornFoxDeliveryRecoveryLease)
 	}
@@ -35,7 +35,7 @@ func (a acornFoxPostgresAdapter) BeginAcornFoxDelivery(ctx context.Context, key,
 	return result, true, nil
 }
 
-func (a acornFoxPostgresAdapter) ReplayAcornFoxDelivery(ctx context.Context, key, digest string) (application.AcornFoxDeliveryResult, bool, error) {
+func (a acornFoxPostgresAdapter) ReplayAcornFoxDelivery(ctx context.Context, appID domain.ID, key, digest string) (application.AcornFoxDeliveryResult, bool, error) {
 	raw, found, err := a.store.ReplayPublish(ctx, strings.TrimSpace(key), "sha256:"+strings.TrimPrefix(digest, "sha256:"))
 	if err != nil || !found {
 		return application.AcornFoxDeliveryResult{}, found, acornFoxDeliveryBeginError(err)
@@ -134,6 +134,15 @@ func validAcornFoxTaskPayload(payload json.RawMessage) bool {
 		case "restart":
 			var request contracts.AcornFoxRuntimeActionRequest
 			return task.Kind == v1.TaskRestart && json.Unmarshal(marker["request"], &request) == nil && request.Validate() == nil
+		case "stop":
+			var request contracts.AcornFoxRuntimeActionRequest
+			return task.Kind == v1.TaskStop && json.Unmarshal(marker["request"], &request) == nil && request.Validate() == nil
+		case "start":
+			var request contracts.AcornFoxRuntimeActionRequest
+			return task.Kind == v1.TaskStart && json.Unmarshal(marker["request"], &request) == nil && request.Validate() == nil
+		case "destroy":
+			var request contracts.AcornFoxRuntimeActionRequest
+			return task.Kind == v1.TaskDestroy && json.Unmarshal(marker["request"], &request) == nil && request.Validate() == nil
 		default:
 			return false
 		}

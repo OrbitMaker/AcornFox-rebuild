@@ -21,7 +21,6 @@ var acornFoxSystemdFiles = []string{
 	"acornfox-edge.service",
 	"acornfox-healthcheck.service",
 	"acornfox-healthcheck.timer",
-	"acornfox-pi-worker.service",
 	"acornfox-upgrade-recover.service",
 	"acornfox-upgrade-safe.target",
 	"acornfox-upgrade-finalize.service",

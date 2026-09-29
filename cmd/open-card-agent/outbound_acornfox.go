@@ -114,6 +114,49 @@ func (e *AcornFoxOutboundExecutor) Execute(ctx context.Context, task v1.TaskRequ
 			return failedAcornFox(task, "runtime_observe_failed", err)
 		}
 		return completedAcornFox(task, "runtime restart completed", observation)
+	case "stop":
+		if task.Kind != v1.TaskStop {
+			return rejectedAcornFox(task, "invalid_argument", "AcornFox payload type does not match task kind")
+		}
+		var request contracts.AcornFoxRuntimeActionRequest
+		if err := decodeStrictJSON(payload.Request, &request); err != nil || request.IdempotencyKey != task.IdempotencyKey {
+			return rejectedAcornFox(task, "invalid_argument", "AcornFox stop request is invalid")
+		}
+		lifecycle, ok := e.driver.(contracts.AcornFoxLifecycleDriver)
+		if !ok {
+			return rejectedAcornFox(task, "unsupported_capability", "AcornFox lifecycle stop is unsupported by driver")
+		}
+		if err := lifecycle.Stop(taskContext, request); err != nil {
+			return failedAcornFox(task, "runtime_stop_failed", err)
+		}
+		observation, err := e.driver.Observe(taskContext, contracts.AcornFoxRuntimeReference{Fact: request.Fact})
+		if err != nil {
+			return failedAcornFox(task, "runtime_observe_failed", err)
+		}
+		return completedAcornFox(task, "runtime stop completed", observation)
+	case "start":
+		if task.Kind != v1.TaskStart {
+			return rejectedAcornFox(task, "invalid_argument", "AcornFox payload type does not match task kind")
+		}
+		var request contracts.AcornFoxRuntimeActionRequest
+		if err := decodeStrictJSON(payload.Request, &request); err != nil || request.IdempotencyKey != task.IdempotencyKey {
+			return rejectedAcornFox(task, "invalid_argument", "AcornFox start request is invalid")
+		}
+		lifecycle, ok := e.driver.(contracts.AcornFoxLifecycleDriver)
+		if !ok {
+			return rejectedAcornFox(task, "unsupported_capability", "AcornFox lifecycle start is unsupported by driver")
+		}
+		if err := lifecycle.Start(taskContext, request); err != nil {
+			return failedAcornFox(task, "runtime_start_failed", err)
+		}
+		observation, err := e.driver.Observe(taskContext, contracts.AcornFoxRuntimeReference{Fact: request.Fact})
+		if err != nil {
+			return failedAcornFox(task, "runtime_observe_failed", err)
+		}
+		if observation.RuntimeState != "running" {
+			return failedAcornFox(task, "runtime_start_failed", errors.New("runtime container is not running after start"))
+		}
+		return completedAcornFox(task, "runtime start completed", observation)
 	case "destroy":
 		if task.Kind != v1.TaskDestroy {
 			return rejectedAcornFox(task, "invalid_argument", "AcornFox payload type does not match task kind")
@@ -122,10 +165,18 @@ func (e *AcornFoxOutboundExecutor) Execute(ctx context.Context, task v1.TaskRequ
 		if err := decodeStrictJSON(payload.Request, &request); err != nil || request.IdempotencyKey != task.IdempotencyKey {
 			return rejectedAcornFox(task, "invalid_argument", "AcornFox destroy request is invalid")
 		}
+		var retained []contracts.AcornFoxRetainedVolumeReceipt
+		if observer, ok := e.driver.(contracts.AcornFoxRetainedVolumeObserver); ok {
+			if observed, err := observer.ObserveRetainedVolumes(taskContext, request.Fact); err == nil {
+				retained = observed
+			} else {
+				return failedAcornFox(task, "retained_volume_observe_failed", err)
+			}
+		}
 		if err := e.driver.Destroy(taskContext, request); err != nil {
 			return failedAcornFox(task, "runtime_destroy_failed", err)
 		}
-		return stoppedAcornFox(task, request.Fact, e.now())
+		return stoppedAcornFox(task, request.Fact, retained, e.now())
 	default:
 		return rejectedAcornFox(task, "unsupported_capability", "AcornFox payload type is not allowlisted")
 	}
@@ -163,19 +214,30 @@ func completedAcornFox(task v1.TaskRequest, logMessage string, observation contr
 	}
 }
 
-func stoppedAcornFox(task v1.TaskRequest, fact contracts.AcornFoxRuntimeReleaseFact, now time.Time) acornFoxOutboundResult {
+func stoppedAcornFox(task v1.TaskRequest, fact contracts.AcornFoxRuntimeReleaseFact, retained []contracts.AcornFoxRetainedVolumeReceipt, now time.Time) acornFoxOutboundResult {
 	deploymentID, err := contracts.AcornFoxRuntimeDeploymentID(fact)
 	if err != nil {
 		return failedAcornFox(task, "runtime_identity_mismatch", err)
 	}
-	details, err := json.Marshal(map[string]string{"deployment_id": deploymentID.String(), "runtime_state": "stopped"})
+	detailsMap := map[string]any{
+		"deployment_id": deploymentID.String(),
+		"runtime_state": "stopped",
+	}
+	if len(retained) > 0 {
+		detailsMap["retained_volumes"] = retained
+	}
+	details, err := json.Marshal(detailsMap)
 	if err != nil {
 		return failedAcornFox(task, "internal_error", err)
+	}
+	evidenceRefs := []string{"acornfox-runtime:" + deploymentID.String()}
+	for _, r := range retained {
+		evidenceRefs = append(evidenceRefs, "acornfox-retention:"+r.LogicalName+":"+r.ReceiptDigest)
 	}
 	return acornFoxOutboundResult{
 		Logs:         []v1.LogChunk{{TaskID: task.TaskID, Sequence: 1, Stream: v1.LogStreamStdout, Data: "runtime destroy completed", Final: true}},
 		Observations: []v1.Observation{{TaskID: task.TaskID, Sequence: 1, TargetRef: "deployment/" + deploymentID.String(), Status: "stopped", Healthy: false, At: now.UTC(), Details: details}},
-		Result:       v1.TaskResult{TaskID: task.TaskID, IdempotencyKey: task.IdempotencyKey, Succeeded: true, Status: v1.TaskResultSucceeded, EvidenceRefs: []string{"acornfox-runtime:" + deploymentID.String()}},
+		Result:       v1.TaskResult{TaskID: task.TaskID, IdempotencyKey: task.IdempotencyKey, Succeeded: true, Status: v1.TaskResultSucceeded, EvidenceRefs: evidenceRefs},
 	}
 }
 

@@ -19,12 +19,6 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/open-card/open-card/internal/acornfoxcandidate"
 	"github.com/open-card/open-card/internal/acornfoxenv"
-	aicontext "github.com/open-card/open-card/internal/ai/context"
-	ailedger "github.com/open-card/open-card/internal/ai/ledger"
-	"github.com/open-card/open-card/internal/ai/orchestrator"
-	aiprovider "github.com/open-card/open-card/internal/ai/provider"
-	airunner "github.com/open-card/open-card/internal/ai/runner"
-	aitools "github.com/open-card/open-card/internal/ai/tools"
 	"github.com/open-card/open-card/internal/application"
 	"github.com/open-card/open-card/internal/auth"
 	"github.com/open-card/open-card/internal/buildnetwork"
@@ -42,7 +36,6 @@ import (
 	registryprovider "github.com/open-card/open-card/internal/providers/registryhttp"
 	secretprovider "github.com/open-card/open-card/internal/providers/secret"
 	"github.com/open-card/open-card/internal/providers/source"
-	"github.com/open-card/open-card/internal/rules"
 )
 
 var processIdentity = "legacy"
@@ -669,47 +662,6 @@ func main() {
 						}
 					}()
 				}
-				if getenv(acornfoxenv.M6Enabled) == "true" {
-					m6Context, m6Cancel := context.WithTimeout(context.Background(), 30*time.Second)
-					if err := validateM6Schema(m6Context, store.DB()); err != nil {
-						m6Cancel()
-						log.Fatal(err)
-					}
-					m6Cancel()
-					workspaceRoot := getenv(acornfoxenv.M6WorkspaceRoot)
-					if workspaceRoot == "" {
-						workspaceRoot = buildWorkRoot + "/m6-workspace"
-					}
-					if err := stdio.MkdirAll(workspaceRoot+"/drafts", 0o700); err != nil {
-						log.Fatal(err)
-					}
-					contextBuilder := aicontext.New(aicontext.Config{MaxBytes: 64 << 10, MaxFileBytes: 16 << 10, MaxLogBytes: 24 << 10, MaxLogLines: 256, TemplateVersion: "context-v1"})
-					catalog := aitools.DefaultCatalog()
-					actionRunner, runnerErr := airunner.NewActionRunner(catalog, airunner.Options{})
-					if runnerErr != nil {
-						log.Fatal(runnerErr)
-					}
-					ledgerStore := ailedger.NewPostgres(store.DB())
-					ruleRegistry := rules.NewPostgres(store.DB())
-					baseOrchestrator := orchestrator.Orchestrator{Context: &m6ContextAdapter{builder: contextBuilder}, Catalog: &m6CatalogAdapter{catalog: catalog}, Runner: &m6RunnerAdapter{runner: actionRunner, last: map[string][]airunner.RunResult{}}, Ledger: ledgerStore, Candidates: &m6CandidateAdapter{registry: ruleRegistry, ledger: ledgerStore}, PolicyVersion: "m6-policy-v1"}
-					providers := map[ailedger.Profile]contracts.AIProvider{}
-					for ledgerProfile, providerProfile := range map[ailedger.Profile]aiprovider.Profile{ailedger.ProfileMainland: aiprovider.ProfileChina, ailedger.ProfileGlobal: aiprovider.ProfileGlobal, ailedger.ProfileLocal: aiprovider.ProfileLocal} {
-						providerValue, providerErr := aiprovider.New(aiprovider.Config{Profile: providerProfile, Model: "fixture-v1", PolicyVersion: "m6-policy-v1", Available: true, MaxTokens: 4096, MaxDuration: 30 * time.Second, CacheEnabled: true, CacheTTL: 10 * time.Minute, Cooldown: time.Second})
-						if providerErr != nil {
-							log.Fatal(providerErr)
-						}
-						providers[ledgerProfile] = providerValue
-					}
-					if _, err := ledgerStore.CurrentSettings(context.Background()); errors.Is(err, ailedger.ErrNotFound) {
-						_, _, err = ledgerStore.AppendSettings(context.Background(), ailedger.SettingsRequest{IdempotencyKey: "m6-default-disabled", RequestDigest: "sha256:m6-default-disabled", Settings: ailedger.AISettings{Version: 1, Enabled: false, Profile: ailedger.ProfileDisabled, DataScopes: []string{"operations_summary"}, MaxTokens: 128, MaxDurationMS: 5000, CooldownMS: 60000, CacheEnabled: true, Actor: "control-plane-bootstrap", ExternalCalls: false, CreatedAt: time.Now().UTC()}})
-						if err != nil {
-							log.Fatal(err)
-						}
-					} else if err != nil {
-						log.Fatal(err)
-					}
-					server.SetM6AI(&M6AIHTTPHandler{Backend: &m6AIBackend{db: store.DB(), ledger: ledgerStore, base: baseOrchestrator, providers: providers, workspaceRoot: workspaceRoot}})
-				}
 			}
 		}
 	} else {
@@ -718,20 +670,8 @@ func main() {
 	hostSampler := hostmetrics.NewSampler(hostmetrics.Config{})
 	hostSampler.Start(lifecycleContext)
 	server.SetAcornFoxHostMetrics(hostmetrics.NewHTTPHandler(hostSampler))
-	if getenv(acornfoxenv.AssistantEnabled) == "true" && controllerStore != nil {
-		workerSocket, toolSocket := getenv(acornfoxenv.AssistantWorkerSocket), getenv(acornfoxenv.AssistantToolsSocket)
-		if workerSocket == "" {
-			workerSocket = "/run/acornfox-pi/worker.sock"
-		}
-		if toolSocket == "" {
-			toolSocket = "/run/acornfox-assistant/tools.sock"
-		}
-		stopAssistant, assistantErr := server.configureAcornFoxAssistant(lifecycleContext, controllerStore.DB(), workerSocket, toolSocket)
-		if assistantErr != nil {
-			log.Print("assistant unavailable: verify its protected runtime configuration")
-		} else {
-			defer stopAssistant()
-		}
+	if getenv(acornfoxenv.AssistantEnabled) == "true" {
+		log.Printf("warning: built-in assistant has been retired; %s is ignored", environment.Name(acornfoxenv.AssistantEnabled))
 	}
 
 	if gatewayAddress != "" {

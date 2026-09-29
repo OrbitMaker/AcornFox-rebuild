@@ -19,6 +19,15 @@ func TestProductionPolicyIsDistinctAndClosed(t *testing.T) {
 	}
 }
 
+func TestNativeRootlessProfileUsesOnlyEmbeddedMember(t *testing.T) {
+	if !bytes.Contains(NativeRootlessProfile(), []byte("/embedded/bin/rootlesskit")) || bytes.Contains(NativeRootlessProfile(), []byte("}/bin/rootlesskit")) {
+		t.Fatal("Native AppArmor profile does not name the embedded worker")
+	}
+	if !bytes.Contains(RootlessProfile(), []byte("}/bin/rootlesskit")) || bytes.Contains(RootlessProfile(), []byte("/embedded/bin/rootlesskit")) {
+		t.Fatal("legacy rootless profile bytes changed")
+	}
+}
+
 func TestFirewallScopeBlocksHostAndPostDNATWithoutGlobalChanges(t *testing.T) {
 	rules := HostRules()
 	for _, want := range []string{`iifname "acornfox-bh" counter drop`, `iifname "acornfox-bh" ip daddr @denied_v4 counter drop`, `iifname "acornfox-bh" ip saddr 10.203.253.2 masquerade`} {

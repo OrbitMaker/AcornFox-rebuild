@@ -11,6 +11,7 @@ import (
 )
 
 type sessionState struct {
+	Local     bool      `json:"local,omitempty"`
 	Origin    string    `json:"origin"`
 	Session   string    `json:"session"`
 	CSRF      string    `json:"csrf"`
@@ -90,7 +91,7 @@ func loadState(env func(string) string) (sessionState, error) {
 	if decoder.Decode(&state) != nil || decoder.Decode(&struct{}{}) != io.EOF || state.Origin == "" || state.Session == "" || state.CSRF == "" || state.ExpiresAt.IsZero() {
 		return sessionState{}, errors.New("AcornFox session is invalid; login again")
 	}
-	if _, err := normalizeOrigin(state.Origin, false); err != nil {
+	if _, err := normalizeOrigin(state.Origin, state.Local); err != nil {
 		return sessionState{}, errors.New("AcornFox session is invalid; login again")
 	}
 	if !state.ExpiresAt.After(time.Now().UTC()) {
@@ -158,4 +159,17 @@ func removeState(env func(string) string) error {
 		return nil
 	}
 	return err
+}
+
+func sessionCookieName(state sessionState) string {
+	if state.Local && strings.HasPrefix(state.Origin, "http://") {
+		return "acornfox_local_session"
+	}
+	return "__Host-acornfox_session"
+}
+func csrfCookieName(state sessionState) string {
+	if state.Local && strings.HasPrefix(state.Origin, "http://") {
+		return "acornfox_local_csrf"
+	}
+	return "__Host-acornfox_csrf"
 }

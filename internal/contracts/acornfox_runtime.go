@@ -209,6 +209,43 @@ type AcornFoxRuntimeDriver interface {
 	Destroy(context.Context, AcornFoxRuntimeActionRequest) error
 }
 
+// AcornFoxLifecycleDriver is an optional narrow extension for drivers supporting
+// recoverable stop and start without destroying containers or releasing resources.
+type AcornFoxLifecycleDriver interface {
+	Stop(context.Context, AcornFoxRuntimeActionRequest) error
+	Start(context.Context, AcornFoxRuntimeActionRequest) error
+}
+
+// AcornFoxRetainedVolumeReceipt records verified retention facts for one managed volume.
+// It contains no host paths, passwords, or host-specific secrets.
+type AcornFoxRetainedVolumeReceipt struct {
+	ApplicationID     domain.ID `json:"application_id"`
+	LogicalName       string    `json:"logical_name"`
+	ManagedVolumeName string    `json:"managed_volume_name"`
+	VolumeDriver      string    `json:"volume_driver"`
+	ReceiptDigest     string    `json:"receipt_digest"`
+	VerifiedAt        time.Time `json:"verified_at"`
+}
+
+func (r AcornFoxRetainedVolumeReceipt) Validate() error {
+	if r.ApplicationID.Empty() || strings.TrimSpace(r.LogicalName) == "" || strings.TrimSpace(r.ManagedVolumeName) == "" {
+		return fmt.Errorf("retained volume identity is invalid")
+	}
+	if !strings.HasPrefix(r.ReceiptDigest, "sha256:") || len(r.ReceiptDigest) != 71 {
+		return fmt.Errorf("retained volume receipt digest is invalid")
+	}
+	if r.VerifiedAt.IsZero() {
+		return fmt.Errorf("retained volume verified time is required")
+	}
+	return nil
+}
+
+// AcornFoxRetainedVolumeObserver is an optional extension for drivers that can
+// inspect and return durable volume receipts and fresh daemon volume facts.
+type AcornFoxRetainedVolumeObserver interface {
+	ObserveRetainedVolumes(context.Context, AcornFoxRuntimeReleaseFact) ([]AcornFoxRetainedVolumeReceipt, error)
+}
+
 // AcornFoxRuntimeDeploymentID is stable for one immutable service fact.
 func AcornFoxRuntimeDeploymentID(fact AcornFoxRuntimeReleaseFact) (domain.ID, error) {
 	if err := fact.Validate(); err != nil {

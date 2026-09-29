@@ -536,105 +536,123 @@ button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,te
 .af-recovery code {
   font:12px ui-monospace,SFMono-Regular,Menlo,monospace;
   color:#333}
-.af-assistant-launch {
+.af-ai-help-launch {
   position:fixed;
   right:24px;
   bottom:24px;
   z-index:20;
   display:grid;
   place-items:center;
-  width:40px;
-  height:40px;
-  border:1px solid #dedede;
+  width:42px;
+  height:42px;
+  border:1px solid #d4d4d8;
   border-radius:50%;
-  background:#fff;
-  color:#171717;
-  box-shadow:0 7px 22px #00000016}
-.af-assistant {
+  background:#18181b;
+  color:#fff;
+  box-shadow:0 7px 22px #00000022;
+  cursor:pointer}
+.af-ai-help-launch:hover {
+  background:#27272a}
+.af-ai-help {
   position:fixed;
   z-index:20;
   display:grid;
-  grid-template-rows:auto minmax(0,1fr) auto;
+  grid-template-rows:auto minmax(0,1fr);
   border:1px solid #dedede;
   border-radius:16px;
   background:#fff;
   box-shadow:0 12px 34px #00000018;
   top:5dvh;
   right:16px;
-  width:432px;
+  width:440px;
   max-width:calc(100vw - 32px);
   height:90dvh;
-  bottom:auto;
-  max-height:none}
-.af-assistant>header {
+  bottom:auto}
+.af-ai-help>header {
   display:flex;
   align-items:start;
   justify-content:space-between;
   border-bottom:1px solid #ededed;
-  height:48px;
-  padding:0 12px}
-.af-assistant > header strong {
+  height:52px;
+  padding:0 14px}
+.af-ai-help>header strong {
   display:flex;
   align-items:center;
-  gap:9px;
-  font-size:15px}
-.af-assistant > header strong svg {
-  font-size:18px}
-.af-assistant header small {
+  gap:8px;
+  font-size:14px;
+  line-height:22px;
+  margin-top:6px}
+.af-ai-help>header small {
   display:block;
-  margin-top:7px;
-  color:#666;
+  margin-top:2px;
+  color:#71717a;
   font-size:12px}
-.af-assistant header span {
-  display:flex;
-  gap:8px}
-.af-assistant header button {
+.af-ai-help>header button {
   display:grid;
   place-items:center;
-  width:34px;
-  height:34px;
+  width:30px;
+  height:30px;
   border:1px solid #e3e3e3;
   border-radius:50%;
-  background:#fff}
-.af-assistant__body {
+  background:#fff;
+  margin-top:10px}
+.af-ai-help__body {
   overflow:auto;
-  padding:16px}
-.af-assistant__notice {
-  margin:0;
+  padding:16px;
+  display:flex;
+  flex-direction:column;
+  gap:16px}
+.af-ai-help__banner {
   padding:12px;
   border-radius:8px;
-  background:#f4f4f4;
-  color:#555;
+  background:#f4f4f5;
+  border:1px solid #e4e4e7}
+.af-ai-help__banner h4 {
+  margin:0 0 6px;
   font-size:13px;
-  line-height:1.6}
-.af-assistant__composer {
-  position:relative;
+  font-weight:600}
+.af-ai-help__banner p {
+  margin:0 0 8px;
+  font-size:12px;
+  line-height:1.5;
+  color:#3f3f46}
+.af-ai-help__rules {
+  font-size:12px;
+  line-height:1.5}
+.af-ai-help__rules ol {
+  margin:4px 0 0;
+  padding-left:18px}
+.af-ai-help__rules li {
+  margin:2px 0}
+.af-ai-help__task {
   display:flex;
-  align-items:end;
-  padding:12px;
-  border-top:1px solid #ededed}
-.af-assistant__composer textarea {
-  width:100%;
-  padding:14px 48px 14px 14px;
-  border:1px solid #dedede;
-  border-radius:20px;
-  background:#f8f8f8;
-  resize:none;
-  min-height:64px}
-.af-assistant__composer button {
-  position:absolute;
-  right:25px;
-  bottom:24px;
-  display:grid;
-  place-items:center;
-  width:31px;
-  height:31px;
-  border:0;
-  border-radius:50%;
-  background:#e5e5e5;
-  color:#171717}
-.af-assistant__composer button:disabled {
-  opacity:.5}
+  flex-direction:column;
+  gap:8px}
+.af-ai-help__task header {
+  display:flex;
+  justify-content:space-between;
+  align-items:center}
+.af-ai-help__task h4,.af-ai-help__cli h4 {
+  margin:0;
+  font-size:13px;
+  font-weight:600}
+.af-ai-help__task pre {
+  margin:0;
+  padding:10px;
+  background:#18181b;
+  color:#f4f4f5;
+  border-radius:8px;
+  font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;
+  white-space:pre-wrap;
+  word-break:break-word;
+  max-height:160px;
+  overflow:auto}
+.af-ai-help__cli dl dt {
+  color:#71717a;
+  font-size:12px}
+.af-ai-help__cli dl dd code {
+  font:12px ui-monospace,SFMono-Regular,Menlo,monospace;
+  color:#18181b}
 .af-hidden-api {
   display:none}
 .af-sidebar .af-footer-label {
@@ -674,19 +692,6 @@ button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,te
   border-bottom-color:#181818;
   color:#181818;
   font-weight:600}
-.af-assistant>header strong {
-  display:flex;
-  font-size:14px;
-  line-height:18px}
-.af-assistant__body strong {
-  display:inline;
-  font-size:inherit}
-.af-assistant>header small {
-  margin-top:2px;
-  line-height:14px}
-.af-assistant>header button {
-  width:28px;
-  height:28px}
 .af-note--warn,.af-note--error {
   color:#3f3f46}
 @media(max-width:900px) {
@@ -797,7 +802,7 @@ button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,te
   flex-wrap:wrap}
 .af-facts {
   grid-template-columns:1fr}
-.af-assistant {
+.af-ai-help {
   bottom:14px;
   right:14px;
   width:calc(100vw - 28px)}

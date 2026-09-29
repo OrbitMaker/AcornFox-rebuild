@@ -331,7 +331,7 @@ func (b *acornFoxBindingStore) readNamed(root *os.Root, name, digest string, tem
 		// Historic bindings remain immutable catalog records after a schema
 		// upgrade. They are readable only when the validated upgrade journal
 		// names these exact bytes; they are never accepted as new candidates.
-		if temporary || !b.retainedUpgradeBinding(raw, digest) {
+		if temporary || (!b.installedFrozen0040Binding(root, raw, digest) && !b.retainedUpgradeBinding(raw, digest)) {
 			return nil, ErrAcornFoxRepoConflict
 		}
 	}
@@ -366,6 +366,12 @@ func (b *acornFoxBindingStore) retainedUpgradeBinding(raw []byte, digest string)
 				return true
 			}
 		}
+		if journal.LocalRollover != nil {
+			old, err := journal.LocalRollover.previous(journal)
+			if err == nil && (matches(old.Old) || matches(old.Next)) {
+				return true
+			}
+		}
 		if journal.PostCross == nil {
 			return false
 		}
@@ -375,4 +381,17 @@ func (b *acornFoxBindingStore) retainedUpgradeBinding(raw []byte, digest string)
 		}
 	}
 	return false
+}
+
+// The first upgrade has no upgrade journal yet. Only the exact, terminal
+// installation journal may authorize its already-installed frozen binding.
+// Put and temporary-file reconciliation still accept current candidates only.
+func (b *acornFoxBindingStore) installedFrozen0040Binding(root *os.Root, raw []byte, digest string) bool {
+	binding, err := parseAcornFoxCandidateBindingV1(raw, digest)
+	if err != nil || validateAcornFoxFrozen0040Binding(binding) != nil {
+		return false
+	}
+	journal, _, _, err := b.store.readJournal(root)
+	return err == nil && journal.Phase == AcornFoxRepoPreparedFinal && !journal.NeedsRecovery &&
+		journal.BindingSHA256 == digest && journal.LayoutSHA256 == b.store.layout.evidence()
 }

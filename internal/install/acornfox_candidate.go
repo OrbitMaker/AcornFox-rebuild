@@ -9,8 +9,6 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
-
-	"github.com/open-card/open-card/internal/pibundle"
 )
 
 // AcornFox V1 names are fixed package policy, not installer configuration.
@@ -28,7 +26,9 @@ const (
 	AcornFoxV1CaddyAccount     = "acornfox-caddy"
 	AcornFoxV1EdgeAccount      = "acornfox-edge"
 
-	AcornFoxCandidateBindingV1Schema = 1
+	AcornFoxCandidateBindingV1Schema      = 1
+	AcornFoxCandidateBindingV2Schema      = 2
+	AcornFoxCandidateBindingCurrentSchema = AcornFoxCandidateBindingV2Schema
 	// AcornFoxLegacyPredecessorMigration is accepted only while parsing an
 	// already-installed, independently pinned predecessor binding. New
 	// candidates continue to require AcornFoxV1MigrationVersion.
@@ -47,7 +47,6 @@ var (
 		"bin/acornfox-server", "bin/acornfox-agent", "bin/acornfox-static-server",
 		"bin/acornfox-secretctl", "bin/acornfox-security-probe", "bin/acornfox-imagegc",
 		"bin/acornfox", "bin/acornfox-admin", "bin/acornfox-upgrade", "bin/acornfox-healthcheck",
-		"bin/acornfox-pi-worker",
 		"bin/buildkitd", "bin/buildctl", "bin/buildkit-runc", "bin/rootlesskit", "bin/caddy",
 	}
 	acornFoxV1Units = []string{
@@ -57,7 +56,6 @@ var (
 		"systemd/acornfox-caddy.service", "systemd/acornfox-edge.service", "systemd/acornfox-healthcheck.service",
 		"systemd/acornfox-healthcheck.timer", "systemd/acornfox-upgrade-recover.service",
 		"systemd/acornfox-upgrade-safe.target", "systemd/acornfox-upgrade-finalize.service",
-		"systemd/acornfox-pi-worker.service",
 		"systemd/acornfox-edge.service.d/10-upgrade-marker.conf",
 	}
 	acornFoxV1Scripts = []string{
@@ -90,8 +88,7 @@ type AcornFoxV1PackageFile struct {
 // AcornFoxV1RequiredFiles returns a defensive copy of the fixed required set.
 // Only direct, hashed web/dist/assets members may be added by a release.
 func AcornFoxV1RequiredFiles() []AcornFoxV1PackageFile {
-	piFiles, _ := pibundle.Entries()
-	files := make([]AcornFoxV1PackageFile, 0, len(acornFoxV1Binaries)+len(acornFoxV1Units)+len(acornFoxV1Scripts)+len(acornFoxV1Migrations)+len(piFiles)+20)
+	files := make([]AcornFoxV1PackageFile, 0, len(acornFoxV1Binaries)+len(acornFoxV1Units)+len(acornFoxV1Scripts)+len(acornFoxV1Migrations)+20)
 	for _, path := range acornFoxV1Binaries {
 		files = append(files, AcornFoxV1PackageFile{path, 0o755})
 	}
@@ -104,12 +101,7 @@ func AcornFoxV1RequiredFiles() []AcornFoxV1PackageFile {
 	for _, name := range acornFoxV1Migrations {
 		files = append(files, AcornFoxV1PackageFile{"migrations/control-plane/" + name, 0o640})
 	}
-	for _, file := range piFiles {
-		files = append(files, AcornFoxV1PackageFile{file.Path, file.Mode})
-	}
 	return append(files,
-		AcornFoxV1PackageFile{"pi/extensions/acornfox-tools.ts", 0o644},
-		AcornFoxV1PackageFile{"pi/UPSTREAM-ASSETS.json", 0o644},
 		AcornFoxV1PackageFile{"config/acornfox-build-network-policy-v1.json", 0o644},
 		AcornFoxV1PackageFile{"config/acornfox-build-resolv.conf", 0o644},
 		AcornFoxV1PackageFile{"config/acornfox-rootlesskit.apparmor", 0o644},
@@ -213,6 +205,9 @@ func parseAcornFoxPredecessorBindingV1(data []byte, expectedSHA256 string) (Acor
 	if err := validateAcornFoxBinding(binding); err == nil {
 		return binding, nil
 	}
+	if err := validateAcornFoxFrozen0040Binding(binding); err == nil {
+		return binding, nil
+	}
 	if err := validateAcornFoxRecent0039Binding(binding); err == nil {
 		return binding, nil
 	}
@@ -232,7 +227,7 @@ func cloneAcornFoxBinding(binding AcornFoxCandidateBindingV1) AcornFoxCandidateB
 }
 
 func validateAcornFoxBinding(b AcornFoxCandidateBindingV1) error {
-	if b.SchemaVersion != AcornFoxCandidateBindingV1Schema {
+	if b.SchemaVersion != AcornFoxCandidateBindingV2Schema {
 		return fmt.Errorf("unsupported AcornFox candidate binding schema %d", b.SchemaVersion)
 	}
 	if b.Product != AcornFoxV1Product || b.ReleaseID != "release-"+b.Version {
@@ -387,9 +382,6 @@ func sameAcornFoxNMinusOne(m *NMinusOne, b *AcornFoxNMinusOneV1) bool {
 }
 
 func validateAcornFoxV1PackageInventory(files []FileDigest) error {
-	if _, err := pibundle.Entries(); err != nil {
-		return errors.New("AcornFox Pi package inventory is invalid")
-	}
 	required := AcornFoxV1RequiredFiles()
 	if len(files) < len(required) {
 		return errors.New("AcornFox package misses required entries")

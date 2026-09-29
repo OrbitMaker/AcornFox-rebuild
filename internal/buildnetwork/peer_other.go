@@ -3,10 +3,12 @@
 package buildnetwork
 
 import (
-	"errors"
 	"net"
+
+	"github.com/open-card/open-card/internal/localpeer"
 )
 
-func peerIdentity(net.Conn) (uint32, int32, error) {
-	return 0, 0, errors.New("installed build attestation requires Linux")
+func peerIdentity(conn net.Conn) (uint32, int32, error) {
+	_, err := localpeer.PeerIdentity(conn)
+	return 0, 0, err
 }

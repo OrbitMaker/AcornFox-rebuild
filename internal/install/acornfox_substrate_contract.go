@@ -420,7 +420,10 @@ func parseAcornFoxLegacy0034SubstrateReceipt(raw []byte, old AcornFoxCandidateBi
 // binds that verified tree through CandidateReceipt.TreeSHA256, exact member
 // count, and the closed installed-path/mapping inventory below.
 func validateAcornFoxV1SubstrateInventory(candidate AcornFoxStageReceiptV1, entries []SubstrateEntry) error {
-	return validateAcornFoxSubstrateInventory(candidate, entries, AcornFoxV1RequiredFiles(), acornFoxFixedSubstrateEntries(candidate))
+	if err := validateAcornFoxSubstrateInventory(candidate, entries, AcornFoxV1RequiredFiles(), acornFoxFixedSubstrateEntries(candidate)); err == nil {
+		return nil
+	}
+	return validateAcornFoxSubstrateInventory(candidate, entries, acornFoxFrozen0040RequiredFiles(), acornFoxFrozen0040FixedSubstrateEntries(candidate))
 }
 
 func validateAcornFoxSubstrateInventory(candidate AcornFoxStageReceiptV1, entries []SubstrateEntry, required []AcornFoxV1PackageFile, fixed map[string]SubstrateEntry) error {

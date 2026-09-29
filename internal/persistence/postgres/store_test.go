@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/open-card/open-card/internal/application"
+	"github.com/open-card/open-card/internal/auth"
 	"github.com/open-card/open-card/internal/domain"
 )
 
@@ -73,6 +74,12 @@ func TestOutboxValidationIsFailClosed(t *testing.T) {
 func TestApplicationErrorsRemainCompatible(t *testing.T) {
 	if !errors.Is(ErrNotFound, application.ErrNotFound) {
 		t.Fatal("postgres ErrNotFound must preserve application error identity")
+	}
+	if !errors.Is(ErrNotFound, auth.ErrNotFound) {
+		t.Fatal("postgres ErrNotFound must preserve auth error identity")
+	}
+	if !errors.Is(ErrCredentialVersionConflict, auth.ErrCredentialVersionConflict) {
+		t.Fatal("postgres ErrCredentialVersionConflict must preserve auth error identity")
 	}
 	if !errors.Is(ErrIdempotencyConflict, application.ErrIdempotencyConflict) {
 		t.Fatal("postgres idempotency conflict must preserve application error identity")

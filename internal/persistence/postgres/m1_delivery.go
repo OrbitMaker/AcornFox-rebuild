@@ -115,6 +115,86 @@ func (s *Store) ReservePublish(ctx context.Context, key, requestDigest string, n
 	}
 }
 
+// ReserveAcornFoxPublish locks the application row, asserts active management_state,
+// checks for active management commands, and binds application_id to the publish reservation.
+func (s *Store) ReserveAcornFoxPublish(ctx context.Context, appID domain.ID, key, requestDigest string, now time.Time) (json.RawMessage, bool, error) {
+	if err := s.requireDB(); err != nil {
+		return nil, false, err
+	}
+	if appID.Empty() {
+		return nil, false, domain.ValidationError("application id is required for AcornFox publish")
+	}
+	key, requestDigest = strings.TrimSpace(key), strings.TrimSpace(requestDigest)
+	if key == "" || !strings.HasPrefix(requestDigest, "sha256:") {
+		return nil, false, domain.ValidationError("publish idempotency key and request digest are required")
+	}
+	if now.IsZero() {
+		now = s.now()
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, false, err
+	}
+	rollback := func(cause error) (json.RawMessage, bool, error) { return nil, false, rollbackTx(tx, cause) }
+
+	var managementState string
+	if err := tx.QueryRowContext(ctx, `SELECT management_state FROM applications WHERE id = $1 FOR UPDATE`, appID.String()).Scan(&managementState); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return rollback(domain.NewError(domain.ErrNotFound, "application not found"))
+		}
+		return rollback(err)
+	}
+	if managementState != "active" {
+		return rollback(domain.NewError(domain.ErrConflict, "application is archiving or archived"))
+	}
+	var activeMgmtID string
+	err = tx.QueryRowContext(ctx, `SELECT id FROM acornfox_management_commands WHERE application_id = $1 AND phase NOT IN ('completed', 'failed') FOR UPDATE`, appID.String()).Scan(&activeMgmtID)
+	if err == nil {
+		return rollback(domain.NewError(domain.ErrConflict, "application management operation in progress; publish is locked"))
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return rollback(err)
+	}
+
+	result, err := tx.ExecContext(ctx, `INSERT INTO m1_publish_requests(idempotency_key,request_digest,status,application_id,created_at,updated_at) VALUES($1,$2,'in_progress',$3,$4,$4) ON CONFLICT(idempotency_key) DO NOTHING`, key, requestDigest, appID.String(), now.UTC())
+	if err != nil {
+		return rollback(err)
+	}
+	inserted, err := result.RowsAffected()
+	if err != nil {
+		return rollback(err)
+	}
+	if inserted == 1 {
+		if err := tx.Commit(); err != nil {
+			return nil, false, err
+		}
+		return nil, false, nil
+	}
+	var storedDigest, status string
+	var response []byte
+	var failure sql.NullString
+	var storedAppID sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT request_digest,status,response,failure_reason,application_id FROM m1_publish_requests WHERE idempotency_key=$1 FOR UPDATE`, key).Scan(&storedDigest, &status, &response, &failure, &storedAppID); err != nil {
+		return rollback(err)
+	}
+	if storedDigest != requestDigest || (storedAppID.Valid && storedAppID.String != appID.String()) {
+		return rollback(ErrIdempotencyConflict)
+	}
+	switch status {
+	case "completed":
+		if len(response) == 0 {
+			return rollback(ErrIdempotencyCorrupt)
+		}
+		if err := tx.Commit(); err != nil {
+			return nil, false, err
+		}
+		return append(json.RawMessage(nil), response...), true, nil
+	case "failed":
+		return rollback(publishFailureError(key, failure.String))
+	default:
+		return rollback(ErrIdempotencyInProgress)
+	}
+}
+
 // AbandonExpiredAcornFoxPublish is deliberately namespaced to new AcornFox
 // commands. A process that dies before it can durably queue its Agent task
 // must not leave that idempotency key in_progress forever, nor may a retry

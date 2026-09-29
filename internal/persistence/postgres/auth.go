@@ -10,7 +10,18 @@ import (
 	"github.com/open-card/open-card/internal/domain"
 )
 
-var ErrCredentialVersionConflict = errors.New("administrator credential version conflict")
+var ErrCredentialVersionConflict = domain.ErrCredentialVersionConflict
+
+func (s *Store) AdministratorExists(ctx context.Context) (bool, error) {
+	if err := s.requireDB(); err != nil {
+		return false, err
+	}
+	var exists bool
+	if err := s.db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM admin_credentials)`).Scan(&exists); err != nil {
+		return false, fmt.Errorf("inspect administrator records: %w", err)
+	}
+	return exists, nil
+}
 
 func (s *Store) CreateAdminCredential(ctx context.Context, credential domain.AdminCredential) error {
 	if err := s.requireDB(); err != nil {
@@ -250,6 +261,151 @@ func (s *Store) AdminLoginRateLimit(ctx context.Context, adminID domain.ID, sour
 		return domain.AdminLoginRateLimit{}, fmt.Errorf("read administrator login rate limit: %w", err)
 	}
 	return record, nil
+}
+
+func (s *Store) RecordAdminLoginFailure(ctx context.Context, adminID domain.ID, sourceDigest domain.AuthDigest, now time.Time) (domain.AdminLoginRateLimit, error) {
+	if err := s.requireDB(); err != nil {
+		return domain.AdminLoginRateLimit{}, err
+	}
+	if err := domain.RequireID(adminID, "login rate limit admin id"); err != nil {
+		return domain.AdminLoginRateLimit{}, err
+	}
+	if err := sourceDigest.Validate("login rate limit source digest"); err != nil {
+		return domain.AdminLoginRateLimit{}, err
+	}
+	if now.IsZero() {
+		return domain.AdminLoginRateLimit{}, domain.ValidationError("login failure record time is required")
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return domain.AdminLoginRateLimit{}, fmt.Errorf("begin record login failure tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Acquire an advisory transaction lock to serialize concurrent attempts for this (admin, source)
+	// even before an initial row exists, preventing the absent-row insert race.
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext($1::text), hashtext($2::text))`, adminID.String(), sourceDigest.String()); err != nil {
+		return domain.AdminLoginRateLimit{}, fmt.Errorf("lock login rate limit key: %w", err)
+	}
+
+	var existing *domain.AdminLoginRateLimit
+	record, err := scanAdminLoginRateLimit(tx.QueryRowContext(ctx, `
+		SELECT admin_id, source_digest, window_started_at, window_expires_at, failure_count, last_failure_at, locked_at, locked_until, updated_at
+		  FROM admin_login_rate_limits
+		 WHERE admin_id = $1 AND source_digest = $2
+	`, adminID.String(), sourceDigest.String()))
+	if err == nil {
+		existing = &record
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return domain.AdminLoginRateLimit{}, fmt.Errorf("query existing rate limit: %w", err)
+	}
+
+	next := domain.TransitionAdminLoginRateLimit(existing, adminID, sourceDigest, now)
+	if err := next.Validate(); err != nil {
+		return domain.AdminLoginRateLimit{}, fmt.Errorf("validate transitioned rate limit: %w", err)
+	}
+
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO admin_login_rate_limits
+			(admin_id, source_digest, window_started_at, window_expires_at, failure_count, last_failure_at, locked_at, locked_until, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		ON CONFLICT (admin_id, source_digest) DO UPDATE
+		   SET window_started_at = EXCLUDED.window_started_at,
+		       window_expires_at = EXCLUDED.window_expires_at,
+		       failure_count = EXCLUDED.failure_count,
+		       last_failure_at = EXCLUDED.last_failure_at,
+		       locked_at = EXCLUDED.locked_at,
+		       locked_until = EXCLUDED.locked_until,
+		       updated_at = EXCLUDED.updated_at
+	`, next.AdminID.String(), next.SourceDigest.String(), next.WindowStartedAt.UTC(), next.WindowExpiresAt.UTC(), next.FailureCount, next.LastFailureAt.UTC(), next.LockedAt, next.LockedUntil, next.UpdatedAt.UTC())
+	if err != nil {
+		return domain.AdminLoginRateLimit{}, fmt.Errorf("upsert transitioned rate limit: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return domain.AdminLoginRateLimit{}, fmt.Errorf("commit record login failure: %w", err)
+	}
+	return next, nil
+}
+
+func (s *Store) CreateAdminSessionIfLoginAllowed(ctx context.Context, session domain.AdminSession, sourceDigest domain.AuthDigest, now time.Time) error {
+	if err := s.requireDB(); err != nil {
+		return err
+	}
+	if err := session.Validate(); err != nil {
+		return err
+	}
+	if err := sourceDigest.Validate("session creation source digest"); err != nil {
+		return err
+	}
+	if now.IsZero() {
+		return domain.ValidationError("session authorization time is required")
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin create admin session tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Acquire exact same advisory xact lock as RecordAdminLoginFailure on (adminID, sourceDigest)
+	// to prevent concurrent failure recording from committing a lock between our rate check and session insert.
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext($1::text), hashtext($2::text))`, session.AdminID.String(), sourceDigest.String()); err != nil {
+		return fmt.Errorf("lock admin login session key: %w", err)
+	}
+
+	// 1. Re-check credential state under FOR SHARE lock
+	var credVersion int64
+	var disabledAt sql.NullTime
+	err = tx.QueryRowContext(ctx, `
+		SELECT credential_version, disabled_at
+		  FROM admin_credentials
+		 WHERE id = $1
+		   FOR SHARE
+	`, session.AdminID.String()).Scan(&credVersion, &disabledAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("check admin credential state: %w", err)
+	}
+	if disabledAt.Valid || credVersion != session.CredentialVersion {
+		return ErrCredentialVersionConflict
+	}
+
+	// 2. Re-check full rate limit state and validate record
+	var existingRate *domain.AdminLoginRateLimit
+	rec, err := scanAdminLoginRateLimit(tx.QueryRowContext(ctx, `
+		SELECT admin_id, source_digest, window_started_at, window_expires_at, failure_count, last_failure_at, locked_at, locked_until, updated_at
+		  FROM admin_login_rate_limits
+		 WHERE admin_id = $1 AND source_digest = $2
+	`, session.AdminID.String(), sourceDigest.String()))
+	if err == nil {
+		existingRate = &rec
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("check rate limit state: %w", err)
+	}
+	if existingRate != nil {
+		if err := existingRate.Validate(); err != nil {
+			return fmt.Errorf("validate persisted rate limit: %w", err)
+		}
+		if existingRate.IsLocked(now) {
+			return domain.ErrRateLimited
+		}
+	}
+
+	// 3. Persist session
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO admin_sessions
+			(id, admin_id, session_digest, csrf_digest, credential_version, created_at, last_seen_at, idle_expires_at, absolute_expires_at, revoked_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+	`, session.ID.String(), session.AdminID.String(), session.SessionDigest.String(), session.CSRFDigest.String(), session.CredentialVersion, session.CreatedAt.UTC(), session.LastSeenAt.UTC(), session.IdleExpiresAt.UTC(), session.AbsoluteExpiresAt.UTC(), session.RevokedAt)
+	if err != nil {
+		return fmt.Errorf("create administrator session: %w", err)
+	}
+
+	return tx.Commit()
 }
 
 type rowScanner interface{ Scan(...any) error }

@@ -76,6 +76,8 @@ func (systemPortAllocator) Allocate(ctx context.Context) (int, error) {
 
 func (systemPortAllocator) Release(int) {}
 
+const ApplicationLoopbackNetworkProfile = "application-loopback"
+
 // Config contains provider-owned boundaries. TaskPrefix namespaces every
 // Docker object this provider can create; it must not overlap arbitrary host
 // containers or networks.
@@ -84,6 +86,7 @@ type Config struct {
 	Command               string
 	TaskPrefix            string
 	Network               string
+	NetworkProfile        string
 	WorkRoot              string
 	ImageStore            contracts.ImageStore
 	Capacity              contracts.CapacityProvider
@@ -110,9 +113,22 @@ func (c Config) normalized() (Config, error) {
 	if !safeName.MatchString(c.TaskPrefix) {
 		return Config{}, errors.New("standalone task prefix must be a safe non-empty name")
 	}
+	if c.NetworkProfile != "" && c.NetworkProfile != ApplicationLoopbackNetworkProfile {
+		return Config{}, errors.New("unsupported runtime network profile")
+	}
+	if c.NetworkProfile == ApplicationLoopbackNetworkProfile && (c.WorkerNetworkIsolated || c.ExistingNetworkValidator != nil) {
+		return Config{}, errors.New("application network profile cannot use worker isolation or external network validator")
+	}
 	if c.Network == "" {
 		c.Network = c.TaskPrefix + "-network"
+		if c.NetworkProfile == ApplicationLoopbackNetworkProfile {
+			c.Network = c.TaskPrefix + "-application-network"
+		}
 	}
+	if c.NetworkProfile == ApplicationLoopbackNetworkProfile && c.Network == c.TaskPrefix+"-network" {
+		return Config{}, errors.New("application profile cannot reuse default worker network name")
+	}
+
 	if !safeName.MatchString(c.Network) || !strings.HasPrefix(c.Network, c.TaskPrefix+"-") {
 		return Config{}, errors.New("standalone network must be a task-prefixed safe name")
 	}
@@ -207,7 +223,9 @@ type runtimeState struct {
 	containerPort   int
 	destroyed       bool
 	phase           string
+	schemaVersion   string
 	fingerprint     string
+	networkID       string
 	createdAt       time.Time
 	updatedAt       time.Time
 	leaseGeneration int
@@ -225,9 +243,15 @@ const (
 	runtimeRecoveryPendingRunning    runtimeRecovery = "pending_present_running"
 	runtimeRecoveryPendingNotRunning runtimeRecovery = "pending_present_not_running"
 	runtimeRecoveryDestroyingAbsent  runtimeRecovery = "destroying_absent"
+	runtimeRecoveryPaused            runtimeRecovery = "paused"
+	runtimeRecoveryPausing           runtimeRecovery = "pausing"
+	runtimeRecoveryResuming          runtimeRecovery = "resuming"
 )
 
-var _ contracts.RuntimeDriver = (*Provider)(nil)
+var (
+	_ contracts.RuntimeDriver          = (*Provider)(nil)
+	_ contracts.LifecycleRuntimeDriver = (*Provider)(nil)
+)
 
 func New(config Config) (*Provider, error) {
 	config, err := config.normalized()
@@ -244,6 +268,7 @@ func New(config Config) (*Provider, error) {
 				contracts.CapabilityRuntimeDeploy, contracts.CapabilityRuntimeObserve,
 				contracts.CapabilityRuntimeLogs, contracts.CapabilityRuntimeRestart,
 				contracts.CapabilityRuntimeDestroy,
+				contracts.CapabilityRuntimeStop, contracts.CapabilityRuntimeStart,
 			),
 			SensitiveInputs: []string{"oci archive", "runtime logs"},
 		},
@@ -267,6 +292,77 @@ func (p *Provider) lockDeployment(id domain.ID) func() {
 	p.guardMu.Unlock()
 	lock.Lock()
 	return lock.Unlock
+}
+
+// Read-only observation never waits behind a mutating lifecycle operation.
+func (p *Provider) tryDeploymentRead(ctx context.Context, id domain.ID, op contracts.OperationContext, cap contracts.Capability) (func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	p.guardMu.Lock()
+	lock := p.lifecycleLocks[id]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		p.lifecycleLocks[id] = lock
+	}
+	p.guardMu.Unlock()
+	if !lock.TryLock() {
+		return nil, p.failure(op, cap, "observe", contracts.ErrConflict, "runtime lifecycle is busy", contracts.RetryBackoff, false, nil)
+	}
+	if err := ctx.Err(); err != nil {
+		lock.Unlock()
+		return nil, err
+	}
+	return lock.Unlock, nil
+}
+
+// Caller holds the deployment read lock. All global state-map acquisitions
+// fail busy rather than waiting on an unrelated long lifecycle transaction.
+func (p *Provider) readObservationState(ctx context.Context, id domain.ID, op contracts.OperationContext, cap contracts.Capability) (runtimeState, error) {
+	busy := func() error {
+		return p.failure(op, cap, "observe", contracts.ErrConflict, "runtime state is busy", contracts.RetryBackoff, false, nil)
+	}
+	if err := ctx.Err(); err != nil {
+		return runtimeState{}, err
+	}
+	if id.Empty() {
+		return runtimeState{}, p.failure(op, cap, "observe", contracts.ErrInvalidArgument, "deployment id required", contracts.RetryNever, false, nil)
+	}
+	if !p.mu.TryLock() {
+		return runtimeState{}, busy()
+	}
+	if existing := p.states[id]; existing != nil {
+		state := *existing
+		p.mu.Unlock()
+		return state, nil
+	}
+	p.mu.Unlock()
+	snapshot, found, err := p.readDurableState(id)
+	if err != nil {
+		return runtimeState{}, p.failure(op, cap, "observe", contracts.ErrUnavailable, "durable runtime state unavailable", contracts.RetryAfterReconnect, true, err)
+	}
+	if !found {
+		return runtimeState{}, p.failure(op, cap, "observe", contracts.ErrNotFound, "managed deployment not found", contracts.RetryUserAction, false, nil)
+	}
+	if err = ctx.Err(); err != nil {
+		return runtimeState{}, err
+	}
+	loaded, err := p.stateFromDurable(ctx, snapshot, op, cap, "observe")
+	if err != nil {
+		return runtimeState{}, err
+	}
+	if err = ctx.Err(); err != nil {
+		return runtimeState{}, err
+	}
+	if !p.mu.TryLock() {
+		return runtimeState{}, busy()
+	}
+	defer p.mu.Unlock()
+	if existing := p.states[id]; existing != nil {
+		return *existing, nil
+	}
+	p.states[id] = loaded
+	return *loaded, nil
 }
 
 func (p *Provider) Deploy(ctx context.Context, request contracts.DeployRequest) (domain.Deployment, error) {
@@ -373,7 +469,18 @@ func (p *Provider) recreateLegacy(ctx context.Context, request contracts.DeployR
 				}
 				return deployment, nil
 			}
-		} else {
+		}
+		if state.phase == "paused" || state.phase == "pausing" || state.phase == "resuming" {
+			p.mu.Unlock()
+			return domain.Deployment{}, p.failure(request.Operation, contracts.CapabilityRuntimeDeploy, "recreate", contracts.ErrConflict, "runtime is in a paused or transitioning lifecycle phase", contracts.RetryNever, false, nil)
+		}
+		for existingHash, existingAction := range state.actions {
+			if existingHash != actionHash && existingAction.status == "started" {
+				p.mu.Unlock()
+				return domain.Deployment{}, p.failure(request.Operation, contracts.CapabilityRuntimeDeploy, "recreate", contracts.ErrConflict, "another runtime mutation is unfinished", contracts.RetryBackoff, true, nil)
+			}
+		}
+		if action, ok := state.actions[actionHash]; !ok || action.status != "started" {
 			now := p.config.Clock().UTC()
 			state.actions[actionHash] = runtimeAction{identityHash: actionHash, action: "recreate", fingerprint: state.fingerprint, status: "started", previousContainerID: state.containerID, at: now}
 			state.updatedAt = now
@@ -622,33 +729,103 @@ func (p *Provider) recover(ctx context.Context, container string, deployment dom
 	return &runtimeState{configuration: copyRuntimeConfiguration(request.Spec.Configuration), configDigest: request.Spec.ConfigDigest, deployment: deployment, service: request.Spec.ServiceName, image: request.Spec.Image, container: container, containerID: facts.ID, port: port, containerPort: request.Spec.Port, phase: "active", fingerprint: p.fingerprint(deployment.ID, request.Spec), createdAt: now, updatedAt: now, actions: make(map[string]runtimeAction), resources: request.Spec.Resources}, true, nil
 }
 
-func (p *Provider) Observe(ctx context.Context, request contracts.ObserveRequest) (contracts.RuntimeObservation, error) {
-	if err := p.check(ctx, request.Operation, contracts.CapabilityRuntimeObserve, "observe"); err != nil {
-		return contracts.RuntimeObservation{}, err
-	}
-	state, err := p.state(request.DeploymentID, request.Operation, contracts.CapabilityRuntimeObserve, "observe")
+// DeploymentObservationSnapshot holds verified runtime observation facts and immutable deployment metadata.
+type DeploymentObservationSnapshot struct {
+	Observation   contracts.RuntimeObservation `json:"observation"`
+	Deployment    domain.Deployment            `json:"deployment"`
+	Image         domain.ImageDigest           `json:"image"`
+	ContainerName string                       `json:"container_name,omitempty"`
+	ContainerPort int                          `json:"container_port,omitempty"`
+	StartedAt     string                       `json:"started_at,omitempty"`
+}
+
+func (p *Provider) ObserveDeploymentSnapshot(ctx context.Context, request contracts.ObserveRequest) (DeploymentObservationSnapshot, error) {
+	unlock, err := p.tryDeploymentRead(ctx, request.DeploymentID, request.Operation, contracts.CapabilityRuntimeObserve)
 	if err != nil {
-		return contracts.RuntimeObservation{}, err
+		return DeploymentObservationSnapshot{}, err
+	}
+	defer unlock()
+	return p.observeDeploymentSnapshotLocked(ctx, request)
+}
+
+// ObserveExpectedDeploymentSnapshot verifies a Core-approved immutable spec with
+// the same locked state, volume and Docker readback checks as ordinary observe.
+func (p *Provider) ObserveExpectedDeploymentSnapshot(ctx context.Context, request contracts.ObserveRequest, expected contracts.RuntimeSpec) (DeploymentObservationSnapshot, error) {
+	unlock, err := p.tryDeploymentRead(ctx, request.DeploymentID, request.Operation, contracts.CapabilityRuntimeObserve)
+	if err != nil {
+		return DeploymentObservationSnapshot{}, err
+	}
+	defer unlock()
+	if err := p.validateSpec(expected, request.Operation); err != nil {
+		return DeploymentObservationSnapshot{}, err
+	}
+	return p.observeDeploymentSnapshotLocked(ctx, request, expected)
+}
+
+func (p *Provider) observeDeploymentSnapshotLocked(ctx context.Context, request contracts.ObserveRequest, expected ...contracts.RuntimeSpec) (DeploymentObservationSnapshot, error) {
+	if err := p.check(ctx, request.Operation, contracts.CapabilityRuntimeObserve, "observe"); err != nil {
+		return DeploymentObservationSnapshot{}, err
+	}
+	state, err := p.readObservationState(ctx, request.DeploymentID, request.Operation, contracts.CapabilityRuntimeObserve)
+	if err != nil {
+		return DeploymentObservationSnapshot{}, err
+	}
+	if len(expected) > 0 && p.fingerprint(request.DeploymentID, expected[0]) != state.fingerprint {
+		return DeploymentObservationSnapshot{}, p.failure(request.Operation, contracts.CapabilityRuntimeObserve, "observe", contracts.ErrConflict, "runtime differs from approved immutable specification", contracts.RetryNever, false, nil)
 	}
 	if state.destroyed {
-		return p.observation(state, "stopped", false, 0, 0, 0, contracts.ResourceLimits{}, false, "", request.Operation), nil
+		obs := p.observation(state, "stopped", false, 0, 0, 0, contracts.ResourceLimits{}, false, "", request.Operation)
+		return DeploymentObservationSnapshot{
+			Observation: obs,
+			Deployment:  state.deployment,
+		}, nil
 	}
 	if err := p.verifyRuntimeVolumes(ctx, state.runtimeSpec(), request.Operation); err != nil {
-		return contracts.RuntimeObservation{}, err
+		return DeploymentObservationSnapshot{}, err
 	}
 	facts, err := p.inspectFacts(ctx, state.container)
 	if err != nil {
-		return contracts.RuntimeObservation{}, p.commandError(request.Operation, contracts.CapabilityRuntimeObserve, "observe", err)
+		return DeploymentObservationSnapshot{}, p.commandError(request.Operation, contracts.CapabilityRuntimeObserve, "observe", err)
 	}
 	port, valid := facts.matchesConfiguration(p.config, state.deployment, state.runtimeSpec())
 	if !valid || port != state.port {
-		return contracts.RuntimeObservation{}, p.failure(request.Operation, contracts.CapabilityRuntimeObserve, "observe", contracts.ErrConflict, "Docker runtime readback does not match the constrained deployment", contracts.RetryNever, false, nil)
+		return DeploymentObservationSnapshot{}, p.failure(request.Operation, contracts.CapabilityRuntimeObserve, "observe", contracts.ErrConflict, "Docker runtime readback does not match the constrained deployment", contracts.RetryNever, false, nil)
 	}
 	status := facts.State.Status
-	if status == "" && facts.State.Running {
+	if state.phase == "paused" {
+		status = "paused"
+	} else if status == "" && facts.State.Running {
 		status = "running"
 	}
-	return p.observation(state, status, facts.State.Running, facts.RestartCount, 0, 0, state.resources, true, facts.ID, request.Operation), nil
+
+	actualName := strings.TrimPrefix(facts.Name, "/")
+	if actualName != state.container {
+		return DeploymentObservationSnapshot{}, p.failure(request.Operation, contracts.CapabilityRuntimeObserve, "observe", contracts.ErrConflict, "Docker runtime name does not match constrained container identity", contracts.RetryNever, false, nil)
+	}
+
+	obs := p.observation(state, status, facts.State.Running, facts.RestartCount, 0, 0, state.resources, true, facts.ID, request.Operation)
+
+	imageDigest := state.runtimeSpec().Image
+	if facts.Image != "" {
+		imageDigest.Digest = facts.Image
+	}
+
+	return DeploymentObservationSnapshot{
+		Observation:   obs,
+		Deployment:    state.deployment,
+		Image:         imageDigest,
+		StartedAt:     facts.State.StartedAt,
+		ContainerName: actualName,
+		ContainerPort: state.runtimeSpec().Port,
+	}, nil
+}
+
+func (p *Provider) Observe(ctx context.Context, request contracts.ObserveRequest) (contracts.RuntimeObservation, error) {
+	snap, err := p.ObserveDeploymentSnapshot(ctx, request)
+	if err != nil {
+		return contracts.RuntimeObservation{}, err
+	}
+	return snap.Observation, nil
 }
 
 func (p *Provider) Logs(ctx context.Context, request contracts.LogsRequest) (<-chan string, error) {
@@ -684,15 +861,23 @@ func (p *Provider) ReadAcornFoxLogs(ctx context.Context, request contracts.LogsR
 	if err := p.check(ctx, request.Operation, contracts.CapabilityRuntimeLogs, "logs"); err != nil {
 		return contracts.AcornFoxBoundedLogs{}, err
 	}
-	state, err := p.state(request.DeploymentID, request.Operation, contracts.CapabilityRuntimeLogs, "logs")
+	unlock, err := p.tryDeploymentRead(ctx, request.DeploymentID, request.Operation, contracts.CapabilityRuntimeLogs)
+	if err != nil {
+		return contracts.AcornFoxBoundedLogs{}, err
+	}
+	defer unlock()
+	state, err := p.readObservationState(ctx, request.DeploymentID, request.Operation, contracts.CapabilityRuntimeLogs)
 	if err != nil {
 		return contracts.AcornFoxBoundedLogs{}, err
 	}
 	if request.ServiceName != "" && request.ServiceName != state.service {
 		return contracts.AcornFoxBoundedLogs{}, p.failure(request.Operation, contracts.CapabilityRuntimeLogs, "logs", contracts.ErrValidation, "runtime service does not match deployment", contracts.RetryNever, false, nil)
 	}
+	if !validContainerID(state.containerID) {
+		return contracts.AcornFoxBoundedLogs{}, p.failure(request.Operation, contracts.CapabilityRuntimeLogs, "logs", contracts.ErrConflict, "immutable runtime container identity unavailable", contracts.RetryNever, false, nil)
+	}
 	capture := newBoundedAcornFoxLogCapture(contracts.AcornFoxLogsMaxBytes)
-	if err := p.config.Runner.Run(ctx, p.config.Command, dockerLogsArgs(request, state.container), capture.stdoutWriter(), capture.stderrWriter()); err != nil {
+	if err := p.config.Runner.Run(ctx, p.config.Command, dockerLogsArgs(request, state.containerID), capture.stdoutWriter(), capture.stderrWriter()); err != nil {
 		return contracts.AcornFoxBoundedLogs{}, p.commandError(request.Operation, contracts.CapabilityRuntimeLogs, "logs", err)
 	}
 	return capture.result(), nil
@@ -820,13 +1005,27 @@ func (p *Provider) Restart(ctx context.Context, request contracts.RestartRequest
 	if action, done := state.actions[actionHash]; done && action.status == "succeeded" && action.action == "restart" && action.fingerprint == state.fingerprint {
 		return nil
 	}
+	if state.destroyed || state.phase != "active" {
+		return p.failure(request.Operation, contracts.CapabilityRuntimeRestart, "restart", contracts.ErrConflict, "runtime is not in an active state", contracts.RetryNever, false, nil)
+	}
+	for hashKey, existingAction := range state.actions {
+		if hashKey != actionHash && existingAction.status == "started" {
+			return p.failure(request.Operation, contracts.CapabilityRuntimeRestart, "restart", contracts.ErrConflict, "concurrent or unfinished runtime action is pending", contracts.RetryBackoff, true, nil)
+		}
+	}
+	if state.containerID == "" || !validContainerID(state.containerID) {
+		return p.failure(request.Operation, contracts.CapabilityRuntimeRestart, "restart", contracts.ErrConflict, "persisted container id is missing", contracts.RetryNever, false, nil)
+	}
 	if err := p.verifyRuntimeVolumes(ctx, state.runtimeSpec(), request.Operation); err != nil {
 		return err
 	}
-	facts, inspectErr := p.inspectFacts(ctx, state.container)
-	_, matches := facts.matchesConfiguration(p.config, state.deployment, state.runtimeSpec())
-	if inspectErr != nil || !matches {
+	facts, inspectErr := p.inspectFacts(ctx, state.containerID)
+	if inspectErr != nil || facts.ID != state.containerID {
 		return p.failure(request.Operation, contracts.CapabilityRuntimeRestart, "restart", contracts.ErrConflict, "runtime facts do not match before restart", contracts.RetryNever, false, inspectErr)
+	}
+	_, matches := facts.matchesConfiguration(p.config, state.deployment, state.runtimeSpec())
+	if !matches {
+		return p.failure(request.Operation, contracts.CapabilityRuntimeRestart, "restart", contracts.ErrConflict, "runtime configuration drifted before restart", contracts.RetryNever, false, nil)
 	}
 	if action, started := state.actions[actionHash]; started && action.action == "restart" && action.fingerprint == state.fingerprint && action.status == "started" && action.previousStartedAt != "" && facts.State.StartedAt != "" && facts.State.StartedAt != action.previousStartedAt {
 		action.status, action.at = "succeeded", p.config.Clock().UTC()
@@ -838,19 +1037,22 @@ func (p *Provider) Restart(ctx context.Context, request contracts.RestartRequest
 	}
 	if _, started := state.actions[actionHash]; !started {
 		now := p.config.Clock().UTC()
-		state.actions[actionHash] = runtimeAction{identityHash: actionHash, action: "restart", fingerprint: state.fingerprint, status: "started", previousContainerID: facts.ID, previousStartedAt: facts.State.StartedAt, at: now}
+		state.actions[actionHash] = runtimeAction{identityHash: actionHash, action: "restart", fingerprint: state.fingerprint, status: "started", previousContainerID: state.containerID, previousStartedAt: facts.State.StartedAt, at: now}
 		state.updatedAt = now
 		if err := p.persistState(state); err != nil {
 			return p.failure(request.Operation, contracts.CapabilityRuntimeRestart, "persist_state", contracts.ErrUnavailable, "pending restart state could not be persisted", contracts.RetryBackoff, true, err)
 		}
 	}
-	if err := p.run(ctx, []string{"restart", state.container}); err != nil {
+	if err := p.run(ctx, []string{"restart", state.containerID}); err != nil {
 		return p.commandError(request.Operation, contracts.CapabilityRuntimeRestart, "restart", err)
 	}
+	after, err := p.inspectFacts(ctx, state.containerID)
+	if err != nil || after.ID != state.containerID {
+		return p.failure(request.Operation, contracts.CapabilityRuntimeRestart, "restart", contracts.ErrConflict, "runtime container identity changed after restart", contracts.RetryNever, false, nil)
+	}
 	if state.configuration != nil {
-		after, err := p.inspectFacts(ctx, state.container)
 		_, matches := after.matchesRunning(p.config, state.deployment, state.runtimeSpec())
-		if err != nil || !matches || after.ID != facts.ID {
+		if !matches {
 			return p.failure(request.Operation, contracts.CapabilityRuntimeRestart, "restart", contracts.ErrConflict, "runtime configuration changed after restart", contracts.RetryNever, false, nil)
 		}
 	}
@@ -899,21 +1101,50 @@ func (p *Provider) destroyOperation(ctx context.Context, request contracts.Destr
 	if action, ok := state.actions[actionHash]; ok && action.action == "destroy" && action.fingerprint == state.fingerprint && action.status == "succeeded" && state.destroyed && state.capacity == nil {
 		return nil
 	}
+	if state.containerID == "" {
+		return p.failure(request.Operation, contracts.CapabilityRuntimeDestroy, "destroy", contracts.ErrConflict, "persisted container id is missing; repair is required before destroy", contracts.RetryNever, false, nil)
+	}
 	if !state.destroyed {
-		now := p.config.Clock().UTC()
-		state.actions[actionHash] = runtimeAction{identityHash: actionHash, action: "destroy", fingerprint: state.fingerprint, status: "started", previousContainerID: state.containerID, at: now}
-		state.phase, state.updatedAt = "destroying", now
-		if err := p.persistState(state); err != nil {
-			return p.failure(request.Operation, contracts.CapabilityRuntimeDestroy, "persist_state", contracts.ErrUnavailable, "pending destroy state could not be persisted", contracts.RetryBackoff, true, err)
-		}
-		if err := p.run(ctx, []string{"rm", "--force", state.container}); err != nil {
-			return p.commandError(request.Operation, contracts.CapabilityRuntimeDestroy, "destroy", err)
-		}
-		state.destroyed = true
-		state.phase, state.updatedAt = "destroyed", p.config.Clock().UTC()
-		state.port = 0
-		if err := p.persistState(state); err != nil {
-			return p.failure(request.Operation, contracts.CapabilityRuntimeDestroy, "persist_state", contracts.ErrUnavailable, "removed runtime state could not be persisted", contracts.RetryBackoff, true, err)
+		facts, inspectErr := p.inspectFacts(ctx, state.containerID)
+		if inspectErr != nil {
+			absent, absentErr := p.confirmContainerAbsentByID(ctx, state.containerID)
+			if absentErr != nil || !absent {
+				return p.failure(request.Operation, contracts.CapabilityRuntimeDestroy, "destroy", contracts.ErrUnavailable, "container absence could not be confirmed with daemon", contracts.RetryAfterReconnect, true, absentErr)
+			}
+			now := p.config.Clock().UTC()
+			state.actions[actionHash] = runtimeAction{identityHash: actionHash, action: "destroy", fingerprint: state.fingerprint, status: "started", previousContainerID: state.containerID, at: now}
+			state.destroyed = true
+			state.phase, state.updatedAt = "destroyed", now
+			state.port = 0
+			if err := p.persistState(state); err != nil {
+				return p.failure(request.Operation, contracts.CapabilityRuntimeDestroy, "persist_state", contracts.ErrUnavailable, "converged destroy state could not be persisted", contracts.RetryBackoff, true, err)
+			}
+		} else {
+			if facts.ID != state.containerID {
+				return p.failure(request.Operation, contracts.CapabilityRuntimeDestroy, "destroy", contracts.ErrConflict, "container identity changed before destroy", contracts.RetryNever, false, nil)
+			}
+			_, matches := facts.matchesConfiguration(p.config, state.deployment, state.runtimeSpec())
+			if !matches {
+				return p.failure(request.Operation, contracts.CapabilityRuntimeDestroy, "destroy", contracts.ErrConflict, "runtime configuration drifted before destroy", contracts.RetryNever, false, nil)
+			}
+			if err := p.verifyRuntimeVolumes(ctx, state.runtimeSpec(), request.Operation); err != nil {
+				return err
+			}
+			now := p.config.Clock().UTC()
+			state.actions[actionHash] = runtimeAction{identityHash: actionHash, action: "destroy", fingerprint: state.fingerprint, status: "started", previousContainerID: state.containerID, at: now}
+			state.phase, state.updatedAt = "destroying", now
+			if err := p.persistState(state); err != nil {
+				return p.failure(request.Operation, contracts.CapabilityRuntimeDestroy, "persist_state", contracts.ErrUnavailable, "pending destroy state could not be persisted", contracts.RetryBackoff, true, err)
+			}
+			if err := p.run(ctx, []string{"rm", "--force", state.containerID}); err != nil {
+				return p.commandError(request.Operation, contracts.CapabilityRuntimeDestroy, "destroy", err)
+			}
+			state.destroyed = true
+			state.phase, state.updatedAt = "destroyed", p.config.Clock().UTC()
+			state.port = 0
+			if err := p.persistState(state); err != nil {
+				return p.failure(request.Operation, contracts.CapabilityRuntimeDestroy, "persist_state", contracts.ErrUnavailable, "removed runtime state could not be persisted", contracts.RetryBackoff, true, err)
+			}
 		}
 	}
 	if state.capacity != nil {
@@ -966,6 +1197,9 @@ func (p *Provider) validateSpec(spec contracts.RuntimeSpec, operation contracts.
 func (p *Provider) ensureNetwork(ctx context.Context, operation contracts.OperationContext) error {
 	p.networkMu.Lock()
 	defer p.networkMu.Unlock()
+	if p.config.NetworkProfile == ApplicationLoopbackNetworkProfile {
+		return p.ensureApplicationNetwork(ctx, operation)
+	}
 	if p.config.ExistingNetworkValidator != nil {
 		raw, err := p.output(ctx, []string{"network", "inspect", p.config.Network})
 		if err != nil || p.config.ExistingNetworkValidator([]byte(raw)) != nil {
@@ -988,6 +1222,110 @@ func (p *Provider) ensureNetwork(ctx context.Context, operation contracts.Operat
 		return p.commandError(operation, contracts.CapabilityRuntimeDeploy, "deploy", err)
 	}
 	return nil
+}
+
+type applicationNetworkFacts struct {
+	ID       string            `json:"Id"`
+	Name     string            `json:"Name"`
+	Driver   string            `json:"Driver"`
+	Internal *bool             `json:"Internal"`
+	Labels   map[string]string `json:"Labels"`
+	Options  map[string]string `json:"Options"`
+}
+
+func (p *Provider) validateApplicationNetwork(raw []byte) (applicationNetworkFacts, error) {
+	var networks []applicationNetworkFacts
+	if err := json.Unmarshal(raw, &networks); err != nil || len(networks) != 1 {
+		return applicationNetworkFacts{}, errors.New("application network readback is malformed")
+	}
+	n := networks[0]
+	if !validContainerID(n.ID) || n.Name != p.config.Network || n.Driver != "bridge" || n.Internal == nil || *n.Internal || n.Labels["open-card.managed"] != "true" || n.Labels["open-card.task-prefix"] != p.config.TaskPrefix || n.Labels["open-card.network-profile"] != ApplicationLoopbackNetworkProfile {
+		return applicationNetworkFacts{}, errors.New("application network is not the owned NAT profile")
+	}
+	for _, key := range []string{"com.docker.network.bridge.gateway_mode_ipv4", "com.docker.network.bridge.gateway_mode_ipv6"} {
+		if mode := n.Options[key]; mode != "" && mode != "nat" {
+			return applicationNetworkFacts{}, errors.New("application network gateway mode is not NAT")
+		}
+	}
+	if v := n.Options["com.docker.network.bridge.enable_ip_masquerade"]; v != "" && v != "true" {
+		return applicationNetworkFacts{}, errors.New("application network masquerading is disabled")
+	}
+	if v := n.Options["com.docker.network.bridge.inhibit_ipv4"]; v != "" && v != "false" {
+		return applicationNetworkFacts{}, errors.New("application network IPv4 is inhibited")
+	}
+	if n.Options["com.docker.network.bridge.trusted_host_interfaces"] != "" {
+		return applicationNetworkFacts{}, errors.New("application network direct routing is unsupported")
+	}
+	return n, nil
+}
+
+func (p *Provider) ensureApplicationNetwork(ctx context.Context, operation contracts.OperationContext) error {
+	raw, err := p.output(ctx, []string{"network", "inspect", p.config.Network})
+	if err != nil {
+		listed, listErr := p.output(ctx, []string{"network", "ls", "--filter", "name=^" + p.config.Network + "$", "--format", "{{.ID}}"})
+		if listErr != nil || strings.TrimSpace(listed) != "" {
+			return p.failure(operation, contracts.CapabilityRuntimeDeploy, "network", contracts.ErrUnavailable, "application network absence could not be confirmed", contracts.RetryAfterReconnect, true, nil)
+		}
+		args := []string{"network", "create", "--driver", "bridge", "--opt", "com.docker.network.bridge.gateway_mode_ipv4=nat", "--label", "open-card.managed=true", "--label", "open-card.task-prefix=" + p.config.TaskPrefix, "--label", "open-card.network-profile=" + ApplicationLoopbackNetworkProfile, p.config.Network}
+		if err := p.run(ctx, args); err != nil {
+			return p.commandError(operation, contracts.CapabilityRuntimeDeploy, "network", err)
+		}
+		raw, err = p.output(ctx, []string{"network", "inspect", p.config.Network})
+		if err != nil {
+			return p.commandError(operation, contracts.CapabilityRuntimeDeploy, "network", err)
+		}
+	}
+	if _, err := p.validateApplicationNetwork([]byte(raw)); err != nil {
+		return p.failure(operation, contracts.CapabilityRuntimeDeploy, "network", contracts.ErrConflict, "application network policy readback failed", contracts.RetryUserAction, false, err)
+	}
+	return nil
+}
+
+// SelectImageLocator chooses an expected locator from explicit daemon backend facts.
+// This is not an observation: Deploy still loads and verifies the exact image ID.
+func (p *Provider) SelectImageLocator(ctx context.Context, manifest domain.ImageDigest, archiveConfigDigest string, operation contracts.OperationContext) (domain.ImageDigest, error) {
+	if err := p.check(ctx, operation, contracts.CapabilityRuntimeObserve, "image_locator"); err != nil {
+		return domain.ImageDigest{}, err
+	}
+	if !validImageID(manifest.Digest) || !validImageID(archiveConfigDigest) {
+		return domain.ImageDigest{}, p.failure(operation, contracts.CapabilityRuntimeObserve, "image_locator", contracts.ErrValidation, "OCI image identities are invalid", contracts.RetryNever, false, nil)
+	}
+	ctx, cancel := p.operationContext(ctx, operation)
+	defer cancel()
+	output, err := p.output(ctx, []string{"info", "--format", `{"driver":{{json .Driver}},"driver_status":{{json .DriverStatus}}}`})
+	if err != nil {
+		return domain.ImageDigest{}, p.commandError(operation, contracts.CapabilityRuntimeObserve, "image_locator", err)
+	}
+	var facts struct {
+		Driver       string     `json:"driver"`
+		DriverStatus [][]string `json:"driver_status"`
+	}
+	if err := json.Unmarshal([]byte(output), &facts); err != nil || facts.Driver == "" {
+		return domain.ImageDigest{}, p.failure(operation, contracts.CapabilityRuntimeObserve, "image_locator", contracts.ErrValidation, "Docker backend facts are malformed", contracts.RetryNever, false, nil)
+	}
+	driverType := ""
+	for _, row := range facts.DriverStatus {
+		if len(row) != 2 || row[0] == "" {
+			return domain.ImageDigest{}, p.failure(operation, contracts.CapabilityRuntimeObserve, "image_locator", contracts.ErrValidation, "Docker backend status is malformed", contracts.RetryNever, false, nil)
+		}
+		if row[0] == "driver-type" {
+			if driverType != "" || row[1] == "" {
+				return domain.ImageDigest{}, p.failure(operation, contracts.CapabilityRuntimeObserve, "image_locator", contracts.ErrValidation, "Docker backend type is ambiguous", contracts.RetryNever, false, nil)
+			}
+			driverType = row[1]
+		}
+	}
+	if driverType == "io.containerd.snapshotter.v1" {
+		return manifest, nil
+	}
+	if driverType == "" {
+		switch facts.Driver {
+		case "overlay2", "aufs", "btrfs", "devicemapper", "vfs", "zfs":
+			manifest.Digest = archiveConfigDigest
+			return manifest, nil
+		}
+	}
+	return domain.ImageDigest{}, p.failure(operation, contracts.CapabilityRuntimeObserve, "image_locator", contracts.ErrUnsupportedCapability, "Docker image backend is unsupported", contracts.RetryNever, false, nil)
 }
 
 func (p *Provider) verifyImage(ctx context.Context, image domain.ImageDigest, operation contracts.OperationContext, accepted ...contracts.RuntimeSpec) error {

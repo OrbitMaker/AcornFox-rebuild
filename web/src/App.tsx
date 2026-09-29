@@ -3,7 +3,7 @@ import { IconApps, IconBell, IconGlobe, IconHistogram, IconSetting } from '@douy
 import { Avatar, Button, Spin } from '@douyinfe/semi-ui';
 import type { ReactNode } from 'react';
 import { createConfiguredApiClient } from './api/client';
-import type { AIInterventionResult, AISettingsResult, ApplicationDetail as ApplicationDetailFact, ApplicationOperationsResult, ApplicationPublishResponse, ApplicationSummary, ApplicationUsageResult, ApiClient, SystemStatusResult } from './api/types';
+import type { ApplicationDetail as ApplicationDetailFact, ApplicationOperationsResult, ApplicationPublishResponse, ApplicationSummary, ApplicationUsageResult, ApiClient, SystemStatusResult } from './api/types';
 import { updateFromPublishEvent } from './domain/applicationEvents';
 import { ApplicationList } from './components/ApplicationList';
 import { ApplicationDetail } from './components/ApplicationDetail';
@@ -11,10 +11,7 @@ import { RequestState } from './components/RequestState';
 import { CreateApplicationWizard } from './components/CreateApplicationWizard';
 import { ApplicationOperationsView } from './features/operations/ApplicationOperationsView';
 import type { OperationRequest, OperationsViewMode } from './features/operations/operationsView';
-import { AIInterventionPlaceholder } from './features/ai-interventions/AIInterventionPlaceholder';
 import { UsageView } from './features/usage/UsageView';
-import { AIInterventionPanel } from './features/ai-interventions/AIInterventionPanel';
-import { AIServiceSettings } from './features/settings/ai/AIServiceSettings';
 import { LoginView } from './features/auth/LoginView';
 import { PasswordRotation } from './features/auth/PasswordRotation';
 import { authErrorMessage, type AuthSession } from './features/auth/auth';
@@ -116,18 +113,16 @@ interface OperationsWorkspaceProps {
   mode: OperationsViewMode;
   onModeChange: (mode: OperationsViewMode) => void;
   onRequestOperation: (request: OperationRequest) => void;
-  aiResult?: AIInterventionResult;
-  aiLoading: boolean;
   sseState: SseConnectionState;
   sseLastEventId?: string;
 }
 
-function OperationsWorkspace({ application, result, loading, message, mode, onModeChange, onRequestOperation, aiResult, aiLoading, sseState, sseLastEventId }: OperationsWorkspaceProps) {
+function OperationsWorkspace({ application, result, loading, message, mode, onModeChange, onRequestOperation, sseState, sseLastEventId }: OperationsWorkspaceProps) {
   if (!application) {
-    return <section className="page-section placeholder-page"><h1>运行与运维</h1><RequestState message="请先从应用列表选择一个应用，才能读取该应用的控制面事实。" /><AIInterventionPlaceholder availability="disabled" /></section>;
+    return <section className="page-section placeholder-page"><h1>运行与运维</h1><RequestState message="请先从应用列表选择一个应用，才能读取该应用的控制面事实。" /></section>;
   }
   if (loading) {
-    return <section className="page-section placeholder-page"><h1>运行与运维</h1><RequestState loading /><AIInterventionPlaceholder availability="disabled" /></section>;
+    return <section className="page-section placeholder-page"><h1>运行与运维</h1><RequestState loading /></section>;
   }
   if (result?.status !== 'available') {
     return (
@@ -135,7 +130,6 @@ function OperationsWorkspace({ application, result, loading, message, mode, onMo
         <p className="eyebrow">运行与运维 · {application.name}</p><h1>运维事实未就绪</h1>
         <SseConnectionStatus state={sseState} lastEventId={sseLastEventId} />
         <RequestState message={message ?? result?.message ?? '控制面尚未提供该应用的运维事实。'} />
-        <AIInterventionPlaceholder availability="disabled" />
       </section>
     );
   }
@@ -144,19 +138,12 @@ function OperationsWorkspace({ application, result, loading, message, mode, onMo
       <SseConnectionStatus state={sseState} lastEventId={sseLastEventId} />
       {message && <div className="inline-alert" role="status">{message}</div>}
       <ApplicationOperationsView facts={result.facts} mode={mode} onModeChange={onModeChange} onRequestOperation={onRequestOperation} />
-      {aiLoading ? <Spin tip="正在读取 AI 介入账本" /> : aiResult?.status === 'available' ? <AIInterventionPanel facts={aiResult.facts} mode={mode === 'operations' ? 'operator' : 'ordinary'} /> : <AIInterventionPlaceholder availability="disabled" />}
     </section>
   );
 }
 
-function AISettingsWorkspace({ result, loading }: { result?: AISettingsResult; loading: boolean }) {
-  if (loading) return <section className="settings-ai-section placeholder-page"><h1>AI 服务</h1><Spin tip="正在读取 AI 服务设置" /></section>;
-  if (result?.status !== 'available') return <section className="settings-ai-section placeholder-page"><h1>AI 服务</h1><p>{result?.message ?? 'AI 服务设置未就绪。'}</p><AIInterventionPlaceholder availability="disabled" /></section>;
-  return <section className="settings-ai-section"><AIServiceSettings settings={result.settings} /></section>;
-}
-
-function SystemSettingsWorkspace({ systemStatusResult, systemStatusLoading, aiSettingsResult, aiSettingsLoading, client, onSessionExpired }: { systemStatusResult?: SystemStatusResult; systemStatusLoading: boolean; aiSettingsResult?: AISettingsResult; aiSettingsLoading: boolean; client: ApiClient; onSessionExpired: () => void }) {
-  return <div className="settings-workspace"><SystemStatusPanel result={systemStatusResult} loading={systemStatusLoading} /><AISettingsWorkspace result={aiSettingsResult} loading={aiSettingsLoading} /><PasswordRotation client={client} onCompleted={onSessionExpired} /></div>;
+function SystemSettingsWorkspace({ systemStatusResult, systemStatusLoading, client, onSessionExpired }: { systemStatusResult?: SystemStatusResult; systemStatusLoading: boolean; client: ApiClient; onSessionExpired: () => void }) {
+  return <div className="settings-workspace"><SystemStatusPanel result={systemStatusResult} loading={systemStatusLoading} /><PasswordRotation client={client} onCompleted={onSessionExpired} /></div>;
 }
 
 function UsageWorkspace({ application, result, loading, mode, onModeChange }: { application?: ApplicationSummary; result?: ApplicationUsageResult; loading: boolean; mode: 'normal' | 'operations'; onModeChange: (mode: 'normal' | 'operations') => void }) {
@@ -188,10 +175,6 @@ export default function App() {
   const [usageResult, setUsageResult] = useState<ApplicationUsageResult>();
   const [usageLoading, setUsageLoading] = useState(false);
   const [usageMode, setUsageMode] = useState<'normal' | 'operations'>('normal');
-  const [aiResult, setAIResult] = useState<AIInterventionResult>();
-  const [aiLoading, setAILoading] = useState(false);
-  const [aiSettingsResult, setAISettingsResult] = useState<AISettingsResult>();
-  const [aiSettingsLoading, setAISettingsLoading] = useState(false);
   const [systemStatusResult, setSystemStatusResult] = useState<SystemStatusResult>();
   const [systemStatusLoading, setSystemStatusLoading] = useState(false);
   const [sseState, setSseState] = useState<SseConnectionState>('closed');
@@ -226,15 +209,11 @@ export default function App() {
     setDetailError(undefined);
     setOperationsResult(undefined);
     setUsageResult(undefined);
-    setAIResult(undefined);
-    setAISettingsResult(undefined);
     setSystemStatusResult(undefined);
     setLoading(false);
     setDetailLoading(false);
     setOperationsLoading(false);
     setUsageLoading(false);
-    setAILoading(false);
-    setAISettingsLoading(false);
     setAuthState({ status: 'unauthenticated', message });
   }, [cancelSelectedWork]);
 
@@ -291,7 +270,6 @@ export default function App() {
     setDetailError(undefined);
     setOperationsResult(undefined);
     setUsageResult(undefined);
-    setAIResult(undefined);
     setOperationsMessage(undefined);
     setView('applications');
   }, [cancelSelectedWork]);
@@ -379,43 +357,6 @@ export default function App() {
     void loadOperations(selectedApplicationId, controller.signal).finally(() => requestControllers.current.delete(controller));
     return () => { controller.abort(); requestControllers.current.delete(controller); };
   }, [loadOperations, selectedApplication?.id, selectedApplicationId, trackController, view]);
-
-  const loadAIInterventions = useCallback(async (applicationId: string, mode: 'ordinary' | 'operator', signal?: AbortSignal) => {
-    setAILoading(true);
-    try {
-      const result = await client.getAIInterventions(applicationId, mode, signal);
-      if (selectedApplicationIdRef.current === applicationId) setAIResult(result);
-    } catch (reason) {
-      if (!isAbortError(reason) && selectedApplicationIdRef.current === applicationId) setAIResult({ status: 'unavailable', message: reason instanceof Error ? reason.message : 'AI 介入账本加载失败' });
-    } finally {
-      if (!signal?.aborted && selectedApplicationIdRef.current === applicationId) setAILoading(false);
-    }
-  }, [client]);
-
-  useEffect(() => {
-    if (view !== 'operations' || !selectedApplicationId || !selectedApplication) {
-      setAIResult(undefined);
-      setAILoading(false);
-      return undefined;
-    }
-    const controller = trackController();
-    void loadAIInterventions(selectedApplicationId, operationsMode === 'operations' ? 'operator' : 'ordinary', controller.signal).finally(() => requestControllers.current.delete(controller));
-    return () => { controller.abort(); requestControllers.current.delete(controller); };
-  }, [loadAIInterventions, operationsMode, selectedApplication?.id, selectedApplicationId, trackController, view]);
-
-  const loadAISettings = useCallback(async (signal?: AbortSignal) => {
-    setAISettingsLoading(true);
-    try { setAISettingsResult(await client.getAISettings(signal)); }
-    catch (reason) { if (!isAbortError(reason)) setAISettingsResult({ status: 'unavailable', message: reason instanceof Error ? reason.message : 'AI 服务设置加载失败' }); }
-    finally { if (!signal?.aborted) setAISettingsLoading(false); }
-  }, [client]);
-
-  useEffect(() => {
-    if (view !== 'settings') return undefined;
-    const controller = trackController();
-    void loadAISettings(controller.signal).finally(() => requestControllers.current.delete(controller));
-    return () => { controller.abort(); requestControllers.current.delete(controller); };
-  }, [loadAISettings, trackController, view]);
 
   const loadSystemStatus = useCallback(async (signal?: AbortSignal) => {
     setSystemStatusLoading(true);
@@ -522,11 +463,11 @@ export default function App() {
           {view === 'applications' && <><ApplicationList applications={applications} loading={loading} error={error} selectedApplicationId={selectedApplicationId} onSelect={handleSelectApplication} onCreate={() => setView('create')} onRefresh={() => void loadApplications()} /><ApplicationDetail application={selectedApplication} detail={detail} loading={detailLoading} error={detailError} onRefresh={refreshDetail} client={client} onPublishAccepted={handlePublishAccepted} onPublishSettled={handlePublishSettled} /></>}
           {view === 'create' && <CreateApplicationWizard client={client} onCancel={() => setView('applications')} onCreated={handleCreated} />}
           {view === 'domains' && (selectedApplication ? <DomainManagementWorkspace client={client} applicationId={selectedApplication.id} onRefresh={() => void loadApplications()} onError={handleDomainError} /> : <section className="page-section placeholder-page"><h1>域名管理</h1><RequestState message="请先从应用列表选择一个应用，才能管理其平台和应用域名。" /></section>)}
-          {view === 'operations' && <OperationsWorkspace application={selectedApplication} result={operationsResult} loading={operationsLoading} message={operationsMessage} mode={operationsMode} onModeChange={setOperationsMode} onRequestOperation={requestOperation} aiResult={aiResult} aiLoading={aiLoading} sseState={sseState} sseLastEventId={sseLastEventId} />}
+          {view === 'operations' && <OperationsWorkspace application={selectedApplication} result={operationsResult} loading={operationsLoading} message={operationsMessage} mode={operationsMode} onModeChange={setOperationsMode} onRequestOperation={requestOperation} sseState={sseState} sseLastEventId={sseLastEventId} />}
           {view === 'usage' && <UsageWorkspace application={selectedApplication} result={usageResult} loading={usageLoading} mode={usageMode} onModeChange={setUsageMode} />}
-          {view === 'settings' && <SystemSettingsWorkspace systemStatusResult={systemStatusResult} systemStatusLoading={systemStatusLoading} aiSettingsResult={aiSettingsResult} aiSettingsLoading={aiSettingsLoading} client={client} onSessionExpired={handlePasswordRotated} />}
+          {view === 'settings' && <SystemSettingsWorkspace systemStatusResult={systemStatusResult} systemStatusLoading={systemStatusLoading} client={client} onSessionExpired={handlePasswordRotated} />}
         </main>
-        <footer className="app-footer"><span>Open Card MVP · Golden Path 在 AI 关闭时可独立运行</span><span>{loading ? <Spin size="small" /> : <><i className="footer-status" /> {stats.running} 个应用运行正常</>}</span></footer>
+        <footer className="app-footer"><span>Open Card 控制台</span><span>{loading ? <Spin size="small" /> : <><i className="footer-status" /> {stats.running} 个应用运行正常</>}</span></footer>
       </div>
     </div>
   );

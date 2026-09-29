@@ -19,6 +19,7 @@ var (
 )
 
 type AcornFoxSourceUpdateRequest struct {
+	UploadID             domain.ID
 	ApplicationID        domain.ID
 	BaseSourceRevisionID domain.ID
 	Ref                  string
@@ -60,11 +61,18 @@ func (s *AcornFoxSourceUpdateService) Update(ctx context.Context, request AcornF
 	if err := domain.RequireID(request.BaseSourceRevisionID, "base source revision id"); err != nil {
 		return contracts.AcornFoxSourceUpdateResult{}, err
 	}
-	ref, err := contracts.NormalizeAcornFoxSourceUpdateRef(request.Ref)
-	if err != nil || request.IdempotencyKey == "" {
+	if request.IdempotencyKey == "" {
 		return contracts.AcornFoxSourceUpdateResult{}, domain.ValidationError("source update request is invalid")
 	}
-	request.Ref = ref
+	if request.UploadID.Empty() {
+		ref, err := contracts.NormalizeAcornFoxSourceUpdateRef(request.Ref)
+		if err != nil {
+			return contracts.AcornFoxSourceUpdateResult{}, domain.ValidationError("source update request is invalid")
+		}
+		request.Ref = ref
+	} else if request.Ref != "" || domain.ValidateSourceUploadStorageRef("upload://"+request.UploadID.String(), request.UploadID) != nil {
+		return contracts.AcornFoxSourceUpdateResult{}, domain.ValidationError("upload source update is invalid")
+	}
 	digest := sourceUpdateDigest(request)
 	lock := s.lock(request.ApplicationID)
 	lock.Lock()
@@ -83,17 +91,27 @@ func (s *AcornFoxSourceUpdateService) Update(ctx context.Context, request AcornF
 	if reservation.Replay != nil {
 		return *reservation.Replay, nil
 	}
-	prepared, err := s.Preparer.Prepare(ctx, contracts.PrepareSourceRequest{ApplicationID: request.ApplicationID, Kind: domain.SourceGitHTTPS, Locator: reservation.RepositoryURL, Ref: request.Ref, WorkspaceRef: "memory://" + request.ApplicationID.String(), Operation: contracts.OperationContext{IdempotencyKey: "acornfox-source-update:" + request.ApplicationID.String() + ":" + request.IdempotencyKey, Actor: "acornfox-source-update"}})
+	prepareRequest := contracts.PrepareSourceRequest{ApplicationID: request.ApplicationID, Kind: domain.SourceGitHTTPS, Locator: reservation.RepositoryURL, Ref: request.Ref, WorkspaceRef: "memory://" + request.ApplicationID.String(), Operation: contracts.OperationContext{IdempotencyKey: "acornfox-source-update:" + request.ApplicationID.String() + ":" + request.IdempotencyKey, Actor: "acornfox-source-update"}}
+	if !request.UploadID.Empty() {
+		prepareRequest.Kind = domain.SourceUpload
+		prepareRequest.Locator = "upload://" + request.UploadID.String()
+		prepareRequest.Ref = ""
+	}
+	prepared, err := s.Preparer.Prepare(ctx, prepareRequest)
 	if err != nil {
 		_ = s.Store.FailAcornFoxSourceUpdate(context.Background(), lease, request, digest, now)
 		return contracts.AcornFoxSourceUpdateResult{}, err
 	}
-	result, commitErr := s.Store.CompleteAcornFoxSourceUpdate(ctx, lease, request, digest, prepared.Revision, now)
+	completedAt := time.Now().UTC()
+	if s.Clock != nil {
+		completedAt = s.Clock().UTC()
+	}
+	result, commitErr := s.Store.CompleteAcornFoxSourceUpdate(ctx, lease, request, digest, prepared.Revision, completedAt)
 	if commitErr != nil {
 		if !errors.Is(commitErr, ErrAcornFoxSourceUpdateUnknown) {
-			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			_ = s.Preparer.Release(cleanupCtx, contracts.ReleaseSourceRequest{Revision: prepared.Revision, Operation: contracts.OperationContext{IdempotencyKey: "acornfox-source-update-cleanup:" + request.IdempotencyKey, Actor: "acornfox-source-update"}})
-			cancel()
+			// Final workspaces are shared by tree digest. Never remove one on
+			// a failed update; another accepted revision may still reference it.
+			// Transient stages are cleaned by Prepare itself.
 			_ = s.Store.FailAcornFoxSourceUpdate(context.Background(), lease, request, digest, now)
 		}
 		return contracts.AcornFoxSourceUpdateResult{}, commitErr
@@ -114,6 +132,10 @@ func (s *AcornFoxSourceUpdateService) lock(applicationID domain.ID) *sync.Mutex 
 }
 
 func sourceUpdateDigest(request AcornFoxSourceUpdateRequest) string {
-	sum := sha256.Sum256([]byte(request.ApplicationID.String() + "\x00" + request.BaseSourceRevisionID.String() + "\x00" + request.Ref))
+	input := request.ApplicationID.String() + "\x00" + request.BaseSourceRevisionID.String() + "\x00" + request.Ref
+	if !request.UploadID.Empty() {
+		input += "\x00upload\x00" + request.UploadID.String()
+	}
+	sum := sha256.Sum256([]byte(input))
 	return "sha256:" + hex.EncodeToString(sum[:])
 }

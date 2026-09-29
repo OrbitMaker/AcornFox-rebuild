@@ -75,3 +75,33 @@ func TestBuildAcceptsPinned0039PredecessorBeforeRequiringBuildInputs(t *testing.
 		t.Fatalf("historical binding did not reach normal build-input validation: %v", err)
 	}
 }
+
+func TestNativePartialModeRejectsLegacyAndArbitraryTargetsBeforeOutput(t *testing.T) {
+	for _, flags := range [][]string{{"--decision", "old.json"}, {"--target", "./cmd/open-card-server"}, {"--allow-dirty"}, {"unexpected"}, nil} {
+		var out, diagnostic bytes.Buffer
+		args := append([]string{"native-partial-build", "--output", filepath.Join(t.TempDir(), "native")}, flags...)
+		if err := run(context.Background(), args, &out, &diagnostic); err == nil {
+			t.Fatal("incomplete or unsupported native input accepted")
+		}
+		if out.Len() != 0 {
+			t.Fatal("invalid native mode emitted output")
+		}
+		if _, err := os.Lstat(args[2]); !os.IsNotExist(err) {
+			t.Fatal("invalid native mode created output")
+		}
+	}
+}
+
+func TestNativeProductModeRejectsUnpinnedTargetBeforeOutput(t *testing.T) {
+	var out, diagnostic bytes.Buffer
+	output := filepath.Join(t.TempDir(), "native-product")
+	if err := run(context.Background(), []string{"native-product-build", "--output", output, "--target", "./cmd/unapproved"}, &out, &diagnostic); err == nil {
+		t.Fatal("product build accepted caller target")
+	}
+	if out.Len() != 0 {
+		t.Fatal("invalid product mode emitted receipt")
+	}
+	if _, err := os.Lstat(output); !os.IsNotExist(err) {
+		t.Fatal("invalid product mode created output")
+	}
+}

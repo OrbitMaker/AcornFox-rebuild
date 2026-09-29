@@ -3,19 +3,18 @@ package desktopupdate
 import (
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"math"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
+
+	"github.com/open-card/open-card/internal/artifactio"
 )
 
 const (
@@ -316,131 +315,47 @@ func StageVerifiedUpdate(ctx context.Context, envelopeBytes []byte, opts Downloa
 }
 
 func downloadArtifactStream(ctx context.Context, initialURL string, allowedHosts []string, out io.Writer, expectedSize int64, expectedSHA256 string, opts DownloadStagingOptions) error {
-	timeout := opts.Timeout
-	if timeout <= 0 {
-		timeout = DefaultDownloadTimeout
-	}
-	reqCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
 	var transport http.RoundTripper
 	if opts.HTTPClient != nil && opts.HTTPClient.Transport != nil {
 		transport = opts.HTTPClient.Transport
-	} else {
-		// Production secure transport: timeout bounds, max response header limits, proxy from env preserved
-		transport = &http.Transport{
-			Proxy: http.ProxyFromEnvironment,
-			DialContext: (&net.Dialer{
-				Timeout:   30 * time.Second,
-				KeepAlive: 30 * time.Second,
-			}).DialContext,
-			ForceAttemptHTTP2:     true,
-			MaxIdleConns:          10,
-			IdleConnTimeout:       90 * time.Second,
-			TLSHandshakeTimeout:   15 * time.Second,
-			ResponseHeaderTimeout: 30 * time.Second,
-			DisableCompression:    true,
-		}
 	}
-
-	customClient := http.Client{
-		Transport: transport,
-		Jar:       nil,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= MaxRedirects {
-				return fmt.Errorf("%w: too many redirects", ErrURLNotAllowed)
-			}
-			if err := validateRedirectURL(req.URL, allowedHosts); err != nil {
-				return err
-			}
-			req.Header.Del("Cookie")
-			req.Header.Del("Authorization")
-			return nil
-		},
+	err := artifactio.DownloadArtifactStream(ctx, artifactio.DownloadOptions{
+		URL:            initialURL,
+		AllowedHosts:   allowedHosts,
+		Out:            out,
+		ExpectedSize:   expectedSize,
+		ExpectedSHA256: expectedSHA256,
+		Timeout:        opts.Timeout,
+		Transport:      transport,
+		MaxRedirects:   MaxRedirects,
+	})
+	if err == nil {
+		return nil
 	}
-
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, initialURL, nil)
-	if err != nil {
-		return fmt.Errorf("%w: failed to create request", ErrDownloadFailed)
+	if errors.Is(err, context.Canceled) {
+		return context.Canceled
 	}
-
-	req.Header.Set("Accept-Encoding", "identity")
-	req.Header.Del("Cookie")
-	req.Header.Del("Authorization")
-
-	resp, err := customClient.Do(req)
-	if err != nil {
-		if errors.Is(err, context.Canceled) {
-			return context.Canceled
-		}
-		if errors.Is(err, context.DeadlineExceeded) {
-			return context.DeadlineExceeded
-		}
-		if errors.Is(err, ErrURLNotAllowed) {
-			return ErrURLNotAllowed
-		}
-		return fmt.Errorf("%w: request failed", ErrDownloadFailed)
+	if errors.Is(err, context.DeadlineExceeded) {
+		return context.DeadlineExceeded
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("%w: unexpected HTTP status %d", ErrDownloadFailed, resp.StatusCode)
+	if errors.Is(err, artifactio.ErrURLNotAllowed) {
+		return ErrURLNotAllowed
 	}
-
-	hasher := sha256.New()
-	multi := io.MultiWriter(out, hasher)
-
-	limitReader := io.LimitReader(resp.Body, expectedSize+1)
-	n, err := io.Copy(multi, limitReader)
-	if err != nil {
-		if errors.Is(err, context.Canceled) {
-			return context.Canceled
-		}
-		if errors.Is(err, context.DeadlineExceeded) {
-			return context.DeadlineExceeded
-		}
-		return fmt.Errorf("%w: stream read error", ErrDownloadFailed)
+	if errors.Is(err, artifactio.ErrSizeMismatch) {
+		return fmt.Errorf("%w: %v", ErrSizeMismatch, err)
 	}
-
-	if n > expectedSize {
-		return fmt.Errorf("%w: downloaded bytes exceeded expected size %d", ErrSizeMismatch, expectedSize)
+	if errors.Is(err, artifactio.ErrDigestMismatch) {
+		return fmt.Errorf("%w: %v", ErrDigestMismatch, err)
 	}
-	if n < expectedSize {
-		return fmt.Errorf("%w: downloaded bytes %d less than expected size %d", ErrSizeMismatch, n, expectedSize)
-	}
-
-	actualSHA256 := hex.EncodeToString(hasher.Sum(nil))
-	if !strings.EqualFold(actualSHA256, expectedSHA256) {
-		return fmt.Errorf("%w: got %s, want %s", ErrDigestMismatch, actualSHA256, expectedSHA256)
-	}
-
-	return nil
+	return fmt.Errorf("%w: %v", ErrDownloadFailed, err)
 }
 
 func validateRedirectURL(u *url.URL, allowedHosts []string) error {
-	if u.Scheme != "https" {
-		return fmt.Errorf("%w: redirect scheme must be https", ErrURLNotAllowed)
-	}
-	if u.User != nil {
-		return fmt.Errorf("%w: redirect userinfo not permitted", ErrURLNotAllowed)
-	}
-	if u.Fragment != "" {
-		return fmt.Errorf("%w: redirect fragment not permitted", ErrURLNotAllowed)
-	}
-	port := u.Port()
-	if port != "" && port != "443" {
-		return fmt.Errorf("%w: redirect non-standard port %q", ErrURLNotAllowed, port)
-	}
-	hostname := strings.ToLower(u.Hostname())
-	matched := false
-	for _, host := range allowedHosts {
-		if hostname == host {
-			matched = true
-			break
+	if err := artifactio.ValidateRedirectURL(u, allowedHosts); err != nil {
+		if errors.Is(err, artifactio.ErrURLNotAllowed) {
+			return fmt.Errorf("%w: %v", ErrURLNotAllowed, err)
 		}
-	}
-	if !matched {
-		return fmt.Errorf("%w: redirect host not in allowed hosts", ErrURLNotAllowed)
+		return err
 	}
 	return nil
 }

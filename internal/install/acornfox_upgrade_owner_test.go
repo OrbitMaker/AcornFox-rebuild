@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 )
@@ -66,6 +67,9 @@ func TestAcornFoxUpgradeAtomicFilePreservesActualNonRootGroup(t *testing.T) {
 	if e = os.Chown(path, os.Getuid(), gid); e != nil {
 		t.Fatal(e)
 	}
+	if err := os.Chmod(path, 0640); err != nil {
+		t.Fatal(err)
+	}
 	principal := acornFoxInstallPrincipal{os.Getuid(), gid}
 	if _, e = u.read(s.root, "edge.env", 0640, 1024); e == nil {
 		t.Fatal("state-root owner incorrectly accepted mixed-group file")
@@ -90,5 +94,17 @@ func TestAcornFoxUpgradeAtomicFilePreservesActualNonRootGroup(t *testing.T) {
 	}
 	if info, e := os.Stat(filepath.Join(directory, "empty.env")); e != nil || info.Size() != 0 || int(info.Sys().(*syscall.Stat_t).Gid) != gid {
 		t.Fatal("empty bound file was mistaken for absent", e)
+	}
+}
+
+func TestAcornFoxUpgradeTempPathValidity(t *testing.T) {
+	for _, path := range []string{"edge.env", "foo/bar.json", "a/b/c/d"} {
+		temp := acornFoxUpgradeTemp(path)
+		if err := validateRelativePath(temp); err != nil {
+			t.Fatalf("acornFoxUpgradeTemp(%q) = %q fails validateRelativePath: %v", path, temp, err)
+		}
+		if strings.HasPrefix(temp, "./") {
+			t.Fatalf("acornFoxUpgradeTemp(%q) = %q has leading ./", path, temp)
+		}
 	}
 }

@@ -551,3 +551,21 @@ describe("AcornFox API client", () => {
     }
   });
 });
+
+describe("uploaded source and configured runtime responses", () => {
+  it("accepts uploaded source lists without accepting a Git commit for uploads", async () => {
+    const source = { id: "source", application_id: "app", kind: "upload", locator_sha256: "sha256:locator", ref: "upload_1", content_digest: "sha256:content", created_at: "2030-01-01T00:00:00Z", immutable: true };
+    const api = createAcornFoxClient(async (input) => json(String(input).split("?")[0].endsWith("/sources") ? { items: [source], next_cursor: null } : source));
+    await expect(api.source("app", "source")).resolves.toMatchObject({ kind: "upload" });
+    await expect(api.sources("app")).resolves.toMatchObject({ items: [{ kind: "upload" }] });
+    const bad = createAcornFoxClient(async () => json({ ...source, commit: "fake" }));
+    await expect(bad.source("app", "source")).rejects.toMatchObject({ code: "invalid_response" });
+  });
+  it("keeps configured desired state and normalizes the read-only default", async () => {
+    const payload = { deployment: { id: "dep", application_id: "app", environment_id: "env", release_id: "rel", stage: "starting", created_at: "2030-01-01T00:00:00Z", updated_at: "2030-01-01T00:00:00Z" }, desired: { schema_version: 2, config_digest: "sha256:" + "a".repeat(64), application_id: "app", environment_id: "env", release_id: "rel", service_name: "web", image: { repository: "registry.test/app", digest: "sha256:" + "b".repeat(64) }, resources: { cpu_millis: 100, memory_bytes: 134217728, pids: 64, disk_reservation_bytes: 67108864 }, configuration: { command: ["serve"], volumes: [{ name: "data", mount_path: "/data", size_bytes: 1024 }] }, accepted_at: "2030-01-01T00:00:00Z", immutable: true }, runtime: null, response: null };
+    const api = createAcornFoxClient(async () => json(payload));
+    await expect(api.status("app", "dep")).resolves.toMatchObject({ desired: { schema_version: 2, configuration: { command: ["serve"], volumes: [{ read_only: false }] } } });
+    const bad = createAcornFoxClient(async () => json({ ...payload, desired: { ...payload.desired, configuration: { privileged: true } } }));
+    await expect(bad.status("app", "dep")).rejects.toMatchObject({ code: "invalid_response" });
+  });
+});

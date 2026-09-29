@@ -119,6 +119,9 @@ func (cache pinnedNPMCache) valid() bool {
 }
 
 func BuildWebAssetsV1(ctx context.Context, plan GoBuildPlanV1, taskRoot, npmCacheRoot string) (*WebAssetStageV1, error) {
+	if plan.nativePartial {
+		return nil, ErrWebStage
+	}
 	return buildWebAssetsV1(ctx, plan, taskRoot, npmCacheRoot, plan.nodeExecutable.run)
 }
 
@@ -200,20 +203,28 @@ func buildWebAssetsV1(ctx context.Context, plan GoBuildPlanV1, taskRoot, npmCach
 	if _, err := runNPM("ci", "--offline", "--ignore-scripts", "--no-audit", "--no-fund"); err != nil {
 		return fail()
 	}
-	if _, err := node.Run(ctx, []string{filepath.Join(webRoot, "node_modules", "typescript", "bin", "tsc"), "--noEmit"}, webRoot, env); err != nil {
+	tscArgs := []string{filepath.Join(webRoot, "node_modules", "typescript", "bin", "tsc"), "--noEmit"}
+	viteArgs := []string{filepath.Join(webRoot, "node_modules", "vite", "bin", "vite.js"), "build", "--mode", "acornfox-release"}
+	distName := "dist"
+	if plan.nativePartial {
+		tscArgs = []string{tscArgs[0], "-p", "tsconfig.core.json", "--noEmit"}
+		viteArgs = []string{viteArgs[0], "build", "--config", "vite.core.config.ts", "--mode", "acornfox-release"}
+		distName = "dist-core"
+	}
+	if _, err := node.Run(ctx, tscArgs, webRoot, env); err != nil {
 		return fail()
 	}
-	if _, err := node.Run(ctx, []string{filepath.Join(webRoot, "node_modules", "vite", "bin", "vite.js"), "build", "--mode", "acornfox-release"}, webRoot, env); err != nil {
+	if _, err := node.Run(ctx, viteArgs, webRoot, env); err != nil {
 		return fail()
 	}
 	if _, err := runNPM("cache", "verify"); err != nil || !plan.npmCLI.valid() || !plan.cache.valid() || !npmCache.valid() {
 		return fail()
 	}
-	files, err := inspectWebDist(filepath.Join(webRoot, "dist"), plan)
+	files, err := inspectWebDist(filepath.Join(webRoot, distName), plan)
 	if err != nil {
 		return fail()
 	}
-	stage.dist, stage.plan, stage.npmCache = filepath.Join(webRoot, "dist"), plan, npmCache
+	stage.dist, stage.plan, stage.npmCache = filepath.Join(webRoot, distName), plan, npmCache
 	tree, _ := json.Marshal(files)
 	stage.receipt = WebBuildReceiptV1{
 		SchemaVersion:      1,
@@ -236,7 +247,7 @@ func buildWebAssetsV1(ctx context.Context, plan GoBuildPlanV1, taskRoot, npmCach
 }
 
 func (stage *WebAssetStageV1) Receipt() (WebBuildReceiptV1, error) {
-	if stage == nil || stage.closed || stage.receipt.Validate() != nil || !stage.parentPin.validAt(stage.parent) || !stage.stagePin.validAt(stage.root) || !stage.npmCache.valid() {
+	if stage == nil || stage.closed || stage.plan.nativePartial || stage.receipt.Validate() != nil || !stage.parentPin.validAt(stage.parent) || !stage.stagePin.validAt(stage.root) || !stage.npmCache.valid() {
 		return WebBuildReceiptV1{}, ErrWebStage
 	}
 	files, err := inspectWebDist(stage.dist, stage.plan)
@@ -428,6 +439,17 @@ func inspectWebDist(path string, plan GoBuildPlanV1) ([]FileEntryV1, error) {
 		return nil, ErrWebStage
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
+	if plan.nativePartial {
+		found := false
+		for _, file := range files {
+			if file.Path == "core.html" {
+				found = true
+			}
+		}
+		if !found {
+			return nil, ErrWebStage
+		}
+	}
 	if parseWebMetadata(metadataRaw, plan) != nil {
 		return nil, ErrWebStage
 	}
@@ -484,7 +506,11 @@ func parseWebMetadata(raw []byte, plan GoBuildPlanV1) error {
 	if err := decoder.Decode(&trailing); err != io.EOF {
 		return ErrWebStage
 	}
-	if metadata.Product != Product || metadata.Mode != "live" || metadata.APIBaseURL != "/api/v1" || metadata.SchemaVersion != webReleaseSchemaVersion || metadata.Version != plan.releaseVersion || metadata.ReleaseID != "release-"+plan.releaseVersion || metadata.SourceRepository != plan.sourceRepositoryURL || metadata.SourceCommit != plan.sourceCommit {
+	product, schema := Product, webReleaseSchemaVersion
+	if plan.nativePartial {
+		product, schema = "acornfox-core", "acornfox-core-release-build-attestation.v1"
+	}
+	if metadata.Product != product || metadata.Mode != "live" || metadata.APIBaseURL != "/api/v1" || metadata.SchemaVersion != schema || metadata.Version != plan.releaseVersion || metadata.ReleaseID != "release-"+plan.releaseVersion || metadata.SourceRepository != plan.sourceRepositoryURL || metadata.SourceCommit != plan.sourceCommit {
 		return ErrWebStage
 	}
 	return nil

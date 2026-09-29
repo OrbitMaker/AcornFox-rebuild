@@ -71,7 +71,7 @@ func AcornFoxPublicAccessErrorCodeOf(err error) (AcornFoxPublicAccessErrorCode, 
 // one small interface records only public-access facts and reads only an
 // already accepted local routable endpoint.
 type AcornFoxPublicAccessStore interface {
-	BeginAcornFoxPublicAccess(context.Context, contracts.AcornFoxPublicAccessFact, contracts.AcornFoxPublicRouteIntent, bool, string, string, time.Time) (contracts.AcornFoxPublicAccessFact, bool, error)
+	BeginAcornFoxPublicAccess(context.Context, contracts.AcornFoxPublicAccessFact, contracts.AcornFoxPublicRouteIntent, bool, string, string, domain.ID, time.Time) (contracts.AcornFoxPublicAccessFact, bool, error)
 	// Commit receives the exact owned route intent used by the local router.
 	// Keeping it alongside the command fact is necessary for a later disable
 	// after a process restart; callers never provide a hostname or target.
@@ -113,10 +113,11 @@ type AcornFoxPublicAccessService struct {
 }
 
 type AcornFoxPublicAccessRequest struct {
-	ApplicationID  domain.ID
-	DeploymentID   domain.ID
-	Enabled        bool
-	IdempotencyKey string
+	ApplicationID       domain.ID
+	DeploymentID        domain.ID
+	Enabled             bool
+	IdempotencyKey      string
+	ManagementCommandID domain.ID
 }
 
 // Get reports only the local command fact. An absent durable fact is the
@@ -173,7 +174,7 @@ func (service *AcornFoxPublicAccessService) Set(ctx context.Context, request Aco
 	}
 	result := acornFoxPublicAccessFact(request.ApplicationID, request.DeploymentID, hostname, request.Enabled, endpointState, localRoute)
 	digest := acornFoxPublicAccessDigest(request, hostname)
-	if replay, replayed, err := service.Store.BeginAcornFoxPublicAccess(ctx, result, intent, request.Enabled, request.IdempotencyKey, digest, service.now()); err != nil {
+	if replay, replayed, err := service.Store.BeginAcornFoxPublicAccess(ctx, result, intent, request.Enabled, request.IdempotencyKey, digest, request.ManagementCommandID, service.now()); err != nil {
 		return contracts.AcornFoxPublicAccessFact{}, acornFoxPublicAccessStoreError(err)
 	} else if replayed {
 		return replay, nil

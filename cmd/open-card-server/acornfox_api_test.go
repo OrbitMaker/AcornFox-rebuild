@@ -295,7 +295,7 @@ func TestAcornFoxMutationsHaveNarrowInputsAndNoLegacyHeader(t *testing.T) {
 	if strings.Join(fixture.calls, ",") != "create:src_1:mutation-key:admin_1,restart:mutation-key,redeploy:mutation-key,probe:http:/ready:mutation-key" {
 		t.Fatalf("calls=%v", fixture.calls)
 	}
-	for _, body := range []string{`{"source_revision_id":"src_1","runtime":{}}`, `{"protocol":"http","host":"127.0.0.1"}`} {
+	for _, body := range []string{`{"source_revision_id":"src_1","runtime":{"privileged":true}}`, `{"protocol":"http","host":"127.0.0.1"}`} {
 		request := httptest.NewRequest(http.MethodPost, "/api/v1/acornfox/apps/app_1/deliveries", strings.NewReader(body))
 		request.Header.Set("Idempotency-Key", "bad")
 		request.AddCookie(session)

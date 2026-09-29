@@ -14,6 +14,134 @@ import (
 	"github.com/open-card/open-card/internal/domain"
 )
 
+type authHTTPStore struct {
+	credential domain.AdminCredential
+	sessions   map[domain.AuthDigest]domain.AdminSession
+	rates      map[domain.AuthDigest]domain.AdminLoginRateLimit
+	sessionErr error
+}
+
+func (s *authHTTPStore) ActiveAdminCredential(context.Context) (domain.AdminCredential, error) {
+	if s.credential.ID.Empty() {
+		return domain.AdminCredential{}, auth.ErrNotFound
+	}
+	return s.credential, nil
+}
+
+func (s *authHTTPStore) RotateAdminCredential(_ context.Context, id domain.ID, expected int64, scheme, hash string, now time.Time) (domain.AdminCredential, error) {
+	if s.credential.ID != id || s.credential.CredentialVersion != expected {
+		return domain.AdminCredential{}, auth.ErrCredentialVersionConflict
+	}
+	s.credential.PasswordHashScheme, s.credential.PasswordHash = scheme, hash
+	s.credential.CredentialVersion++
+	s.credential.UpdatedAt = now
+	return s.credential, nil
+}
+
+func (s *authHTTPStore) CreateAdminSession(_ context.Context, session domain.AdminSession) error {
+	if s.sessions == nil {
+		s.sessions = map[domain.AuthDigest]domain.AdminSession{}
+	}
+	s.sessions[session.SessionDigest] = session
+	return nil
+}
+
+func (s *authHTTPStore) ActiveAdminSessionByDigest(_ context.Context, digest domain.AuthDigest, now time.Time) (domain.AdminSession, error) {
+	if s.sessionErr != nil {
+		return domain.AdminSession{}, s.sessionErr
+	}
+	session, ok := s.sessions[digest]
+	if !ok || session.RevokedAt != nil || !now.Before(session.IdleExpiresAt) || !now.Before(session.AbsoluteExpiresAt) || session.CredentialVersion != s.credential.CredentialVersion {
+		return domain.AdminSession{}, auth.ErrNotFound
+	}
+	return session, nil
+}
+
+func (s *authHTTPStore) TouchAdminSession(_ context.Context, id domain.ID, credentialVersion int64, now time.Time) (domain.AdminSession, error) {
+	for digest, session := range s.sessions {
+		if session.ID == id && session.CredentialVersion == credentialVersion && now.Before(session.IdleExpiresAt) && now.Before(session.AbsoluteExpiresAt) {
+			session.LastSeenAt = now
+			session.IdleExpiresAt = now.Add(domain.AdminSessionIdleTimeout)
+			if session.IdleExpiresAt.After(session.AbsoluteExpiresAt) {
+				session.IdleExpiresAt = session.AbsoluteExpiresAt
+			}
+			s.sessions[digest] = session
+			return session, nil
+		}
+	}
+	return domain.AdminSession{}, auth.ErrNotFound
+}
+
+func (s *authHTTPStore) RevokeAdminSession(_ context.Context, id domain.ID, now time.Time) error {
+	for digest, session := range s.sessions {
+		if session.ID == id {
+			session.RevokedAt = &now
+			s.sessions[digest] = session
+			return nil
+		}
+	}
+	return auth.ErrNotFound
+}
+
+func (s *authHTTPStore) UpsertAdminLoginRateLimit(_ context.Context, record domain.AdminLoginRateLimit) error {
+	if s.rates == nil {
+		s.rates = map[domain.AuthDigest]domain.AdminLoginRateLimit{}
+	}
+	s.rates[record.SourceDigest] = record
+	return nil
+}
+
+func (s *authHTTPStore) AdminLoginRateLimit(_ context.Context, _ domain.ID, digest domain.AuthDigest) (domain.AdminLoginRateLimit, error) {
+	record, ok := s.rates[digest]
+	if !ok {
+		return domain.AdminLoginRateLimit{}, auth.ErrNotFound
+	}
+	return record, nil
+}
+
+func (s *authHTTPStore) RecordAdminLoginFailure(_ context.Context, adminID domain.ID, source domain.AuthDigest, now time.Time) (domain.AdminLoginRateLimit, error) {
+	if s.rates == nil {
+		s.rates = map[domain.AuthDigest]domain.AdminLoginRateLimit{}
+	}
+	var existing *domain.AdminLoginRateLimit
+	if rec, ok := s.rates[source]; ok {
+		existing = &rec
+	}
+	next := domain.TransitionAdminLoginRateLimit(existing, adminID, source, now)
+	s.rates[source] = next
+	return next, nil
+}
+
+func (s *authHTTPStore) CreateAdminSessionIfLoginAllowed(ctx context.Context, session domain.AdminSession, source domain.AuthDigest, now time.Time) error {
+	if s.credential.ID != session.AdminID || s.credential.DisabledAt != nil {
+		return auth.ErrNotFound
+	}
+	if s.credential.CredentialVersion != session.CredentialVersion {
+		return auth.ErrCredentialVersionConflict
+	}
+	if rec, ok := s.rates[source]; ok && rec.IsLocked(now) {
+		return auth.ErrRateLimited
+	}
+	return s.CreateAdminSession(ctx, session)
+}
+
+func authRequest(method, path, body string) *http.Request {
+	request := httptest.NewRequest(method, path, strings.NewReader(body))
+	request.RemoteAddr = "127.0.0.1:49152"
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Origin", "https://console.example.test")
+	return request
+}
+
+func cookieValue(cookies []*http.Cookie, name string) *http.Cookie {
+	for _, cookie := range cookies {
+		if cookie.Name == name {
+			return cookie
+		}
+	}
+	return nil
+}
+
 func attachTestAdministrator(t *testing.T, server *Server, now *time.Time) (*authHTTPStore, *http.Cookie) {
 	store, session, _ := attachTestAdministratorTokens(t, server, now)
 	return store, session

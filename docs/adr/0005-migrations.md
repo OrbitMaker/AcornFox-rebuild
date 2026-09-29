@@ -1,5 +1,7 @@
 # ADR-0005: Forward-only checksummed SQL migrations
 
+> 2026-09-26 scope update: new single-machine installations target SQLite under the [thin-core migration plan](../acornfox-thin-core-migration-plan.md). Preserve the forward-only/checksum/recovery requirements below, with a separate SQLite migration inventory and equivalent exclusive migration ownership. Existing PostgreSQL migrations and checksums remain unchanged. Cross-engine migration and post-cutover recovery require new evidence.
+
 - Status: Accepted; core G5 Spike cases passing
 - Gate: G5 / S1
 

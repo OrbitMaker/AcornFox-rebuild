@@ -47,11 +47,13 @@ const (
 	TaskScale         TaskKind = "scale"
 	TaskRollback      TaskKind = "rollback"
 	TaskDestroy       TaskKind = "destroy"
+	TaskStop          TaskKind = "stop"
+	TaskStart         TaskKind = "start"
 )
 
 func (t TaskKind) Allowed() bool {
 	switch t {
-	case TaskObserve, TaskDeploy, TaskDeployGroup, TaskDestroyGroup, TaskDestroyVolume, TaskLogs, TaskRestart, TaskScale, TaskRollback, TaskDestroy:
+	case TaskObserve, TaskDeploy, TaskDeployGroup, TaskDestroyGroup, TaskDestroyVolume, TaskLogs, TaskRestart, TaskScale, TaskRollback, TaskDestroy, TaskStop, TaskStart:
 		return true
 	default:
 		return false
@@ -121,7 +123,7 @@ func RequiredCapabilityForTaskRequest(task TaskRequest) string {
 	}
 	if marker, present := acornFoxPayloadMarker(task.Parameters); present {
 		switch marker {
-		case "deploy", "redeploy", "observe", "restart", "destroy":
+		case "deploy", "redeploy", "observe", "restart", "destroy", "stop", "start":
 			var wire struct {
 				Request struct {
 					Fact map[string]json.RawMessage `json:"fact"`

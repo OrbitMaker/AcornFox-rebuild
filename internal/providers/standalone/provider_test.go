@@ -2,6 +2,7 @@ package standalone
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -87,14 +88,16 @@ func (s fakeImageStore) OpenOCI(_ context.Context, _ domain.ImageDigest, _ contr
 }
 
 type fixedPorts struct {
-	mu               sync.Mutex
-	port             int
-	allocated        int
-	released         int
-	reconciled       int
-	releaseFailures  int
-	fail             bool
-	hostPortRequests []int
+	mu                 sync.Mutex
+	port               int
+	allocated          int
+	released           int
+	reconciled         int
+	reconciledRetained int
+	finalizedReleased  int
+	releaseFailures    int
+	fail               bool
+	hostPortRequests   []int
 }
 
 func (p *fixedPorts) Allocate(context.Context) (int, error) {
@@ -194,6 +197,18 @@ func (a capacityAdapter) Release(_ context.Context, l contracts.CapacityLease, _
 func (a capacityAdapter) ReconcileActive(context.Context, contracts.CapacityLease, contracts.OperationContext) error {
 	a.ports.mu.Lock()
 	a.ports.reconciled++
+	a.ports.mu.Unlock()
+	return nil
+}
+func (a capacityAdapter) ReconcileRetained(context.Context, contracts.CapacityLease, contracts.OperationContext) error {
+	a.ports.mu.Lock()
+	a.ports.reconciledRetained++
+	a.ports.mu.Unlock()
+	return nil
+}
+func (a capacityAdapter) FinalizeReleased(context.Context, contracts.CapacityLease, contracts.OperationContext) error {
+	a.ports.mu.Lock()
+	a.ports.finalizedReleased++
 	a.ports.mu.Unlock()
 	return nil
 }
@@ -704,7 +719,7 @@ func TestObserveRejectsIndependentLimitReadbackMismatch(t *testing.T) {
 }
 
 func ownedContainerInspect(request contracts.DeployRequest, image string) string {
-	return `{"Id":"` + testContainerID + `","RestartCount":3,"Image":"` + image + `","Config":{"Labels":{"open-card.managed":"true","open-card.task-prefix":"opencard-m1","open-card.deployment-id":"` + request.DeploymentID.String() + `","open-card.application-id":"` + request.Spec.ApplicationID.String() + `","open-card.environment-id":"` + request.Spec.EnvironmentID.String() + `","open-card.release-id":"` + request.Spec.ReleaseID.String() + `","open-card.service":"` + request.Spec.ServiceName + `","open-card.image-repository":"` + request.Spec.Image.Repository + `","open-card.image-digest":"` + request.Spec.Image.Digest + `"},"Volumes":null},"State":{"Running":true},"HostConfig":{"NetworkMode":"opencard-m1-network","Privileged":false,"Binds":null,"CapAdd":null,"CapDrop":["ALL"],"Memory":134217728,"MemorySwap":134217728,"CpuPeriod":100000,"CpuQuota":50000,"PidsLimit":64,"SecurityOpt":["no-new-privileges=true"],"RestartPolicy":{"Name":"no"},"PortBindings":{"8080/tcp":[{"HostIp":"127.0.0.1","HostPort":"39130"}]}}}`
+	return `{"Name":"/opencard-m1-runtime-` + hash(request.DeploymentID.String())[:20] + `","Id":"` + testContainerID + `","RestartCount":3,"Image":"` + image + `","Config":{"Labels":{"open-card.managed":"true","open-card.task-prefix":"opencard-m1","open-card.deployment-id":"` + request.DeploymentID.String() + `","open-card.application-id":"` + request.Spec.ApplicationID.String() + `","open-card.environment-id":"` + request.Spec.EnvironmentID.String() + `","open-card.release-id":"` + request.Spec.ReleaseID.String() + `","open-card.service":"` + request.Spec.ServiceName + `","open-card.image-repository":"` + request.Spec.Image.Repository + `","open-card.image-digest":"` + request.Spec.Image.Digest + `"},"Volumes":null},"State":{"Running":true},"HostConfig":{"NetworkMode":"opencard-m1-network","Privileged":false,"Binds":null,"CapAdd":null,"CapDrop":["ALL"],"Memory":134217728,"MemorySwap":134217728,"CpuPeriod":100000,"CpuQuota":50000,"PidsLimit":64,"SecurityOpt":["no-new-privileges=true"],"RestartPolicy":{"Name":"no"},"PortBindings":{"8080/tcp":[{"HostIp":"127.0.0.1","HostPort":"39130"}]}}}`
 }
 
 func assertContainsPairs(t *testing.T, args []string, pairs ...string) {
@@ -738,4 +753,208 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func TestSelectImageLocatorFromExplicitBackendFacts(t *testing.T) {
+	manifest := domain.ImageDigest{Repository: testImage().Repository, Digest: "sha256:" + strings.Repeat("a", 64)}
+	config := "sha256:" + strings.Repeat("b", 64)
+	for _, tc := range []struct {
+		name, info, want string
+		queryError       bool
+	}{
+		{"containerd", `{"driver":"overlayfs","driver_status":[["driver-type","io.containerd.snapshotter.v1"]]}`, manifest.Digest, false},
+		{"classic-overlay2", `{"driver":"overlay2","driver_status":[["Backing Filesystem","extfs"]]}`, config, false},
+		{"classic-vfs", `{"driver":"vfs","driver_status":null}`, config, false},
+		{"ambiguous-overlayfs", `{"driver":"overlayfs","driver_status":null}`, "", false},
+		{"unknown-type", `{"driver":"overlay2","driver_status":[["driver-type","unknown"]]}`, "", false},
+		{"duplicate-type", `{"driver":"overlayfs","driver_status":[["driver-type","io.containerd.snapshotter.v1"],["driver-type","io.containerd.snapshotter.v1"]]}`, "", false},
+		{"malformed-row", `{"driver":"overlay2","driver_status":[["driver-type"]]}`, "", false},
+		{"malformed-json", `not json`, "", false},
+		{"query-failure", ``, "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runner := &fakeRunner{run: func(args []string, stdout io.Writer) error {
+				if len(args) != 3 || args[0] != "info" || args[1] != "--format" {
+					t.Fatalf("unexpected command: %v", args)
+				}
+				if tc.queryError {
+					return errors.New("info failed")
+				}
+				_, err := io.WriteString(stdout, tc.info)
+				return err
+			}}
+			provider := testProvider(t, runner, &fixedPorts{port: 39123})
+			locator, err := provider.SelectImageLocator(context.Background(), manifest, config, contracts.OperationContext{IdempotencyKey: "selector"})
+			if tc.want == "" {
+				if err == nil {
+					t.Fatalf("unsupported backend accepted: %#v", locator)
+				}
+				return
+			}
+			if err != nil || locator.Repository != manifest.Repository || locator.Digest != tc.want {
+				t.Fatalf("wrong expected locator: %#v %v", locator, err)
+			}
+		})
+	}
+}
+
+func TestApplicationProfileNetworkAndOperativeReadback(t *testing.T) {
+	runner := &fakeRunner{}
+	cfg := testProvider(t, runner, &fixedPorts{port: 39130}).config
+	cfg.Network = ""
+	cfg.NetworkProfile = ApplicationLoopbackNetworkProfile
+	for _, bad := range []string{"worker", "validator", "unknown", "worker-name"} {
+		mixed := cfg
+		switch bad {
+		case "worker":
+			mixed.WorkerNetworkIsolated = true
+		case "validator":
+			mixed.ExistingNetworkValidator = func([]byte) error { return nil }
+		case "unknown":
+			mixed.NetworkProfile = "unknown"
+		case "worker-name":
+			mixed.Network = mixed.TaskPrefix + "-network"
+		}
+		if _, err := New(mixed); err == nil {
+			t.Fatalf("mixed profile %s accepted", bad)
+		}
+	}
+	provider, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if provider.config.Network != "opencard-m1-application-network" {
+		t.Fatalf("wrong profile network: %s", provider.config.Network)
+	}
+	netID := strings.Repeat("e", 64)
+	network := func() map[string]any {
+		return map[string]any{"Id": netID, "Name": provider.config.Network, "Driver": "bridge", "Internal": false, "Labels": map[string]string{"open-card.managed": "true", "open-card.task-prefix": cfg.TaskPrefix, "open-card.network-profile": ApplicationLoopbackNetworkProfile}, "Options": map[string]string{"com.docker.network.bridge.gateway_mode_ipv4": "nat"}}
+	}
+	for _, tc := range []struct {
+		name                          string
+		mutate                        func(map[string]any)
+		inspectFails, listed, lsFails bool
+		want                          bool
+	}{
+		{name: "existing-owned", want: true},
+		{name: "create-confirmed-missing", inspectFails: true, want: true},
+		{name: "foreign-owner", mutate: func(n map[string]any) { n["Labels"].(map[string]string)["open-card.task-prefix"] = "foreign" }},
+		{name: "wrong-profile", mutate: func(n map[string]any) { delete(n["Labels"].(map[string]string), "open-card.network-profile") }},
+		{name: "internal", mutate: func(n map[string]any) { n["Internal"] = true }},
+		{name: "routed", mutate: func(n map[string]any) {
+			n["Options"].(map[string]string)["com.docker.network.bridge.gateway_mode_ipv4"] = "routed"
+		}},
+		{name: "inspect-failed-listed", inspectFails: true, listed: true},
+		{name: "inspect-and-list-failed", inspectFails: true, lsFails: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			facts := network()
+			if tc.mutate != nil {
+				tc.mutate(facts)
+			}
+			created := false
+			createCalls := 0
+			runner.run = func(args []string, stdout io.Writer) error {
+				if args[0] != "network" {
+					t.Fatalf("unexpected network command: %v", args)
+				}
+				switch args[1] {
+				case "inspect":
+					if tc.inspectFails && !created {
+						return errors.New("inspect unavailable")
+					}
+					return json.NewEncoder(stdout).Encode([]map[string]any{facts})
+				case "ls":
+					if tc.lsFails {
+						return errors.New("list unavailable")
+					}
+					if strings.Join(args, " ") != "network ls --filter name=^"+provider.config.Network+"$ --format {{.ID}}" {
+						t.Fatalf("unbounded network list: %v", args)
+					}
+					if tc.listed {
+						_, _ = io.WriteString(stdout, netID)
+					}
+				case "create":
+					createCalls++
+					created = true
+					if strings.Contains(strings.Join(args, " "), "--internal") || !strings.Contains(strings.Join(args, " "), "--opt com.docker.network.bridge.gateway_mode_ipv4=nat") {
+						t.Fatalf("wrong profile creation: %v", args)
+					}
+				default:
+					t.Fatalf("unexpected network subcommand: %v", args)
+				}
+				return nil
+			}
+			err := provider.ensureNetwork(context.Background(), contracts.OperationContext{IdempotencyKey: "profile-network"})
+			if (err == nil) != tc.want {
+				t.Fatalf("network outcome: %v", err)
+			}
+			if (!tc.want || !tc.inspectFails) && createCalls != 0 {
+				t.Fatalf("network created without proved absence: %d", createCalls)
+			}
+		})
+	}
+	request := testRequest("operative-readback")
+	base := func() map[string]any {
+		var facts map[string]any
+		if err := json.Unmarshal([]byte(ownedContainerInspect(request, testDigest)), &facts); err != nil {
+			t.Fatal(err)
+		}
+		facts["HostConfig"].(map[string]any)["NetworkMode"] = provider.config.Network
+		facts["NetworkSettings"] = map[string]any{"Networks": map[string]any{provider.config.Network: map[string]any{"NetworkID": netID}}, "Ports": map[string]any{"8080/tcp": []map[string]string{{"HostIp": "127.0.0.1", "HostPort": "39130"}}, "9797/tcp": nil}}
+		return facts
+	}
+	for _, tc := range []struct {
+		name   string
+		mutate func(map[string]any)
+		want   bool
+	}{
+		{name: "operative-plus-null-metrics", want: true},
+		{name: "requested-only", mutate: func(f map[string]any) { delete(f["NetworkSettings"].(map[string]any), "Ports") }},
+		{name: "null-publication", mutate: func(f map[string]any) {
+			f["NetworkSettings"].(map[string]any)["Ports"].(map[string]any)["8080/tcp"] = nil
+		}},
+		{name: "wrong-ip", mutate: func(f map[string]any) {
+			f["NetworkSettings"].(map[string]any)["Ports"].(map[string]any)["8080/tcp"] = []map[string]string{{"HostIp": "0.0.0.0", "HostPort": "39130"}}
+		}},
+		{name: "wrong-port", mutate: func(f map[string]any) {
+			f["NetworkSettings"].(map[string]any)["Ports"].(map[string]any)["8080/tcp"] = []map[string]string{{"HostIp": "127.0.0.1", "HostPort": "39131"}}
+		}},
+		{name: "extra-publication", mutate: func(f map[string]any) {
+			f["NetworkSettings"].(map[string]any)["Ports"].(map[string]any)["9797/tcp"] = []map[string]string{{"HostIp": "127.0.0.1", "HostPort": "39131"}}
+		}},
+		{name: "wrong-attachment", mutate: func(f map[string]any) {
+			f["NetworkSettings"].(map[string]any)["Networks"].(map[string]any)[provider.config.Network] = map[string]any{"NetworkID": strings.Repeat("f", 64)}
+		}},
+		{name: "stopped-no-operative-ports", want: true, mutate: func(f map[string]any) {
+			f["State"].(map[string]any)["Running"] = false
+			f["State"].(map[string]any)["Status"] = "exited"
+			delete(f["NetworkSettings"].(map[string]any), "Ports")
+		}},
+		{name: "paused-no-operative-ports", want: true, mutate: func(f map[string]any) {
+			f["State"].(map[string]any)["Status"] = "paused"
+			delete(f["NetworkSettings"].(map[string]any), "Ports")
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := base()
+			if tc.mutate != nil {
+				tc.mutate(payload)
+			}
+			runner.run = func(args []string, stdout io.Writer) error {
+				if args[0] == "network" {
+					return json.NewEncoder(stdout).Encode([]map[string]any{network()})
+				}
+				return json.NewEncoder(stdout).Encode(payload)
+			}
+			facts, err := provider.inspectFacts(context.Background(), "container")
+			valid := false
+			if err == nil {
+				_, valid = facts.matchesConfiguration(provider.config, domain.Deployment{ID: request.DeploymentID}, request.Spec)
+			}
+			if valid != tc.want {
+				t.Fatalf("operative acceptance=%v expected=%v err=%v", valid, tc.want, err)
+			}
+		})
+	}
 }

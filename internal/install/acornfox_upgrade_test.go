@@ -24,14 +24,27 @@ type acornFoxUpgradeServiceFake struct {
 
 type acornFoxUpgradePIServiceFake struct {
 	*acornFoxUpgradeServiceFake
-	enabled bool
-	err     error
-	queries int
+	enabled        bool
+	forceLoaded    bool
+	err            error
+	queries        int
+	absenceQueries int
 }
 
 func (f *acornFoxUpgradePIServiceFake) PIEnabled(context.Context) (bool, error) {
 	f.queries++
 	return f.enabled, f.err
+}
+
+func (f *acornFoxUpgradePIServiceFake) PILegacyAbsent(context.Context) (bool, error) {
+	f.absenceQueries++
+	if f.err != nil {
+		return false, f.err
+	}
+	if f.forceLoaded {
+		return false, nil
+	}
+	return true, nil
 }
 
 func (f *acornFoxUpgradeServiceFake) Run(_ context.Context, verb, unit string) error {
@@ -117,25 +130,25 @@ func provisionUpgradeAssistantConfig(t *testing.T, p acornFoxProductionPreparedF
 }
 
 func TestAcornFoxUpgradePreservesOptionalPIServiceIntent(t *testing.T) {
-	t.Run("enabled-worker-orders-before-core-stop-and-server-start", func(t *testing.T) {
+	t.Run("schema2-continuous-upgrade-orders-core-services-without-worker", func(t *testing.T) {
 		u, p, request, base := upgradeFixture(t)
 		provisionUpgradeAssistantConfig(t, p)
-		services := &acornFoxUpgradePIServiceFake{acornFoxUpgradeServiceFake: base, enabled: true}
+		services := &acornFoxUpgradePIServiceFake{acornFoxUpgradeServiceFake: base, enabled: false}
 		u.services = services
 		if _, err := u.upgrade(context.Background(), request); err != nil {
 			t.Fatalf("err=%v calls=%q", err, base.calls)
 		}
 		want := []string{
-			"stop acornfox-pi-worker.service", "stop acornfox-edge.service", "stop acornfox-agent.service", "stop acornfox-server.service", "stop acornfox-caddy.service", "stop acornfox-buildkit.service", "stop acornfox-build-network.service",
-			"daemon-reload ", "start acornfox-build-network.service", "start acornfox-buildkit.service", "start acornfox-caddy.service", "start acornfox-pi-worker.service", "start acornfox-server.service", "start acornfox-agent.service",
+			"stop acornfox-edge.service", "stop acornfox-agent.service", "stop acornfox-server.service", "stop acornfox-caddy.service", "stop acornfox-buildkit.service", "stop acornfox-build-network.service",
+			"daemon-reload ", "start acornfox-build-network.service", "start acornfox-buildkit.service", "start acornfox-caddy.service", "start acornfox-server.service", "start acornfox-agent.service",
 			"healthy " + request.BindingSHA256, "start acornfox-edge.service", "edge healthy",
 		}
-		if services.queries != 1 || !reflect.DeepEqual(base.calls, want) {
+		if services.queries != 0 || !reflect.DeepEqual(base.calls, want) {
 			t.Fatalf("queries=%d\ncalls=%q\nwant=%q", services.queries, base.calls, want)
 		}
 		journal, err := os.ReadFile(filepath.Join(p.state, acornFoxUpgradeJournalPath))
-		if err != nil || !bytes.Contains(journal, []byte(`"pi_enabled":true`)) {
-			t.Fatalf("enabled intent missing from private journal: %v", err)
+		if err != nil || bytes.Contains(journal, []byte(`"pi_enabled":true`)) {
+			t.Fatalf("schema 2 journal should not have pi_enabled:true: %v", err)
 		}
 	})
 	t.Run("disabled-worker-is-never-started", func(t *testing.T) {
@@ -162,20 +175,21 @@ func TestAcornFoxUpgradeRollbackAndRecoveryRestoreEnabledPIWorker(t *testing.T) 
 		u, p, request, base := upgradeFixture(t)
 		provisionUpgradeAssistantConfig(t, p)
 		base.failNext = true
-		services := &acornFoxUpgradePIServiceFake{acornFoxUpgradeServiceFake: base, enabled: true}
+		services := &acornFoxUpgradePIServiceFake{acornFoxUpgradeServiceFake: base, enabled: false}
 		u.services = services
 		if receipt, err := u.upgrade(context.Background(), request); !errors.Is(err, ErrAcornFoxUpgradeRolledBack) || receipt.State != "ROLLED_BACK" {
 			t.Fatalf("receipt=%#v err=%v calls=%q", receipt, err, base.calls)
 		}
-		if countCall(base.calls, "stop acornfox-pi-worker.service") != 2 || countCall(base.calls, "start acornfox-pi-worker.service") != 2 {
-			t.Fatalf("worker intent not restored: %q", base.calls)
+		for _, call := range base.calls {
+			if strings.Contains(call, "acornfox-pi-worker.service") {
+				t.Fatalf("schema 2 rollback should not interact with worker: %q", base.calls)
+			}
 		}
-		assertPIStartsBeforeLastServer(t, base.calls)
 	})
 	t.Run("durable-recovery", func(t *testing.T) {
 		u, p, request, base := upgradeFixture(t)
 		provisionUpgradeAssistantConfig(t, p)
-		services := &acornFoxUpgradePIServiceFake{acornFoxUpgradeServiceFake: base, enabled: true}
+		services := &acornFoxUpgradePIServiceFake{acornFoxUpgradeServiceFake: base, enabled: false}
 		u.services = services
 		fired := false
 		u.step = func(name string) error {
@@ -194,10 +208,11 @@ func TestAcornFoxUpgradeRollbackAndRecoveryRestoreEnabledPIWorker(t *testing.T) 
 		if receipt, handled, err := u.recover(context.Background(), expected); err != nil || !handled || receipt.State != "ROLLED_BACK" {
 			t.Fatalf("receipt=%#v handled=%t err=%v", receipt, handled, err)
 		}
-		if len(base.calls) == 0 || base.calls[0] != "stop acornfox-pi-worker.service" || countCall(base.calls, "start acornfox-pi-worker.service") != 1 {
-			t.Fatalf("recovery did not restore worker: %q", base.calls)
+		for _, call := range base.calls {
+			if strings.Contains(call, "acornfox-pi-worker.service") {
+				t.Fatalf("schema 2 recovery should not interact with worker: %q", base.calls)
+			}
 		}
-		assertPIStartsBeforeLastServer(t, base.calls)
 	})
 }
 
@@ -234,7 +249,7 @@ func TestAcornFoxUpgradePIQueryFailureHasNoHostEffects(t *testing.T) {
 	if _, err := u.upgrade(context.Background(), request); !errors.Is(err, ErrAcornFoxUpgradeUnknown) {
 		t.Fatalf("err=%v", err)
 	}
-	if services.queries != 1 || len(base.calls) != 0 {
+	if services.queries != 0 || services.absenceQueries != 1 || len(base.calls) != 0 {
 		t.Fatalf("queries=%d calls=%q", services.queries, base.calls)
 	}
 	for _, path := range []string{filepath.Join(p.state, acornFoxUpgradeJournalPath), filepath.Join(p.host, acornFoxUpgradeMarkerPath), u.stagePath(request.BindingSHA256)} {
@@ -262,23 +277,25 @@ func TestParseAcornFoxPIServiceStateRejectsInconsistency(t *testing.T) {
 	}
 }
 
-func TestAcornFoxLegacyUpgradeExplicitlyDisablesPI(t *testing.T) {
+func TestAcornFoxLegacyUpgradeKeepsWorkerAbsent(t *testing.T) {
 	journal := acornFoxUpgradeJournal{CrossSchema: &acornFoxCrossSchemaUpgradeV1{OldMigrationVersion: AcornFoxLegacyPredecessorMigration}}
-	base := &acornFoxUpgradeServiceFake{}
-	services := &acornFoxUpgradePIServiceFake{acornFoxUpgradeServiceFake: base}
-	u := &acornFoxUpgrade{services: services}
-	if err := u.ensureLegacyPIDisabled(context.Background(), journal); err != nil || services.queries != 1 || !reflect.DeepEqual(base.calls, []string{"daemon-reload ", "disable acornfox-pi-worker.service"}) {
-		t.Fatalf("err=%v queries=%d calls=%q", err, services.queries, base.calls)
+	u, _, _, base := upgradeFixture(t)
+	store, err := u.openStore()
+	if err != nil {
+		t.Fatal(err)
 	}
-	services.enabled = true
-	if err := u.ensureLegacyPIDisabled(context.Background(), journal); !errors.Is(err, ErrAcornFoxUpgradeConflict) {
-		t.Fatalf("enabled PI err=%v", err)
+	defer store.Close()
+	services := &acornFoxUpgradePIServiceFake{acornFoxUpgradeServiceFake: base}
+	u.services = services
+	if err := u.ensureLegacyWorkerAbsent(context.Background(), store, journal); err != nil || services.queries != 0 || services.absenceQueries != 1 || len(base.calls) != 0 {
+		t.Fatalf("absence check: %v calls=%q", err, base.calls)
+	}
+	services.forceLoaded = true
+	if err := u.ensureLegacyWorkerAbsent(context.Background(), store, journal); !errors.Is(err, ErrAcornFoxUpgradeConflict) {
+		t.Fatalf("unexpected legacy worker accepted: %v", err)
 	}
 }
 
-// upgradeLegacyRuntimeFixture models the completed 0034 runtime state before
-// setup_token existed. It is intentionally constructed only in upgrade tests;
-// normal runtime parsing continues to reject this old schema.
 func upgradeLegacyRuntimeFixture(t *testing.T) (*acornFoxUpgrade, acornFoxProductionPreparedFixture, AcornFoxUpgradeRequestV1, *acornFoxUpgradeServiceFake, []byte) {
 	t.Helper()
 	u, p, request, services := upgradeFixture(t)

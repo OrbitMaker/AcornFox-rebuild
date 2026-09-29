@@ -6,9 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/open-card/open-card/internal/application"
@@ -189,6 +193,84 @@ func TestValidateIntentRejectsHostnameAndLocalAdminTargets(t *testing.T) {
 		t.Fatal("enabled unpersisted request")
 	}
 }
+
+func TestApprovedCustomHostnameRequiresExactPersistedRoute(t *testing.T) {
+	p, source, caddy, generated := fixture(t)
+	custom := generated
+	custom.Hostname = "app.customer.example"
+	approval := contracts.AcornFoxApprovedHostnameRoute{
+		Route: custom, Endpoint: contracts.AcornFoxRoutableEndpoint{ApplicationID: custom.ApplicationID, DeploymentID: custom.DeploymentID, ServiceName: custom.ServiceName, Port: custom.Port, Accepted: true}, ApprovalID: "approval_one",
+		EndpointVersion: "sha256:" + strings.Repeat("a", 64),
+	}
+	source.states = []RouteState{{Intent: custom, Approval: &approval, Enabled: true}}
+	if ValidateIntent(p.root, custom) == nil || ValidateApprovedHostnameRoute(p.root, approval) != nil {
+		t.Fatal("custom-domain approval changed the generated-host policy")
+	}
+
+	unapproved := approval
+	unapproved.Route.Hostname = "other.customer.example"
+	if err := p.EnsureAcornFoxApprovedHostnameRoute(context.Background(), unapproved, "same-key"); !errors.Is(err, application.ErrAcornFoxPublicAccessOwnershipConflict) || len(caddy.methods) != 0 {
+		t.Fatal("unapproved hostname reached Caddy")
+	}
+	wrongVersion := approval
+	wrongVersion.EndpointVersion = "sha256:" + strings.Repeat("b", 64)
+	if err := p.EnsureAcornFoxApprovedHostnameRoute(context.Background(), wrongVersion, "same-key"); !errors.Is(err, application.ErrAcornFoxPublicAccessOwnershipConflict) || len(caddy.methods) != 0 {
+		t.Fatal("unapproved endpoint version reached Caddy")
+	}
+	unacceptedEndpoint := approval
+	unacceptedEndpoint.Endpoint.Accepted = false
+	if err := p.EnsureAcornFoxApprovedHostnameRoute(context.Background(), unacceptedEndpoint, "same-key"); !errors.Is(err, application.ErrAcornFoxPublicAccessOwnershipConflict) || len(caddy.methods) != 0 {
+		t.Fatal("unaccepted runtime endpoint reached Caddy")
+	}
+	source.states[0].Approval = nil
+	if err := p.EnsureAcornFoxApprovedHostnameRoute(context.Background(), approval, "same-key"); !errors.Is(err, application.ErrAcornFoxPublicAccessOwnershipConflict) || len(caddy.methods) != 0 {
+		t.Fatal("caller-only approval reached Caddy")
+	}
+	source.states[0].Approval = &approval
+	if err := p.EnsureAcornFoxApprovedHostnameRoute(context.Background(), approval, "same-key"); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(caddy.methods, []string{http.MethodGet, http.MethodPatch}) ||
+		!bytes.Contains(caddy.body, []byte(custom.Hostname)) ||
+		!bytes.Contains(caddy.body, []byte("127.0.0.1:39130")) {
+		t.Fatal("exact approved hostname was not projected to the fixed loopback endpoint")
+	}
+	source.states[0].Enabled = false
+	if err := p.RemoveAcornFoxApprovedHostnameRoute(context.Background(), approval, "unbind-key"); err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(caddy.body, []byte(custom.Hostname)) {
+		t.Fatal("exact approved hostname was not removed")
+	}
+}
+
+func TestObserveApprovedHostnameRouteIsGetOnlyAndFailClosed(t *testing.T) {
+	p, source, caddy, generated := fixture(t)
+	custom := generated
+	custom.Hostname = "app.customer.example"
+	approval := contracts.AcornFoxApprovedHostnameRoute{
+		Route: custom, Endpoint: contracts.AcornFoxRoutableEndpoint{ApplicationID: custom.ApplicationID, DeploymentID: custom.DeploymentID, ServiceName: custom.ServiceName, Port: custom.Port, Accepted: true}, ApprovalID: "approval_one",
+		EndpointVersion: "sha256:" + strings.Repeat("a", 64),
+	}
+	source.states = []RouteState{{Intent: custom, Approval: &approval, Enabled: false}}
+	present, err := p.ObserveApprovedHostnameRoute(context.Background(), approval)
+	if err != nil || present || !reflect.DeepEqual(caddy.methods, []string{http.MethodGet}) {
+		t.Fatal("verified absence was not GET-only", present, err, caddy.methods)
+	}
+	caddy.body, _ = json.Marshal(object{"@id": SubtreeID, "handler": "subroute", "routes": []object{route(custom)}})
+	caddy.methods = nil
+	present, err = p.ObserveApprovedHostnameRoute(context.Background(), approval)
+	if err != nil || !present || !reflect.DeepEqual(caddy.methods, []string{http.MethodGet}) {
+		t.Fatal("verified presence was not GET-only", present, err, caddy.methods)
+	}
+	caddy.body = bytes.Replace(caddy.body, []byte("127.0.0.1:39130"), []byte("127.0.0.1:39131"), 1)
+	caddy.methods = nil
+	present, err = p.ObserveApprovedHostnameRoute(context.Background(), approval)
+	if err == nil || present || !reflect.DeepEqual(caddy.methods, []string{http.MethodGet}) {
+		t.Fatal("changed upstream was misread as verified absence", present, err, caddy.methods)
+	}
+}
+
 func TestCaddyClientHasNoAmbientProxyOrRedirect(t *testing.T) {
 	p, err := New(Config{AuthorizedRoot: "console.example.com", Source: &testSource{}})
 	if err != nil {
@@ -197,5 +279,117 @@ func TestCaddyClientHasNoAmbientProxyOrRedirect(t *testing.T) {
 	defer p.Close()
 	if p.client.Transport.(*http.Transport).Proxy != nil || p.client.CheckRedirect(nil, nil) == nil {
 		t.Fatal("unsafe admin transport")
+	}
+}
+
+func TestCustomOnlyProtectedUnixAdminProjectsExactApproval(t *testing.T) {
+	temp, err := os.MkdirTemp("/tmp", "acornfox-gw-unix-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(temp) })
+	temp, err = filepath.EvalSymlinks(temp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := filepath.Join(temp, "edge-admin")
+	if err := os.Mkdir(parent, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(parent, os.ModeSetgid|0o750); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(parent, "admin.sock")
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	if err := os.Chmod(path, 0o660); err != nil {
+		t.Fatal(err)
+	}
+	current, _ := json.Marshal(emptySubtree())
+	methods := []string{}
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/id/"+SubtreeID {
+			t.Error("request escaped owned subtree")
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		methods = append(methods, r.Method)
+		w.Header().Set("ETag", `"owned-v1"`)
+		switch r.Method {
+		case http.MethodGet:
+			_, _ = w.Write(current)
+		case http.MethodPatch:
+			if r.Header.Get("If-Match") != `"owned-v1"` {
+				w.WriteHeader(http.StatusPreconditionFailed)
+				return
+			}
+			current, _ = io.ReadAll(r.Body)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	})}
+	go server.Serve(listener)
+	defer server.Close()
+	approval := contracts.AcornFoxApprovedHostnameRoute{
+		Route:      contracts.AcornFoxPublicRouteIntent{ApplicationID: "app_one", DeploymentID: "dep_one", Hostname: "app.customer.example", ServiceName: "web", Port: 39130},
+		Endpoint:   contracts.AcornFoxRoutableEndpoint{ApplicationID: "app_one", DeploymentID: "dep_one", ServiceName: "web", Port: 39130, Accepted: true},
+		ApprovalID: "approval_one", EndpointVersion: "sha256:" + strings.Repeat("a", 64),
+	}
+	source := &testSource{states: []RouteState{{Intent: approval.Route, Approval: &approval, Enabled: true}}}
+	p, err := New(Config{CustomOnly: true, Source: source, AdminUnixSocket: path, AdminSocketUID: uint32(os.Getuid()), AdminSocketGID: uint32(os.Getgid())})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	if err := p.EnsureAcornFoxApprovedHostnameRoute(context.Background(), approval, "bind-key"); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(methods, []string{http.MethodGet, http.MethodPatch}) || !bytes.Contains(current, []byte(approval.Route.Hostname)) {
+		t.Fatal("Unix Admin did not project the exact approved hostname with ETag")
+	}
+	if err := p.EnsureAcornFoxPublicRoute(context.Background(), approval.Route, "generated-key"); !errors.Is(err, application.ErrAcornFoxPublicAccessOwnershipConflict) {
+		t.Fatal("custom-only mode accepted a generated-host request")
+	}
+	if err := os.Chmod(path, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Reconcile(context.Background()); err == nil {
+		t.Fatal("world-writable Admin socket remained usable")
+	}
+	if err := os.Chmod(path, 0o660); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(parent, 0o770); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Reconcile(context.Background()); err == nil {
+		t.Fatal("group-writable Admin socket parent remained usable")
+	}
+	if err := os.Chmod(parent, os.ModeSetgid|0o750); err != nil {
+		t.Fatal(err)
+	}
+	listener.(*net.UnixListener).SetUnlinkOnClose(false)
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var replacementCalls atomic.Int32
+	replacementServer := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		replacementCalls.Add(1)
+		server.Handler.ServeHTTP(w, r)
+	})}
+	go replacementServer.Serve(replacement)
+	defer replacementServer.Close()
+	if err := os.Chmod(path, 0o660); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Reconcile(context.Background()); err == nil || replacementCalls.Load() != 0 {
+		t.Fatal("same-owner, same-mode replacement Admin socket reached Caddy")
 	}
 }

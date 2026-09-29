@@ -614,9 +614,6 @@ else
   fi
 fi
 effect /usr/bin/systemctl daemon-reload
-# Model configuration is optional. A fresh host never starts the worker until
-# configure-assistant has installed both root-only canonical files.
-effect /usr/bin/systemctl disable --now acornfox-pi-worker.service
 effect /usr/bin/systemctl enable acornfox-upgrade-safe.target
 effect /usr/bin/systemctl enable acornfox-build-network.service
 effect /usr/bin/systemctl enable acornfox-buildkit.service
@@ -665,9 +662,6 @@ else
   fi
   # Verify local endpoints on 18481 (healthz, readyz) and 8080 (setup page) with wait-local-ready helper
   "${CLEAN_ENV[@]}" /opt/acornfox/upgrade-tools/acornfox-upgrade wait-local-ready
-fi
-if clean_output /usr/bin/systemctl is-enabled --quiet acornfox-pi-worker.service || clean_output /usr/bin/systemctl is-active --quiet acornfox-pi-worker.service; then
-  fail
 fi
 [[ ! -e /run/acornfox-pi/worker.sock && ! -L /run/acornfox-pi/worker.sock ]] || fail
 

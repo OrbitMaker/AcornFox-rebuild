@@ -28,6 +28,11 @@ func (s *Store) AcquireAcornFoxSourceUpdate(ctx context.Context, request applica
 	if err := validateAcornFoxSourceUpdateRequest(request, digest); err != nil {
 		return application.AcornFoxSourceUpdateReservation{}, nil, err
 	}
+	if !request.UploadID.Empty() {
+		if _, err := s.GetAcornFoxSourceRevision(ctx, request.ApplicationID, request.BaseSourceRevisionID); err != nil {
+			return application.AcornFoxSourceUpdateReservation{}, nil, err
+		}
+	}
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
 		return application.AcornFoxSourceUpdateReservation{}, nil, err
@@ -57,12 +62,31 @@ func (s *Store) beginAcornFoxSourceUpdate(ctx context.Context, conn *sql.Conn, r
 		now = s.now()
 	}
 	now = now.UTC()
+	if !request.UploadID.Empty() {
+		return s.beginAcornFoxUploadSourceUpdate(ctx, conn, request, digest, now)
+	}
 	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		return application.AcornFoxSourceUpdateReservation{}, err
 	}
 	rollback := func(cause error) (application.AcornFoxSourceUpdateReservation, error) {
 		return application.AcornFoxSourceUpdateReservation{}, rollbackTx(tx, cause)
+	}
+	var appManagementState string
+	if err := tx.QueryRowContext(ctx, `SELECT management_state FROM applications WHERE id = $1 FOR UPDATE`, request.ApplicationID.String()).Scan(&appManagementState); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return rollback(ErrNotFound)
+		}
+		return rollback(err)
+	}
+	if appManagementState != "active" {
+		return rollback(domain.NewError(domain.ErrConflict, "application is archiving or archived"))
+	}
+	var activeMgmtID string
+	if err := tx.QueryRowContext(ctx, `SELECT id FROM acornfox_management_commands WHERE application_id = $1 AND phase NOT IN ('completed', 'failed') FOR UPDATE`, request.ApplicationID.String()).Scan(&activeMgmtID); err == nil {
+		return rollback(domain.NewError(domain.ErrConflict, "application management operation in progress"))
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return rollback(err)
 	}
 	var repositoryURL string
 	err = tx.QueryRowContext(ctx, `SELECT metadata.repository_url FROM source_revisions source JOIN acornfox_source_metadata metadata ON metadata.source_revision_id=source.id WHERE source.id=$1 AND source.application_id=$2 AND source.source_kind='git_https'`, request.BaseSourceRevisionID.String(), request.ApplicationID.String()).Scan(&repositoryURL)
@@ -127,6 +151,12 @@ func (s *Store) CompleteAcornFoxSourceUpdate(ctx context.Context, raw applicatio
 	}
 	if err := validateAcornFoxSourceUpdateRequest(request, digest); err != nil {
 		return contracts.AcornFoxSourceUpdateResult{}, err
+	}
+	if !request.UploadID.Empty() {
+		if now.IsZero() {
+			now = s.now()
+		}
+		return s.completeAcornFoxUploadSourceUpdate(ctx, lease, request, digest, revision, now.UTC())
 	}
 	if err := revision.Validate(); err != nil {
 		return contracts.AcornFoxSourceUpdateResult{}, err
@@ -290,9 +320,13 @@ func validateAcornFoxSourceUpdateRequest(request application.AcornFoxSourceUpdat
 	if domain.RequireID(request.ApplicationID, "application id") != nil || domain.RequireID(request.BaseSourceRevisionID, "base source revision id") != nil || strings.TrimSpace(request.IdempotencyKey) == "" {
 		return domain.ValidationError("source update request is invalid")
 	}
-	ref, err := contracts.NormalizeAcornFoxSourceUpdateRef(request.Ref)
-	if err != nil || ref != request.Ref {
-		return domain.ValidationError("source update request is invalid")
+	if request.UploadID.Empty() {
+		ref, err := contracts.NormalizeAcornFoxSourceUpdateRef(request.Ref)
+		if err != nil || ref != request.Ref {
+			return domain.ValidationError("source update request is invalid")
+		}
+	} else if err := validateAcornFoxUploadUpdateInput(request); err != nil {
+		return err
 	}
 	if len(digest) != 71 || !strings.HasPrefix(digest, "sha256:") {
 		return domain.ValidationError("source update digest is invalid")

@@ -193,6 +193,22 @@ func (s *Store) beginAcornFoxFixCandidate(ctx context.Context, db acornFoxFixCan
 	if now.IsZero() {
 		now = s.now()
 	}
+	var appManagementState string
+	if err := db.QueryRowContext(ctx, `SELECT management_state FROM applications WHERE id=$1`, request.ApplicationID.String()).Scan(&appManagementState); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	if appManagementState != "active" {
+		return nil, domain.NewError(domain.ErrConflict, "application is archiving or archived")
+	}
+	var activeMgmtID string
+	if err := db.QueryRowContext(ctx, `SELECT id FROM acornfox_management_commands WHERE application_id=$1 AND phase NOT IN ('completed', 'failed')`, request.ApplicationID.String()).Scan(&activeMgmtID); err == nil {
+		return nil, domain.NewError(domain.ErrConflict, "application management operation in progress")
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
 	result, err := db.ExecContext(ctx, `INSERT INTO acornfox_fix_candidates(application_id,idempotency_key,request_digest,base_source_revision_id,owner_admin_id,state,created_at,updated_at) VALUES($1,$2,$3,$4,$5,'preparing',$6,$6) ON CONFLICT(application_id,idempotency_key) DO NOTHING`, request.ApplicationID.String(), request.IdempotencyKey, digest, request.BaseSourceRevisionID.String(), request.OwnerAdminID.String(), now.UTC())
 	if err != nil {
 		return nil, fmt.Errorf("reserve fix candidate: %w", err)
