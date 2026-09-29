@@ -56,7 +56,7 @@ describe("Core Auth Transport Contract Table", () => {
     ["session", (c) => c.session(), "GET", "/api/v1/acornfox/auth/session", 200, undefined, sessionFixture, false],
     ["changePassword", (c) => c.changePassword("old", "new"), "POST", "/api/v1/acornfox/auth/password", 204, { current_password: "old", new_password: "new" }, null, true],
     ["logout", (c) => c.logout(), "POST", "/api/v1/acornfox/auth/logout", 204, undefined, null, true],
-    ["coreStatus", (c) => c.coreStatus(), "GET", "/api/v1/acornfox/core/status", 200, undefined, { storage: "sqlite", package_management: "not_implemented", capabilities: [] }, false],
+    ["coreStatus", (c) => c.coreStatus(), "GET", "/api/v1/acornfox/core/status", 200, undefined, { storage: "sqlite", executor: { container: false, source_build: false, gateway: false } }, false],
     ["hostMetrics", (c) => c.hostMetrics(), "GET", "/api/v1/acornfox/host/metrics", 200, undefined, validAvailableMetricsFixture, false],
     ["hostMetricsRecent", (c) => c.hostMetricsRecent(60), "GET", "/api/v1/acornfox/host/metrics/recent", 200, undefined, { schema_version: 1, availability: "available", generated_at: "2026-09-26T19:00:00Z", capacity: 360, retention_seconds: 1800, points: [validAvailableMetricsFixture] }, false],
   ];

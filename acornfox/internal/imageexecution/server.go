@@ -11,22 +11,19 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"path/filepath"
 	"sync"
 	"time"
 
 	appcontracts "github.com/acornfox/acornfox/internal/application/contracts"
-	"github.com/acornfox/acornfox/internal/artifactio"
-	"github.com/acornfox/acornfox/internal/localpeer"
-	"github.com/acornfox/acornfox/internal/packprotocol"
+	"github.com/acornfox/acornfox/internal/peer"
 )
 
 func decodeStrictJSON(r io.Reader, dst any) error {
-	data, err := io.ReadAll(io.LimitReader(r, packprotocol.MaxProtocolMessageBytes+1))
+	data, err := io.ReadAll(io.LimitReader(r, peer.MaxMessageBytes+1))
 	if err != nil {
 		return err
 	}
-	if len(data) > packprotocol.MaxProtocolMessageBytes {
+	if len(data) > peer.MaxMessageBytes {
 		return errors.New("request body exceeds protocol limit (64KB)")
 	}
 	dec := json.NewDecoder(bytes.NewReader(data))
@@ -41,75 +38,13 @@ func decodeStrictJSON(r io.Reader, dst any) error {
 	return nil
 }
 
-type peerVerifiedListener struct {
-	net.Listener
-	expectedUID uint32
-	expectedPID int32
-	validator   func(pid int32, uid uint32) error
-}
-
-func (l *peerVerifiedListener) Accept() (net.Conn, error) {
-	for {
-		conn, err := l.Listener.Accept()
-		if err != nil {
-			return nil, err
-		}
-		peer, err := localpeer.PeerIdentity(conn)
-		if err != nil {
-			_ = conn.Close()
-			continue
-		}
-		if peer.UID != l.expectedUID {
-			_ = conn.Close()
-			continue
-		}
-		if l.expectedPID > 0 && peer.PID != l.expectedPID {
-			_ = conn.Close()
-			continue
-		}
-		if l.validator != nil {
-			if err := l.validator(peer.PID, peer.UID); err != nil {
-				_ = conn.Close()
-				continue
-			}
-		}
-		return conn, nil
-	}
-}
-
 // ContainerServerConfig configures the Container role Unix RPC server with mutual peer attestation.
 type ContainerServerConfig struct {
 	EnableLifecycle bool
 	Runtime         *ContainerRuntime
 	SocketPath      string
-	SocketGID       uint32 // Optional unified IPC group; zero preserves legacy socket behavior.
-	ExpectedCoreUID uint32
-	ExpectedCorePID int32
-	PeerValidator   func(pid int32, uid uint32) error
-}
-
-func verifyRoleSocketParent(path string, gid uint32) error {
-	if gid == 0 {
-		return nil
-	}
-	info, err := os.Lstat(filepath.Dir(path))
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0750 || info.Mode()&os.ModeSetgid == 0 || artifactio.CheckFileOwner(info, os.Geteuid(), int(gid)) != nil {
-		return errors.New("prepublished role socket parent is missing or unsafe")
-	}
-	if _, err := os.Lstat(path); err == nil || !os.IsNotExist(err) {
-		return errors.New("role socket path must be absent in unified IPC mode")
-	}
-	return nil
-}
-func verifyRoleSocket(path string, gid uint32) error {
-	if gid == 0 {
-		return nil
-	}
-	info, err := os.Lstat(path)
-	if err != nil || info.Mode()&os.ModeSocket == 0 || info.Mode().Perm() != 0660 || artifactio.CheckFileOwner(info, os.Geteuid(), int(gid)) != nil {
-		return errors.New("role socket did not inherit the prepublished IPC group")
-	}
-	return nil
+	SocketGID       uint32 // shared IPC group of core and executor
+	CoreUID         uint32 // only this account may connect
 }
 
 // ContainerServer serves deployment and observation RPC requests over a Unix domain socket.
@@ -130,33 +65,9 @@ func NewContainerServer(cfg ContainerServerConfig) (*ContainerServer, error) {
 	if cfg.SocketPath == "" {
 		return nil, errors.New("socket path is required")
 	}
-	if err := verifyRoleSocketParent(cfg.SocketPath, cfg.SocketGID); err != nil {
-		return nil, err
-	}
-	if cfg.SocketGID == 0 {
-		_ = os.Remove(cfg.SocketPath)
-	}
-
-	rawListener, err := net.Listen("unix", cfg.SocketPath)
+	verifiedListener, err := peer.Listen(cfg.SocketPath, cfg.SocketGID, cfg.CoreUID)
 	if err != nil {
 		return nil, fmt.Errorf("listen on unix socket %s: %w", cfg.SocketPath, err)
-	}
-	if err := os.Chmod(cfg.SocketPath, 0o660); err != nil {
-		_ = rawListener.Close()
-		_ = os.Remove(cfg.SocketPath)
-		return nil, err
-	}
-	if err := verifyRoleSocket(cfg.SocketPath, cfg.SocketGID); err != nil {
-		_ = rawListener.Close()
-		_ = os.Remove(cfg.SocketPath)
-		return nil, err
-	}
-
-	verifiedListener := &peerVerifiedListener{
-		Listener:    rawListener,
-		expectedUID: cfg.ExpectedCoreUID,
-		expectedPID: cfg.ExpectedCorePID,
-		validator:   cfg.PeerValidator,
 	}
 
 	cs := &ContainerServer{
@@ -250,12 +161,12 @@ func (cs *ContainerServer) handleBuiltOCIImport(w http.ResponseWriter, r *http.R
 		return
 	}
 	encoded := r.Header.Get("X-AcornFox-Built-OCI-Authority")
-	if len(encoded) == 0 || len(encoded) > packprotocol.MaxProtocolMessageBytes*2 {
+	if len(encoded) == 0 || len(encoded) > peer.MaxMessageBytes*2 {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 	data, err := base64.RawURLEncoding.DecodeString(encoded)
-	if err != nil || len(data) > packprotocol.MaxProtocolMessageBytes {
+	if err != nil || len(data) > peer.MaxMessageBytes {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
@@ -295,13 +206,11 @@ func (cs *ContainerServer) Close() error {
 
 // CoreAuthorityServerConfig configures Core's authority Unix socket listener.
 type CoreAuthorityServerConfig struct {
-	LifecycleStore         appcontracts.ImageLifecycleStore
-	Store                  appcontracts.ImageExecutionStore
-	SocketPath             string
-	SocketGID              uint32 // Optional unified IPC group; zero preserves legacy socket behavior.
-	ExpectedContainerUID   uint32
-	ExpectedContainerPID   int32
-	ContainerPeerValidator func(pid int32, uid uint32) error
+	LifecycleStore appcontracts.ImageLifecycleStore
+	Store          appcontracts.ImageExecutionStore
+	SocketPath     string
+	SocketGID      uint32 // shared IPC group of core and executor
+	ExecutorUID    uint32 // only this account may connect
 }
 
 // CoreAuthorityServer exposes Core's live lease authority validation to Container role processes over Unix socket.
@@ -323,33 +232,9 @@ func NewCoreAuthorityServer(cfg CoreAuthorityServerConfig) (*CoreAuthorityServer
 	if cfg.SocketPath == "" {
 		return nil, errors.New("authority socket path is required")
 	}
-	if err := verifyRoleSocketParent(cfg.SocketPath, cfg.SocketGID); err != nil {
-		return nil, err
-	}
-	if cfg.SocketGID == 0 {
-		_ = os.Remove(cfg.SocketPath)
-	}
-
-	rawListener, err := net.Listen("unix", cfg.SocketPath)
+	verifiedListener, err := peer.Listen(cfg.SocketPath, cfg.SocketGID, cfg.ExecutorUID)
 	if err != nil {
 		return nil, fmt.Errorf("listen on authority socket %s: %w", cfg.SocketPath, err)
-	}
-	if err := os.Chmod(cfg.SocketPath, 0o660); err != nil {
-		_ = rawListener.Close()
-		_ = os.Remove(cfg.SocketPath)
-		return nil, err
-	}
-	if err := verifyRoleSocket(cfg.SocketPath, cfg.SocketGID); err != nil {
-		_ = rawListener.Close()
-		_ = os.Remove(cfg.SocketPath)
-		return nil, err
-	}
-
-	verifiedListener := &peerVerifiedListener{
-		Listener:    rawListener,
-		expectedUID: cfg.ExpectedContainerUID,
-		expectedPID: cfg.ExpectedContainerPID,
-		validator:   cfg.ContainerPeerValidator,
 	}
 
 	as := &CoreAuthorityServer{

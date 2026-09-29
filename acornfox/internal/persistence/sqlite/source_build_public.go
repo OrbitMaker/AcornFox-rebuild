@@ -14,7 +14,7 @@ import (
 
 func sourceBuildSchemaReadyTx(ctx context.Context, tx *sql.Tx) error {
 	var checksum string
-	if err := tx.QueryRowContext(ctx, `SELECT checksum FROM _schema_migrations WHERE version=?`, version0012_source_build).Scan(&checksum); err != nil || checksum != sha256Hex(sourceBuildSchemaSQL) {
+	if err := tx.QueryRowContext(ctx, `SELECT checksum FROM _schema_migrations WHERE version=?`, version0008_source_build).Scan(&checksum); err != nil || checksum != sha256Hex(sourceBuildSchemaSQL) {
 		return domain.NewError(domain.ErrUnavailable, "source-build migration unavailable")
 	}
 	var count int

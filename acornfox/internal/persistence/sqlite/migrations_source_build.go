@@ -1,7 +1,7 @@
 package sqlite
 
 // Registered after 0011 in the finite Native SQLite migration sequence.
-const version0012_source_build = "0012_source_build"
+const version0008_source_build = "0008_source_build"
 
 const sourceBuildSchemaSQL = `
 CREATE TABLE source_prepare_intents (

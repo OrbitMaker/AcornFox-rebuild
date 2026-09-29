@@ -18,7 +18,7 @@ import (
 	"github.com/acornfox/acornfox/internal/contracts"
 	"github.com/acornfox/acornfox/internal/dockermetrics"
 	"github.com/acornfox/acornfox/internal/domain"
-	"github.com/acornfox/acornfox/internal/packmanager"
+	"github.com/acornfox/acornfox/internal/peer"
 	capacityprovider "github.com/acornfox/acornfox/internal/providers/capacity"
 	imageprovider "github.com/acornfox/acornfox/internal/providers/image"
 	"github.com/acornfox/acornfox/internal/providers/registryhttp"
@@ -154,7 +154,7 @@ type ContainerRuntime struct {
 	volumes         *volumeprovider.Provider
 	standalone      *standalone.Provider
 	metricsReader   dockermetrics.DockerRuntimeMetricsReader
-	authorityClient *packmanager.UnixHTTPClient
+	authorityClient *peer.Client
 	locksMu         sync.Mutex
 	locks           map[domain.ID]*sync.Mutex
 }
@@ -166,9 +166,7 @@ type RuntimeConfig struct {
 	ImageStoreRoot      string
 	RegistryBaseURL     string
 	AuthoritySocketPath string
-	ExpectedCoreUID     uint32
-	ExpectedCorePID     int32
-	CorePeerValidator   func(pid int32, uid uint32) error
+	CoreUID             uint32 // account that must serve the Core authority socket
 	DockerSocketPath    string
 	Runner              standalone.CommandRunner
 	Ports               standalone.PortAllocator
@@ -190,7 +188,7 @@ func NewContainerRuntime(cfg RuntimeConfig) (*ContainerRuntime, error) {
 		cfg.Clock = time.Now
 	}
 
-	authClient := packmanager.NewUnixHTTPClient(cfg.AuthoritySocketPath, cfg.ExpectedCorePID, cfg.ExpectedCoreUID, cfg.CorePeerValidator, 5*time.Second)
+	authClient := peer.NewClient(cfg.AuthoritySocketPath, cfg.CoreUID, 5*time.Second)
 
 	baseRunner := cfg.Runner
 	if baseRunner == nil {

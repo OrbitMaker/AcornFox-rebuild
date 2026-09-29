@@ -7,22 +7,17 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"os"
-	"path/filepath"
 	"time"
 
 	appcontracts "github.com/acornfox/acornfox/internal/application/contracts"
-	"github.com/acornfox/acornfox/internal/artifactio"
 	"github.com/acornfox/acornfox/internal/contracts"
-	"github.com/acornfox/acornfox/internal/localpeer"
+	"github.com/acornfox/acornfox/internal/peer"
 )
 
 type ServerConfig struct {
-	SocketPath    string
-	SocketGID     uint32
-	ExpectedPID   int32
-	ExpectedUID   uint32
-	PeerValidator func(int32, uint32) error
+	SocketPath string
+	SocketGID  uint32 // shared IPC group of core and executor
+	PeerUID    uint32 // only this account may connect
 }
 
 type Server struct {
@@ -30,57 +25,13 @@ type Server struct {
 	listener net.Listener
 }
 
-type peerListener struct {
-	net.Listener
-	cfg ServerConfig
-}
-
-func (l *peerListener) Accept() (net.Conn, error) {
-	for {
-		conn, err := l.Listener.Accept()
-		if err != nil {
-			return nil, err
-		}
-		peer, err := localpeer.PeerIdentity(conn)
-		if err != nil || peer.PID != l.cfg.ExpectedPID || peer.UID != l.cfg.ExpectedUID || l.cfg.PeerValidator(peer.PID, peer.UID) != nil {
-			_ = conn.Close()
-			continue
-		}
-		return conn, nil
-	}
-}
-
 func startServer(c ServerConfig, handler http.Handler) (*Server, error) {
-	if !filepath.IsAbs(c.SocketPath) || filepath.Clean(c.SocketPath) != c.SocketPath || c.ExpectedPID <= 0 || c.ExpectedUID == 0 || c.PeerValidator == nil {
-		return nil, errors.New("Gateway server needs exact attested Unix peers")
-	}
-	if c.SocketGID != 0 {
-		parent, err := os.Lstat(filepath.Dir(c.SocketPath))
-		if err != nil || !parent.IsDir() || parent.Mode()&os.ModeSymlink != 0 || parent.Mode().Perm() != 0o750 || parent.Mode()&os.ModeSetgid == 0 || artifactio.CheckFileOwner(parent, os.Geteuid(), int(c.SocketGID)) != nil {
-			return nil, errors.New("root-published Gateway socket parent unavailable")
-		}
-	}
-	if _, err := os.Lstat(c.SocketPath); err == nil || !os.IsNotExist(err) {
-		return nil, errors.New("Gateway socket path must be absent")
-	}
-	listener, err := net.Listen("unix", c.SocketPath)
+	listener, err := peer.Listen(c.SocketPath, c.SocketGID, c.PeerUID)
 	if err != nil {
 		return nil, err
 	}
-	if err := os.Chmod(c.SocketPath, 0o660); err != nil {
-		listener.Close()
-		return nil, err
-	}
-	if c.SocketGID != 0 {
-		info, err := os.Lstat(c.SocketPath)
-		if err != nil || info.Mode()&os.ModeSocket == 0 || info.Mode().Perm() != 0o660 || artifactio.CheckFileOwner(info, os.Geteuid(), int(c.SocketGID)) != nil {
-			listener.Close()
-			return nil, errors.New("Gateway socket owner/group mismatch")
-		}
-	}
-	verified := &peerListener{Listener: listener, cfg: c}
-	s := &Server{listener: verified, server: &http.Server{Handler: handler, ReadHeaderTimeout: 3 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 35 * time.Second}}
-	go s.server.Serve(verified)
+	s := &Server{listener: listener, server: &http.Server{Handler: handler, ReadHeaderTimeout: 3 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 35 * time.Second}}
+	go s.server.Serve(listener)
 	return s, nil
 }
 

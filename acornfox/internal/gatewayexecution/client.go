@@ -12,30 +12,28 @@ import (
 	"time"
 
 	appcontracts "github.com/acornfox/acornfox/internal/application/contracts"
-	"github.com/acornfox/acornfox/internal/packmanager"
+	"github.com/acornfox/acornfox/internal/peer"
 )
 
 type ClientConfig struct {
-	SocketPath    string
-	ExpectedPID   int32
-	ExpectedUID   uint32
-	PeerValidator func(int32, uint32) error
+	SocketPath string
+	PeerUID    uint32 // account that must serve the socket
 }
 
 func validateClientConfig(c ClientConfig) error {
-	if !filepath.IsAbs(c.SocketPath) || filepath.Clean(c.SocketPath) != c.SocketPath || c.ExpectedPID <= 0 || c.ExpectedUID == 0 || c.PeerValidator == nil {
-		return errors.New("Gateway client requires an exact attested Unix peer")
+	if !filepath.IsAbs(c.SocketPath) || filepath.Clean(c.SocketPath) != c.SocketPath || c.PeerUID == 0 {
+		return errors.New("Gateway client requires an absolute socket and a non-root peer uid")
 	}
 	return nil
 }
 
-type Client struct{ http *packmanager.UnixHTTPClient }
+type Client struct{ http *peer.Client }
 
 func NewClient(c ClientConfig) (*Client, error) {
 	if err := validateClientConfig(c); err != nil {
 		return nil, err
 	}
-	return &Client{http: packmanager.NewUnixHTTPClient(c.SocketPath, c.ExpectedPID, c.ExpectedUID, c.PeerValidator, 30*time.Second)}, nil
+	return &Client{http: peer.NewClient(c.SocketPath, c.PeerUID, 30*time.Second)}, nil
 }
 
 func (c *Client) ExecuteImagePublicAccess(ctx context.Context, b appcontracts.ImagePublicAccessCommand, authority appcontracts.ImagePublicAccessAuthority) (appcontracts.ImagePublicAccessObservation, error) {
@@ -76,13 +74,13 @@ func (c *Client) ExecuteImagePublicAccess(ctx context.Context, b appcontracts.Im
 	return *response.Observation, nil
 }
 
-type AuthorityClient struct{ http *packmanager.UnixHTTPClient }
+type AuthorityClient struct{ http *peer.Client }
 
 func NewAuthorityClient(c ClientConfig) (*AuthorityClient, error) {
 	if err := validateClientConfig(c); err != nil {
 		return nil, err
 	}
-	return &AuthorityClient{http: packmanager.NewUnixHTTPClient(c.SocketPath, c.ExpectedPID, c.ExpectedUID, c.PeerValidator, 3*time.Second)}, nil
+	return &AuthorityClient{http: peer.NewClient(c.SocketPath, c.PeerUID, 3*time.Second)}, nil
 }
 
 func (c *AuthorityClient) request(ctx context.Context, endpoint string, value any, maxResponse int) (int, []byte, error) {

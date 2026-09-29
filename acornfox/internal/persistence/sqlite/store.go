@@ -15,7 +15,6 @@ import (
 
 	"github.com/acornfox/acornfox/internal/auth"
 	"github.com/acornfox/acornfox/internal/domain"
-	"github.com/acornfox/acornfox/internal/versionpolicy"
 	"golang.org/x/sys/unix"
 	_ "modernc.org/sqlite"
 )
@@ -26,27 +25,20 @@ var (
 )
 
 type Config struct {
-	DataDirectory       string
-	DBName              string
-	BusyTimeout         time.Duration
-	PackCoreVersion     string
-	PackProtocolVersion string
-	// LaunchGeneration is a root-reserved exact generation for Native unified
-	// launches. Zero preserves the existing non-unified increment behavior.
-	LaunchGeneration int64
+	DataDirectory string
+	DBName        string
+	BusyTimeout   time.Duration
 }
 
 type Store struct {
-	db                  *sql.DB
-	dir                 string
-	dbPath              string
-	lockFile            *os.File
-	packCoreVersion     string
-	packProtocolVersion string
-	coreGeneration      int64
-	closeOnce           sync.Once
-	closed              bool
-	mu                  sync.RWMutex
+	db             *sql.DB
+	dir            string
+	dbPath         string
+	lockFile       *os.File
+	coreGeneration int64
+	closeOnce      sync.Once
+	closed         bool
+	mu             sync.RWMutex
 }
 
 var _ auth.Store = (*Store)(nil)
@@ -114,21 +106,6 @@ func verifyTrustedDirectory(cleanDir string) error {
 }
 
 func Open(cfg Config) (*Store, error) {
-	if cfg.LaunchGeneration < 0 {
-		return nil, errors.New("invalid reserved core generation")
-	}
-	if (cfg.PackCoreVersion == "") != (cfg.PackProtocolVersion == "") {
-		return nil, errors.New("package compatibility must be configured as a pair")
-	}
-	if cfg.PackCoreVersion != "" {
-		if _, err := versionpolicy.ParseSemver(cfg.PackCoreVersion); err != nil {
-			return nil, err
-		}
-		if cfg.PackProtocolVersion != "1.0" {
-			return nil, errors.New("unsupported configured package protocol")
-		}
-	}
-
 	dir := strings.TrimSpace(cfg.DataDirectory)
 	if dir == "" || strings.Contains(dir, "\x00") || dir == ":memory:" {
 		return nil, errors.New("valid local sqlite data directory is required")
@@ -231,12 +208,6 @@ func Open(cfg Config) (*Store, error) {
 
 	// Precreate and validate DB file with Linux O_NOFOLLOW
 	dbPath := filepath.Join(cleanDir, dbName)
-	dbExisted := true
-	if _, statErr := os.Lstat(dbPath); os.IsNotExist(statErr) {
-		dbExisted = false
-	} else if statErr != nil {
-		return nil, fmt.Errorf("inspect db file before Native launch: %w", statErr)
-	}
 	dbFd, err := unix.Open(dbPath, unix.O_RDWR|unix.O_CREAT|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("open db file (no-follow): %w", err)
@@ -267,21 +238,6 @@ func Open(cfg Config) (*Store, error) {
 	}
 
 	escapedPath := url.PathEscape(dbPath)
-	// A stale reservation must be rejected while holding the writer flock,
-	// before opening the writable/migrating connection or changing PRAGMAs.
-	// Only a DB genuinely absent before creation is allowed to lack the table.
-	if cfg.LaunchGeneration > 0 && dbExisted {
-		readOnly, err := sql.Open("sqlite", "file:"+escapedPath+"?mode=ro&_pragma=query_only(ON)")
-		if err != nil {
-			return nil, fmt.Errorf("inspect generation before Native launch: %w", err)
-		}
-		var prior int64
-		readErr := readOnly.QueryRow(`SELECT generation FROM core_generation WHERE singleton = 1`).Scan(&prior)
-		closeErr := readOnly.Close()
-		if readErr != nil || closeErr != nil || prior < 0 || prior >= cfg.LaunchGeneration {
-			return nil, errors.New("existing Core generation is incompatible with reserved Native launch")
-		}
-	}
 	dsn := fmt.Sprintf("file:%s?_pragma=foreign_keys(ON)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_pragma=busy_timeout=%d", escapedPath, busyTimeoutMS)
 
 	db, err = sql.Open("sqlite", dsn)
@@ -333,18 +289,10 @@ func Open(cfg Config) (*Store, error) {
 		return nil, fmt.Errorf("begin core generation: %w", err)
 	}
 	defer generationTx.Rollback()
+	// Every open advances the generation so tasks leased by a previous process
+	// can be fenced off.
 	var generation int64
-	query := `UPDATE core_generation SET generation = generation + 1 WHERE singleton = 1 AND generation < 9223372036854775807 RETURNING generation`
-	if cfg.LaunchGeneration > 0 {
-		query = `UPDATE core_generation SET generation = ? WHERE singleton = 1 AND generation < ? RETURNING generation`
-	}
-	var generationErr error
-	if cfg.LaunchGeneration > 0 {
-		generationErr = generationTx.QueryRow(query, cfg.LaunchGeneration, cfg.LaunchGeneration).Scan(&generation)
-	} else {
-		generationErr = generationTx.QueryRow(query).Scan(&generation)
-	}
-	if generationErr != nil {
+	if generationErr := generationTx.QueryRow(`UPDATE core_generation SET generation = generation + 1 WHERE singleton = 1 AND generation < 9223372036854775807 RETURNING generation`).Scan(&generation); generationErr != nil {
 		return nil, fmt.Errorf("advance persistent core generation (exhaustion or stale reservation refuses open): %w", generationErr)
 	}
 	if err := generationTx.Commit(); err != nil {
@@ -353,12 +301,11 @@ func Open(cfg Config) (*Store, error) {
 
 	success = true
 	return &Store{
-		coreGeneration:  generation,
-		packCoreVersion: cfg.PackCoreVersion, packProtocolVersion: cfg.PackProtocolVersion,
-		db:       db,
-		dir:      cleanDir,
-		dbPath:   dbPath,
-		lockFile: lockFile,
+		coreGeneration: generation,
+		db:             db,
+		dir:            cleanDir,
+		dbPath:         dbPath,
+		lockFile:       lockFile,
 	}, nil
 }
 

@@ -15,9 +15,10 @@ import (
 	appcontracts "github.com/acornfox/acornfox/internal/application/contracts"
 	"github.com/acornfox/acornfox/internal/contracts"
 	"github.com/acornfox/acornfox/internal/domain"
+	"github.com/acornfox/acornfox/internal/layout"
 )
 
-const GatewayProjectionLockPath = "/run/acornfox/trust/gateway-projection.lock"
+const GatewayProjectionLockPath = layout.GatewayProjectionLock
 
 // GatewayProjectionLock serializes the short Core Begin transaction with the
 // Gateway's complete snapshot/check/Caddy CAS. It is a root-published inode,

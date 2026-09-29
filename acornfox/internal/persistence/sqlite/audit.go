@@ -16,7 +16,6 @@ import (
 
 	contracts "github.com/acornfox/acornfox/internal/application/contracts"
 	"github.com/acornfox/acornfox/internal/foundation"
-	"github.com/acornfox/acornfox/internal/packprotocol"
 )
 
 const auditV1 = "acornfox-audit-v1"
@@ -112,12 +111,6 @@ func appendAuditTx(ctx context.Context, tx *sql.Tx, in auditInput) (contracts.Au
 		return contracts.AuditEvidence{}, errors.New("audit evidence references exceed bound")
 	}
 	for _, ref := range refs {
-		if strings.HasPrefix(ref, "pack:") {
-			if !packprotocol.ValidPackID(strings.TrimPrefix(ref, "pack:")) {
-				return contracts.AuditEvidence{}, errors.New("invalid pack audit reference")
-			}
-			continue
-		}
 		if !validAuditID(ref) || !(strings.HasPrefix(ref, "app_") || strings.HasPrefix(ref, "op_") || strings.HasPrefix(ref, "task_") || strings.HasPrefix(ref, "evt-") || strings.HasPrefix(ref, "evt_") || strings.HasPrefix(ref, "audit_")) {
 			return contracts.AuditEvidence{}, errors.New("audit references must be safe evidence IDs")
 		}

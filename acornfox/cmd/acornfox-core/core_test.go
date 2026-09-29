@@ -4,12 +4,12 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,119 +18,12 @@ import (
 	"github.com/acornfox/acornfox/internal/auth"
 	"github.com/acornfox/acornfox/internal/corehttp"
 	"github.com/acornfox/acornfox/internal/domain"
-	"github.com/acornfox/acornfox/internal/gatewayexecution"
 	"github.com/acornfox/acornfox/internal/hostmetrics"
-	"github.com/acornfox/acornfox/internal/localpeer"
 	"github.com/acornfox/acornfox/internal/persistence/sqlite"
 	"github.com/acornfox/acornfox/internal/providers/buildkit"
 )
 
 type fakeCoreImageResolver struct{}
-
-func TestNativeSchemaDescribesCompiledPinsWithoutStartingCore(t *testing.T) {
-	dataDir := filepath.Join(t.TempDir(), "unopened-core-data")
-	t.Setenv("ACORNFOX_DATA_DIR", dataDir)
-	read, write, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	previousStdout := os.Stdout
-	os.Stdout = write
-	defer func() { os.Stdout = previousStdout }()
-	err = run([]string{"native-schema"})
-	os.Stdout = previousStdout
-	if closeErr := write.Close(); closeErr != nil {
-		t.Fatal(closeErr)
-	}
-	output, readErr := io.ReadAll(read)
-	if closeErr := read.Close(); closeErr != nil {
-		t.Fatal(closeErr)
-	}
-	if err != nil || readErr != nil {
-		t.Fatalf("native-schema failed: run=%v read=%v", err, readErr)
-	}
-	var described struct {
-		SchemaVersion      int `json:"schema_version"`
-		RequiredMigrations []struct {
-			Version  string `json:"version"`
-			Checksum string `json:"checksum"`
-		} `json:"required_migrations"`
-	}
-	decoder := json.NewDecoder(strings.NewReader(string(output)))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&described); err != nil {
-		t.Fatalf("decode native-schema output: %v", err)
-	}
-	if err := decoder.Decode(new(any)); err != io.EOF {
-		t.Fatalf("native-schema output has trailing data: %v", err)
-	}
-	pins := sqlite.CompiledNativeMigrationPins()
-	if described.SchemaVersion != 1 || len(described.RequiredMigrations) != len(pins) || len(pins) == 0 {
-		t.Fatalf("native-schema did not describe the exact compiled prefix: schema=%d pins=%d compiled=%d", described.SchemaVersion, len(described.RequiredMigrations), len(pins))
-	}
-	for i, pin := range pins {
-		if described.RequiredMigrations[i].Version != pin.Version || described.RequiredMigrations[i].Checksum != pin.Checksum {
-			t.Fatalf("native-schema migration %d differs from the compiled SQL", i+1)
-		}
-	}
-	for _, args := range [][]string{
-		{"native-schema", "-data-dir", dataDir},
-		{"-data-dir", dataDir, "native-schema"},
-		{"unknown-command"},
-	} {
-		if err := run(args); err == nil {
-			t.Fatalf("mixed or unknown Core invocation accepted: %q", args)
-		}
-	}
-	if _, err := os.Stat(dataDir); !os.IsNotExist(err) {
-		t.Fatalf("native-schema or rejected invocation touched the data directory: %v", err)
-	}
-}
-
-func TestCoreGatewayHealthRequiresExactUnixPeer(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "gateway.sock")
-	peer := gatewayexecution.ServerConfig{SocketPath: path, ExpectedPID: int32(os.Getpid()), ExpectedUID: uint32(os.Getuid()), PeerValidator: func(int32, uint32) error { return nil }}
-	server, err := gatewayexecution.NewExecutionServer(peer, &gatewayexecution.Runtime{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer server.Close()
-	binding := &localpeer.RuntimePeerBinding{GatewaySocket: path, GatewayPID: peer.ExpectedPID, GatewayUID: peer.ExpectedUID}
-	if err := gatewayHealth(context.Background(), binding, peer.PeerValidator); err != nil {
-		t.Fatal(err)
-	}
-	binding.GatewayPID++
-	if err := gatewayHealth(context.Background(), binding, peer.PeerValidator); err == nil {
-		t.Fatal("Core accepted a Gateway socket with a different bound PID")
-	}
-}
-
-func TestCoreSocketGIDRequiresBindingAndPreservesLegacyDefault(t *testing.T) {
-	base := []string{"-data-dir", secureTestDir(t)}
-	legacy, err := parseConfig(base)
-	if err != nil || legacy.socketGID != 0 {
-		t.Fatalf("legacy socket group changed: %#v %v", legacy, err)
-	}
-	configured, err := parseConfig(append(append([]string(nil), base...), "-container-binding", "/run/acornfox/trust/runtime-binding.json", "-socket-gid", "981"))
-	if err != nil || configured.socketGID != 981 {
-		t.Fatalf("explicit IPC group not retained: %#v %v", configured, err)
-	}
-	if _, err := parseConfig(append(append([]string(nil), base...), "-socket-gid", "981")); err == nil {
-		t.Fatal("IPC group without protected binding accepted")
-	}
-	if _, err := parseConfig(append(append([]string(nil), base...), "-container-binding", "/run/acornfox/trust/runtime-binding.json", "-socket-gid", "4294967296")); err == nil {
-		t.Fatal("overflow IPC group accepted")
-	}
-}
-
-func TestUnifiedCoreRequiresLaunchTicketButFixtureDoesNot(t *testing.T) {
-	if _, err := parseConfig([]string{"-data-dir", "/var/lib/acornfox/core"}); err == nil {
-		t.Fatal("canonical unified Core accepted without root launch ticket")
-	}
-	if _, err := parseConfig([]string{"-data-dir", secureTestDir(t)}); err != nil {
-		t.Fatalf("non-unified fixture rejected: %v", err)
-	}
-}
 
 func (f *fakeCoreImageResolver) ResolveMetadata(ctx context.Context, repository, reference string) (appcontracts.ResolvedMetadataResult, error) {
 	return appcontracts.ResolvedMetadataResult{
@@ -164,14 +57,6 @@ func (f *fakeMetricsReader) Statfs(path string) (hostmetrics.Filesystem, error) 
 		AvailableBlocks: 40000,
 		BlockSize:       4096,
 	}, nil
-}
-
-type fakeAvailabilityProvider struct {
-	available bool
-}
-
-func (f *fakeAvailabilityProvider) IsAvailable() bool {
-	return f.available
 }
 
 func secureTestDir(t *testing.T, sub ...string) string {
@@ -252,8 +137,8 @@ func TestAcornFoxCoreConfigAgreementAndRejection(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name:    "missing data directory",
-			args:    []string{"-listen", "127.0.0.1:8080"},
+			name:    "empty data directory",
+			args:    []string{"-data-dir", "", "-listen", "127.0.0.1:8080"},
 			wantErr: true,
 		},
 		{
@@ -481,68 +366,36 @@ func TestAcornFoxCoreRoutingAndCapabilityUnavailable(t *testing.T) {
 	if err := json.Unmarshal(authStatus.Body.Bytes(), &statusMap); err != nil {
 		t.Fatalf("unmarshal core status: %v", err)
 	}
-	if statusMap["storage"] != "sqlite" || statusMap["package_management"] != "unavailable" {
+	executor, ok := statusMap["executor"].(map[string]any)
+	if statusMap["storage"] != "sqlite" || !ok || executor["container"] != false || executor["source_build"] != false || executor["gateway"] != false {
 		t.Fatalf("unexpected core status: %v", statusMap)
 	}
-	caps, ok := statusMap["capabilities"].([]any)
-	if !ok || len(caps) != 1 || caps[0] != "host_metrics" {
-		t.Fatalf("expected capabilities array [host_metrics], got %v", statusMap["capabilities"])
-	}
 
-	// 2b. Test dynamic availability provider reflection
-	fakeProvider := &fakeAvailabilityProvider{available: true}
-	serverWithProvider := newCoreServer(coreServerConfig{
-		ExpectedHost:         "127.0.0.1:8080",
-		Store:                store,
-		AuthService:          authService,
-		AuthHandler:          &corehttp.AuthHTTPHandler{Service: authService},
-		Sampler:              sampler,
-		PackConfig:           CorePackConfig{Enabled: true},
-		AvailabilityProvider: fakeProvider,
+	// 2b. Executor readiness is reported from the supervisors' flags.
+	var containerReady atomic.Bool
+	containerReady.Store(true)
+	serverWithExecutor := newCoreServer(coreServerConfig{
+		ExpectedHost: "127.0.0.1:8080",
+		Store:        store,
+		AuthService:  authService,
+		AuthHandler:  &corehttp.AuthHTTPHandler{Service: authService},
+		Sampler:      sampler,
+		Executor:     executorStatus{container: &containerReady},
 	})
-	recAvail := httptest.NewRecorder()
-	serverWithProvider.ServeHTTP(recAvail, coreReq(http.MethodGet, "/api/v1/acornfox/core/status", true))
-	if recAvail.Code != http.StatusOK {
-		t.Fatalf("dynamic status code=%d", recAvail.Code)
-	}
-	var availMap map[string]any
-	_ = json.Unmarshal(recAvail.Body.Bytes(), &availMap)
-	if availMap["package_management"] != "available" {
-		t.Fatalf("expected available when provider is available, got: %v", availMap)
+	recReady := httptest.NewRecorder()
+	serverWithExecutor.ServeHTTP(recReady, coreReq(http.MethodGet, "/api/v1/acornfox/core/status", true))
+	var readyMap map[string]any
+	_ = json.Unmarshal(recReady.Body.Bytes(), &readyMap)
+	if exec, _ := readyMap["executor"].(map[string]any); exec["container"] != true || exec["source_build"] != false {
+		t.Fatalf("executor readiness not reported: %v", readyMap)
 	}
 
-	fakeProvider.available = false
-	recUnavail := httptest.NewRecorder()
-	serverWithProvider.ServeHTTP(recUnavail, coreReq(http.MethodGet, "/api/v1/acornfox/core/status", true))
-	var unavailMap map[string]any
-	_ = json.Unmarshal(recUnavail.Body.Bytes(), &unavailMap)
-	if unavailMap["package_management"] != "unavailable" {
-		t.Fatalf("expected unavailable when provider is offline, got: %v", unavailMap)
-	}
-
-	// 3. Known business APIs without package management return 503 capability_unavailable
-	capabilities := []struct {
-		path string
-		cap  string
-	}{
-		{"/api/v1/acornfox/apps", "apps"},
-		{"/api/v1/acornfox/apps/app-1", "apps"},
-		{"/api/v1/acornfox/source-uploads", "source_uploads"},
-		{"/api/v1/acornfox/source-uploads/upload-1", "source_uploads"},
-	}
-
-	for _, tc := range capabilities {
+	// 3. Removed thin-core business routes are plain JSON 404s.
+	for _, p := range []string{"/api/v1/acornfox/apps", "/api/v1/acornfox/source-uploads"} {
 		rec := httptest.NewRecorder()
-		server.ServeHTTP(rec, coreReq(http.MethodGet, tc.path, true))
-		if rec.Code != http.StatusServiceUnavailable {
-			t.Fatalf("%s code=%d, want 503", tc.path, rec.Code)
-		}
-		var errResp map[string]any
-		if err := json.Unmarshal(rec.Body.Bytes(), &errResp); err != nil {
-			t.Fatalf("parse 503 JSON: %v", err)
-		}
-		if errResp["code"] != "capability_unavailable" || errResp["capability"] != tc.cap {
-			t.Fatalf("expected capability_unavailable for %s, got %v", tc.cap, errResp)
+		server.ServeHTTP(rec, coreReq(http.MethodGet, p, true))
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("%s code=%d, want 404", p, rec.Code)
 		}
 	}
 
@@ -773,78 +626,6 @@ func TestAcornFoxCoreStaticBoundary(t *testing.T) {
 	// 8. Rejection of web root overlapping with data directory
 	if _, err := newStaticCoreHandler(dataDir, dataDir); err == nil {
 		t.Fatal("expected newStaticCoreHandler to reject overlapping webRoot and dataDir")
-	}
-}
-
-func TestAcornFoxCorePackConfigAndStatus(t *testing.T) {
-	dataDir := secureTestDir(t, "core_pack_data")
-	store, err := sqlite.Open(sqlite.Config{DataDirectory: dataDir, DBName: "test.db"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-
-	authSvc, err := auth.NewLocalService(auth.Config{Store: store, Origin: "http://127.0.0.1:8080"})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// 1. Without pack config: status is unavailable
-	serverUnconfigured := newCoreServer(coreServerConfig{
-		ExpectedHost: "127.0.0.1:8080",
-		Store:        store,
-		AuthService:  authSvc,
-		PackConfig:   CorePackConfig{Enabled: false},
-	})
-
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/acornfox/core/status", nil)
-	req.RemoteAddr = "127.0.0.1:45123"
-	req.Host = "127.0.0.1:8080"
-	rec := httptest.NewRecorder()
-	serverUnconfigured.ServeHTTP(rec, req)
-
-	// Since unauthenticated, check 401 or login redirect
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401 unauthenticated, got %d", rec.Code)
-	}
-
-	// 2. Validate loadProtectedPackConfig guards
-	// Rejection of relative path
-	if _, err := loadProtectedPackConfig("relative/path.json"); err == nil {
-		t.Fatal("expected relative path to be rejected")
-	}
-
-	// Empty path returns Disabled
-	emptyCfg, err := loadProtectedPackConfig("")
-	if err != nil || emptyCfg.Enabled {
-		t.Fatalf("expected empty path to return disabled without error, got cfg=%+v, err=%v", emptyCfg, err)
-	}
-
-	// Non-root owned config file is strictly rejected
-	cfgDir := secureTestDir(t, "user_cfg")
-	cfgFile := filepath.Join(cfgDir, "pack-runtime.json")
-	validJSON := `{
-		"socket_path": "/run/acornfox-helper/helper.sock",
-		"state_dir": "/var/lib/acornfox-host-helper",
-		"stage_dir": "/var/lib/acornfox/core/pack-staging",
-		"packs_dir": "/opt/acornfox/packs",
-		"packs_state_dir": "/var/lib/acornfox/packs",
-		"packs_run_dir": "/run/acornfox/packs",
-		"core_uid": 1000,
-		"core_gid": 1000,
-		"trusted_core_executable_sha": "abc123",
-		"installation_binding": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-		"publishers": []
-	}`
-	if err := os.WriteFile(cfgFile, []byte(validJSON), 0640); err != nil {
-		t.Fatal(err)
-	}
-
-	if os.Getuid() != 0 {
-		_, err := loadProtectedPackConfig(cfgFile)
-		if err == nil || !strings.Contains(err.Error(), "strictly by root (0)") {
-			t.Fatalf("expected non-root config to be rejected, got %v", err)
-		}
 	}
 }
 

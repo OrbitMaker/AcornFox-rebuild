@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/acornfox/acornfox/internal/auth"
@@ -12,8 +13,14 @@ import (
 	"github.com/acornfox/acornfox/internal/persistence/sqlite"
 )
 
-type HelperAvailabilityProvider interface {
-	IsAvailable() bool
+// executorStatus reports which executor subsystems core is currently connected to.
+type executorStatus struct {
+	container, source, gateway *atomic.Bool
+}
+
+func (e executorStatus) snapshot() map[string]bool {
+	load := func(b *atomic.Bool) bool { return b != nil && b.Load() }
+	return map[string]bool{"container": load(e.container), "source_build": load(e.source), "gateway": load(e.gateway)}
 }
 
 type coreServer struct {
@@ -26,8 +33,7 @@ type coreServer struct {
 	metricsHandler       *hostmetrics.HTTPHandler
 	recentHandler        *hostmetrics.RecentHTTPHandler
 	imageDeliveryHandler *corehttp.ImageDeliveryHandler
-	packConfig           CorePackConfig
-	availabilityProvider HelperAvailabilityProvider
+	executor             executorStatus
 }
 
 type coreServerConfig struct {
@@ -39,8 +45,7 @@ type coreServerConfig struct {
 	StaticHandler        *staticCoreHandler
 	Sampler              *hostmetrics.Sampler
 	ImageDeliveryHandler *corehttp.ImageDeliveryHandler
-	PackConfig           CorePackConfig
-	AvailabilityProvider HelperAvailabilityProvider
+	Executor             executorStatus
 }
 
 func newCoreServer(cfg coreServerConfig) *coreServer {
@@ -60,8 +65,7 @@ func newCoreServer(cfg coreServerConfig) *coreServer {
 		metricsHandler:       metricsHandler,
 		recentHandler:        recentHandler,
 		imageDeliveryHandler: cfg.ImageDeliveryHandler,
-		packConfig:           cfg.PackConfig,
-		availabilityProvider: cfg.AvailabilityProvider,
+		executor:             cfg.Executor,
 	}
 }
 
@@ -92,12 +96,6 @@ func (s *coreServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		corehttp.WriteJSON(w, http.StatusOK, map[string]any{"status": "ok", "ready": true})
-		return
-	}
-
-	// 3. Retired assistant routes reject with 404 before authentication
-	if r.URL.Path == "/api/v1/acornfox/assistant" || strings.HasPrefix(r.URL.Path, "/api/v1/acornfox/assistant/") {
-		corehttp.WriteJSONError(w, http.StatusNotFound, "not_found", "route not found")
 		return
 	}
 
@@ -133,18 +131,9 @@ func (s *coreServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			corehttp.WriteJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 			return
 		}
-		pkgStatus := "unavailable"
-		if s.packConfig.Enabled {
-			if s.availabilityProvider != nil && s.availabilityProvider.IsAvailable() {
-				pkgStatus = "available"
-			} else if s.availabilityProvider == nil && s.packConfig.Registered {
-				pkgStatus = "available"
-			}
-		}
 		corehttp.WriteJSON(w, http.StatusOK, map[string]any{
-			"storage":            "sqlite",
-			"package_management": pkgStatus,
-			"capabilities":       []string{"host_metrics"},
+			"storage":  "sqlite",
+			"executor": s.executor.snapshot(),
 		})
 		return
 	}
@@ -178,24 +167,6 @@ func (s *coreServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// 8. Native immutable image delivery endpoints (/api/v1/acornfox/image-plans, /api/v1/acornfox/operations/*)
 	if s.imageDeliveryHandler != nil && s.imageDeliveryHandler.Handle(w, r) {
-		return
-	}
-
-	// 9. Known business APIs without packages return structured 503 capability_unavailable
-	var requiredCap string
-	switch {
-	case r.URL.Path == "/api/v1/acornfox/apps" || strings.HasPrefix(r.URL.Path, "/api/v1/acornfox/apps/"):
-		requiredCap = "apps"
-	case r.URL.Path == "/api/v1/acornfox/source-uploads" || strings.HasPrefix(r.URL.Path, "/api/v1/acornfox/source-uploads/"):
-		requiredCap = "source_uploads"
-	}
-
-	if requiredCap != "" {
-		_, ok := corehttp.AuthenticateControlPlane(s.authService, corehttp.LocalAuthRouteConfig, w, r)
-		if !ok {
-			return
-		}
-		corehttp.WriteCapabilityUnavailable(w, requiredCap, requiredCap+" capability is unavailable in thin core")
 		return
 	}
 

@@ -1,7 +1,7 @@
 package sqlite
 
 // Registered after Source-owned 0012 in the finite Native SQLite sequence.
-const version0013_image_public_access = "0013_image_public_access"
+const version0009_image_public_access = "0009_image_public_access"
 
 const imagePublicAccessSchemaSQL = `
 CREATE TABLE image_public_access (

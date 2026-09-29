@@ -402,16 +402,16 @@ export default function CoreApp({
             <div className="cc-tile-icon">
               <svg viewBox="0 0 24 24"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z" /></svg>
             </div>
-            <div className="cc-tile-name">功能包管理</div>
+            <div className="cc-tile-name">执行器</div>
             <div className="cc-tile-sub">
-              {statusReady ? "统一发行组件" : "—"}
+              {statusReady && statusVal ? (statusVal.executor.container ? "已连接" : "未连接") : "—"}
             </div>
           </div>
         </div>
 
         <div className="cc-info-box">
           <p style={{ marginBottom: 6 }}><strong>单机运行模式：</strong></p>
-          <p>当前已激活能力：{statusVal?.capabilities.length ?? 0} 项。可通过镜像部署入口创建计划并查询真实部署结果；组件安装与健康状态以服务端事实为准。</p>
+          <p>执行器连接：{statusVal ? executorSummary(statusVal) : "—"}。可通过镜像部署入口创建计划并查询真实部署结果。</p>
         </div>
 
         {statusFailed && (
@@ -475,7 +475,7 @@ export default function CoreApp({
                   <div className="app-icon-squircle"><svg viewBox="0 0 24 24"><path d="M3 7l9-5 9 5v10l-9 5-9-5V7z" /><path d="M3 7l9 5 9-5M12 12v10" /></svg></div>
                   <div className="app-name-text">镜像部署</div><div className="app-status-badge badge-unknown">计划 → 确认 → 操作结果</div>
                 </button>
-                {/* 3. 功能包管理（诚实显示暂未实现） */}
+                {/* 3. 发行说明 */}
                 <button
                   className="app-card-btn"
                   onClick={() => setCapabilitiesModalOpen(true)}
@@ -612,32 +612,16 @@ export default function CoreApp({
                     value={statusVal.storage === "sqlite" ? "SQLite（单机持久化控制面）" : statusVal.storage}
                   />
                 </div>
-                <div className="webos-form-field">
-                  <label>功能包管理</label>
-                  <input
-                    type="text"
-                    readOnly
-                    className="webos-input"
-                    value={
-                      statusVal.package_management === "not_implemented"
-                        ? "此字段尚未提供组件健康状态"
-                        : statusVal.package_management
-                    }
-                  />
-                </div>
-                <div className="webos-form-field">
-                  <label>当前激活能力（Capabilities）</label>
-                  <input
-                    type="text"
-                    readOnly
-                    className="webos-input"
-                    value={
-                      statusVal.capabilities.length === 0
-                        ? "0 项（服务未声明激活能力）"
-                        : statusVal.capabilities.join(", ")
-                    }
-                  />
-                </div>
+                {([
+                  ["容器运行", statusVal.executor.container],
+                  ["源码构建", statusVal.executor.source_build],
+                  ["域名与 HTTPS", statusVal.executor.gateway],
+                ] as const).map(([label, ok]) => (
+                  <div className="webos-form-field" key={label}>
+                    <label>{label}</label>
+                    <input type="text" readOnly className="webos-input" value={ok ? "已连接" : "未连接"} />
+                  </div>
+                ))}
                 <div className="cc-info-box" style={{ marginTop: 8 }}>
                   <p><strong>说明：</strong>此页面展示服务端核心状态。镜像部署入口单独查询部署计划和操作结果；核心状态不能替代组件健康或应用访问验收。</p>
                 </div>
@@ -733,4 +717,13 @@ export default function CoreApp({
       <Toast toast={toast} />
     </div>
   );
+}
+
+function executorSummary(status: CoreStatus): string {
+  const parts = [
+    status.executor.container ? "容器运行已连接" : "容器运行未连接",
+    status.executor.source_build ? "源码构建已连接" : "源码构建未连接",
+    status.executor.gateway ? "域名与 HTTPS 已连接" : "域名与 HTTPS 未连接",
+  ];
+  return parts.join("，");
 }

@@ -19,7 +19,6 @@ import (
 	"github.com/acornfox/acornfox/internal/domain"
 	"github.com/acornfox/acornfox/internal/foundation"
 	"github.com/acornfox/acornfox/internal/importers/dockerfile"
-	"github.com/acornfox/acornfox/internal/localpeer"
 	capacityprovider "github.com/acornfox/acornfox/internal/providers/capacity"
 	imageprovider "github.com/acornfox/acornfox/internal/providers/image"
 	"github.com/acornfox/acornfox/internal/sourcebuildexecution"
@@ -454,20 +453,14 @@ func runSourceBuildWorkerFixture(t *testing.T, leaseProbe bool) {
 	provider := &workerStageProvider{digest: digest, capacity: cap, workspaceRef: sourceRoot}
 	// Same-process kernel credentials keep this a transport fixture, not
 	// isolated role deployment. Production still requires distinct sealed tuples.
-	att, err := localpeer.AttestLinuxProcess(int32(os.Getpid()))
-	if err != nil {
-		t.Fatal(err)
-	}
-	peerValidator := func(pid int32, uid uint32) error {
-		return localpeer.VerifyProcessIdentity(pid, uid, att.ExecutableSHA256, att.StartTime)
-	}
+	attUID := uint32(os.Getuid())
 	authorityPath := filepath.Join(root, "source-authority.sock")
-	authorityServer, err := sourcebuildexecution.NewAuthorityServer(sourcebuildexecution.ServerConfig{SocketPath: authorityPath, ExpectedPID: att.PID, ExpectedUID: att.UID, PeerValidator: peerValidator}, authority)
+	authorityServer, err := sourcebuildexecution.NewAuthorityServer(sourcebuildexecution.ServerConfig{SocketPath: authorityPath, PeerUID: attUID}, authority)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer authorityServer.Close()
-	authorityClient, err := sourcebuildexecution.NewAuthorityClient(sourcebuildexecution.ClientConfig{SocketPath: authorityPath, ExpectedPID: att.PID, ExpectedUID: att.UID, PeerValidator: peerValidator})
+	authorityClient, err := sourcebuildexecution.NewAuthorityClient(sourcebuildexecution.ClientConfig{SocketPath: authorityPath, PeerUID: attUID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -481,12 +474,12 @@ func runSourceBuildWorkerFixture(t *testing.T, leaseProbe bool) {
 		t.Fatal(err)
 	}
 	executePath := filepath.Join(root, "source-execute.sock")
-	executionServer, err := sourcebuildexecution.NewExecutionServer(sourcebuildexecution.ServerConfig{SocketPath: executePath, ExpectedPID: att.PID, ExpectedUID: att.UID, PeerValidator: peerValidator}, role)
+	executionServer, err := sourcebuildexecution.NewExecutionServer(sourcebuildexecution.ServerConfig{SocketPath: executePath, PeerUID: attUID}, role)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer executionServer.Close()
-	executionClient, err := sourcebuildexecution.NewClient(sourcebuildexecution.ClientConfig{SocketPath: executePath, ExpectedPID: att.PID, ExpectedUID: att.UID, PeerValidator: peerValidator})
+	executionClient, err := sourcebuildexecution.NewClient(sourcebuildexecution.ClientConfig{SocketPath: executePath, PeerUID: attUID})
 	if err != nil {
 		t.Fatal(err)
 	}

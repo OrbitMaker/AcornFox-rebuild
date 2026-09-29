@@ -2,7 +2,6 @@ package sqlite
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"os"
 	"path/filepath"
@@ -48,119 +47,6 @@ func newTestSQLiteStore(t *testing.T) (*Store, string) {
 		_ = store.Close()
 	})
 	return store, dir
-}
-
-func TestReservedLaunchGenerationSurvivesFailedStartAndOldBackup(t *testing.T) {
-	ctx := context.Background()
-	data := secureTestDir(t, "launch-source")
-	// A genuinely absent DB may consume the first root reservation R=1;
-	// this cannot require a prior Store.Open merely to create the database.
-	first, err := Open(Config{DataDirectory: data, LaunchGeneration: 1})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if first.CoreGeneration() != 1 {
-		t.Fatalf("first generation = %d", first.CoreGeneration())
-	}
-	backup := filepath.Join(secureTestDir(t, "launch-backup"), "old.db")
-	if err := first.Backup(ctx, backup); err != nil {
-		t.Fatal(err)
-	}
-	if err := first.Close(); err != nil {
-		t.Fatal(err)
-	}
-	// R=2 was durably reserved before the child opened the store; losing
-	// the child after commit must not erase that reservation.
-	failedChild, err := Open(Config{DataDirectory: data, LaunchGeneration: 2})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if failedChild.CoreGeneration() != 2 {
-		t.Fatalf("reserved generation = %d", failedChild.CoreGeneration())
-	}
-	if err := failedChild.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := Open(Config{DataDirectory: data, LaunchGeneration: 2}); err == nil {
-		t.Fatal("replayed reservation reopened an already advanced store")
-	}
-	readOnly, err := sql.Open("sqlite", "file:"+filepath.Join(data, "acornfox.db")+"?mode=ro&_pragma=query_only(ON)")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var unchanged int64
-	if err := readOnly.QueryRow("SELECT generation FROM core_generation WHERE singleton=1").Scan(&unchanged); err != nil {
-		t.Fatal(err)
-	}
-	if err := readOnly.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if unchanged != 2 {
-		t.Fatalf("rejected replay changed DB generation to %d", unchanged)
-	}
-	// Make 0011 genuinely pending. The stale ticket must reject before the
-	// migration runner recreates its tables or ledger row.
-	raw, err := sql.Open("sqlite", filepath.Join(data, "acornfox.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := raw.Exec(`DROP TABLE image_lifecycle_results; DROP TABLE image_lifecycle_commands; DELETE FROM _schema_migrations WHERE version='0011_image_lifecycle'`); err != nil {
-		t.Fatal(err)
-	}
-	if err := raw.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := Open(Config{DataDirectory: data, LaunchGeneration: 2}); err == nil {
-		t.Fatal("stale reservation migrated pending schema before rejection")
-	}
-	check, err := sql.Open("sqlite", "file:"+filepath.Join(data, "acornfox.db")+"?mode=ro&_pragma=query_only(ON)")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var migrated int
-	if err := check.QueryRow(`SELECT count(*) FROM _schema_migrations WHERE version='0011_image_lifecycle'`).Scan(&migrated); err != nil {
-		t.Fatal(err)
-	}
-	if migrated != 0 {
-		t.Fatal("rejected launch wrote pending migration ledger")
-	}
-	if err := check.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='image_lifecycle_commands'`).Scan(&migrated); err != nil {
-		t.Fatal(err)
-	}
-	if migrated != 0 {
-		t.Fatal("rejected launch created pending migration table")
-	}
-	if err := check.Close(); err != nil {
-		t.Fatal(err)
-	}
-	// A physical restore has only generation 1; the next root reservation
-	// must be R=3, not the old database's apparent next generation 2.
-	restored := secureTestDir(t, "launch-restored")
-	content, err := os.ReadFile(backup)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(restored, "acornfox.db"), content, 0600); err != nil {
-		t.Fatal(err)
-	}
-	next, err := Open(Config{DataDirectory: restored, LaunchGeneration: 3})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if next.CoreGeneration() != 3 {
-		t.Fatalf("restored launch reused old generation: %d", next.CoreGeneration())
-	}
-	if err := next.Close(); err != nil {
-		t.Fatal(err)
-	}
-	legacy, err := Open(Config{DataDirectory: restored})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer legacy.Close()
-	if legacy.CoreGeneration() != 4 {
-		t.Fatalf("non-unified increment changed: %d", legacy.CoreGeneration())
-	}
 }
 
 func TestStoreOpenCloseAndPragmas(t *testing.T) {

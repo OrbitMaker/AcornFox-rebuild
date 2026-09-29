@@ -7,94 +7,30 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"os"
-	"path/filepath"
 	"time"
 
-	"github.com/acornfox/acornfox/internal/artifactio"
 	"github.com/acornfox/acornfox/internal/contracts"
-	"github.com/acornfox/acornfox/internal/localpeer"
-	"github.com/acornfox/acornfox/internal/packprotocol"
+	"github.com/acornfox/acornfox/internal/peer"
 )
 
 type ServerConfig struct {
-	ArchiveStore  contracts.ImageStore
-	SocketPath    string
-	SocketGID     uint32 // Optional unified IPC group; zero retains legacy fixtures.
-	ExpectedPID   int32
-	ExpectedUID   uint32
-	PeerValidator func(int32, uint32) error
-}
-
-func verifySourceSocketParent(path string, gid uint32) error {
-	if gid == 0 {
-		return nil
-	}
-	info, err := os.Lstat(filepath.Dir(path))
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0750 || info.Mode()&os.ModeSetgid == 0 || artifactio.CheckFileOwner(info, os.Geteuid(), int(gid)) != nil {
-		return errors.New("prepublished source socket parent is missing or unsafe")
-	}
-	return nil
-}
-func verifySourceSocket(path string, gid uint32) error {
-	if gid == 0 {
-		return nil
-	}
-	info, err := os.Lstat(path)
-	if err != nil || info.Mode()&os.ModeSocket == 0 || info.Mode().Perm() != 0660 || artifactio.CheckFileOwner(info, os.Geteuid(), int(gid)) != nil {
-		return errors.New("source socket did not inherit the prepublished IPC group")
-	}
-	return nil
+	ArchiveStore contracts.ImageStore
+	SocketPath   string
+	SocketGID    uint32 // shared IPC group of core and executor
+	PeerUID      uint32 // only this account may connect
 }
 
 type Server struct {
 	server   *http.Server
 	listener net.Listener
 }
-type verifiedListener struct {
-	net.Listener
-	cfg ServerConfig
-}
 
-func (l *verifiedListener) Accept() (net.Conn, error) {
-	for {
-		c, err := l.Listener.Accept()
-		if err != nil {
-			return nil, err
-		}
-		peer, err := localpeer.PeerIdentity(c)
-		if err != nil || peer.PID != l.cfg.ExpectedPID || peer.UID != l.cfg.ExpectedUID || l.cfg.PeerValidator(peer.PID, peer.UID) != nil {
-			c.Close()
-			continue
-		}
-		return c, nil
-	}
-}
 func startServer(c ServerConfig, h http.Handler) (*Server, error) {
-	if !filepath.IsAbs(c.SocketPath) || c.ExpectedPID <= 0 || c.PeerValidator == nil {
-		return nil, errors.New("server requires exact attested peer and absolute socket")
-	}
-	if err := verifySourceSocketParent(c.SocketPath, c.SocketGID); err != nil {
-		return nil, err
-	}
-	if _, err := os.Lstat(c.SocketPath); err == nil || !os.IsNotExist(err) {
-		return nil, errors.New("source-build socket path is not absent")
-	}
-	l, err := net.Listen("unix", c.SocketPath)
+	l, err := peer.Listen(c.SocketPath, c.SocketGID, c.PeerUID)
 	if err != nil {
 		return nil, err
 	}
-	if err := os.Chmod(c.SocketPath, 0660); err != nil {
-		l.Close()
-		_ = os.Remove(c.SocketPath)
-		return nil, err
-	}
-	if err := verifySourceSocket(c.SocketPath, c.SocketGID); err != nil {
-		l.Close()
-		_ = os.Remove(c.SocketPath)
-		return nil, err
-	}
-	s := &Server{listener: &verifiedListener{Listener: l, cfg: c}, server: &http.Server{Handler: h, ReadHeaderTimeout: 3 * time.Second}}
+	s := &Server{listener: l, server: &http.Server{Handler: h, ReadHeaderTimeout: 3 * time.Second}}
 	go s.server.Serve(s.listener)
 	return s, nil
 }
@@ -104,7 +40,7 @@ func readCommand(r *http.Request) ([]byte, SourceBuildCommand, error) {
 	if r.Method != http.MethodPost {
 		return nil, command, ErrBinding
 	}
-	raw, err := io.ReadAll(io.LimitReader(r.Body, packprotocol.MaxProtocolMessageBytes+1))
+	raw, err := io.ReadAll(io.LimitReader(r.Body, peer.MaxMessageBytes+1))
 	if err != nil {
 		return nil, command, err
 	}

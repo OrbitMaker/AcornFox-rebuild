@@ -13,27 +13,24 @@ import (
 
 	appcontracts "github.com/acornfox/acornfox/internal/application/contracts"
 	"github.com/acornfox/acornfox/internal/contracts"
-	"github.com/acornfox/acornfox/internal/packmanager"
-	"github.com/acornfox/acornfox/internal/packprotocol"
+	"github.com/acornfox/acornfox/internal/peer"
 )
 
 type ClientConfig struct {
-	SocketPath    string
-	ExpectedPID   int32
-	ExpectedUID   uint32
-	PeerValidator func(int32, uint32) error
+	SocketPath string
+	PeerUID    uint32 // account that must serve the socket
 }
-type Client struct{ http *packmanager.UnixHTTPClient }
+type Client struct{ http *peer.Client }
 
 func NewClient(c ClientConfig) (*Client, error) {
-	if !filepath.IsAbs(c.SocketPath) || c.ExpectedPID <= 0 || c.PeerValidator == nil {
-		return nil, errors.New("source-build client requires exact attested peer and absolute socket")
+	if !filepath.IsAbs(c.SocketPath) || c.PeerUID == 0 {
+		return nil, errors.New("source-build client requires an absolute socket and a non-root peer uid")
 	}
 	// Execution timeout is the sealed Core deadline, not a shorter transport timer.
-	return &Client{http: packmanager.NewUnixHTTPClient(c.SocketPath, c.ExpectedPID, c.ExpectedUID, c.PeerValidator, 0)}, nil
+	return &Client{http: peer.NewClient(c.SocketPath, c.PeerUID, 0)}, nil
 }
 func strictMessage(raw []byte, v any) error {
-	if len(raw) > packprotocol.MaxProtocolMessageBytes {
+	if len(raw) > peer.MaxMessageBytes {
 		return errors.New("source-build message exceeds bound")
 	}
 	d := json.NewDecoder(bytes.NewReader(raw))
@@ -117,13 +114,13 @@ func (c *Client) CheckReady(ctx context.Context) error {
 	return nil
 }
 
-type AuthorityClient struct{ http *packmanager.UnixHTTPClient }
+type AuthorityClient struct{ http *peer.Client }
 
 func NewAuthorityClient(c ClientConfig) (*AuthorityClient, error) {
-	if !filepath.IsAbs(c.SocketPath) || c.ExpectedPID <= 0 || c.PeerValidator == nil {
-		return nil, errors.New("source authority requires attested Core peer")
+	if !filepath.IsAbs(c.SocketPath) || c.PeerUID == 0 {
+		return nil, errors.New("source authority requires an absolute socket and a non-root Core uid")
 	}
-	return &AuthorityClient{packmanager.NewUnixHTTPClient(c.SocketPath, c.ExpectedPID, c.ExpectedUID, c.PeerValidator, 3*time.Second)}, nil
+	return &AuthorityClient{peer.NewClient(c.SocketPath, c.PeerUID, 3*time.Second)}, nil
 }
 func (c *AuthorityClient) AuthorizeSourceBuild(ctx context.Context, command SourceBuildCommand) (appcontracts.SourceBuildPermit, error) {
 	var zero appcontracts.SourceBuildPermit
@@ -131,7 +128,7 @@ func (c *AuthorityClient) AuthorizeSourceBuild(ctx context.Context, command Sour
 	if err != nil {
 		return zero, err
 	}
-	if len(raw) > packprotocol.MaxProtocolMessageBytes {
+	if len(raw) > peer.MaxMessageBytes {
 		return zero, ErrBinding
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://unix/v1/source-build/authorize", bytes.NewReader(raw))

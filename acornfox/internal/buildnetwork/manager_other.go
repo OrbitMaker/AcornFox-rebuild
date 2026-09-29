@@ -12,9 +12,6 @@ type Manager struct{}
 func ReadInstalledPolicy() ([]byte, string, error) {
 	return nil, "", errors.New("installed build network requires Linux")
 }
-func NewProductionManager() (*Manager, error) {
-	return nil, errors.New("installed build network requires Linux")
-}
 func NewNativeProductionManager() (*Manager, error) {
 	return nil, errors.New("installed build network requires Linux")
 }

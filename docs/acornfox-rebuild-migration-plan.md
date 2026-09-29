@@ -132,3 +132,25 @@ M1～M2 按包串行，由单一写入者负责；M4 可以在 M2 完成后与 M
 - CLI 删除了连接旧服务端的命令（apps、sources、deploy、up、upload、check、plan、status、operation、logs、restart/redeploy/probe、public-access、delivery-source、fix-candidate）。其中本地目录打包上传的实现（旧 `cmd/acornfox/local_project.go`）在存档分支，TP-17 时参考。
 - 测试：删除依赖 PostgreSQL、旧服务端、旧 OpenAPI、旧命令和功能包迁移的测试；`corehttp` 中两处基于“0012 迁移尚未注册”的过时断言改为当前行为（已认证的 prepare 返回 201，未知 intent 返回 404）。
 - 顺带发现的既有问题见 `acornfox/README.md`“已知问题”。
+
+### M2（2026-09-29 完成，方案 B）
+
+负责人确认方案 B：核心（普通账号，不能访问 Docker）加执行器（docker 组，合并容器、构建、网关），再加一个只做构建网络规则的 root 小程序。取代第 1、3 节中“一个核心进程 + 一个 root 辅助进程”的说法（原说法会让对外处理请求的核心直接拥有主机 root 能力）。
+
+- 新增 `internal/peer`：Unix socket 两端按内核报告的对端 UID 互相校验，socket 权限 0660、属组 `acornfox-ipc`。取代 PID 钉死、root 进程身份证明和运行时绑定文件。
+- 新增 `internal/layout`：账号 `acornfox`（核心）、`acornfox-exec`（执行器）、组 `acornfox-ipc`，以及全部目录和 socket 路径。
+- 新增 `cmd/acornfox-executor`，取代 `acornfox-container`、`acornfox-source-build`、`acornfox-gateway`。容器运行必需；构建、网关依赖缺失时重试，不阻塞容器运行。
+- 重写 `cmd/acornfox-core` 装配：每个执行器子系统一个监督循环，健康时启动任务消费者，失联时停止并等待退出；等待超时则保持数据库锁到进程退出，避免在仍有写入者时关库。
+- 删除：`hosthelper`、`localpeer`、`corelaunch`、`packmanager`、`packprotocol`、`install`、`artifactio`、`versionpolicy`，`cmd/acornfox-host-helper`，SQLite 中功能包相关的全部表、迁移和代码，以及原生安装器用的离线备份/恢复。
+- SQLite 迁移重排为 0001～0009 一条直线；`operations` 表保留 `target_kind` 列但只允许 `application`。旧开发安装不能原地升级（已确认可接受）。
+- 构建网络规则只接受 `acornfox-exec` 作为构建客户端，BuildKit 路径改为发行包内 `bin/buildkitd`。
+- `core/status` 接口改为报告执行器三个子系统的连接状态，网页同步修改。
+- 规模：Go 产品代码约 5.1 万行（M1 后 6.8 万），测试约 3.1 万行。
+- 验证（开发机）：`go build`、`go vet`（2 条既有警告）、`go test ./...` 29 个包通过；新增监督循环、执行器启动重试、peer 校验的测试，`-race` 通过；网页类型检查、构建、36 个用例通过。
+- 未验证：核心与执行器以两个真实账号在主机上互联，要等 M3 安装脚本创建账号和目录后验证。
+
+与第 3 节目标结构的差异：目录不再改名（如 `persistence/sqlite` → `store`）。现有名称已能表达职责，改名只产生大范围改动和合并风险，没有功能收益。
+
+### 待决问题（M3 前需要定）
+
+- 对外访问入口：核心目前只监听 127.0.0.1，远程浏览器和 CLI 都无法访问。首发需要一个带 HTTPS 的对外入口，同时保持“网关故障时仍能登录修复”的边界。

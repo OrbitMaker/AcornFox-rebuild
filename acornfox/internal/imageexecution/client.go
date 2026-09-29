@@ -14,24 +14,22 @@ import (
 	appcontracts "github.com/acornfox/acornfox/internal/application/contracts"
 	"github.com/acornfox/acornfox/internal/contracts"
 	"github.com/acornfox/acornfox/internal/domain"
-	"github.com/acornfox/acornfox/internal/packmanager"
+	"github.com/acornfox/acornfox/internal/peer"
 )
 
 // Client executes image deployment and observation operations against the Container role daemon.
 type Client struct {
-	httpClient   *packmanager.UnixHTTPClient
-	streamClient *packmanager.UnixHTTPClient
+	httpClient   *peer.Client
+	streamClient *peer.Client
 	socketPath   string
 	timeout      time.Duration
 }
 
 // ClientConfig configures the Unix domain socket client with peer verification.
 type ClientConfig struct {
-	SocketPath    string
-	ExpectedPID   int32
-	ExpectedUID   uint32
-	PeerValidator func(pid int32, uid uint32) error
-	Timeout       time.Duration
+	SocketPath string
+	PeerUID    uint32 // account that must serve the executor socket
+	Timeout    time.Duration
 }
 
 // NewClient constructs a new image execution Unix client.
@@ -43,10 +41,10 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	if timeout <= 0 {
 		timeout = 2 * time.Minute
 	}
-	httpClient := packmanager.NewUnixHTTPClient(cfg.SocketPath, cfg.ExpectedPID, cfg.ExpectedUID, cfg.PeerValidator, timeout)
+	httpClient := peer.NewClient(cfg.SocketPath, cfg.PeerUID, timeout)
 	return &Client{
 		httpClient:   httpClient,
-		streamClient: packmanager.NewUnixHTTPClient(cfg.SocketPath, cfg.ExpectedPID, cfg.ExpectedUID, cfg.PeerValidator, 0),
+		streamClient: peer.NewClient(cfg.SocketPath, cfg.PeerUID, 0),
 		socketPath:   cfg.SocketPath,
 		timeout:      timeout,
 	}, nil

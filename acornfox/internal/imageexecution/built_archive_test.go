@@ -16,7 +16,7 @@ import (
 	appcontracts "github.com/acornfox/acornfox/internal/application/contracts"
 	"github.com/acornfox/acornfox/internal/contracts"
 	"github.com/acornfox/acornfox/internal/domain"
-	"github.com/acornfox/acornfox/internal/packmanager"
+	"github.com/acornfox/acornfox/internal/peer"
 	imageprovider "github.com/acornfox/acornfox/internal/providers/image"
 )
 
@@ -82,19 +82,19 @@ func TestBuiltOCIImportOriginalAuthorityAndDestinationReceipt(t *testing.T) {
 	fact := appcontracts.SourceBuiltArtifactFact{AdminID: "admin-original", ApplicationID: "app-original", EnvironmentID: "env-original", BuildIntentID: "sbi-original", BuildID: "build-original", SourceRevisionID: "src-original", BuildPlanID: "plan-original", ArtifactID: "art-original", Image: image, StorageRef: stored.StorageRef, ArchiveSHA256: stored.Evidence.Digest, SizeBytes: stored.SizeBytes}
 	coreSocket := filepath.Join(root, "core.sock")
 	coreStore := &fakeStoreForAuthority{authorized: true, facts: appcontracts.AuthorityBindingFacts{PlanDigest: "sha256:" + strings.Repeat("a", 64), ApplicationID: fact.ApplicationID, EnvironmentID: fact.EnvironmentID, ReleaseID: "rel-original", ApprovedPort: 8080, ImageOrigin: "source-build", SourceArtifact: &fact}}
-	authority, err := NewCoreAuthorityServer(CoreAuthorityServerConfig{Store: coreStore, SocketPath: coreSocket, ExpectedContainerUID: uint32(os.Getuid()), ExpectedContainerPID: int32(os.Getpid())})
+	authority, err := NewCoreAuthorityServer(CoreAuthorityServerConfig{Store: coreStore, SocketPath: coreSocket, ExecutorUID: uint32(os.Getuid())})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer authority.Close()
-	runtime := &ContainerRuntime{imageStore: destination, authorityClient: packmanager.NewUnixHTTPClient(coreSocket, int32(os.Getpid()), uint32(os.Getuid()), nil, time.Second)}
+	runtime := &ContainerRuntime{imageStore: destination, authorityClient: peer.NewClient(coreSocket, uint32(os.Getuid()), time.Second)}
 	containerSocket := filepath.Join(root, "container.sock")
-	server, err := NewContainerServer(ContainerServerConfig{Runtime: runtime, SocketPath: containerSocket, ExpectedCoreUID: uint32(os.Getuid()), ExpectedCorePID: int32(os.Getpid())})
+	server, err := NewContainerServer(ContainerServerConfig{Runtime: runtime, SocketPath: containerSocket, CoreUID: uint32(os.Getuid())})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer server.Close()
-	client, err := NewClient(ClientConfig{SocketPath: containerSocket, ExpectedPID: int32(os.Getpid()), ExpectedUID: uint32(os.Getuid()), Timeout: time.Second})
+	client, err := NewClient(ClientConfig{SocketPath: containerSocket, PeerUID: uint32(os.Getuid()), Timeout: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}

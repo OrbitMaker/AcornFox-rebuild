@@ -24,7 +24,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/acornfox/acornfox/internal/install"
+	"github.com/acornfox/acornfox/internal/layout"
 )
 
 const statePath = RunRoot + "/state.json"
@@ -38,11 +38,10 @@ type managerIdentity struct {
 	native           bool
 }
 
-func legacyManagerIdentity() managerIdentity {
-	return managerIdentity{"acornfox", "/opt/acornfox/current/bin/buildkitd", false}
-}
+// nativeManagerIdentity admits only acornfox-executor as the build client and
+// the release's rootless buildkitd as the worker.
 func nativeManagerIdentity() managerIdentity {
-	return managerIdentity{"acornfox-build", "/opt/acornfox/current/embedded/bin/buildkitd", true}
+	return managerIdentity{layout.AccountExecutor, layout.CurrentRelease + "/bin/buildkitd", true}
 }
 
 type state struct {
@@ -104,10 +103,6 @@ func readRootFile(path string, limit int64) ([]byte, error) {
 	return raw, err
 }
 
-func NewProductionManager() (*Manager, error) {
-	return newProductionManager(legacyManagerIdentity())
-}
-
 // NewNativeProductionManager serves only the separately owned Native Source
 // adapter. It retains the same root network manager and rootless BuildKit worker.
 func NewNativeProductionManager() (*Manager, error) {
@@ -115,7 +110,7 @@ func NewNativeProductionManager() (*Manager, error) {
 }
 
 func newProductionManager(identity managerIdentity) (*Manager, error) {
-	if identity != legacyManagerIdentity() && identity != nativeManagerIdentity() {
+	if identity != nativeManagerIdentity() {
 		return nil, ErrPolicy
 	}
 	if os.Geteuid() != 0 {
@@ -220,7 +215,7 @@ func (m *Manager) writeState() error {
 	if err != nil {
 		return err
 	}
-	return install.AtomicWriteFile(statePath, append(raw, '\n'), 0600)
+	return AtomicWriteFile(statePath, append(raw, '\n'), 0600)
 }
 
 func (m *Manager) loadState() error {

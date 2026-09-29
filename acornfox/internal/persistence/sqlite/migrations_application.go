@@ -88,6 +88,7 @@ var applicationSchemaDefinitions = []schemaObjectDef{
     failure_reason TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
+    target_kind TEXT NOT NULL DEFAULT 'application' CHECK (target_kind = 'application'),
     UNIQUE (environment_id, idempotency_key),
     CHECK (length(trim(id)) > 0),
     CHECK (length(trim(application_id)) > 0),

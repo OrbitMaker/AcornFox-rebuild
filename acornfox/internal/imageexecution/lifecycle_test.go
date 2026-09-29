@@ -7,7 +7,7 @@ import (
 	"errors"
 	appcontracts "github.com/acornfox/acornfox/internal/application/contracts"
 	"github.com/acornfox/acornfox/internal/domain"
-	"github.com/acornfox/acornfox/internal/packmanager"
+	"github.com/acornfox/acornfox/internal/peer"
 	"net"
 	"net/http"
 	"os"
@@ -37,12 +37,12 @@ func TestLifecycleAuthorityUsesFreshCommandForEachDockerWrite(t *testing.T) {
 	a := appcontracts.ImageLifecycleAuthorityInput{BeginImageExecutionInput: appcontracts.BeginImageExecutionInput{TaskID: b.TaskID, OperationID: b.OperationID, Owner: "fresh", CoreGeneration: 12, LeaseGeneration: 15}, DeploymentID: b.DeploymentID, ReleaseID: b.ReleaseID, PlanDigest: b.PlanDigest, ContainerID: b.ContainerID, Action: b.Action}
 	store := &lifecycleAuthorityStore{binding: b}
 	sock := filepath.Join(t.TempDir(), "authority.sock")
-	server, err := NewCoreAuthorityServer(CoreAuthorityServerConfig{Store: &fakeStoreForAuthority{}, LifecycleStore: store, SocketPath: sock, ExpectedContainerUID: uint32(os.Getuid()), ExpectedContainerPID: int32(os.Getpid())})
+	server, err := NewCoreAuthorityServer(CoreAuthorityServerConfig{Store: &fakeStoreForAuthority{}, LifecycleStore: store, SocketPath: sock, ExecutorUID: uint32(os.Getuid())})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer server.Close()
-	runtime := &ContainerRuntime{authorityClient: packmanager.NewUnixHTTPClient(sock, int32(os.Getpid()), uint32(os.Getuid()), nil, time.Second)}
+	runtime := &ContainerRuntime{authorityClient: peer.NewClient(sock, uint32(os.Getuid()), time.Second)}
 	base := &fakeDockerRunner{}
 	runner := &authorizingCommandRunner{base: base}
 	for _, action := range []appcontracts.ImageLifecycleAction{appcontracts.ImageLifecycleStop, appcontracts.ImageLifecycleStart, appcontracts.ImageLifecycleRestart} {
@@ -91,7 +91,7 @@ func TestLifecycleClientUnknownOnEOFOrMalformedSuccess(t *testing.T) {
 			})}
 			go server.Serve(ln)
 			defer server.Close()
-			client, err := NewClient(ClientConfig{SocketPath: sock, ExpectedPID: int32(os.Getpid()), ExpectedUID: uint32(os.Getuid()), Timeout: time.Second})
+			client, err := NewClient(ClientConfig{SocketPath: sock, PeerUID: uint32(os.Getuid()), Timeout: time.Second})
 			if err != nil {
 				t.Fatal(err)
 			}

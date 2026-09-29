@@ -113,15 +113,14 @@ func TestImagePublicAccessGatewayApprovedUnixProjection(t *testing.T) {
 	})}
 	go caddy.Serve(listener)
 	defer caddy.Close()
-	identity := func(int32, uint32) error { return nil } // Same-process Unix fixture only.
-	peer := gatewayexecution.ServerConfig{ExpectedPID: int32(os.Getpid()), ExpectedUID: uint32(os.Getuid()), PeerValidator: identity}
+	peer := gatewayexecution.ServerConfig{PeerUID: uint32(os.Getuid())}
 	peer.SocketPath = coreSocket
 	coreServer, err := gatewayexecution.NewAuthorityServer(peer, s)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer coreServer.Close()
-	authority, err := gatewayexecution.NewAuthorityClient(gatewayexecution.ClientConfig{SocketPath: coreSocket, ExpectedPID: peer.ExpectedPID, ExpectedUID: peer.ExpectedUID, PeerValidator: identity})
+	authority, err := gatewayexecution.NewAuthorityClient(gatewayexecution.ClientConfig{SocketPath: coreSocket, PeerUID: peer.PeerUID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +136,7 @@ func TestImagePublicAccessGatewayApprovedUnixProjection(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer gatewayServer.Close()
-	client, err := gatewayexecution.NewClient(gatewayexecution.ClientConfig{SocketPath: gatewaySocket, ExpectedPID: peer.ExpectedPID, ExpectedUID: peer.ExpectedUID, PeerValidator: identity})
+	client, err := gatewayexecution.NewClient(gatewayexecution.ClientConfig{SocketPath: gatewaySocket, PeerUID: peer.PeerUID})
 	if err != nil {
 		t.Fatal(err)
 	}

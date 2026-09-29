@@ -19,7 +19,6 @@ import (
 	appcontracts "github.com/acornfox/acornfox/internal/application/contracts"
 	"github.com/acornfox/acornfox/internal/contracts"
 	"github.com/acornfox/acornfox/internal/domain"
-	"github.com/acornfox/acornfox/internal/localpeer"
 	capacityprovider "github.com/acornfox/acornfox/internal/providers/capacity"
 	imageprovider "github.com/acornfox/acornfox/internal/providers/image"
 )
@@ -79,13 +78,7 @@ func TestBuiltOCIExportStreamsBoundedOriginalArchive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	peer, err := localpeer.AttestLinuxProcess(int32(os.Getpid()))
-	if err != nil {
-		t.Fatal(err)
-	}
-	checkPeer := func(pid int32, uid uint32) error {
-		return localpeer.VerifyProcessIdentity(pid, uid, peer.ExecutableSHA256, peer.StartTime)
-	}
+	peerUID := uint32(os.Getuid())
 	capacity, err := capacityprovider.New(capacityprovider.Config{})
 	if err != nil {
 		t.Fatal(err)
@@ -94,12 +87,12 @@ func TestBuiltOCIExportStreamsBoundedOriginalArchive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server, err := NewExecutionServer(ServerConfig{SocketPath: filepath.Join(root, "role.sock"), ExpectedPID: peer.PID, ExpectedUID: peer.UID, PeerValidator: checkPeer, ArchiveStore: images}, role)
+	server, err := NewExecutionServer(ServerConfig{SocketPath: filepath.Join(root, "role.sock"), PeerUID: peerUID, ArchiveStore: images}, role)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer server.Close()
-	client, err := NewClient(ClientConfig{SocketPath: filepath.Join(root, "role.sock"), ExpectedPID: peer.PID, ExpectedUID: peer.UID, PeerValidator: checkPeer})
+	client, err := NewClient(ClientConfig{SocketPath: filepath.Join(root, "role.sock"), PeerUID: peerUID})
 	if err != nil {
 		t.Fatal(err)
 	}

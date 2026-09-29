@@ -9,10 +9,15 @@ export type Session = {
   absolute_expires_at: string;
 };
 
+export type ExecutorStatus = {
+  container: boolean;
+  source_build: boolean;
+  gateway: boolean;
+};
+
 export type CoreStatus = {
   storage: string;
-  package_management: string;
-  capabilities: string[];
+  executor: ExecutorStatus;
 };
 
 export type HostMetricsAvailability = components["schemas"]["HostMetricsResponse"]["availability"];
@@ -231,16 +236,19 @@ function sessionDecoder(value: unknown): Session {
 }
 
 function coreStatusDecoder(value: unknown): CoreStatus {
-  const row = exact(
-    value,
-    ["storage", "package_management", "capabilities"],
-    ["storage", "package_management", "capabilities"],
-  );
-  if (!Array.isArray(row.capabilities)) invalid();
+  const row = exact(value, ["storage", "executor"], ["storage", "executor"]);
+  const executor = exact(row.executor, ["container", "source_build", "gateway"], ["container", "source_build", "gateway"]);
+  const flag = (v: unknown): boolean => {
+    if (typeof v !== "boolean") invalid();
+    return v as boolean;
+  };
   return {
     storage: text(row.storage),
-    package_management: text(row.package_management),
-    capabilities: row.capabilities.map(text),
+    executor: {
+      container: flag(executor.container),
+      source_build: flag(executor.source_build),
+      gateway: flag(executor.gateway),
+    },
   };
 }
 

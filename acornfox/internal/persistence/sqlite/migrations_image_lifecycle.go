@@ -2,7 +2,7 @@ package sqlite
 
 import "strings"
 
-const version0011_image_lifecycle = "0011_image_lifecycle"
+const version0007_image_lifecycle = "0007_image_lifecycle"
 
 var imageLifecycleSchemaDefinitions = []schemaObjectDef{
 	{name: "image_lifecycle_commands", sql: `CREATE TABLE IF NOT EXISTS image_lifecycle_commands (

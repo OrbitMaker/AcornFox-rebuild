@@ -20,7 +20,7 @@ import (
 	appcontracts "github.com/acornfox/acornfox/internal/application/contracts"
 	"github.com/acornfox/acornfox/internal/contracts"
 	"github.com/acornfox/acornfox/internal/domain"
-	"github.com/acornfox/acornfox/internal/packmanager"
+	"github.com/acornfox/acornfox/internal/peer"
 	imageprovider "github.com/acornfox/acornfox/internal/providers/image"
 	"github.com/acornfox/acornfox/internal/providers/registryhttp"
 	"github.com/acornfox/acornfox/internal/providers/standalone"
@@ -115,13 +115,11 @@ func TestCoreAuthorityServer_RoundTrip(t *testing.T) {
 	}
 
 	currentUID := uint32(os.Getuid())
-	currentPID := int32(os.Getpid())
 
 	server, err := NewCoreAuthorityServer(CoreAuthorityServerConfig{
-		Store:                store,
-		SocketPath:           sockPath,
-		ExpectedContainerUID: currentUID,
-		ExpectedContainerPID: currentPID,
+		Store:       store,
+		SocketPath:  sockPath,
+		ExecutorUID: currentUID,
 	})
 	if err != nil {
 		t.Fatalf("NewCoreAuthorityServer: %v", err)
@@ -132,7 +130,7 @@ func TestCoreAuthorityServer_RoundTrip(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	runtime := &ContainerRuntime{
-		authorityClient: packmanager.NewUnixHTTPClient(sockPath, currentPID, currentUID, nil, 2*time.Second),
+		authorityClient: peer.NewClient(sockPath, currentUID, 2*time.Second),
 	}
 
 	req := DeployRequest{
@@ -160,128 +158,6 @@ func TestCoreAuthorityServer_RoundTrip(t *testing.T) {
 	store.authorized = false
 	if _, err := runtime.checkAuthority(ctx, req); err == nil {
 		t.Fatal("expected authority rejection, got nil")
-	}
-}
-
-func TestContainerClient_ObserveRoundTrip(t *testing.T) {
-	dir := t.TempDir()
-	sockPath := filepath.Join(dir, "container.sock")
-
-	currentUID := uint32(os.Getuid())
-	currentPID := int32(os.Getpid())
-
-	rawListener, err := net.Listen("unix", sockPath)
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	defer rawListener.Close()
-
-	verifiedListener := &peerVerifiedListener{
-		Listener:    rawListener,
-		expectedUID: currentUID,
-		expectedPID: currentPID,
-	}
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/image/observe", func(w http.ResponseWriter, r *http.Request) {
-		var req ObserveRequest
-		if err := decodeStrictJSON(r.Body, &req); err != nil {
-			http.Error(w, "invalid request", http.StatusBadRequest)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(ObserveResponse{
-			Success:        true,
-			Status:         "running",
-			Running:        true,
-			ContainerID:    "c-observed-123",
-			ContainerName:  "acornfox-dep-obs-1",
-			ImageID:        "sha256:5b85a3c2678f134440c9502b406b7d6fb8fa83842f1f513f5fb4ebcbe5e638b9",
-			ManifestDigest: "sha256:72611294759dc6b304d1f3efa2d4b1de212ce422866244f31bc29f731e3b2079",
-			StorageRef:     "image/test",
-			ContentDigest:  "sha256:1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff",
-			SizeBytes:      1024,
-			HostPort:       39898,
-			ContainerPort:  9898,
-			ObservedAt:     time.Now().UTC(),
-		})
-	})
-
-	srv := &http.Server{Handler: mux}
-	go func() { _ = srv.Serve(verifiedListener) }()
-	defer srv.Close()
-
-	client, err := NewClient(ClientConfig{
-		SocketPath:  sockPath,
-		ExpectedPID: currentPID,
-		ExpectedUID: currentUID,
-		Timeout:     2 * time.Second,
-	})
-	if err != nil {
-		t.Fatalf("NewClient: %v", err)
-	}
-
-	obs, err := client.ObserveDeployment(context.Background(), domain.ID("dep-obs-1"), domain.ID("op-obs-1"))
-	if err != nil {
-		t.Fatalf("ObserveDeployment failed: %v", err)
-	}
-	if !obs.Running || obs.ContainerID != "c-observed-123" || obs.HostPort != 39898 {
-		t.Fatalf("unexpected observation: %+v", obs)
-	}
-}
-
-func TestRuntimePeerBinding_ValidateAndLoad(t *testing.T) {
-	dir := t.TempDir()
-	validJSON := `{
-		"version": "1.0",
-		"installation_id": "inst-test-01",
-		"container_socket": "/run/acornfox/container.sock",
-		"authority_socket": "/run/acornfox/core-authority.sock",
-		"core_uid": 1000,
-		"core_pid": 1234,
-		"core_exe_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		"core_start_time": "123456",
-		"container_uid": 1000,
-		"container_pid": 5678,
-		"container_exe_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-		"container_start_time": "234567"
-	}`
-
-	validPath := filepath.Join(dir, "valid.json")
-	if err := os.WriteFile(validPath, []byte(validJSON), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	binding, err := ParseRuntimePeerBinding([]byte(validJSON))
-	if err != nil {
-		t.Fatalf("ParseRuntimePeerBinding valid: %v", err)
-	}
-	if binding.CorePID != 1234 || binding.ContainerPID != 5678 {
-		t.Fatalf("unexpected binding: %+v", binding)
-	}
-
-	// Test unconfigured empty path -> returns nil, nil
-	unconf, err := LoadProtectedRuntimePeerBinding("")
-	if err != nil || unconf != nil {
-		t.Fatalf("expected nil for empty path, got unconf=%v err=%v", unconf, err)
-	}
-
-	// Test non-existent path -> returns nil, nil
-	nonexist, err := LoadProtectedRuntimePeerBinding(filepath.Join(dir, "absent.json"))
-	if err != nil || nonexist != nil {
-		t.Fatalf("expected nil for absent file, got nonexist=%v err=%v", nonexist, err)
-	}
-
-	// Test invalid PID 0 rejection
-	invalidJSON := strings.Replace(validJSON, `"core_pid": 1234`, `"core_pid": 0`, 1)
-	if _, err := ParseRuntimePeerBinding([]byte(invalidJSON)); err == nil {
-		t.Fatal("expected error for core_pid=0, got nil")
-	}
-
-	// Test invalid SHA rejection
-	invalidSHAJSON := strings.Replace(validJSON, `"core_exe_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"`, `"core_exe_sha": "short"`, 1)
-	if _, err := ParseRuntimePeerBinding([]byte(invalidSHAJSON)); err == nil {
-		t.Fatal("expected error for short core_exe_sha, got nil")
 	}
 }
 
@@ -350,60 +226,6 @@ func TestContainerRuntime_RequestBoundAuthority_ConcurrencyAndRejection(t *testi
 	}
 }
 
-func TestClient_EOFResponseReturnsTypedUnknown(t *testing.T) {
-	dir := t.TempDir()
-	sockPath := filepath.Join(dir, "eof.sock")
-
-	currentUID := uint32(os.Getuid())
-	currentPID := int32(os.Getpid())
-
-	listener, err := net.Listen("unix", sockPath)
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	defer listener.Close()
-
-	// Server immediately closes connection on POST /v1/image/deploy, producing EOF
-	go func() {
-		for {
-			conn, err := listener.Accept()
-			if err != nil {
-				return
-			}
-			buf := make([]byte, 1024)
-			_, _ = conn.Read(buf)
-			_ = conn.Close()
-		}
-	}()
-
-	client, err := NewClient(ClientConfig{
-		SocketPath:  sockPath,
-		ExpectedPID: currentPID,
-		ExpectedUID: currentUID,
-		Timeout:     2 * time.Second,
-	})
-	if err != nil {
-		t.Fatalf("NewClient: %v", err)
-	}
-
-	_, execErr := client.ExecuteDeployment(context.Background(), appcontracts.ImageExecutionBinding{
-		DeploymentID: domain.ID("dep-eof-1"),
-		ReleaseID:    domain.ID("rel-eof-1"),
-		Plan: appcontracts.ImagePlan{
-			ResolvedImage: appcontracts.ResolvedImage{
-				Digest: "sha256:72611294759dc6b304d1f3efa2d4b1de212ce422866244f31bc29f731e3b2079",
-			},
-		},
-	})
-
-	if execErr == nil {
-		t.Fatal("expected error on lost response, got nil")
-	}
-	if !errors.Is(execErr, appcontracts.ErrOutcomeUnknown) {
-		t.Fatalf("expected typed ErrOutcomeUnknown on EOF response, got %v", execErr)
-	}
-}
-
 func TestClient_InvalidSuccessReturnsTypedUnknown(t *testing.T) {
 	sock := filepath.Join(t.TempDir(), "invalid-success.sock")
 	listener, err := net.Listen("unix", sock)
@@ -419,7 +241,7 @@ func TestClient_InvalidSuccessReturnsTypedUnknown(t *testing.T) {
 	go server.Serve(listener)
 	defer server.Close()
 	client, err := NewClient(ClientConfig{
-		SocketPath: sock, ExpectedPID: int32(os.Getpid()), ExpectedUID: uint32(os.Getuid()), Timeout: 2 * time.Second,
+		SocketPath: sock, PeerUID: uint32(os.Getuid()), Timeout: 2 * time.Second,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -437,7 +259,7 @@ func TestContainerRuntime_VerifiedReceiptRecovery(t *testing.T) {
 	dir := t.TempDir()
 	socket := filepath.Join(dir, "receipt.sock")
 	store := &fakeStoreForAuthority{authorized: true, observationOperation: "op-receipt", observationDeployment: "dep-receipt", facts: appcontracts.AuthorityBindingFacts{ApplicationID: "app-receipt", EnvironmentID: "env-receipt", ReleaseID: "release-receipt", ApprovedPort: 8080, PlanDigest: "sha256:" + strings.Repeat("a", 64)}}
-	server, err := NewCoreAuthorityServer(CoreAuthorityServerConfig{Store: store, SocketPath: socket, ExpectedContainerUID: uint32(os.Getuid()), ExpectedContainerPID: int32(os.Getpid())})
+	server, err := NewCoreAuthorityServer(CoreAuthorityServerConfig{Store: store, SocketPath: socket, ExecutorUID: uint32(os.Getuid())})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -446,7 +268,7 @@ func TestContainerRuntime_VerifiedReceiptRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	runtime := &ContainerRuntime{authorityClient: packmanager.NewUnixHTTPClient(socket, int32(os.Getpid()), uint32(os.Getuid()), nil, time.Second), imageStore: images}
+	runtime := &ContainerRuntime{authorityClient: peer.NewClient(socket, uint32(os.Getuid()), time.Second), imageStore: images}
 	configBytes := []byte(`{"architecture":"amd64","os":"linux","config":{"Volumes":null}}`)
 	layer := []byte("bounded registry fixture layer")
 	digestBytes := func(value []byte) string { return fmt.Sprintf("sha256:%x", sha256.Sum256(value)) }
@@ -790,4 +612,115 @@ func (r receiptFaultReader) Close() error {
 		return errors.New("injected archive close failure")
 	}
 	return err
+}
+
+func TestContainerClient_ObserveRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	sockPath := filepath.Join(dir, "container.sock")
+
+	currentUID := uint32(os.Getuid())
+
+	verifiedListener, err := peer.Listen(sockPath, 0, currentUID)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer verifiedListener.Close()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/image/observe", func(w http.ResponseWriter, r *http.Request) {
+		var req ObserveRequest
+		if err := decodeStrictJSON(r.Body, &req); err != nil {
+			http.Error(w, "invalid request", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(ObserveResponse{
+			Success:        true,
+			Status:         "running",
+			Running:        true,
+			ContainerID:    "c-observed-123",
+			ContainerName:  "acornfox-dep-obs-1",
+			ImageID:        "sha256:5b85a3c2678f134440c9502b406b7d6fb8fa83842f1f513f5fb4ebcbe5e638b9",
+			ManifestDigest: "sha256:72611294759dc6b304d1f3efa2d4b1de212ce422866244f31bc29f731e3b2079",
+			StorageRef:     "image/test",
+			ContentDigest:  "sha256:1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff",
+			SizeBytes:      1024,
+			HostPort:       39898,
+			ContainerPort:  9898,
+			ObservedAt:     time.Now().UTC(),
+		})
+	})
+
+	srv := &http.Server{Handler: mux}
+	go func() { _ = srv.Serve(verifiedListener) }()
+	defer srv.Close()
+
+	client, err := NewClient(ClientConfig{
+		SocketPath: sockPath,
+		PeerUID:    currentUID,
+		Timeout:    2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	obs, err := client.ObserveDeployment(context.Background(), domain.ID("dep-obs-1"), domain.ID("op-obs-1"))
+	if err != nil {
+		t.Fatalf("ObserveDeployment failed: %v", err)
+	}
+	if !obs.Running || obs.ContainerID != "c-observed-123" || obs.HostPort != 39898 {
+		t.Fatalf("unexpected observation: %+v", obs)
+	}
+}
+
+func TestClient_EOFResponseReturnsTypedUnknown(t *testing.T) {
+	dir := t.TempDir()
+	sockPath := filepath.Join(dir, "eof.sock")
+
+	currentUID := uint32(os.Getuid())
+
+	listener, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+
+	// Server immediately closes connection on POST /v1/image/deploy, producing EOF
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			buf := make([]byte, 1024)
+			_, _ = conn.Read(buf)
+			_ = conn.Close()
+		}
+	}()
+
+	client, err := NewClient(ClientConfig{
+		SocketPath: sockPath,
+		PeerUID:    currentUID,
+		Timeout:    2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	_, execErr := client.ExecuteDeployment(context.Background(), appcontracts.ImageExecutionBinding{
+		DeploymentID: domain.ID("dep-eof-1"),
+		ReleaseID:    domain.ID("rel-eof-1"),
+		Plan: appcontracts.ImagePlan{
+			ResolvedImage: appcontracts.ResolvedImage{
+				Digest: "sha256:72611294759dc6b304d1f3efa2d4b1de212ce422866244f31bc29f731e3b2079",
+			},
+		},
+	})
+
+	if execErr == nil {
+		t.Fatal("expected error on lost response, got nil")
+	}
+	if !errors.Is(execErr, appcontracts.ErrOutcomeUnknown) {
+		t.Fatalf("expected typed ErrOutcomeUnknown on EOF response, got %v", execErr)
+	}
 }

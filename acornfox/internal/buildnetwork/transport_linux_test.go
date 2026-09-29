@@ -14,11 +14,8 @@ import (
 )
 
 func TestNativeManagerUsesFixedSourceIdentityAndEmbeddedWorker(t *testing.T) {
-	legacy, native := legacyManagerIdentity(), nativeManagerIdentity()
-	if legacy.clientUser != "acornfox" || legacy.workerExecutable != "/opt/acornfox/current/bin/buildkitd" || legacy.native {
-		t.Fatal("legacy manager identity changed")
-	}
-	if native.clientUser != "acornfox-build" || native.workerExecutable != "/opt/acornfox/current/embedded/bin/buildkitd" || !native.native {
+	native := nativeManagerIdentity()
+	if native.clientUser != "acornfox-exec" || native.workerExecutable != "/opt/acornfox/current/bin/buildkitd" || !native.native {
 		t.Fatal("Native Source identity or embedded BuildKit path is not fixed")
 	}
 	if _, err := newProductionManager(managerIdentity{clientUser: "untrusted", workerExecutable: native.workerExecutable, native: true}); !errors.Is(err, ErrPolicy) {

@@ -26,7 +26,7 @@ func (s *Store) checkImagePublicAccess(ctx context.Context) error {
 		return err
 	}
 	var count int
-	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM _schema_migrations WHERE version=?`, version0013_image_public_access).Scan(&count); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM _schema_migrations WHERE version=?`, version0009_image_public_access).Scan(&count); err != nil {
 		return err
 	}
 	if count != 1 {

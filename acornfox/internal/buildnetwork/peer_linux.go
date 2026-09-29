@@ -5,11 +5,11 @@ package buildnetwork
 import (
 	"net"
 
-	"github.com/acornfox/acornfox/internal/localpeer"
+	"github.com/acornfox/acornfox/internal/peer"
 )
 
 func peerIdentity(connection net.Conn) (uint32, int32, error) {
-	id, err := localpeer.PeerIdentity(connection)
+	id, err := peer.Of(connection)
 	if err != nil {
 		return 0, 0, err
 	}

@@ -21,7 +21,6 @@ type ImageExecutionWorkerConfig struct {
 	PollInterval         time.Duration
 	LeaseDuration        time.Duration
 	MaxAttempts          int
-	AuthoritySocketPath  string
 	Client               appcontracts.ContainerExecutionClient
 	BuiltContainerClient appcontracts.SourceBuiltContainerClient
 	OpenBuiltArchive     func(context.Context, appcontracts.SourceBuiltArtifactFact) (io.ReadCloser, error)

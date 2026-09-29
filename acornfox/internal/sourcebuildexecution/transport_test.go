@@ -16,7 +16,6 @@ import (
 	"github.com/acornfox/acornfox/internal/contracts"
 	"github.com/acornfox/acornfox/internal/domain"
 	"github.com/acornfox/acornfox/internal/foundation"
-	"github.com/acornfox/acornfox/internal/localpeer"
 	capacityprovider "github.com/acornfox/acornfox/internal/providers/capacity"
 )
 
@@ -25,13 +24,7 @@ func TestSourceBuildUnixTransportUsesOriginalAuthorityAndPeer(t *testing.T) {
 	if err := os.Chmod(root, 0700); err != nil {
 		t.Fatal(err)
 	}
-	att, err := localpeer.AttestLinuxProcess(int32(os.Getpid()))
-	if err != nil {
-		t.Fatal(err)
-	}
-	validator := func(pid int32, uid uint32) error {
-		return localpeer.VerifyProcessIdentity(pid, uid, att.ExecutableSHA256, att.StartTime)
-	}
+	attUID := uint32(os.Getuid())
 	binding := appcontracts.SourceBuildBinding{TaskID: "task_unix", OperationID: "op_unix", ApplicationID: "app_unix", Owner: "core-worker", CoreGeneration: 1, LeaseGeneration: 1}
 	request := contracts.PrepareSourceRequest{ApplicationID: binding.ApplicationID, Kind: domain.SourceGitHTTPS, Locator: "https://github.com/acme/app", Ref: strings.Repeat("a", 40), Operation: contracts.OperationContext{IdempotencyKey: "unix-prepare", Deadline: time.Now().Add(time.Minute), Actor: "core-source-build"}}
 	command := SourceBuildCommand{Stage: appcontracts.SourceBuildPrepare, Binding: binding, Prepare: &request}
@@ -43,12 +36,12 @@ func TestSourceBuildUnixTransportUsesOriginalAuthorityAndPeer(t *testing.T) {
 		}
 		return nil
 	}}
-	as, err := NewAuthorityServer(ServerConfig{SocketPath: filepath.Join(root, "authority.sock"), ExpectedPID: att.PID, ExpectedUID: att.UID, PeerValidator: validator}, authority)
+	as, err := NewAuthorityServer(ServerConfig{SocketPath: filepath.Join(root, "authority.sock"), PeerUID: attUID}, authority)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer as.Close()
-	ac, err := NewAuthorityClient(ClientConfig{SocketPath: filepath.Join(root, "authority.sock"), ExpectedPID: att.PID, ExpectedUID: att.UID, PeerValidator: validator})
+	ac, err := NewAuthorityClient(ClientConfig{SocketPath: filepath.Join(root, "authority.sock"), PeerUID: attUID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,12 +65,12 @@ func TestSourceBuildUnixTransportUsesOriginalAuthorityAndPeer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	es, err := NewExecutionServer(ServerConfig{SocketPath: filepath.Join(root, "execute.sock"), ExpectedPID: att.PID, ExpectedUID: att.UID, PeerValidator: validator}, role)
+	es, err := NewExecutionServer(ServerConfig{SocketPath: filepath.Join(root, "execute.sock"), PeerUID: attUID}, role)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer es.Close()
-	client, err := NewClient(ClientConfig{SocketPath: filepath.Join(root, "execute.sock"), ExpectedPID: att.PID, ExpectedUID: att.UID, PeerValidator: validator})
+	client, err := NewClient(ClientConfig{SocketPath: filepath.Join(root, "execute.sock"), PeerUID: attUID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,8 +84,8 @@ func TestSourceBuildUnixTransportUsesOriginalAuthorityAndPeer(t *testing.T) {
 	if _, err := client.ExecuteSourceBuild(context.Background(), raw); err == nil || source.prepared != 1 {
 		t.Fatal("changed full command bypassed Core authority")
 	}
-	if _, err := NewClient(ClientConfig{SocketPath: filepath.Join(root, "execute.sock"), ExpectedPID: att.PID, ExpectedUID: att.UID}); err == nil {
-		t.Fatal("missing live peer validator accepted")
+	if _, err := NewClient(ClientConfig{SocketPath: filepath.Join(root, "execute.sock"), PeerUID: 0}); err == nil {
+		t.Fatal("client without a peer uid was accepted")
 	}
 	if _, err := client.ExecuteSourceBuild(context.Background(), []byte(`{"stage":"cancel"}`)); err == nil || source.prepared != 1 {
 		t.Fatal("unapproved control stage dispatched")

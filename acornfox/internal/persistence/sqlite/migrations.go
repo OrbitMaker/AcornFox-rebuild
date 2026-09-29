@@ -212,119 +212,101 @@ func addNativeSchemaObjects(expected map[string]string, sqlText string, want int
 	return nil
 }
 
-func runMigrationsAndVerifySchema(ctx context.Context, db *sql.DB) (retErr error) {
-	conn, err := db.Conn(ctx)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	var ledgerExists int
-	if err := conn.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type='table' AND name='_schema_migrations'`).Scan(&ledgerExists); err != nil {
-		return err
-	}
-	pending := true
-	if ledgerExists == 1 {
-		var applied int
-		if err := conn.QueryRowContext(ctx, `SELECT count(*) FROM _schema_migrations WHERE version=?`, version0010_image_execution).Scan(&applied); err != nil {
-			return err
-		}
-		pending = applied == 0
-	}
-	defer func() {
-		restoreCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		fail := func(e error) { retErr = errors.Join(retErr, e) }
-		if _, err := conn.ExecContext(restoreCtx, `PRAGMA foreign_keys=ON`); err != nil {
-			fail(fmt.Errorf("restore FK ON failed: %w", err))
-			return
-		}
-		var fk int
-		if err := conn.QueryRowContext(restoreCtx, `PRAGMA foreign_keys`).Scan(&fk); err != nil || fk != 1 {
-			fail(fmt.Errorf("restore FK ON verification failed"))
-			return
-		}
-		rows, err := conn.QueryContext(restoreCtx, `PRAGMA foreign_key_check`)
-		if err != nil {
-			fail(err)
-			return
-		}
-		violation, iterationErr := foreignKeyCheckResult(rows)
-		if iterationErr != nil {
-			fail(iterationErr)
-			return
-		}
-		if violation {
-			fail(fmt.Errorf("foreign key consistency failed: %w", ErrIncompatibleSchema))
-		}
-	}()
-	if pending {
-		if _, err := conn.ExecContext(ctx, `PRAGMA foreign_keys=OFF`); err != nil {
-			return err
-		}
-		var fk int
-		if err := conn.QueryRowContext(ctx, `PRAGMA foreign_keys`).Scan(&fk); err != nil || fk != 0 {
-			return fmt.Errorf("maintenance FK OFF failed")
-		}
-	}
+// migration is one immutable schema step. Applied steps are verified by checksum.
+type migration struct {
+	version string
+	body    string
+}
 
-	tx, err := conn.BeginTx(ctx, nil)
+// migrations is the complete, ordered schema history of a fresh installation.
+// Never edit an entry that has shipped; append a new one instead.
+func migrations() []migration {
+	return []migration{
+		{version0001_admin_auth, authMigrationSQL()},
+		{version0002_application_repository, applicationMigrationSQL()},
+		{version0003_task_fencing, taskMigrationSQL()},
+		{version0004_audit_evidence, auditMigrationSQL()},
+		{version0005_image_delivery, imageDeliveryMigrationSQL()},
+		{version0006_image_execution, imageExecutionMigrationSQL()},
+		{version0007_image_lifecycle, imageLifecycleMigrationSQL()},
+		{version0008_source_build, sourceBuildSchemaSQL},
+		{version0009_image_public_access, imagePublicAccessSchemaSQL},
+	}
+}
+
+// expectedSchema returns the exact final definition of every owned object.
+func expectedSchema() (map[string]string, error) {
+	expected := map[string]string{}
+	for _, group := range [][]schemaObjectDef{
+		ownedSchemaDefinitions, applicationSchemaDefinitions, auditSchemaDefinitions,
+		imageDeliverySchemaDefinitions, imageDeliveryTriggers,
+		imageExecutionSchemaDefinitions, imageExecutionTriggers,
+		imageLifecycleSchemaDefinitions, imageLifecycleTriggers,
+	} {
+		for _, o := range group {
+			expected[o.name] = o.sql
+		}
+	}
+	expected["task_leases"] = finalTaskSchemaSQL(expected["task_leases"])
+	expected[coreGenerationSchema.name] = coreGenerationSchema.sql
+	if err := addNativeSchemaObjects(expected, sourceBuildSchemaSQL, 12); err != nil {
+		return nil, err
+	}
+	if err := addNativeSchemaObjects(expected, imagePublicAccessSchemaSQL, 12); err != nil {
+		return nil, err
+	}
+	return expected, nil
+}
+
+// runMigrationsAndVerifySchema applies pending migrations in one transaction and
+// then requires the database to contain exactly the expected owned schema.
+func runMigrationsAndVerifySchema(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin migration transaction: %w", err)
 	}
 	defer tx.Rollback()
 
-	// 1. Detect arbitrary existing tables before migrations exist
-	var hasMigrationsTable bool
-	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='_schema_migrations');`).Scan(&hasMigrationsTable); err != nil {
+	var hasLedger bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='_schema_migrations');`).Scan(&hasLedger); err != nil {
 		return fmt.Errorf("check _schema_migrations existence: %w", err)
 	}
-
-	migrationsTableSQL := ownedSchemaDefinitions[0].sql
-	if !hasMigrationsTable {
-		var userTableCount int
-		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';`).Scan(&userTableCount); err != nil {
+	if !hasLedger {
+		var tables int
+		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';`).Scan(&tables); err != nil {
 			return fmt.Errorf("inspect pre-migration tables: %w", err)
 		}
-		if userTableCount > 0 {
-			return fmt.Errorf("unexpected nonempty unversioned sqlite database (%d tables): %w", userTableCount, ErrIncompatibleSchema)
+		if tables > 0 {
+			return fmt.Errorf("unexpected nonempty unversioned sqlite database (%d tables): %w", tables, ErrIncompatibleSchema)
 		}
-
-		if _, err := tx.ExecContext(ctx, migrationsTableSQL); err != nil {
+		if _, err := tx.ExecContext(ctx, ownedSchemaDefinitions[0].sql); err != nil {
 			return fmt.Errorf("create _schema_migrations: %w", err)
 		}
 	}
 
-	// 2. Read applied migrations
+	applied := map[string]string{}
 	rows, err := tx.QueryContext(ctx, `SELECT version, checksum FROM _schema_migrations ORDER BY version;`)
 	if err != nil {
 		return fmt.Errorf("query applied migrations: %w", err)
 	}
-	defer rows.Close()
-
-	applied := map[string]string{}
 	for rows.Next() {
 		var v, c string
 		if err := rows.Scan(&v, &c); err != nil {
+			rows.Close()
 			return fmt.Errorf("scan migration row: %w", err)
 		}
 		applied[v] = c
 	}
-	if err := rows.Err(); err != nil {
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
 		return fmt.Errorf("iterate migration rows: %w", err)
 	}
 
-	knownVersions := []string{
-		version0001_admin_auth, version0002_application_repository, version0003_task_fencing,
-		version0004_audit_evidence, version0005_pack_intents, version0006_pack_protocol_execution,
-		version0007_pack_artifact_staging, version0008_pack_activation, version0009_image_delivery,
-		version0010_image_execution, version0011_image_lifecycle, version0012_source_build,
-		version0013_image_public_access,
-	}
-	known := make(map[string]bool, len(knownVersions))
+	steps := migrations()
+	known := make(map[string]bool, len(steps))
 	gap := false
-	for _, version := range knownVersions {
-		known[version] = true
-		if _, ok := applied[version]; !ok {
+	for _, m := range steps {
+		known[m.version] = true
+		if _, ok := applied[m.version]; !ok {
 			gap = true
 		} else if gap {
 			return fmt.Errorf("applied migrations are not a contiguous prefix: %w", ErrIncompatibleSchema)
@@ -337,191 +319,19 @@ func runMigrationsAndVerifySchema(ctx context.Context, db *sql.DB) (retErr error
 	}
 
 	now := FormatTime(time.Now().UTC())
-	migration001SQL := authMigrationSQL()
-	expected001Checksum := sha256Hex(migration001SQL)
-
-	if actualChecksum, ok := applied[version0001_admin_auth]; ok {
-		if actualChecksum != expected001Checksum {
-			return fmt.Errorf("checksum mismatch for migration %s (applied %s, expected %s): %w", version0001_admin_auth, actualChecksum, expected001Checksum, ErrIncompatibleSchema)
-		}
-	} else {
-		if _, err := tx.ExecContext(ctx, migration001SQL); err != nil {
-			return fmt.Errorf("apply migration %s: %w", version0001_admin_auth, err)
-		}
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO _schema_migrations (version, checksum, applied_at)
-			VALUES (?, ?, ?);
-		`, version0001_admin_auth, expected001Checksum, now); err != nil {
-			return fmt.Errorf("record migration %s: %w", version0001_admin_auth, err)
-		}
-	}
-
-	migration002SQL := applicationMigrationSQL()
-	expected002Checksum := sha256Hex(migration002SQL)
-
-	if actualChecksum, ok := applied[version0002_application_repository]; ok {
-		if actualChecksum != expected002Checksum {
-			return fmt.Errorf("checksum mismatch for migration %s (applied %s, expected %s): %w", version0002_application_repository, actualChecksum, expected002Checksum, ErrIncompatibleSchema)
-		}
-	} else {
-		if _, err := tx.ExecContext(ctx, migration002SQL); err != nil {
-			return fmt.Errorf("apply migration %s: %w", version0002_application_repository, err)
-		}
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO _schema_migrations (version, checksum, applied_at)
-			VALUES (?, ?, ?);
-		`, version0002_application_repository, expected002Checksum, now); err != nil {
-			return fmt.Errorf("record migration %s: %w", version0002_application_repository, err)
-		}
-	}
-
-	migration003SQL := taskMigrationSQL()
-	expected003Checksum := sha256Hex(migration003SQL)
-	if actual, ok := applied[version0003_task_fencing]; ok {
-		if actual != expected003Checksum {
-			return fmt.Errorf("checksum mismatch for migration %s: %w", version0003_task_fencing, ErrIncompatibleSchema)
-		}
-	} else {
-		if _, err := tx.ExecContext(ctx, migration003SQL); err != nil {
-			return fmt.Errorf("apply task migration: %w", err)
-		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO _schema_migrations(version,checksum,applied_at) VALUES (?,?,?)`, version0003_task_fencing, expected003Checksum, now); err != nil {
-			return err
-		}
-	}
-
-	migration004SQL := auditMigrationSQL()
-	expected004Checksum := sha256Hex(migration004SQL)
-	if actual, ok := applied[version0004_audit_evidence]; ok {
-		if actual != expected004Checksum {
-			return fmt.Errorf("checksum mismatch for audit migration: %w", ErrIncompatibleSchema)
-		}
-	} else {
-		if _, err := tx.ExecContext(ctx, migration004SQL); err != nil {
-			return fmt.Errorf("apply audit migration: %w", err)
-		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO _schema_migrations(version,checksum,applied_at) VALUES(?,?,?)`, version0004_audit_evidence, expected004Checksum, now); err != nil {
-			return err
-		}
-	}
-
-	expected005Checksum := sha256Hex(packMigrationSQL())
-	if actual, ok := applied[version0005_pack_intents]; ok {
-		if actual != expected005Checksum {
-			return fmt.Errorf("pack migration checksum mismatch: %w", ErrIncompatibleSchema)
-		}
-	} else {
-		if err := applyPackMigration(ctx, tx, nil); err != nil {
-			return fmt.Errorf("pack migration failed: %w", err)
-		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO _schema_migrations(version,checksum,applied_at) VALUES(?,?,?)`, version0005_pack_intents, expected005Checksum, now); err != nil {
-			return err
-		}
-	}
-	if _, err := readInstallationBinding(ctx, tx); err != nil {
-		return fmt.Errorf("%w: %v", ErrCorruptData, err)
-	}
-
-	expected006Checksum := sha256Hex(packExecutionMigrationSQL())
-	if actual, ok := applied[version0006_pack_protocol_execution]; ok {
-		if actual != expected006Checksum {
-			return fmt.Errorf("checksum mismatch for migration %s: %w", version0006_pack_protocol_execution, ErrIncompatibleSchema)
-		}
-	} else {
-		if _, err := tx.ExecContext(ctx, packExecutionMigrationSQL()); err != nil {
-			return fmt.Errorf("apply pack execution migration: %w", err)
-		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO _schema_migrations(version,checksum,applied_at) VALUES(?,?,?)`, version0006_pack_protocol_execution, expected006Checksum, now); err != nil {
-			return err
-		}
-	}
-
-	expected007Checksum := sha256Hex(packLifecycleMigrationSQL())
-	if actual, ok := applied[version0007_pack_artifact_staging]; ok {
-		if actual != expected007Checksum {
-			return fmt.Errorf("checksum mismatch for migration %s: %w", version0007_pack_artifact_staging, ErrIncompatibleSchema)
-		}
-	} else {
-		if _, err := tx.ExecContext(ctx, packLifecycleMigrationSQL()); err != nil {
-			return fmt.Errorf("apply pack lifecycle migration: %w", err)
-		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO _schema_migrations(version,checksum,applied_at) VALUES(?,?,?)`, version0007_pack_artifact_staging, expected007Checksum, now); err != nil {
-			return err
-		}
-	}
-
-	expected008Checksum := sha256Hex(packActivationMigrationSQL())
-	if actual, ok := applied[version0008_pack_activation]; ok {
-		if actual != expected008Checksum {
-			return fmt.Errorf("checksum mismatch for migration %s: %w", version0008_pack_activation, ErrIncompatibleSchema)
-		}
-	} else {
-		if _, err := tx.ExecContext(ctx, packActivationMigrationSQL()); err != nil {
-			return fmt.Errorf("apply pack activation migration: %w", err)
-		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO _schema_migrations(version,checksum,applied_at) VALUES(?,?,?)`, version0008_pack_activation, expected008Checksum, now); err != nil {
-			return err
-		}
-	}
-
-	expected009Checksum := sha256Hex(imageDeliveryMigrationSQL())
-	if actual, ok := applied[version0009_image_delivery]; ok {
-		if actual != expected009Checksum {
-			return fmt.Errorf("checksum mismatch for migration %s: %w", version0009_image_delivery, ErrIncompatibleSchema)
-		}
-	} else {
-		if _, err := tx.ExecContext(ctx, imageDeliveryMigrationSQL()); err != nil {
-			return fmt.Errorf("apply image delivery migration: %w", err)
-		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO _schema_migrations(version,checksum,applied_at) VALUES(?,?,?)`, version0009_image_delivery, expected009Checksum, now); err != nil {
-			return err
-		}
-	}
-
-	expected010Checksum := sha256Hex(imageExecutionMigrationSQL())
-	if actual, ok := applied[version0010_image_execution]; ok {
-		if actual != expected010Checksum {
-			return fmt.Errorf("checksum mismatch for migration %s: %w", version0010_image_execution, ErrIncompatibleSchema)
-		}
-	} else {
-		if _, err := tx.ExecContext(ctx, imageExecutionMigrationSQL()); err != nil {
-			return fmt.Errorf("apply image execution migration: %w", err)
-		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO _schema_migrations(version,checksum,applied_at) VALUES(?,?,?)`, version0010_image_execution, expected010Checksum, now); err != nil {
-			return err
-		}
-	}
-
-	expected011Checksum := sha256Hex(imageLifecycleMigrationSQL())
-	if actual, ok := applied[version0011_image_lifecycle]; ok {
-		if actual != expected011Checksum {
-			return fmt.Errorf("lifecycle migration checksum mismatch: %w", ErrIncompatibleSchema)
-		}
-	} else {
-		if _, err := tx.ExecContext(ctx, imageLifecycleMigrationSQL()); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO _schema_migrations(version,checksum,applied_at) VALUES(?,?,?)`, version0011_image_lifecycle, expected011Checksum, now); err != nil {
-			return err
-		}
-	}
-
-	for _, migration := range []struct{ version, body string }{
-		{version0012_source_build, sourceBuildSchemaSQL},
-		{version0013_image_public_access, imagePublicAccessSchemaSQL},
-	} {
-		checksum := sha256Hex(migration.body)
-		if actual, ok := applied[migration.version]; ok {
+	for _, m := range steps {
+		checksum := sha256Hex(m.body)
+		if actual, ok := applied[m.version]; ok {
 			if actual != checksum {
-				return fmt.Errorf("checksum mismatch for migration %s: %w", migration.version, ErrIncompatibleSchema)
+				return fmt.Errorf("checksum mismatch for migration %s: %w", m.version, ErrIncompatibleSchema)
 			}
 			continue
 		}
-		if _, err := tx.ExecContext(ctx, migration.body); err != nil {
-			return fmt.Errorf("apply migration %s: %w", migration.version, err)
+		if _, err := tx.ExecContext(ctx, m.body); err != nil {
+			return fmt.Errorf("apply migration %s: %w", m.version, err)
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO _schema_migrations(version,checksum,applied_at) VALUES(?,?,?)`, migration.version, checksum, now); err != nil {
-			return fmt.Errorf("record migration %s: %w", migration.version, err)
+		if _, err := tx.ExecContext(ctx, `INSERT INTO _schema_migrations(version,checksum,applied_at) VALUES(?,?,?)`, m.version, checksum, now); err != nil {
+			return fmt.Errorf("record migration %s: %w", m.version, err)
 		}
 	}
 
@@ -534,79 +344,13 @@ func runMigrationsAndVerifySchema(ctx context.Context, db *sql.DB) (retErr error
 		return iterationErr
 	}
 	if violations {
-		return fmt.Errorf("pack migration FK check failed: %w", ErrIncompatibleSchema)
+		return fmt.Errorf("foreign key check failed: %w", ErrIncompatibleSchema)
 	}
 
-	// 3. Structural verification of owned schema: compare actual SQL of all objects
-	expectedSQLMap := map[string]string{}
-	for _, obj := range ownedSchemaDefinitions {
-		expectedSQLMap[obj.name] = obj.sql
-	}
-	for _, obj := range applicationSchemaDefinitions {
-		expectedSQLMap[obj.name] = obj.sql
-	}
-
-	for _, obj := range auditSchemaDefinitions {
-		expectedSQLMap[obj.name] = obj.sql
-	}
-	expectedSQLMap["task_leases"] = finalTaskSchemaSQL(expectedSQLMap["task_leases"])
-	expectedSQLMap[coreGenerationSchema.name] = coreGenerationSchema.sql
-
-	expectedSQLMap["operations"] = packOperationsSQL(`"operations"`)
-	delete(expectedSQLMap, "operations_application_idx")
-	delete(expectedSQLMap, "operations_one_active_per_environment")
-	for _, o := range packOperationIndices {
-		expectedSQLMap[o.name] = o.sql
-	}
-	for _, o := range packSchemaDefinitions {
-		expectedSQLMap[o.name] = o.sql
-	}
-	for _, o := range packIntentTriggers {
-		expectedSQLMap[o.name] = o.sql
-	}
-	for _, o := range packExecutionSchemaDefinitions {
-		expectedSQLMap[o.name] = o.sql
-	}
-	for _, o := range packExecutionTriggers {
-		expectedSQLMap[o.name] = o.sql
-	}
-	for _, o := range packLifecycleSchemaDefinitions {
-		expectedSQLMap[o.name] = o.sql
-	}
-	for _, o := range packLifecycleTriggers {
-		expectedSQLMap[o.name] = o.sql
-	}
-	for _, o := range packActivationSchemaDefinitions {
-		expectedSQLMap[o.name] = o.sql
-	}
-	for _, o := range packActivationTriggers {
-		expectedSQLMap[o.name] = o.sql
-	}
-	for _, o := range imageDeliverySchemaDefinitions {
-		expectedSQLMap[o.name] = o.sql
-	}
-	for _, o := range imageDeliveryTriggers {
-		expectedSQLMap[o.name] = o.sql
-	}
-	for _, o := range imageExecutionSchemaDefinitions {
-		expectedSQLMap[o.name] = o.sql
-	}
-	for _, o := range imageExecutionTriggers {
-		expectedSQLMap[o.name] = o.sql
-	}
-
-	for _, objects := range [][]schemaObjectDef{imageLifecycleSchemaDefinitions, imageLifecycleTriggers} {
-		for _, o := range objects {
-			expectedSQLMap[o.name] = o.sql
-		}
-	}
-	if err := addNativeSchemaObjects(expectedSQLMap, sourceBuildSchemaSQL, 12); err != nil {
+	expected, err := expectedSchema()
+	if err != nil {
 		return err
 	}
-	if err := addNativeSchemaObjects(expectedSQLMap, imagePublicAccessSchemaSQL, 12); err != nil {
-		return err
-	}
-
 	schemaRows, err := tx.QueryContext(ctx, `
 		SELECT type, name, sql
 		  FROM sqlite_master
@@ -619,32 +363,29 @@ func runMigrationsAndVerifySchema(ctx context.Context, db *sql.DB) (retErr error
 		return fmt.Errorf("query sqlite schema objects: %w", err)
 	}
 	defer schemaRows.Close()
-
-	foundObjects := map[string]bool{}
+	found := map[string]bool{}
 	for schemaRows.Next() {
 		var objType, objName, actualSQL string
 		if err := schemaRows.Scan(&objType, &objName, &actualSQL); err != nil {
 			return fmt.Errorf("scan sqlite schema object: %w", err)
 		}
-		expectedSQL, ok := expectedSQLMap[objName]
+		want, ok := expected[objName]
 		if !ok {
-			return fmt.Errorf("unexpected %s in owned auth schema %q: %w", objType, objName, ErrIncompatibleSchema)
+			return fmt.Errorf("unexpected %s %q in owned schema: %w", objType, objName, ErrIncompatibleSchema)
 		}
-		if normalizeSQL(actualSQL) != normalizeSQL(expectedSQL) {
+		if normalizeSQL(actualSQL) != normalizeSQL(want) {
 			return fmt.Errorf("altered structural definition for %s %q: %w", objType, objName, ErrIncompatibleSchema)
 		}
-		foundObjects[objName] = true
+		found[objName] = true
 	}
 	if err := schemaRows.Err(); err != nil {
 		return err
 	}
-
-	for exp := range expectedSQLMap {
-		if !foundObjects[exp] {
-			return fmt.Errorf("missing expected object in owned auth schema %q: %w", exp, ErrIncompatibleSchema)
+	for name := range expected {
+		if !found[name] {
+			return fmt.Errorf("missing expected object %q in owned schema: %w", name, ErrIncompatibleSchema)
 		}
 	}
-
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("%w: commit schema migration: %v", ErrOutcomeUnknown, err)
 	}

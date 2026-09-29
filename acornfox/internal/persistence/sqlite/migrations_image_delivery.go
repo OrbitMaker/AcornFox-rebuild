@@ -4,7 +4,7 @@ import (
 	"strings"
 )
 
-const version0009_image_delivery = "0009_image_delivery"
+const version0005_image_delivery = "0005_image_delivery"
 
 var imageDeliverySchemaDefinitions = []schemaObjectDef{
 	{

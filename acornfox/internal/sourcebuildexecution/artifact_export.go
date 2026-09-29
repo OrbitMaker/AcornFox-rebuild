@@ -16,7 +16,7 @@ import (
 
 	appcontracts "github.com/acornfox/acornfox/internal/application/contracts"
 	"github.com/acornfox/acornfox/internal/contracts"
-	"github.com/acornfox/acornfox/internal/packprotocol"
+	"github.com/acornfox/acornfox/internal/peer"
 	imageprovider "github.com/acornfox/acornfox/internal/providers/image"
 )
 
@@ -51,7 +51,7 @@ func serveBuiltOCI(w http.ResponseWriter, r *http.Request, store contracts.Image
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, packprotocol.MaxProtocolMessageBytes+1))
+	body, err := io.ReadAll(io.LimitReader(r.Body, peer.MaxMessageBytes+1))
 	if clearErr := rc.SetReadDeadline(time.Time{}); clearErr != nil {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
@@ -167,7 +167,7 @@ func (c *Client) OpenBuiltOCI(ctx context.Context, fact appcontracts.SourceBuilt
 		return nil, ErrBuiltOCI
 	}
 	payload, err := json.Marshal(fact)
-	if err != nil || len(payload) > packprotocol.MaxProtocolMessageBytes {
+	if err != nil || len(payload) > peer.MaxMessageBytes {
 		return nil, ErrBuiltOCI
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://unix/v1/source-build/open-oci", bytes.NewReader(payload))

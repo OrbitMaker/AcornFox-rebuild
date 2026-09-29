@@ -4,7 +4,7 @@ import (
 	"strings"
 )
 
-const version0010_image_execution = "0010_image_execution"
+const version0006_image_execution = "0006_image_execution"
 
 var imageExecutionSchemaDefinitions = []schemaObjectDef{
 	{
