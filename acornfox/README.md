@@ -4,52 +4,41 @@
 
 ## 当前状态
 
-迁移清单 M2 已完成：运行时已收敛为核心加执行器。**下一步按 [v2 设计与迁移清单](../docs/acornfox-rebuild-migration-plan.md) 重建**：`acornfox server` + `acornfox runner` 两个服务，状态记在 AcornFox、运行交给 Docker、访问交给 Caddy。下文描述的是 M2 时的代码，执行层（`imageexecution`、`sourcebuildexecution`、`gatewayexecution` 等）将在 v2 的 N1 完成后删除。
+按 [v2 设计与迁移清单](../docs/acornfox-rebuild-migration-plan.md) 重建中：N0 原型、N1 状态与调和已完成并在开发机验收（记录见迁移清单第 8 节，实现契约见 [n1-contract.md](../docs/n1-contract.md)）。下一步 N2：CLI 经 SSH 部署。
 
 ## 运行时
 
 ```text
-                 浏览器 / CLI
-                      │ HTTP（目前只监听 127.0.0.1）
-        ┌─────────────▼─────────────┐
-        │ acornfox-core（账号 acornfox）│  API、网页、认证、SQLite、任务调度
-        └─────────────┬─────────────┘  不能访问 Docker / BuildKit / Caddy
-     Unix socket（/run/acornfox，组 acornfox-ipc，双方只接受对方 UID）
-        ┌─────────────▼─────────────┐
-        │ acornfox-executor（账号 acornfox-exec）│  容器运行、源码构建、网关
-        └──┬───────────┬───────────┬┘  只接受核心发来的有类型请求
-           │           │           │
-        dockerd   buildkitd       caddy
-                 （rootless）
-        acornfox-build-network（root）  构建期出站网络规则（nftables）
+用户电脑：acornfox CLI + Skill ──SSH──┐
+                                     ▼
+acornfox server（账号 acornfox）  API、SQLite 期望状态、调和器；只监听 127.0.0.1
+        │ Unix socket（internal/peer，按对端 UID 校验）
+acornfox runner（账号 acornfox-exec，docker 组）  唯一操作 Docker 的程序，不保存状态
+        │
+      dockerd                 caddy（server 经 admin socket 只管理 af-* 路由）
 ```
 
-- 执行器里容器运行是必需的；源码构建、网关在依赖（BuildKit、Caddy）就绪时启动，否则定期重试，不影响已部署应用的管理。
-- 核心按执行器健康状态启停对应的任务消费者；执行器不在时，登录、查看等功能照常可用，任务在执行器恢复后继续。
-- 账号、目录和 socket 路径定义在 `internal/layout`。
+- 状态记在 AcornFox（SQLite），运行交给 Docker，访问交给 Caddy。调和而不是编排：每轮对比期望与实际，只做必要动作；资源名固定（`af-<应用>-<部署ID>`），重复执行即幂等。
+- server 或 runner 任一崩溃重启，已部署应用不受影响，未完成的部署自动接着做完。
+- 只处理带 `acornfox.managed=1` 标签的 Docker 对象。
 
 ## 目录
 
 ```text
-cmd/
-  acornfox                 CLI
-  acornfox-core            核心服务
-  acornfox-executor        执行器
-  acornfox-build-network   构建网络规则（root）
+cmd/acornfox               CLI；子命令 server、runner（旧 CLI 命令在 N2 按新 API 重做）
 internal/
-  layout                   主机路径与账号
-  peer                     核心与执行器之间的 Unix socket（按对端 UID 校验）
-  persistence/sqlite       本机唯一权威数据（迁移 0001～0009）
-  application              镜像部署 / 生命周期 / 源码构建 / 域名 的业务服务与契约
-  corehttp  auth           HTTP 接口、管理员认证与会话
-  imageexecution           拉取 → 校验 digest → 创建并启动容器 → 读回端口 → 观测
-  sourcebuildexecution     固定 Git 提交 → 受限 BuildKit 构建 → 导出 OCI 镜像
-  gatewayexecution         为已部署应用写入 Caddy 路由并观测证书
-  providers/               registryhttp、image、buildkit、source、acornfoxroute、volume、standalone、capacity
-  importers/dockerfile     Dockerfile 静态解析与安全拒绝
-  hostmetrics containermetrics dockermetrics   主机与容器指标、近期趋势
-  buildnetwork             构建期出站网络控制
-web/                       网页控制台（React）
+  state                    SQLite 期望状态：应用、部署、环境变量、数据卷、附加服务、事件、管理员认证表
+  runner                   Docker SDK 实现、peer socket 上的 HTTP 服务与客户端
+  reconcile                调和器：推进部署、收敛、崩溃恢复、回收
+  caddyroute               Caddy admin API 路由同步
+  apiserver                server 的 HTTP API（N1 无认证，只允许回环地址）
+  peer                     Unix socket 边界（按对端 UID 校验）
+  auth                     管理员密码与会话（N3 控制台登录复用）
+  importers/dockerfile     Dockerfile 安全检查规则（待接入）
+  hostmetrics containermetrics dockermetrics   主机与容器指标（N4 接入）
+  contracts domain foundation application/contracts compatibility   旧 CLI 与指标仍依赖的类型，N2 后按需精简
+prototype/                 N0 原型与控制台设计稿（只作参考）
+web/                       旧网页控制台；N3 按工作台设计重做
 ```
 
 ## 构建与测试
@@ -58,14 +47,14 @@ web/                       网页控制台（React）
 
 ```bash
 GOTOOLCHAIN=go1.25.13 go build ./...
-GOTOOLCHAIN=go1.25.13 go test ./...
-cd web && npm ci && npm run build && npm test
+GOTOOLCHAIN=go1.25.13 go test -race ./...
+ACORNFOX_DOCKER_IT=1 go test -race -run Docker ./internal/runner/   # 需要本机 Docker
 ```
 
 ## 已知问题
 
-- 核心只监听回环地址，远程的浏览器和 CLI 目前无法访问。首发需要一个带 HTTPS 的对外入口（M3/M4 决定方案）。
-- CLI 仍为 Cookie + CSRF 会话，Windows 下无法编译（缺少读密码实现），M4 处理。
-- `go vet` 有 2 条既有警告：`internal/providers/capacity` 一处不可达代码；一个测试里的自赋值。
-- `internal/containermetrics` 的定时测试偶发失败，需要改为不依赖真实时间。
-- 网页类型 `web/src/api/acornfox-generated-schema.ts` 由旧 OpenAPI 生成，M4 改为从核心 OpenAPI 生成。
+- 停止应用最多延迟一轮巡检（约 10 秒）才生效，N4 改为立即执行。
+- 内存超限的提示引用的 `acornfox app set --memory` 在 N2 才提供。
+- 正式安装时 server 与 runner 分属两个账号，上传目录需对 `acornfox-ipc` 组可读（N5）。
+- `internal/containermetrics` 的定时测试在机器繁忙时偶发失败，需要改为不依赖真实时间。
+- `web/` 仍对接旧 API，N3 重做前不可用。

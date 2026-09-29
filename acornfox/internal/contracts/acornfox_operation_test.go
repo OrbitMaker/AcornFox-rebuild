@@ -16,7 +16,7 @@ func TestAcornFoxOperationResultSeparatesVerifiedExecutionFromHealth(t *testing.
 	if strings.Contains(string(AcornFoxOperationEvidenceObserved), "healthy") {
 		t.Fatal("ordinary evidence must not imply health")
 	}
-	result.Status, result.Evidence = AcornFoxOperationUnknown, result.Evidence
+	result.Status = AcornFoxOperationUnknown
 	if err := result.Validate(); err == nil {
 		t.Fatal("unknown result accepted task evidence")
 	}

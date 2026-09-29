@@ -3,13 +3,13 @@ module github.com/acornfox/acornfox
 go 1.25.13
 
 require (
+	github.com/containerd/errdefs v1.0.0
 	github.com/distribution/reference v0.6.0
 	golang.org/x/sys v0.47.0
 	modernc.org/sqlite v1.59.0
 )
 
 require (
-	github.com/containerd/errdefs v1.0.0 // indirect
 	github.com/containerd/errdefs/pkg v0.3.0 // indirect
 	github.com/docker/go-connections v0.7.0 // indirect
 	github.com/docker/go-units v0.5.0 // indirect

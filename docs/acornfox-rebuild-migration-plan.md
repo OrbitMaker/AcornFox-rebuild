@@ -122,20 +122,10 @@
 5. **版本保留与回退**：每个应用保留最近 3 个成功版本的镜像，支持 `acornfox rollback`（即以上一版镜像新建一次部署）；更早的镜像和失败构建的镜像自动清理。
 6. **N1 审核补充（2026-09-29）**：每应用默认资源上限 512 MB 内存、1 CPU（可调）；全机同时只构建 1 个；环境变量对服务器管理员（root / docker 组）可见，AcornFox 只保证 API、界面、CLI 与日志不显示密钥；N1 含最基础的 Caddy 切换（IP:端口），域名与 HTTPS 仍在 N3；上传包先落盘到 `/var/lib/acornfox/uploads/<部署ID>.tar`，部署结束后删除，用于崩溃后重建。
 
-## 4. 现有代码的去留
+## 4. 现有代码的去留（N1 后已执行）
 
-| 现有 | 去向 |
-| --- | --- |
-| `internal/peer` | 保留，用于 server–runner socket |
-| `internal/auth`、`corehttp` 中认证与初始化部分 | 保留（访问令牌推迟到公网控制台路径） |
-| `persistence/sqlite` 中存储打开、加锁、迁移执行、结构校验、认证表 | 保留写法；业务表按 3.1 新建 |
-| `importers/dockerfile` | 保留安全检查规则 |
-| `hostmetrics`、`dockermetrics`、`containermetrics` | 保留；容器指标改由 runner 提供数据 |
-| `providers/volume`、`providers/standalone` 中容器参数与安全限制 | 参考重写到 runner |
-| `providers/acornfoxroute` | 评估：若“只管自己那部分 Caddy 配置”的逻辑能直接复用则保留，否则重写为更小的路由模块 |
-| `web/src/core`、`web/src/shared` | 保留，接口随新 API 调整 |
-| `cmd/acornfox` | 保留命令框架；改为经 SSH 连接、补 Windows、命令按新 API 重做 |
-| `imageexecution`、`sourcebuildexecution`、`gatewayexecution`、`application`、`providers/{registryhttp,image,buildkit,source,capacity}`、`buildnetwork`、`cmd/acornfox-build-network`、`cmd/acornfox-executor`、`layout` | 由新 runner / 调和器取代；N1 完成后删除 |
+- **已删除**（2026-09-29，可从 git 历史找回）：`cmd/acornfox-core`、`cmd/acornfox-executor`、`cmd/acornfox-build-network`、`internal/{imageexecution,sourcebuildexecution,gatewayexecution,buildnetwork,layout,corehttp,persistence,providers,acornfoxrelease,observability}`、`internal/application` 的业务服务、`release/`。Go 代码约 9.1 万行 → 3.6 万行（含测试）。其中 `corehttp` 与 `persistence/sqlite` 原计划部分保留，但它们依赖已删除的执行层：认证表已复制进 `internal/state`，登录接口在 N3 基于 `internal/auth` 重写。
+- **保留**：`peer`、`auth`、`importers/dockerfile`（安全规则，待接入）、三个指标包（N4 接入）、`web/`（N3 重做）、`cmd/acornfox`（N2 改为经 SSH 并按新 API 重做命令）；旧 CLI 与指标仍依赖的 `contracts`、`domain`、`foundation`、`application/contracts`、`compatibility` 在 N2 后按需精简。
 
 ## 5. 执行步骤
 
@@ -170,6 +160,7 @@
 ## 8. 已完成记录
 
 - **N0**（提交 `856bdbbf`，2026-09-29 通过）：开发机上从 Linux 与 macOS CLI 各完成一次“上传目录 → Docker 构建 → 运行 → Caddy 路由 → 网址”（约 3～4 秒）；重新部署期间 25 次探测全部 200；构建失败、启动崩溃、缺少 Dockerfile 均返回结构化诊断。发现并修正：自动重启会把崩溃误判为端口无响应（改为检查期间有重启即判定退出）；构建日志需去掉颜色码和步骤噪音。确认 Docker 29 可通过 API 使用传统构建器。结论：v2 方向成立，进入 N1。原型代码只作参考，不直接进入正式实现。
+- **N1**（提交 `3cd22119`、`84e8f390`、`ea5e889e`，2026-09-29 通过）：`internal/state`、`runner`、`reconcile`、`caddyroute`、`apiserver` 与 `acornfox server` / `runner` 子命令。开发机实测：部署约 4 秒；重新部署期间 223 与 368 次探测全部 200；在排队、构建、健康检查、切换流量各时间点 `kill -9` server 或 runner，重启后都自动上线且无残留；同键与同内容重复提交只产生 1 个部署，连续 3 次提交只构建最后一个；`VOLUME /data` 自动保存，十余次重新部署、强杀与回退后数据不丢；写入容器内的 SQLite 触发 `data/unpersisted_database`；512 MB / 1 CPU / 日志轮转生效，超内存报 `health/out_of_memory`；无标签的同名前缀容器全程未被触碰，带标签的孤儿容器被清理；镜像按“当前 + 3 个旧版”回收。实测发现并修正 7 个问题：runner 构建目录错指 `/tmp`；每 30 秒只推进一个阶段（82 秒 → 4 秒）；Caddy 更新误用 PUT（只能新建）且失败原因未记录；runner 短暂断开被计为构建中断；未关 swap 导致内存上限无效；端口提示给出宿主端口。遗留：停止最多延迟一轮巡检（N4）、`acornfox app set` 命令（N2）、两账号下上传目录权限（N5）。
 - **开发机清理**（2026-09-29）：删除 N0 原型、旧 AcornFox 运行环境（tp06a 进程、容器、数据卷、网络、账号、目录）、旧 MVP 的 Caddy/PostgreSQL/BuildKit 容器、预览容器、10 台 acornfox 桌面测试虚拟机及磁盘、约 28 GB 旧构建缓存（磁盘空闲 40 GB → 91 GB）。清理前备份旧 MVP 数据库导出、tp06a 的 SQLite 数据与受保护证据到 `战略项目/devbox-archive-20260929/`（含校验和）。Agent Ops（aiops）只停止并禁用服务、容器和测试虚拟机，数据与磁盘保留，80 端口已释放。k3s PoC 节点 `opencard-dev-01` 保留未动。
 
 - **M0**：存档分支 `archive/acornfox-thin-core-20260929`（提交 `577b5605`）；阿里云测试机 `i-REDACTED` 已销毁。
