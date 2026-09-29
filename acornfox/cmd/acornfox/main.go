@@ -27,6 +27,14 @@ type cli struct {
 func main() { os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr, os.Getenv)) }
 
 func run(args []string, in io.Reader, out, errOut io.Writer, env func(string) string) int {
+	if len(args) > 0 {
+		switch args[0] {
+		case "server":
+			return runServer(args[1:], out, errOut)
+		case "runner":
+			return runRunner(args[1:]...)
+		}
+	}
 	c := &cli{in: in, out: out, err: errOut, env: env, client: &http.Client{Timeout: 30 * time.Second}}
 	clean, jsonOutput, err := consumeGlobalJSON(args)
 	if err != nil {
