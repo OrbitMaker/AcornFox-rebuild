@@ -117,23 +117,24 @@
 
 1. **首发只支持网页 / API 应用**：对外提供 HTTP、能通过健康检查的应用。后台任务、定时任务放到首发之后。
 2. **应用身份**：应用名在同一台服务器上唯一。CLI 首次部署后在项目目录写入 `.acornfox`（服务器名 + 应用名，不含任何密钥），再次部署时自动读取，避免重复建应用。
-3. **应用数据保存**：容器里写的文件会随重新部署丢失，所以要把需要保存的目录挂到服务器上（`/var/lib/acornfox/volumes/<应用>/…`）。来源：自动识别 Dockerfile 的 `VOLUME`；用 `acornfox volume add <容器内路径>` 补充（下次部署生效）；部署后检查容器内新写出的 `.db` / `.sqlite` 等文件，不在保存目录中时给出诊断 `data/unpersisted_database` 并提示命令。删除应用时数据目录默认保留。只保证重新部署不丢，服务器损坏仍会丢，首发不提供备份，文档写明。
+3. **应用数据保存**：容器里写的文件会随重新部署丢失，所以把需要保存的目录挂为 Docker 命名数据卷（`af-<应用>-<序号>`，首次挂载自动继承镜像中该目录的文件与权限，避免宿主目录属主不符导致写入失败）。来源：自动识别 Dockerfile 的 `VOLUME`；用 `acornfox volume add <容器内路径>` 补充（下次部署生效）；部署后检查容器内新写出的 `.db` / `.sqlite` 等文件，不在保存目录中时给出诊断 `data/unpersisted_database` 并提示命令。删除应用时数据目录默认保留。只保证重新部署不丢，服务器损坏仍会丢，首发不提供备份，文档写明。
 4. **密钥**：存在 SQLite 中，数据库文件仅 `acornfox` 账号可读（0600）；接口只写不读，界面和 CLI 只显示“已设置”；日志和诊断中出现的密钥值做替换。不做同机加密（密钥只能放在同一台机器上，意义不大）。
-5. **版本保留与回退**：每个应用保留最近 3 个成功版本的镜像，支持 `acornfox rollback`；更早的镜像和失败构建的镜像自动清理。
+5. **版本保留与回退**：每个应用保留最近 3 个成功版本的镜像，支持 `acornfox rollback`（即以上一版镜像新建一次部署）；更早的镜像和失败构建的镜像自动清理。
+6. **N1 审核补充（2026-09-29）**：每应用默认资源上限 512 MB 内存、1 CPU（可调）；全机同时只构建 1 个；环境变量对服务器管理员（root / docker 组）可见，AcornFox 只保证 API、界面、CLI 与日志不显示密钥；N1 含最基础的 Caddy 切换（IP:端口），域名与 HTTPS 仍在 N3；上传包先落盘到 `/var/lib/acornfox/uploads/<部署ID>.tar`，部署结束后删除，用于崩溃后重建。
 
 ## 4. 现有代码的去留
 
 | 现有 | 去向 |
 | --- | --- |
 | `internal/peer` | 保留，用于 server–runner socket |
-| `internal/auth`、`corehttp` 中认证与初始化部分 | 保留，增加访问令牌 |
+| `internal/auth`、`corehttp` 中认证与初始化部分 | 保留（访问令牌推迟到公网控制台路径） |
 | `persistence/sqlite` 中存储打开、加锁、迁移执行、结构校验、认证表 | 保留写法；业务表按 3.1 新建 |
 | `importers/dockerfile` | 保留安全检查规则 |
 | `hostmetrics`、`dockermetrics`、`containermetrics` | 保留；容器指标改由 runner 提供数据 |
 | `providers/volume`、`providers/standalone` 中容器参数与安全限制 | 参考重写到 runner |
 | `providers/acornfoxroute` | 评估：若“只管自己那部分 Caddy 配置”的逻辑能直接复用则保留，否则重写为更小的路由模块 |
 | `web/src/core`、`web/src/shared` | 保留，接口随新 API 调整 |
-| `cmd/acornfox` | 保留命令框架；改为令牌认证、补 Windows、命令按新 API 重做 |
+| `cmd/acornfox` | 保留命令框架；改为经 SSH 连接、补 Windows、命令按新 API 重做 |
 | `imageexecution`、`sourcebuildexecution`、`gatewayexecution`、`application`、`providers/{registryhttp,image,buildkit,source,capacity}`、`buildnetwork`、`cmd/acornfox-build-network`、`cmd/acornfox-executor`、`layout` | 由新 runner / 调和器取代；N1 完成后删除 |
 
 ## 5. 执行步骤
