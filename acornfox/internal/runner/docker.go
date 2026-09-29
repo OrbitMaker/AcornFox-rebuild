@@ -464,9 +464,10 @@ func (d *Docker) EnsureContainer(ctx context.Context, req EnsureContainerRequest
 				Config: map[string]string{"max-size": LogMaxSize, "max-file": LogMaxFiles},
 			},
 			Resources: container.Resources{
-				Memory:    memory,
-				NanoCPUs:  nanoCPUs,
-				PidsLimit: &pids,
+				Memory:     memory,
+				MemorySwap: memory, // equal to Memory: no swap, so the limit is real and OOM is detectable
+				NanoCPUs:   nanoCPUs,
+				PidsLimit:  &pids,
 			},
 			Privileged: false,
 			Mounts:     mounts,

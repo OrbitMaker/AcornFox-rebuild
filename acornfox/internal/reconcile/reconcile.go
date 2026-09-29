@@ -388,7 +388,18 @@ func (r *Reconciler) build(ctx context.Context, app state.App, d *state.Deployme
 		<-r.buildSem
 		if err != nil {
 			r.log.Error("build", "deployment", d.ID, "err", err)
-			return // transient; retry next round, still building
+			// Transient runner/transport failure: stay in building and retry on a
+			// later round. Attempts only count builds interrupted by a server
+			// crash, so give this attempt back.
+			if u, uerr := r.cfg.Store.UpdateDeployment(ctx, d.ID, func(dep *state.Deployment) error {
+				if dep.Attempts > 0 {
+					dep.Attempts--
+				}
+				return nil
+			}); uerr == nil {
+				*d = u
+			}
+			return
 		}
 		if !resp.OK {
 			diag := &state.Diagnosis{Stage: "build", Code: "build_failed", Message: "构建失败"}
@@ -456,14 +467,8 @@ func (r *Reconciler) build(ctx context.Context, app state.App, d *state.Deployme
 // doStart creates and starts the container, then moves to checking.
 func (r *Reconciler) doStart(ctx context.Context, app state.App, d *state.Deployment, env []state.EnvVar, volumes []state.Volume) {
 	// resolve port
-	port := app.Port
-	if port == 0 {
-		if info, err := r.cfg.Runner.ImageInspect(ctx, app.Name, d.ImageID); err == nil && len(info.ExposedPorts) > 0 {
-			port = info.ExposedPorts[0]
-		}
-	}
-	if port == 0 {
-		port = 8080
+	port, declared := r.containerPort(ctx, app, d.ImageID)
+	if !declared {
 		r.event(ctx, app.Name, d.ID, "start", "未声明 EXPOSE，按 8080 处理")
 	}
 
@@ -530,6 +535,18 @@ func (r *Reconciler) doStart(ctx context.Context, app state.App, d *state.Deploy
 	*d = updated
 }
 
+// containerPort is the app's container port: explicit, else the image's first
+// EXPOSE, else 8080. declared is false only in the 8080 fallback case.
+func (r *Reconciler) containerPort(ctx context.Context, app state.App, imageID string) (port int, declared bool) {
+	if app.Port != 0 {
+		return app.Port, true
+	}
+	if info, err := r.cfg.Runner.ImageInspect(ctx, app.Name, imageID); err == nil && len(info.ExposedPorts) > 0 {
+		return info.ExposedPorts[0], true
+	}
+	return 8080, false
+}
+
 // doCheck runs the health check loop, then moves to routing (or fails).
 func (r *Reconciler) doCheck(ctx context.Context, app state.App, d *state.Deployment, env []state.EnvVar) {
 	name := runner.ContainerName(app.Name, d.ID)
@@ -538,12 +555,11 @@ func (r *Reconciler) doCheck(ctx context.Context, app state.App, d *state.Deploy
 		healthPath = state.DefaultHealthPath
 	}
 
+	containerPort, _ := r.containerPort(ctx, app, d.ImageID)
 	deadline := r.cfg.Now().Add(r.cfg.HealthTimeout)
-	var lastPort int
 	for {
 		ci, ok := r.findContainer(ctx, app.Name, name)
 		if ok {
-			lastPort = ci.HostPort
 			// container-level failure detection
 			if ci.OOMKilled {
 				logs := r.tailLogs(ctx, app.Name, name, env)
@@ -593,7 +609,7 @@ func (r *Reconciler) doCheck(ctx context.Context, app state.App, d *state.Deploy
 			Code:       "port_not_listening",
 			Message:    "健康检查超时，端口未监听",
 			LogExcerpt: logs,
-			Hint:       fmt.Sprintf("请确认应用监听容器端口 %d", lastPort),
+			Hint:       fmt.Sprintf("请确认应用在容器内监听 0.0.0.0:%d（可用 EXPOSE 声明端口）", containerPort),
 		})
 		_ = r.cfg.Runner.RemoveContainer(ctx, app.Name, name)
 		return
@@ -774,15 +790,7 @@ func (r *Reconciler) recreateLive(ctx context.Context, app state.App) {
 	if live == nil || live.ImageID == "" {
 		return
 	}
-	port := app.Port
-	if port == 0 {
-		if info, err := r.cfg.Runner.ImageInspect(ctx, app.Name, live.ImageID); err == nil && len(info.ExposedPorts) > 0 {
-			port = info.ExposedPorts[0]
-		}
-	}
-	if port == 0 {
-		port = 8080
-	}
+	port, _ := r.containerPort(ctx, app, live.ImageID)
 	env, _ := r.cfg.Store.ListEnv(ctx, app.Name)
 	envMap := make(map[string]string, len(env))
 	for _, e := range env {

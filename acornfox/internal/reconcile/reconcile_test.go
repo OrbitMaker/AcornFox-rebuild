@@ -862,6 +862,31 @@ func TestOrphanCleanup(t *testing.T) {
 	}
 }
 
+// A runner that drops mid-build (killed, restarted) is a transient failure and
+// must not use up the crash-retry budget: after several blips the build still
+// completes instead of failing as build/interrupted.
+func TestTransientBuildErrorsDoNotCountAsInterruptions(t *testing.T) {
+	h := newHarness(t)
+	h.store.putApp(baseApp("web"))
+	h.store.putDeployment(queued("web", "blip00000001", 1))
+	h.runner.mu.Lock()
+	h.runner.buildErr["blip00000001"] = runner.ErrUnavailable
+	h.runner.mu.Unlock()
+	for i := 0; i < 3; i++ {
+		h.rec.round(context.Background(), "web")
+		d := h.store.getDeployment("blip00000001")
+		if d.Status != state.StatusBuilding {
+			t.Fatalf("round %d: want building, got %s (diag=%+v)", i, d.Status, d.Diagnosis)
+		}
+	}
+	h.runner.mu.Lock()
+	delete(h.runner.buildErr, "blip00000001")
+	h.runner.mu.Unlock()
+	if d := h.driveToTerminal(t, "web", "blip00000001", 3); d.Status != state.StatusLive {
+		t.Fatalf("want live after runner recovers, got %s (diag=%+v)", d.Status, d.Diagnosis)
+	}
+}
+
 func TestRunnerUnavailableLeavesPendingThenContinues(t *testing.T) {
 	h := newHarness(t)
 	h.store.putApp(baseApp("web"))
