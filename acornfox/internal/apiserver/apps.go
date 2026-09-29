@@ -68,6 +68,13 @@ func (s *server) buildAppView(ctx context.Context, a state.App, detail bool) app
 	// Observed container state (best-effort).
 	v.ObservedState = s.observeApp(ctx, a, &v)
 
+	// The newest deployment tells the console whether a deploy is in progress
+	// or failed, including apps that never went live.
+	if ds, err := s.store.ListDeployments(ctx, a.Name, 1); err == nil && len(ds) > 0 {
+		latest := ds[0]
+		v.Latest = &latest
+	}
+
 	if !detail {
 		return v
 	}

@@ -393,9 +393,17 @@ func (c *Client) Domains(ctx context.Context, app string) ([]Domain, error) {
 // carry non-fatal Warnings (e.g. dns_mismatch) that the caller should surface.
 func (c *Client) AddDomain(ctx context.Context, app, name string) (Domain, error) {
 	path := "/v1/apps/" + url.PathEscape(app) + "/domains"
-	var d Domain
-	if _, err := c.doJSON(ctx, http.MethodPost, path, map[string]string{"name": name}, &d); err != nil {
+	// The server replies {"domain": {...}, "warnings": [...]}.
+	var resp struct {
+		Domain   Domain      `json:"domain"`
+		Warnings []Diagnosis `json:"warnings"`
+	}
+	if _, err := c.doJSON(ctx, http.MethodPost, path, map[string]string{"name": name}, &resp); err != nil {
 		return Domain{}, err
+	}
+	d := resp.Domain
+	if len(resp.Warnings) > 0 {
+		d.Warnings = resp.Warnings
 	}
 	return d, nil
 }

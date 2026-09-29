@@ -1,9 +1,11 @@
 package apiserver
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"errors"
+	"io"
 	"io/fs"
 	"net"
 	"net/http"
@@ -272,18 +274,31 @@ func (s *server) serveStatic(w http.ResponseWriter, r *http.Request) {
 	serveFSFile(w, r, s.consoleFS, upath)
 }
 
-// serveFSFile serves a single file from an fs.FS using http.FileServer's
-// content-type and range handling.
+// serveFSFile writes one embedded file. http.FileServer is not used because it
+// redirects any request for ".../index.html" to "./", which loops for "/".
+// http.ServeContent keeps content-type detection, conditional and range requests.
 func serveFSFile(w http.ResponseWriter, r *http.Request, fsys fs.FS, name string) {
-	http.StripPrefix("/", http.FileServer(http.FS(fsys))).ServeHTTP(w, requestForName(r, name))
-}
-
-// requestForName clones r with its path set to "/"+name so http.FileServer
-// serves that exact file.
-func requestForName(r *http.Request, name string) *http.Request {
-	clone := r.Clone(r.Context())
-	clone.URL.Path = "/" + name
-	return clone
+	f, err := fsys.Open(name)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || info.IsDir() {
+		http.NotFound(w, r)
+		return
+	}
+	rs, ok := f.(io.ReadSeeker)
+	if !ok {
+		data, rerr := io.ReadAll(f)
+		if rerr != nil {
+			http.Error(w, "read error", http.StatusInternalServerError)
+			return
+		}
+		rs = bytes.NewReader(data)
+	}
+	http.ServeContent(w, r, name, info.ModTime(), rs)
 }
 
 // placeholder renders a minimal Chinese page used when no console assets are

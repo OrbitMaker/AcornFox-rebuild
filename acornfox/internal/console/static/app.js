@@ -129,9 +129,11 @@ async function apiError(r) {
 //   desired stopped                 -> stopped (grey)
 function deriveStatus(app) {
   if (app.desired === "stopped") return "stopped";
-  const live = app.live;
-  if (live && PENDING_STATUSES.has(live.status)) return "deploying";
-  if (live && live.status === "failed") return "failed";
+  // The newest deployment decides "deploying" and "failed"; a failed redeploy
+  // leaves the previous version serving, which still counts as needing attention.
+  const latest = app.latest || app.live;
+  if (latest && PENDING_STATUSES.has(latest.status)) return "deploying";
+  if (latest && latest.status === "failed") return "failed";
   if (app.observed_state === "running") return "running";
   // Desired running but the container is not running.
   if (app.observed_state === "stopped" || app.observed_state === "missing") return "crashed";
@@ -140,9 +142,15 @@ function deriveStatus(app) {
 
 // appDiagnosis returns the failure diagnosis to surface for an app, if any.
 function appDiagnosis(app) {
-  const live = app.live;
-  if (live && live.diagnosis) return live.diagnosis;
+  const latest = app.latest || app.live;
+  if (latest && latest.status === "failed" && latest.diagnosis) return latest.diagnosis;
   return null;
+}
+
+// failedDeploymentID is the deployment the diagnosis belongs to.
+function failedDeploymentID(app) {
+  const latest = app.latest || app.live;
+  return latest ? latest.id : "";
 }
 
 // domainDiagnosis returns the first failed-domain diagnosis, if any.
@@ -250,7 +258,7 @@ function attentionItems() {
     const st = deriveStatus(a);
     const diag = appDiagnosis(a);
     if (st === "failed" && diag) {
-      items.push({ app: a.name, title: "部署失败", why: diag.message, kind: "deploy", diag, deploymentID: a.live ? a.live.id : "" });
+      items.push({ app: a.name, title: a.live ? "新版本部署失败（旧版本仍在服务）" : "部署失败", why: diag.message, kind: "deploy", diag, deploymentID: failedDeploymentID(a) });
     } else if (st === "crashed") {
       const d = diag || { stage: "start", code: "not_running", message: "容器未在运行，但期望状态为运行中。", hint: "查看日志排查启动失败原因，或重新部署。" };
       items.push({ app: a.name, title: "未在运行", why: d.message, kind: "crash", diag: d, deploymentID: a.live ? a.live.id : "" });
@@ -473,7 +481,7 @@ function appWindow() {
 function overviewTab(a, st, meta) {
   const frag = document.createDocumentFragment();
   const diag = appDiagnosis(a);
-  if (diag) frag.append(diagCard(diag, a.name, a.live ? a.live.id : ""));
+  if (diag) frag.append(diagCard(diag, a.name, failedDeploymentID(a)));
 
   const dl = el("dl", { class: "kv" });
   dl.append(el("dt", { text: "状态" }));

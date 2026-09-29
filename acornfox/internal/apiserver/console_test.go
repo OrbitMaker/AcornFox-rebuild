@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"github.com/acornfox/acornfox/internal/state"
@@ -335,6 +336,25 @@ func TestConsoleStaticPlaceholder(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "控制台") {
 		t.Errorf("placeholder page unexpected: %s", rec.Body.String())
+	}
+}
+
+// "/" must serve index.html directly (http.FileServer would redirect in a loop).
+func TestConsoleStaticIndexServedAtRoot(t *testing.T) {
+	cfg, _, _ := newTestConfig(t)
+	cfg.ConsoleFS = fstest.MapFS{
+		"index.html": {Data: []byte("<!doctype html><title>af</title>")},
+		"app.js":     {Data: []byte("console.log(1)")},
+	}
+	console := NewConsole(cfg)
+	for path, want := range map[string]string{"/": "<title>af</title>", "/app.js": "console.log", "/index.html": "<title>af</title>"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Host = "127.0.0.1:18800"
+		rec := httptest.NewRecorder()
+		console.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), want) {
+			t.Fatalf("GET %s = %d %q", path, rec.Code, rec.Body.String())
+		}
 	}
 }
 

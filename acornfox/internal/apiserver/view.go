@@ -71,6 +71,7 @@ type appView struct {
 	ObservedState     string             `json:"observed_state"` // running | stopped | missing | unavailable
 	Observed          *observedContainer `json:"observed,omitempty"`
 	Live              *state.Deployment  `json:"live,omitempty"`
+	Latest            *state.Deployment  `json:"latest,omitempty"` // newest deployment (may be pending or failed while Live keeps serving)
 	Env               []envKeyView       `json:"env,omitempty"`
 	Volumes           []state.Volume     `json:"volumes,omitempty"`
 	Domains           []state.Domain     `json:"domains,omitempty"`
