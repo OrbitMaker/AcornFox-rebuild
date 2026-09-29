@@ -1,5 +1,0 @@
-abi <abi/4.0>,
-include <tunables/global>
-profile acornfox-rootlesskit /opt/acornfox/{current,releases/*}/bin/rootlesskit flags=(unconfined) {
-  userns,
-}

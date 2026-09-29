@@ -1,7 +1,0 @@
-{
-  "api_version": "2021-03-23",
-  "read_action": "DescribeRecordList",
-  "write_actions_for_dry_run_only": ["CreateRecord", "ModifyRecord", "DeleteRecord"],
-  "allowed_targets": ["console A", "ingress A", "*.apps A", "customer CNAME"],
-  "forbidden_runtime_terms": ["secretid", "secretkey", "tccli", "credential.helper"]
-}

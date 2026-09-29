@@ -1,3 +1,0 @@
-FROM alpine:3.23.5
-
-RUN wget -T 2 -qO- http://169.254.169.254/latest/meta-data/

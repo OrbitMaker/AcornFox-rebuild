@@ -1,9 +1,0 @@
-{
-  "version": "3.9",
-  "services": {
-    "app": {
-      "image": "registry.example.test/opencard/negative@sha256:8888888888888888888888888888888888888888888888888888888888888888",
-      "devices": ["/dev/kvm:/dev/kvm"]
-    }
-  }
-}

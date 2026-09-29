@@ -1,99 +1,12 @@
-# Open Card 云原生基础设施 PoC
+# AcornFox
 
-本仓库只验证一条本地 IDC 基础设施链路：
+面向 Vibe Coding 用户的一句话部署：在 AI 工作台里加载 AcornFox Skill，通过 CLI、网页或 API 把应用部署到自己的服务器（开源单机版）或 AcornFox 云。
 
-`物理机 -> libvirt VM -> k3s -> Open-Local -> Higress -> Demo/CloudNativePG -> Prometheus`
+- 单机版代码：[acornfox/](acornfox/README.md)
+- 战略、阶段与优先级：[docs/acornfox-strategy-roadmap.md](docs/acornfox-strategy-roadmap.md)
+- 当前阶段执行入口：[docs/acornfox-rebuild-migration-plan.md](docs/acornfox-rebuild-migration-plan.md)
+- 架构：[docs/acornfox-product-architecture.md](docs/acornfox-product-architecture.md)
 
-本阶段不包含 SaaS 控制台、用户、支付、计费、多租户、AI Agent、云 API 或应用市场。
+历史代码（Open Card 基础设施 PoC、PostgreSQL 控制面、多进程统一安装等）保存在分支 `archive/acornfox-thin-core-20260929` 与更早的分支中；`docs/` 下的其他文档只作历史参考。
 
-## 目标拓扑
-
-| 节点 | 所在宿主 | 角色 | 规格 | 磁盘 |
-| --- | --- | --- | --- | --- |
-| `node-dev-01` | 开发机 | k3s server + 可调度 worker | 4C/4GiB | 30GiB OS + 20GiB local PV |
-| `node-test-01` | 测试机 | k3s agent | 4C/4GiB | 30GiB OS + 20GiB local PV |
-| `node-test-02` | 测试机 | k3s agent | 4C/4GiB | 30GiB OS + 20GiB local PV |
-| `node-test-03` | 测试机 | k3s agent | 4C/4GiB | 30GiB OS + 20GiB local PV |
-
-每节点总磁盘 50GiB。独立的 20GiB 虚拟块设备用于 LVM/Open-Local，避免在系统根盘上做破坏性切分。
-
-## 严格执行顺序
-
-```text
-preflight -> VMs/k3s -> storage -> OpenKruise -> Higress -> Demo -> PostgreSQL -> monitoring -> drills
-```
-
-管理机前置命令：`ssh`、`kubectl`、`helm`、`curl`、`openssl`。两台 Linux 宿主需要 KVM/libvirt、`virt-install`、`qemu-img` 与 `cloud-localds`；预检会一次性核对这些条件。
-
-完整安装：
-
-```bash
-cp config/cluster.env.example config/cluster.env
-# 按现场填写两台宿主和 VM 的 SSH 私钥路径；cluster.env 不入 Git
-./install.sh
-```
-
-分阶段执行：
-
-```bash
-make preflight
-make kubernetes
-make storage
-make openkruise
-make higress
-make demo
-make postgres
-make monitoring
-make drills
-```
-
-每个阶段先安装再验证，日志和快照写入 `artifacts/<phase>/`。`artifacts/` 是现场证据，不保存凭据。
-
-## 版本基线
-
-- k3s `v1.34.10+k3s1`
-- Open-Local `v0.7.1`
-- OpenKruise `v1.9.1`
-- Higress `v2.2.4`
-- CloudNativePG `v1.30.0`
-- kube-prometheus-stack Helm chart `88.5.2`
-
-版本均被脚本固定，升级必须作为单独阶段重新验证兼容性。
-
-## 验收入口
-
-- MVP 产品说明与菜单树（派生文档，非实现证明）：[docs/mvp-product-spec.md](docs/mvp-product-spec.md)
-- MVP AI 能力架构（派生文档，非实现证明）：[docs/mvp-ai-architecture.md](docs/mvp-ai-architecture.md)
-- 架构和边界：[docs/architecture.md](docs/architecture.md)
-- 验收矩阵：[docs/acceptance-matrix.md](docs/acceptance-matrix.md)
-- 故障演练报告：[docs/fault-drill-report.md](docs/fault-drill-report.md)
-- 已知问题：[docs/known-issues.md](docs/known-issues.md)
-- 下一阶段建议：[docs/next-phase.md](docs/next-phase.md)
-- 云上自建 K8S 三云成本与抢占策略：[docs/cloud-k8s-pricing-and-spot-strategy.md](docs/cloud-k8s-pricing-and-spot-strategy.md)
-- 动态容量采购模型：[docs/dynamic-capacity-procurement-model.md](docs/dynamic-capacity-procurement-model.md)
-- 云服务器运维与 SSH 入口：[docs/cloud-server-operations.md](docs/cloud-server-operations.md)
-
-## 当前现场状态（2026-08-21）
-
-第一阶段已全部通过。局域网入口：
-
-```bash
-curl -H 'Host: open-card.local' http://192.168.31.71:30080/
-curl -k --resolve open-card.local:30443:192.168.31.71 https://open-card.local:30443/
-```
-
-管理集群：
-
-```bash
-KUBECONFIG="$PWD/artifacts/kubeconfig" kubectl get nodes -o wide
-make verify
-```
-
-Grafana 与 Prometheus 保持 ClusterIP，仅通过 `kubectl port-forward` 在管理机本地查看，未暴露公网。
-
-## 安全边界
-
-- 不删除旧 Sealos VM、磁盘或快照。
-- 若需要释放测试机资源，只允许对脚本中明确列出的旧测试 VM 执行优雅关机并取消 autostart。
-- 不在 Git 中保存私钥、kubeconfig、k3s token、Grafana 密码或数据库凭据。
-- 所有磁盘初始化只允许命中 VM 内独立的数据盘，禁止对宿主盘和 VM 根盘执行 `pvcreate`/`wipefs`。
+许可：单机版计划采用 AGPL-3.0，见 [LICENSE](LICENSE)。

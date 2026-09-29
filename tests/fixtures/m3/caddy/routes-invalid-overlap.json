@@ -1,9 +1,0 @@
-{
-  "fixture_id": "m3-caddy-routes-invalid-overlap-v1",
-  "admin": {"listen": "127.0.0.1:2019", "loopback_only": true},
-  "routes": [
-    {"route_id": "route_overlap_api", "host": "demo.apps.opencard.test", "path_prefix": "/api", "service": "api", "upstream": "127.0.0.1:18082"},
-    {"route_id": "route_overlap_api_v2", "host": "demo.apps.opencard.test", "path_prefix": "/api/v2", "service": "frontend", "upstream": "127.0.0.1:18081"}
-  ],
-  "expected": {"accepted": false, "error_code": "route_path_overlap", "old_routes_preserved": true, "caddy_reload_attempted": false}
-}

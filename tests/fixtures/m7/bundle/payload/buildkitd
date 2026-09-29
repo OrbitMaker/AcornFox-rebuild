@@ -1,5 +1,0 @@
-OPEN_CARD_RC_FIXTURE_BINARY
-name=buildkitd
-version=0.32.2
-network=none
-build=fixture-only

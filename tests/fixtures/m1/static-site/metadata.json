@@ -1,7 +1,0 @@
-{
-  "schema_version": 1,
-  "fixture_id": "static-site",
-  "kind": "static",
-  "entrypoint": "index.html",
-  "expected_files": ["index.html", "metadata.json", "style.css"]
-}

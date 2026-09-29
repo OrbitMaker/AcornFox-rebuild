@@ -1,8 +1,0 @@
-{
-  "fixture_id": "m3-domain-conflicts-v1",
-  "cases": [
-    {"case_id": "same-host-two-applications", "kind": "domain_binding", "application_a": "app_a", "application_b": "app_b", "hostname": "shared.customer.test", "expected": {"accepted": false, "error_code": "domain_already_bound"}},
-    {"case_id": "same-host-same-prefix", "kind": "route", "hostname": "demo.apps.opencard.test", "paths": ["/api", "/api"], "expected": {"accepted": false, "error_code": "route_duplicate"}},
-    {"case_id": "nested-prefix", "kind": "route", "hostname": "demo.apps.opencard.test", "paths": ["/", "/api"], "expected": {"accepted": true, "specific_prefix_wins": true}}
-  ]
-}

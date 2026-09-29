@@ -1,6 +1,0 @@
-{
-  "fixture_id": "m3-caddy-routes-invalid-admin-v1",
-  "admin": {"listen": "0.0.0.0:2019", "loopback_only": false, "publicly_exposed": true},
-  "routes": [],
-  "expected": {"accepted": false, "error_code": "admin_must_be_loopback", "caddy_started": false}
-}
