@@ -295,10 +295,10 @@ func desiredServer(r Route) caddyServer {
 	}
 }
 
-// desiredDomainsServer builds the shared "af-domains" server: it listens on the
-// HTTP and HTTPS ports and host-matches each app's domains to that app's
-// upstream. Automatic HTTPS stays enabled (the default), so Caddy obtains
-// certificates and redirects HTTP to HTTPS itself. Routes are emitted in a
+// desiredDomainsServer builds the shared "af-domains" HTTPS server and
+// host-matches each app's domains to its upstream. Caddy creates the HTTP
+// redirect listener itself; serving these host routes on HTTP would take
+// precedence over its automatic redirects. Routes are emitted in a
 // deterministic order (by app, then upstream) so serverEqual sees a stable
 // shape.
 func (c *caddyRouter) desiredDomainsServer(routes []Route) caddyServer {
@@ -329,7 +329,6 @@ func (c *caddyRouter) desiredDomainsServer(routes []Route) caddyServer {
 	}
 	return caddyServer{
 		Listen: []string{
-			fmt.Sprintf(":%d", c.https.HTTPPort),
 			fmt.Sprintf(":%d", c.https.HTTPSPort),
 		},
 		Routes: croutes,
@@ -466,7 +465,20 @@ func (c *caddyRouter) syncTLSPolicy(ctx context.Context, domains []string) error
 		return err
 	}
 	if existing {
-		return c.putJSON(ctx, "/id/"+tlsPolicyID, want)
+		// The ID resolves to an array element. POST appends there; PATCH
+		// replaces the existing policy without creating a duplicate ID.
+		payload, err := json.Marshal(want)
+		if err != nil {
+			return fmt.Errorf("caddy marshal tls policy: %w", err)
+		}
+		body, status, err := c.do(ctx, http.MethodPatch, "/id/"+tlsPolicyID, payload)
+		if err != nil {
+			return err
+		}
+		if status < 200 || status >= 300 {
+			return fmt.Errorf("caddy replace tls policy: status %d: %s", status, strings.TrimSpace(string(body)))
+		}
+		return nil
 	}
 	// Append via the array's "..." path so foreign policies survive.
 	return c.appendRaw(ctx, "/config/apps/tls/automation/policies/...", []tlsAutomationPolicy{*want})
@@ -698,8 +710,7 @@ func isNullOrEmpty(raw json.RawMessage) bool {
 	return t == "" || t == "null"
 }
 
-// putServer writes one server. PUT replaces the value at an existing path and
-// creates it when absent, which is exactly the idempotent behaviour we want.
+// putServer sets or replaces one server object through Caddy's POST semantics.
 func (c *caddyRouter) putServer(ctx context.Context, name string, srv caddyServer) error {
 	return c.putJSON(ctx, "/config/apps/http/servers/"+name, srv)
 }

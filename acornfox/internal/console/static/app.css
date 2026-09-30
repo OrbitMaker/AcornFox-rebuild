@@ -181,6 +181,7 @@ a { color: var(--accent); }
 
 /* Confirm dialog */
 .overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.45); z-index: 70; }
+#win-overlay { z-index: 29; }
 .dialog { position: fixed; left: 50%; top: 42%; transform: translate(-50%, -50%); z-index: 71; width: min(400px, 92vw); background: var(--panel-solid); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); padding: 20px; }
 .dialog h3 { margin: 0 0 8px; font-size: 15px; }
 .dialog p { margin: 0 0 16px; color: var(--muted); }

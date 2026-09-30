@@ -45,7 +45,7 @@
 
 ## 3. 域名与 HTTPS（`caddyroute`、`reconcile`）
 
-- `caddyroute.New(adminSocket, HTTPSConfig)`（新增参数；旧调用处一起改）。Sync 时，若任一路由有 Domains，维护共享服务器 `af-domains`：`listen [":<HTTPPort>", ":<HTTPSPort>"]`，每个应用一条路由 `match:[{host:[domains...]}]` → `reverse_proxy` 到该应用上游；Caddy 自动 HTTPS 保持开启（HTTP 自动跳转 HTTPS）。`Issuer=internal` 时加 `apps.tls.automation.policies:[{subjects:[所有域名], issuers:[{module:"internal"}]}]`；只增改我们自己的策略（以 subjects 集合识别，放在一个固定的 `@id: "af-tls-policy"` 对象里），不碰其他配置。无域名时删除 `af-domains` 与我们的策略。
+- `caddyroute.New(adminSocket, HTTPSConfig)`（新增参数；旧调用处一起改）。Sync 时，若任一路由有 Domains，维护共享服务器 `af-domains`：只 `listen [":<HTTPSPort>"]`，每个应用一条路由 `match:[{host:[domains...]}]` → `reverse_proxy` 到该应用上游；HTTP 监听与 308 跳转交给 Caddy 自动生成，避免应用的 host 路由抢先在 HTTP 返回内容。`Issuer=internal` 时加 `apps.tls.automation.policies:[{subjects:[所有域名], issuers:[{module:"internal"}]}]`；只增改固定 `@id: "af-tls-policy"` 的自有策略，已有数组元素用 PATCH 替换。无域名时删除 `af-domains` 与我们的策略。
 - 为保证已备案域名能用 80/443：生产上 Caddy 以自己的 systemd 服务运行并有绑定低端口的能力（N5 安装负责）；开发机测试用 `-https-port 18443 -http-port 18080 -https-issuer internal`。
 - `reconcile` 每轮（应用级）对每个域名做一次 TLS 探测：连接 `127.0.0.1:<HTTPSPort>`，SNI=域名，校验证书链（`Issuer=internal` 时使用 Caddy 本地 CA 根证书路径 `-https-ca-file`，否则用系统根证书）且证书覆盖该域名 → `ready`；否则保持 `pending`，超过 `DomainPendingBudget` → `failed`，诊断 `domain/cert_pending`：message “域名 X 的 HTTPS 证书尚未签发”，hint “确认域名 A 记录指向本服务器、80 与 443 端口已放行；中国大陆服务器的域名须已完成 ICP 备案，否则 80/443 会被拦截、证书无法签发。未备案时请继续使用 http://IP:端口”。状态变化才写库和事件。
 - server 新增 flags：`-http-port 80 -https-port 443 -https-issuer "" -https-ca-file "" -acme-email ""`。

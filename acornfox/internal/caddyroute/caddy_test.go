@@ -217,7 +217,7 @@ func (f *fakeCaddy) handle(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(v)
-	case http.MethodPut, http.MethodPost:
+	case http.MethodPut, http.MethodPost, http.MethodPatch:
 		body, _ := io.ReadAll(r.Body)
 		var v any
 		if len(body) > 0 {
@@ -242,7 +242,11 @@ func (f *fakeCaddy) handle(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
-		// Like real Caddy: PUT creates and refuses an existing key; POST sets or replaces.
+		if _, exists := f.getPath(path); !exists && r.Method == http.MethodPatch {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		// PATCH replaces an existing value; PUT creates; POST sets object keys.
 		if _, exists := f.getPath(path); exists && r.Method == http.MethodPut {
 			http.Error(w, `{"error":"key already exists"}`, http.StatusConflict)
 			return
@@ -413,7 +417,7 @@ func TestSyncSkipsUnchanged(t *testing.T) {
 	var mu sync.Mutex
 	base := f.srv.Handler
 	f.srv.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if req.Method == http.MethodPut || req.Method == http.MethodPost || req.Method == http.MethodDelete {
+		if req.Method == http.MethodPut || req.Method == http.MethodPost || req.Method == http.MethodPatch || req.Method == http.MethodDelete {
 			mu.Lock()
 			writes++
 			mu.Unlock()
@@ -537,14 +541,14 @@ func TestSyncCreatesDomainsServerInternalIssuer(t *testing.T) {
 		t.Fatalf("Sync: %v", err)
 	}
 
-	// af-domains server exists and listens on both ports.
+	// App content is served on HTTPS only; Caddy owns the HTTP redirect listener.
 	srv, ok := f.servers()[domainsServer].(map[string]any)
 	if !ok {
 		t.Fatalf("af-domains server not created")
 	}
 	listen := srv["listen"].([]any)
-	if len(listen) != 2 {
-		t.Fatalf("af-domains listen = %v, want 2 ports", listen)
+	if len(listen) != 1 || listen[0] != ":18443" {
+		t.Fatalf("af-domains listen = %v, want HTTPS port only", listen)
 	}
 	// Automatic HTTPS must NOT be disabled on the domains server.
 	if _, disabled := srv["automatic_https"]; disabled {
@@ -709,7 +713,7 @@ func TestSyncDomainsIdempotentNoOp(t *testing.T) {
 	mu.Unlock()
 
 	// Identical sync: the servers are unchanged; only the TLS policy is
-	// re-PUT (idempotent by @id). Assert servers were not rewritten.
+	// replaced by PATCH at its @id. Assert servers were not rewritten.
 	if err := r.Sync(ctx, routes); err != nil {
 		t.Fatalf("Sync 2: %v", err)
 	}

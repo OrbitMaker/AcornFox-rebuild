@@ -4,14 +4,14 @@
 
 ## 当前状态
 
-按 [v2 设计与迁移清单](../docs/acornfox-rebuild-migration-plan.md) 重建中：N0 原型、N1 状态与调和已完成并在开发机验收（记录见迁移清单第 8 节，实现契约见 [n1-contract.md](../docs/n1-contract.md)）。下一步 N2：CLI 经 SSH 部署。
+按 [v2 设计与迁移清单](../docs/acornfox-rebuild-migration-plan.md) 重建中：N0～N3 已通过开发机验收，N3 同时完成 Mac 原生 CLI、控制台和剪贴板检查（见 [N3 验收记录](../docs/evidence/n3-acceptance-2026-09-30.md)）。阶段 0 仍需 N5 的干净安装与升级；N4 完整运维观测、N6 Skill 与独立首发验收尚未完成。
 
 ## 运行时
 
 ```text
 用户电脑：acornfox CLI + Skill ──SSH──┐
                                      ▼
-acornfox server（账号 acornfox）  API、SQLite 期望状态、调和器；只监听 127.0.0.1
+acornfox server（账号 acornfox）  SQLite、调和器；可信 API 用 Unix socket，控制台仅监听回环地址
         │ Unix socket（internal/peer，按对端 UID 校验）
 acornfox runner（账号 acornfox-exec，docker 组）  唯一操作 Docker 的程序，不保存状态
         │
@@ -25,20 +25,21 @@ acornfox runner（账号 acornfox-exec，docker 组）  唯一操作 Docker 的�
 ## 目录
 
 ```text
-cmd/acornfox               CLI；子命令 server、runner（旧 CLI 命令在 N2 按新 API 重做）
+cmd/acornfox               经 SSH 的 CLI；服务器子命令 server、runner、proxy
 internal/
   state                    SQLite 期望状态：应用、部署、环境变量、数据卷、附加服务、事件、管理员认证表
   runner                   Docker SDK 实现、peer socket 上的 HTTP 服务与客户端
   reconcile                调和器：推进部署、收敛、崩溃恢复、回收
   caddyroute               Caddy admin API 路由同步
-  apiserver                server 的 HTTP API（N1 无认证，只允许回环地址）
+  apiserver                Unix socket 可信 API；控制台会话、Host 检查与 CSRF
+  console                  内嵌原生 JS/CSS 工作台
+  cli client pack          跨平台命令、SSH 传输与目录打包
   peer                     Unix socket 边界（按对端 UID 校验）
   auth                     管理员密码与会话（N3 控制台登录复用）
   importers/dockerfile     Dockerfile 安全检查规则（待接入）
   hostmetrics containermetrics dockermetrics   主机与容器指标（N4 接入）
   contracts domain foundation application/contracts compatibility   旧 CLI 与指标仍依赖的类型，N2 后按需精简
 prototype/                 N0 原型与控制台设计稿（只作参考）
-web/                       旧网页控制台；N3 按工作台设计重做
 ```
 
 ## 构建与测试
@@ -54,7 +55,5 @@ ACORNFOX_DOCKER_IT=1 go test -race -run Docker ./internal/runner/   # 需要本�
 ## 已知问题
 
 - 停止应用最多延迟一轮巡检（约 10 秒）才生效，N4 改为立即执行。
-- 内存超限的提示引用的 `acornfox app set --memory` 在 N2 才提供。
 - 正式安装时 server 与 runner 分属两个账号，上传目录需对 `acornfox-ipc` 组可读（N5）。
 - `internal/containermetrics` 的定时测试在机器繁忙时偶发失败，需要改为不依赖真实时间。
-- `web/` 仍对接旧 API，N3 重做前不可用。

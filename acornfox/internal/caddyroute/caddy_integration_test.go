@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -21,10 +22,9 @@ import (
 //
 // The test:
 //  1. Starts a local httptest upstream serving a known body.
-//  2. Syncs one route with a domain, Issuer internal, ports 18080/18443.
-//  3. Fetches https://<domain>:18443/ (resolving the name to 127.0.0.1) using
-//     the Caddy local root CA and asserts the body.
-//  4. Syncs with no routes and asserts af-domains and the policy are gone.
+//  2. Syncs one route with a domain, internal issuer and isolated free ports.
+//  3. Checks HTTPS content and the HTTP redirect using the Caddy local root CA.
+//  4. Repeats the sync, then removes routes and checks policy cleanup.
 func TestCaddyIntegration(t *testing.T) {
 	if os.Getenv("ACORNFOX_CADDY_IT") != "1" {
 		t.Skip("set ACORNFOX_CADDY_IT=1 to run the real Caddy integration test")
@@ -48,11 +48,13 @@ func TestCaddyIntegration(t *testing.T) {
 	defer upstream.Close()
 	upHost := upstream.Listener.Addr().String() // 127.0.0.1:<port>
 
-	r := New(adminSock, HTTPSConfig{HTTPPort: 18080, HTTPSPort: 18443, Issuer: "internal"})
 	ctx := context.Background()
 
+	// Isolate this check from the running development console and app routes.
+	httpPort, httpsPort, publicPort := freePorts(t)
+	r := New(adminSock, HTTPSConfig{HTTPPort: httpPort, HTTPSPort: httpsPort, Issuer: "internal"})
 	// 2. sync a route with the domain
-	route := Route{App: "notes", PublicPort: 18810, Upstream: upHost, Domains: []string{domain}}
+	route := Route{App: "notes", PublicPort: publicPort, Upstream: upHost, Domains: []string{domain}}
 	if err := r.Sync(ctx, []Route{route}); err != nil {
 		t.Fatalf("Sync with domain: %v", err)
 	}
@@ -60,13 +62,13 @@ func TestCaddyIntegration(t *testing.T) {
 	// Wait for the internal CA to issue the certificate (Caddy issues on demand
 	// / at load; poll the HTTPS endpoint until it presents a valid cert).
 	pool := loadRootCA(t, rootCAPath)
-	client := httpsClient(pool, domain, "127.0.0.1:18443")
+	client := httpsClient(pool, domain, fmt.Sprintf("127.0.0.1:%d", httpsPort))
 
 	deadline := time.Now().Add(30 * time.Second)
 	var got string
 	var lastErr error
 	for time.Now().Before(deadline) {
-		resp, err := client.Get("https://" + domain + ":18443/")
+		resp, err := client.Get(fmt.Sprintf("https://%s:%d/", domain, httpsPort))
 		if err != nil {
 			lastErr = err
 			time.Sleep(500 * time.Millisecond)
@@ -85,6 +87,27 @@ func TestCaddyIntegration(t *testing.T) {
 		t.Fatalf("body = %q, want %q", got, body)
 	}
 
+	// HTTP must redirect before any application content is served, retaining
+	// the path and query. Caddy treats HTTPSPort as the internal listener port;
+	// its public redirect uses the canonical HTTPS URL.
+	redirectClient := &http.Client{
+		Timeout:       5 * time.Second,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse },
+		Transport: &http.Transport{DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, network, fmt.Sprintf("127.0.0.1:%d", httpPort))
+		}},
+	}
+	resp, err := redirectClient.Get(fmt.Sprintf("http://%s:%d/redirect-check?from=http", domain, httpPort))
+	if err != nil {
+		t.Fatalf("HTTP redirect: %v", err)
+	}
+	resp.Body.Close()
+	wantLocation := "https://" + domain + "/redirect-check?from=http"
+	if resp.StatusCode != http.StatusPermanentRedirect || resp.Header.Get("Location") != wantLocation {
+		t.Fatalf("HTTP redirect = %d %q, want 308 %q", resp.StatusCode, resp.Header.Get("Location"), wantLocation)
+	}
+
 	// Confirm the af-domains server and our TLS policy exist.
 	cur, err := r.Current(ctx)
 	if err != nil {
@@ -93,6 +116,9 @@ func TestCaddyIntegration(t *testing.T) {
 	if d := cur["notes"].Domains; len(d) != 1 || d[0] != domain {
 		t.Fatalf("Current domains = %v", d)
 	}
+	if err := r.Sync(ctx, []Route{route}); err != nil {
+		t.Fatalf("repeat Sync with existing TLS policy: %v", err)
+	}
 
 	// 4. sync with no routes: af-domains and the policy must be gone.
 	if err := r.Sync(ctx, nil); err != nil {
@@ -100,6 +126,24 @@ func TestCaddyIntegration(t *testing.T) {
 	}
 	assertGone(t, adminSock, "/config/apps/http/servers/af-domains")
 	assertGone(t, adminSock, "/id/"+tlsPolicyID)
+}
+
+func freePorts(t *testing.T) (int, int, int) {
+	t.Helper()
+	var listeners []net.Listener
+	defer func() {
+		for _, ln := range listeners {
+			ln.Close()
+		}
+	}()
+	for range 3 {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		listeners = append(listeners, ln)
+	}
+	return listeners[0].Addr().(*net.TCPAddr).Port, listeners[1].Addr().(*net.TCPAddr).Port, listeners[2].Addr().(*net.TCPAddr).Port
 }
 
 func loadRootCA(t *testing.T, path string) *x509.CertPool {

@@ -201,8 +201,20 @@ let pollTimer = null;
 // ---------------------------------------------------------------------------
 
 const $ = (id) => document.getElementById(id);
+const FOCUSABLE = "button, a, summary, [tabindex]";
+
+function focusKey(node) {
+  return node.tagName + ":" + (node.getAttribute("aria-label") || node.getAttribute("href") || node.id || node.textContent);
+}
 
 function render() {
+  const active = document.activeElement;
+  const activeKey = active && active.matches(FOCUSABLE) ? focusKey(active) : null;
+  const previousWindow = $("window");
+  const activeInWindow = previousWindow?.contains(active);
+  const previousScope = activeInWindow ? previousWindow : document;
+  const activeIndex = activeKey ? Array.from(previousScope.querySelectorAll(FOCUSABLE)).filter((node) => focusKey(node) === activeKey).indexOf(active) : 0;
+  const previousView = previousWindow?.dataset.viewKey || "";
   renderFatal();
   if (state.fatal) return;
   renderConnectionBanner();
@@ -210,6 +222,14 @@ function render() {
   renderDesk();
   renderDock();
   renderWindow();
+  const currentWindow = $("window");
+  // Polling replaces controls. Preserve keyboard focus within the same view,
+  // while a newly opened window still receives its initial focus.
+  if (activeKey && !active.isConnected && previousView === (currentWindow?.dataset.viewKey || "")) {
+    const scope = activeInWindow ? currentWindow : document;
+    const replacement = Array.from(scope.querySelectorAll(FOCUSABLE)).filter((node) => focusKey(node) === activeKey)[activeIndex];
+    if (replacement) replacement.focus({ preventScroll: true });
+  }
 }
 
 function renderFatal() {
@@ -404,6 +424,12 @@ function renderDock() {
 
 function renderWindow() {
   const existing = $("window");
+  const viewKey = state.openApp ? "app:" + state.openApp : "tool:" + state.openTool;
+  const sameView = existing?.dataset.viewKey === viewKey;
+  const sameTab = sameView && existing.dataset.detailTab === state.detailTab;
+  const scrollTop = sameTab ? existing.querySelector(".win-body")?.scrollTop || 0 : 0;
+  const logScrollTop = sameTab ? existing.querySelector(".logbox")?.scrollTop || 0 : 0;
+  const expandedDetails = sameTab ? Array.from(existing.querySelectorAll("details"), (node) => node.open) : [];
   if (existing) existing.remove();
   const overlay = $("win-overlay");
   if (overlay) overlay.remove();
@@ -417,10 +443,21 @@ function renderWindow() {
   const ov = el("div", { id: "win-overlay", class: "overlay", onclick: closeWindow });
   document.body.append(ov);
   win.id = "window";
+  win.dataset.viewKey = viewKey;
+  win.dataset.detailTab = state.detailTab;
   document.body.append(win);
-  // Move focus into the window for keyboard users.
-  const focusable = win.querySelector("button, a, [tabindex]");
-  if (focusable) focusable.focus();
+  if (sameTab) {
+    win.querySelector(".win-body").scrollTop = scrollTop;
+    const logbox = win.querySelector(".logbox");
+    if (logbox) logbox.scrollTop = logScrollTop;
+    win.querySelectorAll("details").forEach((node, index) => { node.open = expandedDetails[index] || false; });
+  }
+  // Only the initial open moves focus into the window. In particular, a poll
+  // must not steal focus from the separate confirmation dialog.
+  if (!sameView) {
+    const focusable = win.querySelector(FOCUSABLE);
+    if (focusable) focusable.focus({ preventScroll: true });
+  }
 }
 
 function windowHead(title, tileText, tileColor, pill) {
@@ -503,7 +540,7 @@ function overviewTab(a, st, meta) {
   dl.append(el("dd", { text: verText }));
 
   dl.append(el("dt", { text: "资源" }));
-  if (st === "running" && a.observed) {
+  if (a.observed && a.observed.running) {
     dl.append(el("dd", { text: `内存上限 ${a.memory_mb} MB · CPU ${(a.cpu_milli / 1000).toFixed(1)} 核` }));
   } else {
     dl.append(el("dd", {}, el("span", { class: "muted", text: "未运行" })));
@@ -810,7 +847,7 @@ async function actOnApp(action) {
   if (!name) return;
   try {
     await api.post("/v1/apps/" + encodeURIComponent(name) + "/" + action, {});
-    toast(action === "start" ? "已启动" : action === "rollback" ? "已回退" : "已停止");
+    toast(action === "start" ? "已提交启动" : action === "rollback" ? "已提交回退，正在部署" : "已提交停止");
     await poll();
     if (state.openApp === name) await loadDetail(name);
   } catch (e) { handleError(e); }
@@ -874,7 +911,10 @@ function fallbackCopy(text, done) {
   ta.style.opacity = "0";
   document.body.append(ta);
   ta.select();
-  try { document.execCommand("copy"); done(); } catch (_) { toast("复制失败，请手动复制"); }
+  try {
+    if (document.execCommand("copy")) done();
+    else toast("复制失败，请手动复制");
+  } catch (_) { toast("复制失败，请手动复制"); }
   ta.remove();
 }
 
