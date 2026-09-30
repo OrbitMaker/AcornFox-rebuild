@@ -77,13 +77,15 @@ func mainWith(ctx context.Context, args []string, stdin io.Reader, stdout, stder
 		return a.out.usageError("%s", err.Error())
 	}
 	if len(rest) == 0 {
-		return a.out.usageError("需要一个子命令；可用：target deploy status apps logs stats env volume app set rollback redeploy stop start restart delete open domain add remove addons version")
+		return a.out.usageError("需要一个子命令；可用：target deploy status apps logs stats env volume app set rollback redeploy stop start restart delete open domain add remove addons skill version")
 	}
 
 	cmd, cmdArgs := rest[0], rest[1:]
 	switch cmd {
 	case "version":
 		return a.cmdVersion()
+	case "skill":
+		return a.cmdSkill(ctx, cmdArgs)
 	case "target":
 		return a.cmdTarget(ctx, cmdArgs)
 	case "deploy":
