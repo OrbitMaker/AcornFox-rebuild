@@ -33,6 +33,9 @@ type fakeStore struct {
 	sessions map[string]*fakeSession
 	domains  map[string]state.Domain // name -> domain
 	clock    func() time.Time
+
+	addons        map[string]state.Addon // N4.2: app+"/"+kind -> add-on
+	removedAddons map[string]state.Addon
 }
 
 // fakeSession mirrors the stored session, keyed by session secret digest.
@@ -154,8 +157,8 @@ func (f *fakeStore) CreateDeployment(_ context.Context, in state.NewDeployment) 
 			}
 		}
 	}
-	// Duplicate by digest of the newest pending-or-live deployment.
-	for i := len(f.order) - 1; i >= 0; i-- {
+	// Duplicate by digest unless this is an explicit redeploy.
+	for i := len(f.order) - 1; !in.BypassDedup && i >= 0; i-- {
 		d := f.deployments[f.order[i]]
 		if d.App != in.App {
 			continue
@@ -287,6 +290,43 @@ func (f *fakeStore) ListVolumes(_ context.Context, app string) ([]state.Volume, 
 	return out, nil
 }
 
+func (f *fakeStore) DeleteApp(_ context.Context, name string, keepVolumes bool) error {
+	// N4.1: lifecycle-agent added this method.
+	// fakeStore removes the app and optionally its volumes.
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.apps[name]; !ok {
+		return state.ErrNotFound
+	}
+	delete(f.apps, name)
+	delete(f.env, name)
+	if !keepVolumes {
+		delete(f.volumes, name)
+	}
+	// Remove deployments and events
+	newOrder := []string{}
+	for _, id := range f.order {
+		if f.deployments[id].App != name {
+			newOrder = append(newOrder, id)
+		} else {
+			delete(f.deployments, id)
+		}
+	}
+	f.order = newOrder
+	delete(f.events, name)
+	// Remove domains
+	toDelete := []string{}
+	for dname, d := range f.domains {
+		if d.App == name {
+			toDelete = append(toDelete, dname)
+		}
+	}
+	for _, dname := range toDelete {
+		delete(f.domains, dname)
+	}
+	return nil
+}
+
 func (f *fakeStore) AddEvent(_ context.Context, e state.Event) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -340,6 +380,16 @@ type fakeRunner struct {
 	containers map[string][]runner.ContainerInfo
 	logLines   map[string][]string // keyed by container name
 	logsErr    error
+
+	// N4.2: recorded mutating calls and injectable failures.
+	removedContainers  []string
+	removedVolumes     []string
+	removedNetworks    []string
+	removeNetworkErr   error
+	removeVolumeErr    error
+	removeContainerErr error
+	volumeListErr      error
+	volumes            map[string][]runner.VolumeInfo
 }
 
 func newFakeRunner() *fakeRunner {
@@ -369,6 +419,52 @@ func (r *fakeRunner) Logs(_ context.Context, _, name string, _ int) ([]string, e
 		return nil, r.logsErr
 	}
 	return r.logLines[name], nil
+}
+
+func (r *fakeRunner) ContainerStats(_ context.Context, _, _ string) (runner.StatsResponse, error) {
+	// N4.3: observability-agent added this method.
+	// fakeRunner returns empty for tests that don't exercise stats.
+	return runner.StatsResponse{}, nil
+}
+
+func (r *fakeRunner) StopContainer(_ context.Context, _, _ string) error {
+	// N4.1: lifecycle-agent added this method.
+	// fakeRunner returns success for tests.
+	return nil
+}
+
+func (r *fakeRunner) StartContainer(_ context.Context, app, name string) (runner.ContainerInfo, error) {
+	// N4.1: lifecycle-agent added this method.
+	// fakeRunner returns empty info for tests.
+	return runner.ContainerInfo{App: app, Name: name}, nil
+}
+
+func (r *fakeRunner) ListVolumes(_ context.Context, app string) ([]runner.VolumeInfo, error) {
+	return r.volumes[app], r.volumeListErr
+}
+
+func (r *fakeRunner) RemoveContainer(_ context.Context, _, name string) error {
+	if r.removeContainerErr != nil {
+		return r.removeContainerErr
+	}
+	r.removedContainers = append(r.removedContainers, name)
+	return nil
+}
+
+func (r *fakeRunner) RemoveVolume(_ context.Context, _, name string) error {
+	if r.removeVolumeErr != nil {
+		return r.removeVolumeErr
+	}
+	r.removedVolumes = append(r.removedVolumes, name)
+	return nil
+}
+
+func (r *fakeRunner) RemoveNetwork(_ context.Context, app string) error {
+	if r.removeNetworkErr != nil {
+		return r.removeNetworkErr
+	}
+	r.removedNetworks = append(r.removedNetworks, app)
+	return nil
 }
 
 var errRunnerDown = errors.New("runner down")
@@ -493,6 +589,85 @@ func (f *fakeStore) ListDomains(_ context.Context, app string) ([]state.Domain, 
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
+// -------- N4.2 add-ons [addon-agent] --------
+
+func (f *fakeStore) ListAddons(_ context.Context, app string) ([]state.Addon, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []state.Addon
+	for _, a := range f.addons {
+		if a.App == app {
+			out = append(out, a)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Kind < out[j].Kind })
+	return out, nil
+}
+
+// AddAddon mirrors state.Store: app must exist, and kind and env var are
+// unique per app.
+func (f *fakeStore) AddAddon(_ context.Context, addon state.Addon) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.apps[addon.App]; !ok {
+		return false, state.ErrNotFound
+	}
+	for _, a := range f.addons {
+		if a.App == addon.App && (a.Kind == addon.Kind || a.EnvVar == addon.EnvVar) {
+			return false, state.ErrConflict
+		}
+	}
+	if f.addons == nil {
+		f.addons = map[string]state.Addon{}
+	}
+	key := addon.App + "/" + addon.Kind
+	if old, ok := f.removedAddons[key]; ok {
+		f.addons[key] = old
+		delete(f.removedAddons, key)
+		return true, nil
+	}
+	if addon.CreatedAt.IsZero() {
+		addon.CreatedAt = f.now()
+	}
+	f.addons[key] = addon
+	return false, nil
+}
+
+func (f *fakeStore) RemoveAddon(_ context.Context, app, kind string, deleteVolume bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	key := app + "/" + kind
+	addon, active := f.addons[key]
+	if !active {
+		if _, retained := f.removedAddons[key]; !deleteVolume || !retained {
+			return state.ErrNotFound
+		}
+	}
+	if deleteVolume {
+		delete(f.removedAddons, key)
+	} else {
+		if f.removedAddons == nil {
+			f.removedAddons = map[string]state.Addon{}
+		}
+		f.removedAddons[key] = addon
+	}
+	delete(f.addons, key)
+	return nil
+}
+
+func (f *fakeStore) ListRemovedAddons(_ context.Context, app string) ([]state.Addon, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []state.Addon
+	for _, a := range f.removedAddons {
+		if a.App == app {
+			out = append(out, a)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Kind < out[j].Kind })
 	return out, nil
 }
 

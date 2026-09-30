@@ -7,6 +7,8 @@ import (
 	"context"
 	"io"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/acornfox/acornfox/internal/cli"
 	"github.com/acornfox/acornfox/internal/client"
@@ -32,7 +34,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	connect := func(ctx context.Context, t client.Target) (client.API, error) {
 		return client.Connect(ctx, t)
 	}
-	return cli.MainWithConnector(context.Background(), args, stdin, stdout, stderr, os.Getenv, connect, "", mustGetwd())
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return cli.MainWithConnector(ctx, args, stdin, stdout, stderr, os.Getenv, connect, "", mustGetwd())
 }
 
 func mustGetwd() string {

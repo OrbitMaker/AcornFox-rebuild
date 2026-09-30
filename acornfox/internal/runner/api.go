@@ -71,9 +71,11 @@ const (
 	PathContainerStart  = "/v1/containers/start"  // POST ContainerRef -> ContainerInfo
 	PathContainerRemove = "/v1/containers/remove" // POST ContainerRef -> OK (missing is success)
 	PathContainerLogs   = "/v1/containers/logs"   // POST LogsRequest -> LogsResponse
+	PathContainerStats  = "/v1/containers/stats"  // POST StatsRequest -> StatsResponse
 	PathContainerDiff   = "/v1/containers/diff"   // POST ContainerRef -> DiffResponse
 	PathVolumeEnsure    = "/v1/volumes/ensure"    // POST VolumeRef -> OK
 	PathVolumeList      = "/v1/volumes/list"      // POST AppRef -> VolumeListResponse
+	PathVolumeRemove    = "/v1/volumes/remove"    // POST VolumeRef -> OK (missing is success; in use is an error)
 )
 
 type ErrorResponse struct {
@@ -189,6 +191,12 @@ type EnsureContainerRequest struct {
 	Mounts       []Mount           `json:"mounts"`
 	MemoryMB     int               `json:"memory_mb"` // >= 64
 	CPUMilli     int               `json:"cpu_milli"` // >= 100
+	// Role is RoleApp (default, "" means app) or RoleAddon. An add-on request
+	// must use DeploymentID AddonDeploymentID(kind) and match AddonSpecFor(kind)
+	// exactly (image, port, single data mount); its port is never published on
+	// the host, the pinned image is pulled if missing, and the spec's
+	// entrypoint is applied. See addon.go.
+	Role string `json:"role,omitempty"`
 }
 
 // ContainerInfo is the observed state of one managed container.
@@ -205,8 +213,9 @@ type ContainerInfo struct {
 	RestartCount int    `json:"restart_count"`
 	ExitCode     int    `json:"exit_code"`
 	OOMKilled    bool   `json:"oom_killed"`
-	HostPort     int    `json:"host_port"`  // published port on 127.0.0.1, 0 if none
-	StartedAt    string `json:"started_at"` // RFC3339 from Docker, may be empty
+	HostPort     int    `json:"host_port"`        // published port on 127.0.0.1, 0 if none
+	StartedAt    string `json:"started_at"`       // RFC3339 from Docker, may be empty
+	Health       string `json:"health,omitempty"` // Docker healthcheck: starting | healthy | unhealthy; "" when the container has none
 }
 
 type ContainerListResponse struct {
@@ -221,6 +230,23 @@ type LogsRequest struct {
 
 type LogsResponse struct {
 	Lines []string `json:"lines"` // stdout and stderr interleaved, ANSI removed
+}
+
+// StatsRequest requests container resource usage metrics.
+type StatsRequest struct {
+	App  string `json:"app"`
+	Name string `json:"name"`
+}
+
+// StatsResponse contains container resource usage metrics.
+type StatsResponse struct {
+	CPUAvailable  bool    `json:"cpu_available"`
+	CPUPercent    float64 `json:"cpu_percent"`     // CPU usage percentage
+	MemoryUsageMB float64 `json:"memory_usage_mb"` // Memory usage in MB
+	MemoryLimitMB float64 `json:"memory_limit_mb"` // Memory limit in MB
+	NetworkRxMB   float64 `json:"network_rx_mb"`   // Network received in MB
+	NetworkTxMB   float64 `json:"network_tx_mb"`   // Network transmitted in MB
+	PIDs          uint64  `json:"pids"`            // Number of PIDs
 }
 
 // DiffResponse lists files added or changed in the container's writable
@@ -257,13 +283,16 @@ type API interface {
 	StartContainer(ctx context.Context, app, name string) (ContainerInfo, error)
 	RemoveContainer(ctx context.Context, app, name string) error
 	Logs(ctx context.Context, app, name string, tail int) ([]string, error)
+	ContainerStats(ctx context.Context, app, name string) (StatsResponse, error)
 	Diff(ctx context.Context, app, name string) ([]string, error)
 	EnsureVolume(ctx context.Context, app, name string) error
 	ListVolumes(ctx context.Context, app string) ([]VolumeInfo, error)
+	RemoveVolume(ctx context.Context, app, name string) error // only volumes labeled for app; missing is success
 }
 
 var (
 	ErrNotFound    = errors.New("runner: not found")
+	ErrStopped     = errors.New("runner: container stopped")
 	ErrUnavailable = errors.New("runner: unavailable")
 )
 

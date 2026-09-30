@@ -175,6 +175,7 @@ type NewDeployment struct {
 	SourceRef    string
 	SourceDigest string
 	RequestKey   string
+	BypassDedup  bool // when true, skip digest-based deduplication (used by redeploy)
 }
 
 // Config configures Open.
@@ -217,7 +218,10 @@ exactly these signatures):
 	ListEnv(ctx, app string) ([]EnvVar, error)   // includes secret values
 	AddVolume(ctx, app, path string, auto bool) (Volume, bool, error) // idempotent per (app,path); bool = created
 	ListVolumes(ctx, app string) ([]Volume, error)
-	ListAddons(ctx, app string) ([]Addon, error)
+	ListAddons(ctx, app string) ([]Addon, error) // active add-ons only
+	ListRemovedAddons(ctx, app string) ([]Addon, error)
+	AddAddon(ctx context.Context, addon Addon) (bool, error) // bool=true when restoring retained credentials
+	RemoveAddon(ctx context.Context, app, kind string, deleteVolume bool) error
 
 	// Events
 	AddEvent(ctx, e Event) error

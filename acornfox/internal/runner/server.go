@@ -2,6 +2,7 @@ package runner
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"path"
@@ -51,9 +52,13 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST "+PathContainerStart, s.handleContainerStart)
 	s.mux.HandleFunc("POST "+PathContainerRemove, s.handleContainerRemove)
 	s.mux.HandleFunc("POST "+PathContainerLogs, s.handleContainerLogs)
+	s.mux.HandleFunc("POST "+PathContainerLogBatch, s.handleLogBatch)
+	s.mux.HandleFunc("POST "+PathContainerStats, s.handleContainerStats)
 	s.mux.HandleFunc("POST "+PathContainerDiff, s.handleContainerDiff)
 	s.mux.HandleFunc("POST "+PathVolumeEnsure, s.handleVolumeEnsure)
 	s.mux.HandleFunc("POST "+PathVolumeList, s.handleVolumeList)
+	s.mux.HandleFunc("POST "+PathVolumeRemove, s.handleVolumeRemove)
+	s.mux.HandleFunc("POST "+PathNetworkRemove, s.handleNetworkRemove)
 }
 
 // ---- response helpers ----
@@ -70,8 +75,22 @@ func writeError(w http.ResponseWriter, status int, code, msg string) {
 
 // writeAPIError maps an API error to the correct HTTP status and error code.
 func writeAPIError(w http.ResponseWriter, err error) {
+	var remote *RemoteError
+	if errors.As(err, &remote) {
+		writeError(w, remote.Status, remote.Code, remote.Message)
+		return
+	}
+	if errors.Is(err, ErrStopped) {
+		writeError(w, http.StatusConflict, "container_stopped", err.Error())
+		return
+	}
+
 	if err == ErrNotFound {
 		writeError(w, http.StatusNotFound, "not_found", err.Error())
+		return
+	}
+	if errors.Is(err, ErrPullFailed) {
+		writeError(w, http.StatusBadGateway, codePullFailed, err.Error())
 		return
 	}
 	writeError(w, http.StatusInternalServerError, "docker_error", err.Error())
@@ -111,8 +130,8 @@ func validContainerName(w http.ResponseWriter, app, name string) bool {
 		return false
 	}
 	id := strings.TrimPrefix(name, prefix)
-	if !ValidDeploymentID(id) {
-		writeError(w, http.StatusBadRequest, "invalid_request", "container name must end with a 12-hex deployment id")
+	if !validContainerSuffix(id) {
+		writeError(w, http.StatusBadRequest, "invalid_request", "container name must end with a 12-hex deployment id or addon-<kind>")
 		return false
 	}
 	return true
@@ -273,8 +292,20 @@ func (s *Server) handleContainerEnsure(w http.ResponseWriter, r *http.Request) {
 	if !validAppName(w, req.App) {
 		return
 	}
-	if !ValidDeploymentID(req.DeploymentID) {
-		writeError(w, http.StatusBadRequest, "invalid_request", "invalid deployment id")
+	switch req.Role {
+	case "", RoleApp:
+		if !ValidDeploymentID(req.DeploymentID) {
+			writeError(w, http.StatusBadRequest, "invalid_request", "invalid deployment id")
+			return
+		}
+	case RoleAddon:
+		// Add-ons may only run the runner's pinned spec (image, port, mount).
+		if _, err := validateAddonRequest(req); err != nil {
+			writeError(w, http.StatusBadRequest, "refused", err.Error())
+			return
+		}
+	default:
+		writeError(w, http.StatusBadRequest, "invalid_request", "role must be app or addon")
 		return
 	}
 	if req.Image == "" {
@@ -395,6 +426,23 @@ func (s *Server) handleContainerLogs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, LogsResponse{Lines: lines})
 }
 
+func (s *Server) handleContainerStats(w http.ResponseWriter, r *http.Request) {
+	var req StatsRequest
+	if err := decode(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "malformed request body")
+		return
+	}
+	if !validContainerName(w, req.App, req.Name) {
+		return
+	}
+	stats, err := s.api.ContainerStats(r.Context(), req.App, req.Name)
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, stats)
+}
+
 func (s *Server) handleContainerDiff(w http.ResponseWriter, r *http.Request) {
 	var ref ContainerRef
 	if err := decode(r, &ref); err != nil {
@@ -422,6 +470,22 @@ func (s *Server) handleVolumeEnsure(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.api.EnsureVolume(r.Context(), ref.App, ref.Name); err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, OK{OK: true})
+}
+
+func (s *Server) handleVolumeRemove(w http.ResponseWriter, r *http.Request) {
+	var ref VolumeRef
+	if err := decode(r, &ref); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "malformed request body")
+		return
+	}
+	if !validVolumeName(w, ref.App, ref.Name) {
+		return
+	}
+	if err := s.api.RemoveVolume(r.Context(), ref.App, ref.Name); err != nil {
 		writeAPIError(w, err)
 		return
 	}

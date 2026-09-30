@@ -21,7 +21,6 @@ import (
 	"time"
 
 	cerrdefs "github.com/containerd/errdefs"
-	"github.com/moby/moby/api/pkg/stdcopy"
 	"github.com/moby/moby/api/types/build"
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/mount"
@@ -619,6 +618,25 @@ func (d *Docker) RemoveImage(ctx context.Context, app, ref string) error {
 func (d *Docker) EnsureContainer(ctx context.Context, req EnsureContainerRequest) (ContainerInfo, error) {
 	name := ContainerName(req.App, req.DeploymentID)
 
+	role := req.Role
+	if role == "" {
+		role = RoleApp
+	}
+	var addon *AddonSpec
+	switch role {
+	case RoleApp:
+	case RoleAddon:
+		// Re-checked here (not only at the socket) so no caller of Docker can
+		// run anything but the pinned add-on spec under the add-on role.
+		spec, err := validateAddonRequest(req)
+		if err != nil {
+			return ContainerInfo{}, err
+		}
+		addon = &spec
+	default:
+		return ContainerInfo{}, fmt.Errorf("invalid role %q", req.Role)
+	}
+
 	// If it already exists, reuse it as-is (name is the idempotency key).
 	inspect, err := d.cli.ContainerInspect(ctx, name, client.ContainerInspectOptions{})
 	if err == nil {
@@ -649,27 +667,51 @@ func (d *Docker) EnsureContainer(ctx context.Context, req EnsureContainerRequest
 		LabelManaged:    "1",
 		LabelApp:        req.App,
 		LabelDeployment: req.DeploymentID,
-		LabelRole:       RoleApp,
+		LabelRole:       role,
 	}
 	pids := int64(DefaultPidsLimit)
 	memory := int64(req.MemoryMB) * (1 << 20)
 	nanoCPUs := int64(req.CPUMilli) * 1e6
 
+	cfg := &container.Config{
+		Image:        req.Image,
+		Labels:       labels,
+		Env:          envSlice(req.Env),
+		ExposedPorts: network.PortSet{containerPort: {}},
+	}
+	// App containers publish only on loopback; Caddy is the public entry point.
+	// Add-ons publish nothing: they are reachable only by name inside
+	// NetworkName(app).
+	var bindings network.PortMap
+	if addon == nil {
+		bindings = network.PortMap{containerPort: {{
+			HostIP:   netip.MustParseAddr("127.0.0.1"),
+			HostPort: "0",
+		}}}
+	} else {
+		if err := d.ensureAddonImage(ctx, addon.Image); err != nil {
+			return ContainerInfo{}, err
+		}
+		if addon.Entrypoint != nil {
+			cfg.Entrypoint = addon.Entrypoint
+		}
+		if hc := addon.Health; hc != nil {
+			cfg.Healthcheck = &container.HealthConfig{
+				Test:        hc.Test,
+				Interval:    hc.Interval,
+				Timeout:     hc.Timeout,
+				StartPeriod: hc.StartPeriod,
+				Retries:     hc.Retries,
+			}
+		}
+	}
+
 	created, err := d.cli.ContainerCreate(ctx, client.ContainerCreateOptions{
-		Name: name,
-		Config: &container.Config{
-			Image:        req.Image,
-			Labels:       labels,
-			Env:          envSlice(req.Env),
-			ExposedPorts: network.PortSet{containerPort: {}},
-		},
+		Name:   name,
+		Config: cfg,
 		HostConfig: &container.HostConfig{
-			NetworkMode: container.NetworkMode(NetworkName(req.App)),
-			// Publish only on loopback; Caddy is the public entry point.
-			PortBindings: network.PortMap{containerPort: {{
-				HostIP:   netip.MustParseAddr("127.0.0.1"),
-				HostPort: "0",
-			}}},
+			NetworkMode:   container.NetworkMode(NetworkName(req.App)),
+			PortBindings:  bindings,
 			RestartPolicy: container.RestartPolicy{Name: container.RestartPolicyUnlessStopped},
 			SecurityOpt:   []string{"no-new-privileges"},
 			LogConfig: container.LogConfig{
@@ -705,6 +747,28 @@ func (d *Docker) EnsureContainer(ctx context.Context, req EnsureContainerRequest
 	return d.containerInfo(ctx, name)
 }
 
+// ensureAddonImage pulls a pinned add-on image if it is not present locally.
+// The image is left untagged by AcornFox, so per-app image GC never removes it.
+func (d *Docker) ensureAddonImage(ctx context.Context, ref string) error {
+	if _, err := d.cli.ImageInspect(ctx, ref); err == nil {
+		return nil
+	} else if !cerrdefs.IsNotFound(err) {
+		return err
+	}
+	pctx, cancel := context.WithTimeout(ctx, pullImageTimeout)
+	defer cancel()
+	resp, err := d.cli.ImagePull(pctx, ref, client.ImagePullOptions{})
+	if err != nil {
+		return fmt.Errorf("%w: %s: %v", ErrPullFailed, ref, err)
+	}
+	werr := resp.Wait(pctx)
+	_ = resp.Close()
+	if werr != nil {
+		return fmt.Errorf("%w: %s: %v", ErrPullFailed, ref, werr)
+	}
+	return nil
+}
+
 // startIfNeeded starts an existing container only if it is not already running.
 func (d *Docker) startIfNeeded(ctx context.Context, name string, inspect client.ContainerInspectResult) error {
 	if inspect.Container.State != nil && inspect.Container.State.Running {
@@ -727,8 +791,8 @@ func (d *Docker) startByName(ctx context.Context, name string) error {
 // not already exist.
 func (d *Docker) ensureNetwork(ctx context.Context, app string) error {
 	name := NetworkName(app)
-	if _, err := d.cli.NetworkInspect(ctx, name, client.NetworkInspectOptions{}); err == nil {
-		return nil
+	if res, err := d.cli.NetworkInspect(ctx, name, client.NetworkInspectOptions{}); err == nil {
+		return checkNetworkOwner(app, res.Network)
 	} else if !cerrdefs.IsNotFound(err) {
 		return err
 	}
@@ -736,9 +800,13 @@ func (d *Docker) ensureNetwork(ctx context.Context, app string) error {
 		Driver: "bridge",
 		Labels: map[string]string{LabelManaged: "1", LabelApp: app},
 	})
-	// Another goroutine may have created it first.
+	// A concurrent creator may have claimed the name; re-check ownership.
 	if err != nil && cerrdefs.IsConflict(err) {
-		return nil
+		res, inspectErr := d.cli.NetworkInspect(ctx, name, client.NetworkInspectOptions{})
+		if inspectErr != nil {
+			return inspectErr
+		}
+		return checkNetworkOwner(app, res.Network)
 	}
 	return err
 }
@@ -839,6 +907,9 @@ func (d *Docker) containerInfoByID(ctx context.Context, id string) (ContainerInf
 		info.ExitCode = c.State.ExitCode
 		info.OOMKilled = c.State.OOMKilled
 		info.StartedAt = c.State.StartedAt
+		if c.State.Health != nil && c.State.Health.Status != container.NoHealthcheck {
+			info.Health = string(c.State.Health.Status)
+		}
 	}
 	info.HostPort = firstHostPort(c.NetworkSettings)
 	return info, nil
@@ -867,66 +938,86 @@ func firstHostPort(ns *container.NetworkSettings) int {
 
 // StopContainer stops a managed container. Missing is success.
 func (d *Docker) StopContainer(ctx context.Context, app, name string) error {
-	if _, err := d.cli.ContainerInspect(ctx, name, client.ContainerInspectOptions{}); err != nil {
-		if cerrdefs.IsNotFound(err) {
-			return nil
-		}
+	c, err := d.managedContainer(ctx, app, name)
+	if errors.Is(err, ErrNotFound) {
+		return nil
+	}
+	if err != nil {
 		return err
 	}
-	_, err := d.cli.ContainerStop(ctx, name, client.ContainerStopOptions{})
-	if err != nil && cerrdefs.IsNotFound(err) {
+	_, err = d.cli.ContainerStop(ctx, c.ID, client.ContainerStopOptions{})
+	if cerrdefs.IsNotFound(err) {
 		return nil
 	}
 	return err
 }
 
-// StartContainer starts a managed container and returns its state.
+// StartContainer starts only a labeled container of app.
 func (d *Docker) StartContainer(ctx context.Context, app, name string) (ContainerInfo, error) {
-	if err := d.startByName(ctx, name); err != nil {
+	c, err := d.managedContainer(ctx, app, name)
+	if err != nil {
+		return ContainerInfo{}, err
+	}
+	if err := d.startByName(ctx, c.ID); err != nil {
 		if cerrdefs.IsNotFound(err) {
 			return ContainerInfo{}, ErrNotFound
 		}
 		return ContainerInfo{}, err
 	}
-	return d.containerInfo(ctx, name)
+	return d.containerInfoByID(ctx, c.ID)
 }
 
-// RemoveContainer force-removes a managed container. Missing is success.
+// RemoveContainer force-removes only a labeled container of app. Missing is success.
 func (d *Docker) RemoveContainer(ctx context.Context, app, name string) error {
-	_, err := d.cli.ContainerRemove(ctx, name, client.ContainerRemoveOptions{Force: true})
-	if err != nil && cerrdefs.IsNotFound(err) {
+	c, err := d.managedContainer(ctx, app, name)
+	if errors.Is(err, ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	_, err = d.cli.ContainerRemove(ctx, c.ID, client.ContainerRemoveOptions{Force: true})
+	if cerrdefs.IsNotFound(err) {
 		return nil
 	}
 	return err
 }
 
-// Logs returns the last tail lines of a container's combined output, ANSI
-// stripped.
+// Logs preserves the existing line-only API, using the timestamped reader.
 func (d *Docker) Logs(ctx context.Context, app, name string, tail int) ([]string, error) {
-	if tail <= 0 {
-		tail = 40
+	batch, err := d.LogBatch(ctx, app, name, tail, "")
+	if err != nil {
+		return nil, err
 	}
-	if tail > 1000 {
-		tail = 1000
+	out := make([]string, 0, len(batch.Records))
+	for _, record := range batch.Records {
+		out = append(out, record.Text)
 	}
-	rc, err := d.cli.ContainerLogs(ctx, name, client.ContainerLogsOptions{
-		ShowStdout: true,
-		ShowStderr: true,
-		Tail:       strconv.Itoa(tail),
-	})
+	return out, nil
+}
+
+// ContainerStats never queries unowned or stopped containers.
+func (d *Docker) ContainerStats(ctx context.Context, app, name string) (StatsResponse, error) {
+	c, err := d.managedContainer(ctx, app, name)
+	if err != nil {
+		return StatsResponse{}, err
+	}
+	if c.State == nil || !c.State.Running {
+		return StatsResponse{}, ErrStopped
+	}
+	stats, err := d.cli.ContainerStats(ctx, c.ID, client.ContainerStatsOptions{Stream: false, IncludePreviousSample: true})
 	if err != nil {
 		if cerrdefs.IsNotFound(err) {
-			return nil, ErrNotFound
+			return StatsResponse{}, ErrNotFound
 		}
-		return nil, err
+		return StatsResponse{}, err
 	}
-	defer rc.Close()
-
-	var buf bytes.Buffer
-	if _, err := stdcopy.StdCopy(&buf, &buf, io.LimitReader(rc, 4<<20)); err != nil {
-		return nil, err
+	defer stats.Body.Close()
+	var v container.StatsResponse
+	if err := json.NewDecoder(stats.Body).Decode(&v); err != nil {
+		return StatsResponse{}, err
 	}
-	return splitLogLines(buf.Bytes()), nil
+	return containerStatsView(v), nil
 }
 
 // splitLogLines splits raw log bytes into ANSI-stripped, non-empty lines.
@@ -948,21 +1039,18 @@ var dbFilePattern = regexp.MustCompile(`(?i)\.(db|sqlite|sqlite3|db-wal|db-journ
 // Diff returns database-like files added or changed in the writable layer,
 // excluding paths under the container's mounts.
 func (d *Docker) Diff(ctx context.Context, app, name string) ([]string, error) {
-	inspect, err := d.cli.ContainerInspect(ctx, name, client.ContainerInspectOptions{})
+	owned, err := d.managedContainer(ctx, app, name)
 	if err != nil {
-		if cerrdefs.IsNotFound(err) {
-			return nil, ErrNotFound
-		}
 		return nil, err
 	}
 	var mountTargets []string
-	for _, mp := range inspect.Container.Mounts {
+	for _, mp := range owned.Mounts {
 		if mp.Destination != "" {
 			mountTargets = append(mountTargets, path.Clean(mp.Destination))
 		}
 	}
 
-	res, err := d.cli.ContainerDiff(ctx, name, client.ContainerDiffOptions{})
+	res, err := d.cli.ContainerDiff(ctx, owned.ID, client.ContainerDiffOptions{})
 	if err != nil {
 		if cerrdefs.IsNotFound(err) {
 			return nil, ErrNotFound
@@ -1007,6 +1095,33 @@ func (d *Docker) EnsureVolume(ctx context.Context, app, name string) error {
 		Labels: map[string]string{LabelManaged: "1", LabelApp: app},
 	})
 	return err
+}
+
+// RemoveVolume deletes a named volume that is managed and labeled for app.
+// A missing volume is success. A volume still attached to a container is an
+// error (it is never force-removed). The label check matters because volume
+// name prefixes alone can overlap between apps ("af-a-" vs "af-a-b-").
+func (d *Docker) RemoveVolume(ctx context.Context, app, name string) error {
+	if !strings.HasPrefix(name, VolumePrefix(app)) {
+		return fmt.Errorf("volume %q must start with %q", name, VolumePrefix(app))
+	}
+	res, err := d.cli.VolumeInspect(ctx, name, client.VolumeInspectOptions{})
+	if err != nil {
+		if cerrdefs.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	if res.Volume.Labels[LabelManaged] != "1" || res.Volume.Labels[LabelApp] != app {
+		return fmt.Errorf("volume %q is not managed for app %q", name, app)
+	}
+	if _, err := d.cli.VolumeRemove(ctx, name, client.VolumeRemoveOptions{}); err != nil {
+		if cerrdefs.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 // ListVolumes lists managed volumes, optionally filtered to one app.

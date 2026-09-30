@@ -5,8 +5,12 @@
 - 单机版代码：[acornfox/](acornfox/README.md)
 - 战略、阶段与优先级：[docs/acornfox-strategy-roadmap.md](docs/acornfox-strategy-roadmap.md)
 - 当前阶段执行入口：[docs/acornfox-rebuild-migration-plan.md](docs/acornfox-rebuild-migration-plan.md)
+- 共享实时进度：[docs/current-milestone.md](docs/current-milestone.md)
+- 任务认领与文件所有权：[docs/active-tasks.md](docs/active-tasks.md)
+- Claude Code / Codex / Kiro 共同规则：[AGENTS.md](AGENTS.md)
+- 技术决策：[docs/tech-decisions.md](docs/tech-decisions.md)
 - 架构：[docs/acornfox-product-architecture.md](docs/acornfox-product-architecture.md)
 
-历史代码（Open Card 基础设施 PoC、PostgreSQL 控制面、多进程统一安装等）保存在分支 `archive/acornfox-thin-core-20260929` 与更早的分支中；`docs/` 下的其他文档只作历史参考。
+历史代码（Open Card 基础设施 PoC、PostgreSQL 控制面、多进程统一安装等）保存在分支 `archive/acornfox-thin-core-20260929` 与更早的分支中；除上述共享进度、任务、决策与各阶段验收证据外，`docs/` 下其余旧文档只作历史参考。
 
 许可：单机版计划采用 AGPL-3.0，见 [LICENSE](LICENSE)。

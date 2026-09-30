@@ -335,6 +335,13 @@ CREATE TABLE app_domains (
 CREATE INDEX app_domains_app_idx ON app_domains (app, name);
 `
 
+// migration0005 adds soft-delete support for addons via removed_at column.
+const migration0005 = `
+ALTER TABLE addons ADD COLUMN removed_at TEXT DEFAULT NULL;
+
+CREATE INDEX idx_addons_removed ON addons(app, removed_at);
+`
+
 // migrationList is the complete, ordered schema history. Never edit a shipped
 // entry; append a new one instead.
 func migrationList() []migration {
@@ -343,6 +350,7 @@ func migrationList() []migration {
 		{"0002_admin_auth", migration0002},
 		{"0003_source_git", migration0003},
 		{"0004_console_domains", migration0004},
+		{"0005_addon_soft_delete", migration0005},
 	}
 }
 

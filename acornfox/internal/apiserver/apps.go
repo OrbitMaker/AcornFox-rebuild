@@ -93,6 +93,9 @@ func (s *server) buildAppView(ctx context.Context, a state.App, detail bool) app
 	if doms, err := s.store.ListDomains(ctx, a.Name); err == nil {
 		v.Domains = doms
 	}
+	if addons, err := s.addonViews(ctx, a.Name); err == nil {
+		v.Addons = addons
+	}
 	return v
 }
 
@@ -158,13 +161,18 @@ func (s *server) putEnv(w http.ResponseWriter, r *http.Request) {
 		s.mapStoreError(w, err)
 		return
 	}
+	// Check if the app has a live deployment
+	appRec, _ := s.store.GetApp(ctx, app)
+	redeployAvailable := appRec.CurrentDeployment != ""
+
 	// Value is never echoed back; only the key and secret flag, plus a note
 	// that the change applies on the next deployment.
 	writeJSON(w, http.StatusOK, map[string]any{
-		"key":     key,
-		"secret":  body.Secret,
-		"applied": false,
-		"note":    "已保存到期望状态，下次部署生效",
+		"key":                key,
+		"secret":             body.Secret,
+		"applied":            false,
+		"redeploy_available": redeployAvailable,
+		"note":               "已保存到期望状态，下次部署生效",
 	})
 }
 
@@ -238,6 +246,160 @@ func (s *server) stopApp(w http.ResponseWriter, r *http.Request) {
 // startApp implements POST /v1/apps/{app}/start.
 func (s *server) startApp(w http.ResponseWriter, r *http.Request) {
 	s.setDesired(w, r, state.DesiredRunning)
+}
+
+// restartApp implements POST /v1/apps/{app}/restart: stop then start the live container.
+func (s *server) restartApp(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	app := r.PathValue("app")
+	if !state.ValidAppName(app) {
+		writeError(w, http.StatusBadRequest, "invalid_app", "应用名不合法")
+		return
+	}
+
+	// Ensure the app exists and is running
+	appRec, err := s.store.GetApp(ctx, app)
+	if err != nil {
+		s.mapStoreError(w, err)
+		return
+	}
+	if appRec.Desired != state.DesiredRunning {
+		writeError(w, http.StatusBadRequest, "not_running", "应用未在运行状态，无法重启")
+		return
+	}
+	if appRec.CurrentDeployment == "" {
+		writeError(w, http.StatusBadRequest, "no_deployment", "应用没有活跃的部署，无法重启")
+		return
+	}
+
+	// Trigger restart by asking the runner to restart the container.
+	// The reconciler will observe the restart and keep the app running.
+	containers, err := s.runner.ListContainers(ctx, app)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "runner_unavailable", "执行器不可用")
+		return
+	}
+
+	var liveContainer *runner.ContainerInfo
+	for i := range containers {
+		if containers[i].Role == runner.RoleApp && containers[i].DeploymentID == appRec.CurrentDeployment {
+			liveContainer = &containers[i]
+			break
+		}
+	}
+
+	if liveContainer == nil {
+		writeError(w, http.StatusNotFound, "container_missing", "未找到运行中的容器")
+		return
+	}
+
+	// Restart = stop + start. The reconciler will ensure it stays running.
+	if err := s.runner.StopContainer(ctx, app, liveContainer.Name); err != nil {
+		s.log.Error("stop container for restart", "app", app, "name", liveContainer.Name, "err", err)
+		writeError(w, http.StatusInternalServerError, "stop_failed", "停止容器失败")
+		return
+	}
+
+	if _, err := s.runner.StartContainer(ctx, app, liveContainer.Name); err != nil {
+		s.log.Error("start container after restart", "app", app, "name", liveContainer.Name, "err", err)
+		writeError(w, http.StatusInternalServerError, "start_failed", "启动容器失败")
+		return
+	}
+
+	s.kicker.Kick(app)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"name":      app,
+		"restarted": true,
+	})
+}
+
+// deleteApp implements DELETE /v1/apps/{app}?volumes=(true|false): remove the app
+// and optionally its volumes. volumes=true means delete volumes; default is false (keep).
+func (s *server) deleteApp(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	app := r.PathValue("app")
+	if !state.ValidAppName(app) {
+		writeError(w, http.StatusBadRequest, "invalid_app", "应用名不合法")
+		return
+	}
+
+	raw := r.URL.Query().Get("volumes")
+	if raw != "" && raw != "true" && raw != "false" {
+		writeError(w, http.StatusBadRequest, "invalid_volumes", "volumes 必须为 true 或 false，默认保留数据卷")
+		return
+	}
+	deleteVolumes := raw == "true"
+	err := s.withApp(ctx, app, func() error {
+		if _, err := s.store.GetApp(ctx, app); err != nil {
+			return err
+		}
+		volumeNames := map[string]bool{}
+		if deleteVolumes {
+			volumes, err := s.runner.ListVolumes(ctx, app)
+			if err != nil {
+				return &lifecycleError{http.StatusServiceUnavailable, "runner_unavailable", "无法读取应用的数据卷，尚未删除应用，请稍后重试"}
+			}
+			for _, v := range volumes {
+				volumeNames[v.Name] = true
+			}
+			// Include recorded volumes even when Docker has already removed them
+			// during an earlier partial attempt; missing removals are idempotent.
+			vols, err := s.store.ListVolumes(ctx, app)
+			if err != nil {
+				return err
+			}
+			for _, v := range vols {
+				volumeNames[v.VolumeName] = true
+			}
+			active, err := s.store.ListAddons(ctx, app)
+			if err != nil {
+				return err
+			}
+			removed, err := s.store.ListRemovedAddons(ctx, app)
+			if err != nil {
+				return err
+			}
+			for _, a := range append(active, removed...) {
+				volumeNames[a.VolumeName] = true
+			}
+		}
+		containers, err := s.runner.ListContainers(ctx, app)
+		if err != nil {
+			return &lifecycleError{http.StatusServiceUnavailable, "runner_unavailable", "无法读取应用容器，尚未删除应用，请稍后重试"}
+		}
+		for _, c := range containers {
+			if err := s.runner.RemoveContainer(ctx, app, c.Name); err != nil {
+				return &lifecycleError{http.StatusServiceUnavailable, "container_removal_failed", "容器 " + c.Name + " 删除失败，应用记录仍保留，数据卷尚未删除，请稍后重试"}
+			}
+		}
+		for name := range volumeNames {
+			if err := s.runner.RemoveVolume(ctx, app, name); err != nil {
+				return &lifecycleError{http.StatusServiceUnavailable, "volume_removal_failed", "数据卷 " + name + " 删除失败，应用记录仍保留；部分容器或数据卷可能已删除，请稍后重试"}
+			}
+		}
+		if err := s.runner.RemoveNetwork(ctx, app); err != nil {
+			return &lifecycleError{http.StatusServiceUnavailable, "network_removal_failed", "应用网络 " + runner.NetworkName(app) + " 未能回收（可能仍有容器连接或标签不匹配），应用记录仍保留；部分容器或数据卷可能已删除，请检查后重试"}
+		}
+		return s.store.DeleteApp(ctx, app, !deleteVolumes)
+	})
+	if err != nil {
+		var opErr *lifecycleError
+		if errors.As(err, &opErr) {
+			writeError(w, opErr.status, opErr.code, opErr.message)
+		} else {
+			s.mapStoreError(w, err)
+		}
+		return
+	}
+
+	// Kick the reconciler to clean up any remaining resources
+	s.kicker.Kick(app)
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"name":            app,
+		"deleted":         true,
+		"volumes_deleted": deleteVolumes,
+	})
 }
 
 func (s *server) setDesired(w http.ResponseWriter, r *http.Request, desired string) {
@@ -320,7 +482,12 @@ func (s *server) patchApp(w http.ResponseWriter, r *http.Request) {
 		s.mapStoreError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, s.buildAppView(ctx, updated, true))
+	view := s.buildAppView(ctx, updated, true)
+	resp := map[string]any{"app": view}
+	if updated.CurrentDeployment != "" {
+		resp["redeploy_available"] = true
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // appLogs implements GET /v1/apps/{app}/logs?tail=N: the last N lines of the

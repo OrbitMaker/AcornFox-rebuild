@@ -18,6 +18,7 @@ type fakeAPI struct {
 	statusFn     func(ctx context.Context) (client.Status, error)
 	deployFn     func(ctx context.Context, app string, opt client.DeployOptions) (client.Deployment, bool, error)
 	rollbackFn   func(ctx context.Context, app string) (client.Deployment, error)
+	redeployFn   func(ctx context.Context, app string) (string, error)
 	deploymentFn func(ctx context.Context, id string, after int64) (client.Deployment, []client.Event, error)
 	appsFn       func(ctx context.Context) ([]client.App, error)
 	appFn        func(ctx context.Context, app string) (client.App, error)
@@ -28,12 +29,23 @@ type fakeAPI struct {
 	addVolumeFn  func(ctx context.Context, app, path string) error
 	stopFn       func(ctx context.Context, app string) error
 	startFn      func(ctx context.Context, app string) error
+	restartFn    func(ctx context.Context, app string) error
+	deleteAppFn  func(ctx context.Context, app string, deleteVolumes bool) error
+
+	// N4.3
+	hostMetricsFn func(ctx context.Context) (client.HostMetrics, error)
+	appMetricsFn  func(ctx context.Context, app string) (client.AppMetrics, error)
 
 	// N3
 	consoleTokenFn func(ctx context.Context) (string, error)
 	domainsFn      func(ctx context.Context, app string) ([]client.Domain, error)
 	addDomainFn    func(ctx context.Context, app, name string) (client.Domain, error)
 	removeDomainFn func(ctx context.Context, app, name string) error
+
+	// N4.2 [addon-agent]
+	addonsFn      func(ctx context.Context, app string) ([]client.Addon, error)
+	addAddonFn    func(ctx context.Context, app, kind string) (client.AddonResult, error)
+	removeAddonFn func(ctx context.Context, app, kind string, deleteVolume bool) (client.AddonRemoval, error)
 
 	closed bool
 
@@ -67,6 +79,13 @@ func (f *fakeAPI) Rollback(ctx context.Context, app string) (client.Deployment, 
 		return f.rollbackFn(ctx, app)
 	}
 	return client.Deployment{ID: "roll1", App: app, Seq: 2, Status: "live"}, nil
+}
+
+func (f *fakeAPI) Redeploy(ctx context.Context, app string) (string, error) {
+	if f.redeployFn != nil {
+		return f.redeployFn(ctx, app)
+	}
+	return "redep123", nil
 }
 
 func (f *fakeAPI) Deployment(ctx context.Context, id string, after int64) (client.Deployment, []client.Event, error) {
@@ -140,6 +159,34 @@ func (f *fakeAPI) Start(ctx context.Context, app string) error {
 	return nil
 }
 
+func (f *fakeAPI) Restart(ctx context.Context, app string) error {
+	if f.restartFn != nil {
+		return f.restartFn(ctx, app)
+	}
+	return nil
+}
+
+func (f *fakeAPI) DeleteApp(ctx context.Context, app string, deleteVolumes bool) error {
+	if f.deleteAppFn != nil {
+		return f.deleteAppFn(ctx, app, deleteVolumes)
+	}
+	return nil
+}
+
+func (f *fakeAPI) HostMetrics(ctx context.Context) (client.HostMetrics, error) {
+	if f.hostMetricsFn != nil {
+		return f.hostMetricsFn(ctx)
+	}
+	return client.HostMetrics{Available: false}, nil
+}
+
+func (f *fakeAPI) AppMetrics(ctx context.Context, app string) (client.AppMetrics, error) {
+	if f.appMetricsFn != nil {
+		return f.appMetricsFn(ctx, app)
+	}
+	return client.AppMetrics{App: app}, nil
+}
+
 func (f *fakeAPI) Close() error { f.closed = true; return nil }
 
 func (f *fakeAPI) ConsoleToken(ctx context.Context) (string, error) {
@@ -168,6 +215,28 @@ func (f *fakeAPI) RemoveDomain(ctx context.Context, app, name string) error {
 		return f.removeDomainFn(ctx, app, name)
 	}
 	return nil
+}
+
+// N4.2 [addon-agent]
+func (f *fakeAPI) Addons(ctx context.Context, app string) ([]client.Addon, error) {
+	if f.addonsFn != nil {
+		return f.addonsFn(ctx, app)
+	}
+	return nil, nil
+}
+
+func (f *fakeAPI) AddAddon(ctx context.Context, app, kind string) (client.AddonResult, error) {
+	if f.addAddonFn != nil {
+		return f.addAddonFn(ctx, app, kind)
+	}
+	return client.AddonResult{Addon: client.Addon{Kind: kind, EnvVar: "DATABASE_URL"}}, nil
+}
+
+func (f *fakeAPI) RemoveAddon(ctx context.Context, app, kind string, deleteVolume bool) (client.AddonRemoval, error) {
+	if f.removeAddonFn != nil {
+		return f.removeAddonFn(ctx, app, kind, deleteVolume)
+	}
+	return client.AddonRemoval{Kind: kind, Removed: true, VolumeDeleted: deleteVolume}, nil
 }
 
 // harness wires a test invocation with an injected fake API, config dir and

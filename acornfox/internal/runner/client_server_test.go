@@ -60,6 +60,10 @@ type fakeAPI struct {
 	logsErr  error
 	logTail  int
 
+	statsResp StatsResponse
+	statsErr  error
+	statsName string
+
 	diffFiles []string
 	diffErr   error
 
@@ -68,6 +72,10 @@ type fakeAPI struct {
 
 	volumes    []VolumeInfo
 	volumesErr error
+
+	// N4.2 [addon-agent]
+	removeVolErr  error
+	removeVolName string
 }
 
 func (f *fakeAPI) Ping(context.Context) (PingResponse, error) { return f.pingResp, f.pingErr }
@@ -126,6 +134,11 @@ func (f *fakeAPI) Logs(_ context.Context, _, _ string, tail int) ([]string, erro
 	return f.logLines, f.logsErr
 }
 
+func (f *fakeAPI) ContainerStats(_ context.Context, _, name string) (StatsResponse, error) {
+	f.statsName = name
+	return f.statsResp, f.statsErr
+}
+
 func (f *fakeAPI) Diff(context.Context, string, string) ([]string, error) {
 	return f.diffFiles, f.diffErr
 }
@@ -137,6 +150,11 @@ func (f *fakeAPI) EnsureVolume(_ context.Context, _, name string) error {
 
 func (f *fakeAPI) ListVolumes(context.Context, string) ([]VolumeInfo, error) {
 	return f.volumes, f.volumesErr
+}
+
+func (f *fakeAPI) RemoveVolume(_ context.Context, _, name string) error {
+	f.removeVolName = name
+	return f.removeVolErr
 }
 
 var _ API = (*fakeAPI)(nil)

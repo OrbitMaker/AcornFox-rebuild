@@ -3,6 +3,8 @@ package client
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -89,12 +91,19 @@ func (c *Client) doJSON(ctx context.Context, method, path string, body any, out 
 // transport-level failure (no response bytes) as a connect *Error and a non-2xx
 // response as a server *Error.
 func (c *Client) do(ctx context.Context, method, path string, body io.Reader, size int64, contentType string, out any) (int, error) {
+	return c.doWithKey(ctx, method, path, body, size, contentType, "", out)
+}
+
+func (c *Client) doWithKey(ctx context.Context, method, path string, body io.Reader, size int64, contentType, key string, out any) (int, error) {
 	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, body)
 	if err != nil {
 		return 0, err
 	}
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
+	}
+	if key != "" {
+		req.Header.Set("Idempotency-Key", key)
 	}
 	if size >= 0 {
 		req.ContentLength = size
@@ -261,6 +270,25 @@ func (c *Client) Rollback(ctx context.Context, app string) (Deployment, error) {
 	return dep, nil
 }
 
+// Redeploy calls POST /v1/apps/{app}/redeploy and returns the new deployment ID.
+func (c *Client) Redeploy(ctx context.Context, app string) (string, error) {
+	var resp struct {
+		App          string `json:"app"`
+		DeploymentID string `json:"deployment_id"`
+	}
+	path := "/v1/apps/" + url.PathEscape(app) + "/redeploy"
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return "", err
+	}
+	// The key belongs to this operation and stays on the same HTTP request if
+	// the transport retries it; a later deliberate redeploy gets a new key.
+	if _, err := c.doWithKey(ctx, http.MethodPost, path, nil, -1, "", hex.EncodeToString(nonce[:]), &resp); err != nil {
+		return "", err
+	}
+	return resp.DeploymentID, nil
+}
+
 // Deployment calls GET /v1/deployments/{id}?after=N and returns the deployment
 // plus its events.
 func (c *Client) Deployment(ctx context.Context, id string, afterEvent int64) (Deployment, []Event, error) {
@@ -360,6 +388,23 @@ func (c *Client) Start(ctx context.Context, app string) error {
 	return err
 }
 
+// Restart calls POST /v1/apps/{app}/restart.
+func (c *Client) Restart(ctx context.Context, app string) error {
+	path := "/v1/apps/" + url.PathEscape(app) + "/restart"
+	_, err := c.do(ctx, http.MethodPost, path, nil, -1, "", nil)
+	return err
+}
+
+// DeleteApp calls DELETE /v1/apps/{app}?volumes=(true|false).
+func (c *Client) DeleteApp(ctx context.Context, app string, deleteVolumes bool) error {
+	path := "/v1/apps/" + url.PathEscape(app)
+	if deleteVolumes {
+		path += "?volumes=true"
+	}
+	_, err := c.do(ctx, http.MethodDelete, path, nil, -1, "", nil)
+	return err
+}
+
 // ---- N3 API methods ----
 
 // ConsoleToken calls POST /v1/console/tokens on the trusted entry (Unix socket
@@ -375,6 +420,25 @@ func (c *Client) ConsoleToken(ctx context.Context) (string, error) {
 		return "", err
 	}
 	return wire.Token, nil
+}
+
+// HostMetrics calls GET /v1/metrics/host.
+func (c *Client) HostMetrics(ctx context.Context) (HostMetrics, error) {
+	var metrics HostMetrics
+	if _, err := c.do(ctx, http.MethodGet, "/v1/metrics/host", nil, -1, "", &metrics); err != nil {
+		return HostMetrics{}, err
+	}
+	return metrics, nil
+}
+
+// AppMetrics calls GET /v1/metrics/apps/{app}.
+func (c *Client) AppMetrics(ctx context.Context, app string) (AppMetrics, error) {
+	path := "/v1/metrics/apps/" + url.PathEscape(app)
+	var metrics AppMetrics
+	if _, err := c.do(ctx, http.MethodGet, path, nil, -1, "", &metrics); err != nil {
+		return AppMetrics{}, err
+	}
+	return metrics, nil
 }
 
 // Domains calls GET /v1/apps/{app}/domains.
@@ -413,4 +477,42 @@ func (c *Client) RemoveDomain(ctx context.Context, app, name string) error {
 	path := "/v1/apps/" + url.PathEscape(app) + "/domains/" + url.PathEscape(name)
 	_, err := c.do(ctx, http.MethodDelete, path, nil, -1, "", nil)
 	return err
+}
+
+// ---- N4.2 add-ons ----
+
+// Addons calls GET /v1/apps/{app}/addons.
+func (c *Client) Addons(ctx context.Context, app string) ([]Addon, error) {
+	path := "/v1/apps/" + url.PathEscape(app) + "/addons"
+	var wrap struct {
+		Addons []Addon `json:"addons"`
+	}
+	if _, err := c.do(ctx, http.MethodGet, path, nil, -1, "", &wrap); err != nil {
+		return nil, err
+	}
+	return wrap.Addons, nil
+}
+
+// AddAddon calls POST /v1/apps/{app}/addons {"kind"}.
+func (c *Client) AddAddon(ctx context.Context, app, kind string) (AddonResult, error) {
+	path := "/v1/apps/" + url.PathEscape(app) + "/addons"
+	var out AddonResult
+	if _, err := c.doJSON(ctx, http.MethodPost, path, map[string]string{"kind": kind}, &out); err != nil {
+		return AddonResult{}, err
+	}
+	return out, nil
+}
+
+// RemoveAddon calls DELETE /v1/apps/{app}/addons/{kind}; deleteVolume adds
+// ?volumes=true, otherwise the data volume is kept.
+func (c *Client) RemoveAddon(ctx context.Context, app, kind string, deleteVolume bool) (AddonRemoval, error) {
+	path := "/v1/apps/" + url.PathEscape(app) + "/addons/" + url.PathEscape(kind)
+	if deleteVolume {
+		path += "?volumes=true"
+	}
+	var out AddonRemoval
+	if _, err := c.do(ctx, http.MethodDelete, path, nil, -1, "", &out); err != nil {
+		return AddonRemoval{}, err
+	}
+	return out, nil
 }

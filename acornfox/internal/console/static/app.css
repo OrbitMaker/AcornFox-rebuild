@@ -190,3 +190,19 @@ a { color: var(--accent); }
 .envlist { list-style: none; margin: 0; padding: 0; }
 .envlist li { display: flex; align-items: center; gap: 10px; padding: 7px 0; border-bottom: 1px solid var(--line); }
 .envlist .k { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+/* Current-value stat tiles: no fabricated history and no color-only meaning. */
+.metric-tiles { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%, 180px),1fr)); gap:12px; margin:16px 0; }
+.metric-tile { display:flex; flex-direction:column; gap:8px; padding:14px; border:1px solid var(--line); border-radius:10px; min-width:0; overflow-wrap:anywhere; }
+.metric-tile strong { font-size:1.4rem; font-weight:600; color:var(--text); }
+.log-controls { flex-wrap:wrap; }
+.log-controls select { font:inherit; color:var(--text); background:var(--panel-solid); border:1px solid var(--line); border-radius:8px; padding:7px; max-width:100%; }
+.logbox { max-width:100%; white-space:pre-wrap; overflow-wrap:anywhere; }
+:root { color-scheme:dark; }
+@media (prefers-color-scheme:light) { :root:not([data-theme="dark"]) { color-scheme:light; } }
+:root[data-theme="light"] { color-scheme:light; }
+
+.addon-card { border:1px solid var(--line); border-radius:10px; padding:14px; margin-bottom:12px; min-width:0; }
+.addon-card h4 { margin:0; }
+.addon-card .kv { margin-top:14px; margin-bottom:0; }
+.addon-card dd { overflow-wrap:anywhere; }

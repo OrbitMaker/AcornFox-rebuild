@@ -125,23 +125,90 @@ type API interface {
 	Status(ctx context.Context) (Status, error)                                          // also verifies APIVersion (connect/version_mismatch)
 	Deploy(ctx context.Context, app string, opt DeployOptions) (Deployment, bool, error) // bool = newly created (false = duplicate)
 	Rollback(ctx context.Context, app string) (Deployment, error)
+	Redeploy(ctx context.Context, app string) (string, error) // N4.4: POST /v1/apps/{app}/redeploy, returns deployment_id
 	Deployment(ctx context.Context, id string, afterEvent int64) (Deployment, []Event, error)
 	Apps(ctx context.Context) ([]App, error)
 	App(ctx context.Context, app string) (App, error)
 	UpdateApp(ctx context.Context, app string, s AppSettings) (App, error)
 	Logs(ctx context.Context, app string, tail int) ([]string, error)
+	HostMetrics(ctx context.Context) (HostMetrics, error)           // N4.3: GET /v1/metrics/host
+	AppMetrics(ctx context.Context, app string) (AppMetrics, error) // N4.3: GET /v1/metrics/apps/{app}
 	SetEnv(ctx context.Context, app, key, value string, secret bool) error
 	UnsetEnv(ctx context.Context, app, key string) error
 	AddVolume(ctx context.Context, app, path string) error
 	Stop(ctx context.Context, app string) error
 	Start(ctx context.Context, app string) error
-	Close() error // ends the SSH session
+	Restart(ctx context.Context, app string) error                       // N4: POST /v1/apps/{app}/restart
+	DeleteApp(ctx context.Context, app string, deleteVolumes bool) error // N4: DELETE /v1/apps/{app}?volumes=(true|false)
+	Close() error                                                        // ends the SSH session
 
 	// N3
 	ConsoleToken(ctx context.Context) (string, error)                // POST /v1/console/tokens (trusted socket only)
 	Domains(ctx context.Context, app string) ([]Domain, error)       // GET  /v1/apps/{app}/domains
 	AddDomain(ctx context.Context, app, name string) (Domain, error) // POST /v1/apps/{app}/domains {"name"}
 	RemoveDomain(ctx context.Context, app, name string) error        // DELETE /v1/apps/{app}/domains/{name}
+
+	// N4.2 add-ons
+	Addons(ctx context.Context, app string) ([]Addon, error)                                    // GET    /v1/apps/{app}/addons
+	AddAddon(ctx context.Context, app, kind string) (AddonResult, error)                        // POST   /v1/apps/{app}/addons {"kind"}
+	RemoveAddon(ctx context.Context, app, kind string, deleteVolume bool) (AddonRemoval, error) // DELETE /v1/apps/{app}/addons/{kind}[?volumes=true]
+}
+
+// Addon mirrors the server's add-on view. Credentials are never sent.
+type Addon struct {
+	Kind          string    `json:"kind"`
+	Image         string    `json:"image"`
+	EnvVar        string    `json:"env_var"`
+	Host          string    `json:"host"`
+	Port          int       `json:"port"`
+	VolumeName    string    `json:"volume_name"`
+	ObservedState string    `json:"observed_state"`
+	CreatedAt     time.Time `json:"created_at"`
+}
+
+// AddonResult is the POST /v1/apps/{app}/addons reply.
+type AddonResult struct {
+	Reused       bool   `json:"reused,omitempty"`
+	Addon        Addon  `json:"addon"`
+	DeploymentID string `json:"deployment_id,omitempty"`
+	Note         string `json:"note"`
+}
+
+// AddonRemoval is the DELETE /v1/apps/{app}/addons/{kind} reply.
+type AddonRemoval struct {
+	Kind          string `json:"kind"`
+	Removed       bool   `json:"removed"`
+	DeploymentID  string `json:"deployment_id,omitempty"`
+	VolumeDeleted bool   `json:"volume_deleted"`
+	VolumeName    string `json:"volume_name"`
+}
+
+// HostMetrics mirrors the host metrics response.
+type HostMetrics struct {
+	MemoryPercent *float64 `json:"memory_percent,omitempty"`
+	DiskPercent   *float64 `json:"disk_percent,omitempty"`
+	Available     bool     `json:"available"`
+	CPUPercent    *float64 `json:"cpu_percent,omitempty"`
+	MemoryUsed    *uint64  `json:"memory_used,omitempty"`
+	MemoryTotal   *uint64  `json:"memory_total,omitempty"`
+	DiskUsed      *uint64  `json:"disk_used,omitempty"`
+	DiskTotal     *uint64  `json:"disk_total,omitempty"`
+	Load1         *float64 `json:"load1,omitempty"`
+	UptimeSeconds *float64 `json:"uptime_seconds,omitempty"`
+}
+
+// AppMetrics mirrors the app metrics response.
+type AppMetrics struct {
+	Available     *bool   `json:"available,omitempty"`
+	CPUAvailable  *bool   `json:"cpu_available,omitempty"`
+	ObservedState string  `json:"observed_state,omitempty"`
+	App           string  `json:"app"`
+	CPUPercent    float64 `json:"cpu_percent"`
+	MemoryUsageMB float64 `json:"memory_usage_mb"`
+	MemoryLimitMB float64 `json:"memory_limit_mb"`
+	NetworkRxMB   float64 `json:"network_rx_mb"`
+	NetworkTxMB   float64 `json:"network_tx_mb"`
+	PIDs          uint64  `json:"pids"`
 }
 
 // Domain mirrors state.Domain on the wire.

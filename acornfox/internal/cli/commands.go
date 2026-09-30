@@ -179,44 +179,6 @@ func (a *app) cmdApps(ctx context.Context, args []string) int {
 	return exitOK
 }
 
-// cmdLogs implements `logs [--tail N]`.
-func (a *app) cmdLogs(ctx context.Context, args []string) int {
-	fs := flag.NewFlagSet("logs", flag.ContinueOnError)
-	fs.SetOutput(a.out.stderr)
-	tail := fs.Int("tail", 100, "返回最近 N 行（最多 1000）")
-	if err := fs.Parse(args); err != nil {
-		return exitUsage
-	}
-	if *tail < 1 {
-		*tail = 100
-	}
-	if *tail > 1000 {
-		*tail = 1000
-	}
-	res, err := a.resolveTargetAndApp()
-	if err != nil {
-		return a.out.usageError("%s", err.Error())
-	}
-	api, derr := a.dial(ctx, res.target)
-	if derr != nil {
-		return a.out.fail(derr)
-	}
-	defer api.Close()
-
-	lines, serr := api.Logs(ctx, res.app, *tail)
-	if serr != nil {
-		return a.out.fail(serr)
-	}
-	if a.out.json {
-		a.out.emitJSON(map[string]any{"lines": lines})
-		return exitOK
-	}
-	for _, l := range lines {
-		a.out.human("%s", l)
-	}
-	return exitOK
-}
-
 // cmdEnv implements `env set KEY=VALUE [--secret]` / `env unset KEY` /
 // `env list`.
 func (a *app) cmdEnv(ctx context.Context, args []string) int {
@@ -259,10 +221,10 @@ func (a *app) cmdEnv(ctx context.Context, args []string) int {
 		}
 		if a.out.json {
 			// Never include the value.
-			a.out.emitJSON(map[string]any{"key": key, "secret": *secret, "note": "下次部署生效"})
+			a.out.emitJSON(map[string]any{"key": key, "secret": *secret, "note": "下次部署生效；应用已上线时可运行 acornfox redeploy 立即生效"})
 			return exitOK
 		}
-		a.out.human("已设置 %s，下次部署生效。", key)
+		a.out.human("已设置 %s，下次部署生效；应用已上线时可运行 acornfox redeploy 立即生效。", key)
 		return exitOK
 
 	case "unset":
@@ -279,10 +241,10 @@ func (a *app) cmdEnv(ctx context.Context, args []string) int {
 			return a.out.fail(serr)
 		}
 		if a.out.json {
-			a.out.emitJSON(map[string]any{"key": key, "note": "下次部署生效"})
+			a.out.emitJSON(map[string]any{"key": key, "note": "下次部署生效；应用已上线时可运行 acornfox redeploy 立即生效"})
 			return exitOK
 		}
-		a.out.human("已删除 %s，下次部署生效。", key)
+		a.out.human("已删除 %s，下次部署生效；应用已上线时可运行 acornfox redeploy 立即生效。", key)
 		return exitOK
 
 	case "list":
@@ -462,11 +424,11 @@ func (a *app) cmdApp(ctx context.Context, args []string) int {
 	if a.out.json {
 		a.out.emitJSON(map[string]any{
 			"app": updated.Name, "memory_mb": updated.MemoryMB, "cpu_milli": updated.CPUMilli,
-			"port": updated.Port, "health_path": updated.HealthPath, "note": "下次部署生效",
+			"port": updated.Port, "health_path": updated.HealthPath, "note": "下次部署生效；应用已上线时可运行 acornfox redeploy 立即生效",
 		})
 		return exitOK
 	}
-	a.out.human("已更新应用设置，下次部署生效。")
+	a.out.human("已更新应用设置，下次部署生效；应用已上线时可运行 acornfox redeploy 立即生效。")
 	return exitOK
 }
 
@@ -501,6 +463,36 @@ func (a *app) cmdRollback(ctx context.Context, args []string) int {
 	return a.waitDeployment(ctx, api, res.app, dep, *timeout)
 }
 
+// cmdRedeploy submits `redeploy` and prints the ID for subsequent status queries.
+func (a *app) cmdRedeploy(ctx context.Context, args []string) int {
+	fs := flag.NewFlagSet("redeploy", flag.ContinueOnError)
+	fs.SetOutput(a.out.stderr)
+	if err := fs.Parse(args); err != nil {
+		return exitUsage
+	}
+	res, err := a.resolveTargetAndApp()
+	if err != nil {
+		return a.out.usageError("%s", err.Error())
+	}
+	api, derr := a.dial(ctx, res.target)
+	if derr != nil {
+		return a.out.fail(derr)
+	}
+	defer api.Close()
+
+	deploymentID, serr := api.Redeploy(ctx, res.app)
+	if serr != nil {
+		return a.out.fail(serr)
+	}
+	if a.out.json {
+		a.out.emitJSON(map[string]any{"deployment_id": deploymentID})
+		return exitOK
+	}
+	a.out.human("已触发重新部署，部署 ID: %s", deploymentID)
+	a.out.human("可使用 acornfox status %s 查看进度和诊断", deploymentID)
+	return exitOK
+}
+
 // cmdStop implements `stop`.
 func (a *app) cmdStop(ctx context.Context, args []string) int {
 	return a.simpleAppAction(ctx, args, "stop")
@@ -509,6 +501,70 @@ func (a *app) cmdStop(ctx context.Context, args []string) int {
 // cmdStart implements `start`.
 func (a *app) cmdStart(ctx context.Context, args []string) int {
 	return a.simpleAppAction(ctx, args, "start")
+}
+
+// cmdRestart implements `restart`.
+func (a *app) cmdRestart(ctx context.Context, args []string) int {
+	if len(args) != 0 {
+		return a.out.usageError("restart 不接受参数")
+	}
+	res, err := a.resolveTargetAndApp()
+	if err != nil {
+		return a.out.usageError("%s", err.Error())
+	}
+	api, derr := a.dial(ctx, res.target)
+	if derr != nil {
+		return a.out.fail(derr)
+	}
+	defer api.Close()
+
+	if serr := api.Restart(ctx, res.app); serr != nil {
+		return a.out.fail(serr)
+	}
+	if a.out.json {
+		a.out.emitJSON(map[string]any{"app": res.app, "restarted": true})
+		return exitOK
+	}
+	a.out.human("已重启应用 %s。", res.app)
+	return exitOK
+}
+
+// cmdDelete implements `delete [--volumes]`.
+func (a *app) cmdDelete(ctx context.Context, args []string) int {
+	fs := flag.NewFlagSet("delete", flag.ContinueOnError)
+	fs.SetOutput(a.out.stderr)
+	deleteVolumes := fs.Bool("volumes", false, "同时删除数据卷（默认保留）")
+	if err := fs.Parse(args); err != nil {
+		return exitUsage
+	}
+
+	res, err := a.resolveTargetAndApp()
+	if err != nil {
+		return a.out.usageError("%s", err.Error())
+	}
+	api, derr := a.dial(ctx, res.target)
+	if derr != nil {
+		return a.out.fail(derr)
+	}
+	defer api.Close()
+
+	if serr := api.DeleteApp(ctx, res.app, *deleteVolumes); serr != nil {
+		return a.out.fail(serr)
+	}
+	if a.out.json {
+		a.out.emitJSON(map[string]any{
+			"app":             res.app,
+			"deleted":         true,
+			"volumes_deleted": *deleteVolumes,
+		})
+		return exitOK
+	}
+	if *deleteVolumes {
+		a.out.human("已删除应用 %s 及其所有数据卷。", res.app)
+	} else {
+		a.out.human("已删除应用 %s（数据卷已保留）。", res.app)
+	}
+	return exitOK
 }
 
 func (a *app) simpleAppAction(ctx context.Context, args []string, action string) int {

@@ -167,10 +167,18 @@ func (c *Client) RemoveImage(ctx context.Context, app, ref string) error {
 	return c.call(ctx, c.standard, PathImageRemove, ImageRef{App: app, Ref: ref}, clientDefaultBound, nil)
 }
 
-// EnsureContainer implements API.
+// EnsureContainer implements API. Add-on requests may pull their pinned image
+// on first creation, so they use the long client and the pull timeout.
 func (c *Client) EnsureContainer(ctx context.Context, req EnsureContainerRequest) (ContainerInfo, error) {
 	var out ContainerInfo
-	err := c.call(ctx, c.standard, PathContainerEnsure, req, clientDefaultBound, &out)
+	pc := c.standard
+	if req.Role == RoleAddon {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, pullTimeout+time.Minute)
+		defer cancel()
+		pc = c.long
+	}
+	err := c.call(ctx, pc, PathContainerEnsure, req, clientDefaultBound, &out)
 	return out, err
 }
 
@@ -205,6 +213,17 @@ func (c *Client) Logs(ctx context.Context, app, name string, tail int) ([]string
 	return out.Lines, err
 }
 
+// ContainerStats implements API.
+func (c *Client) ContainerStats(ctx context.Context, app, name string) (StatsResponse, error) {
+	var out StatsResponse
+	err := c.call(ctx, c.standard, PathContainerStats, StatsRequest{App: app, Name: name}, clientDefaultBound, &out)
+	var remote *RemoteError
+	if errors.As(err, &remote) && remote.Code == "container_stopped" {
+		return out, ErrStopped
+	}
+	return out, err
+}
+
 // Diff implements API.
 func (c *Client) Diff(ctx context.Context, app, name string) ([]string, error) {
 	var out DiffResponse
@@ -215,6 +234,11 @@ func (c *Client) Diff(ctx context.Context, app, name string) ([]string, error) {
 // EnsureVolume implements API.
 func (c *Client) EnsureVolume(ctx context.Context, app, name string) error {
 	return c.call(ctx, c.standard, PathVolumeEnsure, VolumeRef{App: app, Name: name}, clientDefaultBound, nil)
+}
+
+// RemoveVolume implements API.
+func (c *Client) RemoveVolume(ctx context.Context, app, name string) error {
+	return c.call(ctx, c.standard, PathVolumeRemove, VolumeRef{App: app, Name: name}, clientDefaultBound, nil)
 }
 
 // ListVolumes implements API.

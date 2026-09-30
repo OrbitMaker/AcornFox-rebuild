@@ -8,6 +8,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 
 	"golang.org/x/sys/unix"
 )
@@ -15,6 +16,8 @@ import (
 // HostView is the wire shape of GET /v1/host. On any error the provider returns
 // Available=false and the numeric fields are omitted.
 type HostView struct {
+	MemoryPercent *float64 `json:"memory_percent,omitempty"`
+	DiskPercent   *float64 `json:"disk_percent,omitempty"`
 	Available     bool     `json:"available"`
 	CPUPercent    *float64 `json:"cpu_percent,omitempty"`
 	MemoryUsed    *uint64  `json:"memory_used,omitempty"`
@@ -50,8 +53,12 @@ func (osProcSource) statfs(path string) (unix.Statfs_t, error) {
 // A single-shot CPU reading needs two samples; to keep GET /v1/host cheap and
 // side-effect free it reports CPU only when it can take a brief second sample.
 type procHostProvider struct {
-	src     procSource
-	dataDir string
+	cpuMu         sync.Mutex
+	previousTotal uint64
+	previousIdle  uint64
+	hasPrevious   bool
+	src           procSource
+	dataDir       string
 }
 
 func newProcHostProvider(dataDir string) *procHostProvider {
@@ -75,10 +82,18 @@ func (p *procHostProvider) Host(ctx context.Context) HostView {
 		used := memTotal - memAvail
 		v.MemoryUsed = &used
 		v.MemoryTotal = &memTotal
+		if memTotal > 0 {
+			percent := float64(used) / float64(memTotal) * 100
+			v.MemoryPercent = &percent
+		}
 	}
 	if diskOK {
 		v.DiskUsed = &diskUsed
 		v.DiskTotal = &diskTotal
+		if diskTotal > 0 {
+			percent := float64(diskUsed) / float64(diskTotal) * 100
+			v.DiskPercent = &percent
+		}
 	}
 	if load1, ok := p.readLoad1(); ok {
 		v.Load1 = &load1
@@ -167,42 +182,54 @@ func (p *procHostProvider) readUptime() (float64, bool) {
 	return v, true
 }
 
-// readCPUPercent computes utilisation from a single /proc/stat aggregate line:
-// (total-idle)/total since boot. This is an average since boot rather than an
-// instantaneous rate, but it needs no second sample and never fails a request.
+// readCPUPercent measures changes between requests, never the average since boot.
+// The first request and reset/unchanged counters intentionally omit CPU.
 func (p *procHostProvider) readCPUPercent() (float64, bool) {
+	p.cpuMu.Lock()
+	defer p.cpuMu.Unlock()
 	data, err := p.src.readFile("/proc/stat")
 	if err != nil {
 		return 0, false
 	}
+	total, idle, ok := parseCPUCounter(data)
+	if !ok {
+		return 0, false
+	}
+	previousTotal, previousIdle, hasPrevious := p.previousTotal, p.previousIdle, p.hasPrevious
+	p.previousTotal, p.previousIdle, p.hasPrevious = total, idle, true
+	if !hasPrevious || total <= previousTotal || idle < previousIdle {
+		return 0, false
+	}
+	dt, di := total-previousTotal, idle-previousIdle
+	if di > dt {
+		return 0, false
+	}
+	return float64(dt-di) / float64(dt) * 100, true
+}
+
+func parseCPUCounter(data []byte) (total, idle uint64, ok bool) {
 	sc := bufio.NewScanner(bytes.NewReader(data))
 	if !sc.Scan() {
-		return 0, false
+		return 0, 0, false
 	}
-	f := strings.Fields(sc.Text())
-	if len(f) < 5 || f[0] != "cpu" {
-		return 0, false
+	fields := strings.Fields(sc.Text())
+	if len(fields) < 5 || fields[0] != "cpu" {
+		return 0, 0, false
 	}
-	var total, idle uint64
-	end := len(f)
+	// Guest times are already included in user/nice, so do not double-count.
+	end := len(fields)
 	if end > 9 {
 		end = 9
 	}
-	for i, s := range f[1:end] {
-		n, perr := strconv.ParseUint(s, 10, 64)
-		if perr != nil {
-			return 0, false
+	for i, s := range fields[1:end] {
+		value, err := strconv.ParseUint(s, 10, 64)
+		if err != nil {
+			return 0, 0, false
 		}
-		total += n
-		if i == 3 || i == 4 { // idle + iowait
-			idle += n
+		total += value
+		if i == 3 || i == 4 {
+			idle += value
 		}
 	}
-	if total == 0 || idle > total {
-		return 0, false
-	}
-	pct := float64(total-idle) / float64(total) * 100
-	// Round to two decimals.
-	pct = float64(int64(pct*100+0.5)) / 100
-	return pct, true
+	return total, idle, total > 0 && idle <= total
 }

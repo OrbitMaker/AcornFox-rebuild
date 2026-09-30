@@ -260,6 +260,41 @@ func (s *Store) UpdateApp(ctx context.Context, name string, fn func(*App) error)
 	return app, err
 }
 
+// DeleteApp removes an app and its related SQL records, including volume
+// records (ON DELETE CASCADE). keepVolumes is retained for caller compatibility;
+// this store never deletes Docker volumes. The caller handles Docker cleanup
+// and must delete requested volumes before removing the app record.
+func (s *Store) DeleteApp(ctx context.Context, name string, keepVolumes bool) error {
+	return s.inTx(ctx, func(tx *sql.Tx) error {
+		// Ensure the app exists.
+		if _, err := scanAppTx(ctx, tx, name); err != nil {
+			return err
+		}
+
+		// Delete related data in dependency order (foreign keys are ON DELETE CASCADE
+		// from the schema, but we make it explicit here for clarity).
+		if _, err := tx.ExecContext(ctx, `DELETE FROM events WHERE app=?`, name); err != nil {
+			return fmt.Errorf("delete events: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM app_domains WHERE app=?`, name); err != nil {
+			return fmt.Errorf("delete domains: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM app_env WHERE app=?`, name); err != nil {
+			return fmt.Errorf("delete env: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM addons WHERE app=?`, name); err != nil {
+			return fmt.Errorf("delete addons: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM deployments WHERE app=?`, name); err != nil {
+			return fmt.Errorf("delete deployments: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM apps WHERE name=?`, name); err != nil {
+			return fmt.Errorf("delete app: %w", err)
+		}
+		return nil
+	})
+}
+
 // SetCurrentDeployment atomically retires the previous live deployment (keeping
 // its FinishedAt), marks deploymentID live, and points apps.current_deployment
 // at it.
@@ -334,7 +369,8 @@ func (s *Store) CreateDeployment(ctx context.Context, in NewDeployment) (Deploym
 			}
 		}
 		// Idempotency by digest of the newest pending-or-live deployment.
-		if in.SourceDigest != "" {
+		// Skip this check when BypassDedup is true (used by redeploy).
+		if in.SourceDigest != "" && !in.BypassDedup {
 			newest, err := scanNewestPendingOrLiveTx(ctx, tx, in.App)
 			if err == nil && newest.SourceDigest == in.SourceDigest {
 				dep = newest
@@ -659,9 +695,9 @@ func (s *Store) ListVolumes(ctx context.Context, app string) ([]Volume, error) {
 	return out, rows.Err()
 }
 
-// ListAddons returns all add-ons of an app, ordered by kind.
+// ListAddons returns all add-ons of an app that are not soft-deleted, ordered by kind.
 func (s *Store) ListAddons(ctx context.Context, app string) ([]Addon, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT app, kind, image, volume_name, credentials, env_var, created_at FROM addons WHERE app=? ORDER BY kind`, app)
+	rows, err := s.db.QueryContext(ctx, `SELECT app, kind, image, volume_name, credentials, env_var, created_at FROM addons WHERE app=? AND removed_at IS NULL ORDER BY kind`, app)
 	if err != nil {
 		return nil, fmt.Errorf("list addons: %w", err)
 	}
@@ -682,6 +718,130 @@ func (s *Store) ListAddons(ctx context.Context, app string) ([]Addon, error) {
 		out = append(out, a)
 	}
 	return out, rows.Err()
+}
+
+// ListRemovedAddons returns all soft-deleted add-ons of an app, ordered by kind.
+func (s *Store) ListRemovedAddons(ctx context.Context, app string) ([]Addon, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT app, kind, image, volume_name, credentials, env_var, created_at FROM addons WHERE app=? AND removed_at IS NOT NULL ORDER BY kind`, app)
+	if err != nil {
+		return nil, fmt.Errorf("list removed addons: %w", err)
+	}
+	defer rows.Close()
+	var out []Addon
+	for rows.Next() {
+		var a Addon
+		var creds, createdText string
+		if err := rows.Scan(&a.App, &a.Kind, &a.Image, &a.VolumeName, &creds, &a.EnvVar, &createdText); err != nil {
+			return nil, fmt.Errorf("scan addon: %w", err)
+		}
+		if creds != "" {
+			a.Credentials = json.RawMessage(creds)
+		}
+		if a.CreatedAt, err = parseTime(createdText); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+// AddAddon records an add-on for an app. If a soft-deleted add-on of the same
+// kind exists, it is restored with its existing credentials (returned via reused=true).
+// It returns ErrNotFound when the app is missing, ErrInvalid for malformed input,
+// and ErrConflict when the app already has an active add-on of that kind or another
+// add-on providing the same env var.
+func (s *Store) AddAddon(ctx context.Context, addon Addon) (reused bool, err error) {
+	if !ValidAddonKind(addon.Kind) || addon.Image == "" || addon.VolumeName == "" ||
+		!envKeyPattern.MatchString(addon.EnvVar) || !json.Valid(addon.Credentials) {
+		return false, fmt.Errorf("%w: addon %s/%s", ErrInvalid, addon.App, addon.Kind)
+	}
+	err = s.inTx(ctx, func(tx *sql.Tx) error {
+		if _, err := scanAppTx(ctx, tx, addon.App); err != nil {
+			return err
+		}
+
+		// Restoring an add-on keeps its pinned image, volume, env var and credentials.
+		var existingKind, existingEnvVar string
+		var removedAt sql.NullString
+		err := tx.QueryRowContext(ctx, `SELECT kind, env_var, removed_at FROM addons WHERE app=? AND kind=? LIMIT 1`,
+			addon.App, addon.Kind).Scan(&existingKind, &existingEnvVar, &removedAt)
+		restore := err == nil && removedAt.Valid
+		if err == nil && !restore {
+			return fmt.Errorf("%w: app %s already has addon %s", ErrConflict, addon.App, existingKind)
+		}
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("check addon conflict: %w", err)
+		}
+
+		envVar := addon.EnvVar
+		if restore {
+			envVar = existingEnvVar
+		}
+		var conflictKind string
+		err = tx.QueryRowContext(ctx, `SELECT kind FROM addons WHERE app=? AND env_var=? AND removed_at IS NULL LIMIT 1`,
+			addon.App, envVar).Scan(&conflictKind)
+		if err == nil {
+			return fmt.Errorf("%w: app %s already has addon %s providing %s", ErrConflict, addon.App, conflictKind, envVar)
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("check env var conflict: %w", err)
+		}
+		if restore {
+			if _, err := tx.ExecContext(ctx, `UPDATE addons SET removed_at=NULL WHERE app=? AND kind=?`, addon.App, addon.Kind); err != nil {
+				return fmt.Errorf("restore addon: %w", err)
+			}
+			reused = true
+			return nil
+		}
+
+		createdAt := addon.CreatedAt
+		if createdAt.IsZero() {
+			createdAt = s.nowUTC()
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO addons (app, kind, image, volume_name, credentials, env_var, created_at, removed_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, NULL)`,
+			addon.App, addon.Kind, addon.Image, addon.VolumeName, string(addon.Credentials), addon.EnvVar, formatTime(createdAt)); err != nil {
+			return fmt.Errorf("insert addon: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	return reused, nil
+}
+
+// RemoveAddon soft-deletes or hard-deletes the add-on record of kind from app.
+// When deleteVolume is false, it soft-deletes (sets removed_at); when true, it
+// hard-deletes. It returns ErrNotFound when no such add-on exists.
+func (s *Store) RemoveAddon(ctx context.Context, app, kind string, deleteVolume bool) error {
+	if deleteVolume {
+		res, err := s.db.ExecContext(ctx, `DELETE FROM addons WHERE app=? AND kind=?`, app, kind)
+		if err != nil {
+			return fmt.Errorf("delete addon: %w", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("delete addon: %w", err)
+		}
+		if n == 0 {
+			return fmt.Errorf("%w: addon %s/%s", ErrNotFound, app, kind)
+		}
+	} else {
+		now := formatTime(s.nowUTC())
+		res, err := s.db.ExecContext(ctx, `UPDATE addons SET removed_at=? WHERE app=? AND kind=? AND removed_at IS NULL`, now, app, kind)
+		if err != nil {
+			return fmt.Errorf("soft delete addon: %w", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("soft delete addon: %w", err)
+		}
+		if n == 0 {
+			return fmt.Errorf("%w: addon %s/%s", ErrNotFound, app, kind)
+		}
+	}
+	return nil
 }
 
 // -------- Events --------

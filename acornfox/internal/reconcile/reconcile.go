@@ -41,6 +41,9 @@ type Store interface {
 	ListEnv(ctx context.Context, app string) ([]state.EnvVar, error)
 	ListVolumes(ctx context.Context, app string) ([]state.Volume, error)
 
+	// Addons (N4)
+	ListAddons(ctx context.Context, app string) ([]state.Addon, error)
+
 	// Events
 	AddEvent(ctx context.Context, e state.Event) error
 
@@ -116,12 +119,16 @@ type Reconciler struct {
 	caOnce sync.Once
 	caPool *x509.CertPool
 	caErr  error
+
+	// N4.2: poll interval of the add-on readiness gate (tests shorten it)
+	addonPoll time.Duration
 }
 
 // worker owns one app's serial reconcile goroutine.
 type worker struct {
-	app  string
-	kick chan struct{} // buffered size 1; coalesces triggers
+	app   string
+	kick  chan struct{} // buffered size 1; coalesces triggers
+	token chan struct{} // held by a reconcile round or an explicit API operation
 }
 
 // New builds a Reconciler, filling defaults.
@@ -155,6 +162,7 @@ func New(cfg Config) *Reconciler {
 		lastPingEvt:    make(map[string]time.Time),
 		buildSem:       make(chan struct{}, 1),
 		routeFailSince: make(map[string]time.Time),
+		addonPoll:      time.Second,
 	}
 }
 
@@ -210,25 +218,63 @@ func (r *Reconciler) shutdown() {
 // It lazily creates the app's serial goroutine on first use.
 func (r *Reconciler) Kick(app string) {
 	r.mu.Lock()
-	w, ok := r.workers[app]
-	if !ok {
-		w = &worker{app: app, kick: make(chan struct{}, 1)}
-		r.workers[app] = w
-		go r.workerLoop(w)
-	}
-	r.mu.Unlock()
-
+	defer r.mu.Unlock()
+	w := r.workerLocked(app)
 	select {
 	case w.kick <- struct{}{}:
 	default: // already pending; coalesce
 	}
 }
 
-// workerLoop runs one app's rounds strictly serially.
+// workerLocked returns the app's worker. The caller holds r.mu.
+func (r *Reconciler) workerLocked(app string) *worker {
+	w, ok := r.workers[app]
+	if !ok {
+		w = &worker{app: app, kick: make(chan struct{}, 1), token: make(chan struct{}, 1)}
+		r.workers[app] = w
+		go r.workerLoop(w)
+	}
+	return w
+}
+
+// WithApp serializes an explicit operation with this app's reconcile rounds.
+// Waiting is cancellable; different apps do not block each other. fn may Kick
+// the same app because Kick only queues a round. fn must not call WithApp again
+// for the same app.
+func (r *Reconciler) WithApp(ctx context.Context, app string, fn func() error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	w := r.workerLocked(app)
+	r.mu.Unlock()
+	return w.with(ctx, fn)
+}
+
+func (w *worker) with(ctx context.Context, fn func() error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case w.token <- struct{}{}:
+		defer func() { <-w.token }()
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return fn()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// workerLoop runs one app's rounds strictly serially with explicit API operations.
 func (r *Reconciler) workerLoop(w *worker) {
 	for range w.kick {
 		ctx := context.Background()
-		r.round(ctx, w.app)
+		_ = w.with(ctx, func() error {
+			r.round(ctx, w.app)
+			return nil
+		})
 	}
 }
 
@@ -254,16 +300,28 @@ func (r *Reconciler) round(ctx context.Context, app string) {
 		r.log.Error("pending deployments", "app", app, "err", err)
 		return
 	}
-	env, err := st.ListEnv(ctx, app)
-	if err != nil {
-		r.log.Error("list env", "app", app, "err", err)
-		return
-	}
 	volumes, err := st.ListVolumes(ctx, app)
 	if err != nil {
 		r.log.Error("list volumes", "app", app, "err", err)
 		return
 	}
+	addons, err := st.ListAddons(ctx, app)
+	if err != nil {
+		r.log.Error("list addons", "app", app, "err", err)
+		return
+	}
+	// env is the app's own variables plus the add-on connection URLs (as
+	// secrets), so they are injected into new containers and redacted from
+	// diagnoses like any other secret.
+	env, err := r.appEnv(ctx, app, addons)
+	if err != nil {
+		r.log.Error("list env", "app", app, "err", err)
+		return
+	}
+
+	// N4.2: add-on containers are ensured before any deployment advances, so a
+	// new app container finds its database already running.
+	r.reconcileAddons(ctx, appRec, addons)
 
 	// 2.2.2 supersede: keep only the newest pending deployment.
 	pending = r.supersede(ctx, app, pending)
@@ -584,6 +642,22 @@ func (r *Reconciler) build(ctx context.Context, app state.App, d *state.Deployme
 
 // doStart creates and starts the container, then moves to checking.
 func (r *Reconciler) doStart(ctx context.Context, app state.App, d *state.Deployment, env []state.EnvVar, volumes []state.Volume) {
+	// N4.2 / ADR-0006: the new container starts only once every add-on
+	// accepts connections; otherwise the deployment fails at stage "addon".
+	if addons, err := r.cfg.Store.ListAddons(ctx, app.Name); err != nil {
+		r.log.Error("list addons", "app", app.Name, "err", err)
+		return // retry next round
+	} else if len(addons) > 0 {
+		ok, problem := r.waitAddonsReady(ctx, app, addons)
+		if problem != nil {
+			r.fail(ctx, app, d, env, r.addonDiagnosis(ctx, app, problem, addonSecrets(env, addons)))
+			return
+		}
+		if !ok {
+			return // runner unavailable; stay in starting
+		}
+	}
+
 	// resolve port
 	port, declared := r.containerPort(ctx, app, d.ImageID)
 	if !declared {
@@ -814,7 +888,7 @@ func (r *Reconciler) doRoute(ctx context.Context, app state.App, d *state.Deploy
 // fail marks a deployment failed with a redacted diagnosis and removes upload.
 func (r *Reconciler) fail(ctx context.Context, app state.App, d *state.Deployment, env []state.EnvVar, diag *state.Diagnosis) {
 	if env == nil {
-		env, _ = r.cfg.Store.ListEnv(ctx, app.Name)
+		env, _ = r.appEnv(ctx, app.Name, nil)
 	}
 	r.redactDiagnosis(diag, env)
 	updated, err := r.cfg.Store.UpdateDeployment(ctx, d.ID, func(dep *state.Deployment) error {
@@ -911,7 +985,7 @@ func (r *Reconciler) recreateLive(ctx context.Context, app state.App) {
 		return
 	}
 	port, _ := r.containerPort(ctx, app, live.ImageID)
-	env, _ := r.cfg.Store.ListEnv(ctx, app.Name)
+	env, _ := r.appEnv(ctx, app.Name, nil)
 	envMap := make(map[string]string, len(env))
 	for _, e := range env {
 		envMap[e.Key] = e.Value
@@ -953,12 +1027,19 @@ func (r *Reconciler) appGC(ctx context.Context, app string, pending []state.Depl
 		r.log.Error("kept deployments", "app", app, "err", err)
 		return
 	}
-	keepIDs := map[string]struct{}{}
+	// Build a set of image IDs that must be kept (not deployment IDs).
+	// A shared image may have been built by an old deployment but is still
+	// referenced by a kept deployment, so we protect by actual ImageID.
+	keepImageIDs := map[string]struct{}{}
 	for _, d := range kept {
-		keepIDs[d.ID] = struct{}{}
+		if d.ImageID != "" {
+			keepImageIDs[d.ImageID] = struct{}{}
+		}
 	}
 	for _, d := range pending {
-		keepIDs[d.ID] = struct{}{}
+		if d.ImageID != "" {
+			keepImageIDs[d.ImageID] = struct{}{}
+		}
 	}
 
 	images, err := r.cfg.Runner.ListImages(ctx, app)
@@ -967,7 +1048,7 @@ func (r *Reconciler) appGC(ctx context.Context, app string, pending []state.Depl
 		return
 	}
 	for _, img := range images {
-		if _, ok := keepIDs[img.DeploymentID]; ok {
+		if _, ok := keepImageIDs[img.ID]; ok {
 			continue
 		}
 		if err := r.cfg.Runner.RemoveImage(ctx, app, img.ID); err != nil {

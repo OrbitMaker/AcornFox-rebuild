@@ -45,6 +45,7 @@ type Store interface {
 	GetApp(ctx context.Context, name string) (state.App, error)
 	ListApps(ctx context.Context) ([]state.App, error)
 	UpdateApp(ctx context.Context, name string, fn func(*state.App) error) (state.App, error)
+	DeleteApp(ctx context.Context, name string, keepVolumes bool) error
 
 	CreateDeployment(ctx context.Context, in state.NewDeployment) (state.Deployment, bool, error)
 	GetDeployment(ctx context.Context, id string) (state.Deployment, error)
@@ -56,6 +57,12 @@ type Store interface {
 	ListEnv(ctx context.Context, app string) ([]state.EnvVar, error)
 	AddVolume(ctx context.Context, app, path string, auto bool) (state.Volume, bool, error)
 	ListVolumes(ctx context.Context, app string) ([]state.Volume, error)
+
+	// N4 addons
+	AddAddon(ctx context.Context, addon state.Addon) (bool, error)
+	RemoveAddon(ctx context.Context, app, kind string, deleteVolume bool) error
+	ListAddons(ctx context.Context, app string) ([]state.Addon, error)
+	ListRemovedAddons(ctx context.Context, app string) ([]state.Addon, error)
 
 	ListEvents(ctx context.Context, app, deploymentID string, afterID int64, limit int) ([]state.Event, error)
 
@@ -75,12 +82,23 @@ type Kicker interface {
 	Kick(app string)
 }
 
-// Runner is the read-only subset of runner.API the API server uses to observe
-// live container state and daemon health. Its methods must never mutate state.
+// Runner is the subset of runner.API the API server uses to observe live
+// container state and daemon health. Mutating calls are limited to explicit
+// user actions (restart, deleting an add-on's data); everything else is left
+// to the reconciler.
 type Runner interface {
 	Ping(ctx context.Context) (runner.PingResponse, error)
 	ListContainers(ctx context.Context, app string) ([]runner.ContainerInfo, error)
 	Logs(ctx context.Context, app, name string, tail int) ([]string, error)
+	ContainerStats(ctx context.Context, app, name string) (runner.StatsResponse, error)
+	// N4: container lifecycle for restart
+	StopContainer(ctx context.Context, app, name string) error
+	StartContainer(ctx context.Context, app, name string) (runner.ContainerInfo, error)
+	// N4.2: explicit add-on data deletion (DELETE .../addons/{kind}?volumes=true)
+	RemoveContainer(ctx context.Context, app, name string) error
+	RemoveVolume(ctx context.Context, app, name string) error
+	RemoveNetwork(ctx context.Context, app string) error
+	ListVolumes(ctx context.Context, app string) ([]runner.VolumeInfo, error)
 }
 
 // Config configures New. Store, Kicker, Runner and UploadDir are required.
@@ -177,11 +195,14 @@ func newServer(cfg Config) *server {
 func (s *server) registerV1(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/apps/{app}/deployments", s.createDeployment)
 	mux.HandleFunc("POST /v1/apps/{app}/rollback", s.rollback)
+	mux.HandleFunc("POST /v1/apps/{app}/redeploy", s.redeploy)
 	mux.HandleFunc("GET /v1/deployments/{id}", s.getDeployment)
 	mux.HandleFunc("GET /v1/apps", s.listApps)
 	mux.HandleFunc("GET /v1/apps/{app}", s.getApp)
 	mux.HandleFunc("PATCH /v1/apps/{app}", s.patchApp)
-	mux.HandleFunc("GET /v1/apps/{app}/logs", s.appLogs)
+	mux.HandleFunc("DELETE /v1/apps/{app}", s.deleteApp)
+	mux.HandleFunc("GET /v1/apps/{app}/logs", s.observedLogs)
+	mux.HandleFunc("GET /v1/apps/{app}/log-batch", s.appLogBatch)
 	mux.HandleFunc("GET /v1/apps/{app}/deployments", s.listDeployments)
 	mux.HandleFunc("PUT /v1/apps/{app}/env/{key}", s.putEnv)
 	mux.HandleFunc("DELETE /v1/apps/{app}/env/{key}", s.deleteEnv)
@@ -189,8 +210,14 @@ func (s *server) registerV1(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/apps/{app}/domains", s.listDomains)
 	mux.HandleFunc("POST /v1/apps/{app}/domains", s.addDomain)
 	mux.HandleFunc("DELETE /v1/apps/{app}/domains/{name}", s.removeDomain)
+	mux.HandleFunc("GET /v1/apps/{app}/addons", s.listAddons)
+	mux.HandleFunc("POST /v1/apps/{app}/addons", s.addAddon)
+	mux.HandleFunc("DELETE /v1/apps/{app}/addons/{kind}", s.removeAddon)
 	mux.HandleFunc("POST /v1/apps/{app}/stop", s.stopApp)
 	mux.HandleFunc("POST /v1/apps/{app}/start", s.startApp)
+	mux.HandleFunc("POST /v1/apps/{app}/restart", s.restartApp)
+	mux.HandleFunc("GET /v1/metrics/host", s.getHostMetrics)
+	mux.HandleFunc("GET /v1/metrics/apps/{app}", s.getAppMetrics)
 	mux.HandleFunc("GET /v1/host", s.getHost)
 	mux.HandleFunc("GET /v1/status", s.status)
 }

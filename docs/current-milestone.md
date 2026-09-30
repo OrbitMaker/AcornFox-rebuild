@@ -1,0 +1,89 @@
+# 当前里程碑：N4 生命周期与观测
+
+状态：进行中（2026-09-30 开始）。任务认领见 `active-tasks.md`，技术决策见 `tech-decisions.md`。
+
+完成标准（`acornfox-rebuild-migration-plan.md` 第 5 节）：停止、启动、重启、重新部署、删除（默认保留数据卷）；附加服务 `add` / 删除；日志、主机与容器指标。验收：操作后数据卷内容保留；网页与 CLI 显示状态、日志、指标。
+
+## 进度
+
+### N4.1 生命周期：核心实测通过，网络回收修复待最终实机复验
+
+已确认存在：`apps.desired` 字段（migration 0001）；API `POST /v1/apps/{app}/stop|start|restart`、`DELETE /v1/apps/{app}`，写入期望状态后立即触发一轮调和；runner 停止、启动、删除容器；调和器按 `desired` 收敛；CLI `stop`、`start`、`restart`、`delete`；相关单元测试通过。
+
+`redeploy`、自动重新部署及实际数据卷删除已补齐；删除容器/数据卷与同应用调和串行，失败保留应用记录供重试。原服务端候选已通过真实启停、重启、重部署、删除及数据保留验收。
+
+2026-10-01 已补产品网络回收：固定本应用名、核对受管/应用标签、拒绝连接端点、按检查所得 ID 删除、缺失幂等；同名/并发创建冲突检查归属。网络失败保留应用记录，默认保留卷也回收网络。相关本地 race 通过；最终 `77f33…` 候选传输被工具 Auto 拒绝，真实自动回收复验尚未执行。旧候选由驱动手工清理的证据不作为新功能实测通过。
+
+### N4.2 附加服务：进行中
+
+已确认存在（单元测试通过）：
+- Store `AddAddon`（同类或同一环境变量冲突返回 409）、`RemoveAddon`、`ListAddons`；凭据生成（32 位十六进制密码，MySQL root 密码单独生成，库名/用户名超 32 字符时截断加哈希）。
+- runner 固定规格（`internal/runner/addon.go`）：socket 与 Docker 两处校验镜像、端口、数据卷；缺镜像时拉取；不发布端口；Docker healthcheck 只探测 127.0.0.1 的 TCP；新增 `RemoveVolume`（只删带本应用标签的卷）。
+- 调和器（`internal/reconcile/addons.go`）：确保附加服务容器运行、清理已删除的附加服务容器（保留数据卷）；`DATABASE_URL` / `REDIS_URL` 以密钥形式注入新应用容器并参与脱敏；ADR-0006 部署门控（最多 120 秒，`addon/pull_failed|start_failed|exited|out_of_memory|not_ready`）。
+- API `GET|POST /v1/apps/{app}/addons`、`DELETE /v1/apps/{app}/addons/{kind}[?volumes=true]`；应用详情返回 `addons` 及其观测状态；凭据与连接地址不出接口。
+- CLI `add`、`remove [--volumes]`、`addons`。
+
+连接变量在新容器创建时注入；`restart` 不更新环境。已上线应用的 `add` / `remove` 自动创建新部署，`redeploy` 可显式重建当前镜像；源码摘要去重仍保留，请求键幂等不被绕过。
+
+`remove addon → add addon` 使用软删除保留旧凭据及数据。实际删除卷失败时仍保留凭据，重试成功后才硬删除记录。删除整个应用则会清除 SQL 记录，默认仅保留 Docker 卷；同名应用再次添加服务时若卷存在但凭据缺失，返回 `addon_data_orphaned`，不会静默生成错误的新密码。
+
+网页附加服务只读列表已补齐；原服务端候选在私有 Docker 上已验证三种数据库初始化、healthcheck、实际 SELECT 1/PING、私网端口、删除重加凭据恢复与数据保留。真实 SSH/Chrome 也已验证健康状态与公有字段，不显示凭据。
+
+### N4.3 观测：进行中
+
+已确认存在：runner `ContainerStats`；API `GET /v1/metrics/host`、`GET /v1/metrics/apps/{app}`；CLI `stats`。
+
+`logs APP --tail N --since ... -f`、短轮询游标、脱敏、真实资源指标、网页跟随/暂停与焦点/滚动已验证。真实 SSH 发现旧 CLI Ctrl+C 未接取消上下文，已用 `signal.NotifyContext` 修复；新 Mac CLI 的 12 次真实 SSH 执行全部 exit 0、重复日志保留、SIGINT exit 0、下一 stats 可用。新 CLI 1055…连接原兼容服务端 e6…的边界已记录，最终新 Linux 候选完整回归仍待传输权限解除。
+
+### N4.4 重新部署与数据卷删除：进行中
+
+内容：
+- 新增 `redeploy`：用当前上线的镜像重建容器，不重新构建。
+- 应用已上线时，`add` / `remove` 自动重新部署。
+- `env set` / `app set` 的提示说明可以用 `redeploy` 立即生效。
+- `delete --volumes` 真正删除应用和附加服务的数据卷。
+- 统一删除数据卷时的参数写法。
+
+### N4 验收：收口代码已补，最终候选开发机复验受工具权限状态阻塞
+
+剩余五项按本会话任务推进：
+1. 测试编译与回归修复：完成，构建/vet/核心包竞态测试通过。
+2. 日志跟随与网页观测：本地实现与回归完成。
+3. 网页附加服务列表：本地实现与回归完成。
+4. 开发机真实 Docker 验收：原 e6b44…服务端候选已完成 20 项功能断言，三种数据库连接、数据保留、启停/重启、删除恢复、删卷、指标与合成值脱敏通过；真实 Chrome 8 项通过，新 Mac CLI 1055…对原兼容 API/proxy 的 12 次执行全为 exit 0。
+5. 六平台交叉编译与全量测试：原 e6b44…候选 Linux build/vet/全量 race 及显式 Docker/Caddy 实测四项全部 exit 0。修复后 1055…候选六平台重新编译通过，Mac 子进程 Ctrl+C 及真实 SSH 复测通过；其再次完整源码传输被重新活跃的 Auto 分类器拒绝，未执行最终 Linux 回归。不得用原候选通过替代最终候选完整通过。
+
+收口代码均已补齐。最终候选 `77f33e45712dc3480c6d9a21c2971483773ddf9cc9dcfec06bb55398519ad094` 六平台编译、build/vet及相关本地 race 通过；仍须当前候选 Linux 全量与真实网络自动回收复验。此前工具模式不一致的阻塞已由本轮明确退出 Auto 解除，最终候选成功传输；逐文件/运行摘要相符，Linux build/vet/完整 race 已通过，私有环境以最终二进制恢复，真实网络回收收口进行中。原有 116 个宿主容器保护基线继续核验。
+
+本地脚本 `acornfox/scripts/n4-verify.py` 将产品源码及测试输入复制到新的本地快照，生成清单、日志、真实退出码与二进制 SHA-256；不传输或发布。`compile` 为交叉编译，`tests` 为当前平台实际测试，`all` 在同一快照上执行两者。未执行/skip 不能记作通过。
+
+最新收口候选与阻塞见 [2026-10-01 最终候选](evidence/n4-final-candidate-2026-10-01.md)。此前 [开发机实测](evidence/n4-devbox-verification-2026-09-30.md) 和 [本地验证](evidence/n4-local-verification-2026-09-30.md) 保留各自候选的过程证据，不与新候选结果混淆。
+
+## 附加服务设计（已确认）
+
+- 附加服务就是 AcornFox 管理的容器：标签 `acornfox.role=addon`，名称 `af-<app>-addon-<kind>`，与应用同在网络 `af-<app>`，不发布端口。
+- 固定官方镜像：`postgres:16-alpine`、`mysql:8.4`、`redis:7-alpine`。内存上限：PostgreSQL / MySQL 512 MB，Redis 256 MB。
+- 凭据明文存在 SQLite（文件权限 0600），接口、CLI、日志不回显。
+- 删除附加服务默认保留数据卷，加 `--volumes` 才删除。
+- 附加服务未就绪（能接受连接才算就绪，最多等 120 秒）时，应用部署判为失败，旧版本继续服务。诊断阶段为 `addon`，写明是哪个附加服务、出了什么事、对应用的影响，并说明数据卷未被改动（见 `tech-decisions.md` ADR-0006）。
+
+## 数据库
+
+`apps.desired` 与 `addons` 在 migration 0001 中已有；本轮追加 migration `0005_addon_soft_delete`，以 `removed_at` 保留已停用服务的凭据。0001～0004 不修改。
+
+## 验收清单
+
+- [ ] 停止应用后容器停止，再次启动后恢复正常
+- [ ] 删除应用默认保留数据卷，`--volumes` 删除数据卷
+- [ ] 添加 PostgreSQL 后，应用可通过 `DATABASE_URL` 连接
+- [ ] 附加服务端口不对外暴露，只在应用网络内可见
+- [ ] 日志命令显示最近日志，`-f` 持续跟踪
+- [ ] 网页控制台显示状态、日志与 CPU / 内存指标
+- [ ] `go vet ./...`、`go test ./...` 在开发机通过
+- [x] 六个平台编译通过（原候选及 CLI 信号修复后候选，均为交叉编译，不等同六平台实机运行）
+
+## 已知限制
+
+附加服务不含备份、主从复制与版本升级（属于云版范围）；首发只保证能用、重新部署不丢数据（迁移计划第 3.9 节）。
+
+最后更新：2026-09-30 [cc]

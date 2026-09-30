@@ -77,7 +77,7 @@ func mainWith(ctx context.Context, args []string, stdin io.Reader, stdout, stder
 		return a.out.usageError("%s", err.Error())
 	}
 	if len(rest) == 0 {
-		return a.out.usageError("需要一个子命令；可用：target deploy status apps logs env volume app set rollback stop start open domain version")
+		return a.out.usageError("需要一个子命令；可用：target deploy status apps logs stats env volume app set rollback redeploy stop start restart delete open domain add remove addons version")
 	}
 
 	cmd, cmdArgs := rest[0], rest[1:]
@@ -94,6 +94,8 @@ func mainWith(ctx context.Context, args []string, stdin io.Reader, stdout, stder
 		return a.cmdApps(ctx, cmdArgs)
 	case "logs":
 		return a.cmdLogs(ctx, cmdArgs)
+	case "stats":
+		return a.cmdStats(ctx, cmdArgs)
 	case "env":
 		return a.cmdEnv(ctx, cmdArgs)
 	case "volume":
@@ -102,14 +104,26 @@ func mainWith(ctx context.Context, args []string, stdin io.Reader, stdout, stder
 		return a.cmdApp(ctx, cmdArgs)
 	case "rollback":
 		return a.cmdRollback(ctx, cmdArgs)
+	case "redeploy":
+		return a.cmdRedeploy(ctx, cmdArgs)
 	case "stop":
 		return a.cmdStop(ctx, cmdArgs)
 	case "start":
 		return a.cmdStart(ctx, cmdArgs)
+	case "restart":
+		return a.cmdRestart(ctx, cmdArgs)
+	case "delete":
+		return a.cmdDelete(ctx, cmdArgs)
 	case "open":
 		return a.cmdOpen(ctx, cmdArgs)
 	case "domain":
 		return a.cmdDomain(ctx, cmdArgs)
+	case "add": // N4.2
+		return a.cmdAdd(ctx, cmdArgs)
+	case "remove": // N4.2
+		return a.cmdRemove(ctx, cmdArgs)
+	case "addons": // N4.2
+		return a.cmdAddons(ctx, cmdArgs)
 	default:
 		return a.out.usageError("未知命令：%s", cmd)
 	}

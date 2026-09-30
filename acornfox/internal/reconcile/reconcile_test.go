@@ -52,6 +52,7 @@ type fakeStore struct {
 	volumes     map[string][]state.Volume
 	events      []state.Event
 	domains     map[string]*state.Domain // key: app+"/"+name
+	addons      map[string][]state.Addon // N4.2 [addon-agent]
 }
 
 func newStore() *fakeStore {
@@ -241,6 +242,28 @@ func (s *fakeStore) ListDomains(_ context.Context, app string) ([]state.Domain, 
 	return out, nil
 }
 
+func (s *fakeStore) ListAddons(_ context.Context, app string) ([]state.Addon, error) {
+	// N4.2 [addon-agent]: seeded with putAddon; empty for other tests.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]state.Addon(nil), s.addons[app]...), nil
+}
+
+func (s *fakeStore) putAddon(a state.Addon) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.addons == nil {
+		s.addons = map[string][]state.Addon{}
+	}
+	s.addons[a.App] = append(s.addons[a.App], a)
+}
+
+func (s *fakeStore) clearAddons(app string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.addons, app)
+}
+
 func (s *fakeStore) SetDomainStatus(_ context.Context, app, name, status string, diag *state.Diagnosis) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -337,6 +360,13 @@ type fakeRunner struct {
 
 	// which deployments EnsureContainer should fail for
 	ensureErr map[string]error
+
+	// N4.2 [addon-agent]: every EnsureContainer request, in order.
+	ensureReqs []runner.EnsureContainerRequest
+	// Health of new add-on containers by name; default "healthy".
+	addonHealth map[string]string
+	// Called on every ListContainers (tests use it to advance the clock).
+	onList func()
 }
 
 func newRunner() *fakeRunner {
@@ -466,28 +496,43 @@ func (f *fakeRunner) EnsureContainer(_ context.Context, req runner.EnsureContain
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	name := runner.ContainerName(req.App, req.DeploymentID)
+	f.ensureReqs = append(f.ensureReqs, req)
 	if err := f.ensureErr[req.DeploymentID]; err != nil {
 		return runner.ContainerInfo{}, err
 	}
 	if c, ok := f.containers[name]; ok {
 		return c, nil
 	}
+	role := req.Role
+	if role == "" {
+		role = runner.RoleApp
+	}
 	c := runner.ContainerInfo{
 		ID:           "c-" + name,
 		Name:         name,
 		App:          req.App,
 		DeploymentID: req.DeploymentID,
-		Role:         runner.RoleApp,
+		Role:         role,
 		Image:        req.Image,
 		State:        "running",
 		Running:      true,
 		HostPort:     40000 + len(f.containers),
+	}
+	if role == runner.RoleAddon {
+		c.HostPort = 0 // add-ons are never published
+		c.Health = "healthy"
+		if h, ok := f.addonHealth[name]; ok {
+			c.Health = h
+		}
 	}
 	f.containers[name] = c
 	return c, nil
 }
 
 func (f *fakeRunner) ListContainers(_ context.Context, app string) ([]runner.ContainerInfo, error) {
+	if f.onList != nil {
+		f.onList()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var out []runner.ContainerInfo
@@ -536,6 +581,12 @@ func (f *fakeRunner) Logs(_ context.Context, app, name string, tail int) ([]stri
 	return f.logs[name], nil
 }
 
+func (f *fakeRunner) ContainerStats(_ context.Context, app, name string) (runner.StatsResponse, error) {
+	// N4.3: observability-agent added this method.
+	// fakeRunner returns empty stats for tests.
+	return runner.StatsResponse{}, nil
+}
+
 func (f *fakeRunner) Diff(_ context.Context, app, name string) ([]string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -546,6 +597,14 @@ func (f *fakeRunner) EnsureVolume(_ context.Context, app, name string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.volumes[name] = true
+	return nil
+}
+
+func (f *fakeRunner) RemoveVolume(_ context.Context, app, name string) error {
+	// N4.2 [addon-agent]
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.volumes, name)
 	return nil
 }
 

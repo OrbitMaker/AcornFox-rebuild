@@ -87,8 +87,8 @@ const api = {
     return body;
   },
 
-  async get(path) {
-    const r = await fetch(path, { headers: { Accept: "application/json" } });
+  async get(path, signal) {
+    const r = await fetch(path, { headers: { Accept: "application/json" }, signal });
     if (!r.ok) throw await apiError(r);
     return r.json();
   },
@@ -188,6 +188,8 @@ const state = {
   detail: null,      // detailed appView for openApp
   detailTab: "overview",
   logs: null,        // last fetched log lines for openApp
+  logCursor: "", logFollow: false, logTail: 100, logError: null,
+  logGeneration: 0, appMetrics: null,
   deployments: null, // deployments history for openApp
   fatal: null,       // {code,message} full-screen state
   connectionLost: false,
@@ -195,13 +197,15 @@ const state = {
 };
 
 let pollTimer = null;
+let logRequest = null;
+let pollInFlight = false;
 
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
 
 const $ = (id) => document.getElementById(id);
-const FOCUSABLE = "button, a, summary, [tabindex]";
+const FOCUSABLE = "button, a, summary, select, input, [tabindex]";
 
 function focusKey(node) {
   return node.tagName + ":" + (node.getAttribute("aria-label") || node.getAttribute("href") || node.id || node.textContent);
@@ -428,7 +432,9 @@ function renderWindow() {
   const sameView = existing?.dataset.viewKey === viewKey;
   const sameTab = sameView && existing.dataset.detailTab === state.detailTab;
   const scrollTop = sameTab ? existing.querySelector(".win-body")?.scrollTop || 0 : 0;
-  const logScrollTop = sameTab ? existing.querySelector(".logbox")?.scrollTop || 0 : 0;
+  const oldLog = sameTab ? existing.querySelector(".logbox") : null;
+  const logScrollTop = oldLog?.scrollTop || 0;
+  const logAtBottom = !oldLog || oldLog.scrollHeight - oldLog.scrollTop - oldLog.clientHeight < 24;
   const expandedDetails = sameTab ? Array.from(existing.querySelectorAll("details"), (node) => node.open) : [];
   if (existing) existing.remove();
   const overlay = $("win-overlay");
@@ -449,7 +455,7 @@ function renderWindow() {
   if (sameTab) {
     win.querySelector(".win-body").scrollTop = scrollTop;
     const logbox = win.querySelector(".logbox");
-    if (logbox) logbox.scrollTop = logScrollTop;
+    if (logbox) logbox.scrollTop = state.logFollow && logAtBottom ? logbox.scrollHeight : logScrollTop;
     win.querySelectorAll("details").forEach((node, index) => { node.open = expandedDetails[index] || false; });
   }
   // Only the initial open moves focus into the window. In particular, a poll
@@ -497,7 +503,7 @@ function appWindow() {
   ]);
   win.append(head);
 
-  const tabs = [["overview", "概览"], ["deploys", "部署记录"], ["logs", "日志"], ["domains", "域名"], ["settings", "设置"]];
+  const tabs = [["overview", "概览"], ["addons", "附加服务"], ["deploys", "部署记录"], ["logs", "日志"], ["domains", "域名"], ["settings", "设置"]];
   const tabsRow = el("div", { class: "tabs", role: "tablist" });
   for (const [k, label] of tabs) {
     tabsRow.append(button(label, state.detailTab === k ? "on" : "", () => setTab(k), label));
@@ -507,6 +513,7 @@ function appWindow() {
   const body = el("div", { class: "win-body" });
   if (!state.detail) body.append(el("p", { class: "muted", text: "正在加载…" }));
   else if (state.detailTab === "overview") body.append(overviewTab(a, st, meta));
+  else if (state.detailTab === "addons") body.append(addonsTab(a));
   else if (state.detailTab === "deploys") body.append(deploysTab(a));
   else if (state.detailTab === "logs") body.append(logsTab(a));
   else if (state.detailTab === "domains") body.append(domainsTab(a));
@@ -546,6 +553,7 @@ function overviewTab(a, st, meta) {
     dl.append(el("dd", {}, el("span", { class: "muted", text: "未运行" })));
   }
   frag.append(dl);
+  frag.append(appMetricsPanel(a));
 
   const row = el("div", { class: "row" });
   if (a.desired === "stopped") {
@@ -610,16 +618,95 @@ function deployStatusText(status) {
 
 function logsTab(a) {
   const frag = document.createDocumentFragment();
-  const row = el("div", { class: "row" }, [
-    button("刷新日志", "btn", () => refreshLogs(a.name), "刷新日志"),
-    el("span", { class: "faint", text: "最近 100 行" }),
+  const tail = el("select", { id: "logs-tail", "aria-label": "日志行数", onchange: (event) => {
+    state.logTail = Number(event.target.value);
+    refreshLogs(a.name, true);
+  }});
+  for (const value of [100, 500, 1000]) tail.append(el("option", { value, text: "最近 " + value + " 行" }));
+  tail.value = String(state.logTail);
+  const row = el("div", { class: "row log-controls" }, [
+    button("刷新日志", "btn", () => refreshLogs(a.name, true), "刷新日志"),
+    button(state.logFollow ? "暂停跟随" : "跟随新日志", "btn", () => toggleLogFollow(a.name), "日志跟随开关"),
+    tail,
+    el("span", { class: "faint", text: state.logFollow ? "每 3 秒跟随 · 最多保留 2000 行" : "已暂停跟随" }),
   ]);
   frag.append(row);
-  const pre = el("pre", { class: "mono logbox" });
-  if (state.logs === null) pre.textContent = "点击「刷新日志」加载。";
+  if (state.logError) frag.append(el("p", { class: "muted", role: "status", text: state.logError }));
+  const pre = el("pre", { class: "mono logbox", tabindex: "0", "aria-label": "应用日志" });
+  if (state.logs === null) pre.textContent = "正在加载日志…";
   else if (state.logs.length === 0) pre.textContent = "暂无日志。";
   else pre.textContent = state.logs.join("\n");
   frag.append(pre);
+  return frag;
+}
+
+function metricTile(label, value, detail) {
+  return el("div", { class: "metric-tile" }, [
+    el("span", { class: "muted", text: label }),
+    el("strong", { text: value }),
+    detail ? el("span", { class: "faint", text: detail }) : null,
+  ]);
+}
+
+function appMetricsPanel(a) {
+  const metrics = state.appMetrics;
+  if (!metrics) return el("p", { class: "muted", text: "资源指标：正在采样…" });
+  if (metrics.available === false) return el("p", { class: "muted", text: "资源指标暂不可用（" + observedMetricText(metrics.observed_state) + "）。" });
+  const cpu = metrics.cpu_available === false ? "采样中" : numberText(metrics.cpu_percent, "%");
+  const memory = numberText(metrics.memory_usage_mb, " MB");
+  const limit = metrics.memory_limit_mb > 0 ? "上限 " + numberText(metrics.memory_limit_mb, " MB") : "未设置内存上限";
+  return el("section", { class: "metric-tiles", "aria-label": a.name + " 当前资源指标" }, [
+    metricTile("CPU 使用率", cpu, "100% 表示使用 1 个核心"),
+    metricTile("内存使用", memory, limit),
+    metricTile("网络接收 / 发送", numberText(metrics.network_rx_mb, " MB") + " / " + numberText(metrics.network_tx_mb, " MB"), "容器累计流量"),
+    metricTile("进程数", Number.isFinite(metrics.pids) ? String(metrics.pids) : "不可用"),
+  ]);
+}
+
+function observedMetricText(state) {
+  return ({ stopped: "已停止", exited: "已停止", missing: "尚无容器", restarting: "正在重启", unavailable: "执行器不可用" })[state] || state || "不可用";
+}
+
+function numberText(value, unit) {
+  return Number.isFinite(value) ? value.toFixed(1) + (unit || "") : "不可用";
+}
+
+// Read-only view: render only the explicit public fields. Connection URLs,
+// passwords and raw credentials never enter the DOM, even if an API regresses.
+function addonsTab(a) {
+  const frag = document.createDocumentFragment();
+  const addons = Array.isArray(a.addons) ? a.addons : [];
+  if (addons.length === 0) {
+    frag.append(el("p", { class: "muted", text: "此应用还没有附加服务。" }));
+    frag.append(el("p", { class: "mono", text: "acornfox add postgres --app " + a.name }));
+    return frag;
+  }
+  const states = {
+    running: ["运行中", ""], starting: ["初始化中", "warn"], unhealthy: ["未就绪", "bad"],
+    stopped: ["已停止", "idle"], missing: ["等待创建", "warn"], unavailable: ["无法读取状态", "idle"],
+  };
+  const labels = { postgres: "PostgreSQL", mysql: "MySQL", redis: "Redis" };
+  for (const addon of addons) {
+    const [status, style] = states[addon.observed_state] || ["状态未知", "idle"];
+    const card = el("article", { class: "addon-card", "aria-label": (labels[addon.kind] || addon.kind || "附加服务") + " 状态" });
+    card.append(el("div", { class: "row" }, [
+      el("h4", { text: labels[addon.kind] || addon.kind || "附加服务" }),
+      pillNode(status, style),
+    ]));
+    const dl = el("dl", { class: "kv" });
+    for (const [label, value] of [
+      ["镜像", addon.image || "未知"],
+      ["网络内地址", addon.host ? addon.host + ":" + addon.port : "暂不可用"],
+      ["连接变量", addon.env_var || "未设置"],
+      ["数据卷", addon.volume_name || "未知"],
+    ]) {
+      dl.append(el("dt", { text: label }));
+      dl.append(el("dd", { class: "mono", text: value }));
+    }
+    card.append(dl);
+    frag.append(card);
+  }
+  frag.append(el("p", { class: "faint", text: "端口仅在应用专用网络内可见。连接信息以密钥注入应用，控制台不显示密码。删除附加服务默认保留数据卷。" }));
   return frag;
 }
 
@@ -715,9 +802,13 @@ function serverTool() {
     frag.append(el("p", { class: "muted", text: "主机资源暂不可用。" }));
     return frag;
   }
-  if (typeof h.cpu_percent === "number") frag.append(metric("CPU", Math.round(h.cpu_percent)));
-  if (h.memory_total) frag.append(metric("内存", pct(h.memory_used, h.memory_total)));
-  if (h.disk_total) frag.append(metric("磁盘", pct(h.disk_used, h.disk_total)));
+  const memoryPct = h.memory_total > 0 ? pct(h.memory_used, h.memory_total) : null;
+  const diskPct = h.disk_total > 0 ? pct(h.disk_used, h.disk_total) : null;
+  frag.append(el("section", { class: "metric-tiles", "aria-label": "主机当前资源指标" }, [
+    metricTile("CPU 使用率", typeof h.cpu_percent === "number" ? numberText(h.cpu_percent, "%") : "采样中", "相邻轮询之间的平均值"),
+    metricTile("内存使用率", memoryPct !== null ? numberText(memoryPct, "%") : "不可用", bytePair(h.memory_used, h.memory_total)),
+    metricTile("磁盘使用率", diskPct !== null ? numberText(diskPct, "%") : "不可用", bytePair(h.disk_used, h.disk_total)),
+  ]));
   const dl = el("dl", { class: "kv" });
   if (typeof h.load1 === "number") { dl.append(el("dt", { text: "负载" })); dl.append(el("dd", { text: h.load1.toFixed(2) })); }
   if (h.uptime_seconds) { dl.append(el("dt", { text: "运行时长" })); dl.append(el("dd", { text: uptimeText(h.uptime_seconds) })); }
@@ -725,13 +816,9 @@ function serverTool() {
   return frag;
 }
 
-function metric(name, value) {
-  const m = el("div", { class: "metric" }, [
-    el("div", { class: "row" }, [el("span", { text: name }), el("span", { class: "muted", text: value + "%" })]),
-    el("div", { class: "bar" }, el("i")),
-  ]);
-  m.querySelector("i").style.width = Math.max(0, Math.min(100, value)) + "%";
-  return m;
+function bytePair(used, total) {
+  if (!Number.isFinite(used) || !Number.isFinite(total) || total <= 0) return "";
+  return (used / (1024 ** 3)).toFixed(1) + " / " + (total / (1024 ** 3)).toFixed(1) + " GiB";
 }
 
 function uptimeText(s) {
@@ -782,7 +869,8 @@ function openApp(name) {
   state.openTool = null;
   state.detailTab = "overview";
   state.detail = null;
-  state.logs = null;
+  resetLogReader();
+  state.appMetrics = null;
   state.deployments = null;
   location.hash = "app=" + encodeURIComponent(name);
   render();
@@ -790,6 +878,8 @@ function openApp(name) {
 }
 
 function openTool(tool) {
+  resetLogReader();
+  state.appMetrics = null;
   state.openTool = state.openTool === tool ? null : tool;
   state.openApp = null;
   state.detail = null;
@@ -798,6 +888,8 @@ function openTool(tool) {
 }
 
 function closeWindow() {
+  resetLogReader();
+  state.appMetrics = null;
   state.openApp = null;
   state.openTool = null;
   state.detail = null;
@@ -806,6 +898,11 @@ function closeWindow() {
 }
 
 function setTab(tab) {
+  if (state.detailTab === "logs" && tab !== "logs") {
+    state.logGeneration++;
+    if (logRequest) logRequest.abort();
+    logRequest = null;
+  }
   state.detailTab = tab;
   render();
   if (tab === "deploys" && state.openApp) loadDeployments(state.openApp);
@@ -814,9 +911,13 @@ function setTab(tab) {
 
 async function loadDetail(name) {
   try {
-    const d = await api.get("/v1/apps/" + encodeURIComponent(name));
+    const [d, metrics] = await Promise.all([
+      api.get("/v1/apps/" + encodeURIComponent(name)),
+      api.get("/v1/metrics/apps/" + encodeURIComponent(name)).catch(() => ({ available: false, observed_state: "unavailable" })),
+    ]);
     if (state.openApp !== name) return;
     state.detail = d;
+    state.appMetrics = metrics;
     render();
   } catch (e) { handleError(e); }
 }
@@ -830,15 +931,58 @@ async function loadDeployments(name) {
   } catch (e) { handleError(e); }
 }
 
-async function refreshLogs(name) {
+function resetLogReader() {
+  state.logGeneration++;
+  if (logRequest) logRequest.abort();
+  logRequest = null;
+  state.logs = null;
+  state.logCursor = "";
+  state.logFollow = false;
+  state.logError = null;
+}
+
+function toggleLogFollow(name) {
+  state.logFollow = !state.logFollow;
+  if (!state.logFollow) {
+    state.logGeneration++;
+    if (logRequest) logRequest.abort();
+    logRequest = null;
+  } else refreshLogs(name);
+  render();
+}
+
+async function refreshLogs(name, reset = false) {
+  if (reset) {
+    state.logGeneration++;
+    if (logRequest) logRequest.abort();
+    logRequest = null;
+    state.logCursor = "";
+    state.logs = null;
+  }
+  if (logRequest) return;
+  const generation = state.logGeneration;
+  const request = new AbortController();
+  logRequest = request;
   try {
-    const body = await api.get("/v1/apps/" + encodeURIComponent(name) + "/logs?tail=100");
-    if (state.openApp !== name) return;
-    state.logs = body.lines || [];
+    const query = new URLSearchParams({ tail: String(state.logTail) });
+    if (state.logCursor) query.set("cursor", state.logCursor);
+    const body = await api.get("/v1/apps/" + encodeURIComponent(name) + "/log-batch?" + query.toString(), request.signal);
+    if (state.openApp !== name || state.logGeneration !== generation) return;
+    if (body.reset) state.logs = [];
+    state.logs = (state.logs || []).concat(body.lines || []).slice(-2000);
+    state.logCursor = body.cursor || "";
+    state.logError = null;
     render();
+    if (body.has_more && state.logFollow) setTimeout(() => refreshLogs(name), 0);
   } catch (e) {
-    if (e.code === "no_live_deployment") { state.logs = []; render(); return; }
-    handleError(e);
+    if (e.name === "AbortError" || state.openApp !== name || state.logGeneration !== generation) return;
+    state.logError = e.message || "无法读取日志";
+    if (e.code === "no_live_deployment") state.logs = [];
+    if (e.status === 501 || e.status === 404) state.logFollow = false;
+    if (e.status === 401) handleError(e);
+    else render();
+  } finally {
+    if (logRequest === request) logRequest = null;
   }
 }
 
@@ -959,6 +1103,8 @@ function toggleTheme() {
 // ---------------------------------------------------------------------------
 
 async function poll() {
+  if (pollInFlight) return;
+  pollInFlight = true;
   try {
     const [appsBody, hostBody] = await Promise.all([
       api.get("/v1/apps"),
@@ -970,8 +1116,12 @@ async function poll() {
     state.connectionLost = false;
     if (state.fatal && state.fatal.code === "connection") state.fatal = null;
     render();
-    if (state.openApp) loadDetail(state.openApp);
+    if (state.openApp) {
+      await loadDetail(state.openApp);
+      if (state.detailTab === "logs" && state.logFollow) await refreshLogs(state.openApp);
+    }
   } catch (e) { handleError(e); }
+  finally { pollInFlight = false; }
 }
 
 function handleError(e) {

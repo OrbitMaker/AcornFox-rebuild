@@ -198,6 +198,54 @@ func (s *server) rollback(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, deploymentView(dep))
 }
 
+// redeploy implements POST /v1/apps/{app}/redeploy: recreate the live
+// deployment using its current image, bypassing deduplication.
+func (s *server) redeploy(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	app := r.PathValue("app")
+	if !state.ValidAppName(app) {
+		writeError(w, http.StatusBadRequest, "invalid_app", "应用名不合法")
+		return
+	}
+	appRec, err := s.store.GetApp(ctx, app)
+	if err != nil {
+		s.mapStoreError(w, err)
+		return
+	}
+	if appRec.CurrentDeployment == "" {
+		writeError(w, http.StatusConflict, "no_live_version", "应用尚未上线，请先部署")
+		return
+	}
+
+	liveDep, err := s.store.GetDeployment(ctx, appRec.CurrentDeployment)
+	if err != nil {
+		s.mapStoreError(w, err)
+		return
+	}
+	if liveDep.ImageID == "" {
+		writeError(w, http.StatusConflict, "no_image", "当前部署没有镜像 ID，无法重新部署")
+		return
+	}
+
+	dep, _, err := s.store.CreateDeployment(ctx, state.NewDeployment{
+		App:          app,
+		SourceKind:   state.SourceImage,
+		SourceRef:    liveDep.ImageID,
+		SourceDigest: liveDep.ImageID,
+		BypassDedup:  true,
+		RequestKey:   r.Header.Get("Idempotency-Key"),
+	})
+	if err != nil {
+		s.mapStoreError(w, err)
+		return
+	}
+	s.kicker.Kick(app)
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"app":           app,
+		"deployment_id": dep.ID,
+	})
+}
+
 // getDeployment implements GET /v1/deployments/{id}: the deployment plus its
 // events, optionally filtered by ?after=<event id>.
 func (s *server) getDeployment(w http.ResponseWriter, r *http.Request) {

@@ -59,6 +59,8 @@ func runServer(args []string, stdout, stderr io.Writer) int {
 		runnerUID     = fs_.Int("runner-uid", os.Getuid(), "uid the runner process runs as")
 		caddyAdmin    = fs_.String("caddy-admin", "/run/acornfox/caddy-admin.sock", "Caddy admin API unix socket")
 		publicHost    = fs_.String("public-host", "", "host used in app URLs (e.g. the LAN IP)")
+		publicPortMin = fs_.Int("public-port-min", 18810, "应用公开端口范围下限")
+		publicPortMax = fs_.Int("public-port-max", 18899, "应用公开端口范围上限")
 		httpPort      = fs_.Int("http-port", 80, "HTTP port of the shared af-domains server (ACME HTTP-01 and redirect)")
 		httpsPort     = fs_.Int("https-port", 443, "HTTPS port of the shared af-domains server")
 		httpsIssuer   = fs_.String("https-issuer", "", "certificate issuer: \"\"/acme = public ACME, internal = Caddy local CA (dev)")
@@ -102,7 +104,11 @@ func runServer(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	st, err := state.Open(state.Config{Path: filepath.Join(*dataDir, "acornfox.db")})
+	st, err := state.Open(state.Config{
+		Path:          filepath.Join(*dataDir, "acornfox.db"),
+		PublicPortMin: *publicPortMin,
+		PublicPortMax: *publicPortMax,
+	})
 	if err != nil {
 		fmt.Fprintln(stderr, "open state:", err)
 		return 1
