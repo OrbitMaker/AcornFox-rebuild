@@ -36,6 +36,52 @@ error_exit() {
     exit 1
 }
 
+# GitHub 仓库与下载代理
+# ACORNFOX_REPO 可覆盖发布仓库；ACORNFOX_GITHUB_PROXY 指定自己的 GitHub 加速前缀
+# （形如 https://example.com/，拼接为 前缀+原始地址）。中国大陆先直连，失败再依次试代理。
+ACORNFOX_REPO="${ACORNFOX_REPO:-acornfox/acornfox}"
+GITHUB_PROXIES=()
+
+setup_github_proxies() {
+    GITHUB_PROXIES=("")
+    if [ -n "${ACORNFOX_GITHUB_PROXY:-}" ]; then
+        GITHUB_PROXIES+=("${ACORNFOX_GITHUB_PROXY%/}/")
+    fi
+    if $IN_CHINA; then
+        GITHUB_PROXIES+=("https://ghfast.top/" "https://gh-proxy.com/")
+    fi
+}
+
+# github_download URL OUT：依次直连、走代理下载 GitHub 文件
+github_download() {
+    local url="$1" out="$2" p
+    for p in "${GITHUB_PROXIES[@]}"; do
+        if [ -n "$p" ]; then
+            log_info "尝试通过 ${p} 下载"
+        fi
+        if curl -fL --connect-timeout 10 --max-time 600 --retry 2 -o "$out" "${p}${url}"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# github_latest_tag：通过 releases/latest 的跳转地址取最新版本号（不依赖 api.github.com）
+github_latest_tag() {
+    local p loc
+    for p in "${GITHUB_PROXIES[@]}"; do
+        loc=$(curl -fsSIL --connect-timeout 10 --max-time 30 -o /dev/null -w '%{url_effective}' \
+            "${p}https://github.com/${ACORNFOX_REPO}/releases/latest" 2>/dev/null || true)
+        case "$loc" in
+            */releases/tag/*)
+                echo "${loc##*/}"
+                return 0
+                ;;
+        esac
+    done
+    return 1
+}
+
 # 检查 root 权限
 check_root() {
     if [ "$EUID" -ne 0 ]; then
@@ -122,9 +168,27 @@ parse_args() {
     FORCE_GLOBAL=false
     SKIP_DOCKER=false
     SKIP_CADDY=false
+    ACORNFOX_VERSION="latest"
+    LOCAL_BINARY=""
+    REGISTRY_MIRRORS=()
 
     while [[ $# -gt 0 ]]; do
         case $1 in
+            --version)
+                [[ $# -ge 2 ]] || error_exit "--version 需要一个版本号，例如 v0.2.0"
+                ACORNFOX_VERSION="$2"
+                shift 2
+                ;;
+            --binary)
+                [[ $# -ge 2 ]] || error_exit "--binary 需要一个本地文件路径"
+                LOCAL_BINARY="$2"
+                shift 2
+                ;;
+            --registry-mirror)
+                [[ $# -ge 2 ]] || error_exit "--registry-mirror 需要一个地址，例如 https://xxxx.mirror.aliyuncs.com"
+                REGISTRY_MIRRORS+=("$2")
+                shift 2
+                ;;
             --china)
                 FORCE_CHINA=true
                 shift
@@ -170,18 +234,26 @@ AcornFox 安装脚本
     sudo bash install.sh [选项]
 
 选项:
-    --china          强制使用中国镜像源
-    --global         强制使用国际源
-    --skip-docker    跳过 Docker 安装（如已安装）
-    --skip-caddy     跳过 Caddy 安装（如已安装）
-    -h, --help       显示此帮助信息
+    --version V            安装指定版本（默认 latest）
+    --binary PATH          使用本地 acornfox 二进制文件，不下载（用于测试候选版本）
+    --registry-mirror URL  Docker Hub 镜像加速地址，可重复指定
+                           阿里云 ECS 建议使用控制台“容器镜像服务 → 镜像加速器”中的专属地址
+    --china                强制使用中国镜像源
+    --global               强制使用国际源
+    --skip-docker          跳过 Docker 安装（如已安装）
+    --skip-caddy           跳过 Caddy 安装（如已安装）
+    -h, --help             显示此帮助信息
+
+环境变量:
+    ACORNFOX_GITHUB_PROXY  GitHub 下载加速前缀，如 https://ghfast.top/（直连失败时使用）
+    ACORNFOX_REPO          发布仓库，默认 acornfox/acornfox
 
 示例:
     # 自动检测并安装
     sudo bash install.sh
 
-    # 强制使用中国镜像源
-    sudo bash install.sh --china
+    # 强制使用中国镜像源，并指定阿里云专属镜像加速
+    sudo bash install.sh --china --registry-mirror https://xxxx.mirror.aliyuncs.com
 
     # 跳过已安装的 Docker
     sudo bash install.sh --skip-docker
@@ -193,8 +265,10 @@ EOF
 update_apt() {
     log_info "更新软件包列表..."
 
-    # 如果在中国，配置 APT 使用国内镜像
-    if $IN_CHINA; then
+    # 如果在中国，配置 APT 使用国内镜像（云厂商镜像已自带国内源时不改动）
+    if $IN_CHINA && grep -rqsE 'mirrors\.(aliyun|tencent|cloud\.tencent|huaweicloud|tuna\.tsinghua|ustc)|mirrors\.[a-z]+\.com' /etc/apt/sources.list /etc/apt/sources.list.d/; then
+        log_info "APT 已使用国内镜像，保持不变"
+    elif $IN_CHINA; then
         log_info "配置 APT 使用国内镜像..."
         case "$OS" in
             ubuntu)
@@ -293,21 +367,30 @@ install_docker() {
 configure_docker_mirror() {
     log_info "配置 Docker 镜像加速..."
 
-    if ! $IN_CHINA; then
-        log_info "非中国环境，跳过镜像加速配置"
+    if [ ${#REGISTRY_MIRRORS[@]} -eq 0 ]; then
+        if ! $IN_CHINA; then
+            log_info "非中国环境，跳过镜像加速配置"
+            return
+        fi
+        # 公共加速器可用性经常变化；阿里云 ECS 用户应改用控制台里的专属地址
+        REGISTRY_MIRRORS=("https://docker.m.daocloud.io" "https://mirror.ccs.tencentyun.com")
+    fi
+
+    # 已有 daemon.json 时不覆盖，避免破坏用户已有的 Docker 配置
+    if [ -s /etc/docker/daemon.json ]; then
+        if grep -q '"registry-mirrors"' /etc/docker/daemon.json; then
+            log_info "/etc/docker/daemon.json 已配置 registry-mirrors，保持不变"
+        else
+            log_warn "/etc/docker/daemon.json 已存在，未自动修改；如需镜像加速，请手动加入："
+            echo "    \"registry-mirrors\": [$(printf '"%s",' "${REGISTRY_MIRRORS[@]}" | sed 's/,$//')]"
+        fi
         return
     fi
 
-    # 创建 Docker 配置目录
     mkdir -p /etc/docker
-
-    # 配置镜像加速器
-    cat > /etc/docker/daemon.json << 'EOF'
+    cat > /etc/docker/daemon.json << EOF
 {
-  "registry-mirrors": [
-    "https://registry.cn-hangzhou.aliyuncs.com",
-    "https://mirror.ccs.tencentyun.com"
-  ],
+  "registry-mirrors": [$(printf '"%s",' "${REGISTRY_MIRRORS[@]}" | sed 's/,$//')],
   "log-driver": "json-file",
   "log-opts": {
     "max-size": "10m",
@@ -316,11 +399,11 @@ configure_docker_mirror() {
 }
 EOF
 
-    # 重启 Docker
     systemctl daemon-reload
     systemctl restart docker
 
-    log_success "Docker 镜像加速配置完成"
+    log_success "Docker 镜像加速配置完成: ${REGISTRY_MIRRORS[*]}"
+    log_info "阿里云 ECS 建议改用专属加速地址：容器镜像服务控制台 → 镜像工具 → 镜像加速器"
 }
 
 # 安装 Caddy
@@ -339,17 +422,50 @@ install_caddy() {
     log_info "安装 Caddy..."
 
     if $IN_CHINA; then
-        # 使用 GitHub 加速代理下载
-        log_info "通过代理下载 Caddy..."
+        # apt 源 dl.cloudsmith.io 在大陆不稳定，改为从 GitHub Releases 下载二进制
+        log_info "从 GitHub Releases 下载 Caddy..."
         ARCH=$(dpkg --print-architecture)
         CADDY_VERSION="2.8.4"
 
-        wget -q --show-progress "https://ghproxy.com/https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}/caddy_${CADDY_VERSION}_linux_${ARCH}.tar.gz" -O /tmp/caddy.tar.gz || error_exit "下载 Caddy 失败"
+        github_download "https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}/caddy_${CADDY_VERSION}_linux_${ARCH}.tar.gz" /tmp/caddy.tar.gz \
+            || error_exit "下载 Caddy 失败；可设置 ACORNFOX_GITHUB_PROXY 指定可用的 GitHub 加速地址后重试"
 
-        tar -xzf /tmp/caddy.tar.gz -C /tmp
-        mv /tmp/caddy /usr/bin/caddy
-        chmod +x /usr/bin/caddy
-        rm -f /tmp/caddy.tar.gz /tmp/LICENSE /tmp/README.md
+        tar -xzf /tmp/caddy.tar.gz -C /tmp caddy
+        install -m 0755 /tmp/caddy /usr/bin/caddy
+        rm -f /tmp/caddy.tar.gz /tmp/caddy
+
+        # 二进制安装没有 deb 包自带的账号和 systemd 服务，这里补齐
+        if ! getent group caddy >/dev/null; then
+            groupadd --system caddy
+        fi
+        if ! id caddy >/dev/null 2>&1; then
+            useradd --system --gid caddy --create-home --home-dir /var/lib/caddy \
+                --shell /usr/sbin/nologin --comment "Caddy web server" caddy
+        fi
+        cat > /etc/systemd/system/caddy.service << 'EOF'
+[Unit]
+Description=Caddy
+Documentation=https://caddyserver.com/docs/
+After=network.target network-online.target
+Requires=network-online.target
+
+[Service]
+Type=notify
+User=caddy
+Group=caddy
+ExecStart=/usr/bin/caddy run --environ --config /etc/caddy/Caddyfile
+ExecReload=/usr/bin/caddy reload --config /etc/caddy/Caddyfile --force
+TimeoutStopSec=5s
+LimitNOFILE=1048576
+PrivateTmp=true
+ProtectSystem=full
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload
+        systemctl enable caddy
     else
         # 使用官方 apt 仓库安装
         log_info "使用官方仓库安装 Caddy..."
@@ -386,9 +502,11 @@ configure_caddy() {
     mkdir -p /etc/caddy
 
     # 创建 Caddyfile，启用 Unix socket admin API
+    # socket 由 Caddy 以 0660 创建；/run/acornfox 是 setgid 目录，
+    # socket 自动归属 acornfox-ipc 组，server 可直接访问，重启后无需再手动 chmod
     cat > /etc/caddy/Caddyfile << 'EOF'
 {
-    admin unix//run/acornfox/caddy-admin.sock {
+    admin unix//run/acornfox/caddy-admin.sock|0660 {
         origins *
     }
     persist_config off
@@ -397,29 +515,22 @@ configure_caddy() {
 # AcornFox 应用路由将通过 API 动态添加
 EOF
 
-    # 设置 Caddyfile 权限
     chown root:root /etc/caddy/Caddyfile
     chmod 644 /etc/caddy/Caddyfile
 
-    # 创建 /run/acornfox 目录并设置权限
-    mkdir -p /run/acornfox
-    chown acornfox:acornfox /run/acornfox
-    chmod 775 /run/acornfox
+    # 组成员变化（caddy 加入 acornfox-ipc）需要重启才生效
+    systemctl enable caddy
+    systemctl restart caddy
 
-    # 重启 Caddy 以应用配置
-    if systemctl is-active --quiet caddy; then
-        systemctl restart caddy
-        sleep 2
-    fi
-
-    # 验证 admin socket 是否创建
+    local i
+    for i in $(seq 1 10); do
+        [ -S /run/acornfox/caddy-admin.sock ] && break
+        sleep 1
+    done
     if [ -S /run/acornfox/caddy-admin.sock ]; then
-        # 设置 socket 权限，允许 acornfox 用户访问
-        chmod 660 /run/acornfox/caddy-admin.sock
-        chown caddy:acornfox /run/acornfox/caddy-admin.sock
         log_success "Caddy admin socket 配置完成"
     else
-        log_warn "Caddy admin socket 尚未创建，可能需要手动配置"
+        error_exit "Caddy admin socket 未创建，请检查: journalctl -u caddy -n 50"
     fi
 }
 
@@ -454,17 +565,14 @@ create_accounts() {
         usermod -aG docker acornfox-exec
     fi
 
-    # 修复 Caddy admin socket 权限问题
-    # 将 caddy 用户添加到 acornfox 组，允许访问 /run/acornfox/
-    if id caddy >/dev/null 2>&1; then
-        usermod -aG acornfox caddy
-        log_info "已将 caddy 用户添加到 acornfox 组"
-    fi
+    # 已存在的账号也确保在 acornfox-ipc 组中（重复安装、旧版本升级）
+    usermod -aG acornfox-ipc acornfox
+    usermod -aG acornfox-ipc acornfox-exec
 
-    # 将 acornfox 用户添加到 caddy 组，允许访问 Caddy admin socket
-    if getent group caddy >/dev/null; then
-        usermod -aG caddy acornfox
-        log_info "已将 acornfox 用户添加到 caddy 组"
+    # caddy 需要在 /run/acornfox 中创建 admin socket
+    if id caddy >/dev/null 2>&1; then
+        usermod -aG acornfox-ipc caddy
+        log_info "已将 caddy 用户添加到 acornfox-ipc 组"
     fi
 }
 
@@ -485,39 +593,32 @@ download_acornfox() {
             ;;
     esac
 
-    # 从 GitHub Releases 下载最新版本
-    # 格式: https://github.com/acornfox/acornfox/releases/download/v0.2.0/acornfox_linux_amd64
-    VERSION="${1:-latest}"
+    if [ -n "$LOCAL_BINARY" ]; then
+        [ -f "$LOCAL_BINARY" ] || error_exit "本地二进制文件不存在: $LOCAL_BINARY"
+        log_info "使用本地二进制文件: $LOCAL_BINARY"
+        install -m 0755 "$LOCAL_BINARY" /usr/local/bin/acornfox.new
+        mv -f /usr/local/bin/acornfox.new /usr/local/bin/acornfox
+        log_success "AcornFox 安装成功: $(/usr/local/bin/acornfox version)"
+        return
+    fi
+
+    # 从 GitHub Releases 下载
+    # 格式: https://github.com/<repo>/releases/download/v0.2.0/acornfox_linux_amd64
+    VERSION="$ACORNFOX_VERSION"
 
     if [ "$VERSION" = "latest" ]; then
-        # 获取最新 release 版本号
         log_info "获取最新版本号..."
-
-        if $IN_CHINA; then
-            # 使用代理获取最新版本
-            VERSION=$(curl -fsSL "https://ghproxy.com/https://api.github.com/repos/acornfox/acornfox/releases/latest" 2>/dev/null | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/' || echo "v0.2.0")
-        else
-            VERSION=$(curl -fsSL "https://api.github.com/repos/acornfox/acornfox/releases/latest" 2>/dev/null | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/' || echo "v0.2.0")
-        fi
-
+        VERSION=$(github_latest_tag) || error_exit "无法获取最新版本号；用 --version vX.Y.Z 指定版本，或用 --binary 安装本地文件"
         log_info "最新版本: $VERSION"
     fi
 
-    DOWNLOAD_URL="https://github.com/acornfox/acornfox/releases/download/${VERSION}/acornfox_linux_${ARCH}"
-
-    if $IN_CHINA; then
-        # 使用 GitHub 代理
-        DOWNLOAD_URL="https://ghproxy.com/${DOWNLOAD_URL}"
-        log_info "使用中国镜像加速"
-    fi
-
+    DOWNLOAD_URL="https://github.com/${ACORNFOX_REPO}/releases/download/${VERSION}/acornfox_linux_${ARCH}"
     log_info "下载地址: $DOWNLOAD_URL"
 
-    # 下载到临时目录
-    if wget -q --show-progress "$DOWNLOAD_URL" -O /tmp/acornfox; then
+    if github_download "$DOWNLOAD_URL" /tmp/acornfox; then
         log_success "下载完成"
     else
-        error_exit "下载 AcornFox 失败，请检查网络连接或版本号是否正确"
+        error_exit "下载 AcornFox 失败，请检查网络或版本号；也可设置 ACORNFOX_GITHUB_PROXY 或使用 --binary"
     fi
 
     # 安装到 /usr/local/bin
@@ -537,15 +638,25 @@ download_acornfox() {
 create_directories() {
     log_info "创建数据目录..."
 
-    # 主数据目录
-    mkdir -p /var/lib/acornfox/{data,uploads,logs}
-    chown -R acornfox:acornfox /var/lib/acornfox
-    chmod 750 /var/lib/acornfox
+    # 数据目录：数据库只有 acornfox 可读；runner（acornfox-exec）只需穿过
+    # /var/lib/acornfox 去读 uploads/ 中的上传包，所以组只给执行权限
+    mkdir -p /var/lib/acornfox/uploads
+    chown acornfox:acornfox-ipc /var/lib/acornfox
+    chmod 0710 /var/lib/acornfox
+    chown acornfox:acornfox-ipc /var/lib/acornfox/uploads
+    chmod 2750 /var/lib/acornfox/uploads
 
-    # runner socket 目录
-    mkdir -p /run/acornfox
-    chown acornfox-exec:acornfox-ipc /run/acornfox
-    chmod 2770 /run/acornfox
+    # /run 是 tmpfs，重启后会清空；用 tmpfiles.d 让 systemd 每次开机重建。
+    # setgid 让 server、runner、caddy 各自创建的 socket 都归属 acornfox-ipc 组。
+    # 其他用户只有穿过权限（o+x），能否连接由各 socket 自身决定：
+    # api.sock 归 acornfox-users 组（CLI 用户），caddy-admin.sock 只给 acornfox-ipc。
+    cat > /etc/tmpfiles.d/acornfox.conf << 'EOF'
+d /run/acornfox 2771 root acornfox-ipc -
+EOF
+    systemd-tmpfiles --create /etc/tmpfiles.d/acornfox.conf
+    # 旧版本安装可能留下其他属主，统一修正
+    chown root:acornfox-ipc /run/acornfox
+    chmod 2771 /run/acornfox
 
     log_success "数据目录创建完成"
 }
@@ -557,8 +668,8 @@ initialize_database() {
     # 使用 acornfox 用户初始化数据库
     su - acornfox -c "/usr/local/bin/acornfox init" || error_exit "数据库初始化失败"
 
-    # 设置数据库文件权限
-    chmod 600 /var/lib/acornfox/data/acornfox.db
+    # 设置数据库文件权限（路径与 server 的 --data-dir 默认值一致）
+    chmod 600 /var/lib/acornfox/acornfox.db
 
     log_success "数据库初始化完成"
 }
@@ -604,7 +715,7 @@ Requires=docker.service
 Type=simple
 User=acornfox
 Group=acornfox
-ExecStart=/usr/local/bin/acornfox server --runner-uid $ACORNFOX_EXEC_UID
+ExecStart=/usr/local/bin/acornfox server --runner-uid $ACORNFOX_EXEC_UID --listen-group acornfox-users
 Restart=on-failure
 RestartSec=5s
 StandardOutput=journal
@@ -661,10 +772,11 @@ start_services() {
     log_info "启动 AcornFox 服务..."
 
     # 启用并启动服务
+    # 用 restart：重复安装时让已运行的服务换上新二进制和新组成员
     systemctl enable acornfox-server acornfox-runner
-    systemctl start acornfox-runner
+    systemctl restart acornfox-runner
     sleep 2
-    systemctl start acornfox-server
+    systemctl restart acornfox-server
 
     # 等待服务启动
     sleep 3
@@ -699,7 +811,8 @@ ${BLUE}下一步:${NC}
   1. 在本地电脑安装 CLI:
      ${YELLOW}curl -fsSL https://acornfox.dev/install-cli.sh | bash${NC}
 
-  2. 配置服务器连接:
+  2. 配置服务器连接（SSH 用户需为 root 或在 acornfox-users 组中）:
+     ${YELLOW}sudo usermod -aG acornfox-users <你的 SSH 用户>${NC}   # 非 root 时执行一次
      ${YELLOW}acornfox target add my-server --ssh user@${HOSTNAME}${NC}
 
   3. 打开网页控制台:
@@ -724,6 +837,14 @@ main() {
     log_info "版本: 1.0.0"
     echo ""
 
+    # --help 不需要 root，也不做环境探测
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            -h|--help) show_help; exit 0 ;;
+        esac
+    done
+
     # 检查权限
     check_root
 
@@ -733,6 +854,7 @@ main() {
 
     # 解析参数
     parse_args "$@"
+    setup_github_proxies
 
     # 安装流程
     update_apt
@@ -741,9 +863,9 @@ main() {
     configure_docker_mirror
     install_caddy
     create_accounts
-    configure_caddy
     create_directories
-    download_acornfox "${1:-latest}"
+    configure_caddy
+    download_acornfox
     initialize_database
     generate_admin_token
     create_systemd_services

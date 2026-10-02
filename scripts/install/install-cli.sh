@@ -55,48 +55,71 @@ detect_platform() {
 download_cli() {
     VERSION="${1:-latest}"
 
+    command -v curl >/dev/null 2>&1 || error_exit "需要 curl"
+    setup_github_proxies
+
     if [ "$VERSION" = "latest" ]; then
-        # 获取最新 release 版本号
         log_info "获取最新版本号..."
-
-        if curl -s -m 2 "http://ip-api.com/json/?fields=countryCode" 2>/dev/null | grep -q '"countryCode":"CN"'; then
-            # 使用代理获取最新版本
-            VERSION=$(curl -fsSL "https://ghproxy.com/https://api.github.com/repos/acornfox/acornfox/releases/latest" 2>/dev/null | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/' || echo "v0.2.0")
-        else
-            VERSION=$(curl -fsSL "https://api.github.com/repos/acornfox/acornfox/releases/latest" 2>/dev/null | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/' || echo "v0.2.0")
-        fi
-
+        VERSION=$(github_latest_tag) || error_exit "无法获取最新版本号；用 bash install-cli.sh vX.Y.Z 指定版本"
         log_info "最新版本: $VERSION"
     fi
 
     BINARY_NAME="acornfox"
-
+    ASSET="acornfox_${OS}_${ARCH}"
     if [ "$OS" = "windows" ]; then
         BINARY_NAME="acornfox.exe"
+        ASSET="${ASSET}.exe"
     fi
 
-    DOWNLOAD_URL="https://github.com/acornfox/acornfox/releases/download/${VERSION}/acornfox_${OS}_${ARCH}"
+    DOWNLOAD_URL="https://github.com/${ACORNFOX_REPO}/releases/download/${VERSION}/${ASSET}"
+    log_info "下载 AcornFox CLI: $DOWNLOAD_URL"
 
-    # 中国用户使用代理
-    if curl -s -m 2 "http://ip-api.com/json/?fields=countryCode" 2>/dev/null | grep -q '"countryCode":"CN"'; then
-        DOWNLOAD_URL="https://ghproxy.com/${DOWNLOAD_URL}"
-        log_info "使用中国镜像加速"
-    fi
-
-    log_info "下载 AcornFox CLI..."
-    log_info "URL: $DOWNLOAD_URL"
-
-    TMP_FILE="/tmp/${BINARY_NAME}"
-
-    if command -v curl >/dev/null 2>&1; then
-        curl -fSL --progress-bar "$DOWNLOAD_URL" -o "$TMP_FILE" || error_exit "下载失败"
-    elif command -v wget >/dev/null 2>&1; then
-        wget -q --show-progress "$DOWNLOAD_URL" -O "$TMP_FILE" || error_exit "下载失败"
-    else
-        error_exit "需要 curl 或 wget"
-    fi
-
+    TMP_DIR=$(mktemp -d)
+    TMP_FILE="${TMP_DIR}/${BINARY_NAME}"
+    github_download "$DOWNLOAD_URL" "$TMP_FILE" || error_exit "下载失败；可设置 ACORNFOX_GITHUB_PROXY 指定 GitHub 加速地址"
     chmod +x "$TMP_FILE"
+}
+
+# GitHub 仓库与下载代理（与 install.sh 一致）
+ACORNFOX_REPO="${ACORNFOX_REPO:-acornfox/acornfox}"
+GITHUB_PROXIES=()
+
+setup_github_proxies() {
+    GITHUB_PROXIES=("")
+    if [ -n "${ACORNFOX_GITHUB_PROXY:-}" ]; then
+        GITHUB_PROXIES+=("${ACORNFOX_GITHUB_PROXY%/}/")
+    fi
+    if curl -s -m 3 "http://ip-api.com/json/?fields=countryCode" 2>/dev/null | grep -q '"countryCode":"CN"'; then
+        GITHUB_PROXIES+=("https://ghfast.top/" "https://gh-proxy.com/")
+    fi
+}
+
+github_download() {
+    local url="$1" out="$2" p
+    for p in "${GITHUB_PROXIES[@]}"; do
+        if [ -n "$p" ]; then
+            log_info "尝试通过 ${p} 下载"
+        fi
+        if curl -fL --progress-bar --connect-timeout 10 --max-time 600 --retry 2 -o "$out" "${p}${url}"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+github_latest_tag() {
+    local p loc
+    for p in "${GITHUB_PROXIES[@]}"; do
+        loc=$(curl -fsSIL --connect-timeout 10 --max-time 30 -o /dev/null -w '%{url_effective}' \
+            "${p}https://github.com/${ACORNFOX_REPO}/releases/latest" 2>/dev/null || true)
+        case "$loc" in
+            */releases/tag/*)
+                echo "${loc##*/}"
+                return 0
+                ;;
+        esac
+    done
+    return 1
 }
 
 # 安装 CLI
@@ -104,7 +127,7 @@ install_cli() {
     if [ "$OS" = "windows" ]; then
         INSTALL_DIR="$HOME/AppData/Local/AcornFox"
         mkdir -p "$INSTALL_DIR"
-        mv "/tmp/acornfox.exe" "$INSTALL_DIR/acornfox.exe"
+        mv "$TMP_FILE" "$INSTALL_DIR/acornfox.exe"
 
         log_success "已安装到: $INSTALL_DIR"
         echo ""
@@ -113,13 +136,18 @@ install_cli() {
     else
         # Linux/macOS
         if [ -w "/usr/local/bin" ]; then
-            mv "/tmp/acornfox" "/usr/local/bin/acornfox"
+            mv "$TMP_FILE" "/usr/local/bin/acornfox"
             log_success "已安装到: /usr/local/bin/acornfox"
         else
-            sudo mv "/tmp/acornfox" "/usr/local/bin/acornfox"
+            sudo mv "$TMP_FILE" "/usr/local/bin/acornfox"
             log_success "已安装到: /usr/local/bin/acornfox (需要 sudo)"
         fi
+        # macOS 会给下载的文件加隔离属性，去掉以免首次运行被拦截
+        if [ "$OS" = "darwin" ]; then
+            xattr -d com.apple.quarantine /usr/local/bin/acornfox 2>/dev/null || true
+        fi
     fi
+    rmdir "$TMP_DIR" 2>/dev/null || true
 }
 
 # 验证安装
@@ -155,7 +183,6 @@ show_usage() {
    acornfox skill install
 
 文档: https://acornfox.dev/docs
-帮助: acornfox --help
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
