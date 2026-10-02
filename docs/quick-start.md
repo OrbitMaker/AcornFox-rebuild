@@ -60,7 +60,7 @@ acf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 curl -fsSL https://get.acornfox.dev/install-cli.sh | bash
 ```
 
-**Windows 用户**：在 PowerShell 或 Git Bash 中执行。
+**Windows 用户**：在 Git Bash 中执行，或从 GitHub Releases 下载 `acornfox_windows_amd64.exe`，改名为 `acornfox.exe` 后放到 PATH 中的目录。
 
 安装完成后验证：
 
@@ -132,51 +132,36 @@ acornfox deploy --image nginx:latest --app my-app
 
 ## 查看部署状态
 
-部署命令是**异步**的，需要查询状态：
+`acornfox deploy` 会一直等到部署结束（成功或失败）再返回，期间打印每个阶段的进度。加 `--no-wait` 则提交后立即返回。
 
-```bash
-# 查看状态
-acornfox status
+**部署状态**：
 
-# JSON 格式（便于脚本处理）
-acornfox status --json
-```
-
-**状态说明**：
-
-| 状态 | 含义 | 下一步 |
-|------|------|--------|
-| `queued` | 排队中 | 等待 |
-| `building` | 构建中 | 等待 |
-| `checking` | 健康检查中 | 等待，通常 10-30 秒 |
-| `live` | 运行中 ✅ | 访问 URL |
-| `failed` | 失败 ❌ | 查看诊断 |
+| 状态 | 含义 |
+|------|------|
+| `queued` | 排队中 |
+| `building` | 构建镜像 |
+| `starting` | 启动容器 |
+| `checking` | 健康检查，通常 10-30 秒 |
+| `routing` | 配置访问地址 |
+| `live` | 运行中 ✅ |
+| `failed` | 失败 ❌，见诊断 |
+| `superseded` | 被更新的提交取代 |
 
 ### 成功部署
 
-当状态变为 `live` 时：
-
-```bash
-acornfox status
+```
+部署成功：http://your-server-ip:端口
 ```
 
-输出：
-
-```
-应用: my-app
-状态: live
-访问地址: http://your-server-ip:8080
-部署时间: 2026-10-01 10:30:00
-```
-
-在浏览器中打开访问地址即可。
+之后随时可以用 `acornfox status` 查看应用的访问地址和运行状态。
 
 ### 部署失败
 
-当状态为 `failed` 时，查看诊断：
+`deploy` 失败时会直接打印失败原因、建议和日志片段。之后想再看一次：
 
 ```bash
-acornfox diagnose
+acornfox diagnose          # 本机最近一次部署
+acornfox diagnose 部署ID    # 指定部署
 ```
 
 常见错误和修复方法：[故障排查](troubleshooting.md)

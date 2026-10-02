@@ -264,6 +264,65 @@ N4 需要实现停止、启动、重启功能,如何在调和模型中表达?
 
 ---
 
+## 首发前决策
+
+### ADR-0007: 服务器上的账号、目录与 socket 布局
+
+**日期**: 2026-10-02  
+**状态**: 接受（install.sh / upgrade.sh 已实现，测试服务器手工验证上传可读）  
+**提出者**: [cc]
+
+#### 背景
+
+首发验收时部署全部失败，报“无法读取上传的项目包”。原因是 server（acornfox）写出的上传包为 0640 acornfox:acornfox，runner（acornfox-exec）不在该组，读不到。排查中还发现：`/run` 是 tmpfs，重启后 `/run/acornfox` 消失；手工把它改成 acornfox-exec 所有后，Caddy 重启时又建不了 admin socket。
+
+#### 决策
+
+三个服务账号共用一个通信组 `acornfox-ipc`（成员：acornfox、acornfox-exec、caddy），权限靠目录控制，不靠文件：
+
+| 路径 | 所有者 | 权限 | 说明 |
+| --- | --- | --- | --- |
+| `/var/lib/acornfox` | acornfox:acornfox-ipc | 0710 | 组只能穿过，看不到数据库 |
+| `/var/lib/acornfox/uploads` | acornfox:acornfox-ipc | 2750 | runner 只读上传包 |
+| 上传包 `uploads/*.tar.gz` | acornfox | 0644 | 外层目录已挡住其他本地用户 |
+| `/run/acornfox` | root:acornfox-ipc | 2771 | 由 `/etc/tmpfiles.d/acornfox.conf` 开机重建；setgid 让新 socket 继承组；其他用户只能穿过 |
+| `api.sock` | acornfox:acornfox-users | 0660 | `server --listen-group acornfox-users`；SSH 用户为 root 或加入 acornfox-users |
+| `runner.sock` | acornfox-exec:acornfox-ipc | 0660 | 另有对端 UID 校验，只接受 server |
+| `caddy-admin.sock` | caddy:acornfox-ipc | 0660 | 只有服务账号能改路由 |
+
+Caddy 的 admin 接口为 `unix//run/acornfox/caddy-admin.sock|0660`，`persist_config off`，路由完全由 AcornFox 每次同步时写入。
+
+CLI 用户单独用 `acornfox-users` 组：若让 SSH 用户加入 acornfox-ipc，他们就能直接改 Caddy 路由，权限超出 API 本身。
+
+#### 理由
+
+1. 不需要任何服务以 root 运行，也不需要账号互加对方的主组。
+2. 文件权限出错（umask、Chmod 遗漏）时，目录仍是第二道防线。
+3. tmpfiles.d 是 systemd 发行版上重建 `/run` 子目录的标准做法。
+
+#### 后果
+
+**代价**: 上传包本身对“能进入目录的人”可读；这些人只有三个服务账号和 root。
+
+#### 替代方案
+
+- **runner 加入 acornfox 主组**: 会让 runner 读到数据库，违背 ADR-0002 的单一权限边界。
+- **server 把包通过 socket 流给 runner**: 更干净，但要改 runner 协议，首发前不做。
+
+### ADR-0008: Skill 采用 SKILL.md 目录格式，诊断命令 `diagnose`
+
+**日期**: 2026-10-02  
+**状态**: 接受  
+**提出者**: [cc]
+
+#### 决策
+
+- Skill 是带 `name`/`description` frontmatter 的 `SKILL.md`，源文件 `acornfox/internal/cli/skilldata/SKILL.md`（嵌入二进制），仓库根 `skills/acornfox/SKILL.md` 为同步副本，测试保证一致。
+- `acornfox skill install` 自动安装到已检测到的 Claude Code（`~/.claude/skills/acornfox/SKILL.md`）和 Codex（`~/.codex/skills/acornfox/SKILL.md`）；其他工具用 `--dir` 指定目录或 `skill print` 输出内容。原先写死的 Cursor、Windsurf、MarsCode、通义灵码路径未经核实，已去掉。
+- 新增 `acornfox diagnose [DEPLOYMENT_ID]`：不带 ID 时查本机最近一次提交的部署。记录存在用户配置目录 `acornfox/last-deployments.json`，不写进项目里的 `.acornfox`，避免每次部署都改动用户仓库。
+
+---
+
 ## 如何使用本文档
 
 1. **做重要决策前**: 先在此文档提议,征求其他 Agent 意见

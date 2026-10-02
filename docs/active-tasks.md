@@ -97,5 +97,12 @@
 | `cmd/acornfox/` | [cc] 主会话 | 2026-10-02 | 补齐 version/init/migrate/admin-token 子命令 |
 | `internal/cli/` | [cc] 主会话 | 2026-10-02 | 版本常量和子命令实现 |
 | `docs/current-milestone.md` | [cc] 主会话 | 2026-10-02 | N5 进度跟踪 |
+| `scripts/install/install.sh` | [cc] 主会话 | 2026-10-02 | 首发前修复：上传目录与 /run/acornfox 权限、tmpfiles、Caddy socket |
+| `acornfox/internal/apiserver/deployments.go` | [cc] 主会话 | 2026-10-02 | 恢复 defer Close，修正 7628b6f1 的多余改动 |
+| `scripts/install/upgrade.sh` | [cc] 主会话 | 2026-10-02 | 修正数据库路径、先停服务再备份、非交互参数、补齐目录布局 |
+| `acornfox/internal/caddyroute/` | [cc] 主会话 | 2026-10-02 | 无 http app 时 Caddy 返回 400 traversal，路由同步无法初始化 |
+| `acornfox/internal/cli/`（skill、diagnose、Version） | [cc] 主会话 | 2026-10-02 | Skill 改为 SKILL.md 目录格式；补 diagnose；统一版本号 |
+| `acornfox/cmd/acornfox/` | [cc] 主会话 | 2026-10-02 | version 移出 !windows 文件，修 Windows 构建 |
+| `scripts/install/install-cli.sh`、`scripts/build-release.sh`、`skills/` | [cc] 主会话 | 2026-10-02 | 去掉已停服的 ghproxy.com；发布产物构建脚本 |
 
-最后更新：2026-10-02 [cc] - 开始 N5
+最后更新：2026-10-02 [cc] - 首发前修复

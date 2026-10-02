@@ -28,7 +28,7 @@ curl -fsSL https://raw.githubusercontent.com/acornfox/acornfox/main/scripts/inst
 - [ ] systemd 服务已启动
   - [ ] `systemctl status acornfox-server` 显示 active (running)
   - [ ] `systemctl status acornfox-runner` 显示 active (running)
-- [ ] 数据库已初始化（`/var/lib/acornfox/data/acornfox.db` 存在）
+- [ ] 数据库已初始化（`/var/lib/acornfox/acornfox.db` 存在）
 - [ ] 管理员令牌已生成（`/root/.acornfox-token` 存在）
 
 ### 初始化测试
@@ -79,11 +79,11 @@ acornfox skill install
 - [ ] `acornfox apps` 返回空列表（无错误）
 - [ ] Skill 安装成功，输出类似：
   ```
-  ✓ Claude Code: 已安装到 /Users/xxx/.claude/skills/acornfox.md
-  成功安装到 1 个工作台
+  ✓ Claude Code：已安装到 /Users/xxx/.claude/skills/acornfox/SKILL.md
   ```
-- [ ] Skill 文件存在于正确位置
-- [ ] Skill 文件内容完整（包含命令速查、工作流程、Dockerfile 模板）
+  其他工具：`acornfox skill install --dir <该工具的 skills 目录>`，或 `acornfox skill print` 复制内容
+- [ ] Skill 文件存在于正确位置，开头有 `name`/`description` frontmatter
+- [ ] 在 Claude Code 中输入 `/acornfox` 或说“用 acornfox 部署”能触发 Skill
 
 ---
 
