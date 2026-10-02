@@ -457,6 +457,7 @@ func (a *app) cmdRollback(ctx context.Context, args []string) int {
 	if serr != nil {
 		return a.out.fail(serr)
 	}
+	a.rememberDeployment(res.targetName, res.app, dep.ID)
 	if *noWait {
 		return a.reportDeployment(ctx, api, res.app, dep, nil)
 	}
@@ -484,6 +485,7 @@ func (a *app) cmdRedeploy(ctx context.Context, args []string) int {
 	if serr != nil {
 		return a.out.fail(serr)
 	}
+	a.rememberDeployment(res.targetName, res.app, deploymentID)
 	if a.out.json {
 		a.out.emitJSON(map[string]any{"deployment_id": deploymentID})
 		return exitOK

@@ -114,6 +114,7 @@ func (a *app) cmdDeploy(ctx context.Context, args []string) int {
 	// Persist .acornfox on first successful submission (write into workDir if
 	// no existing project file).
 	a.persistProject(res)
+	a.rememberDeployment(res.targetName, res.app, dep.ID)
 
 	if *noWait {
 		return a.reportDeployment(ctx, api, res.app, dep, nil)

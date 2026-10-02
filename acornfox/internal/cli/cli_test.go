@@ -20,7 +20,7 @@ func TestVersionJSON(t *testing.T) {
 	if m["ok"] != true {
 		t.Fatalf("ok != true: %v", m)
 	}
-	if m["version"] != version {
+	if m["version"] != Version {
 		t.Fatalf("version = %v", m["version"])
 	}
 	if int(m["api_version"].(float64)) != client.APIVersion {

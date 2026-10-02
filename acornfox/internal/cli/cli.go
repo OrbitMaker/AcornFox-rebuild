@@ -14,8 +14,10 @@ import (
 	"github.com/acornfox/acornfox/internal/client"
 )
 
-// version is the client version reported by `acornfox version`.
-const version = "0.2.0"
+// Version is the AcornFox version reported by `acornfox version` (client and
+// server share one binary). Release builds set it with
+// -ldflags "-X github.com/acornfox/acornfox/internal/cli.Version=x.y.z".
+var Version = "0.2.0-dev"
 
 // Connector opens a client.API for a target. It is injected so the command
 // layer stays decoupled from the concurrently implemented client.Connect. main
@@ -77,7 +79,7 @@ func mainWith(ctx context.Context, args []string, stdin io.Reader, stdout, stder
 		return a.out.usageError("%s", err.Error())
 	}
 	if len(rest) == 0 {
-		return a.out.usageError("需要一个子命令；可用：target deploy status apps logs stats env volume app set rollback redeploy stop start restart delete open domain add remove addons skill version")
+		return a.out.usageError("需要一个子命令；可用：target deploy status diagnose apps logs stats env volume app set rollback redeploy stop start restart delete open domain add remove addons skill version")
 	}
 
 	cmd, cmdArgs := rest[0], rest[1:]
@@ -92,6 +94,8 @@ func mainWith(ctx context.Context, args []string, stdin io.Reader, stdout, stder
 		return a.cmdDeploy(ctx, cmdArgs)
 	case "status":
 		return a.cmdStatus(ctx, cmdArgs)
+	case "diagnose":
+		return a.cmdDiagnose(ctx, cmdArgs)
 	case "apps":
 		return a.cmdApps(ctx, cmdArgs)
 	case "logs":

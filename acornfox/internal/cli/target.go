@@ -11,12 +11,12 @@ import (
 func (a *app) cmdVersion() int {
 	if a.out.json {
 		a.out.emitJSON(map[string]any{
-			"version":     version,
+			"version":     Version,
 			"api_version": client.APIVersion,
 		})
 		return exitOK
 	}
-	a.out.human("acornfox 客户端版本 %s，API 版本 %d", version, client.APIVersion)
+	a.out.human("acornfox 客户端版本 %s，API 版本 %d", Version, client.APIVersion)
 	return exitOK
 }
 

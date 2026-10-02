@@ -41,6 +41,7 @@ func (a *app) cmdAdd(ctx context.Context, args []string) int {
 	if serr != nil {
 		return a.out.fail(serr)
 	}
+	a.rememberDeployment(res.targetName, res.app, r.DeploymentID)
 	if a.out.json {
 		a.out.emitJSON(map[string]any{
 			"app":           res.app,
