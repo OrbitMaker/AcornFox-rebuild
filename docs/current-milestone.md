@@ -197,9 +197,63 @@ N5 安装与升级里程碑全部完成：
 
 ---
 
-# 下一里程碑：N6 Skill 与验收
+# 当前里程碑：N6 Skill 与验收
 
-状态：🚧 **准备开始**（2026-10-02）
+状态：🚧 **进行中**（2026-10-02）
+
+## N6.1 Skill 开发：✅ 完成 (2026-10-02)
+
+**已完成**：
+- ✅ `acornfox skill install` 命令实现
+- ✅ 自动检测 AI 工作台（Claude Code, Cursor, Windsurf, 豆包, 通义灵码）
+- ✅ 跨平台支持（Windows/macOS/Linux）
+- ✅ Skill 内容完整（命令速查、工作流程、Dockerfile 模板）
+- ✅ 实际测试通过（已安装到 `~/.claude/skills/acornfox.md`）
+
+**代码位置**：
+- `internal/cli/skill.go` - Skill 安装实现
+- `internal/cli/cli.go` - 命令注册
+
+**验证**：
+```bash
+acornfox skill install
+# ✓ Claude Code: 已安装到 /Users/xxx/.claude/skills/acornfox.md
+# 成功安装到 1 个工作台
+```
+
+## N6.2 首发验收：⏳ 待开始
+
+**验收文档**：`docs/n6-acceptance-checklist.md`
+
+**7 项验收检查**：
+1. ⏳ 一条命令安装并初始化
+2. ⏳ CLI 和 Skill 安装
+3. ⏳ AI 生成 Dockerfile 并部署
+4. ⏳ 失败诊断与修复
+5. ⏳ 域名 HTTPS 与未备案提示
+6. ⏳ 生命周期与数据持久化
+7. ⏳ 目标工作台全部通过 5 项检查
+
+**验收要求**：
+- 在干净的 Ubuntu 24.04 服务器上
+- 由未参与开发的人完成
+- 至少 3 个工作台通过全部检查
+
+**通过标准**：
+- 前 6 项必须全部通过
+- 第 7 项至少 3 个工作台通过
+
+---
+
+## N6 完成后的下一步
+
+验收通过后，AcornFox 单机版即可开源首发：
+
+1. 创建 GitHub Release（v0.2.0）
+2. 构建跨平台二进制文件
+3. 更新官网安装脚本
+4. 发布开源公告
+5. 进入阶段 2：首发验证
 
 ### N5.2 CLI 安装脚本：进行中
 

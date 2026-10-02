@@ -52,27 +52,37 @@
 
 # N6 Skill 与验收
 
-里程碑：N6。待开始。
+里程碑：N6。进行中（2026-10-02）。
 
 ## N6.1 Skill 开发
 
-- 状态：🔜 `available`
-- 负责：待认领
-- 内容：开发 AcornFox Skill 用于 AI 工作台集成
-  - `acornfox skill install` 命令
-  - Skill 定义文件
-  - 与 dbskill、Claude Code 等工作台集成
-- 相关代码：待创建
+- 状态：✅ `completed` (2026-10-02)
+- 负责：[cc] 主会话
+- 已完成：
+  - ✅ `acornfox skill install` 命令实现
+  - ✅ 自动检测 5 个工作台（Claude Code, Cursor, Windsurf, 豆包, 通义灵码）
+  - ✅ 跨平台支持（Windows/macOS/Linux）
+  - ✅ Skill 内容完整
+  - ✅ 实际测试通过
+- 相关代码：`internal/cli/skill.go`
 
 ## N6.2 首发验收
 
-- 状态：🔜 `available`
-- 负责：待认领
-- 内容：按路线图第 6.2 节完成 7 项首发检查
-  - 由未参与开发的人完成验收
-  - 文档完整性检查
-  - 用户体验验证
-- 相关文档：`docs/acornfox-strategy-roadmap.md` 第 6.2 节
+- 状态：⏳ `available`
+- 负责：待认领（需未参与开发的人）
+- 内容：按验收清单完成 7 项检查
+  - 在干净 Ubuntu 24.04 服务器上
+  - 至少 3 个工作台通过完整流程
+  - 记录验收结果
+- 相关文档：`docs/n6-acceptance-checklist.md`
+
+---
+
+## 正在编辑的文件
+
+- `docs/current-milestone.md` - [cc] 2026-10-02
+- `docs/active-tasks.md` - [cc] 2026-10-02
+- `docs/n6-acceptance-checklist.md` - [cc] 2026-10-02（新增）
 
 ## 认领流程
 
