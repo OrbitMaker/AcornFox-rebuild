@@ -267,7 +267,7 @@ func (c *caddyRouter) ensureHTTPPort(ctx context.Context, field string, port, de
 		if t != "" && t != "null" {
 			_ = json.Unmarshal(body, &have)
 		}
-	} else if status != http.StatusNotFound {
+	} else if !pathMissing(status, body) {
 		return fmt.Errorf("caddy get %s: status %d: %s", field, status, strings.TrimSpace(string(body)))
 	}
 	// Caddy treats an unset field as the default.
@@ -611,13 +611,24 @@ func (c *caddyRouter) appendRaw(ctx context.Context, path string, v any) error {
 	return nil
 }
 
+// pathMissing reports whether a GET failed only because the path does not
+// exist. Caddy answers 404 for a missing final key but 400 "invalid traversal
+// path" when an intermediate key (e.g. apps.http on a Caddyfile with only
+// global options) is missing.
+func pathMissing(status int, body []byte) bool {
+	if status == http.StatusNotFound {
+		return true
+	}
+	return status == http.StatusBadRequest && bytes.Contains(body, []byte("invalid traversal path"))
+}
+
 // getServers reads /config/apps/http/servers, tolerating a null/empty config.
 func (c *caddyRouter) getServers(ctx context.Context) (map[string]caddyServer, error) {
 	body, status, err := c.do(ctx, http.MethodGet, "/config/apps/http/servers", nil)
 	if err != nil {
 		return nil, err
 	}
-	if status == http.StatusNotFound {
+	if pathMissing(status, body) {
 		return map[string]caddyServer{}, nil
 	}
 	if status < 200 || status >= 300 {
@@ -649,7 +660,7 @@ func (c *caddyRouter) ensureServersPath(ctx context.Context) error {
 		if trimmed != "" && trimmed != "null" {
 			return nil // servers object already present
 		}
-	} else if status != http.StatusNotFound {
+	} else if !pathMissing(status, body) {
 		return fmt.Errorf("caddy probe servers: status %d: %s", status, strings.TrimSpace(string(body)))
 	}
 

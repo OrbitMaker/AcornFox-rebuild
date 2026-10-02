@@ -23,6 +23,9 @@ type fakeCaddy struct {
 	config map[string]any // root Caddy config
 	srv    *http.Server
 	socket string
+	// realTraversal makes GET on a path below a missing intermediate key
+	// answer like real Caddy (400 "invalid traversal path") instead of 404.
+	realTraversal bool
 }
 
 func startFakeCaddy(t *testing.T, initial map[string]any) *fakeCaddy {
@@ -212,6 +215,14 @@ func (f *fakeCaddy) handle(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		v, ok := f.getPath(path)
 		if !ok {
+			if f.realTraversal && strings.HasPrefix(path, "/config/") {
+				if parent := path[:strings.LastIndex(path, "/")]; parent != "/config" {
+					if _, pok := f.getPath(parent); !pok {
+						http.Error(w, `{"error":"invalid traversal path at: `+strings.TrimPrefix(parent, "/")+`"}`, http.StatusBadRequest)
+						return
+					}
+				}
+			}
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
@@ -460,6 +471,36 @@ func TestCurrentEmpty(t *testing.T) {
 	}
 	if len(cur) != 0 {
 		t.Errorf("current = %d, want 0", len(cur))
+	}
+}
+
+// A Caddyfile with only global options (admin socket, persist_config off)
+// yields a config with no apps.http; real Caddy answers GET on
+// apps/http/servers with 400 "invalid traversal path", not 404.
+func TestSyncAndCurrentWithoutHTTPApp(t *testing.T) {
+	f := startFakeCaddy(t, map[string]any{
+		"admin": map[string]any{"listen": "unix//run/acornfox/caddy-admin.sock"},
+	})
+	f.realTraversal = true
+	r := New(f.socket, HTTPSConfig{})
+	ctx := context.Background()
+
+	cur, err := r.Current(ctx)
+	if err != nil {
+		t.Fatalf("Current without http app: %v", err)
+	}
+	if len(cur) != 0 {
+		t.Errorf("current = %d, want 0", len(cur))
+	}
+
+	if err := r.Sync(ctx, []Route{{App: "web", PublicPort: 18810, Upstream: "127.0.0.1:32001"}}); err != nil {
+		t.Fatalf("Sync without http app: %v", err)
+	}
+	if _, ok := f.servers()["af-web"]; !ok {
+		t.Fatalf("af-web not created: %+v", f.config)
+	}
+	if _, ok := f.config["admin"]; !ok {
+		t.Errorf("admin config clobbered: %+v", f.config)
 	}
 }
 
