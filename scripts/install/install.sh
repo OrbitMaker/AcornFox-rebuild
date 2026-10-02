@@ -373,6 +373,56 @@ install_caddy() {
     fi
 }
 
+# 配置 Caddy admin API socket
+configure_caddy() {
+    if $SKIP_CADDY; then
+        log_info "跳过 Caddy 配置"
+        return
+    fi
+
+    log_info "配置 Caddy admin API socket..."
+
+    # 创建 Caddy 配置目录
+    mkdir -p /etc/caddy
+
+    # 创建 Caddyfile，启用 Unix socket admin API
+    cat > /etc/caddy/Caddyfile << 'EOF'
+{
+    admin unix//run/acornfox/caddy-admin.sock {
+        origins *
+    }
+    persist_config off
+}
+
+# AcornFox 应用路由将通过 API 动态添加
+EOF
+
+    # 设置 Caddyfile 权限
+    chown root:root /etc/caddy/Caddyfile
+    chmod 644 /etc/caddy/Caddyfile
+
+    # 创建 /run/acornfox 目录并设置权限
+    mkdir -p /run/acornfox
+    chown acornfox:acornfox /run/acornfox
+    chmod 775 /run/acornfox
+
+    # 重启 Caddy 以应用配置
+    if systemctl is-active --quiet caddy; then
+        systemctl restart caddy
+        sleep 2
+    fi
+
+    # 验证 admin socket 是否创建
+    if [ -S /run/acornfox/caddy-admin.sock ]; then
+        # 设置 socket 权限，允许 acornfox 用户访问
+        chmod 660 /run/acornfox/caddy-admin.sock
+        chown caddy:acornfox /run/acornfox/caddy-admin.sock
+        log_success "Caddy admin socket 配置完成"
+    else
+        log_warn "Caddy admin socket 尚未创建，可能需要手动配置"
+    fi
+}
+
 # 创建系统账号和组
 create_accounts() {
     log_info "创建系统账号和组..."
@@ -402,6 +452,19 @@ create_accounts() {
     else
         # 确保 acornfox-exec 在 docker 组中
         usermod -aG docker acornfox-exec
+    fi
+
+    # 修复 Caddy admin socket 权限问题
+    # 将 caddy 用户添加到 acornfox 组，允许访问 /run/acornfox/
+    if id caddy >/dev/null 2>&1; then
+        usermod -aG acornfox caddy
+        log_info "已将 caddy 用户添加到 acornfox 组"
+    fi
+
+    # 将 acornfox 用户添加到 caddy 组，允许访问 Caddy admin socket
+    if getent group caddy >/dev/null; then
+        usermod -aG caddy acornfox
+        log_info "已将 acornfox 用户添加到 caddy 组"
     fi
 }
 
@@ -522,8 +585,15 @@ generate_admin_token() {
 create_systemd_services() {
     log_info "创建 systemd 服务..."
 
+    # 获取用户 UID（修复 peer credentials 验证问题）
+    ACORNFOX_UID=$(id -u acornfox)
+    ACORNFOX_EXEC_UID=$(id -u acornfox-exec)
+
+    log_info "配置 UID: acornfox=$ACORNFOX_UID, acornfox-exec=$ACORNFOX_EXEC_UID"
+
     # acornfox-server.service
-    cat > /etc/systemd/system/acornfox-server.service << 'EOF'
+    # 重要：添加 --runner-uid 参数，解决 peer credentials 验证问题
+    cat > /etc/systemd/system/acornfox-server.service << EOF
 [Unit]
 Description=AcornFox Server
 Documentation=https://acornfox.dev
@@ -534,7 +604,7 @@ Requires=docker.service
 Type=simple
 User=acornfox
 Group=acornfox
-ExecStart=/usr/local/bin/acornfox server
+ExecStart=/usr/local/bin/acornfox server --runner-uid $ACORNFOX_EXEC_UID
 Restart=on-failure
 RestartSec=5s
 StandardOutput=journal
@@ -553,7 +623,8 @@ WantedBy=multi-user.target
 EOF
 
     # acornfox-runner.service
-    cat > /etc/systemd/system/acornfox-runner.service << 'EOF'
+    # 重要：添加 --server-uid 参数，解决 peer credentials 验证问题
+    cat > /etc/systemd/system/acornfox-runner.service << EOF
 [Unit]
 Description=AcornFox Runner
 Documentation=https://acornfox.dev
@@ -564,7 +635,7 @@ Requires=docker.service
 Type=simple
 User=acornfox-exec
 Group=acornfox-exec
-ExecStart=/usr/local/bin/acornfox runner
+ExecStart=/usr/local/bin/acornfox runner --server-uid $ACORNFOX_UID
 Restart=on-failure
 RestartSec=5s
 StandardOutput=journal
@@ -582,7 +653,7 @@ EOF
     # 重新加载 systemd
     systemctl daemon-reload
 
-    log_success "systemd 服务创建完成"
+    log_success "systemd 服务创建完成（已配置正确的 UID 参数）"
 }
 
 # 启动服务
@@ -670,6 +741,7 @@ main() {
     configure_docker_mirror
     install_caddy
     create_accounts
+    configure_caddy
     create_directories
     download_acornfox "${1:-latest}"
     initialize_database
