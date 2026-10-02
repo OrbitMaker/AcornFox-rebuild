@@ -1,46 +1,45 @@
 # 活跃任务
 
-里程碑：N4。状态取值：`available` 可认领、`in_progress` 进行中、`review` 待实测、`completed` 已完成、`blocked` 被阻塞。各任务的已完成内容见 `current-milestone.md`。
+里程碑：N5。状态取值：`available` 可认领、`in_progress` 进行中、`review` 待实测、`completed` 已完成、`blocked` 被阻塞。各任务的已完成内容见 `current-milestone.md`。
 
 以下代码路径都在 `acornfox/` 下。
 
-## N4.1 生命周期管理
+## N5.1 子命令补齐
 
-- 状态：✅ `completed` (2026-10-01)
+- 状态：🚧 `in_progress` (2026-10-02)
 - 负责：[cc] 主会话
-- 已完成：启停、重启、重新部署、默认保留卷、显式删卷、网络自动回收
-- 测试结果：所有单元测试通过 (含 race 检测)，网络回收测试通过
-- 相关代码：`internal/apiserver/apps.go`、`internal/reconcile/reconcile.go`、`internal/runner/docker.go`、`internal/runner/network.go`、`internal/cli/commands.go`
+- 内容：补齐安装和升级脚本需要的子命令
+  - `acornfox version` - 输出版本信息
+  - `acornfox init` - 初始化数据库
+  - `acornfox migrate` - 执行数据库迁移
+  - `acornfox admin-token` - 生成初始管理员令牌
+- 相关代码：`cmd/acornfox/main.go`、`internal/cli/`、`internal/state/`
 
-## N4.2 附加服务
+## N5.2 安装脚本完善
 
-- 状态：✅ `completed` (2026-10-01)
-- 负责：[cc] 主会话
-- 已完成：PostgreSQL/MySQL/Redis 三种服务、凭据管理、软删除、健康检查门控、网页界面
-- 测试结果：所有单元测试通过，Store/Runner/Reconciler 层完整覆盖
-- 相关代码：`internal/state/addons.go`、`internal/state/store.go`、`internal/apiserver/addons.go`、`internal/reconcile/addons.go`、`internal/runner/addon.go`、`internal/cli/addon.go`
+- 状态：🔜 `available`
+- 负责：待认领
+- 内容：完善并测试 `scripts/install/install.sh`
+  - 替换二进制下载 TODO
+  - 实机测试（国内云主机）
+- 相关文件：`scripts/install/install.sh`
 
-## N4.3 观测能力
+## N5.3 升级脚本测试
 
-- 状态：✅ `completed` (2026-10-01)
-- 负责：[cc] 主会话
-- 已完成：日志查看/跟随/脱敏、主机/容器指标、CLI stats、网页界面、信号处理
-- 测试结果：所有单元测试通过 (含 CLI Ctrl+C 信号处理)，网页 DOM 测试通过
-- 相关代码：`internal/apiserver/metrics.go`、`internal/apiserver/logs.go`、`internal/cli/stats.go`、`internal/cli/logs.go`、`internal/runner/observations.go`
+- 状态：🔜 `available`
+- 负责：待认领
+- 内容：测试升级和回滚机制
+  - 正常升级流程
+  - 迁移失败回滚
+  - 服务启动失败回滚
+- 相关文件：`scripts/install/upgrade.sh`
 
-## N4 验收
+## N5.4 CLI 安装脚本审查
 
-- 状态：✅ `completed` (2026-10-01)
-- 负责：[cc] 主会话
-- 已完成：
-  - 镜像 GC 共享保护修复 (commit `0c3e8729`)
-  - 所有核心包单元测试通过 (macOS arm64 + race 检测)
-  - go build/vet 静态检查通过
-  - 网络回收测试通过
-  - 文档更新完成
-- 测试平台：macOS arm64 (Go 1.25.13)
-- 验收证据：`docs/evidence/n4-completion-2026-10-01.md`
-- 代码提交：`0c3e8729` - "Fix image GC to protect shared images by ImageID"
+- 状态：🔜 `available`
+- 负责：待认领
+- 内容：审查和测试客户端安装脚本
+- 相关文件：`scripts/install/install-cli.sh`
 
 ## 认领流程
 
@@ -52,6 +51,8 @@
 
 | 文件或目录 | 编辑者 | 开始时间 | 说明 |
 | --- | --- | --- | --- |
-| `.cache/n4-*` 验收驱动、共享进度及证据 | [cc] 主会话 | 2026-10-01 | 仅用同一最终候选进行开发机复验，无子代理 |
+| `cmd/acornfox/` | [cc] 主会话 | 2026-10-02 | 补齐 version/init/migrate/admin-token 子命令 |
+| `internal/cli/` | [cc] 主会话 | 2026-10-02 | 版本常量和子命令实现 |
+| `docs/current-milestone.md` | [cc] 主会话 | 2026-10-02 | N5 进度跟踪 |
 
-最后更新：2026-10-01 [cc] - N4 完成
+最后更新：2026-10-02 [cc] - 开始 N5

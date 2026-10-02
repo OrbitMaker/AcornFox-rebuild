@@ -27,6 +27,14 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			return runRunner(args[1:]...)
 		case "proxy":
 			return runProxy(args[1:], stdin, stdout, stderr)
+		case "version":
+			return runVersion(args[1:], stdout)
+		case "init":
+			return runInit(args[1:], stdout, stderr)
+		case "migrate":
+			return runMigrate(args[1:], stdout, stderr)
+		case "admin-token":
+			return runAdminToken(args[1:], stdout, stderr)
 		}
 	}
 	// The default connector wraps client.Connect so internal/cli stays
