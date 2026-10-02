@@ -77,12 +77,14 @@ func (s *server) createDeployment(w http.ResponseWriter, r *http.Request) {
 	// Ensure cleanup on every error path; success paths set done=true.
 	done := false
 	defer func() {
-		_ = tmp.Close()
+		// tmp.Close() is called before rename, so don't call it again here
 		if !done {
 			_ = os.Remove(tmpName)
 		}
 	}()
-	if err := tmp.Chmod(0o640); err != nil {
+	// Set permissions to 0644 so both server (acornfox) and runner (acornfox-exec) can read.
+	// The runner needs read access to build the uploaded project.
+	if err := tmp.Chmod(0o644); err != nil {
 		s.log.Error("chmod temp upload", "err", err)
 		writeError(w, http.StatusInternalServerError, "internal", "无法设置上传文件权限")
 		return
@@ -130,8 +132,17 @@ func (s *server) createDeployment(w http.ResponseWriter, r *http.Request) {
 
 	// New deployment: give the upload its stable name <id>.tar.gz.
 	finalName := filepath.Join(s.uploadDir, dep.ID+".tar.gz")
+
+	// CRITICAL: Close the file before rename to ensure all data is flushed
+	// and the file handle doesn't interfere with the rename operation.
+	if err := tmp.Close(); err != nil {
+		s.log.Error("close temp upload before rename", "err", err)
+		writeError(w, http.StatusInternalServerError, "internal", "无法关闭临时文件")
+		return
+	}
+
 	if err := os.Rename(tmpName, finalName); err != nil {
-		s.log.Error("rename upload", "err", err)
+		s.log.Error("rename upload", "err", err, "from", tmpName, "to", finalName)
 		writeError(w, http.StatusInternalServerError, "internal", "无法保存上传文件")
 		return
 	}
