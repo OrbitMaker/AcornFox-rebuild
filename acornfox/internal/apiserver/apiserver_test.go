@@ -64,10 +64,10 @@ func TestUploadHappyPath(t *testing.T) {
 	if _, err := os.Stat(final); err != nil {
 		t.Fatalf("final upload not found: %v", err)
 	}
-	// Mode 0640.
+	// Mode 0644 (world-readable, as the runner account needs to read it).
 	info, _ := os.Stat(final)
-	if info.Mode().Perm() != 0o640 {
-		t.Fatalf("mode = %v, want 0640", info.Mode().Perm())
+	if info.Mode().Perm() != 0o644 {
+		t.Fatalf("mode = %v, want 0644", info.Mode().Perm())
 	}
 	// SourceRef points to the final file.
 	got, _ := st.GetDeployment(context.Background(), dep.ID)
