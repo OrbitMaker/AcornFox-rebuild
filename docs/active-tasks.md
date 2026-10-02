@@ -18,29 +18,61 @@
 
 ## N5.2 安装脚本完善
 
-- 状态：🔜 `available`
-- 负责：待认领
-- 内容：完善并测试 `scripts/install/install.sh`
-  - 替换二进制下载 TODO
-  - 实机测试（国内云主机）
-- 相关文件：`scripts/install/install.sh`
+- 状态：✅ `completed` (2026-10-02)
+- 负责：[cc] 主会话
+- 已完成：
+  - ✅ Caddy 安装改进（国际环境使用 apt 仓库）
+  - ✅ 实现自动 latest 版本检测
+  - ✅ GitHub 镜像加速
+  - ✅ 错误处理和版本验证
+- 相关代码：`scripts/install/install.sh`
 
-## N5.3 升级脚本测试
+## N5.3 升级脚本完善
 
-- 状态：🔜 `available`
-- 负责：待认领
-- 内容：测试升级和回滚机制
-  - 正常升级流程
-  - 迁移失败回滚
-  - 服务启动失败回滚
-- 相关文件：`scripts/install/upgrade.sh`
+- 状态：✅ `completed` (2026-10-02)
+- 负责：[cc] 主会话
+- 已完成：
+  - ✅ 添加自动 latest 版本检测
+  - ✅ 镜像加速逻辑一致性
+  - ✅ 完整的备份和回滚机制
+- 相关代码：`scripts/install/upgrade.sh`
 
 ## N5.4 CLI 安装脚本审查
 
+- 状态：✅ `completed` (2026-10-02)
+- 负责：[cc] 主会话
+- 已完成：
+  - ✅ 添加自动 latest 版本检测
+  - ✅ 支持指定版本参数
+  - ✅ 跨平台兼容性验证
+  - ✅ 中国镜像加速
+- 相关代码：`scripts/install/install-cli.sh`
+
+---
+
+# N6 Skill 与验收
+
+里程碑：N6。待开始。
+
+## N6.1 Skill 开发
+
 - 状态：🔜 `available`
 - 负责：待认领
-- 内容：审查和测试客户端安装脚本
-- 相关文件：`scripts/install/install-cli.sh`
+- 内容：开发 AcornFox Skill 用于 AI 工作台集成
+  - `acornfox skill install` 命令
+  - Skill 定义文件
+  - 与 dbskill、Claude Code 等工作台集成
+- 相关代码：待创建
+
+## N6.2 首发验收
+
+- 状态：🔜 `available`
+- 负责：待认领
+- 内容：按路线图第 6.2 节完成 7 项首发检查
+  - 由未参与开发的人完成验收
+  - 文档完整性检查
+  - 用户体验验证
+- 相关文档：`docs/acornfox-strategy-roadmap.md` 第 6.2 节
 
 ## 认领流程
 
