@@ -70,6 +70,21 @@ download_new_version() {
     esac
 
     VERSION="${1:-latest}"
+
+    if [ "$VERSION" = "latest" ]; then
+        # 获取最新 release 版本号
+        log_info "获取最新版本号..."
+
+        if curl -s -m 2 "http://ip-api.com/json/?fields=countryCode" 2>/dev/null | grep -q '"countryCode":"CN"'; then
+            # 使用代理获取最新版本
+            VERSION=$(curl -fsSL "https://ghproxy.com/https://api.github.com/repos/acornfox/acornfox/releases/latest" 2>/dev/null | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/' || echo "v0.2.0")
+        else
+            VERSION=$(curl -fsSL "https://api.github.com/repos/acornfox/acornfox/releases/latest" 2>/dev/null | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/' || echo "v0.2.0")
+        fi
+
+        log_info "最新版本: $VERSION"
+    fi
+
     DOWNLOAD_URL="https://github.com/acornfox/acornfox/releases/download/${VERSION}/acornfox_linux_${ARCH}"
 
     # 检查是否在中国

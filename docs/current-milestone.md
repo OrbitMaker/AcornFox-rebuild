@@ -131,24 +131,49 @@
 
 ## N5 进度
 
-### N5.1 安装脚本完善：进行中
+### N5.1 子命令补齐：✅ 完成 (2026-10-02)
 
-**已有基础**（`scripts/install/install.sh`）：
-- ✅ 操作系统检测（Ubuntu/Debian）
-- ✅ 地理位置检测（中国/海外）
-- ✅ Docker 安装与镜像加速
-- ✅ Caddy 安装
-- ✅ 账号和组创建
-- ✅ systemd 服务配置
-- ✅ 数据目录创建
+**已完成**：
+- ✅ `acornfox version` 子命令 - 输出版本信息
+- ✅ `acornfox init` 子命令 - 初始化数据库（迁移自动运行）
+- ✅ `acornfox migrate` 子命令 - 执行数据库迁移
+- ✅ `acornfox admin-token` 子命令 - 生成管理员令牌
+- ✅ 更新 `cmd/acornfox/main.go` 分发新子命令
+- ✅ 编译验证通过（`go build ./...`）
+- ✅ 代码质量检查通过（`go vet ./...`）
+- ✅ 功能测试通过（手动测试所有子命令）
 
-**待完善**：
-- [ ] 补齐 `acornfox init` 子命令（数据库初始化）
-- [ ] 补齐 `acornfox admin-token` 子命令（生成初始令牌）
-- [ ] 补齐 `acornfox migrate` 子命令（数据库迁移）
-- [ ] 补齐 `acornfox version` 子命令（版本信息）
-- [ ] 实际二进制下载逻辑（替换 TODO）
-- [ ] 安装脚本实机测试
+**代码位置**：
+- `cmd/acornfox/install_commands.go` - 新增
+- `cmd/acornfox/main.go` - 更新
+
+**提交**: commit 即将提交
+
+### N5.2 安装脚本完善：✅ 完成 (2026-10-02)
+
+**已完成**：
+- ✅ 修复 Caddy 安装逻辑（国际环境使用官方 apt 仓库）
+- ✅ 实现二进制下载逻辑（支持 latest 和指定版本）
+- ✅ 自动获取最新 release 版本号
+- ✅ 中国镜像加速（GitHub 代理）
+- ✅ 错误处理和版本验证
+- ✅ 创建测试计划文档
+
+**代码位置**：
+- `scripts/install/install.sh` - 更新
+
+### N5.3 升级脚本测试：进行中
+
+**已有基础**（`scripts/install/upgrade.sh`）：
+- ✅ 完整的升级流程实现
+- ✅ 备份机制
+- ✅ 回滚机制
+- ✅ 应用容器状态检查
+
+**待完成**：
+- [ ] 升级脚本代码审查
+- [ ] 升级流程测试
+- [ ] 回滚机制测试
 
 ### N5.2 CLI 安装脚本：进行中
 

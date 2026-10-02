@@ -344,15 +344,25 @@ install_caddy() {
         ARCH=$(dpkg --print-architecture)
         CADDY_VERSION="2.8.4"
 
-        wget -q "https://ghproxy.com/https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}/caddy_${CADDY_VERSION}_linux_${ARCH}.tar.gz" -O /tmp/caddy.tar.gz || error_exit "下载 Caddy 失败"
+        wget -q --show-progress "https://ghproxy.com/https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}/caddy_${CADDY_VERSION}_linux_${ARCH}.tar.gz" -O /tmp/caddy.tar.gz || error_exit "下载 Caddy 失败"
 
         tar -xzf /tmp/caddy.tar.gz -C /tmp
         mv /tmp/caddy /usr/bin/caddy
         chmod +x /usr/bin/caddy
         rm -f /tmp/caddy.tar.gz /tmp/LICENSE /tmp/README.md
     else
-        # 使用官方安装脚本
-        curl -fsSL https://getcaddy.com | bash -s personal || error_exit "Caddy 安装失败"
+        # 使用官方 apt 仓库安装
+        log_info "使用官方仓库安装 Caddy..."
+
+        # 添加 Caddy GPG 密钥
+        curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+
+        # 添加 Caddy 仓库
+        echo "deb [signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.gpg] https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main" | tee /etc/apt/sources.list.d/caddy-stable.list
+
+        # 安装 Caddy
+        apt-get update -qq
+        apt-get install -y -qq caddy || error_exit "Caddy 安装失败"
     fi
 
     # 验证安装
@@ -412,27 +422,49 @@ download_acornfox() {
             ;;
     esac
 
-    # TODO: 替换为实际的下载地址
-    VERSION="latest"
+    # 从 GitHub Releases 下载最新版本
+    # 格式: https://github.com/acornfox/acornfox/releases/download/v0.2.0/acornfox_linux_amd64
+    VERSION="${1:-latest}"
+
+    if [ "$VERSION" = "latest" ]; then
+        # 获取最新 release 版本号
+        log_info "获取最新版本号..."
+
+        if $IN_CHINA; then
+            # 使用代理获取最新版本
+            VERSION=$(curl -fsSL "https://ghproxy.com/https://api.github.com/repos/acornfox/acornfox/releases/latest" 2>/dev/null | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/' || echo "v0.2.0")
+        else
+            VERSION=$(curl -fsSL "https://api.github.com/repos/acornfox/acornfox/releases/latest" 2>/dev/null | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/' || echo "v0.2.0")
+        fi
+
+        log_info "最新版本: $VERSION"
+    fi
+
     DOWNLOAD_URL="https://github.com/acornfox/acornfox/releases/download/${VERSION}/acornfox_linux_${ARCH}"
 
     if $IN_CHINA; then
         # 使用 GitHub 代理
         DOWNLOAD_URL="https://ghproxy.com/${DOWNLOAD_URL}"
+        log_info "使用中国镜像加速"
     fi
 
     log_info "下载地址: $DOWNLOAD_URL"
 
     # 下载到临时目录
-    wget -q --show-progress "$DOWNLOAD_URL" -O /tmp/acornfox || error_exit "下载 AcornFox 失败"
+    if wget -q --show-progress "$DOWNLOAD_URL" -O /tmp/acornfox; then
+        log_success "下载完成"
+    else
+        error_exit "下载 AcornFox 失败，请检查网络连接或版本号是否正确"
+    fi
 
     # 安装到 /usr/local/bin
     install -m 0755 /tmp/acornfox /usr/local/bin/acornfox
     rm -f /tmp/acornfox
 
     # 验证安装
-    if /usr/local/bin/acornfox version >/dev/null 2>&1; then
-        log_success "AcornFox 安装成功"
+    INSTALLED_VERSION=$(/usr/local/bin/acornfox version 2>/dev/null | awk '{print $2}' || echo "unknown")
+    if [ "$INSTALLED_VERSION" != "unknown" ]; then
+        log_success "AcornFox 安装成功: $INSTALLED_VERSION"
     else
         error_exit "AcornFox 安装验证失败"
     fi
@@ -639,11 +671,7 @@ main() {
     install_caddy
     create_accounts
     create_directories
-
-    # TODO: 替换为实际的下载逻辑
-    # download_acornfox
-    log_warn "跳过二进制下载（开发阶段）"
-
+    download_acornfox "${1:-latest}"
     initialize_database
     generate_admin_token
     create_systemd_services

@@ -6,14 +6,15 @@
 
 ## N5.1 子命令补齐
 
-- 状态：🚧 `in_progress` (2026-10-02)
+- 状态：✅ `completed` (2026-10-02)
 - 负责：[cc] 主会话
-- 内容：补齐安装和升级脚本需要的子命令
-  - `acornfox version` - 输出版本信息
-  - `acornfox init` - 初始化数据库
-  - `acornfox migrate` - 执行数据库迁移
-  - `acornfox admin-token` - 生成初始管理员令牌
-- 相关代码：`cmd/acornfox/main.go`、`internal/cli/`、`internal/state/`
+- 已完成：
+  - ✅ `acornfox version` - 输出版本信息
+  - ✅ `acornfox init` - 初始化数据库
+  - ✅ `acornfox migrate` - 执行数据库迁移
+  - ✅ `acornfox admin-token` - 生成初始管理员令牌
+  - ✅ 编译和测试验证通过
+- 相关代码：`cmd/acornfox/install_commands.go` (新增)、`cmd/acornfox/main.go` (更新)
 
 ## N5.2 安装脚本完善
 
