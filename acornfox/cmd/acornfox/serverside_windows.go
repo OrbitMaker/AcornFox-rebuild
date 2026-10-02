@@ -27,3 +27,18 @@ func runProxy(_ []string, _ io.Reader, _ io.Writer, stderr io.Writer) int {
 	fmt.Fprintln(stderr, serverOnly)
 	return 2
 }
+
+func runInit(_ []string, _ io.Writer, stderr io.Writer) int {
+	fmt.Fprintln(stderr, serverOnly)
+	return 2
+}
+
+func runMigrate(_ []string, _ io.Writer, stderr io.Writer) int {
+	fmt.Fprintln(stderr, serverOnly)
+	return 2
+}
+
+func runAdminToken(_ []string, _ io.Writer, stderr io.Writer) int {
+	fmt.Fprintln(stderr, serverOnly)
+	return 2
+}

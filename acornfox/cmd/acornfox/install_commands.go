@@ -1,7 +1,7 @@
 //go:build !windows
 
-// This file implements installation and upgrade subcommands for N5:
-// - version: print version information
+// This file implements installation and upgrade subcommands for N5
+// (version lives in version.go so Windows builds have it too):
 // - init: initialize database (migrations run automatically via state.Open)
 // - migrate: run database migrations (for upgrades)
 // - admin-token: generate initial admin token
@@ -18,21 +18,6 @@ import (
 
 	"github.com/acornfox/acornfox/internal/state"
 )
-
-// version is the AcornFox version string. It is set at build time via
-// -ldflags "-X main.version=x.y.z" or defaults to dev.
-var version = "0.2.0-dev"
-
-// runVersion implements `acornfox version`: print version information.
-func runVersion(args []string, stdout io.Writer) int {
-	fs := flag.NewFlagSet("version", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	if err := fs.Parse(args); err != nil {
-		return 2
-	}
-	fmt.Fprintf(stdout, "acornfox %s\n", version)
-	return 0
-}
 
 // runInit implements `acornfox init`: initialize the database. The actual
 // migrations are run automatically by state.Open, so this just ensures the
