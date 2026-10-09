@@ -61,6 +61,8 @@ v0.2.0 发布到 GitHub 后，张家口测试机直连 GitHub 下载约 10 KB/s�
 
 全新实例 `i-REDACTED` 管道执行：**110 秒**（原 355 秒）。apt update 18 秒、基础依赖 5 秒、Docker 22 秒（阿里云内网源首次成功）、Caddy 50 秒（GitHub 直连低速中止后经代理）、AcornFox 8 秒（Gitee）。腾讯云内网 Docker 源未实测。
 
+随后 Caddy 也改为随发行版附在 Gitee（官方安装包与许可证；校验文件优先取 Caddy 官方 GitHub）。国内镜像站无 Caddy 官方 apt 仓库，Ubuntu 仓库的 2.6.2 实测不支持 `persist_config`。全新实例 `i-REDACTED` 原样执行 README 国内命令：**90 秒**。apt update 23 秒、基础依赖 7 秒、Docker 31 秒、Caddy 11 秒、AcornFox 8 秒，四个服务 active。
+
 ## 仍待完成
 
 - GitHub 正式路径（`releases/latest/download/install.sh`）在境外服务器上的全新安装未测；v0.2.0 附件里的脚本不含 Gitee 与低速换源，需发布 v0.2.1 才对 GitHub 路径生效。
