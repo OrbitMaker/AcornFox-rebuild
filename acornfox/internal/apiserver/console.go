@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 
 	"github.com/acornfox/acornfox/internal/state"
@@ -169,7 +170,20 @@ func (s *server) consoleSession(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"csrf":       csrf,
 		"expires_at": sess.AbsoluteExpires,
+		"server":     s.serverLabel(),
 	})
+}
+
+// serverLabel names this server in the console top bar: the public host used
+// in app URLs when configured, otherwise the machine's hostname.
+func (s *server) serverLabel() string {
+	if s.publicHost != "" {
+		return s.publicHost
+	}
+	if h, err := os.Hostname(); err == nil {
+		return h
+	}
+	return ""
 }
 
 // consoleLogout implements POST /v1/console/logout: revokes the session.

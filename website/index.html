@@ -5,22 +5,22 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AcornFox - 在 AI 工作台里，把应用部署到你自己的服务器</title>
     <meta name="description" content="AcornFox 是开源的单机部署平台：在 Claude Code、Codex 等 AI 工作台里说一句话，应用就构建、上线到你自己的 Linux 服务器。失败时返回结构化诊断，AI 读完即可修复。">
-    <meta name="theme-color" content="#050b18">
-    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M6 13c0-5 4.5-8 10-8s10 3 10 8z' fill='%235ee7ff'/%3E%3Cpath d='M8 13h16c0 8-3.5 14-8 14s-8-6-8-14z' fill='%232aa8d8'/%3E%3Cpath d='M16 5V2' stroke='%235ee7ff' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E">
+    <meta name="theme-color" content="#050505">
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M6 13c0-5 4.5-8 10-8s10 3 10 8z' fill='%23ffffff'/%3E%3Cpath d='M8 13h16c0 8-3.5 14-8 14s-8-6-8-14z' fill='%239a9a9a'/%3E%3Cpath d='M16 5V2' stroke='%23ffffff' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E">
     <script>document.documentElement.className += ' js';</script>
     <style>
         :root {
-            --bg: #050b18;
-            --bg-2: #08142a;
-            --panel: rgba(12, 26, 52, 0.62);
-            --panel-solid: #0b1a33;
-            --line: rgba(120, 190, 255, 0.14);
-            --line-strong: rgba(120, 210, 255, 0.32);
-            --text: #e6f1ff;
-            --text-dim: #8fa5c4;
-            --text-faint: #5d7393;
-            --accent: #5ee7ff;
-            --accent-2: #3b82f6;
+            --bg: #050505;
+            --bg-2: #0b0b0b;
+            --panel: rgba(18, 18, 18, 0.66);
+            --panel-solid: #111111;
+            --line: rgba(255, 255, 255, 0.10);
+            --line-strong: rgba(255, 255, 255, 0.24);
+            --text: #f5f5f5;
+            --text-dim: #a3a3a3;
+            --text-faint: #6e6e6e;
+            --accent: #ffffff;
+            --accent-2: #d4d4d4;
             --ok: #4ade80;
             --warn: #fbbf24;
             --err: #f87171;
@@ -47,12 +47,12 @@
         nav {
             position: fixed; inset: 0 0 auto 0; z-index: 20;
             backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
-            background: rgba(5, 11, 24, 0.55);
+            background: rgba(5, 5, 5, 0.55);
             border-bottom: 1px solid var(--line);
         }
         nav .wrap { display: flex; align-items: center; justify-content: space-between; height: 64px; }
         .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 18px; letter-spacing: .3px; }
-        .brand svg { width: 26px; height: 26px; filter: drop-shadow(0 0 8px rgba(94, 231, 255, .45)); }
+        .brand svg { width: 26px; height: 26px; filter: drop-shadow(0 0 8px rgba(255, 255, 255, .25)); }
         .nav-links { display: flex; gap: 28px; font-size: 14px; color: var(--text-dim); }
         .nav-links a:hover { color: var(--text); }
         .nav-links .ext::after { content: " ↗"; font-size: 11px; opacity: .6; }
@@ -72,13 +72,13 @@
         .hero::before { /* 不支持 WebGL 时的静态底色，也给画布打底 */
             content: ""; position: absolute; inset: 0; z-index: -3;
             background:
-                radial-gradient(1200px 600px at 70% 10%, rgba(59, 130, 246, .28), transparent 60%),
-                radial-gradient(900px 500px at 15% 30%, rgba(94, 231, 255, .16), transparent 60%),
-                linear-gradient(180deg, #071630 0%, var(--bg) 85%);
+                radial-gradient(1200px 600px at 70% 10%, rgba(210, 210, 210, .28), transparent 60%),
+                radial-gradient(900px 500px at 15% 30%, rgba(255, 255, 255, .16), transparent 60%),
+                linear-gradient(180deg, #0c0c0c 0%, var(--bg) 85%);
         }
         .shade { /* 压暗文字一侧，保证正文可读 */
             position: absolute; inset: 0; z-index: -1; pointer-events: none;
-            background: linear-gradient(90deg, rgba(5, 11, 24, .72) 0%, rgba(5, 11, 24, .45) 42%, rgba(5, 11, 24, .1) 75%);
+            background: linear-gradient(90deg, rgba(5, 5, 5, .72) 0%, rgba(5, 5, 5, .45) 42%, rgba(5, 5, 5, .1) 75%);
         }
         .hero::after { /* 底部淡出，接到下方内容 */
             content: ""; position: absolute; inset: auto 0 0 0; height: 220px; z-index: -1;
@@ -91,7 +91,7 @@
             display: inline-flex; align-items: center; gap: 8px;
             font-family: var(--mono); font-size: 12px; color: var(--accent);
             padding: 6px 12px; border: 1px solid var(--line-strong); border-radius: 999px;
-            background: rgba(94, 231, 255, .06);
+            background: rgba(255, 255, 255, .06);
         }
         .eyebrow i { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 10px var(--accent); }
         h1 {
@@ -100,7 +100,7 @@
             text-wrap: balance;
         }
         h1 .glow {
-            background: linear-gradient(100deg, #ffffff 0%, var(--accent) 55%, #7aa7ff 100%);
+            background: linear-gradient(100deg, #ffffff 0%, var(--accent) 55%, #a3a3a3 100%);
             -webkit-background-clip: text; background-clip: text; color: transparent;
         }
         .lead { font-size: 18px; color: var(--text-dim); max-width: 34em; }
@@ -111,14 +111,14 @@
             font: 13px var(--sans); color: var(--text-dim); background: transparent;
             border: 1px solid transparent; border-radius: 8px; padding: 5px 12px; cursor: pointer;
         }
-        .tab[aria-selected="true"] { color: var(--text); border-color: var(--line-strong); background: rgba(94, 231, 255, .07); }
+        .tab[aria-selected="true"] { color: var(--text); border-color: var(--line-strong); background: rgba(255, 255, 255, .07); }
         .cmd {
             display: flex; align-items: center; gap: 10px;
-            background: rgba(3, 9, 20, .72); border: 1px solid var(--line-strong); border-radius: 12px;
+            background: rgba(3, 3, 3, .72); border: 1px solid var(--line-strong); border-radius: 12px;
             padding: 12px 12px 12px 16px;
-            box-shadow: 0 0 0 1px rgba(94, 231, 255, .04), 0 18px 50px -20px rgba(94, 231, 255, .35);
+            box-shadow: 0 0 0 1px rgba(255, 255, 255, .04), 0 18px 50px -20px rgba(255, 255, 255, .35);
         }
-        .cmd code { flex: 1; min-width: 0; font-size: 13px; color: #cfe8ff; white-space: nowrap; overflow-x: auto; scrollbar-width: none; }
+        .cmd code { flex: 1; min-width: 0; font-size: 13px; color: #e5e5e5; white-space: nowrap; overflow-x: auto; scrollbar-width: none; }
         .cmd code::-webkit-scrollbar { display: none; }
         .cmd code .p { color: var(--accent); user-select: none; }
         .copy {
@@ -133,11 +133,11 @@
         .step-label b { color: var(--accent); font-weight: 600; }
         .prompt {
             display: flex; align-items: flex-start; gap: 12px;
-            background: rgba(3, 9, 20, .72); border: 1px solid var(--line-strong); border-radius: 12px;
+            background: rgba(3, 3, 3, .72); border: 1px solid var(--line-strong); border-radius: 12px;
             padding: 14px 12px 14px 16px;
-            box-shadow: 0 0 0 1px rgba(94, 231, 255, .04), 0 18px 50px -20px rgba(94, 231, 255, .35);
+            box-shadow: 0 0 0 1px rgba(255, 255, 255, .04), 0 18px 50px -20px rgba(255, 255, 255, .35);
         }
-        .prompt p { flex: 1; min-width: 0; font-size: 14px; line-height: 1.7; color: #dbeeff; }
+        .prompt p { flex: 1; min-width: 0; font-size: 14px; line-height: 1.7; color: #ededed; }
 
         .stats { display: flex; gap: 36px; margin-top: 36px; flex-wrap: wrap; }
         .stat b { display: block; font-size: 26px; font-weight: 800; font-family: var(--mono); color: var(--text); }
@@ -147,7 +147,7 @@
         .console {
             background: var(--panel); border: 1px solid var(--line-strong); border-radius: var(--radius);
             backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
-            box-shadow: 0 30px 80px -30px rgba(0, 0, 0, .8), 0 0 60px -20px rgba(94, 231, 255, .25);
+            box-shadow: 0 30px 80px -30px rgba(0, 0, 0, .8), 0 0 60px -20px rgba(255, 255, 255, .25);
             overflow: hidden; font-size: 13px;
         }
         .console-bar {
@@ -156,7 +156,7 @@
             font-family: var(--mono); font-size: 12px;
         }
         .dots { display: flex; gap: 6px; }
-        .dots i { width: 10px; height: 10px; border-radius: 50%; background: #1e3354; }
+        .dots i { width: 10px; height: 10px; border-radius: 50%; background: #2a2a2a; }
         .console-body { padding: 16px 18px 18px; display: grid; gap: 12px; min-height: 340px; }
         .msg { display: grid; grid-template-columns: 34px 1fr; gap: 10px; }
         .js .msg { opacity: 0; transform: translateY(6px); transition: opacity .45s, transform .45s; }
@@ -167,8 +167,8 @@
         .bubble.user { color: #ffffff; }
         .log {
             margin-top: 6px; font-family: var(--mono); font-size: 12px; line-height: 1.7;
-            background: rgba(2, 6, 14, .55); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px;
-            color: #a9c3e4; white-space: pre-wrap; overflow-wrap: anywhere;
+            background: rgba(2, 2, 2, .55); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px;
+            color: #bdbdbd; white-space: pre-wrap; overflow-wrap: anywhere;
         }
         .log .s { color: var(--accent); }
         .log .e { color: var(--err); }
@@ -185,7 +185,7 @@
         .loop { margin-top: 48px; display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; counter-reset: step; }
         .step {
             position: relative; padding: 22px 20px; border: 1px solid var(--line); border-radius: var(--radius);
-            background: linear-gradient(180deg, rgba(14, 30, 58, .55), rgba(8, 18, 36, .35));
+            background: linear-gradient(180deg, rgba(22, 22, 22, .55), rgba(12, 12, 12, .35));
         }
         .step::before {
             counter-increment: step; content: "0" counter(step);
@@ -193,12 +193,12 @@
         }
         .step h3 { font-size: 17px; margin: 10px 0 6px; }
         .step p { font-size: 14px; color: var(--text-dim); }
-        .step code { font-size: 12px; color: #cfe8ff; background: rgba(94, 231, 255, .08); padding: 1px 6px; border-radius: 5px; }
+        .step code { font-size: 12px; color: #e5e5e5; background: rgba(255, 255, 255, .08); padding: 1px 6px; border-radius: 5px; }
 
         /* 特性 */
         .features { margin-top: 48px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
         .feature { background: var(--bg); padding: 30px 26px; transition: background .25s; }
-        .feature:hover { background: #07122a; }
+        .feature:hover { background: #0d0d0d; }
         .feature svg { width: 28px; height: 28px; stroke: var(--accent); fill: none; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
         .feature h3 { font-size: 17px; margin: 16px 0 8px; }
         .feature p { font-size: 14px; color: var(--text-dim); }
@@ -224,7 +224,7 @@
         .cta { text-align: center; padding: 120px 0 130px; position: relative; overflow: hidden; }
         .cta::before {
             content: ""; position: absolute; inset: 0; z-index: -1;
-            background: radial-gradient(700px 300px at 50% 100%, rgba(94, 231, 255, .14), transparent 70%);
+            background: radial-gradient(700px 300px at 50% 100%, rgba(255, 255, 255, .14), transparent 70%);
         }
         .cta .install { margin: 32px auto 0; text-align: left; }
         .cta .sub { margin: 0 auto; }
@@ -240,7 +240,7 @@
 
         @media (max-width: 960px) {
             .hero-grid { grid-template-columns: 1fr; gap: 40px; }
-            .shade { background: rgba(5, 11, 24, .5); }
+            .shade { background: rgba(5, 5, 5, .5); }
             .loop { grid-template-columns: repeat(2, 1fr); }
             .features, .benches { grid-template-columns: 1fr 1fr; }
             .arch { grid-template-columns: 1fr; }
@@ -263,7 +263,7 @@
     <nav>
         <div class="wrap">
             <a class="brand" href="#">
-                <svg viewBox="0 0 32 32" aria-hidden="true"><path d="M6 13c0-5 4.5-8 10-8s10 3 10 8z" fill="#5ee7ff"/><path d="M8 13h16c0 8-3.5 14-8 14s-8-6-8-14z" fill="#2aa8d8"/><path d="M16 5V2" stroke="#5ee7ff" stroke-width="2" stroke-linecap="round"/></svg>
+                <svg viewBox="0 0 32 32" aria-hidden="true"><path d="M6 13c0-5 4.5-8 10-8s10 3 10 8z" fill="#ffffff"/><path d="M8 13h16c0 8-3.5 14-8 14s-8-6-8-14z" fill="#9a9a9a"/><path d="M16 5V2" stroke="#ffffff" stroke-width="2" stroke-linecap="round"/></svg>
                 AcornFox
             </a>
             <div class="nav-links">
@@ -563,9 +563,9 @@ app.example.com  <span class="ok">ready</span></div></div></div>
             '  float glint=step(.72,hash(id+4.1))*tw*near*smoothstep(.22,.02,d);',
             '  float top=smoothstep(-.1,1.,uv.y);',
             '  float m=1.-smoothstep(0.,.5,distance(uv,uMouse));',
-            '  vec3 deep=mix(vec3(.010,.028,.062),vec3(.024,.07,.15),top);',
-            '  vec3 line=mix(vec3(.12,.42,.82),vec3(.36,.86,1.),c);',
-            '  vec3 col=deep+line*c*(.34+.40*top)*(1.+.5*m)+vec3(.8,.96,1.)*glint*(.55+.45*top)*(1.+.4*m);',
+            '  vec3 deep=mix(vec3(.012,.012,.013),vec3(.05,.05,.054),top);',
+            '  vec3 line=mix(vec3(.42,.42,.44),vec3(.93,.93,.96),c);',
+            '  vec3 col=deep+line*c*(.34+.40*top)*(1.+.5*m)+vec3(1.,1.,1.)*glint*(.55+.45*top)*(1.+.4*m);',
             '  gl_FragColor=vec4(col,1.);',
             '}'
         ].join('\n');

@@ -5,13 +5,15 @@
    overridden by data-theme on <html>. */
 
 :root {
-  --bg: #111214; --wall1: #15171b; --wall2: #0e0f11;
-  --panel: rgba(28, 30, 34, 0.86); --panel-solid: #1c1e22; --line: rgba(255,255,255,0.08);
-  --text: #e8e9ec; --muted: #9a9ca3; --faint: #6b6e76;
-  --accent: #3ecf8e; --accent-soft: rgba(62,207,142,0.14);
+  --bg: #0a0a0a; --wall1: #141414; --wall2: #070707;
+  --panel: rgba(22, 22, 22, 0.9); --panel-solid: #161616; --line: rgba(255,255,255,0.09);
+  --text: #f2f2f2; --muted: #a0a0a0; --faint: #6a6a6a;
+  /* 品牌色为黑白：深色下为白，浅色下为黑。状态只用 ok / warn / bad 三种颜色。 */
+  --accent: #f2f2f2; --accent-soft: rgba(255,255,255,0.10); --accent-ink: #0a0a0a;
+  --ok: #3ecf8e; --ok-soft: rgba(62,207,142,0.14);
   --warn: #f5a524; --warn-soft: rgba(245,165,36,0.14);
   --bad: #f0616d; --bad-soft: rgba(240,97,109,0.14);
-  --icon: #24262b; --shadow: 0 20px 60px rgba(0,0,0,0.45);
+  --icon: #1c1c1c; --shadow: 0 20px 60px rgba(0,0,0,0.55);
   --radius: 14px;
   font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Segoe UI", "Microsoft YaHei", sans-serif;
 }
@@ -20,17 +22,21 @@
    override is set, or when data-theme="light" is chosen. */
 @media (prefers-color-scheme: light) {
   :root:not([data-theme="dark"]) {
-    --bg: #f3f4f6; --wall1: #f7f8fa; --wall2: #eceef2;
-    --panel: rgba(255,255,255,0.9); --panel-solid: #ffffff; --line: rgba(0,0,0,0.08);
-    --text: #1d1f23; --muted: #62656d; --faint: #9a9da5; --icon: #ffffff;
-    --shadow: 0 20px 50px rgba(20,24,33,0.14);
+    --bg: #f5f5f5; --wall1: #fafafa; --wall2: #ececec;
+    --panel: rgba(255,255,255,0.94); --panel-solid: #ffffff; --line: rgba(0,0,0,0.09);
+    --text: #111111; --muted: #555555; --faint: #999999; --icon: #ffffff;
+    --accent: #111111; --accent-soft: rgba(0,0,0,0.06); --accent-ink: #ffffff;
+    --ok: #16a34a; --ok-soft: rgba(22,163,74,0.12);
+    --shadow: 0 20px 50px rgba(0,0,0,0.12);
   }
 }
 :root[data-theme="light"] {
-  --bg: #f3f4f6; --wall1: #f7f8fa; --wall2: #eceef2;
-  --panel: rgba(255,255,255,0.9); --panel-solid: #ffffff; --line: rgba(0,0,0,0.08);
-  --text: #1d1f23; --muted: #62656d; --faint: #9a9da5; --icon: #ffffff;
-  --shadow: 0 20px 50px rgba(20,24,33,0.14);
+  --bg: #f5f5f5; --wall1: #fafafa; --wall2: #ececec;
+  --panel: rgba(255,255,255,0.94); --panel-solid: #ffffff; --line: rgba(0,0,0,0.09);
+  --text: #111111; --muted: #555555; --faint: #999999; --icon: #ffffff;
+  --accent: #111111; --accent-soft: rgba(0,0,0,0.06); --accent-ink: #ffffff;
+  --ok: #16a34a; --ok-soft: rgba(22,163,74,0.12);
+  --shadow: 0 20px 50px rgba(0,0,0,0.12);
 }
 
 * { box-sizing: border-box; }
@@ -40,7 +46,8 @@ body {
   font-size: 14px;
 }
 button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; }
-a { color: var(--accent); }
+a { color: var(--text); text-decoration: underline; text-underline-offset: 3px; text-decoration-color: var(--faint); }
+a:hover { text-decoration-color: var(--text); }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
 .grow { flex: 1; }
 .muted { color: var(--muted); }
@@ -57,10 +64,10 @@ a { color: var(--accent); }
   background: color-mix(in srgb, var(--bg) 70%, transparent); backdrop-filter: blur(10px);
 }
 .brand { display: flex; align-items: center; gap: 8px; font-weight: 600; }
-.logo { width: 22px; height: 22px; border-radius: 6px; background: var(--accent); display: grid; place-items: center; color: #08120d; font-size: 13px; font-weight: 800; }
+.logo { width: 22px; height: 22px; display: block; color: var(--text); }
 .server { color: var(--muted); font-size: 13px; }
 .health { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
-.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); flex: none; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); flex: none; }
 .dot.warn { background: var(--warn); }
 .dot.bad { background: var(--bad); }
 .dot.idle { background: var(--faint); }
@@ -73,7 +80,7 @@ a { color: var(--accent); }
 .apps { display: grid; grid-template-columns: repeat(auto-fill, 112px); gap: 26px 18px; justify-content: center; }
 .app { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 10px 4px; border-radius: 12px; width: 112px; }
 .app:hover { background: var(--line); }
-.tile { position: relative; width: 64px; height: 64px; border-radius: 16px; background: var(--icon); border: 1px solid var(--line); display: grid; place-items: center; box-shadow: 0 6px 18px rgba(0,0,0,.18); font-size: 24px; font-weight: 700; color: #fff; }
+.tile { position: relative; width: 64px; height: 64px; border-radius: 16px; background: var(--icon); border: 1px solid var(--line); display: grid; place-items: center; box-shadow: 0 6px 18px rgba(0,0,0,.18); font-size: 24px; font-weight: 700; color: var(--text); }
 .tile .badge { position: absolute; right: -3px; bottom: -3px; width: 14px; height: 14px; border-radius: 50%; border: 3px solid var(--bg); }
 .app .name { font-size: 13px; text-align: center; word-break: break-all; }
 .app .sub { font-size: 11.5px; color: var(--muted); margin-top: -4px; }
@@ -81,7 +88,7 @@ a { color: var(--accent); }
 
 /* Dock */
 .dock { position: absolute; left: 50%; bottom: 18px; transform: translateX(-50%); display: flex; gap: 4px; padding: 6px; background: var(--panel); border: 1px solid var(--line); border-radius: 16px; box-shadow: var(--shadow); backdrop-filter: blur(16px); z-index: 20; }
-.dock button { display: flex; align-items: center; gap: 7px; padding: 8px 12px; border-radius: 11px; color: var(--muted); font-size: 13px; }
+.dock button { display: flex; align-items: center; gap: 7px; padding: 8px 12px; border-radius: 11px; color: var(--muted); font-size: 13px; white-space: nowrap; flex: none; }
 .dock button:hover, .dock button.on { background: var(--line); color: var(--text); }
 .dock .sep { width: 1px; margin: 6px 4px; background: var(--line); }
 
@@ -112,12 +119,15 @@ a { color: var(--accent); }
 .win-head { display: flex; align-items: center; gap: 10px; padding: 12px 16px; border-bottom: 1px solid var(--line); }
 .win-head h3 { margin: 0; font-size: 15px; font-weight: 600; }
 .win-head .tile { width: 30px; height: 30px; border-radius: 9px; font-size: 14px; }
-.win-body { padding: 16px 18px; overflow: auto; }
-.tabs { display: flex; gap: 2px; padding: 0 12px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
-.tabs button { padding: 10px 10px; color: var(--muted); font-size: 13px; border-bottom: 2px solid transparent; }
+.win-body { padding: 16px 18px; overflow: auto; flex: 1; min-height: 0; }
+.win.app-win { height: min(620px, 74vh); }
+.win:focus { outline: none; }
+.tabs { display: flex; gap: 2px; padding: 0 12px; border-bottom: 1px solid var(--line); overflow-x: auto; scrollbar-width: none; flex: none; }
+.tabs::-webkit-scrollbar { display: none; }
+.tabs button { padding: 10px 10px; color: var(--muted); font-size: 13px; border-bottom: 2px solid transparent; white-space: nowrap; flex: none; }
 .tabs button.on { color: var(--text); border-color: var(--accent); }
 
-.pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px; border-radius: 999px; font-size: 12px; background: var(--accent-soft); color: var(--accent); }
+.pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px; border-radius: 999px; font-size: 12px; background: var(--ok-soft); color: var(--ok); }
 .pill.bad { background: var(--bad-soft); color: var(--bad); }
 .pill.warn { background: var(--warn-soft); color: var(--warn); }
 .pill.idle { background: var(--line); color: var(--muted); }
@@ -129,8 +139,8 @@ a { color: var(--accent); }
 
 .btn { padding: 7px 12px; border-radius: 9px; border: 1px solid var(--line); font-size: 13px; }
 .btn:hover { background: var(--line); }
-.btn.primary { background: var(--accent); color: #07140e; border-color: transparent; font-weight: 600; }
-.btn.primary:hover { filter: brightness(1.05); background: var(--accent); }
+.btn.primary { background: var(--accent); color: var(--accent-ink); border-color: transparent; font-weight: 600; }
+.btn.primary:hover { opacity: .88; background: var(--accent); }
 .btn.danger { color: var(--bad); }
 .btn[disabled] { opacity: .5; cursor: default; }
 .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
@@ -150,10 +160,12 @@ a { color: var(--accent); }
 .timeline li b { width: 64px; flex: none; }
 .timeline .grow { min-width: 0; }
 
-.logbox { margin: 0; white-space: pre-wrap; color: var(--muted); max-height: 320px; overflow: auto; }
+.logbox { margin: 0; white-space: pre-wrap; color: var(--muted); max-height: 360px; overflow: auto; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: rgba(0,0,0,.28); line-height: 1.6; }
+:root[data-theme="light"] .logbox { background: rgba(0,0,0,.04); }
+@media (prefers-color-scheme: light) { :root:not([data-theme="dark"]) .logbox { background: rgba(0,0,0,.04); } }
 
 .bar { height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; }
-.bar i { display: block; height: 100%; background: var(--accent); border-radius: 3px; }
+.bar i { display: block; height: 100%; background: var(--text); border-radius: 3px; }
 .metric { margin-bottom: 12px; }
 .metric .row { justify-content: space-between; }
 
@@ -192,7 +204,7 @@ a { color: var(--accent); }
 .envlist .k { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 
 /* Current-value stat tiles: no fabricated history and no color-only meaning. */
-.metric-tiles { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%, 180px),1fr)); gap:12px; margin:16px 0; }
+.metric-tiles { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%, 128px),1fr)); gap:12px; margin:16px 0; }
 .metric-tile { display:flex; flex-direction:column; gap:8px; padding:14px; border:1px solid var(--line); border-radius:10px; min-width:0; overflow-wrap:anywhere; }
 .metric-tile strong { font-size:1.4rem; font-weight:600; color:var(--text); }
 .log-controls { flex-wrap:wrap; }
@@ -206,3 +218,20 @@ a { color: var(--accent); }
 .addon-card h4 { margin:0; }
 .addon-card .kv { margin-top:14px; margin-bottom:0; }
 .addon-card dd { overflow-wrap:anywhere; }
+
+/* 手机：工具栏贴底铺满、可横向滑动；窗口留出工具栏的空间 */
+@media (max-width: 560px) {
+  .dock { left: 8px; right: 8px; transform: none; bottom: 10px; overflow-x: auto; scrollbar-width: none; justify-content: space-between; }
+  .dock::-webkit-scrollbar { display: none; }
+  .dock button { padding: 8px 10px; }
+  .win { top: 52px; transform: translateX(-50%); max-height: calc(100vh - 52px - 76px); }
+  .win.app-win { height: calc(100vh - 52px - 76px); }
+  .deskwrap { bottom: 76px; }
+  .kv { grid-template-columns: 84px 1fr; }
+  .top .server { display: none; }
+}
+
+/* 可复制的提示语或命令 */
+.copyblock { display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px; margin: 8px 0 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--accent-soft); }
+.copyblock p { flex: 1; min-width: 0; margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.6; color: var(--text); }
+.copyblock .btn { flex: none; }

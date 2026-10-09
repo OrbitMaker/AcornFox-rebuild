@@ -19,10 +19,6 @@ const STATUS = {
 };
 
 const PENDING_STATUSES = new Set(["queued", "building", "starting", "checking", "routing"]);
-const TILE_COLORS = [
-  "#3ecf8e", "#f5a524", "#f0616d", "#5b8def", "#a855f7",
-  "#e05d9e", "#14b8a6", "#f97316", "#0ea5e9", "#8b5cf6",
-];
 
 // el creates an element with attributes and children. Text children are set as
 // text nodes; never via innerHTML.
@@ -50,12 +46,6 @@ function firstChar(name) {
   return chars.length ? chars[0].toUpperCase() : "?";
 }
 
-// hashColor picks a stable color from the app name.
-function hashColor(name) {
-  let h = 0;
-  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
-  return TILE_COLORS[h % TILE_COLORS.length];
-}
 
 // timeAgo renders a coarse "N 分钟前" string from an ISO timestamp.
 function timeAgo(iso) {
@@ -211,6 +201,32 @@ function focusKey(node) {
   return node.tagName + ":" + (node.getAttribute("aria-label") || node.getAttribute("href") || node.id || node.textContent);
 }
 
+// selectionInside reports whether the user has a non-empty text selection
+// inside node. Polling must not rebuild that node, or the selection is lost.
+function selectionInside(node) {
+  const sel = window.getSelection();
+  if (!node || !sel || sel.isCollapsed || !sel.rangeCount) return false;
+  return node.contains(sel.anchorNode) || node.contains(sel.focusNode);
+}
+
+// swapChildren replaces target's children with next's only when the markup
+// differs. Unchanged regions keep their nodes, so selections, hover states and
+// running animations survive the 3-second poll.
+function sameChildren(a, b) {
+  if (a.childNodes.length !== b.childNodes.length) return false;
+  for (let i = 0; i < a.childNodes.length; i++) {
+    if (!a.childNodes[i].isEqualNode(b.childNodes[i])) return false;
+  }
+  return true;
+}
+
+function swapChildren(target, next) {
+  if (sameChildren(target, next)) return false;
+  clear(target);
+  while (next.firstChild) target.append(next.firstChild);
+  return true;
+}
+
 function render() {
   const active = document.activeElement;
   const activeKey = active && active.matches(FOCUSABLE) ? focusKey(active) : null;
@@ -260,8 +276,13 @@ function renderConnectionBanner() {
 }
 
 function renderHealth() {
-  const health = $("health");
-  clear(health);
+  const target = $("health");
+  const health = document.createElement("div");
+  buildHealth(health);
+  swapChildren(target, health);
+}
+
+function buildHealth(health) {
   if (!state.loaded) return;
   const running = state.apps.filter((a) => deriveStatus(a) === "running").length;
   const attention = attentionItems().length;
@@ -296,8 +317,27 @@ function attentionItems() {
 }
 
 function renderDesk() {
-  const desk = $("desk");
-  clear(desk);
+  const target = $("desk");
+  if (selectionInside(target)) return;
+  const desk = document.createElement("div");
+  buildDesk(desk);
+  // The ambient line (CPU / memory percentages) changes on almost every poll;
+  // update it in place instead of rebuilding the whole desk.
+  const curAmb = target.querySelector(".ambient");
+  const nextAmb = desk.querySelector(".ambient");
+  if (curAmb && nextAmb) {
+    const a = target.cloneNode(true), b = desk.cloneNode(true);
+    a.querySelector(".ambient").remove();
+    b.querySelector(".ambient").remove();
+    if (sameChildren(a, b)) {
+      if (!curAmb.isEqualNode(nextAmb)) curAmb.replaceWith(nextAmb);
+      return;
+    }
+  }
+  swapChildren(target, desk);
+}
+
+function buildDesk(desk) {
   if (!state.loaded) {
     desk.append(el("div", { class: "state" }, el("div", { class: "card" }, [
       el("div", { class: "spinner" }), el("p", { text: "正在连接服务器…" }),
@@ -358,7 +398,6 @@ function appTile(a) {
   const st = deriveStatus(a);
   const meta = STATUS[st];
   const tile = el("div", { class: "tile", "aria-hidden": "true", text: firstChar(a.name) });
-  tile.style.background = hashColor(a.name);
   const badgeClass = "badge dot " + meta.dot + (st === "deploying" ? " live" : "");
   tile.append(el("span", { class: badgeClass.trim() }));
   return button(null, "app", () => openApp(a.name), "打开 " + a.name, [
@@ -406,8 +445,13 @@ function button(text, cls, onClick, ariaLabel, children) {
 // ---------------------------------------------------------------------------
 
 function renderDock() {
-  const dock = $("dock");
-  clear(dock);
+  const target = $("dock");
+  const dock = document.createElement("div");
+  buildDock(dock);
+  swapChildren(target, dock);
+}
+
+function buildDock(dock) {
   if (!state.loaded || state.fatal) return;
   const items = [
     ["deploy", "＋ 部署"],
@@ -436,14 +480,23 @@ function renderWindow() {
   const logScrollTop = oldLog?.scrollTop || 0;
   const logAtBottom = !oldLog || oldLog.scrollHeight - oldLog.scrollTop - oldLog.clientHeight < 24;
   const expandedDetails = sameTab ? Array.from(existing.querySelectorAll("details"), (node) => node.open) : [];
+  if (sameTab && !state.fatal && selectionInside(existing)) return;
+
+  let win = null;
+  if (!state.fatal) {
+    if (state.openApp) win = appWindow();
+    else if (state.openTool) win = toolWindow();
+  }
+  if (win && sameTab) {
+    win.querySelectorAll("details").forEach((node, index) => { node.open = expandedDetails[index] ?? node.open; });
+    const probe = win.cloneNode(true);
+    probe.id = "window"; probe.dataset.viewKey = viewKey; probe.dataset.detailTab = state.detailTab;
+    probe.setAttribute("tabindex", "-1");
+    if (probe.isEqualNode(existing)) return;
+  }
   if (existing) existing.remove();
   const overlay = $("win-overlay");
   if (overlay) overlay.remove();
-  if (state.fatal) return;
-
-  let win = null;
-  if (state.openApp) win = appWindow();
-  else if (state.openTool) win = toolWindow();
   if (!win) return;
 
   const ov = el("div", { id: "win-overlay", class: "overlay", onclick: closeWindow });
@@ -451,19 +504,18 @@ function renderWindow() {
   win.id = "window";
   win.dataset.viewKey = viewKey;
   win.dataset.detailTab = state.detailTab;
+  win.setAttribute("tabindex", "-1");
   document.body.append(win);
   if (sameTab) {
     win.querySelector(".win-body").scrollTop = scrollTop;
     const logbox = win.querySelector(".logbox");
     if (logbox) logbox.scrollTop = state.logFollow && logAtBottom ? logbox.scrollHeight : logScrollTop;
-    win.querySelectorAll("details").forEach((node, index) => { node.open = expandedDetails[index] || false; });
   }
   // Only the initial open moves focus into the window. In particular, a poll
   // must not steal focus from the separate confirmation dialog.
-  if (!sameView) {
-    const focusable = win.querySelector(FOCUSABLE);
-    if (focusable) focusable.focus({ preventScroll: true });
-  }
+  // Focus the window itself rather than its first control, so the close
+  // button does not light up with a focus ring on every open; Tab moves in.
+  if (!sameView) win.focus({ preventScroll: true });
 }
 
 function windowHead(title, tileText, tileColor, pill) {
@@ -494,9 +546,8 @@ function appWindow() {
   const st = deriveStatus(a);
   const meta = STATUS[st];
 
-  const win = el("section", { class: "win", role: "dialog", "aria-modal": "true", "aria-label": a.name + " 应用窗口" });
+  const win = el("section", { class: "win app-win", role: "dialog", "aria-modal": "true", "aria-label": a.name + " 应用窗口" });
   const t = el("div", { class: "tile", "aria-hidden": "true", text: firstChar(a.name) });
-  t.style.background = hashColor(a.name);
   const head = el("div", { class: "win-head" }, [
     t, el("h3", { text: a.name }), pillNode(meta.text, meta.pill),
     el("div", { class: "grow" }), button("✕", "iconbtn", closeWindow, "关闭（Esc）"),
@@ -528,15 +579,15 @@ function overviewTab(a, st, meta) {
   if (diag) frag.append(diagCard(diag, a.name, failedDeploymentID(a)));
 
   const dl = el("dl", { class: "kv" });
-  dl.append(el("dt", { text: "状态" }));
-  dl.append(el("dd", {}, pillNode(meta.text, meta.pill)));
-
+  const running = !!(a.observed && a.observed.running);
   dl.append(el("dt", { text: "网址" }));
-  if (a.url) {
+  if (a.url && running) {
     dl.append(el("dd", {}, el("span", { class: "url" }, [
       el("a", { href: a.url, target: "_blank", rel: "noopener", text: a.url }),
       button("复制", "btn", () => copyToClipboard(a.url, "网址已复制"), "复制网址"),
     ])));
+  } else if (a.url) {
+    dl.append(el("dd", {}, el("span", { class: "muted", text: a.url + "（未运行，暂无法访问）" })));
   } else {
     dl.append(el("dd", {}, el("span", { class: "muted", text: "部署成功后显示" })));
   }
@@ -547,22 +598,21 @@ function overviewTab(a, st, meta) {
   dl.append(el("dd", { text: verText }));
 
   dl.append(el("dt", { text: "资源" }));
-  if (a.observed && a.observed.running) {
-    dl.append(el("dd", { text: `内存上限 ${a.memory_mb} MB · CPU ${(a.cpu_milli / 1000).toFixed(1)} 核` }));
-  } else {
-    dl.append(el("dd", {}, el("span", { class: "muted", text: "未运行" })));
-  }
+  dl.append(el("dd", { text: `内存上限 ${a.memory_mb} MB · CPU ${(a.cpu_milli / 1000).toFixed(1)} 核` }));
   frag.append(dl);
-  frag.append(appMetricsPanel(a));
+  if (running) frag.append(appMetricsPanel(a));
 
+  // Only offer actions that apply to the current state.
   const row = el("div", { class: "row" });
   if (a.desired === "stopped") {
     row.append(button("启动", "btn primary", () => actOnApp("start"), "启动应用"));
-  } else {
+  } else if (running) {
+    row.append(button("重启", "btn", () => actOnApp("restart"), "重启应用"));
     row.append(button("停止", "btn danger", confirmStop, "停止应用"));
   }
-  row.append(button("回退到上一版", "btn", () => actOnApp("rollback"), "回退到上一版"));
-  frag.append(row);
+  if (live) row.append(button("重新部署", "btn", () => actOnApp("redeploy"), "用当前版本重新部署"));
+  if (live && live.seq > 1) row.append(button("回退到上一版", "btn", () => actOnApp("rollback"), "回退到上一版"));
+  if (row.childNodes.length) frag.append(row);
 
   frag.append(el("p", { class: "faint", text: "未备案域名无法使用 80/443 端口，当前通过 IP:端口 访问。绑定已备案域名后可自动开启 HTTPS。" }));
   return frag;
@@ -582,8 +632,8 @@ function diagCard(diag, appName, deploymentID) {
   ]);
   card.append(row);
   if (diag.log_excerpt) {
-    const details = el("details");
-    details.append(el("summary", { text: "查看日志" }));
+    const details = el("details", { open: "" });
+    details.append(el("summary", { text: "日志片段" }));
     details.append(el("pre", { class: "mono", text: diag.log_excerpt }));
     card.append(details);
   }
@@ -656,15 +706,24 @@ function appMetricsPanel(a) {
   const memory = numberText(metrics.memory_usage_mb, " MB");
   const limit = metrics.memory_limit_mb > 0 ? "上限 " + numberText(metrics.memory_limit_mb, " MB") : "未设置内存上限";
   return el("section", { class: "metric-tiles", "aria-label": a.name + " 当前资源指标" }, [
-    metricTile("CPU 使用率", cpu, "100% 表示使用 1 个核心"),
+    metricTile("CPU 使用率", cpu, "1 核 = 100%"),
     metricTile("内存使用", memory, limit),
-    metricTile("网络接收 / 发送", numberText(metrics.network_rx_mb, " MB") + " / " + numberText(metrics.network_tx_mb, " MB"), "容器累计流量"),
+    metricTile("网络接收 / 发送", sizeText(metrics.network_rx_mb) + " / " + sizeText(metrics.network_tx_mb), "容器累计流量"),
     metricTile("进程数", Number.isFinite(metrics.pids) ? String(metrics.pids) : "不可用"),
   ]);
 }
 
 function observedMetricText(state) {
   return ({ stopped: "已停止", exited: "已停止", missing: "尚无容器", restarting: "正在重启", unavailable: "执行器不可用" })[state] || state || "不可用";
+}
+
+// sizeText formats a megabyte value with a unit that keeps small traffic visible.
+function sizeText(mb) {
+  if (!Number.isFinite(mb)) return "不可用";
+  // A no-break space keeps "35 KB" together; lines may only wrap at " / ".
+  if (mb >= 1024) return (mb / 1024).toFixed(1) + "\u00a0GB";
+  if (mb >= 1) return mb.toFixed(1) + "\u00a0MB";
+  return Math.round(mb * 1024) + "\u00a0KB";
 }
 
 function numberText(value, unit) {
@@ -774,7 +833,7 @@ function settingsTab(a) {
   dl.append(el("dt", { text: "端口" }));
   dl.append(el("dd", { text: String(a.port || 0) }));
   frag.append(dl);
-  frag.append(el("p", { class: "faint", text: "环境变量与数据卷在下次部署时生效；密钥值不会显示或返回。" }));
+  frag.append(el("p", { class: "faint", text: "此处只读。修改请在 AI 工作台里说明，或用 acornfox env set / volume add / app set；改完点「重新部署」生效。密钥值不会显示或返回。" }));
   return frag;
 }
 
@@ -805,7 +864,7 @@ function serverTool() {
   const memoryPct = h.memory_total > 0 ? pct(h.memory_used, h.memory_total) : null;
   const diskPct = h.disk_total > 0 ? pct(h.disk_used, h.disk_total) : null;
   frag.append(el("section", { class: "metric-tiles", "aria-label": "主机当前资源指标" }, [
-    metricTile("CPU 使用率", typeof h.cpu_percent === "number" ? numberText(h.cpu_percent, "%") : "采样中", "相邻轮询之间的平均值"),
+    metricTile("CPU 使用率", typeof h.cpu_percent === "number" ? numberText(h.cpu_percent, "%") : "采样中", "最近几秒的平均值"),
     metricTile("内存使用率", memoryPct !== null ? numberText(memoryPct, "%") : "不可用", bytePair(h.memory_used, h.memory_total)),
     metricTile("磁盘使用率", diskPct !== null ? numberText(diskPct, "%") : "不可用", bytePair(h.disk_used, h.disk_total)),
   ]));
@@ -828,19 +887,29 @@ function uptimeText(s) {
   return h ? `${h} 小时 ${m} 分钟` : `${m} 分钟`;
 }
 
+const SKILL_PROMPT = "请安装 AcornFox Skill：下载 https://acornfox.com/skill/SKILL.md ，保存为你 skills 目录下的 acornfox/SKILL.md（Claude Code 是 ~/.claude/skills，Codex 是 ~/.codex/skills），然后按这个 Skill 把当前项目部署到我的服务器。";
+
+function copyBlock(text, okMsg, label, mono) {
+  return el("div", { class: "copyblock" }, [
+    el("p", { class: mono ? "mono" : "", text }),
+    button("复制", "btn", () => copyToClipboard(text, okMsg), label),
+  ]);
+}
+
 function deployTool() {
   const frag = document.createDocumentFragment();
-  frag.append(el("p", { class: "muted", text: "推荐：在你的 AI 工作台里说「帮我部署」。也可以在项目目录运行：" }));
-  frag.append(el("p", { class: "mono", text: "acornfox deploy ." }));
+  frag.append(el("p", { class: "muted", text: "推荐：在 AI 工作台里说「帮我把这个项目部署到我的服务器」。没有安装 Skill 的话，先把下面这句话发给 AI：" }));
+  frag.append(copyBlock(SKILL_PROMPT, "已复制，发给你的 AI 即可", "复制 Skill 安装提示"));
+  frag.append(el("p", { class: "muted", text: "也可以在项目目录（含 Dockerfile）手动运行：" }));
+  frag.append(copyBlock("acornfox deploy", "命令已复制", "复制部署命令", true));
   return frag;
 }
 
 function aiTool() {
   const frag = document.createDocumentFragment();
-  frag.append(el("p", { text: "1. 在你的电脑安装 AI 工作台技能（N6 提供）。" }));
-  frag.append(el("p", { text: "2. 对 AI 说：「帮我把这个项目部署到我的服务器」。" }));
-  frag.append(el("p", { text: "3. 或在项目目录手动运行：" }));
-  frag.append(el("p", { class: "mono", text: "acornfox deploy" }));
+  frag.append(el("p", { text: "1. 把下面这句话发给你的 AI 工作台（Claude Code、Codex 等），它会安装 AcornFox Skill：" }));
+  frag.append(copyBlock(SKILL_PROMPT, "已复制，发给你的 AI 即可", "复制 Skill 安装提示"));
+  frag.append(el("p", { text: "2. 之后在项目里说「帮我把这个项目部署到我的服务器」。部署失败时，点诊断卡上的「复制给 AI」让它修复。" }));
   return frag;
 }
 
@@ -991,7 +1060,7 @@ async function actOnApp(action) {
   if (!name) return;
   try {
     await api.post("/v1/apps/" + encodeURIComponent(name) + "/" + action, {});
-    toast(action === "start" ? "已提交启动" : action === "rollback" ? "已提交回退，正在部署" : "已提交停止");
+    toast(({ start: "已提交启动", restart: "已提交重启", redeploy: "已提交重新部署", rollback: "已提交回退，正在部署" })[action] || "已提交停止");
     await poll();
     if (state.openApp === name) await loadDetail(name);
   } catch (e) { handleError(e); }
@@ -1025,7 +1094,8 @@ function showConfirm(title, body, okLabel, action) {
   confirmAction = action;
   $("confirm-overlay").hidden = false;
   $("confirm-dialog").hidden = false;
-  ok.focus();
+  // Default focus on the safe choice: Enter must not stop or delete anything.
+  $("confirm-cancel").focus();
 }
 
 function hideConfirm() {
@@ -1198,7 +1268,11 @@ async function boot() {
 
   // Fetch the CSRF token, then start the data loop.
   try {
-    await api.session();
+    const sess = await api.session();
+    if (sess && sess.server) {
+      $("server-label").textContent = sess.server;
+      document.title = "AcornFox · " + sess.server;
+    }
   } catch (e) {
     if (e.status === 401) { handleError(e); return; }
     // A missing session endpoint (e.g. dev) should not block read-only polling.
