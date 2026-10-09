@@ -81,6 +81,7 @@ acornfox logs --json [--tail 200]      # 容器日志
 | `dockerfile_missing` | 按项目类型生成 Dockerfile |
 | `too_large` | 补 `.dockerignore`，排除 node_modules、构建产物、大文件 |
 | `build_failed` | 读 `log_excerpt`，修依赖或构建命令 |
+| `registry_timeout` | 构建时下载依赖超时：服务器在中国大陆时，Dockerfile 里改用国内镜像源（见下文 Dockerfile 要点）后重新部署 |
 | `pull_failed` / `pull_timeout` / `image_not_found` | 基础镜像拉不下来：核对镜像名和标签；服务器在中国大陆时请用户配置 Docker 镜像加速 |
 | `port_not_listening` | 程序要监听 `0.0.0.0`（不是 127.0.0.1），端口与 `--port` 一致 |
 | `container_exited` / `start_failed` | 看 `log_excerpt` 和 `acornfox logs`，修启动命令或缺失的环境变量 |
@@ -126,6 +127,7 @@ acornfox domain add example.com --json
 
 ## Dockerfile 要点
 
+- 服务器在中国大陆时，安装依赖一开始就用国内镜像源，否则 npm / pip / Go 下载常会超时：npm 加 `--registry=https://registry.npmmirror.com`，pip 加 `-i https://mirrors.aliyun.com/pypi/simple`，Go 设 `ENV GOPROXY=https://goproxy.cn,direct`。
 - 程序监听 `0.0.0.0:$PORT`，`EXPOSE` 与 `--port` 一致。
 - 用多阶段构建和 `.dockerignore` 控制体积（上传上限 200 MB）。
 - 需要持久化的数据写到固定目录，再用 `volume add` 挂载。

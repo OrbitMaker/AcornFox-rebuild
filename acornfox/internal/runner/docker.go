@@ -39,6 +39,10 @@ var ansiPattern = regexp.MustCompile(`\x1b\[[0-9;]*[A-Za-z]`)
 var (
 	missingModulePattern = regexp.MustCompile(`(?i)(ModuleNotFoundError|Cannot find module|no required module|not found: )`)
 	pullFailurePattern   = regexp.MustCompile(`(?i)(TLS handshake timeout|i/o timeout|dial tcp|context deadline exceeded|no such host|connection reset|connection refused|EOF)`)
+	// Package-manager downloads during the build (npm / yarn / pnpm, pip, Go
+	// modules, apk, apt). Checked before pullFailurePattern, whose generic
+	// network errors would otherwise blame the base image.
+	registryTimeoutPattern = regexp.MustCompile(`(?i)(npm (ERR!|error) (code |errno )?(ETIMEDOUT|ECONNRESET|ECONNREFUSED|EAI_AGAIN|ENOTFOUND)|network request to https?://\S*registry|ERR_PNPM_META_FETCH_FAIL|trouble with your network connection|Read timed out|ConnectTimeoutError|Could not fetch URL|Retrying \(Retry\(total=|proxy\.golang\.org|sum\.golang\.org|dl-cdn\.alpinelinux\.org|Failed to fetch https?://\S*(debian|ubuntu)|Could not connect to \S*(debian|ubuntu))`)
 )
 
 // Docker implements API against a local Docker daemon. It only ever touches
@@ -250,6 +254,9 @@ func classifyBuild(err error, lines []string) *Failure {
 		Hint:       "根据日志修改 Dockerfile 或依赖后重新部署",
 	}
 	switch {
+	case registryTimeoutPattern.MatchString(all):
+		f.Code = "registry_timeout"
+		f.Hint = "构建时访问软件包源超时。服务器在中国大陆时，在 Dockerfile 中改用国内镜像源后重新部署：npm 加 --registry=https://registry.npmmirror.com；pip 加 -i https://mirrors.aliyun.com/pypi/simple；Go 设 ENV GOPROXY=https://goproxy.cn,direct；Alpine 用 sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories"
 	case pullFailurePattern.MatchString(all):
 		f.Code = "base_image_not_found"
 		f.Hint = "基础镜像拉取失败：检查镜像名，或为服务器配置镜像加速后重试"
