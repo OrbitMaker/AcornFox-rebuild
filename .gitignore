@@ -29,3 +29,6 @@ dist-core-stub/
 /acornfox/acornfox
 /acornfox/acornfox-*
 !/acornfox/acornfox-*/
+
+# 服务器、IP、DNS 等运维信息只放本地，不进仓库（仓库公开）。
+/ops-private/

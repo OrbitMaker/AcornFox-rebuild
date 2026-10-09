@@ -64,10 +64,10 @@ evidence tools. The current positive local fixture is:
 {
   "provider": "aliyun",
   "product": "ecs",
-  "account_id": "<account-id>",
+  "account_id": "<云账号 ID>",
   "region": "cn-shanghai",
-  "instance_id": "i-REDACTED",
-  "public_ipv4": "<server-ip>",
+  "instance_id": "<实例 ID>",
+  "public_ipv4": "<公网 IP>",
   "private_ipv4": "172.20.81.108"
 }
 ```

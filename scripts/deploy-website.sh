@@ -3,13 +3,13 @@ set -euo pipefail
 
 # AcornFox 官网部署脚本
 # 把仓库中已提交的 website/ 上传到服务器，由 Caddy 提供静态页面并自动申请 HTTPS 证书。
-# 默认目标是上海包年包月 ECS；官网与测试机分开，避免互相影响。
-# 用法: SSH_KEY=~/.ssh/xxx scripts/deploy-website.sh
+# 官网服务器与测试机分开，避免互相影响。服务器信息不写进仓库，通过环境变量传入。
+# 用法: SERVER_IP=服务器地址 SSH_KEY=~/.ssh/xxx scripts/deploy-website.sh
 #
 # Caddy 配置只写官网自己的站点文件 /etc/caddy/sites/acornfox-website.caddy，
 # 主 Caddyfile 只确保有 import 这一行，不覆盖服务器上已有的其他站点。
 
-SERVER_IP="${SERVER_IP:-<server-ip>}"
+SERVER_IP="${SERVER_IP:?请用 SERVER_IP 指定官网服务器地址}"
 SERVER_USER="${SERVER_USER:-root}"
 DOMAIN="${DOMAIN:-acornfox.com}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

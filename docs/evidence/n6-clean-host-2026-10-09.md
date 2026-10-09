@@ -6,13 +6,13 @@
 
 | 项 | 值 |
 | --- | --- |
-| 实例 | `i-REDACTED`，ecs.c6.large（2 核 4 GB），cn-zhangjiakou-a，抢占式，24 小时自动释放 |
+| 实例 | 国内云主机，2 核 4 GB，抢占式，测试后释放 |
 | 系统 | Ubuntu 24.04.5 LTS，官方镜像 `ubuntu_24_04_x64_20G_alibase_20260916.vhd`，开机即装，无手工改动 |
-| 安全组 | 测试专用 `sg-REDACTED`：TCP 22、80、443、18810-18899 |
+| 安全组 | 测试专用：TCP 22、80、443、18810-18899 |
 | 服务端 | 本地构建 `0.2.0-rc2`（`install.sh --binary`，尚无 GitHub Release） |
 | 客户端 | macOS arm64，本地构建 CLI，经 SSH 连接 |
 
-前两台实例（`i-REDACTED`、`i-REDACTED`）用于发现和修复问题，已释放；其结果不作为验收证据。
+前两台实例用于发现和修复问题，已释放；其结果不作为验收证据。
 
 ## 实测中发现并修复的问题
 
@@ -33,7 +33,7 @@
 | 检查 | 结果 |
 | --- | --- |
 | 一条命令安装 | exit 0；Docker 29.9.0（腾讯源第 2 次重试成功）、Caddy 2.8.4、server/runner/caddy/docker 全部 active；3 个 socket 属主权限正确；10 分钟内无 warning 日志 |
-| 首次部署（Dockerfile 项目） | 24 秒上线，输出 `http://<server-ip>:18810`，公网访问返回应用内容 |
+| 首次部署（Dockerfile 项目） | 24 秒上线，输出 `http://<服务器IP>:18810`，公网访问返回应用内容 |
 | 失败诊断 | 启动即退出的版本：判失败，诊断"容器启动后退出或反复重启"并附日志片段；旧版本继续服务 |
 | 附加服务 | `add postgres`：healthcheck 通过，5432 不对外发布，应用容器注入 `DATABASE_URL` 并可写入数据 |
 | 生命周期 | stop（约 5 秒后停止，访问中断）/ start / restart / redeploy 后数据保留 |
@@ -45,31 +45,31 @@
 
 ## 发布后正式路径（v0.2.0 + Gitee 镜像）
 
-v0.2.0 发布到 GitHub 后，张家口测试机直连 GitHub 下载约 10 KB/s：`upgrade.sh` 6.5 分钟，`install-cli.sh` 超过 20 分钟未完成。按用户选定方案建 Gitee 镜像 `VIP13390/AcornFox-rebuild`（ADR-0011）后：
+v0.2.0 发布到 GitHub 后，国内测试机直连 GitHub 下载约 10 KB/s：`upgrade.sh` 6.5 分钟，`install-cli.sh` 超过 20 分钟未完成。按用户选定方案建 Gitee 镜像 `VIP13390/AcornFox-rebuild`（ADR-0011）后：
 
 | 检查 | 结果 |
 | --- | --- |
 | Gitee 匿名下载 | 13 MB 二进制 6.5 秒（约 2 MB/s），SHA256 通过；Gitee 发行版 API 可匿名取最新版本 |
 | `install-cli.sh`（Gitee 优先） | 8 秒完成并通过校验 |
 | `upgrade.sh`（Gitee 优先） | 15 秒；首次因 ip-api 超时误判为境外，改为先查云元数据并沿用安装时判断后通过 |
-| 全新实例 `i-REDACTED` 原样执行 README 国内命令 `curl -fsSL https://gitee.com/VIP13390/AcornFox-rebuild/raw/main/scripts/install/install.sh \| sudo bash` | exit 0，355 秒；其中 Docker 约 5 分钟（阿里云 Docker 源仍不一致，重试后换腾讯源），Caddy 经 ghfast 约 40 秒，AcornFox 从 Gitee 约 8 秒 |
+| 全新国内实例原样执行 README 国内命令 `curl -fsSL https://gitee.com/VIP13390/AcornFox-rebuild/raw/main/scripts/install/install.sh \| sudo bash` | exit 0，355 秒；其中 Docker 约 5 分钟（阿里云 Docker 源仍不一致，重试后换腾讯源），Caddy 经 ghfast 约 40 秒，AcornFox 从 Gitee 约 8 秒 |
 | 发布版 macOS CLI（`dist/acornfox_darwin_arm64`，v0.2.0） | 首次连接按设计要求先确认主机指纹；`deploy` 11.6 秒上线，公网访问正常 |
 
 ### 安装耗时优化（同日）
 
 上面 355 秒的分解：原以为慢在 Docker，按 apt 日志实测是 `install.sh` 把阿里云镜像自带的内网源 `mirrors.cloud.aliyuncs.com` 当成"非国内源"替换成公网 `mirrors.aliyun.com`（正则 `mirrors\.[a-z]+\.com` 匹配不到两级子域），冷启动 `apt-get update` 由 17 秒变为 251 秒（同为 203 MB 索引）。修复：只在源指向境外官方地址时替换，并停用指向官方地址的 deb822 `*.sources`；Docker 在阿里云/腾讯云先用内网源（GPG 密钥仍经 https 获取），索引不一致直接换源不重试。
 
-全新实例 `i-REDACTED` 管道执行：**110 秒**（原 355 秒）。apt update 18 秒、基础依赖 5 秒、Docker 22 秒（阿里云内网源首次成功）、Caddy 50 秒（GitHub 直连低速中止后经代理）、AcornFox 8 秒（Gitee）。腾讯云内网 Docker 源未实测。
+全新国内实例管道执行：**110 秒**（原 355 秒）。apt update 18 秒、基础依赖 5 秒、Docker 22 秒（阿里云内网源首次成功）、Caddy 50 秒（GitHub 直连低速中止后经代理）、AcornFox 8 秒（Gitee）。腾讯云内网 Docker 源未实测。
 
-随后 Caddy 也改为随发行版附在 Gitee（官方安装包与许可证；校验文件优先取 Caddy 官方 GitHub）。国内镜像站无 Caddy 官方 apt 仓库，Ubuntu 仓库的 2.6.2 实测不支持 `persist_config`。全新实例 `i-REDACTED` 原样执行 README 国内命令：**90 秒**。apt update 23 秒、基础依赖 7 秒、Docker 31 秒、Caddy 11 秒、AcornFox 8 秒，四个服务 active。
+随后 Caddy 也改为随发行版附在 Gitee（官方安装包与许可证；校验文件优先取 Caddy 官方 GitHub）。国内镜像站无 Caddy 官方 apt 仓库，Ubuntu 仓库的 2.6.2 实测不支持 `persist_config`。全新国内实例原样执行 README 国内命令：**90 秒**。apt update 23 秒、基础依赖 7 秒、Docker 31 秒、Caddy 11 秒、AcornFox 8 秒，四个服务 active。
 
-## 境外路径（新加坡，同日）
+## 境外路径（同日）
 
-阿里云 ap-southeast-1a 全新抢占式实例（ecs.c7.large，Ubuntu 24.04，临时 VPC/安全组）原样执行 GitHub 安装命令（v0.2.1）：**失败**。Docker 经 download.docker.com 19 秒装好，随后 Caddy 官方 apt 仓库 `dl.cloudsmith.io` 返回 `402 Payment Required`，apt update 失败，脚本退出。该代码自 N5 起存在，v0.2.0、v0.2.1 境外全新安装均受影响。
+全新境外抢占式实例（2 核，Ubuntu 24.04）原样执行 GitHub 安装命令（v0.2.1）：**失败**。Docker 经 download.docker.com 19 秒装好，随后 Caddy 官方 apt 仓库 `dl.cloudsmith.io` 返回 `402 Payment Required`，apt update 失败，脚本退出。该代码自 N5 起存在，v0.2.0、v0.2.1 境外全新安装均受影响。
 
 修复：所有地区都下载 Caddy 官方二进制（大陆先 Gitee），去掉 cloudsmith 源；重装时清理旧版本留下的 `caddy-stable.list`。在同一台失败过的机器上重跑修复后的脚本：15 秒，已清理失效源，四个服务 active；发布版 v0.2.1 CLI 部署 9 秒上线，公网访问正常。
 
-v0.2.2 发布后，新加坡另开全新实例（ecs.c7.large）原样执行 GitHub 安装命令：**52 秒**，Docker 经 download.docker.com、Caddy 经 GitHub 官方二进制，四个服务 active；v0.2.2 CLI 部署上线、公网可访问。新加坡临时资源（实例、VPC、交换机、安全组、密钥对）已全部删除。
+v0.2.2 发布后，另开全新境外实例原样执行 GitHub 安装命令：**52 秒**，Docker 经 download.docker.com、Caddy 经 GitHub 官方二进制，四个服务 active；v0.2.2 CLI 部署上线、公网可访问。境外临时资源已全部删除。
 
 ## 仍待完成
 
