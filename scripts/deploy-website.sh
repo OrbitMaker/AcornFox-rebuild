@@ -152,7 +152,11 @@ www.${DOMAIN} {
     redir https://${DOMAIN}{uri} permanent
 }
 CADDYFILE
-caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null
+if ! out=$(caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile 2>&1); then
+    echo "   ❌ Caddy 配置校验失败："
+    echo "$out" | tail -5
+    exit 1
+fi
 
 echo "5️⃣ 启动 Caddy..."
 systemctl enable --quiet caddy
