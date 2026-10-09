@@ -161,7 +161,7 @@ func (s *server) addAddonLocked(w http.ResponseWriter, r *http.Request) {
 		}
 		for _, v := range volumes {
 			if v.Name == runner.AddonVolumeName(app, body.Kind) {
-				writeError(w, http.StatusConflict, "addon_data_orphaned", "检测到保留的数据卷 "+v.Name+"，但旧凭据记录缺失；不会生成新密码覆盖旧连接，请先恢复原 AcornFox 状态记录或人工恢复数据库访问")
+				writeError(w, http.StatusConflict, "addon_data_orphaned", "检测到保留的数据卷 "+v.Name+"，但旧凭据记录缺失；不会生成新密码覆盖旧连接，请先恢复原 AcornFox 状态记录或人工恢复数据库访问；确认不需要旧数据时，运行 acornfox delete --volumes 删除应用及其数据卷（不可恢复）后重新部署")
 				return
 			}
 		}

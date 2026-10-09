@@ -357,14 +357,23 @@ func (s *Store) CreateDeployment(ctx context.Context, in NewDeployment) (Deploym
 		if _, err := scanAppTx(ctx, tx, in.App); err != nil {
 			return err
 		}
-		// Idempotency by request key.
+		// Idempotency by request key. Only a pending or live deployment is
+		// returned as-is; once the earlier one has ended (failed, retired,
+		// superseded) the same request means "deploy this again", so its key is
+		// released and a new deployment is created below. Otherwise fixing the
+		// server and re-running `deploy` on unchanged code would keep returning
+		// the old failure.
 		if in.RequestKey != "" {
 			existing, err := scanDeploymentByRequestKeyTx(ctx, tx, in.App, in.RequestKey)
-			if err == nil {
+			switch {
+			case err == nil && !deploymentEnded(existing.Status):
 				dep = existing
 				return nil
-			}
-			if !errors.Is(err, ErrNotFound) {
+			case err == nil:
+				if _, err := tx.ExecContext(ctx, `UPDATE deployments SET request_key='' WHERE id=?`, existing.ID); err != nil {
+					return fmt.Errorf("release request key: %w", err)
+				}
+			case !errors.Is(err, ErrNotFound):
 				return err
 			}
 		}
@@ -1031,6 +1040,12 @@ func scanDeploymentByRequestKeyTx(ctx context.Context, tx *sql.Tx, app, key stri
 		return Deployment{}, fmt.Errorf("scan deployment by request key: %w", err)
 	}
 	return d, nil
+}
+
+// deploymentEnded reports whether a deployment is finished and not serving:
+// the complement of the pending-or-live set used for digest dedup.
+func deploymentEnded(status string) bool {
+	return status == StatusFailed || status == StatusRetired || status == StatusSuperseded
 }
 
 func scanNewestPendingOrLiveTx(ctx context.Context, tx *sql.Tx, app string) (Deployment, error) {

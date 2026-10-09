@@ -17,7 +17,7 @@
 
 ```bash
 # 在干净的 Ubuntu 24.04 服务器上执行
-curl -fsSL https://raw.githubusercontent.com/acornfox/acornfox/main/scripts/install/install.sh | sudo bash
+curl -fsSL https://github.com/OrbitMaker/AcornFox-rebuild/releases/latest/download/install.sh | sudo bash
 ```
 
 ### 验收标准
@@ -50,7 +50,7 @@ acornfox open
 
 ```bash
 # 安装 CLI
-curl -fsSL https://acornfox.dev/install-cli.sh | bash
+curl -fsSL https://github.com/OrbitMaker/AcornFox-rebuild/releases/latest/download/install-cli.sh | bash
 
 # 或手动安装
 # macOS: 下载 acornfox_darwin_amd64 (Intel) 或 acornfox_darwin_arm64 (Apple Silicon)

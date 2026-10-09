@@ -6,6 +6,14 @@
 
 set -euo pipefail
 
+# curl | sudo bash 时 stdin 是脚本本身，不能让 apt/debconf 交互读取它
+export DEBIAN_FRONTEND=noninteractive
+
+# 新开的云主机开机后 unattended-upgrades 会占用 dpkg 锁几分钟，等锁释放而不是直接失败
+apt_get() {
+    apt-get -o DPkg::Lock::Timeout=600 -o Acquire::Retries=3 "$@"
+}
+
 # 颜色输出
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -39,7 +47,7 @@ error_exit() {
 # GitHub 仓库与下载代理
 # ACORNFOX_REPO 可覆盖发布仓库；ACORNFOX_GITHUB_PROXY 指定自己的 GitHub 加速前缀
 # （形如 https://example.com/，拼接为 前缀+原始地址）。中国大陆先直连，失败再依次试代理。
-ACORNFOX_REPO="${ACORNFOX_REPO:-acornfox/acornfox}"
+ACORNFOX_REPO="${ACORNFOX_REPO:-OrbitMaker/AcornFox-rebuild}"
 GITHUB_PROXIES=()
 
 setup_github_proxies() {
@@ -64,6 +72,33 @@ github_download() {
         fi
     done
     return 1
+}
+
+# verify_sha256 FILE ASSET VERSION：用同一 Release 的 SHA256SUMS 校验下载文件，不一致则删除并中止。
+# 能发现下载损坏和镜像代理被篡改的单个文件；SHA256SUMS 与二进制走同一通道，防不了整个发布源被替换。
+verify_sha256() {
+    local file="$1" asset="$2" version="$3" sums want got
+    sums=$(mktemp)
+    if ! github_download "https://github.com/${ACORNFOX_REPO}/releases/download/${version}/SHA256SUMS" "$sums"; then
+        rm -f "$sums" "$file"
+        error_exit "下载 SHA256SUMS 失败，无法校验 ${asset}"
+    fi
+    want=$(awk -v a="$asset" '$2 == a || $2 == "*" a {print $1; exit}' "$sums")
+    rm -f "$sums"
+    if [ -z "$want" ]; then
+        rm -f "$file"
+        error_exit "SHA256SUMS 中没有 ${asset}"
+    fi
+    if command -v sha256sum >/dev/null 2>&1; then
+        got=$(sha256sum "$file" | awk '{print $1}')
+    else
+        got=$(shasum -a 256 "$file" | awk '{print $1}')
+    fi
+    if [ "$got" != "$want" ]; then
+        rm -f "$file"
+        error_exit "${asset} SHA256 校验失败：期望 ${want}，实际 ${got}"
+    fi
+    log_success "SHA256 校验通过: ${asset}"
 }
 
 # github_latest_tag：通过 releases/latest 的跳转地址取最新版本号（不依赖 api.github.com）
@@ -171,6 +206,7 @@ parse_args() {
     ACORNFOX_VERSION="latest"
     LOCAL_BINARY=""
     REGISTRY_MIRRORS=()
+    PUBLIC_HOST=""
 
     while [[ $# -gt 0 ]]; do
         case $1 in
@@ -182,6 +218,11 @@ parse_args() {
             --binary)
                 [[ $# -ge 2 ]] || error_exit "--binary 需要一个本地文件路径"
                 LOCAL_BINARY="$2"
+                shift 2
+                ;;
+            --public-host)
+                [[ $# -ge 2 ]] || error_exit "--public-host 需要服务器的公网 IP 或域名"
+                PUBLIC_HOST="$2"
                 shift 2
                 ;;
             --registry-mirror)
@@ -236,6 +277,7 @@ AcornFox 安装脚本
 选项:
     --version V            安装指定版本（默认 latest）
     --binary PATH          使用本地 acornfox 二进制文件，不下载（用于测试候选版本）
+    --public-host HOST     应用访问地址中的主机（公网 IP 或域名），默认自动检测
     --registry-mirror URL  Docker Hub 镜像加速地址，可重复指定
                            阿里云 ECS 建议使用控制台“容器镜像服务 → 镜像加速器”中的专属地址
     --china                强制使用中国镜像源
@@ -295,13 +337,13 @@ EOF
         esac
     fi
 
-    apt-get update -qq || error_exit "更新软件包列表失败"
+    apt_get update -qq || error_exit "更新软件包列表失败"
 }
 
 # 安装基础依赖
 install_dependencies() {
     log_info "安装基础依赖..."
-    apt-get install -y -qq \
+    apt_get install -y -qq \
         curl \
         wget \
         ca-certificates \
@@ -327,29 +369,43 @@ install_docker() {
 
     log_info "安装 Docker..."
 
+    # 国内镜像站在 Docker 新版本发布后会有一段时间不一致（索引大小不符、包 404、读超时），
+    # 每个源试两次，都不行再换下一个；全部失败时退回发行版仓库自带的 docker.io。
+    local sources=() src attempt installed=false
     if $IN_CHINA; then
-        # 使用阿里云 Docker 镜像源
-        log_info "使用阿里云 Docker 镜像源..."
-
-        # 添加阿里云 Docker GPG 密钥
-        curl -fsSL https://mirrors.aliyun.com/docker-ce/linux/${OS}/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
-
-        # 添加阿里云 Docker 仓库
-        echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://mirrors.aliyun.com/docker-ce/linux/${OS} ${OS_CODENAME} stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+        sources=("https://mirrors.aliyun.com/docker-ce" "https://mirrors.cloud.tencent.com/docker-ce" "https://mirrors.tuna.tsinghua.edu.cn/docker-ce")
     else
-        # 使用 Docker 官方源
-        log_info "使用 Docker 官方源..."
-
-        # 添加 Docker 官方 GPG 密钥
-        curl -fsSL https://download.docker.com/linux/${OS}/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
-
-        # 添加 Docker 官方仓库
-        echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/${OS} ${OS_CODENAME} stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+        sources=("https://download.docker.com")
     fi
 
-    # 安装 Docker
-    apt-get update -qq
-    apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin || error_exit "Docker 安装失败"
+    for src in "${sources[@]}"; do
+        log_info "使用 Docker 源: ${src}"
+        if ! curl -fsSL --connect-timeout 10 --max-time 60 "${src}/linux/${OS}/gpg" \
+            | gpg --batch --yes --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg; then
+            log_warn "无法从 ${src} 获取 GPG 密钥，换下一个源"
+            continue
+        fi
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] ${src}/linux/${OS} ${OS_CODENAME} stable" > /etc/apt/sources.list.d/docker.list
+        for attempt in 1 2; do
+            if apt_get update -qq && apt_get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin; then
+                installed=true
+                break 2
+            fi
+            log_warn "Docker 源 ${src} 第 ${attempt} 次安装失败（镜像站可能正在同步）"
+            sleep 5
+        done
+    done
+
+    if ! $installed; then
+        # 不留下失效的源，免得之后的 apt-get update 一直报错
+        rm -f /etc/apt/sources.list.d/docker.list
+        log_warn "Docker 官方源均不可用，改用发行版仓库的 docker.io"
+        apt_get update -qq || true
+        apt_get install -y -qq docker.io \
+            || error_exit "Docker 安装失败：所有 Docker 源都不可用，请稍后重试，或先手动安装 Docker 后用 --skip-docker"
+        # runner 通过 Docker API 构建，不依赖 buildx；Debian 11/12 仓库没有这个包，装不上不算失败
+        apt_get install -y -qq docker-buildx >/dev/null 2>&1 || true
+    fi
 
     # 启动 Docker
     systemctl enable docker
@@ -430,6 +486,16 @@ install_caddy() {
         github_download "https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}/caddy_${CADDY_VERSION}_linux_${ARCH}.tar.gz" /tmp/caddy.tar.gz \
             || error_exit "下载 Caddy 失败；可设置 ACORNFOX_GITHUB_PROXY 指定可用的 GitHub 加速地址后重试"
 
+        # Caddy 官方随发布提供 SHA-512 校验文件
+        github_download "https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}/caddy_${CADDY_VERSION}_checksums.txt" /tmp/caddy_checksums.txt \
+            || error_exit "下载 Caddy 校验文件失败"
+        CADDY_WANT=$(awk -v a="caddy_${CADDY_VERSION}_linux_${ARCH}.tar.gz" '$2 == a {print $1; exit}' /tmp/caddy_checksums.txt)
+        rm -f /tmp/caddy_checksums.txt
+        if [ -z "$CADDY_WANT" ] || [ "$(sha512sum /tmp/caddy.tar.gz | awk '{print $1}')" != "$CADDY_WANT" ]; then
+            rm -f /tmp/caddy.tar.gz
+            error_exit "Caddy 安装包 SHA-512 校验失败"
+        fi
+
         tar -xzf /tmp/caddy.tar.gz -C /tmp caddy
         install -m 0755 /tmp/caddy /usr/bin/caddy
         rm -f /tmp/caddy.tar.gz /tmp/caddy
@@ -477,8 +543,8 @@ EOF
         echo "deb [signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.gpg] https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main" | tee /etc/apt/sources.list.d/caddy-stable.list
 
         # 安装 Caddy
-        apt-get update -qq
-        apt-get install -y -qq caddy || error_exit "Caddy 安装失败"
+        apt_get update -qq
+        apt_get install -y -qq caddy || error_exit "Caddy 安装失败"
     fi
 
     # 验证安装
@@ -506,8 +572,10 @@ configure_caddy() {
     # socket 自动归属 acornfox-ipc 组，server 可直接访问，重启后无需再手动 chmod
     cat > /etc/caddy/Caddyfile << 'EOF'
 {
+    # AcornFox 以 http://caddy 访问管理接口，Caddy 校验 Host 头；
+    # origins 不支持通配符，写 * 会拒绝所有请求（403 host not allowed: caddy）
     admin unix//run/acornfox/caddy-admin.sock|0660 {
-        origins *
+        origins caddy
     }
     persist_config off
 }
@@ -620,6 +688,7 @@ download_acornfox() {
     else
         error_exit "下载 AcornFox 失败，请检查网络或版本号；也可设置 ACORNFOX_GITHUB_PROXY 或使用 --binary"
     fi
+    verify_sha256 /tmp/acornfox "acornfox_linux_${ARCH}" "$VERSION"
 
     # 安装到 /usr/local/bin
     install -m 0755 /tmp/acornfox /usr/local/bin/acornfox
@@ -692,6 +761,34 @@ generate_admin_token() {
     log_success "管理员令牌已生成"
 }
 
+# 检测应用访问地址中的主机：优先云厂商元数据里的公网 IP，取不到再用本机首个地址。
+# 元数据接口出错时会返回 HTML 页面，所以每个结果都要校验是 IPv4。
+detect_public_host() {
+    if [ -n "$PUBLIC_HOST" ]; then
+        log_info "应用访问地址主机: $PUBLIC_HOST（手动指定）"
+        return
+    fi
+    local url ip
+    for url in \
+        http://100.100.100.200/latest/meta-data/eipv4 \
+        http://100.100.100.200/latest/meta-data/public-ipv4 \
+        http://metadata.tencentyun.com/latest/meta-data/public-ipv4 \
+        http://169.254.169.254/latest/meta-data/public-ipv4; do
+        ip=$(curl -fs -m 2 "$url" 2>/dev/null || true)
+        if [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+            PUBLIC_HOST="$ip"
+            log_info "应用访问地址主机: $PUBLIC_HOST（云厂商元数据）"
+            return
+        fi
+    done
+    PUBLIC_HOST=$(hostname -I 2>/dev/null | awk '{print $1}')
+    if [ -n "$PUBLIC_HOST" ]; then
+        log_warn "未从云厂商元数据取到公网 IP，暂用本机地址 $PUBLIC_HOST；如不对，用 --public-host 重新安装或修改 acornfox-server 服务"
+    else
+        log_warn "无法确定服务器地址，部署输出的访问地址将不含主机名；可用 --public-host 指定"
+    fi
+}
+
 # 创建 systemd 服务
 create_systemd_services() {
     log_info "创建 systemd 服务..."
@@ -707,7 +804,7 @@ create_systemd_services() {
     cat > /etc/systemd/system/acornfox-server.service << EOF
 [Unit]
 Description=AcornFox Server
-Documentation=https://acornfox.dev
+Documentation=https://github.com/OrbitMaker/AcornFox-rebuild
 After=network.target docker.service
 Requires=docker.service
 
@@ -715,7 +812,7 @@ Requires=docker.service
 Type=simple
 User=acornfox
 Group=acornfox
-ExecStart=/usr/local/bin/acornfox server --runner-uid $ACORNFOX_EXEC_UID --listen-group acornfox-users
+ExecStart=/usr/local/bin/acornfox server --runner-uid $ACORNFOX_EXEC_UID --listen-group acornfox-users${PUBLIC_HOST:+ --public-host $PUBLIC_HOST}
 Restart=on-failure
 RestartSec=5s
 StandardOutput=journal
@@ -738,7 +835,7 @@ EOF
     cat > /etc/systemd/system/acornfox-runner.service << EOF
 [Unit]
 Description=AcornFox Runner
-Documentation=https://acornfox.dev
+Documentation=https://github.com/OrbitMaker/AcornFox-rebuild
 After=network.target docker.service
 Requires=docker.service
 
@@ -807,9 +904,14 @@ ${BLUE}服务状态:${NC}
 ${BLUE}管理员令牌:${NC}
 $(cat /root/.acornfox-token)
 
+${BLUE}云服务器安全组（重要）:${NC}
+  应用通过 ${YELLOW}http://${PUBLIC_HOST:-服务器IP}:端口${NC} 访问，端口在 18810-18899 之间分配。
+  请在云厂商控制台的安全组中放行入方向 TCP ${YELLOW}18810-18899${NC}；
+  绑定域名并启用 HTTPS 还需要放行 ${YELLOW}80${NC} 和 ${YELLOW}443${NC}。
+
 ${BLUE}下一步:${NC}
   1. 在本地电脑安装 CLI:
-     ${YELLOW}curl -fsSL https://acornfox.dev/install-cli.sh | bash${NC}
+     ${YELLOW}curl -fsSL https://github.com/OrbitMaker/AcornFox-rebuild/releases/latest/download/install-cli.sh | bash${NC}
 
   2. 配置服务器连接（SSH 用户需为 root 或在 acornfox-users 组中）:
      ${YELLOW}sudo usermod -aG acornfox-users <你的 SSH 用户>${NC}   # 非 root 时执行一次
@@ -819,7 +921,7 @@ ${BLUE}下一步:${NC}
      ${YELLOW}acornfox open${NC}
 
 ${BLUE}文档:${NC}
-  https://acornfox.dev/docs
+  https://github.com/OrbitMaker/AcornFox-rebuild/tree/main/docs
 
 ${BLUE}故障排查:${NC}
   查看日志: ${YELLOW}journalctl -u acornfox-server -f${NC}
@@ -834,7 +936,6 @@ EOF
 main() {
     echo ""
     log_info "AcornFox 安装脚本"
-    log_info "版本: 1.0.0"
     echo ""
 
     # --help 不需要 root，也不做环境探测
@@ -868,6 +969,7 @@ main() {
     download_acornfox
     initialize_database
     generate_admin_token
+    detect_public_host
     create_systemd_services
     start_services
 

@@ -3,8 +3,8 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>安装测试 - AcornFox</title>
-    <meta name="description" content="AcornFox 安装脚本测试页面 - 一键部署你的应用">
+    <title>安装 - AcornFox</title>
+    <meta name="description" content="在自己的 Linux 服务器上一条命令安装 AcornFox">
     <style>
         * {
             margin: 0;
@@ -272,25 +272,25 @@
         </header>
 
         <div class="warning-banner">
-            <strong>⚠️ 测试环境专用</strong>
-            本页面提供的安装脚本指向测试服务器，仅用于功能验证。正式使用请访问主站。
+            <strong>提示</strong>
+            安装脚本和二进制都从 GitHub Releases 下载，二进制按同一 Release 的 SHA256SUMS 校验。中国大陆服务器访问 GitHub 失败时，脚本会自动尝试加速代理。
         </div>
 
         <div class="install-section">
-            <h2>🚀 快速安装（测试版）</h2>
+            <h2>🚀 快速安装</h2>
             <p>在 Linux 服务器上一键安装 AcornFox，自动配置所有依赖。</p>
 
             <h3>服务器端安装</h3>
             <div class="command-box">
                 <button class="copy-btn" onclick="copyCommand(this, 'install-server')">复制</button>
-                <pre><code id="install-server">curl -fsSL http://<server-ip>/scripts/install/install.sh | bash</code></pre>
+                <pre><code id="install-server">curl -fsSL https://github.com/OrbitMaker/AcornFox-rebuild/releases/latest/download/install.sh | sudo bash</code></pre>
             </div>
 
             <h3>客户端 CLI 安装</h3>
             <p>在本地安装 AcornFox CLI 工具：</p>
             <div class="command-box">
                 <button class="copy-btn" onclick="copyCommand(this, 'install-cli')">复制</button>
-                <pre><code id="install-cli">curl -fsSL http://<server-ip>/scripts/install/install-cli.sh | bash</code></pre>
+                <pre><code id="install-cli">curl -fsSL https://github.com/OrbitMaker/AcornFox-rebuild/releases/latest/download/install-cli.sh | bash</code></pre>
             </div>
 
             <ul class="step-list">
@@ -325,8 +325,8 @@
                     <p>反向代理与 HTTPS</p>
                 </div>
                 <div class="feature-card">
-                    <h4>🗄️ PostgreSQL</h4>
-                    <p>默认数据库</p>
+                    <h4>🔐 systemd 服务</h4>
+                    <p>server 与 runner 分账号运行</p>
                 </div>
                 <div class="feature-card">
                     <h4>🎯 AcornFox</h4>
@@ -340,7 +340,7 @@
             <ul class="step-list">
                 <li>
                     <strong>操作系统</strong>
-                    <p>Ubuntu 20.04+、Debian 11+、CentOS 8+、或其他主流 Linux 发行版</p>
+                    <p>Ubuntu 24.04 / 22.04 / 20.04、Debian 12 / 11（amd64 或 arm64）</p>
                 </li>
                 <li>
                     <strong>硬件配置</strong>
@@ -354,26 +354,13 @@
         </div>
 
         <div class="install-section">
-            <h2>🧪 测试环境信息</h2>
-            <div class="command-box">
-                <pre><code>测试服务器: <server-ip>
-操作系统: Ubuntu 22.04 LTS
-配置: 2核 4GB RAM
-区域: 阿里云华北（张家口）</code></pre>
-            </div>
-            <p style="color: var(--text-secondary); margin-top: 1rem;">
-                📌 测试服务器可能随时重置，请勿用于生产环境。
-            </p>
-        </div>
-
-        <div class="install-section">
             <h2>📖 手动安装</h2>
             <p>如果自动安装遇到问题，可以手动执行：</p>
 
             <h3>1. 下载安装脚本</h3>
             <div class="command-box">
                 <button class="copy-btn" onclick="copyCommand(this, 'download')">复制</button>
-                <pre><code id="download">wget http://<server-ip>/scripts/install/install.sh
+                <pre><code id="download">curl -fsSLO https://github.com/OrbitMaker/AcornFox-rebuild/releases/latest/download/install.sh
 chmod +x install.sh</code></pre>
             </div>
 
@@ -387,8 +374,7 @@ chmod +x install.sh</code></pre>
             <p>如果在中国大陆，脚本会自动检测并使用镜像源。也可以手动指定：</p>
             <div class="command-box">
                 <button class="copy-btn" onclick="copyCommand(this, 'china')">复制</button>
-                <pre><code id="china">export ACORNFOX_MIRROR=cn
-sudo ./install.sh</code></pre>
+                <pre><code id="china">sudo ./install.sh --china</code></pre>
             </div>
         </div>
 

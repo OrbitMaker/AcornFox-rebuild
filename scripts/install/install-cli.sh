@@ -77,11 +77,12 @@ download_cli() {
     TMP_DIR=$(mktemp -d)
     TMP_FILE="${TMP_DIR}/${BINARY_NAME}"
     github_download "$DOWNLOAD_URL" "$TMP_FILE" || error_exit "下载失败；可设置 ACORNFOX_GITHUB_PROXY 指定 GitHub 加速地址"
+    verify_sha256 "$TMP_FILE" "$ASSET" "$VERSION"
     chmod +x "$TMP_FILE"
 }
 
 # GitHub 仓库与下载代理（与 install.sh 一致）
-ACORNFOX_REPO="${ACORNFOX_REPO:-acornfox/acornfox}"
+ACORNFOX_REPO="${ACORNFOX_REPO:-OrbitMaker/AcornFox-rebuild}"
 GITHUB_PROXIES=()
 
 setup_github_proxies() {
@@ -105,6 +106,33 @@ github_download() {
         fi
     done
     return 1
+}
+
+# verify_sha256 FILE ASSET VERSION：用同一 Release 的 SHA256SUMS 校验下载文件，不一致则删除并中止。
+# 能发现下载损坏和镜像代理被篡改的单个文件；SHA256SUMS 与二进制走同一通道，防不了整个发布源被替换。
+verify_sha256() {
+    local file="$1" asset="$2" version="$3" sums want got
+    sums=$(mktemp)
+    if ! github_download "https://github.com/${ACORNFOX_REPO}/releases/download/${version}/SHA256SUMS" "$sums"; then
+        rm -f "$sums" "$file"
+        error_exit "下载 SHA256SUMS 失败，无法校验 ${asset}"
+    fi
+    want=$(awk -v a="$asset" '$2 == a || $2 == "*" a {print $1; exit}' "$sums")
+    rm -f "$sums"
+    if [ -z "$want" ]; then
+        rm -f "$file"
+        error_exit "SHA256SUMS 中没有 ${asset}"
+    fi
+    if command -v sha256sum >/dev/null 2>&1; then
+        got=$(sha256sum "$file" | awk '{print $1}')
+    else
+        got=$(shasum -a 256 "$file" | awk '{print $1}')
+    fi
+    if [ "$got" != "$want" ]; then
+        rm -f "$file"
+        error_exit "${asset} SHA256 校验失败：期望 ${want}，实际 ${got}"
+    fi
+    log_success "SHA256 校验通过: ${asset}"
 }
 
 github_latest_tag() {
@@ -182,7 +210,7 @@ show_usage() {
 3. 安装 AI 工作台 Skill:
    acornfox skill install
 
-文档: https://acornfox.dev/docs
+文档: https://github.com/OrbitMaker/AcornFox-rebuild/tree/main/docs
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 

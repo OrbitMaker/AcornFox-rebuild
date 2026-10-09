@@ -33,17 +33,19 @@ AcornFox 专为以下场景设计：
 在你的 Linux 服务器上（Ubuntu 24.04/22.04/20.04 或 Debian 12/11）：
 
 ```bash
-curl -fsSL https://get.acornfox.dev/install.sh | sudo bash
+curl -fsSL https://github.com/OrbitMaker/AcornFox-rebuild/releases/latest/download/install.sh | sudo bash
 ```
 
 安装完成后会显示管理员令牌，请妥善保存。
+
+> **云服务器安全组**：应用通过 `http://服务器IP:端口` 访问，端口在 18810-18899 之间分配。请在云厂商控制台的安全组中放行入方向 TCP 18810-18899；绑定域名启用 HTTPS 还需放行 80 和 443。
 
 ### 2. 安装客户端 CLI
 
 在你的本地电脑（Windows/macOS/Linux）：
 
 ```bash
-curl -fsSL https://get.acornfox.dev/install-cli.sh | bash
+curl -fsSL https://github.com/OrbitMaker/AcornFox-rebuild/releases/latest/download/install-cli.sh | bash
 ```
 
 ### 3. 配置服务器连接
@@ -174,19 +176,18 @@ sudo bash install.sh --global
 ## 📚 文档
 
 - [快速开始](docs/quick-start.md)
-- [完整命令参考](docs/commands.md)
-- [AI 工作台集成](docs/ai-integration.md)
-- [故障排查](docs/troubleshooting.md)
+- [常见问题](docs/quick-start.md#常见问题)
+- [AI 工作台 Skill](skills/acornfox/SKILL.md)
 - [架构设计](docs/architecture.md)
 
 ## 🛠️ 升级
 
 ```bash
 # 服务器端升级
-curl -fsSL https://get.acornfox.dev/upgrade.sh | sudo bash
+curl -fsSL https://github.com/OrbitMaker/AcornFox-rebuild/releases/latest/download/upgrade.sh | sudo bash
 
 # 客户端升级
-curl -fsSL https://get.acornfox.dev/install-cli.sh | bash
+curl -fsSL https://github.com/OrbitMaker/AcornFox-rebuild/releases/latest/download/install-cli.sh | bash
 ```
 
 升级过程自动：
@@ -222,9 +223,8 @@ AcornFox 站在巨人的肩膀上：
 
 ## 📮 联系方式
 
-- 问题反馈: [GitHub Issues](https://github.com/acornfox/acornfox/issues)
-- 邮件: hello@acornfox.dev
-- 文档: https://acornfox.dev/docs
+- 问题反馈: [GitHub Issues](https://github.com/OrbitMaker/AcornFox-rebuild/issues)
+- 文档: https://github.com/OrbitMaker/AcornFox-rebuild/tree/main/docs
 
 ---
 

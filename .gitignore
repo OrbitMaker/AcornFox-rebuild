@@ -24,3 +24,8 @@ dist/
 dist-stub/
 dist-core/
 dist-core-stub/
+
+# Locally built binaries and release output (scripts/build-release.sh writes dist/).
+/acornfox/acornfox
+/acornfox/acornfox-*
+!/acornfox/acornfox-*/

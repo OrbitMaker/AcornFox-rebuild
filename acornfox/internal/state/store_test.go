@@ -236,6 +236,37 @@ func TestCreateDeploymentIdempotency(t *testing.T) {
 	}
 }
 
+func TestCreateDeploymentRetriesEndedRequestKey(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	s.EnsureApp(ctx, "web")
+
+	in := NewDeployment{App: "web", SourceKind: SourceUpload, SourceRef: "/u/1", SourceDigest: "aaa", RequestKey: "k1"}
+	first, created, err := s.CreateDeployment(ctx, in)
+	if err != nil || !created {
+		t.Fatalf("create: %v created=%v", err, created)
+	}
+	for _, status := range []string{StatusFailed, StatusRetired, StatusSuperseded} {
+		if _, err := s.UpdateDeployment(ctx, first.ID, func(d *Deployment) error {
+			d.Status = status
+			return nil
+		}); err != nil {
+			t.Fatalf("mark %s: %v", status, err)
+		}
+		// Same content, same key after the earlier one ended: deploy again.
+		again, created, err := s.CreateDeployment(ctx, in)
+		if err != nil || !created || again.ID == first.ID {
+			t.Fatalf("after %s: created=%v id=%s err=%v", status, created, again.ID, err)
+		}
+		// A retry of that new request is still idempotent while it is pending.
+		retry, created, err := s.CreateDeployment(ctx, in)
+		if err != nil || created || retry.ID != again.ID {
+			t.Fatalf("retry after %s: created=%v id=%s want %s err=%v", status, created, retry.ID, again.ID, err)
+		}
+		first = again
+	}
+}
+
 func TestConcurrentCreateDeployment(t *testing.T) {
 	s := openTest(t)
 	ctx := context.Background()

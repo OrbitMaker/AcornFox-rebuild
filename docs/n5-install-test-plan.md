@@ -18,24 +18,24 @@
 
 ```bash
 # 在干净的 Ubuntu 22.04 服务器上执行
-curl -fsSL https://raw.githubusercontent.com/acornfox/acornfox/main/scripts/install/install.sh | sudo bash
+curl -fsSL https://github.com/OrbitMaker/AcornFox-rebuild/releases/latest/download/install.sh | sudo bash
 ```
 
 ### 2. 中国镜像源测试
 
 ```bash
 # 强制使用中国镜像
-curl -fsSL https://raw.githubusercontent.com/acornfox/acornfox/main/scripts/install/install.sh | sudo bash -s -- --china
+curl -fsSL https://github.com/OrbitMaker/AcornFox-rebuild/releases/latest/download/install.sh | sudo bash -s -- --china
 ```
 
 ### 3. 跳过已安装组件测试
 
 ```bash
 # 已有 Docker，跳过 Docker 安装
-curl -fsSL https://raw.githubusercontent.com/acornfox/acornfox/main/scripts/install/install.sh | sudo bash -s -- --skip-docker
+curl -fsSL https://github.com/OrbitMaker/AcornFox-rebuild/releases/latest/download/install.sh | sudo bash -s -- --skip-docker
 
 # 已有 Caddy，跳过 Caddy 安装
-curl -fsSL https://raw.githubusercontent.com/acornfox/acornfox/main/scripts/install/install.sh | sudo bash -s -- --skip-caddy
+curl -fsSL https://github.com/OrbitMaker/AcornFox-rebuild/releases/latest/download/install.sh | sudo bash -s -- --skip-caddy
 ```
 
 ## 验收清单
@@ -72,7 +72,7 @@ curl -fsSL https://raw.githubusercontent.com/acornfox/acornfox/main/scripts/inst
 
 ```bash
 # 1. 安装 CLI
-curl -fsSL https://acornfox.dev/install-cli.sh | bash
+curl -fsSL https://github.com/OrbitMaker/AcornFox-rebuild/releases/latest/download/install-cli.sh | bash
 
 # 2. 配置目标服务器
 acornfox target add test-server --ssh user@<server-ip>
