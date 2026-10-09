@@ -201,7 +201,7 @@ backup_current() {
     cp /usr/local/bin/acornfox "${BACKUP_PATH}/acornfox.bin" || error_exit "备份二进制文件失败"
 
     # 备份数据库（服务已停止，连同 WAL 文件一起复制才是一致的快照）
-    [ -f "$DB_PATH" ] || error_exit "找不到数据库 $DB_PATH，拒绝在没有备份的情况下升级"
+    [ -f "$DB_PATH" ] || error_exit "找不到数据库 ${DB_PATH}，拒绝在没有备份的情况下升级"
     local f
     for f in "$DB_PATH" "$DB_PATH-wal" "$DB_PATH-shm"; do
         if [ -f "$f" ]; then
@@ -223,7 +223,7 @@ download_new_version() {
         [ -f "$LOCAL_BINARY" ] || error_exit "本地二进制文件不存在: $LOCAL_BINARY"
         install -m 0755 "$LOCAL_BINARY" /tmp/acornfox.new
         NEW_VERSION=$(/tmp/acornfox.new version 2>/dev/null | awk '{print $2}' || echo "unknown")
-        log_info "使用本地二进制文件: $LOCAL_BINARY（$NEW_VERSION）"
+        log_info "使用本地二进制文件: ${LOCAL_BINARY}（${NEW_VERSION}）"
         return
     fi
 

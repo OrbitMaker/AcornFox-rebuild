@@ -22,7 +22,7 @@ export GITEE_TOKEN
 
 [ -f "$DIST/SHA256SUMS" ] || { echo "dist/SHA256SUMS 不存在，先运行 scripts/build-release.sh $VERSION" >&2; exit 1; }
 grep -q "${VERSION#v}" <("$DIST/acornfox_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')" version) \
-    || { echo "dist/ 中的二进制不是 $VERSION，先重新运行 scripts/build-release.sh $VERSION" >&2; exit 1; }
+    || { echo "dist/ 中的二进制不是 ${VERSION}，先重新运行 scripts/build-release.sh $VERSION" >&2; exit 1; }
 git -C "$ROOT" rev-parse -q --verify "refs/tags/$VERSION" >/dev/null || { echo "本地没有标签 $VERSION" >&2; exit 1; }
 
 # 令牌经 askpass 从环境变量读取，不写进 git 配置或远程地址
@@ -45,9 +45,9 @@ if [ -z "$RELEASE_ID" ]; then
             "$GITEE_TOKEN" "$VERSION" "$BODY" \
         | curl -fsS -X POST "${API}/releases" -H 'Content-Type: application/json' --data @- \
         | python3 -c 'import sys,json; print(json.load(sys.stdin)["id"])')
-    echo "已创建发行版 $VERSION（id $RELEASE_ID）"
+    echo "已创建发行版 ${VERSION}（id ${RELEASE_ID}）"
 else
-    echo "复用已有发行版 $VERSION（id $RELEASE_ID）"
+    echo "复用已有发行版 ${VERSION}（id ${RELEASE_ID}）"
 fi
 
 # 已上传的同名附件跳过，便于中断后重跑

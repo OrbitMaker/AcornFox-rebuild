@@ -176,16 +176,16 @@ detect_os() {
     case "$OS" in
         ubuntu)
             if [[ ! "$OS_VERSION" =~ ^(20.04|22.04|24.04)$ ]]; then
-                log_warn "未测试的 Ubuntu 版本: $OS_VERSION，继续安装可能遇到问题"
+                log_warn "未测试的 Ubuntu 版本: ${OS_VERSION}，继续安装可能遇到问题"
             fi
             ;;
         debian)
             if [[ ! "$OS_VERSION" =~ ^(11|12)$ ]]; then
-                log_warn "未测试的 Debian 版本: $OS_VERSION，继续安装可能遇到问题"
+                log_warn "未测试的 Debian 版本: ${OS_VERSION}，继续安装可能遇到问题"
             fi
             ;;
         *)
-            error_exit "不支持的操作系统: $OS，目前仅支持 Ubuntu 和 Debian"
+            error_exit "不支持的操作系统: ${OS}，目前仅支持 Ubuntu 和 Debian"
             ;;
     esac
 }
@@ -378,7 +378,7 @@ EOF
             [ -f "$f" ] || continue
             if grep -qE "$official" "$f"; then
                 mv "$f" "$f.bak"
-                log_info "已停用境外官方源 $f（备份为 $f.bak）"
+                log_info "已停用境外官方源 ${f}（备份为 $f.bak）"
             fi
         done
     elif $IN_CHINA; then
@@ -851,7 +851,7 @@ generate_admin_token() {
 # 元数据接口出错时会返回 HTML 页面，所以每个结果都要校验是 IPv4。
 detect_public_host() {
     if [ -n "$PUBLIC_HOST" ]; then
-        log_info "应用访问地址主机: $PUBLIC_HOST（手动指定）"
+        log_info "应用访问地址主机: ${PUBLIC_HOST}（手动指定）"
         return
     fi
     local url ip
@@ -863,13 +863,13 @@ detect_public_host() {
         ip=$(curl -fs -m 2 "$url" 2>/dev/null || true)
         if [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
             PUBLIC_HOST="$ip"
-            log_info "应用访问地址主机: $PUBLIC_HOST（云厂商元数据）"
+            log_info "应用访问地址主机: ${PUBLIC_HOST}（云厂商元数据）"
             return
         fi
     done
     PUBLIC_HOST=$(hostname -I 2>/dev/null | awk '{print $1}')
     if [ -n "$PUBLIC_HOST" ]; then
-        log_warn "未从云厂商元数据取到公网 IP，暂用本机地址 $PUBLIC_HOST；如不对，用 --public-host 重新安装或修改 acornfox-server 服务"
+        log_warn "未从云厂商元数据取到公网 IP，暂用本机地址 ${PUBLIC_HOST}；如不对，用 --public-host 重新安装或修改 acornfox-server 服务"
     else
         log_warn "无法确定服务器地址，部署输出的访问地址将不含主机名；可用 --public-host 指定"
     fi
