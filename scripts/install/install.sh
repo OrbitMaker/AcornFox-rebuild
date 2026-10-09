@@ -542,17 +542,40 @@ install_caddy() {
     log_info "安装 Caddy..."
 
     if $IN_CHINA; then
-        # apt 源 dl.cloudsmith.io 在大陆不稳定，改为从 GitHub Releases 下载二进制
-        log_info "从 GitHub Releases 下载 Caddy..."
+        # apt 源 dl.cloudsmith.io 在大陆不稳定，国内镜像站也没有同步它；Ubuntu/Debian 仓库里的
+        # caddy 2.6.2 不支持 persist_config。所以下载官方二进制：AcornFox 发行版在 Gitee 上附带
+        # 同一份 Caddy 安装包与官方校验文件，先从 Gitee 取，失败再走 GitHub 直连和代理。
         ARCH=$(dpkg --print-architecture)
         CADDY_VERSION="2.8.4"
+        local caddy_tag="" name
+        if [ -n "$ACORNFOX_GITEE_REPO" ]; then
+            caddy_tag="$ACORNFOX_VERSION"
+            [ "$caddy_tag" = "latest" ] && caddy_tag=$(latest_tag 2>/dev/null || true)
+        fi
+        local official="https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}"
+        local mirror="https://gitee.com/${ACORNFOX_GITEE_REPO}/releases/download/${caddy_tag}"
+        name="caddy_${CADDY_VERSION}_linux_${ARCH}.tar.gz"
+        if [ -n "$caddy_tag" ] && curl -fL --connect-timeout 10 --max-time 600 --speed-limit 51200 --speed-time 15 \
+            -o "/tmp/${name}" "${mirror}/${name}"; then
+            log_info "已从 Gitee 镜像下载 ${name}"
+        else
+            log_info "从 GitHub 下载 ${name}..."
+            github_download "${official}/${name}" "/tmp/${name}" \
+                || error_exit "下载 Caddy 失败；可设置 ACORNFOX_GITHUB_PROXY 指定可用的 GitHub 加速地址后重试"
+        fi
+        # 校验文件只有几 KB，优先取 Caddy 官方的，与镜像上的安装包互相独立；取不到再用镜像副本
+        name="caddy_${CADDY_VERSION}_checksums.txt"
+        if ! curl -fsSL --connect-timeout 10 --max-time 30 -o "/tmp/${name}" "${official}/${name}"; then
+            if [ -n "$caddy_tag" ] && curl -fsSL --connect-timeout 10 --max-time 60 -o "/tmp/${name}" "${mirror}/${name}"; then
+                log_warn "Caddy 官方校验文件取不到，改用 Gitee 镜像上的副本"
+            else
+                github_download "${official}/${name}" "/tmp/${name}" || error_exit "下载 Caddy 校验文件失败"
+            fi
+        fi
+        mv "/tmp/caddy_${CADDY_VERSION}_linux_${ARCH}.tar.gz" /tmp/caddy.tar.gz
+        mv "/tmp/caddy_${CADDY_VERSION}_checksums.txt" /tmp/caddy_checksums.txt
 
-        github_download "https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}/caddy_${CADDY_VERSION}_linux_${ARCH}.tar.gz" /tmp/caddy.tar.gz \
-            || error_exit "下载 Caddy 失败；可设置 ACORNFOX_GITHUB_PROXY 指定可用的 GitHub 加速地址后重试"
-
-        # Caddy 官方随发布提供 SHA-512 校验文件
-        github_download "https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}/caddy_${CADDY_VERSION}_checksums.txt" /tmp/caddy_checksums.txt \
-            || error_exit "下载 Caddy 校验文件失败"
+        # 无论从哪里下载，都按 Caddy 官方发布的 SHA-512 校验
         CADDY_WANT=$(awk -v a="caddy_${CADDY_VERSION}_linux_${ARCH}.tar.gz" '$2 == a {print $1; exit}' /tmp/caddy_checksums.txt)
         rm -f /tmp/caddy_checksums.txt
         if [ -z "$CADDY_WANT" ] || [ "$(sha512sum /tmp/caddy.tar.gz | awk '{print $1}')" != "$CADDY_WANT" ]; then

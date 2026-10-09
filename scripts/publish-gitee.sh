@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 把一个已发布到 GitHub 的版本同步到 Gitee 国内镜像：推送 main 与标签、创建发行版、上传 dist/ 下的文件。
-# 先运行 scripts/build-release.sh vX.Y.Z 并发布 GitHub Release，再运行本脚本。
+# 先运行 scripts/build-release.sh vX.Y.Z 并发布 GitHub Release，再在已推送到 GitHub main 的提交上运行本脚本。
 # 用法: scripts/publish-gitee.sh v0.2.1
 # 令牌：环境变量 GITEE_TOKEN，或文件 ~/.config/acornfox/gitee-token（需 projects 权限）。
 
@@ -31,9 +31,10 @@ trap 'rm -f "$ASKPASS"' EXIT
 printf '#!/bin/sh\ncase "$1" in Username*) echo %s;; *) printf %%s "$GITEE_TOKEN";; esac\n' "$GITEE_USER" > "$ASKPASS"
 chmod 700 "$ASKPASS"
 
+# main 推当前 HEAD（与 GitHub main 一致，可能比该版本标签更新）；非快进时 git 会拒绝
 echo "推送 main 与 $VERSION 到 gitee.com/$GITEE_REPO"
 GIT_ASKPASS="$ASKPASS" GIT_TERMINAL_PROMPT=0 git -C "$ROOT" -c credential.helper= push \
-    "https://gitee.com/${GITEE_REPO}.git" "refs/tags/${VERSION}^{commit}:refs/heads/main" "refs/tags/${VERSION}:refs/tags/${VERSION}"
+    "https://gitee.com/${GITEE_REPO}.git" "HEAD:refs/heads/main" "refs/tags/${VERSION}:refs/tags/${VERSION}"
 
 # 已有同名发行版则复用，否则创建
 RELEASE_ID=$(curl -fsS "${API}/releases/tags/${VERSION}?access_token=${GITEE_TOKEN}" 2>/dev/null \
