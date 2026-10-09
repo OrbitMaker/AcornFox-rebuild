@@ -17,6 +17,10 @@ func (a *app) cmdStats(ctx context.Context, args []string) int {
 		return a.out.usageError("stats 最多接受一个应用名参数")
 	}
 
+	// stats --app NAME behaves like stats NAME, as --app does for other commands.
+	if len(rest) == 0 && a.flagApp != "" {
+		return a.statsApp(ctx, a.flagApp)
+	}
 	// stats without app name = host metrics
 	if len(rest) == 0 {
 		return a.statsHost(ctx)

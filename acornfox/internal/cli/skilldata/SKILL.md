@@ -118,7 +118,7 @@ acornfox stop --json
 acornfox start --json
 acornfox restart --json
 acornfox rollback --json        # 回到上一个成功版本
-acornfox stats --json           # CPU、内存
+acornfox stats APP --json       # 该应用的 CPU、内存、网络（不带应用名则是整台服务器）
 acornfox domain add example.com --json
 ```
 

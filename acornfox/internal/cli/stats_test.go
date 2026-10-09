@@ -60,6 +60,19 @@ func TestStatsAppUsesPositionalName(t *testing.T) {
 	}
 }
 
+func TestStatsAppFromAppFlag(t *testing.T) {
+	h := newHarness(t)
+	h.addTarget("dev", "http://dev")
+	var gotApp string
+	h.api.appMetricsFn = func(ctx context.Context, app string) (client.AppMetrics, error) {
+		gotApp = app
+		return client.AppMetrics{App: app, CPUPercent: 1.5, MemoryUsageMB: 128, MemoryLimitMB: 512}, nil
+	}
+	if code, _, errOut := h.run("--app", "shop", "stats"); code != exitOK || gotApp != "shop" {
+		t.Fatalf("exit %d app %q stderr %q", code, gotApp, errOut)
+	}
+}
+
 // A zero memory limit must not divide by zero.
 func TestStatsAppNoMemoryLimit(t *testing.T) {
 	h := newHarness(t)
