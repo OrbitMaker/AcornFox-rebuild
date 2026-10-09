@@ -3,436 +3,238 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>安装 - AcornFox</title>
-    <meta name="description" content="在自己的 Linux 服务器上一条命令安装 AcornFox">
+    <title>安装指南 - AcornFox</title>
+    <meta name="description" content="在自己的 Linux 服务器上一条命令安装 AcornFox，再在本地电脑安装 CLI 与 AI 工作台 Skill。">
+    <meta name="theme-color" content="#050b18">
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M6 13c0-5 4.5-8 10-8s10 3 10 8z' fill='%235ee7ff'/%3E%3Cpath d='M8 13h16c0 8-3.5 14-8 14s-8-6-8-14z' fill='%232aa8d8'/%3E%3Cpath d='M16 5V2' stroke='%235ee7ff' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E">
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-
         :root {
-            --bg-primary: #0a0e1a;
-            --bg-secondary: #12192e;
-            --bg-card: #1a2340;
-            --text-primary: #e2e8f0;
-            --text-secondary: #94a3b8;
-            --accent: #3b82f6;
-            --accent-hover: #2563eb;
-            --success: #10b981;
-            --border: #1e293b;
-            --code-bg: #0f172a;
+            --bg: #050b18;
+            --line: rgba(120, 190, 255, 0.14);
+            --line-strong: rgba(120, 210, 255, 0.32);
+            --text: #e6f1ff;
+            --text-dim: #8fa5c4;
+            --text-faint: #5d7393;
+            --accent: #5ee7ff;
+            --ok: #4ade80;
+            --warn: #fbbf24;
+            --mono: ui-monospace, "SFMono-Regular", Menlo, Consolas, "Liberation Mono", monospace;
+            --sans: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
         }
-
+        * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
-            background: var(--bg-primary);
-            color: var(--text-primary);
-            line-height: 1.6;
-            min-height: 100vh;
+            font-family: var(--sans); background: var(--bg); color: var(--text); line-height: 1.7;
+            -webkit-font-smoothing: antialiased;
+            background-image:
+                radial-gradient(900px 420px at 80% -10%, rgba(59, 130, 246, .22), transparent 60%),
+                radial-gradient(700px 360px at 0% 0%, rgba(94, 231, 255, .10), transparent 60%);
+            background-repeat: no-repeat;
         }
+        a { color: var(--accent); text-decoration: none; }
+        a:hover { text-decoration: underline; }
+        code { font-family: var(--mono); font-size: .92em; color: #cfe8ff; background: rgba(94, 231, 255, .08); padding: 1px 6px; border-radius: 5px; }
+        .wrap { width: min(860px, 100% - 40px); margin: 0 auto; }
 
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-            padding: 2rem 1rem;
+        nav { border-bottom: 1px solid var(--line); background: rgba(5, 11, 24, .6); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); position: sticky; top: 0; z-index: 10; }
+        nav .wrap { display: flex; align-items: center; justify-content: space-between; height: 60px; }
+        .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; color: var(--text); }
+        .brand:hover { text-decoration: none; }
+        .brand svg { width: 24px; height: 24px; filter: drop-shadow(0 0 8px rgba(94, 231, 255, .45)); }
+        .nav-links { display: flex; gap: 22px; font-size: 14px; }
+        .nav-links a { color: var(--text-dim); }
+        .nav-links a:hover { color: var(--text); text-decoration: none; }
+
+        header { padding: 64px 0 28px; }
+        .kicker { font-family: var(--mono); font-size: 12px; color: var(--accent); letter-spacing: 1.5px; text-transform: uppercase; }
+        h1 { font-size: clamp(28px, 4vw, 40px); margin: 10px 0 12px; letter-spacing: -.3px; }
+        header p { color: var(--text-dim); }
+
+        .req { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 28px; }
+        .req div { border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; font-size: 14px; color: var(--text-dim); }
+        .req b { display: block; color: var(--text); font-size: 13px; margin-bottom: 2px; }
+
+        main { padding-bottom: 80px; }
+        .step { position: relative; padding: 36px 0 8px 56px; border-left: 1px solid var(--line); margin-left: 16px; }
+        .step:last-child { border-left-color: transparent; }
+        .num {
+            position: absolute; left: -17px; top: 34px; width: 34px; height: 34px; border-radius: 50%;
+            display: grid; place-items: center; font-family: var(--mono); font-size: 13px; color: var(--accent);
+            background: var(--bg); border: 1px solid var(--line-strong); box-shadow: 0 0 18px rgba(94, 231, 255, .18);
         }
+        h2 { font-size: 21px; margin-bottom: 6px; }
+        .step > p { color: var(--text-dim); font-size: 15px; }
+        .small { margin-top: 12px; font-size: 14px; color: var(--text-faint); }
+        h3 { font-size: 14px; color: var(--text-dim); font-weight: 600; margin: 18px 0 8px; }
 
-        header {
-            text-align: center;
-            padding: 3rem 0 2rem;
+        .cmd {
+            display: flex; align-items: center; gap: 10px; margin-top: 10px;
+            background: rgba(3, 9, 20, .8); border: 1px solid var(--line-strong); border-radius: 12px; padding: 11px 11px 11px 16px;
         }
-
-        .logo {
-            font-size: 2.5rem;
-            font-weight: 700;
-            background: linear-gradient(135deg, #3b82f6, #8b5cf6);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
-            margin-bottom: 0.5rem;
+        .cmd pre { flex: 1; min-width: 0; font-family: var(--mono); font-size: 13px; color: #cfe8ff; overflow-x: auto; white-space: pre; scrollbar-width: thin; }
+        .cmd pre .c { color: var(--text-faint); }
+        .copy {
+            flex: none; align-self: flex-start; font: 600 12px var(--sans); color: var(--bg); background: var(--accent);
+            border: 0; border-radius: 8px; padding: 6px 12px; cursor: pointer;
         }
+        .copy.done { background: var(--ok); }
 
-        .subtitle {
-            color: var(--text-secondary);
-            font-size: 1.1rem;
+        .note {
+            margin-top: 14px; padding: 12px 16px; border-radius: 10px; font-size: 14px; color: var(--text-dim);
+            border: 1px solid rgba(251, 191, 36, .28); background: rgba(251, 191, 36, .06);
         }
+        .note b { color: var(--warn); }
+        table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 14px; }
+        th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+        th { color: var(--text-faint); font-weight: 500; font-size: 13px; }
+        td:first-child { white-space: nowrap; }
+        td { color: var(--text-dim); }
 
-        .warning-banner {
-            background: rgba(234, 179, 8, 0.1);
-            border: 1px solid rgba(234, 179, 8, 0.3);
-            border-radius: 8px;
-            padding: 1rem 1.5rem;
-            margin: 2rem 0;
-            color: #fbbf24;
-        }
+        footer { border-top: 1px solid var(--line); padding: 28px 0 40px; font-size: 13px; color: var(--text-faint); }
+        footer .wrap { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 16px; }
+        footer a { color: var(--text-faint); }
 
-        .warning-banner strong {
-            display: block;
-            margin-bottom: 0.5rem;
-            font-size: 1.1rem;
-        }
-
-        .install-section {
-            background: var(--bg-card);
-            border: 1px solid var(--border);
-            border-radius: 12px;
-            padding: 2rem;
-            margin: 2rem 0;
-        }
-
-        .install-section h2 {
-            font-size: 1.5rem;
-            margin-bottom: 1rem;
-            color: var(--text-primary);
-        }
-
-        .install-section h3 {
-            font-size: 1.2rem;
-            margin: 1.5rem 0 1rem;
-            color: var(--accent);
-        }
-
-        .install-section p {
-            color: var(--text-secondary);
-            margin-bottom: 1rem;
-        }
-
-        .command-box {
-            background: var(--code-bg);
-            border: 1px solid var(--border);
-            border-radius: 8px;
-            padding: 1.5rem;
-            margin: 1rem 0;
-            position: relative;
-            overflow-x: auto;
-        }
-
-        .command-box pre {
-            margin: 0;
-            font-family: 'Monaco', 'Menlo', monospace;
-            font-size: 0.9rem;
-            line-height: 1.5;
-            color: var(--text-primary);
-        }
-
-        .command-box code {
-            color: var(--success);
-        }
-
-        .copy-btn {
-            position: absolute;
-            top: 1rem;
-            right: 1rem;
-            background: var(--accent);
-            color: white;
-            border: none;
-            padding: 0.5rem 1rem;
-            border-radius: 6px;
-            cursor: pointer;
-            font-size: 0.85rem;
-            transition: all 0.2s;
-        }
-
-        .copy-btn:hover {
-            background: var(--accent-hover);
-        }
-
-        .copy-btn.copied {
-            background: var(--success);
-        }
-
-        .step-list {
-            list-style: none;
-            counter-reset: step-counter;
-            margin: 1.5rem 0;
-        }
-
-        .step-list li {
-            counter-increment: step-counter;
-            position: relative;
-            padding-left: 3rem;
-            margin-bottom: 1.5rem;
-        }
-
-        .step-list li::before {
-            content: counter(step-counter);
-            position: absolute;
-            left: 0;
-            top: 0;
-            width: 2rem;
-            height: 2rem;
-            background: var(--accent);
-            color: white;
-            border-radius: 50%;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-weight: 700;
-        }
-
-        .feature-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-            gap: 1rem;
-            margin: 1.5rem 0;
-        }
-
-        .feature-card {
-            background: var(--bg-secondary);
-            border: 1px solid var(--border);
-            border-radius: 8px;
-            padding: 1.5rem;
-        }
-
-        .feature-card h4 {
-            color: var(--accent);
-            margin-bottom: 0.5rem;
-        }
-
-        .feature-card p {
-            color: var(--text-secondary);
-            font-size: 0.9rem;
-            margin: 0;
-        }
-
-        .btn-group {
-            display: flex;
-            gap: 1rem;
-            margin: 2rem 0;
-            flex-wrap: wrap;
-        }
-
-        .btn {
-            padding: 0.75rem 1.5rem;
-            border-radius: 8px;
-            text-decoration: none;
-            font-weight: 500;
-            transition: all 0.2s;
-            display: inline-block;
-        }
-
-        .btn-primary {
-            background: var(--accent);
-            color: white;
-            border: none;
-        }
-
-        .btn-primary:hover {
-            background: var(--accent-hover);
-            transform: translateY(-2px);
-        }
-
-        .btn-secondary {
-            background: transparent;
-            color: var(--accent);
-            border: 1px solid var(--accent);
-        }
-
-        .btn-secondary:hover {
-            background: rgba(59, 130, 246, 0.1);
-        }
-
-        footer {
-            text-align: center;
-            padding: 2rem 0;
-            color: var(--text-secondary);
-            border-top: 1px solid var(--border);
-            margin-top: 4rem;
-        }
-
-        @media (max-width: 768px) {
-            .logo {
-                font-size: 2rem;
-            }
-
-            .command-box {
-                padding: 1rem;
-            }
-
-            .copy-btn {
-                position: static;
-                display: block;
-                width: 100%;
-                margin-top: 1rem;
-            }
-
-            .step-list li {
-                padding-left: 2.5rem;
-            }
+        @media (max-width: 640px) {
+            .req { grid-template-columns: 1fr; }
+            .step { padding-left: 36px; }
+            .nav-links .hide-sm { display: none; }
+            td:first-child { white-space: normal; }
         }
     </style>
 </head>
 <body>
-    <div class="container">
-        <header>
-            <div class="logo">🦊 AcornFox</div>
-            <p class="subtitle">让 AI 一句话部署你的应用</p>
-        </header>
-
-        <div class="warning-banner">
-            <strong>提示</strong>
-            安装脚本和二进制都从 GitHub Releases 下载，二进制按同一 Release 的 SHA256SUMS 校验。中国大陆服务器访问 GitHub 失败时，脚本会自动尝试加速代理。
-        </div>
-
-        <div class="install-section">
-            <h2>🚀 快速安装</h2>
-            <p>在 Linux 服务器上一键安装 AcornFox，自动配置所有依赖。</p>
-
-            <h3>服务器端安装</h3>
-            <div class="command-box">
-                <button class="copy-btn" onclick="copyCommand(this, 'install-server')">复制</button>
-                <pre><code id="install-server">curl -fsSL https://github.com/OrbitMaker/AcornFox-rebuild/releases/latest/download/install.sh | sudo bash</code></pre>
+    <nav>
+        <div class="wrap">
+            <a class="brand" href="/">
+                <svg viewBox="0 0 32 32" aria-hidden="true"><path d="M6 13c0-5 4.5-8 10-8s10 3 10 8z" fill="#5ee7ff"/><path d="M8 13h16c0 8-3.5 14-8 14s-8-6-8-14z" fill="#2aa8d8"/><path d="M16 5V2" stroke="#5ee7ff" stroke-width="2" stroke-linecap="round"/></svg>
+                AcornFox
+            </a>
+            <div class="nav-links">
+                <a href="/">首页</a>
+                <a href="https://github.com/OrbitMaker/AcornFox-rebuild">GitHub</a>
+                <a class="hide-sm" href="https://gitee.com/VIP13390/AcornFox-rebuild">Gitee</a>
             </div>
+        </div>
+    </nav>
 
+    <header>
+        <div class="wrap">
+            <span class="kicker">Install</span>
+            <h1>安装指南</h1>
+            <p>服务器端一条命令装好 Docker、Caddy 与 AcornFox；本地电脑安装 CLI，经 SSH 连接服务器。全新阿里云实例实测约 90 秒。</p>
+            <div class="req">
+                <div><b>操作系统</b>Ubuntu 24.04 / 22.04 / 20.04，Debian 12 / 11</div>
+                <div><b>架构与配置</b>amd64 或 arm64，建议 2 核 2 GB 以上</div>
+                <div><b>本地电脑</b>macOS、Linux 或 Windows（Git Bash），能 SSH 登录服务器</div>
+            </div>
+        </div>
+    </header>
+
+    <main class="wrap">
+        <section class="step">
+            <span class="num">1</span>
+            <h2>在服务器上安装</h2>
+            <p>以 root 或 sudo 执行。中国大陆服务器自动使用 Gitee 镜像与国内软件源；下载的程序按 SHA256 校验。</p>
             <h3>中国大陆服务器</h3>
-            <p>访问 GitHub 较慢时改用 Gitee 镜像，脚本与二进制都从 Gitee 下载，同样按 SHA256SUMS 校验：</p>
-            <div class="command-box">
-                <button class="copy-btn" onclick="copyCommand(this, 'install-server-cn')">复制</button>
-                <pre><code id="install-server-cn">curl -fsSL https://gitee.com/VIP13390/AcornFox-rebuild/raw/main/scripts/install/install.sh | sudo bash</code></pre>
-            </div>
+            <div class="cmd"><pre>curl -fsSL https://gitee.com/VIP13390/AcornFox-rebuild/raw/main/scripts/install/install.sh | sudo bash</pre><button class="copy" type="button">复制</button></div>
+            <h3>其他地区</h3>
+            <div class="cmd"><pre>curl -fsSL https://github.com/OrbitMaker/AcornFox-rebuild/releases/latest/download/install.sh | sudo bash</pre><button class="copy" type="button">复制</button></div>
+            <p class="small">安装完成后会显示管理员令牌，也保存在 <code>/root/.acornfox-token</code>。</p>
 
-            <h3>客户端 CLI 安装</h3>
-            <p>在本地安装 AcornFox CLI 工具：</p>
-            <div class="command-box">
-                <button class="copy-btn" onclick="copyCommand(this, 'install-cli')">复制</button>
-                <pre><code id="install-cli">curl -fsSL https://github.com/OrbitMaker/AcornFox-rebuild/releases/latest/download/install-cli.sh | bash</code></pre>
-            </div>
+            <h3>常用选项</h3>
+            <table>
+                <tr><th>选项</th><th>说明</th></tr>
+                <tr><td><code>--version v0.2.2</code></td><td>安装指定版本，默认最新</td></tr>
+                <tr><td><code>--public-host HOST</code></td><td>部署输出的访问地址中的主机，默认从云厂商元数据取公网 IP</td></tr>
+                <tr><td><code>--registry-mirror URL</code></td><td>Docker Hub 加速地址；阿里云 ECS 建议用控制台「容器镜像服务 → 镜像加速器」的专属地址</td></tr>
+                <tr><td><code>--china</code> / <code>--global</code></td><td>强制使用国内或国际源</td></tr>
+                <tr><td><code>--skip-docker</code> / <code>--skip-caddy</code></td><td>跳过已安装的组件</td></tr>
+            </table>
+            <p class="small">通过管道传参：<code>curl … | sudo bash -s -- --china</code></p>
+        </section>
 
-            <ul class="step-list">
-                <li>
-                    <strong>系统检测</strong>
-                    <p>自动检测操作系统、架构和地理位置</p>
-                </li>
-                <li>
-                    <strong>依赖安装</strong>
-                    <p>Docker、Caddy 等核心依赖（国内自动使用镜像源）</p>
-                </li>
-                <li>
-                    <strong>服务配置</strong>
-                    <p>systemd 服务、数据库初始化、管理员令牌生成</p>
-                </li>
-                <li>
-                    <strong>启动验证</strong>
-                    <p>健康检查并显示访问地址</p>
-                </li>
-            </ul>
+        <section class="step">
+            <span class="num">2</span>
+            <h2>放行安全组端口</h2>
+            <p>云服务器默认只开放 22 端口，请在云厂商控制台的安全组中添加入方向规则：</p>
+            <table>
+                <tr><th>端口</th><th>用途</th></tr>
+                <tr><td><code>TCP 18810-18899</code></td><td>应用访问端口：<code>http://服务器IP:端口</code></td></tr>
+                <tr><td><code>TCP 80、443</code></td><td>绑定域名并自动 HTTPS 时需要</td></tr>
+            </table>
+            <div class="note"><b>备案提示：</b>中国大陆服务器绑定域名，须已完成 ICP 备案，否则无法通过 80/443 访问；未备案时仍可用 IP:端口 访问。</div>
+        </section>
+
+        <section class="step">
+            <span class="num">3</span>
+            <h2>在本地电脑安装 CLI 与 Skill</h2>
+            <h3>中国大陆</h3>
+            <div class="cmd"><pre>curl -fsSL https://gitee.com/VIP13390/AcornFox-rebuild/raw/main/scripts/install/install-cli.sh | bash</pre><button class="copy" type="button">复制</button></div>
+            <h3>其他地区</h3>
+            <div class="cmd"><pre>curl -fsSL https://github.com/OrbitMaker/AcornFox-rebuild/releases/latest/download/install-cli.sh | bash</pre><button class="copy" type="button">复制</button></div>
+            <p style="margin-top:14px;color:var(--text-dim)">再为 AI 工作台安装 Skill（自动识别 Claude Code、Codex；其他工具用 <code>--dir</code> 指定目录）：</p>
+            <div class="cmd"><pre>acornfox skill install</pre><button class="copy" type="button">复制</button></div>
+        </section>
+
+        <section class="step">
+            <span class="num">4</span>
+            <h2>连接服务器</h2>
+            <p>CLI 经 SSH 连接，不需要开放额外端口。首次连接前，先在终端里 <code>ssh</code> 登录一次，确认服务器指纹。</p>
+            <div class="cmd"><pre>acornfox target add my-server --ssh root@服务器IP</pre><button class="copy" type="button">复制</button></div>
+            <p class="small">不用 root 时，先在服务器上执行一次 <code>sudo usermod -aG acornfox-users 你的用户</code> 并重新登录。</p>
+        </section>
+
+        <section class="step">
+            <span class="num">5</span>
+            <h2>部署</h2>
+            <p>在 AI 工作台里说「把这个项目部署到我的服务器」，或在项目目录（含 Dockerfile）手动执行：</p>
+            <div class="cmd"><pre>acornfox deploy</pre><button class="copy" type="button">复制</button></div>
+            <p class="small">也可以部署公开 Git 仓库 <code>acornfox deploy --git https://github.com/user/repo</code> 或现成镜像 <code>acornfox deploy --image nginx:1.27-alpine --port 80</code>。失败时输出阶段、原因、建议与日志片段，<code>acornfox diagnose</code> 可再次查看最近一次部署的诊断。</p>
+        </section>
+
+        <section class="step">
+            <span class="num">6</span>
+            <h2>升级</h2>
+            <p>自动备份二进制与数据库后升级，失败自动回退；运行中的应用不中断。</p>
+            <h3>中国大陆服务器</h3>
+            <div class="cmd"><pre>curl -fsSL https://gitee.com/VIP13390/AcornFox-rebuild/raw/main/scripts/install/upgrade.sh | sudo bash</pre><button class="copy" type="button">复制</button></div>
+            <h3>其他地区</h3>
+            <div class="cmd"><pre>curl -fsSL https://github.com/OrbitMaker/AcornFox-rebuild/releases/latest/download/upgrade.sh | sudo bash</pre><button class="copy" type="button">复制</button></div>
+        </section>
+    </main>
+
+    <footer>
+        <div class="wrap">
+            <span>© 2026 AcornFox · AGPL-3.0 开源</span>
+            <span><a href="https://github.com/OrbitMaker/AcornFox-rebuild/blob/main/docs/quick-start.md">完整文档</a> · <a href="https://github.com/OrbitMaker/AcornFox-rebuild/issues">问题反馈</a></span>
         </div>
-
-        <div class="install-section">
-            <h2>📦 安装内容</h2>
-            <div class="feature-grid">
-                <div class="feature-card">
-                    <h4>🐳 Docker</h4>
-                    <p>容器运行时环境</p>
-                </div>
-                <div class="feature-card">
-                    <h4>🌐 Caddy</h4>
-                    <p>反向代理与 HTTPS</p>
-                </div>
-                <div class="feature-card">
-                    <h4>🔐 systemd 服务</h4>
-                    <p>server 与 runner 分账号运行</p>
-                </div>
-                <div class="feature-card">
-                    <h4>🎯 AcornFox</h4>
-                    <p>核心服务与 CLI</p>
-                </div>
-            </div>
-        </div>
-
-        <div class="install-section">
-            <h2>🔧 系统要求</h2>
-            <ul class="step-list">
-                <li>
-                    <strong>操作系统</strong>
-                    <p>Ubuntu 24.04 / 22.04 / 20.04、Debian 12 / 11（amd64 或 arm64）</p>
-                </li>
-                <li>
-                    <strong>硬件配置</strong>
-                    <p>最低 2 核 2GB RAM，推荐 2 核 4GB RAM</p>
-                </li>
-                <li>
-                    <strong>网络</strong>
-                    <p>公网 IP（可选），开放 80/443 端口</p>
-                </li>
-            </ul>
-        </div>
-
-        <div class="install-section">
-            <h2>📖 手动安装</h2>
-            <p>如果自动安装遇到问题，可以手动执行：</p>
-
-            <h3>1. 下载安装脚本</h3>
-            <div class="command-box">
-                <button class="copy-btn" onclick="copyCommand(this, 'download')">复制</button>
-                <pre><code id="download">curl -fsSLO https://github.com/OrbitMaker/AcornFox-rebuild/releases/latest/download/install.sh
-chmod +x install.sh</code></pre>
-            </div>
-
-            <h3>2. 执行安装</h3>
-            <div class="command-box">
-                <button class="copy-btn" onclick="copyCommand(this, 'run')">复制</button>
-                <pre><code id="run">sudo ./install.sh</code></pre>
-            </div>
-
-            <h3>3. 国内加速（可选）</h3>
-            <p>如果在中国大陆，脚本会自动检测并使用镜像源。也可以手动指定：</p>
-            <div class="command-box">
-                <button class="copy-btn" onclick="copyCommand(this, 'china')">复制</button>
-                <pre><code id="china">sudo ./install.sh --china</code></pre>
-            </div>
-        </div>
-
-        <div class="btn-group">
-            <a href="/" class="btn btn-primary">返回主页</a>
-            <a href="https://github.com/OrbitMaker/AcornFox-rebuild" class="btn btn-secondary">GitHub 仓库</a>
-            <a href="https://github.com/OrbitMaker/AcornFox-rebuild/blob/main/docs/quick-start.md" class="btn btn-secondary">完整文档</a>
-        </div>
-
-        <footer>
-            <p>&copy; 2026 AcornFox - 基于 AGPL-3.0 开源</p>
-            <p style="margin-top: 0.5rem; font-size: 0.9rem;">
-                让 AI 一句话部署你的应用
-            </p>
-        </footer>
-    </div>
+    </footer>
 
     <script>
-        function copyCommand(button, elementId) {
-            const code = document.getElementById(elementId);
-            const text = code.textContent;
-
-            navigator.clipboard.writeText(text).then(() => {
-                const originalText = button.textContent;
-                button.textContent = '已复制！';
-                button.classList.add('copied');
-
-                setTimeout(() => {
-                    button.textContent = originalText;
-                    button.classList.remove('copied');
-                }, 2000);
-            }).catch(err => {
-                console.error('复制失败:', err);
-                alert('复制失败，请手动复制');
-            });
-        }
-
-        // 页面加载动画
-        document.addEventListener('DOMContentLoaded', () => {
-            const sections = document.querySelectorAll('.install-section');
-            sections.forEach((section, index) => {
-                section.style.opacity = '0';
-                section.style.transform = 'translateY(20px)';
-                section.style.transition = 'all 0.5s ease';
-
-                setTimeout(() => {
-                    section.style.opacity = '1';
-                    section.style.transform = 'translateY(0)';
-                }, index * 100);
+    (function () {
+        'use strict';
+        // 复制命令；以 # 开头的注释行不复制
+        document.querySelectorAll('.cmd').forEach(function (box) {
+            var btn = box.querySelector('.copy');
+            btn.addEventListener('click', function () {
+                var text = box.querySelector('pre').textContent.split('\n')
+                    .filter(function (l) { return l.trim() && l.trim().charAt(0) !== '#'; }).join('\n');
+                var done = function () {
+                    btn.textContent = '已复制'; btn.classList.add('done');
+                    setTimeout(function () { btn.textContent = '复制'; btn.classList.remove('done'); }, 1600);
+                };
+                if (navigator.clipboard && window.isSecureContext) {
+                    navigator.clipboard.writeText(text).then(done, function () { fallback(text); done(); });
+                } else { fallback(text); done(); }
             });
         });
+        function fallback(text) {
+            var ta = document.createElement('textarea');
+            ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+            document.body.appendChild(ta); ta.select();
+            try { document.execCommand('copy'); } catch (e) { /* 用户可手动选择 */ }
+            document.body.removeChild(ta);
+        }
+    })();
     </script>
 </body>
 </html>

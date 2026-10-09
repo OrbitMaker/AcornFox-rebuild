@@ -3,551 +3,630 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="description" content="AcornFox - 让 AI 一句话部署你的应用。开源的应用部署平台，支持本地目录、Git 仓库和 Docker 镜像。">
-    <meta name="keywords" content="AcornFox,部署,Docker,AI,开源,云原生">
-    <title>AcornFox - 让 AI 一句话部署你的应用</title>
-    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🦊</text></svg>">
+    <title>AcornFox - 在 AI 工作台里，把应用部署到你自己的服务器</title>
+    <meta name="description" content="AcornFox 是开源的单机部署平台：在 Claude Code、Codex 等 AI 工作台里说一句话，应用就构建、上线到你自己的 Linux 服务器。失败时返回结构化诊断，AI 读完即可修复。">
+    <meta name="theme-color" content="#050b18">
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M6 13c0-5 4.5-8 10-8s10 3 10 8z' fill='%235ee7ff'/%3E%3Cpath d='M8 13h16c0 8-3.5 14-8 14s-8-6-8-14z' fill='%232aa8d8'/%3E%3Cpath d='M16 5V2' stroke='%235ee7ff' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E">
+    <script>document.documentElement.className += ' js';</script>
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-
         :root {
-            --primary: #00d4ff;
-            --primary-dark: #0099cc;
-            --secondary: #ff6b35;
-            --dark: #0a0e27;
-            --dark-light: #1a1f3a;
-            --text: #e0e6ed;
-            --text-dim: #8b93a7;
-            --gradient: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            --glow: 0 0 20px rgba(0, 212, 255, 0.3);
+            --bg: #050b18;
+            --bg-2: #08142a;
+            --panel: rgba(12, 26, 52, 0.62);
+            --panel-solid: #0b1a33;
+            --line: rgba(120, 190, 255, 0.14);
+            --line-strong: rgba(120, 210, 255, 0.32);
+            --text: #e6f1ff;
+            --text-dim: #8fa5c4;
+            --text-faint: #5d7393;
+            --accent: #5ee7ff;
+            --accent-2: #3b82f6;
+            --ok: #4ade80;
+            --warn: #fbbf24;
+            --err: #f87171;
+            --mono: ui-monospace, "SFMono-Regular", Menlo, Consolas, "Liberation Mono", monospace;
+            --sans: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            --radius: 14px;
         }
 
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html { scroll-behavior: smooth; }
         body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-            background: var(--dark);
+            font-family: var(--sans);
+            background: var(--bg);
             color: var(--text);
-            line-height: 1.6;
+            line-height: 1.65;
+            -webkit-font-smoothing: antialiased;
             overflow-x: hidden;
         }
+        a { color: inherit; text-decoration: none; }
+        code, pre { font-family: var(--mono); }
+        .wrap { width: min(1120px, 100% - 40px); margin: 0 auto; }
 
-        /* 动态背景 */
-        .bg-animation {
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            z-index: -1;
-            background:
-                radial-gradient(ellipse at 20% 30%, rgba(102, 126, 234, 0.15) 0%, transparent 50%),
-                radial-gradient(ellipse at 80% 70%, rgba(118, 75, 162, 0.15) 0%, transparent 50%);
-        }
-
-        .stars {
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            z-index: -1;
-        }
-
-        .star {
-            position: absolute;
-            width: 2px;
-            height: 2px;
-            background: white;
-            border-radius: 50%;
-            animation: twinkle 3s infinite;
-        }
-
-        @keyframes twinkle {
-            0%, 100% { opacity: 0.3; }
-            50% { opacity: 1; }
-        }
-
-        /* Header */
-        header {
-            position: fixed;
-            top: 0;
-            width: 100%;
-            backdrop-filter: blur(10px);
-            background: rgba(10, 14, 39, 0.8);
-            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
-            z-index: 1000;
-        }
-
+        /* 导航 */
         nav {
-            max-width: 1200px;
-            margin: 0 auto;
-            padding: 1rem 2rem;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
+            position: fixed; inset: 0 0 auto 0; z-index: 20;
+            backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+            background: rgba(5, 11, 24, 0.55);
+            border-bottom: 1px solid var(--line);
         }
+        nav .wrap { display: flex; align-items: center; justify-content: space-between; height: 64px; }
+        .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 18px; letter-spacing: .3px; }
+        .brand svg { width: 26px; height: 26px; filter: drop-shadow(0 0 8px rgba(94, 231, 255, .45)); }
+        .nav-links { display: flex; gap: 28px; font-size: 14px; color: var(--text-dim); }
+        .nav-links a:hover { color: var(--text); }
+        .nav-links .ext::after { content: " ↗"; font-size: 11px; opacity: .6; }
 
-        .logo {
-            font-size: 1.5rem;
-            font-weight: bold;
-            color: var(--primary);
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-        }
-
-        .nav-links {
-            display: flex;
-            gap: 2rem;
-            list-style: none;
-        }
-
-        .nav-links a {
-            color: var(--text);
-            text-decoration: none;
-            transition: color 0.3s;
-        }
-
-        .nav-links a:hover {
-            color: var(--primary);
-        }
-
-        /* Hero Section */
+        /* 首屏 */
         .hero {
-            min-height: 100vh;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            text-align: center;
-            padding: 8rem 2rem 4rem;
+            position: relative; min-height: 100vh; min-height: 100svh;
+            display: flex; align-items: center;
+            padding: 120px 0 80px;
+            overflow: hidden;
+            isolation: isolate;
         }
-
-        .hero-content h1 {
-            font-size: clamp(2.5rem, 8vw, 4.5rem);
-            font-weight: 800;
-            margin-bottom: 1.5rem;
-            background: linear-gradient(135deg, var(--primary) 0%, #667eea 100%);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
+        #water {
+            position: absolute; inset: 0; width: 100%; height: 100%;
+            z-index: -2; display: block;
         }
-
-        .hero-content .subtitle {
-            font-size: clamp(1.2rem, 3vw, 1.8rem);
-            color: var(--text-dim);
-            margin-bottom: 3rem;
-            max-width: 800px;
-            margin-left: auto;
-            margin-right: auto;
+        .hero::before { /* 不支持 WebGL 时的静态底色，也给画布打底 */
+            content: ""; position: absolute; inset: 0; z-index: -3;
+            background:
+                radial-gradient(1200px 600px at 70% 10%, rgba(59, 130, 246, .28), transparent 60%),
+                radial-gradient(900px 500px at 15% 30%, rgba(94, 231, 255, .16), transparent 60%),
+                linear-gradient(180deg, #071630 0%, var(--bg) 85%);
         }
-
-        .cta-buttons {
-            display: flex;
-            gap: 1.5rem;
-            justify-content: center;
-            flex-wrap: wrap;
+        .shade { /* 压暗文字一侧，保证正文可读 */
+            position: absolute; inset: 0; z-index: -1; pointer-events: none;
+            background: linear-gradient(90deg, rgba(5, 11, 24, .72) 0%, rgba(5, 11, 24, .45) 42%, rgba(5, 11, 24, .1) 75%);
         }
-
-        .btn {
-            padding: 1rem 2.5rem;
-            border-radius: 50px;
-            text-decoration: none;
-            font-weight: 600;
-            font-size: 1.1rem;
-            transition: all 0.3s;
-            display: inline-block;
+        .hero::after { /* 底部淡出，接到下方内容 */
+            content: ""; position: absolute; inset: auto 0 0 0; height: 220px; z-index: -1;
+            background: linear-gradient(180deg, transparent, var(--bg));
+            pointer-events: none;
         }
-
-        .btn-primary {
-            background: var(--primary);
-            color: var(--dark);
-            box-shadow: var(--glow);
+        .hero-grid { display: grid; grid-template-columns: 1.15fr 1fr; gap: 48px; align-items: center; }
+        .hero-grid > * { min-width: 0; } /* 网格项默认不收缩，长命令会撑破手机屏幕 */
+        .eyebrow {
+            display: inline-flex; align-items: center; gap: 8px;
+            font-family: var(--mono); font-size: 12px; color: var(--accent);
+            padding: 6px 12px; border: 1px solid var(--line-strong); border-radius: 999px;
+            background: rgba(94, 231, 255, .06);
         }
-
-        .btn-primary:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 10px 40px rgba(0, 212, 255, 0.5);
+        .eyebrow i { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 10px var(--accent); }
+        h1 {
+            margin: 22px 0 18px;
+            font-size: clamp(30px, 3.6vw, 44px); line-height: 1.2; letter-spacing: -.5px; font-weight: 800;
+            text-wrap: balance;
         }
-
-        .btn-secondary {
-            background: transparent;
-            color: var(--primary);
-            border: 2px solid var(--primary);
+        h1 .glow {
+            background: linear-gradient(100deg, #ffffff 0%, var(--accent) 55%, #7aa7ff 100%);
+            -webkit-background-clip: text; background-clip: text; color: transparent;
         }
+        .lead { font-size: 18px; color: var(--text-dim); max-width: 34em; }
 
-        .btn-secondary:hover {
-            background: var(--primary);
-            color: var(--dark);
+        .install { margin-top: 32px; max-width: 560px; }
+        .tabs { display: flex; gap: 4px; margin-bottom: 8px; }
+        .tab {
+            font: 13px var(--sans); color: var(--text-dim); background: transparent;
+            border: 1px solid transparent; border-radius: 8px; padding: 5px 12px; cursor: pointer;
         }
-
-        /* Features Section */
-        .features {
-            max-width: 1200px;
-            margin: 0 auto;
-            padding: 6rem 2rem;
+        .tab[aria-selected="true"] { color: var(--text); border-color: var(--line-strong); background: rgba(94, 231, 255, .07); }
+        .cmd {
+            display: flex; align-items: center; gap: 10px;
+            background: rgba(3, 9, 20, .72); border: 1px solid var(--line-strong); border-radius: 12px;
+            padding: 12px 12px 12px 16px;
+            box-shadow: 0 0 0 1px rgba(94, 231, 255, .04), 0 18px 50px -20px rgba(94, 231, 255, .35);
         }
-
-        .section-title {
-            text-align: center;
-            font-size: 2.5rem;
-            margin-bottom: 4rem;
-            color: var(--primary);
+        .cmd code { flex: 1; min-width: 0; font-size: 13px; color: #cfe8ff; white-space: nowrap; overflow-x: auto; scrollbar-width: none; }
+        .cmd code::-webkit-scrollbar { display: none; }
+        .cmd code .p { color: var(--accent); user-select: none; }
+        .copy {
+            flex: none; font: 12px var(--sans); color: var(--bg); background: var(--accent);
+            border: 0; border-radius: 8px; padding: 7px 12px; cursor: pointer; font-weight: 600;
         }
+        .copy:hover { filter: brightness(1.1); }
+        .copy.done { background: var(--ok); }
+        .hint { margin-top: 10px; font-size: 13px; color: var(--text-faint); }
 
-        .features-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-            gap: 2rem;
+        .stats { display: flex; gap: 36px; margin-top: 36px; flex-wrap: wrap; }
+        .stat b { display: block; font-size: 26px; font-weight: 800; font-family: var(--mono); color: var(--text); }
+        .stat span { font-size: 13px; color: var(--text-dim); }
+
+        /* 首屏右侧：AI 工作台对话示意 */
+        .console {
+            background: var(--panel); border: 1px solid var(--line-strong); border-radius: var(--radius);
+            backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+            box-shadow: 0 30px 80px -30px rgba(0, 0, 0, .8), 0 0 60px -20px rgba(94, 231, 255, .25);
+            overflow: hidden; font-size: 13px;
         }
-
-        .feature-card {
-            background: var(--dark-light);
-            padding: 2rem;
-            border-radius: 20px;
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            transition: all 0.3s;
+        .console-bar {
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 10px 14px; border-bottom: 1px solid var(--line); color: var(--text-faint);
+            font-family: var(--mono); font-size: 12px;
         }
-
-        .feature-card:hover {
-            transform: translateY(-5px);
-            border-color: var(--primary);
-            box-shadow: var(--glow);
+        .dots { display: flex; gap: 6px; }
+        .dots i { width: 10px; height: 10px; border-radius: 50%; background: #1e3354; }
+        .console-body { padding: 16px 18px 18px; display: grid; gap: 12px; min-height: 340px; }
+        .msg { display: grid; grid-template-columns: 34px 1fr; gap: 10px; }
+        .js .msg { opacity: 0; transform: translateY(6px); transition: opacity .45s, transform .45s; }
+        .js .msg.show { opacity: 1; transform: none; }
+        .who { font-family: var(--mono); font-size: 11px; color: var(--text-faint); padding-top: 2px; }
+        .who.ai { color: var(--accent); }
+        .bubble { color: var(--text); }
+        .bubble.user { color: #ffffff; }
+        .log {
+            margin-top: 6px; font-family: var(--mono); font-size: 12px; line-height: 1.7;
+            background: rgba(2, 6, 14, .55); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px;
+            color: #a9c3e4; white-space: pre-wrap; overflow-wrap: anywhere;
         }
+        .log .s { color: var(--accent); }
+        .log .e { color: var(--err); }
+        .log .ok { color: var(--ok); }
+        .console-note { padding: 0 18px 12px; font-size: 11px; color: var(--text-faint); }
 
-        .feature-icon {
-            font-size: 3rem;
-            margin-bottom: 1rem;
+        /* 通用分区 */
+        section.block { padding: 110px 0; position: relative; }
+        .kicker { font-family: var(--mono); font-size: 12px; color: var(--accent); letter-spacing: 1.5px; text-transform: uppercase; }
+        h2 { font-size: clamp(26px, 3.4vw, 38px); line-height: 1.25; margin: 12px 0 14px; font-weight: 800; letter-spacing: -.3px; }
+        .sub { color: var(--text-dim); max-width: 40em; }
+
+        /* 闭环流程 */
+        .loop { margin-top: 48px; display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; counter-reset: step; }
+        .step {
+            position: relative; padding: 22px 20px; border: 1px solid var(--line); border-radius: var(--radius);
+            background: linear-gradient(180deg, rgba(14, 30, 58, .55), rgba(8, 18, 36, .35));
         }
-
-        .feature-card h3 {
-            font-size: 1.5rem;
-            margin-bottom: 1rem;
-            color: var(--primary);
+        .step::before {
+            counter-increment: step; content: "0" counter(step);
+            font-family: var(--mono); font-size: 12px; color: var(--accent);
         }
+        .step h3 { font-size: 17px; margin: 10px 0 6px; }
+        .step p { font-size: 14px; color: var(--text-dim); }
+        .step code { font-size: 12px; color: #cfe8ff; background: rgba(94, 231, 255, .08); padding: 1px 6px; border-radius: 5px; }
 
-        .feature-card p {
-            color: var(--text-dim);
-            line-height: 1.8;
+        /* 特性 */
+        .features { margin-top: 48px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
+        .feature { background: var(--bg); padding: 30px 26px; transition: background .25s; }
+        .feature:hover { background: #07122a; }
+        .feature svg { width: 28px; height: 28px; stroke: var(--accent); fill: none; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+        .feature h3 { font-size: 17px; margin: 16px 0 8px; }
+        .feature p { font-size: 14px; color: var(--text-dim); }
+
+        /* 架构 */
+        .arch { margin-top: 48px; display: grid; grid-template-columns: 1fr auto 1fr auto 1fr; align-items: stretch; gap: 14px; }
+        .node { border: 1px solid var(--line-strong); border-radius: var(--radius); padding: 20px; background: var(--panel-solid); }
+        .node h4 { font-size: 15px; margin-bottom: 6px; }
+        .node p { font-size: 13px; color: var(--text-dim); }
+        .node .tag { font-family: var(--mono); font-size: 11px; color: var(--accent); }
+        .link { align-self: center; font-family: var(--mono); font-size: 12px; color: var(--text-faint); text-align: center; }
+        .link::before { content: ""; display: block; width: 46px; height: 1px; margin: 0 auto 6px; background: linear-gradient(90deg, transparent, var(--accent), transparent); }
+
+        /* 工作台 */
+        .benches { margin-top: 40px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+        .bench { border: 1px solid var(--line); border-radius: var(--radius); padding: 22px; }
+        .bench h4 { font-size: 16px; display: flex; align-items: center; justify-content: space-between; }
+        .bench .badge { font-size: 11px; font-weight: 500; color: var(--ok); border: 1px solid rgba(74, 222, 128, .35); border-radius: 999px; padding: 2px 8px; }
+        .bench .badge.manual { color: var(--text-dim); border-color: var(--line-strong); }
+        .bench p { margin-top: 8px; font-size: 14px; color: var(--text-dim); }
+
+        /* 收尾 */
+        .cta { text-align: center; padding: 120px 0 130px; position: relative; overflow: hidden; }
+        .cta::before {
+            content: ""; position: absolute; inset: 0; z-index: -1;
+            background: radial-gradient(700px 300px at 50% 100%, rgba(94, 231, 255, .14), transparent 70%);
         }
+        .cta .install { margin: 32px auto 0; text-align: left; }
+        .cta .sub { margin: 0 auto; }
 
-        /* Code Demo */
-        .demo {
-            max-width: 1200px;
-            margin: 0 auto;
-            padding: 6rem 2rem;
+        footer { border-top: 1px solid var(--line); padding: 32px 0 40px; color: var(--text-faint); font-size: 13px; }
+        footer .wrap { display: flex; justify-content: space-between; gap: 20px; flex-wrap: wrap; }
+        footer .links { display: flex; gap: 22px; }
+        footer a:hover { color: var(--text); }
+
+        /* 只有脚本运行时才先隐藏再渐显；脚本失败时内容照常显示 */
+        .js .reveal { opacity: 0; transform: translateY(18px); transition: opacity .7s ease, transform .7s ease; }
+        .js .reveal.in { opacity: 1; transform: none; }
+
+        @media (max-width: 960px) {
+            .hero-grid { grid-template-columns: 1fr; gap: 40px; }
+            .shade { background: rgba(5, 11, 24, .5); }
+            .loop { grid-template-columns: repeat(2, 1fr); }
+            .features, .benches { grid-template-columns: 1fr 1fr; }
+            .arch { grid-template-columns: 1fr; }
+            .link::before { width: 1px; height: 22px; background: linear-gradient(180deg, transparent, var(--accent), transparent); }
         }
-
-        .terminal {
-            background: #1e1e1e;
-            border-radius: 15px;
-            padding: 2rem;
-            overflow-x: auto;
-            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
-            border: 1px solid rgba(255, 255, 255, 0.1);
+        @media (max-width: 620px) {
+            .nav-links { gap: 16px; }
+            .nav-links .hide-sm { display: none; }
+            .loop, .features, .benches { grid-template-columns: 1fr; }
+            .stats { gap: 24px; }
+            section.block { padding: 80px 0; }
         }
-
-        .terminal-header {
-            display: flex;
-            gap: 0.5rem;
-            margin-bottom: 1.5rem;
-        }
-
-        .terminal-dot {
-            width: 12px;
-            height: 12px;
-            border-radius: 50%;
-        }
-
-        .terminal-dot.red { background: #ff5f56; }
-        .terminal-dot.yellow { background: #ffbd2e; }
-        .terminal-dot.green { background: #27c93f; }
-
-        .terminal code {
-            color: #d4d4d4;
-            font-family: 'Monaco', 'Menlo', 'Courier New', monospace;
-            font-size: 0.95rem;
-            line-height: 1.8;
-        }
-
-        .terminal .command {
-            color: var(--primary);
-        }
-
-        .terminal .comment {
-            color: #6a9955;
-        }
-
-        .terminal .output {
-            color: #ce9178;
-        }
-
-        /* Stats */
-        .stats {
-            max-width: 1200px;
-            margin: 0 auto;
-            padding: 6rem 2rem;
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 3rem;
-            text-align: center;
-        }
-
-        .stat-item h3 {
-            font-size: 3rem;
-            color: var(--primary);
-            margin-bottom: 0.5rem;
-        }
-
-        .stat-item p {
-            color: var(--text-dim);
-            font-size: 1.1rem;
-        }
-
-        /* Footer */
-        footer {
-            background: var(--dark-light);
-            padding: 3rem 2rem;
-            text-align: center;
-            border-top: 1px solid rgba(255, 255, 255, 0.1);
-        }
-
-        .footer-links {
-            display: flex;
-            justify-content: center;
-            gap: 2rem;
-            margin-bottom: 2rem;
-            flex-wrap: wrap;
-        }
-
-        .footer-links a {
-            color: var(--text-dim);
-            text-decoration: none;
-            transition: color 0.3s;
-        }
-
-        .footer-links a:hover {
-            color: var(--primary);
-        }
-
-        .copyright {
-            color: var(--text-dim);
-            font-size: 0.9rem;
-        }
-
-        /* Responsive */
-        @media (max-width: 768px) {
-            .nav-links {
-                display: none;
-            }
-
-            .hero {
-                padding-top: 6rem;
-            }
-
-            .cta-buttons {
-                flex-direction: column;
-            }
-        }
-
-        /* Scroll Animations */
-        @keyframes fadeInUp {
-            from {
-                opacity: 0;
-                transform: translateY(30px);
-            }
-            to {
-                opacity: 1;
-                transform: translateY(0);
-            }
-        }
-
-        .fade-in {
-            animation: fadeInUp 0.8s ease-out;
+        @media (prefers-reduced-motion: reduce) {
+            html { scroll-behavior: auto; }
+            .js .reveal, .js .msg { transition: none; opacity: 1; transform: none; }
         }
     </style>
 </head>
 <body>
-    <!-- 背景动画 -->
-    <div class="bg-animation"></div>
-    <div class="stars" id="stars"></div>
-
-    <!-- Header -->
-    <header>
-        <nav>
-            <div class="logo">
-                <span>🦊</span>
-                <span>AcornFox</span>
+    <nav>
+        <div class="wrap">
+            <a class="brand" href="#">
+                <svg viewBox="0 0 32 32" aria-hidden="true"><path d="M6 13c0-5 4.5-8 10-8s10 3 10 8z" fill="#5ee7ff"/><path d="M8 13h16c0 8-3.5 14-8 14s-8-6-8-14z" fill="#2aa8d8"/><path d="M16 5V2" stroke="#5ee7ff" stroke-width="2" stroke-linecap="round"/></svg>
+                AcornFox
+            </a>
+            <div class="nav-links">
+                <a href="#loop" class="hide-sm">工作方式</a>
+                <a href="#features" class="hide-sm">特性</a>
+                <a href="install.html">安装</a>
+                <a class="ext" href="https://github.com/OrbitMaker/AcornFox-rebuild">GitHub</a>
+                <a class="ext hide-sm" href="https://gitee.com/VIP13390/AcornFox-rebuild">Gitee</a>
             </div>
-            <ul class="nav-links">
-                <li><a href="#features">特性</a></li>
-                <li><a href="#demo">演示</a></li>
-                <li><a href="https://github.com/OrbitMaker/AcornFox-rebuild">GitHub</a></li>
-                <li><a href="/docs/quick-start.html">文档</a></li>
-            </ul>
-        </nav>
+        </div>
+    </nav>
+
+    <header class="hero">
+        <canvas id="water" aria-hidden="true"></canvas>
+        <div class="shade" aria-hidden="true"></div>
+        <div class="wrap hero-grid">
+            <div>
+                <span class="eyebrow"><i></i>开源单机版 v0.2 · AGPL-3.0</span>
+                <h1>在 AI 工作台里说一句话，<br><span class="glow">应用就跑在你自己的服务器上</span></h1>
+                <p class="lead">AcornFox 把构建、上线、域名与 HTTPS 交给你自己的 Linux 服务器。部署失败时返回结构化诊断，AI 读完就能接着修。</p>
+
+                <div class="install" data-install>
+                    <div class="tabs" role="tablist">
+                        <button class="tab" role="tab" aria-selected="true" data-cmd="cn">中国大陆服务器</button>
+                        <button class="tab" role="tab" aria-selected="false" data-cmd="global">其他地区</button>
+                    </div>
+                    <div class="cmd">
+                        <code><span class="p">$ </span><span data-text></span></code>
+                        <button class="copy" type="button">复制</button>
+                    </div>
+                    <p class="hint">在服务器上执行；装好 Docker、Caddy 与 AcornFox，并输出管理员令牌。</p>
+                </div>
+
+                <div class="stats">
+                    <div class="stat"><b>90 秒</b><span>全新服务器一条命令装好</span></div>
+                    <div class="stat"><b>&lt;30 秒</b><span>示例项目首次上线</span></div>
+                    <div class="stat"><b>0 中断</b><span>升级时应用持续服务</span></div>
+                </div>
+            </div>
+
+            <div class="console" aria-label="AI 工作台部署过程示意">
+                <div class="console-bar"><div class="dots"><i></i><i></i><i></i></div><span>Claude Code · my-app</span><span></span></div>
+                <div class="console-body" id="chat">
+                    <div class="msg"><div class="who">你</div><div class="bubble user">把这个项目部署到我的服务器</div></div>
+                    <div class="msg"><div class="who ai">AI</div><div class="bubble">已生成 Dockerfile，开始部署。
+                        <div class="log"><span class="s">[build]</span>  镜像就绪，启动容器
+<span class="s">[health]</span> <span class="e">容器启动后退出或反复重启</span>
+日志片段：Error: DATABASE_URL is not set</div></div></div>
+                    <div class="msg"><div class="who ai">AI</div><div class="bubble">诊断显示缺少数据库。添加 PostgreSQL 并重新部署。
+                        <div class="log"><span class="s">$</span> acornfox add postgres
+<span class="s">[health]</span> 健康检查通过，切换流量
+<span class="ok">✓ 已上线 http://203.0.113.10:18810</span></div></div></div>
+                    <div class="msg"><div class="who">你</div><div class="bubble user">绑定域名 app.example.com</div></div>
+                    <div class="msg"><div class="who ai">AI</div><div class="bubble"><div class="log"><span class="s">$</span> acornfox domain add app.example.com
+已添加域名 app.example.com（状态：pending）。
+<span class="s">$</span> acornfox domain list
+app.example.com  <span class="ok">ready</span></div></div></div>
+                </div>
+                <p class="console-note">示意：输出格式来自 AcornFox CLI，地址为示例。</p>
+            </div>
+        </div>
     </header>
 
-    <!-- Hero Section -->
-    <section class="hero">
-        <div class="hero-content fade-in">
-            <h1>让 AI 一句话部署你的应用</h1>
-            <p class="subtitle">开源的应用部署平台，支持本地目录、Git 仓库和 Docker 镜像。<br>集成 AI 工作台，自然语言完成部署。</p>
-            <div class="cta-buttons">
-                <a href="/docs/quick-start.html" class="btn btn-primary">快速开始</a>
-                <a href="https://github.com/OrbitMaker/AcornFox-rebuild" class="btn btn-secondary">查看源码</a>
+    <section class="block" id="loop">
+        <div class="wrap">
+            <div class="reveal">
+                <span class="kicker">How it works</span>
+                <h2>部署、失败、修复，都在一次对话里完成</h2>
+                <p class="sub">AcornFox 的输出为 AI 而写：每次失败都给出阶段、原因、建议和日志片段，AI 不用猜。</p>
+            </div>
+            <div class="loop">
+                <div class="step reveal"><h3>说一句话</h3><p>AI 分析项目、生成 Dockerfile，调用 <code>acornfox deploy</code> 打包上传。</p></div>
+                <div class="step reveal"><h3>服务器构建</h3><p>在你的服务器上构建镜像、启动容器，健康检查通过才切换流量。</p></div>
+                <div class="step reveal"><h3>失败给诊断</h3><p>旧版本继续服务；返回结构化诊断，交给 AI 修改后重新部署。</p></div>
+                <div class="step reveal"><h3>上线可访问</h3><p>立即得到 <code>http://IP:端口</code>；绑定已备案域名后自动 HTTPS。</p></div>
             </div>
         </div>
     </section>
 
-    <!-- Features -->
-    <section class="features" id="features">
-        <h2 class="section-title">核心特性</h2>
-        <div class="features-grid">
-            <div class="feature-card">
-                <div class="feature-icon">🚀</div>
-                <h3>一键部署</h3>
-                <p>支持本地目录、Git 仓库或 Docker 镜像。一条命令完成部署，自动构建和运行。</p>
+    <section class="block" id="features">
+        <div class="wrap">
+            <div class="reveal">
+                <span class="kicker">Features</span>
+                <h2>一台服务器需要的，都已经备好</h2>
+                <p class="sub">状态记在 AcornFox，运行交给 Docker：AcornFox 重启或升级时，你的应用照常运行。</p>
             </div>
-            <div class="feature-card">
-                <div class="feature-icon">🤖</div>
-                <h3>AI 集成</h3>
-                <p>集成主流 AI 工作台（Claude Code、Cursor、Windsurf），通过自然语言完成部署。</p>
-            </div>
-            <div class="feature-card">
-                <div class="feature-icon">🔍</div>
-                <h3>智能诊断</h3>
-                <p>部署失败时返回结构化诊断信息，AI 自动分析并修复问题。</p>
-            </div>
-            <div class="feature-card">
-                <div class="feature-icon">🗄️</div>
-                <h3>附加服务</h3>
-                <p>一键添加 PostgreSQL、MySQL 或 Redis，自动配置连接和数据持久化。</p>
-            </div>
-            <div class="feature-card">
-                <div class="feature-icon">📊</div>
-                <h3>实时监控</h3>
-                <p>查看应用日志和资源使用情况，支持实时跟踪和历史查询。</p>
-            </div>
-            <div class="feature-card">
-                <div class="feature-icon">🌐</div>
-                <h3>自动 HTTPS</h3>
-                <p>已备案域名自动申请 Let's Encrypt 证书，零配置启用 HTTPS。</p>
+            <div class="features reveal">
+                <div class="feature">
+                    <svg viewBox="0 0 24 24"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M12 12l8-4.5M12 12v9M12 12L4 7.5"/></svg>
+                    <h3>三种来源，一条命令</h3>
+                    <p>本地目录（Dockerfile）、公开 Git 仓库或现成镜像，<code>acornfox deploy</code> 即可。</p>
+                </div>
+                <div class="feature">
+                    <svg viewBox="0 0 24 24"><path d="M4 5h16v11H8l-4 4z"/><path d="M9 10h.01M12 10h.01M15 10h.01"/></svg>
+                    <h3>结构化失败诊断</h3>
+                    <p>构建、启动、健康检查、路由逐阶段判定，附建议与日志片段，可直接交给 AI。</p>
+                </div>
+                <div class="feature">
+                    <svg viewBox="0 0 24 24"><ellipse cx="12" cy="6" rx="7" ry="3"/><path d="M5 6v12c0 1.7 3.1 3 7 3s7-1.3 7-3V6M5 12c0 1.7 3.1 3 7 3s7-1.3 7-3"/></svg>
+                    <h3>PostgreSQL · MySQL · Redis</h3>
+                    <p><code>acornfox add postgres</code> 自动注入连接变量，端口不对外暴露，删除默认保留数据卷。</p>
+                </div>
+                <div class="feature">
+                    <svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5"/></svg>
+                    <h3>完整生命周期</h3>
+                    <p>停止、启动、重启、重新部署、回滚、删除；升级前自动备份，失败自动回退。</p>
+                </div>
+                <div class="feature">
+                    <svg viewBox="0 0 24 24"><path d="M3 20h18"/><path d="M6 16v-5M11 16V6M16 16v-8M21 16v-3"/></svg>
+                    <h3>日志、指标与控制台</h3>
+                    <p>实时跟随日志，查看主机与容器的 CPU、内存；<code>acornfox open</code> 打开网页控制台。</p>
+                </div>
+                <div class="feature">
+                    <svg viewBox="0 0 24 24"><rect x="5" y="10" width="14" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>
+                    <h3>HTTPS 与国内优化</h3>
+                    <p>已备案域名自动签发证书；国内服务器走 Gitee 镜像与云厂商内网源，未备案域名给出提示。</p>
+                </div>
             </div>
         </div>
     </section>
 
-    <!-- Demo -->
-    <section class="demo" id="demo">
-        <h2 class="section-title">快速演示</h2>
-        <div class="terminal">
-            <div class="terminal-header">
-                <span class="terminal-dot red"></span>
-                <span class="terminal-dot yellow"></span>
-                <span class="terminal-dot green"></span>
+    <section class="block">
+        <div class="wrap">
+            <div class="reveal">
+                <span class="kicker">Architecture</span>
+                <h2>简单的三层，权限分开</h2>
+                <p class="sub">CLI 经 SSH 连接服务器，不开放额外端口；server 不持有 Docker 权限，runner 只接受类型化请求。</p>
             </div>
-            <pre><code><span class="comment"># 1. 安装服务器端（Ubuntu/Debian）</span>
-<span class="command">curl -fsSL https://github.com/OrbitMaker/AcornFox-rebuild/releases/latest/download/install.sh | sudo bash</span>
-<span class="comment"># 中国大陆服务器：</span>
-<span class="command">curl -fsSL https://gitee.com/VIP13390/AcornFox-rebuild/raw/main/scripts/install/install.sh | sudo bash</span>
-
-<span class="comment"># 2. 安装客户端 CLI（Windows/macOS/Linux）</span>
-<span class="command">curl -fsSL https://github.com/OrbitMaker/AcornFox-rebuild/releases/latest/download/install-cli.sh | bash</span>
-
-<span class="comment"># 3. 配置服务器连接</span>
-<span class="command">acornfox target add my-server --ssh user@your-server-ip</span>
-
-<span class="comment"># 4. 部署你的应用</span>
-<span class="command">cd your-project && acornfox deploy</span>
-
-<span class="comment"># 5. 查看状态</span>
-<span class="command">acornfox status</span>
-<span class="output">应用: my-app
-状态: live ✓
-访问地址: http://your-server:8080</span></code></pre>
+            <div class="arch reveal">
+                <div class="node"><span class="tag">你的电脑</span><h4>AI 工作台 + CLI</h4><p>Claude Code / Codex 通过 Skill 调用 <code>acornfox</code> 命令。</p></div>
+                <div class="link">SSH</div>
+                <div class="node"><span class="tag">acornfox server</span><h4>状态与调和</h4><p>记录期望状态，持续收敛；SQLite 存储，Unix socket 通信。</p></div>
+                <div class="link">类型化请求</div>
+                <div class="node"><span class="tag">runner · Docker · Caddy</span><h4>执行与路由</h4><p>构建与运行容器；Caddy 负责路由与自动 HTTPS。</p></div>
+            </div>
         </div>
     </section>
 
-    <!-- Stats -->
-    <section class="stats">
-        <div class="stat-item">
-            <h3>5 分钟</h3>
-            <p>完成首次部署</p>
-        </div>
-        <div class="stat-item">
-            <h3>零配置</h3>
-            <p>开箱即用</p>
-        </div>
-        <div class="stat-item">
-            <h3>100% 开源</h3>
-            <p>AGPL-3.0 许可证</p>
-        </div>
-        <div class="stat-item">
-            <h3>5+ AI 工作台</h3>
-            <p>无缝集成</p>
+    <section class="block">
+        <div class="wrap">
+            <div class="reveal">
+                <span class="kicker">AI Workbench</span>
+                <h2>装好 Skill，AI 就会用 AcornFox</h2>
+                <p class="sub"><code>acornfox skill install</code> 自动识别本机的 AI 工作台并安装 Skill，内含命令速查、工作流程与 Dockerfile 模板。</p>
+            </div>
+            <div class="benches">
+                <div class="bench reveal"><h4>Claude Code <span class="badge">自动安装</span></h4><p>安装到 <code>~/.claude/skills/acornfox</code>。</p></div>
+                <div class="bench reveal"><h4>Codex <span class="badge">自动安装</span></h4><p>安装到 <code>~/.codex/skills/acornfox</code>。</p></div>
+                <div class="bench reveal"><h4>其他工具 <span class="badge manual">手动</span></h4><p>用 <code>skill install --dir</code> 指定目录，或 <code>skill print</code> 输出内容。</p></div>
+            </div>
         </div>
     </section>
 
-    <!-- Footer -->
+    <section class="cta">
+        <div class="wrap reveal">
+            <span class="kicker">Get started</span>
+            <h2>准备一台 Linux 服务器，开始吧</h2>
+            <p class="sub">Ubuntu 24.04 / 22.04 / 20.04 或 Debian 12 / 11，amd64 / arm64。云服务器请在安全组放行 TCP 18810-18899，绑定域名再放行 80、443。</p>
+            <div class="install" data-install>
+                <div class="tabs" role="tablist">
+                    <button class="tab" role="tab" aria-selected="true" data-cmd="cli">本地电脑：安装 CLI</button>
+                    <button class="tab" role="tab" aria-selected="false" data-cmd="cli-cn">CLI（中国大陆）</button>
+                </div>
+                <div class="cmd">
+                    <code><span class="p">$ </span><span data-text></span></code>
+                    <button class="copy" type="button">复制</button>
+                </div>
+                <p class="hint">然后：<code>acornfox target add my-server --ssh root@服务器IP</code>，再在项目目录运行 <code>acornfox deploy</code>。完整步骤见 <a href="install.html" style="color:var(--accent)">安装指南</a>。</p>
+            </div>
+        </div>
+    </section>
+
     <footer>
-        <div class="footer-links">
-            <a href="/docs/quick-start.html">快速开始</a>
-            <a href="https://github.com/OrbitMaker/AcornFox-rebuild">GitHub</a>
-            <a href="https://github.com/OrbitMaker/AcornFox-rebuild/issues">问题反馈</a>
-            <a href="/docs/contributing.html">贡献指南</a>
+        <div class="wrap">
+            <span>© 2026 AcornFox · AGPL-3.0 开源</span>
+            <div class="links">
+                <a href="https://github.com/OrbitMaker/AcornFox-rebuild">GitHub</a>
+                <a href="https://gitee.com/VIP13390/AcornFox-rebuild">Gitee 镜像</a>
+                <a href="https://github.com/OrbitMaker/AcornFox-rebuild/blob/main/docs/quick-start.md">文档</a>
+                <a href="https://github.com/OrbitMaker/AcornFox-rebuild/issues">问题反馈</a>
+            </div>
         </div>
-        <p class="copyright">© 2026 AcornFox. Licensed under AGPL-3.0.</p>
     </footer>
 
     <script>
-        // 生成星星背景
-        function createStars() {
-            const stars = document.getElementById('stars');
-            const starCount = 100;
+    (function () {
+        'use strict';
 
-            for (let i = 0; i < starCount; i++) {
-                const star = document.createElement('div');
-                star.className = 'star';
-                star.style.left = Math.random() * 100 + '%';
-                star.style.top = Math.random() * 100 + '%';
-                star.style.animationDelay = Math.random() * 3 + 's';
-                stars.appendChild(star);
+        // ---------- 安装命令切换与复制 ----------
+        var CMDS = {
+            cn: 'curl -fsSL https://gitee.com/VIP13390/AcornFox-rebuild/raw/main/scripts/install/install.sh | sudo bash',
+            global: 'curl -fsSL https://github.com/OrbitMaker/AcornFox-rebuild/releases/latest/download/install.sh | sudo bash',
+            cli: 'curl -fsSL https://github.com/OrbitMaker/AcornFox-rebuild/releases/latest/download/install-cli.sh | bash',
+            'cli-cn': 'curl -fsSL https://gitee.com/VIP13390/AcornFox-rebuild/raw/main/scripts/install/install-cli.sh | bash'
+        };
+        document.querySelectorAll('[data-install]').forEach(function (box) {
+            var text = box.querySelector('[data-text]');
+            var tabs = box.querySelectorAll('.tab');
+            var copy = box.querySelector('.copy');
+            function select(tab) {
+                tabs.forEach(function (t) { t.setAttribute('aria-selected', String(t === tab)); });
+                text.textContent = CMDS[tab.dataset.cmd];
+            }
+            tabs.forEach(function (t) { t.addEventListener('click', function () { select(t); }); });
+            select(tabs[0]);
+            copy.addEventListener('click', function () {
+                var value = text.textContent;
+                var done = function () {
+                    copy.textContent = '已复制'; copy.classList.add('done');
+                    setTimeout(function () { copy.textContent = '复制'; copy.classList.remove('done'); }, 1600);
+                };
+                if (navigator.clipboard && window.isSecureContext) {
+                    navigator.clipboard.writeText(value).then(done, function () { fallbackCopy(value); done(); });
+                } else { fallbackCopy(value); done(); }
+            });
+        });
+        function fallbackCopy(value) {
+            var ta = document.createElement('textarea');
+            ta.value = value; ta.style.position = 'fixed'; ta.style.opacity = '0';
+            document.body.appendChild(ta); ta.select();
+            try { document.execCommand('copy'); } catch (e) { /* 忽略，用户可手动选择 */ }
+            document.body.removeChild(ta);
+        }
+
+        var reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+        // ---------- 对话逐条出现 ----------
+        var msgs = document.querySelectorAll('#chat .msg');
+        msgs.forEach(function (m, i) {
+            if (reduceMotion) { m.classList.add('show'); return; }
+            setTimeout(function () { m.classList.add('show'); }, 400 + i * 900);
+        });
+
+        // ---------- 滚动渐显 ----------
+        // 直接按位置判断进入视口（只有十几个元素，开销很小），不依赖 IntersectionObserver：
+        // 它在部分环境下不触发回调，内容就会一直隐藏
+        var pending = Array.prototype.slice.call(document.querySelectorAll('.reveal'));
+        function revealVisible() {
+            var limit = window.innerHeight * 0.92;
+            pending = pending.filter(function (el) {
+                var r = el.getBoundingClientRect();
+                if (reduceMotion || (r.top < limit && r.bottom > 0)) { el.classList.add('in'); return false; }
+                return true;
+            });
+            if (!pending.length) {
+                window.removeEventListener('scroll', onScroll);
+                window.removeEventListener('resize', onScroll);
             }
         }
-
-        // 滚动动画
-        function observeElements() {
-            const observer = new IntersectionObserver((entries) => {
-                entries.forEach(entry => {
-                    if (entry.isIntersecting) {
-                        entry.target.classList.add('fade-in');
-                    }
-                });
-            }, { threshold: 0.1 });
-
-            document.querySelectorAll('.feature-card, .terminal').forEach(el => {
-                observer.observe(el);
-            });
+        var ticking = false;
+        function onScroll() {
+            if (ticking) { return; }
+            ticking = true;
+            requestAnimationFrame(function () { ticking = false; revealVisible(); });
         }
+        window.addEventListener('scroll', onScroll, { passive: true });
+        window.addEventListener('resize', onScroll, { passive: true });
+        revealVisible();
+        // 兜底：无论如何，几秒后全部显示
+        setTimeout(function () { pending.forEach(function (el) { el.classList.add('in'); }); pending = []; }, 4000);
 
-        // 初始化
-        document.addEventListener('DOMContentLoaded', () => {
-            createStars();
-            observeElements();
-        });
+        // ---------- 首屏水面焦散背景（WebGL） ----------
+        var canvas = document.getElementById('water');
+        var gl = canvas.getContext('webgl', { antialias: false, alpha: false, premultipliedAlpha: false, powerPreference: 'low-power' });
+        if (!gl) { canvas.style.display = 'none'; return; }
 
-        // 平滑滚动
-        document.querySelectorAll('a[href^="#"]').forEach(anchor => {
-            anchor.addEventListener('click', function (e) {
-                e.preventDefault();
-                const target = document.querySelector(this.getAttribute('href'));
-                if (target) {
-                    target.scrollIntoView({ behavior: 'smooth', block: 'start' });
-                }
-            });
-        });
+        var VERT = 'attribute vec2 a;void main(){gl_Position=vec4(a,0.,1.);}';
+        // 域扭曲噪声的"脊线"做出水底焦散的亮纹，叠加沿亮纹闪烁的星点
+        var FRAG = [
+            'precision mediump float;',
+            'uniform vec2 uRes; uniform float uTime; uniform vec2 uMouse; uniform float uPx;',
+            'float hash(vec2 p){p=fract(p*vec2(123.34,456.21));p+=dot(p,p+45.32);return fract(p.x*p.y);}',
+            'float noise(vec2 p){vec2 i=floor(p),f=fract(p);vec2 u=f*f*(3.-2.*f);',
+            '  return mix(mix(hash(i),hash(i+vec2(1,0)),u.x),mix(hash(i+vec2(0,1)),hash(i+vec2(1,1)),u.x),u.y);}',
+            'float fbm(vec2 p){float v=0.,a=.5;mat2 m=mat2(1.6,1.2,-1.2,1.6);for(int i=0;i<4;i++){v+=a*noise(p);p=m*p;a*=.5;}return v;}',
+            // 域扭曲噪声的"脊线"：细而柔和的水底光纹
+            'float caustic(vec2 p,float t){',
+            '  vec2 w=vec2(fbm(p+vec2(0.,t*.10)),fbm(p+vec2(5.2,1.3)-vec2(t*.08,0.)));',
+            '  float h=fbm(p*1.3+w*1.8+vec2(t*.05,-t*.04));',
+            '  return pow(1.-abs(h*2.-1.),16.);}',
+            'void main(){',
+            '  vec2 uv=gl_FragCoord.xy/uRes.xy;',
+            '  vec2 p=(gl_FragCoord.xy-.5*uRes.xy)/uRes.y;',
+            '  float t=uTime;',
+            '  vec2 q=p*vec2(3.6,4.8)+vec2(0.,t*.04);',
+            '  float c=caustic(q,t)*.7+caustic(q*1.7+3.1,t*1.25)*.4;',
+            // 粼粼波光：按屏幕像素划分格子，每格至多一个圆形小光点，随机相位闪烁，多出现在光纹附近
+            '  vec2 cell=gl_FragCoord.xy/(9.*uPx);',
+            '  vec2 id=floor(cell); vec2 f=fract(cell)-.5;',
+            '  vec2 off=(vec2(hash(id+1.7),hash(id+9.3))-.5)*.6;',
+            '  float d=length(f-off);',
+            '  float ph=hash(id);',
+            '  float tw=pow(.5+.5*sin(t*(.8+ph*2.2)+ph*6.283),18.);',
+            '  float near=smoothstep(.04,.5,c)+.25*smoothstep(.55,.45,abs(fbm(q*.6+t*.05)-.5));',
+            '  float glint=step(.72,hash(id+4.1))*tw*near*smoothstep(.22,.02,d);',
+            '  float top=smoothstep(-.1,1.,uv.y);',
+            '  float m=1.-smoothstep(0.,.5,distance(uv,uMouse));',
+            '  vec3 deep=mix(vec3(.010,.028,.062),vec3(.024,.07,.15),top);',
+            '  vec3 line=mix(vec3(.12,.42,.82),vec3(.36,.86,1.),c);',
+            '  vec3 col=deep+line*c*(.34+.40*top)*(1.+.5*m)+vec3(.8,.96,1.)*glint*(.55+.45*top)*(1.+.4*m);',
+            '  gl_FragColor=vec4(col,1.);',
+            '}'
+        ].join('\n');
+
+        function compile(type, src) {
+            var s = gl.createShader(type);
+            gl.shaderSource(s, src); gl.compileShader(s);
+            if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) { throw new Error(gl.getShaderInfoLog(s)); }
+            return s;
+        }
+        var prog;
+        try {
+            prog = gl.createProgram();
+            gl.attachShader(prog, compile(gl.VERTEX_SHADER, VERT));
+            gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FRAG));
+            gl.linkProgram(prog);
+            if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) { throw new Error(gl.getProgramInfoLog(prog)); }
+        } catch (err) {
+            canvas.style.display = 'none';
+            return;
+        }
+        gl.useProgram(prog);
+        var buf = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+        var loc = gl.getAttribLocation(prog, 'a');
+        gl.enableVertexAttribArray(loc);
+        gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+        var uRes = gl.getUniformLocation(prog, 'uRes');
+        var uTime = gl.getUniformLocation(prog, 'uTime');
+        var uMouse = gl.getUniformLocation(prog, 'uMouse');
+        var uPx = gl.getUniformLocation(prog, 'uPx');
+
+        // 以较低分辨率渲染再由浏览器放大：焦散本身很柔和，看不出差别，GPU 负担小得多
+        var SCALE = 0.5;
+        function resize() {
+            var dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+            var w = Math.max(1, Math.floor(canvas.clientWidth * dpr * SCALE));
+            var h = Math.max(1, Math.floor(canvas.clientHeight * dpr * SCALE));
+            if (canvas.width !== w || canvas.height !== h) {
+                canvas.width = w; canvas.height = h;
+                gl.viewport(0, 0, w, h);
+            }
+            gl.uniform2f(uRes, w, h);
+            gl.uniform1f(uPx, dpr * SCALE);
+        }
+        var mouse = [0.7, 0.75], target = [0.7, 0.75];
+        window.addEventListener('pointermove', function (e) {
+            var r = canvas.getBoundingClientRect();
+            target[0] = (e.clientX - r.left) / r.width;
+            target[1] = 1 - (e.clientY - r.top) / r.height;
+        }, { passive: true });
+
+        var start = performance.now(), visible = true, raf = 0;
+        function frame(now) {
+            raf = 0;
+            resize();
+            mouse[0] += (target[0] - mouse[0]) * 0.05;
+            mouse[1] += (target[1] - mouse[1]) * 0.05;
+            gl.uniform1f(uTime, (now - start) / 1000);
+            gl.uniform2f(uMouse, mouse[0], mouse[1]);
+            gl.drawArrays(gl.TRIANGLES, 0, 3);
+            if (!reduceMotion && visible && !document.hidden) { raf = requestAnimationFrame(frame); }
+        }
+        function kick() { if (!raf && !reduceMotion && visible && !document.hidden) { raf = requestAnimationFrame(frame); } }
+        window.addEventListener('resize', function () { if (reduceMotion) { frame(performance.now()); } }, { passive: true });
+        document.addEventListener('visibilitychange', kick);
+        if ('IntersectionObserver' in window) {
+            new IntersectionObserver(function (entries) { visible = entries[0].isIntersecting; kick(); }).observe(canvas);
+        }
+        // 减少动态效果时只画一帧静止的水面
+        if (reduceMotion) { start -= 8000; frame(performance.now()); } else { kick(); }
+    })();
     </script>
 </body>
 </html>

@@ -327,7 +327,8 @@ AcornFox 安装脚本
 
 环境变量:
     ACORNFOX_GITHUB_PROXY  GitHub 下载加速前缀，如 https://ghfast.top/（直连失败时使用）
-    ACORNFOX_REPO          发布仓库，默认 acornfox/acornfox
+    ACORNFOX_REPO          发布仓库，默认 OrbitMaker/AcornFox-rebuild
+    ACORNFOX_GITEE_REPO    中国大陆优先使用的 Gitee 镜像，默认 VIP13390/AcornFox-rebuild；设为空则不用
 
 示例:
     # 自动检测并安装
