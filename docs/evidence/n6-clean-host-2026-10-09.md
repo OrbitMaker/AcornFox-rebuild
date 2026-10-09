@@ -43,9 +43,21 @@
 | 升级 rc2→rc3 | 备份、迁移、替换、重启、验证通过；期间 21 次探测全 200 |
 | 故意破坏升级 | 假二进制启动失败，自动恢复二进制和数据库，回到 rc3；期间 61 次探测全 200 |
 
+## 发布后正式路径（v0.2.0 + Gitee 镜像）
+
+v0.2.0 发布到 GitHub 后，张家口测试机直连 GitHub 下载约 10 KB/s：`upgrade.sh` 6.5 分钟，`install-cli.sh` 超过 20 分钟未完成。按用户选定方案建 Gitee 镜像 `VIP13390/AcornFox-rebuild`（ADR-0011）后：
+
+| 检查 | 结果 |
+| --- | --- |
+| Gitee 匿名下载 | 13 MB 二进制 6.5 秒（约 2 MB/s），SHA256 通过；Gitee 发行版 API 可匿名取最新版本 |
+| `install-cli.sh`（Gitee 优先） | 8 秒完成并通过校验 |
+| `upgrade.sh`（Gitee 优先） | 15 秒；首次因 ip-api 超时误判为境外，改为先查云元数据并沿用安装时判断后通过 |
+| 全新实例 `i-REDACTED` 原样执行 README 国内命令 `curl -fsSL https://gitee.com/VIP13390/AcornFox-rebuild/raw/main/scripts/install/install.sh \| sudo bash` | exit 0，355 秒；其中 Docker 约 5 分钟（阿里云 Docker 源仍不一致，重试后换腾讯源），Caddy 经 ghfast 约 40 秒，AcornFox 从 Gitee 约 8 秒 |
+| 发布版 macOS CLI（`dist/acornfox_darwin_arm64`，v0.2.0） | 首次连接按设计要求先确认主机指纹；`deploy` 11.6 秒上线，公网访问正常 |
+
 ## 仍待完成
 
-- 发布 GitHub Release（二进制 + `SHA256SUMS` + 三个脚本）后，用正式下载路径（非 `--binary`）重跑安装，并验证 `install-cli.sh`。
+- GitHub 正式路径（`releases/latest/download/install.sh`）在境外服务器上的全新安装未测；v0.2.0 附件里的脚本不含 Gitee 与低速换源，需发布 v0.2.1 才对 GitHub 路径生效。
 - 第 5 项域名 HTTPS / 未备案提示：需要一个解析到测试机的域名。
 - 第 2、7 项 Skill 与 AI 工作台；由未参与开发的人完成独立验收。
 - 小问题：`stop` 在容器实际停止前就打印"已停止"；`upgrade.sh` 摘要打印原始颜色转义码；国内 GitHub 直连下载 Caddy 很慢（前两台约 10 分钟，第三台走 ghfast 代理较快）。

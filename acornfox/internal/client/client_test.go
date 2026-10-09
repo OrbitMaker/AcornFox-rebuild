@@ -438,6 +438,7 @@ func TestSSHConnectDiagnoses(t *testing.T) {
 		{"noroute", "ssh: connect to host x port 22: No route to host", "255", codeHostUnreachable},
 		{"auth", "user@host: Permission denied (publickey).", "255", codeAuthFailed},
 		{"hostkey", "Host key verification failed.", "255", codeHostKeyUnknown},
+		{"hostkey-changed", "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\n@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\nHost key verification failed.", "255", codeHostKeyChanged},
 		{"notfound", "bash: acornfox: command not found", "127", codeAcornfoxMissing},
 		{"notfound-zh", "bash: 行 1: acornfox: 未找到命令", "1", codeAcornfoxMissing},
 		{"notfound-dash", "sh: 1: acornfox: not found", "1", codeAcornfoxMissing},

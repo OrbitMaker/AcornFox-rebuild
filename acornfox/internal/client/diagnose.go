@@ -8,6 +8,7 @@ const (
 	codeHostUnreachable  = "host_unreachable"
 	codeAuthFailed       = "auth_failed"
 	codeHostKeyUnknown   = "host_key_unknown"
+	codeHostKeyChanged   = "host_key_changed"
 	codeAcornfoxMissing  = "acornfox_missing"
 	codePermissionDenied = "permission_denied"
 	codeServerDown       = "server_down"
@@ -54,6 +55,8 @@ func connectMessage(code string) (message, hint string) {
 		return "SSH 认证失败", "先在终端里 `ssh user@host` 确认能免密登录（`ssh-copy-id`）"
 	case codeHostKeyUnknown:
 		return "服务器主机指纹未确认", "先手动 `ssh user@host` 一次确认主机指纹"
+	case codeHostKeyChanged:
+		return "服务器主机指纹与本机记录不一致", "若确认服务器重装过或 IP 换了机器，运行 `ssh-keygen -R 主机` 删除旧记录，再手动 `ssh user@host` 确认新指纹；否则可能是中间人攻击，不要继续"
 	case codeAcornfoxMissing:
 		return "服务器上未安装 acornfox", "服务器上尚未安装 AcornFox"
 	case codePermissionDenied:
@@ -106,6 +109,9 @@ func classifySSH(exitCode int, stderr string) string {
 		strings.Contains(low, "no route to host"),
 		strings.Contains(low, "network is unreachable"):
 		return codeHostUnreachable
+	// A changed key also ends with "Host key verification failed", so check it first.
+	case strings.Contains(low, "remote host identification has changed"):
+		return codeHostKeyChanged
 	case strings.Contains(low, "host key verification failed"):
 		return codeHostKeyUnknown
 	case strings.Contains(low, "permission denied"):
