@@ -61,6 +61,8 @@ acornfox deploy --json --image nginx:1.27-alpine --app my-app
 - 成功：`{"ok":true,"url":"http://IP:端口",...}`，把 `url` 告诉用户。
 - 失败：`{"ok":false,"diagnosis":{"stage","code","message","log_excerpt","hint"}}`，按下文修复后重新部署。
 
+用户说「重新部署」「再部署一次」时：本地代码或 Dockerfile 有改动就用 `deploy` 上传新代码；没有改动、只是想让环境变量或设置生效，才用 `redeploy`（它只重建当前版本，不上传本地代码）。拿不准时先问用户。
+
 首次部署后当前目录会生成 `.acornfox`（只记服务器名和应用名，不含凭据），之后的命令无需再指定 `--app`。
 
 ## 状态与诊断
