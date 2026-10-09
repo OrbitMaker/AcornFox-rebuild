@@ -119,6 +119,12 @@ type Deployment struct {
 	CreatedAt    time.Time   `json:"created_at"`
 	UpdatedAt    time.Time   `json:"updated_at"`
 	FinishedAt   *time.Time  `json:"finished_at,omitempty"`
+	// Set when this deployment re-uses an existing image (redeploy, rollback,
+	// addon change): the version it was based on, that version's original
+	// source kind, and why it was created (see Reason*).
+	BasedOnSeq int    `json:"based_on_seq,omitempty"`
+	OriginKind string `json:"origin_kind,omitempty"`
+	Reason     string `json:"reason,omitempty"`
 }
 
 // EnvVar is one environment variable. Secret values are never returned by
@@ -175,8 +181,20 @@ type NewDeployment struct {
 	SourceRef    string
 	SourceDigest string
 	RequestKey   string
-	BypassDedup  bool // when true, skip digest-based deduplication (used by redeploy)
+	BypassDedup  bool   // when true, skip digest-based deduplication (used by redeploy)
+	BasedOnSeq   int    // version this deployment re-uses, 0 for a fresh source
+	OriginKind   string // original source kind of the re-used version
+	Reason       string // Reason* value, empty for a fresh source
 }
+
+// Reasons for a deployment that re-uses an existing image. Addon changes carry
+// the addon kind after a colon, e.g. "addon_add:postgres".
+const (
+	ReasonRedeploy    = "redeploy"
+	ReasonRollback    = "rollback"
+	ReasonAddonAdd    = "addon_add"
+	ReasonAddonRemove = "addon_remove"
+)
 
 // Config configures Open.
 type Config struct {

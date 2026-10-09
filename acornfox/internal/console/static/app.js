@@ -594,7 +594,7 @@ function overviewTab(a, st, meta) {
 
   dl.append(el("dt", { text: "当前版本" }));
   const live = a.live;
-  const verText = live ? `第 ${live.seq} 版 · ${sourceLabel(live.source_kind)} · ${timeAgo(live.created_at)}` : "尚无版本";
+  const verText = live ? [`第 ${live.seq} 版`, deploymentSource(live), reasonText(live), timeAgo(live.created_at)].filter(Boolean).join(" · ") : "尚无版本";
   dl.append(el("dd", { text: verText }));
 
   dl.append(el("dt", { text: "资源" }));
@@ -622,6 +622,28 @@ function sourceLabel(kind) {
   return kind === "image" ? "镜像" : kind === "git" ? "Git" : "上传";
 }
 
+const ADDON_NAMES = { postgres: "PostgreSQL", mysql: "MySQL", redis: "Redis" };
+
+// reasonText explains a deployment that re-used an existing image, e.g.
+// "添加 PostgreSQL（基于第 1 版）". Empty for a fresh build.
+function reasonText(d) {
+  if (!d || !d.reason) return "";
+  const [kind, addon] = d.reason.split(":");
+  const what = ({
+    redeploy: "重新部署",
+    rollback: "回退",
+    addon_add: "添加 " + (ADDON_NAMES[addon] || addon || "附加服务"),
+    addon_remove: "移除 " + (ADDON_NAMES[addon] || addon || "附加服务"),
+  })[kind] || d.reason;
+  return d.based_on_seq ? `${what}（基于第 ${d.based_on_seq} 版）` : what;
+}
+
+// deploymentSource shows where the code originally came from; a redeploy of
+// an uploaded directory is still "上传", not "镜像".
+function deploymentSource(d) {
+  return sourceLabel(d.origin_kind || d.source_kind);
+}
+
 function diagCard(diag, appName, deploymentID) {
   const card = el("div", { class: "diag", role: "alert" });
   card.append(el("h4", { text: "✕ " + (diag.message || "部署失败") }));
@@ -647,7 +669,8 @@ function deploysTab(a) {
   const ul = el("ul", { class: "timeline" });
   for (const d of list) {
     const dotCls = d.status === "live" ? "" : d.status === "failed" ? "bad" : PENDING_STATUSES.has(d.status) ? "warn" : "idle";
-    const msg = d.diagnosis ? d.diagnosis.message : deployStatusText(d.status);
+    const why = reasonText(d);
+    const msg = d.diagnosis ? d.diagnosis.message : deployStatusText(d.status) + (why ? " · " + why : "");
     ul.append(el("li", {}, [
       el("span", { class: "dot " + dotCls }),
       el("b", { text: "第 " + d.seq + " 版" }),
@@ -681,6 +704,10 @@ function logsTab(a) {
     el("span", { class: "faint", text: state.logFollow ? "每 3 秒跟随 · 最多保留 2000 行" : "已暂停跟随" }),
   ]);
   frag.append(row);
+  // Logs come from the running container; a new version starts a new one.
+  if (a.live && a.live.seq > 1) {
+    frag.append(el("p", { class: "faint", text: `当前显示第 ${a.live.seq} 版的日志；更早版本的日志已随旧容器删除。` }));
+  }
   if (state.logError) frag.append(el("p", { class: "muted", role: "status", text: state.logError }));
   const pre = el("pre", { class: "mono logbox", tabindex: "0", "aria-label": "应用日志" });
   if (state.logs === null) pre.textContent = "正在加载日志…";

@@ -28,9 +28,19 @@ type lifecycleError struct {
 
 func (e *lifecycleError) Error() string { return e.message }
 
+// originKind is the source a deployment's image originally came from: its own
+// source kind, or the inherited origin when it already re-used an image.
+func originKind(d state.Deployment) string {
+	if d.OriginKind != "" {
+		return d.OriginKind
+	}
+	return d.SourceKind
+}
+
 // redeployLive recreates the current image while retaining request-key dedup.
-// An app that has never gone live has nothing to recreate.
-func (s *server) redeployLive(ctx context.Context, app, key string) (string, error) {
+// An app that has never gone live has nothing to recreate. reason is a
+// state.Reason* value recorded for display.
+func (s *server) redeployLive(ctx context.Context, app, key, reason string) (string, error) {
 	a, err := s.store.GetApp(ctx, app)
 	if err != nil {
 		return "", err
@@ -48,6 +58,7 @@ func (s *server) redeployLive(ctx context.Context, app, key string) (string, err
 	dep, _, err := s.store.CreateDeployment(ctx, state.NewDeployment{
 		App: app, SourceKind: state.SourceImage, SourceRef: live.ImageID,
 		SourceDigest: live.ImageID, BypassDedup: true, RequestKey: key,
+		BasedOnSeq: live.Seq, OriginKind: originKind(live), Reason: reason,
 	})
 	if err != nil {
 		return "", err

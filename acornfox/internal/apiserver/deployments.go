@@ -200,6 +200,9 @@ func (s *server) rollback(w http.ResponseWriter, r *http.Request) {
 		SourceKind:   state.SourceImage,
 		SourceRef:    target.ImageID,
 		SourceDigest: target.ImageID,
+		BasedOnSeq:   target.Seq,
+		OriginKind:   originKind(*target),
+		Reason:       state.ReasonRollback,
 	})
 	if err != nil {
 		s.mapStoreError(w, err)
@@ -245,6 +248,9 @@ func (s *server) redeploy(w http.ResponseWriter, r *http.Request) {
 		SourceDigest: liveDep.ImageID,
 		BypassDedup:  true,
 		RequestKey:   r.Header.Get("Idempotency-Key"),
+		BasedOnSeq:   liveDep.Seq,
+		OriginKind:   originKind(liveDep),
+		Reason:       state.ReasonRedeploy,
 	})
 	if err != nil {
 		s.mapStoreError(w, err)

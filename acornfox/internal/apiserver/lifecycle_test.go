@@ -132,4 +132,48 @@ func TestAddonAutomaticallyRedeploysLiveVersion(t *testing.T) {
 	if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &removal) != nil || removal.DeploymentID == "" || removal.DeploymentID == result.DeploymentID {
 		t.Fatalf("remove must create a new deployment: %d %s", w.Code, w.Body)
 	}
+	added, removed := st.deployments[result.DeploymentID], st.deployments[removal.DeploymentID]
+	if added.Reason != "addon_add:postgres" || added.BasedOnSeq != live.Seq || added.OriginKind != state.SourceImage {
+		t.Fatalf("addon add deployment = reason %q based_on %d origin %q", added.Reason, added.BasedOnSeq, added.OriginKind)
+	}
+	if removed.Reason != "addon_remove:postgres" {
+		t.Fatalf("addon remove deployment reason = %q", removed.Reason)
+	}
+}
+
+func TestRedeployKeepsOriginalSource(t *testing.T) {
+	h, st, _, _ := addonTestServer(t)
+	ctx := context.Background()
+	first, _, err := st.CreateDeployment(ctx, state.NewDeployment{App: "shop", SourceKind: state.SourceUpload, SourceRef: "/u/1", SourceDigest: "aaa"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	makeLive := func(id string) {
+		st.deployments[id].ImageID, st.deployments[id].Status = "sha256:built", state.StatusLive
+		a := st.apps["shop"]
+		a.CurrentDeployment = id
+		st.apps["shop"] = a
+	}
+	makeLive(first.ID)
+	var resp struct {
+		DeploymentID string `json:"deployment_id"`
+	}
+	w := do(t, h, http.MethodPost, "/v1/apps/shop/redeploy", nil, nil)
+	if w.Code != http.StatusAccepted || json.Unmarshal(w.Body.Bytes(), &resp) != nil {
+		t.Fatalf("redeploy: %d %s", w.Code, w.Body)
+	}
+	second := st.deployments[resp.DeploymentID]
+	if second.SourceKind != state.SourceImage || second.OriginKind != state.SourceUpload || second.BasedOnSeq != first.Seq || second.Reason != state.ReasonRedeploy {
+		t.Fatalf("second = source %q origin %q based_on %d reason %q", second.SourceKind, second.OriginKind, second.BasedOnSeq, second.Reason)
+	}
+	// Redeploying a redeploy still reports the original upload, not "image".
+	makeLive(second.ID)
+	w = do(t, h, http.MethodPost, "/v1/apps/shop/redeploy", nil, nil)
+	if w.Code != http.StatusAccepted || json.Unmarshal(w.Body.Bytes(), &resp) != nil {
+		t.Fatalf("second redeploy: %d %s", w.Code, w.Body)
+	}
+	third := st.deployments[resp.DeploymentID]
+	if third.OriginKind != state.SourceUpload || third.BasedOnSeq != second.Seq {
+		t.Fatalf("third = origin %q based_on %d, want upload / %d", third.OriginKind, third.BasedOnSeq, second.Seq)
+	}
 }

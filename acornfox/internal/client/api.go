@@ -49,6 +49,9 @@ type Deployment struct {
 	App        string      `json:"app"`
 	Seq        int         `json:"seq"`
 	SourceKind string      `json:"source_kind"`
+	BasedOnSeq int         `json:"based_on_seq,omitempty"`
+	OriginKind string      `json:"origin_kind,omitempty"`
+	Reason     string      `json:"reason,omitempty"`
 	Status     string      `json:"status"`
 	Diagnosis  *Diagnosis  `json:"diagnosis,omitempty"`
 	Warnings   []Diagnosis `json:"warnings,omitempty"`

@@ -234,6 +234,10 @@ func TestRollbackSuccess(t *testing.T) {
 	if newDep.SourceRef != "sha256:image123" {
 		t.Fatalf("source_ref = %q, want image id", newDep.SourceRef)
 	}
+	// The re-used image still shows where it originally came from.
+	if newDep.OriginKind != state.SourceUpload || newDep.BasedOnSeq != d.Seq || newDep.Reason != state.ReasonRollback {
+		t.Fatalf("origin = %q based_on = %d reason = %q, want upload / %d / rollback", newDep.OriginKind, newDep.BasedOnSeq, newDep.Reason, d.Seq)
+	}
 	if len(k.kicks) != before+1 {
 		t.Fatalf("rollback did not kick")
 	}

@@ -184,6 +184,9 @@ func (f *fakeStore) CreateDeployment(_ context.Context, in state.NewDeployment) 
 		Status:       state.StatusQueued,
 		CreatedAt:    now,
 		UpdatedAt:    now,
+		BasedOnSeq:   in.BasedOnSeq,
+		OriginKind:   in.OriginKind,
+		Reason:       in.Reason,
 	}
 	f.deployments[d.ID] = d
 	f.order = append(f.order, d.ID)

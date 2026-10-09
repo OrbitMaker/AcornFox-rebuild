@@ -342,6 +342,36 @@ ALTER TABLE addons ADD COLUMN removed_at TEXT DEFAULT NULL;
 CREATE INDEX idx_addons_removed ON addons(app, removed_at);
 `
 
+// migration0006 records where a re-used image came from. Redeploy, rollback
+// and addon changes create image-source deployments of an existing image;
+// these columns keep the original source (upload / git / image), the version it
+// was based on and why it happened, so users do not see "image" for an app
+// they deployed from a directory.
+const migration0006 = `
+ALTER TABLE deployments ADD COLUMN based_on_seq INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE deployments ADD COLUMN origin_kind TEXT NOT NULL DEFAULT '' CHECK (origin_kind IN ('', 'upload', 'image', 'git'));
+ALTER TABLE deployments ADD COLUMN reason TEXT NOT NULL DEFAULT '';
+`
+
+// migration0007 backfills origin_kind for image-source deployments created
+// before 0006 (and for ones that inherited "image" from them): a redeploy or
+// rollback references the image built by an earlier upload / git deployment of
+// the same app, whose source kind is the real origin. Apps deployed straight
+// from an image have no such build and keep "image".
+const migration0007 = `
+UPDATE deployments
+SET origin_kind = (
+    SELECT o.source_kind FROM deployments o
+    WHERE o.app = deployments.app AND o.image_id = deployments.source_ref
+      AND o.source_kind IN ('upload', 'git')
+    ORDER BY o.seq LIMIT 1)
+WHERE source_kind = 'image' AND origin_kind IN ('', 'image')
+  AND EXISTS (
+    SELECT 1 FROM deployments o
+    WHERE o.app = deployments.app AND o.image_id = deployments.source_ref
+      AND o.source_kind IN ('upload', 'git'));
+`
+
 // migrationList is the complete, ordered schema history. Never edit a shipped
 // entry; append a new one instead.
 func migrationList() []migration {
@@ -351,6 +381,8 @@ func migrationList() []migration {
 		{"0003_source_git", migration0003},
 		{"0004_console_domains", migration0004},
 		{"0005_addon_soft_delete", migration0005},
+		{"0006_deployment_origin", migration0006},
+		{"0007_backfill_deployment_origin", migration0007},
 	}
 }
 

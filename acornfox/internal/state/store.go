@@ -403,9 +403,10 @@ func (s *Store) CreateDeployment(ctx context.Context, in NewDeployment) (Deploym
 		now := time.Now().UTC()
 		nowText := formatTime(now)
 		_, err = tx.ExecContext(ctx, `INSERT INTO deployments
-			(id, app, seq, source_kind, source_ref, source_digest, request_key, image_id, status, attempts, diagnosis, warnings, created_at, updated_at, finished_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, 0, '', '', ?, ?, NULL)`,
-			id, in.App, seq, in.SourceKind, in.SourceRef, in.SourceDigest, in.RequestKey, StatusQueued, nowText, nowText)
+			(id, app, seq, source_kind, source_ref, source_digest, request_key, image_id, status, attempts, diagnosis, warnings, created_at, updated_at, finished_at, based_on_seq, origin_kind, reason)
+			VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, 0, '', '', ?, ?, NULL, ?, ?, ?)`,
+			id, in.App, seq, in.SourceKind, in.SourceRef, in.SourceDigest, in.RequestKey, StatusQueued, nowText, nowText,
+			in.BasedOnSeq, in.OriginKind, in.Reason)
 		if err != nil {
 			return fmt.Errorf("insert deployment: %w", err)
 		}
@@ -984,7 +985,7 @@ func allocatePortTx(ctx context.Context, tx *sql.Tx, minPort, maxPort int) (int,
 	return 0, fmt.Errorf("%w: public port range [%d,%d] exhausted", ErrConflict, minPort, maxPort)
 }
 
-const deploymentSelect = `SELECT id, app, seq, source_kind, source_ref, source_digest, request_key, image_id, status, attempts, diagnosis, warnings, created_at, updated_at, finished_at`
+const deploymentSelect = `SELECT id, app, seq, source_kind, source_ref, source_digest, request_key, image_id, status, attempts, diagnosis, warnings, created_at, updated_at, finished_at, based_on_seq, origin_kind, reason`
 
 func scanDeploymentFrom(sc rowScanner) (Deployment, error) {
 	var d Deployment
@@ -992,7 +993,7 @@ func scanDeploymentFrom(sc rowScanner) (Deployment, error) {
 	var finishedText sql.NullString
 	if err := sc.Scan(&d.ID, &d.App, &d.Seq, &d.SourceKind, &d.SourceRef, &d.SourceDigest,
 		&d.RequestKey, &d.ImageID, &d.Status, &d.Attempts, &diagText, &warnText,
-		&createdText, &updatedText, &finishedText); err != nil {
+		&createdText, &updatedText, &finishedText, &d.BasedOnSeq, &d.OriginKind, &d.Reason); err != nil {
 		return Deployment{}, err
 	}
 	var err error
