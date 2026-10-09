@@ -13,12 +13,14 @@ AcornFox 把带 Dockerfile 的项目部署到用户自己的 Linux 服务器（�
 
 ### 1. 判断网络环境
 
-安装源按网络选择：中国大陆用 Gitee 镜像，其他地区用 GitHub。用户电脑和服务器可能不在同一地区，**两边分别判断**（在服务器上判断时，把下面这段经 `ssh USER@HOST '…'` 执行）：
+安装源按网络选择：中国大陆用 Gitee 镜像，其他地区用 GitHub。用户电脑和服务器可能不在同一地区，**两边分别判断**：
 
 ```bash
-cc=$(curl -s -m 5 "http://ip-api.com/json/?fields=countryCode" | grep -o '"[A-Z][A-Z]"' | tr -d '"')
+cc=$(curl -s -m 5 'http://ip-api.com/line/?fields=countryCode')
 if [ "$cc" = CN ] || { [ -z "$cc" ] && ! curl -s -m 6 -o /dev/null https://github.com; }; then echo cn; else echo global; fi
 ```
+
+在服务器上判断时，用 `ssh USER@HOST "curl -s -m 5 'http://ip-api.com/line/?fields=countryCode'"` 取国家代码（输出 `CN` 即中国大陆）；输出为空时再用 `ssh USER@HOST 'curl -s -m 6 -o /dev/null https://github.com && echo ok'` 判断能否直连 GitHub。不要把整段脚本套进 ssh 的引号里，引号嵌套容易出错。
 
 | 结果 | 安装脚本地址前缀 |
 | --- | --- |
