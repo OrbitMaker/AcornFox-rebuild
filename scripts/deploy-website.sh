@@ -1,44 +1,54 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
 # AcornFox 官网部署脚本
-# 用途：自动部署官网到阿里云服务器
+# 把仓库中已提交的 website/ 上传到服务器，由 Caddy 提供静态页面并自动申请 HTTPS 证书。
+# 默认目标是上海包年包月 ECS；官网与测试机分开，避免互相影响。
+# 用法: SSH_KEY=~/.ssh/xxx scripts/deploy-website.sh
+#
+# Caddy 配置只写官网自己的站点文件 /etc/caddy/sites/acornfox-website.caddy，
+# 主 Caddyfile 只确保有 import 这一行，不覆盖服务器上已有的其他站点。
 
 SERVER_IP="${SERVER_IP:-<server-ip>}"
 SERVER_USER="${SERVER_USER:-root}"
 DOMAIN="${DOMAIN:-acornfox.com}"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-echo "🚀 开始部署 AcornFox 官网"
-echo "目标服务器: ${SERVER_USER}@${SERVER_IP}"
-echo "域名: ${DOMAIN}"
+SSH_OPTS=(-o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new)
+if [ -n "${SSH_KEY:-}" ]; then
+    SSH_OPTS+=(-i "$SSH_KEY" -o IdentitiesOnly=yes)
+fi
+TARGET="${SERVER_USER}@${SERVER_IP}"
+
+REV=$(git -C "$ROOT" rev-parse --short HEAD)
+if [ -n "$(git -C "$ROOT" status --porcelain -- website)" ]; then
+    echo "⚠️  website/ 有未提交的修改，本次只部署已提交的版本 ${REV}"
+fi
+
+echo "🚀 部署 AcornFox 官网（${REV}）"
+echo "目标服务器: ${TARGET}"
+echo "域名: ${DOMAIN}、www.${DOMAIN}"
 echo ""
 
-# 检查 SSH 连接
 echo "📡 测试 SSH 连接..."
-if ! ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no "${SERVER_USER}@${SERVER_IP}" 'echo "✓ SSH 连接成功"'; then
-    echo "❌ SSH 连接失败"
-    echo "请确保："
-    echo "  1. 服务器 IP 正确"
-    echo "  2. SSH 密钥已配置或可以输入密码"
-    echo "  3. 安全组已开放 22 端口"
+if ! ssh "${SSH_OPTS[@]}" "$TARGET" 'echo "✓ SSH 连接成功"'; then
+    echo "❌ SSH 连接失败：检查服务器 IP、SSH 密钥（SSH_KEY）以及安全组是否放行 22"
     exit 1
 fi
 
-# 在服务器上执行部署
+echo "📤 上传 website/（${REV}）..."
+git -C "$ROOT" archive --format=tar HEAD website \
+    | ssh "${SSH_OPTS[@]}" "$TARGET" 'rm -rf /tmp/acornfox-site && mkdir -p /tmp/acornfox-site && tar -x -C /tmp/acornfox-site'
+
 echo ""
 echo "📦 开始远程部署..."
-ssh -o StrictHostKeyChecking=no "${SERVER_USER}@${SERVER_IP}" << 'ENDSSH'
+ssh "${SSH_OPTS[@]}" "$TARGET" "DOMAIN='${DOMAIN}' REV='${REV}' bash -s" << 'ENDSSH'
 set -e
 
 echo "1️⃣ 更新系统包..."
-apt update -qq
+apt-get update -qq
 
-echo "2️⃣ 检查并安装 Git..."
-if ! command -v git &> /dev/null; then
-    apt install -y git
-fi
-
-echo "3️⃣ 检查并安装 Caddy..."
+echo "2️⃣ 检查并安装 Caddy..."
 if ! command -v caddy &> /dev/null; then
     # Caddy 官方 apt 仓库 dl.cloudsmith.io 现对匿名请求返回 402，改为下载官方二进制并按官方
     # SHA-512 校验；安装包先从 Gitee 镜像取（服务器在中国大陆），与 scripts/install/install.sh 一致。
@@ -97,94 +107,78 @@ UNIT
     echo "   ✓ Caddy $(caddy version | awk '{print $1}') 已安装"
 fi
 
-echo "4️⃣ 克隆 GitHub 仓库..."
-cd /var/www
-if [ -d "AcornFox-rebuild" ]; then
-    echo "   仓库已存在，更新代码..."
-    cd AcornFox-rebuild
-    git fetch origin
-    git reset --hard origin/main
-    cd ..
-else
-    echo "   首次克隆仓库..."
-    git clone https://github.com/OrbitMaker/AcornFox-rebuild.git
+echo "3️⃣ 部署官网文件..."
+mkdir -p /var/www
+rm -rf /var/www/acornfox.new
+mv /tmp/acornfox-site/website /var/www/acornfox.new
+echo "$REV" > /var/www/acornfox.new/.revision
+chmod -R a+rX /var/www/acornfox.new
+rm -rf /var/www/acornfox.old
+[ -d /var/www/acornfox ] && mv /var/www/acornfox /var/www/acornfox.old
+mv /var/www/acornfox.new /var/www/acornfox
+rm -rf /var/www/acornfox.old /tmp/acornfox-site
+
+echo "4️⃣ 配置 Caddy..."
+mkdir -p /etc/caddy/sites /var/log/caddy
+chown caddy:caddy /var/log/caddy
+# 主 Caddyfile 只保证引入站点目录，不覆盖已有内容
+if [ ! -s /etc/caddy/Caddyfile ]; then
+    echo 'import /etc/caddy/sites/*.caddy' > /etc/caddy/Caddyfile
+elif ! grep -qF 'import /etc/caddy/sites/*.caddy' /etc/caddy/Caddyfile; then
+    cp /etc/caddy/Caddyfile "/etc/caddy/Caddyfile.bak-$(date +%Y%m%d%H%M%S)"
+    printf '\nimport /etc/caddy/sites/*.caddy\n' >> /etc/caddy/Caddyfile
 fi
-
-echo "5️⃣ 部署官网文件..."
-mkdir -p /var/www/acornfox
-cp -r AcornFox-rebuild/website/* /var/www/acornfox/
-chmod -R 755 /var/www/acornfox
-
-echo "6️⃣ 配置 Caddy..."
-cat > /etc/caddy/Caddyfile << 'CADDYFILE'
-# AcornFox 官网配置
-acornfox.com, www.acornfox.com {
+cat > /etc/caddy/sites/acornfox-website.caddy << CADDYFILE
+# AcornFox 官网（由 scripts/deploy-website.sh 生成）
+${DOMAIN} {
     root * /var/www/acornfox
     file_server
     encode gzip
 
-    # 安全头
     header {
         X-Content-Type-Options "nosniff"
         X-Frame-Options "DENY"
-        X-XSS-Protection "1; mode=block"
-        Referrer-Policy "no-referrer-when-downgrade"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        -Server
     }
 
-    # 日志
     log {
         output file /var/log/caddy/acornfox.log
         format json
     }
 }
 
-# 默认响应（IP 直接访问）
-:80 {
-    respond "AcornFox - Server Running" 200
+www.${DOMAIN} {
+    redir https://${DOMAIN}{uri} permanent
 }
 CADDYFILE
+caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null
 
-echo "7️⃣ 启动 Caddy 服务..."
-systemctl enable caddy
-systemctl restart caddy
-
-echo "8️⃣ 检查服务状态..."
+echo "5️⃣ 启动 Caddy..."
+systemctl enable --quiet caddy
+if systemctl is-active --quiet caddy; then
+    systemctl reload caddy
+else
+    systemctl start caddy
+fi
+sleep 2
 if systemctl is-active --quiet caddy; then
     echo "   ✓ Caddy 运行正常"
 else
     echo "   ❌ Caddy 启动失败"
-    systemctl status caddy
+    systemctl status caddy --no-pager | tail -20
     exit 1
 fi
 
 echo ""
-echo "✅ 部署完成！"
-echo ""
-echo "📊 服务信息："
-echo "  - 文档根目录: /var/www/acornfox"
-echo "  - Caddy 配置: /etc/caddy/Caddyfile"
-echo "  - 日志目录: /var/log/caddy/"
-echo ""
-echo "🌐 访问测试："
-echo "  - IP 访问: http://<server-ip>"
-echo "  - 域名访问: http://acornfox.com (需配置 DNS)"
-echo ""
+echo "✅ 部署完成：/var/www/acornfox（版本 ${REV}）"
 ENDSSH
 
-# 本地验证
 echo ""
-echo "🧪 验证部署..."
-if curl -sS -o /dev/null -w "%{http_code}" "http://${SERVER_IP}" | grep -q "200"; then
-    echo "✓ HTTP 访问正常"
-else
-    echo "⚠️  HTTP 访问异常，请检查防火墙规则"
-fi
-
+echo "🧪 验证（按服务器 IP 直连，不依赖 DNS）..."
+code=$(curl -s -m 15 -o /dev/null -w "%{http_code}" --resolve "${DOMAIN}:80:${SERVER_IP}" "http://${DOMAIN}/" || true)
+echo "  http://${DOMAIN} → ${code}（308 表示已跳转到 HTTPS）"
+code=$(curl -s -m 15 -o /dev/null -w "%{http_code}" --resolve "${DOMAIN}:443:${SERVER_IP}" "https://${DOMAIN}/" || true)
+echo "  https://${DOMAIN} → ${code}（DNS 指向本机前证书无法签发，000 属正常）"
 echo ""
-echo "🎉 部署成功完成！"
-echo ""
-echo "📋 下一步操作："
-echo "  1. 配置 DNS 解析（acornfox.com → ${SERVER_IP}）"
-echo "  2. 等待 DNS 生效后访问 https://acornfox.com"
-echo "  3. Caddy 会自动申请 HTTPS 证书"
-echo ""
+echo "DNS：${DOMAIN} 与 www.${DOMAIN} 需指向 ${SERVER_IP}，生效后 Caddy 会自动申请证书。"
