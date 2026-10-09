@@ -28,41 +28,47 @@ AcornFox 专为以下场景设计：
 
 ## 🚀 快速开始
 
-### 1. 安装服务器端
+### 推荐：把一句话发给 AI 工作台
 
-在你的 Linux 服务器上（Ubuntu 24.04/22.04/20.04 或 Debian 12/11）：
+准备一台能 SSH 登录的 Linux 服务器（Ubuntu 24.04/22.04/20.04 或 Debian 12/11），在 Claude Code、Codex 等 AI 工作台里发送：
 
-```bash
-curl -fsSL https://github.com/OrbitMaker/AcornFox-rebuild/releases/latest/download/install.sh | sudo bash
+```text
+请安装 AcornFox Skill：下载 https://acornfox.com/skill/SKILL.md ，保存为你 skills 目录下的 acornfox/SKILL.md（Claude Code 是 ~/.claude/skills，Codex 是 ~/.codex/skills），然后按这个 Skill 把当前项目部署到我的服务器。
 ```
 
-中国大陆服务器访问 GitHub 很慢，请改用 Gitee 镜像（脚本与二进制都从 Gitee 下载，同样按 SHA256SUMS 校验）：
+AI 会先安装 Skill，再由 Skill 分别判断你的电脑和服务器在国内还是海外，选择 Gitee 或 GitHub 下载源，装好 CLI 与服务端，然后部署。
+
+> **云服务器安全组**：应用通过 `http://服务器IP:端口` 访问，端口在 18810-18899 之间分配。请在云厂商控制台的安全组中放行入方向 TCP 18810-18899；绑定域名启用 HTTPS 还需放行 80 和 443。
+
+### 手动安装
+
+#### 1. 安装服务器端
 
 ```bash
+# 中国大陆服务器（Gitee 镜像）
 curl -fsSL https://gitee.com/VIP13390/AcornFox-rebuild/raw/main/scripts/install/install.sh | sudo bash
+# 其他地区
+curl -fsSL https://github.com/OrbitMaker/AcornFox-rebuild/releases/latest/download/install.sh | sudo bash
 ```
 
 安装完成后会显示管理员令牌，请妥善保存。
 
-> **云服务器安全组**：应用通过 `http://服务器IP:端口` 访问，端口在 18810-18899 之间分配。请在云厂商控制台的安全组中放行入方向 TCP 18810-18899；绑定域名启用 HTTPS 还需放行 80 和 443。
-
-### 2. 安装客户端 CLI
-
-在你的本地电脑（Windows/macOS/Linux）：
+#### 2. 安装客户端 CLI
 
 ```bash
-curl -fsSL https://github.com/OrbitMaker/AcornFox-rebuild/releases/latest/download/install-cli.sh | bash
-# 中国大陆：
+# 中国大陆
 curl -fsSL https://gitee.com/VIP13390/AcornFox-rebuild/raw/main/scripts/install/install-cli.sh | bash
+# 其他地区
+curl -fsSL https://github.com/OrbitMaker/AcornFox-rebuild/releases/latest/download/install-cli.sh | bash
 ```
 
-### 3. 配置服务器连接
+#### 3. 配置服务器连接
 
 ```bash
 acornfox target add my-server --ssh user@your-server-ip
 ```
 
-### 4. 部署你的第一个应用
+#### 4. 部署你的第一个应用
 
 ```bash
 cd your-project
@@ -79,41 +85,30 @@ acornfox status
 
 ## 🤖 AI 工作台集成
 
-AcornFox 支持通过 AI 助手自然语言部署应用：
+Skill 是使用 AcornFox 的入口：首次使用时由它安装 CLI 与服务端，之后负责部署、读诊断并修复、管理数据库和生命周期。
 
 ### 安装 Skill
 
-```bash
-acornfox skill install
-```
+- **还没有 CLI**：把「快速开始」里那句话发给 AI 工作台，AI 会从 `https://acornfox.com/skill/SKILL.md` 下载 Skill。
+- **已有 CLI**：`acornfox skill install` 安装与 CLI 同版本的 Skill。
 
-支持的 AI 工作台：
-- **Claude Code** - Anthropic 官方 CLI
-- **Cursor** - AI 代码编辑器
-- **Windsurf** - Codeium AI 编辑器
-- **豆包 MarsCode** - 字节跳动 AI 编程助手
-- **通义灵码** - 阿里云 AI 编程助手
+| 工作台 | 方式 |
+| --- | --- |
+| Claude Code | 自动安装到 `~/.claude/skills/acornfox/` |
+| Codex | 自动安装到 `~/.codex/skills/acornfox/` |
+| 其他工具 | `acornfox skill install --dir 目录`，或 `acornfox skill print` 输出内容 |
 
 ### 使用示例
 
-安装 Skill 后，在 AI 工作台中：
-
 ```
-你: 帮我部署这个 Node.js 项目
+你: 帮我把这个项目部署到我的服务器
 
-AI: 
-✓ 检测到 Express 应用
-✓ 生成 Dockerfile
-✓ 正在部署...
-✓ 部署完成！访问地址: http://your-server:8080
+AI: 已生成 Dockerfile，开始部署。
+    [health] 容器启动后退出或反复重启
+    日志片段：Error: DATABASE_URL is not set
+AI: 诊断显示缺少数据库，添加 PostgreSQL 并重新部署。
+    ✓ 已上线 http://服务器IP:18810
 ```
-
-AI 会自动：
-- 分析项目类型
-- 生成合适的 Dockerfile
-- 执行部署命令
-- 查询部署状态
-- 遇到错误时自动诊断并修复
 
 ## 📖 核心命令
 

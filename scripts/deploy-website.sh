@@ -21,8 +21,8 @@ fi
 TARGET="${SERVER_USER}@${SERVER_IP}"
 
 REV=$(git -C "$ROOT" rev-parse --short HEAD)
-if [ -n "$(git -C "$ROOT" status --porcelain -- website)" ]; then
-    echo "⚠️  website/ 有未提交的修改，本次只部署已提交的版本 ${REV}"
+if [ -n "$(git -C "$ROOT" status --porcelain -- website skills/acornfox)" ]; then
+    echo "⚠️  website/ 或 Skill 有未提交的修改，本次只部署已提交的版本 ${REV}"
 fi
 
 echo "🚀 部署 AcornFox 官网（${REV}）"
@@ -36,8 +36,9 @@ if ! ssh "${SSH_OPTS[@]}" "$TARGET" 'echo "✓ SSH 连接成功"'; then
     exit 1
 fi
 
-echo "📤 上传 website/（${REV}）..."
-git -C "$ROOT" archive --format=tar HEAD website \
+echo "📤 上传 website/ 与 Skill（${REV}）..."
+# Skill 以仓库中的 skills/acornfox/SKILL.md 为准，发布到 /skill/SKILL.md，供用户"发给 AI 一句话"安装
+git -C "$ROOT" archive --format=tar HEAD website skills/acornfox/SKILL.md \
     | ssh "${SSH_OPTS[@]}" "$TARGET" 'rm -rf /tmp/acornfox-site && mkdir -p /tmp/acornfox-site && tar -x -C /tmp/acornfox-site'
 
 echo ""
@@ -111,6 +112,8 @@ echo "3️⃣ 部署官网文件..."
 mkdir -p /var/www
 rm -rf /var/www/acornfox.new
 mv /tmp/acornfox-site/website /var/www/acornfox.new
+mkdir -p /var/www/acornfox.new/skill
+mv /tmp/acornfox-site/skills/acornfox/SKILL.md /var/www/acornfox.new/skill/SKILL.md
 echo "$REV" > /var/www/acornfox.new/.revision
 chmod -R a+rX /var/www/acornfox.new
 rm -rf /var/www/acornfox.old
@@ -134,6 +137,9 @@ ${DOMAIN} {
     root * /var/www/acornfox
     file_server
     encode gzip
+
+    @markdown path *.md
+    header @markdown Content-Type "text/markdown; charset=utf-8"
 
     header {
         X-Content-Type-Options "nosniff"

@@ -72,6 +72,7 @@
         }
         .cmd pre { flex: 1; min-width: 0; font-family: var(--mono); font-size: 13px; color: #cfe8ff; overflow-x: auto; white-space: pre; scrollbar-width: thin; }
         .cmd pre .c { color: var(--text-faint); }
+        .cmd pre.wrap-text { white-space: pre-wrap; font-family: var(--sans); font-size: 14px; line-height: 1.7; color: #dbeeff; }
         .copy {
             flex: none; align-self: flex-start; font: 600 12px var(--sans); color: var(--bg); background: var(--accent);
             border: 0; border-radius: 8px; padding: 6px 12px; cursor: pointer;
@@ -118,9 +119,11 @@
 
     <header>
         <div class="wrap">
-            <span class="kicker">Install</span>
+            <span class="kicker">Install · 推荐方式</span>
             <h1>安装指南</h1>
-            <p>服务器端一条命令装好 Docker、Caddy 与 AcornFox；本地电脑安装 CLI，经 SSH 连接服务器。全新阿里云实例实测约 90 秒。</p>
+            <p>推荐把下面这句话发给你的 AI 工作台：先装 Skill，再由 Skill 判断你的电脑和服务器在国内还是海外，选对下载源，装好 CLI 与服务端并部署。</p>
+            <div class="cmd" style="margin-top:16px"><pre class="wrap-text">请安装 AcornFox Skill：下载 https://acornfox.com/skill/SKILL.md ，保存为你 skills 目录下的 acornfox/SKILL.md（Claude Code 是 ~/.claude/skills，Codex 是 ~/.codex/skills），然后按这个 Skill 把当前项目部署到我的服务器。</pre><button class="copy" type="button">复制</button></div>
+            <p class="small">下面是手动安装步骤，与 Skill 自动执行的步骤相同。全新国内云主机实测约 90 秒。</p>
             <div class="req">
                 <div><b>操作系统</b>Ubuntu 24.04 / 22.04 / 20.04，Debian 12 / 11</div>
                 <div><b>架构与配置</b>amd64 或 arm64，建议 2 核 2 GB 以上</div>

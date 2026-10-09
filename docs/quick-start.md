@@ -1,6 +1,14 @@
 # 快速开始
 
-5 分钟完成首次部署。
+全新服务器约 2 分钟完成安装与首次部署（实测安装约 90 秒，示例项目首次上线 30 秒以内）。
+
+## 推荐：把一句话发给 AI 工作台
+
+```text
+请安装 AcornFox Skill：下载 https://acornfox.com/skill/SKILL.md ，保存为你 skills 目录下的 acornfox/SKILL.md（Claude Code 是 ~/.claude/skills，Codex 是 ~/.codex/skills），然后按这个 Skill 把当前项目部署到我的服务器。
+```
+
+AI 先安装 Skill，再由 Skill 分别判断你的电脑和服务器在国内还是海外，选择 Gitee 或 GitHub 下载源，完成下文的全部步骤。下文是手动操作的说明。
 
 ## 环境要求
 

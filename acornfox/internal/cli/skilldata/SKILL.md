@@ -1,18 +1,49 @@
 ---
 name: acornfox
-description: 用 AcornFox CLI 把当前项目部署到用户自己的服务器，并处理部署失败、数据库、日志和应用生命周期。用户说“部署”“上线”“发布到服务器”“加个数据库”“看日志”或提到 acornfox 时使用。
+description: 用 AcornFox 把当前项目部署到用户自己的服务器：首次使用时按国内或海外网络安装 CLI 与服务端，之后处理部署失败、数据库、日志和应用生命周期。用户说“部署”“上线”“发布到服务器”“加个数据库”“看日志”或提到 acornfox 时使用。
 ---
 
 # AcornFox 部署
 
 AcornFox 把带 Dockerfile 的项目部署到用户自己的 Linux 服务器（经 SSH）。所有命令都加 `--json`，按输出里的 `ok` 字段判断成败。
 
-## 前置检查
+## 首次使用：安装与连接
 
-1. `acornfox version --json`：确认 CLI 已安装。
-2. `acornfox target list --json`：确认已配置服务器。没有时请用户提供 SSH 地址，执行
-   `acornfox target add NAME --ssh USER@HOST [--port N] [--identity 私钥路径]`。
-   不要自己猜测服务器地址或私钥。
+用户通常只装了这个 Skill。按顺序检查，已就绪的步骤直接跳过。
+
+### 1. 判断网络环境
+
+安装源按网络选择：中国大陆用 Gitee 镜像，其他地区用 GitHub。用户电脑和服务器可能不在同一地区，**两边分别判断**（在服务器上判断时，把下面这段经 `ssh USER@HOST '…'` 执行）：
+
+```bash
+cc=$(curl -s -m 5 "http://ip-api.com/json/?fields=countryCode" | grep -o '"[A-Z][A-Z]"' | tr -d '"')
+if [ "$cc" = CN ] || { [ -z "$cc" ] && ! curl -s -m 6 -o /dev/null https://github.com; }; then echo cn; else echo global; fi
+```
+
+| 结果 | 安装脚本地址前缀 |
+| --- | --- |
+| `cn` | `https://gitee.com/VIP13390/AcornFox-rebuild/raw/main/scripts/install/` |
+| `global` | `https://github.com/OrbitMaker/AcornFox-rebuild/releases/latest/download/` |
+
+### 2. 安装 CLI（用户电脑）
+
+`acornfox version --json` 失败时，按本机判断结果执行 `curl -fsSL <前缀>install-cli.sh | bash`。Windows 需在 Git Bash 中执行。脚本需要 sudo 密码而你无法输入时，把命令交给用户自己执行（Claude Code 中可让用户输入 `! 命令`）。
+
+### 3. 连接服务器
+
+1. `acornfox target list --json` 已有服务器则跳到第 4 步。
+2. 请用户提供 SSH 地址（`USER@HOST`，可选端口和私钥路径）。不要猜测地址或私钥。
+3. 首次连接请用户先在自己的终端执行一次 `ssh USER@HOST` 确认主机指纹；不要用关闭指纹校验的参数绕过。
+4. `ssh USER@HOST 'command -v acornfox && acornfox version'` 检查服务端。未安装时：
+   - 按服务器的判断结果执行 `ssh USER@HOST 'curl -fsSL <前缀>install.sh | sudo bash'`（USER 为 root 时去掉 sudo；需要输入 sudo 密码时交给用户执行）。全新服务器约 1～2 分钟。
+   - 输出中的管理员令牌不要在对话里复述。
+   - 提醒用户在云厂商安全组放行 TCP 18810-18899（应用端口）；要绑定域名再放行 80、443。
+   - USER 不是 root 时，执行一次 `ssh USER@HOST 'sudo usermod -aG acornfox-users USER'`，之后的连接才有权限。
+5. `acornfox target add NAME --ssh USER@HOST [--port N] [--identity 私钥路径] --json`。
+
+### 4. 更新 Skill（可选）
+
+`acornfox skill install` 用与 CLI 同版本的 Skill 覆盖当前文件。
 
 ## 部署
 

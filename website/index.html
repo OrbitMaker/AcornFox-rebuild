@@ -128,6 +128,16 @@
         .copy:hover { filter: brightness(1.1); }
         .copy.done { background: var(--ok); }
         .hint { margin-top: 10px; font-size: 13px; color: var(--text-faint); }
+        .hint a { color: var(--accent); }
+        .step-label { font-size: 13px; color: var(--text-dim); margin-bottom: 8px; }
+        .step-label b { color: var(--accent); font-weight: 600; }
+        .prompt {
+            display: flex; align-items: flex-start; gap: 12px;
+            background: rgba(3, 9, 20, .72); border: 1px solid var(--line-strong); border-radius: 12px;
+            padding: 14px 12px 14px 16px;
+            box-shadow: 0 0 0 1px rgba(94, 231, 255, .04), 0 18px 50px -20px rgba(94, 231, 255, .35);
+        }
+        .prompt p { flex: 1; min-width: 0; font-size: 14px; line-height: 1.7; color: #dbeeff; }
 
         .stats { display: flex; gap: 36px; margin-top: 36px; flex-wrap: wrap; }
         .stat b { display: block; font-size: 26px; font-weight: 800; font-family: var(--mono); color: var(--text); }
@@ -275,16 +285,13 @@
                 <h1>在 AI 工作台里说一句话，<br><span class="glow">应用就跑在你自己的服务器上</span></h1>
                 <p class="lead">AcornFox 把构建、上线、域名与 HTTPS 交给你自己的 Linux 服务器。部署失败时返回结构化诊断，AI 读完就能接着修。</p>
 
-                <div class="install" data-install>
-                    <div class="tabs" role="tablist">
-                        <button class="tab" role="tab" aria-selected="true" data-cmd="cn">中国大陆服务器</button>
-                        <button class="tab" role="tab" aria-selected="false" data-cmd="global">其他地区</button>
+                <div class="install">
+                    <p class="step-label"><b>第一步</b>　把这句话发给你的 AI 工作台</p>
+                    <div class="prompt">
+                        <p data-prompt>请安装 AcornFox Skill：下载 https://acornfox.com/skill/SKILL.md ，保存为你 skills 目录下的 acornfox/SKILL.md（Claude Code 是 ~/.claude/skills，Codex 是 ~/.codex/skills），然后按这个 Skill 把当前项目部署到我的服务器。</p>
+                        <button class="copy" type="button" data-copy-prompt>复制</button>
                     </div>
-                    <div class="cmd">
-                        <code><span class="p">$ </span><span data-text></span></code>
-                        <button class="copy" type="button">复制</button>
-                    </div>
-                    <p class="hint">在服务器上执行；装好 Docker、Caddy 与 AcornFox，并输出管理员令牌。</p>
+                    <p class="hint">Skill 会判断你的电脑和服务器在国内还是海外，选对下载源，装好 CLI 与服务端，然后部署。只需准备一台能 SSH 登录的 Linux 服务器。<a href="install.html">手动安装 →</a></p>
                 </div>
 
                 <div class="stats">
@@ -297,8 +304,8 @@
             <div class="console" aria-label="AI 工作台部署过程示意">
                 <div class="console-bar"><div class="dots"><i></i><i></i><i></i></div><span>Claude Code · my-app</span><span></span></div>
                 <div class="console-body" id="chat">
-                    <div class="msg"><div class="who">你</div><div class="bubble user">把这个项目部署到我的服务器</div></div>
-                    <div class="msg"><div class="who ai">AI</div><div class="bubble">已生成 Dockerfile，开始部署。
+                    <div class="msg"><div class="who">你</div><div class="bubble user">请安装 AcornFox Skill……把当前项目部署到我的服务器</div></div>
+                    <div class="msg"><div class="who ai">AI</div><div class="bubble">Skill 已安装。检测到你在国内，从 Gitee 镜像装好 CLI 与服务端；已生成 Dockerfile，开始部署。
                         <div class="log"><span class="s">[build]</span>  镜像就绪，启动容器
 <span class="s">[health]</span> <span class="e">容器启动后退出或反复重启</span>
 日志片段：Error: DATABASE_URL is not set</div></div></div>
@@ -411,11 +418,12 @@ app.example.com  <span class="ok">ready</span></div></div></div>
         <div class="wrap reveal">
             <span class="kicker">Get started</span>
             <h2>准备一台 Linux 服务器，开始吧</h2>
+            <p class="sub" style="margin-bottom:6px">推荐把首屏那句话发给 AI；也可以手动安装：</p>
             <p class="sub">Ubuntu 24.04 / 22.04 / 20.04 或 Debian 12 / 11，amd64 / arm64。云服务器请在安全组放行 TCP 18810-18899，绑定域名再放行 80、443。</p>
             <div class="install" data-install>
                 <div class="tabs" role="tablist">
-                    <button class="tab" role="tab" aria-selected="true" data-cmd="cli">本地电脑：安装 CLI</button>
-                    <button class="tab" role="tab" aria-selected="false" data-cmd="cli-cn">CLI（中国大陆）</button>
+                    <button class="tab" role="tab" aria-selected="true" data-cmd="cli-cn">CLI（中国大陆）</button>
+                    <button class="tab" role="tab" aria-selected="false" data-cmd="cli">CLI（其他地区）</button>
                 </div>
                 <div class="cmd">
                     <code><span class="p">$ </span><span data-text></span></code>
@@ -444,11 +452,15 @@ app.example.com  <span class="ok">ready</span></div></div></div>
 
         // ---------- 安装命令切换与复制 ----------
         var CMDS = {
-            cn: 'curl -fsSL https://gitee.com/VIP13390/AcornFox-rebuild/raw/main/scripts/install/install.sh | sudo bash',
-            global: 'curl -fsSL https://github.com/OrbitMaker/AcornFox-rebuild/releases/latest/download/install.sh | sudo bash',
             cli: 'curl -fsSL https://github.com/OrbitMaker/AcornFox-rebuild/releases/latest/download/install-cli.sh | bash',
             'cli-cn': 'curl -fsSL https://gitee.com/VIP13390/AcornFox-rebuild/raw/main/scripts/install/install-cli.sh | bash'
         };
+        document.querySelectorAll('[data-copy-prompt]').forEach(function (btn) {
+            btn.addEventListener('click', function () {
+                var value = btn.parentNode.querySelector('[data-prompt]').textContent;
+                copyText(value, btn);
+            });
+        });
         document.querySelectorAll('[data-install]').forEach(function (box) {
             var text = box.querySelector('[data-text]');
             var tabs = box.querySelectorAll('.tab');
@@ -459,17 +471,17 @@ app.example.com  <span class="ok">ready</span></div></div></div>
             }
             tabs.forEach(function (t) { t.addEventListener('click', function () { select(t); }); });
             select(tabs[0]);
-            copy.addEventListener('click', function () {
-                var value = text.textContent;
-                var done = function () {
-                    copy.textContent = '已复制'; copy.classList.add('done');
-                    setTimeout(function () { copy.textContent = '复制'; copy.classList.remove('done'); }, 1600);
-                };
-                if (navigator.clipboard && window.isSecureContext) {
-                    navigator.clipboard.writeText(value).then(done, function () { fallbackCopy(value); done(); });
-                } else { fallbackCopy(value); done(); }
-            });
+            copy.addEventListener('click', function () { copyText(text.textContent, copy); });
         });
+        function copyText(value, btn) {
+            var done = function () {
+                btn.textContent = '已复制'; btn.classList.add('done');
+                setTimeout(function () { btn.textContent = '复制'; btn.classList.remove('done'); }, 1600);
+            };
+            if (navigator.clipboard && window.isSecureContext) {
+                navigator.clipboard.writeText(value).then(done, function () { fallbackCopy(value); done(); });
+            } else { fallbackCopy(value); done(); }
+        }
         function fallbackCopy(value) {
             var ta = document.createElement('textarea');
             ta.value = value; ta.style.position = 'fixed'; ta.style.opacity = '0';
