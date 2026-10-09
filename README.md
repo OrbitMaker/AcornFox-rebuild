@@ -36,6 +36,12 @@ AcornFox 专为以下场景设计：
 curl -fsSL https://github.com/OrbitMaker/AcornFox-rebuild/releases/latest/download/install.sh | sudo bash
 ```
 
+中国大陆服务器访问 GitHub 很慢，请改用 Gitee 镜像（脚本与二进制都从 Gitee 下载，同样按 SHA256SUMS 校验）：
+
+```bash
+curl -fsSL https://gitee.com/VIP13390/AcornFox-rebuild/raw/main/scripts/install/install.sh | sudo bash
+```
+
 安装完成后会显示管理员令牌，请妥善保存。
 
 > **云服务器安全组**：应用通过 `http://服务器IP:端口` 访问，端口在 18810-18899 之间分配。请在云厂商控制台的安全组中放行入方向 TCP 18810-18899；绑定域名启用 HTTPS 还需放行 80 和 443。
@@ -46,6 +52,8 @@ curl -fsSL https://github.com/OrbitMaker/AcornFox-rebuild/releases/latest/downlo
 
 ```bash
 curl -fsSL https://github.com/OrbitMaker/AcornFox-rebuild/releases/latest/download/install-cli.sh | bash
+# 中国大陆：
+curl -fsSL https://gitee.com/VIP13390/AcornFox-rebuild/raw/main/scripts/install/install-cli.sh | bash
 ```
 
 ### 3. 配置服务器连接
@@ -185,6 +193,8 @@ sudo bash install.sh --global
 ```bash
 # 服务器端升级
 curl -fsSL https://github.com/OrbitMaker/AcornFox-rebuild/releases/latest/download/upgrade.sh | sudo bash
+# 中国大陆：
+curl -fsSL https://gitee.com/VIP13390/AcornFox-rebuild/raw/main/scripts/install/upgrade.sh | sudo bash
 
 # 客户端升级
 curl -fsSL https://github.com/OrbitMaker/AcornFox-rebuild/releases/latest/download/install-cli.sh | bash

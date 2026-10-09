@@ -63,15 +63,51 @@ setup_github_proxies() {
 # github_download URL OUT：依次直连、走代理下载 GitHub 文件
 github_download() {
     local url="$1" out="$2" p
+    # 连续 15 秒低于 50KB/s 就放弃当前源换下一个：国内直连 GitHub 常只有十几 KB/s，
+    # 不限速时要等满 --max-time 才会轮到代理。所有源都太慢时，最后不限速再试一次。
     for p in "${GITHUB_PROXIES[@]}"; do
         if [ -n "$p" ]; then
             log_info "尝试通过 ${p} 下载"
         fi
-        if curl -fL --connect-timeout 10 --max-time 600 --retry 2 -o "$out" "${p}${url}"; then
+        if curl -fL --connect-timeout 10 --max-time 600 --speed-limit 51200 --speed-time 15 -o "$out" "${p}${url}"; then
             return 0
         fi
     done
-    return 1
+    log_info "所有下载源都较慢，不限速重试一次"
+    curl -fL --connect-timeout 10 --max-time 1800 --retry 2 -o "$out" "${GITHUB_PROXIES[0]}${url}"
+}
+
+# 国内镜像：Gitee 发行版与 GitHub Release 的文件相同（同一份 SHA256SUMS 校验）。
+# 中国大陆服务器先从 Gitee 下载，失败再走 GitHub 直连和代理；ACORNFOX_GITEE_REPO 设为空可关闭。
+ACORNFOX_GITEE_REPO="${ACORNFOX_GITEE_REPO-VIP13390/AcornFox-rebuild}"
+
+# release_download VERSION ASSET OUT：下载某个版本的 Release 文件
+release_download() {
+    local version="$1" asset="$2" out="$3"
+    if $IN_CHINA && [ -n "$ACORNFOX_GITEE_REPO" ]; then
+        log_info "从 Gitee 镜像下载 ${asset}"
+        if curl -fL --connect-timeout 10 --max-time 600 --speed-limit 51200 --speed-time 15 -o "$out" \
+            "https://gitee.com/${ACORNFOX_GITEE_REPO}/releases/download/${version}/${asset}"; then
+            return 0
+        fi
+        log_warn "Gitee 镜像下载失败，改从 GitHub 下载"
+    fi
+    github_download "https://github.com/${ACORNFOX_REPO}/releases/download/${version}/${asset}" "$out"
+}
+
+# latest_tag：最新版本号。中国大陆先查 Gitee 发行版 API（Gitee 的 releases/latest
+# 页面不跳转到版本页，不能沿用 GitHub 的做法），再走 GitHub 的 releases/latest 跳转
+latest_tag() {
+    local tag
+    if $IN_CHINA && [ -n "$ACORNFOX_GITEE_REPO" ]; then
+        tag=$(curl -fsS -m 15 "https://gitee.com/api/v5/repos/${ACORNFOX_GITEE_REPO}/releases/latest" 2>/dev/null \
+            | grep -o '"tag_name":"[^"]*"' | head -1 | cut -d'"' -f4)
+        if [ -n "$tag" ]; then
+            echo "$tag"
+            return 0
+        fi
+    fi
+    github_latest_tag
 }
 
 # verify_sha256 FILE ASSET VERSION：用同一 Release 的 SHA256SUMS 校验下载文件，不一致则删除并中止。
@@ -79,7 +115,7 @@ github_download() {
 verify_sha256() {
     local file="$1" asset="$2" version="$3" sums want got
     sums=$(mktemp)
-    if ! github_download "https://github.com/${ACORNFOX_REPO}/releases/download/${version}/SHA256SUMS" "$sums"; then
+    if ! release_download "$version" SHA256SUMS "$sums"; then
         rm -f "$sums" "$file"
         error_exit "下载 SHA256SUMS 失败，无法校验 ${asset}"
     fi
@@ -676,14 +712,13 @@ download_acornfox() {
 
     if [ "$VERSION" = "latest" ]; then
         log_info "获取最新版本号..."
-        VERSION=$(github_latest_tag) || error_exit "无法获取最新版本号；用 --version vX.Y.Z 指定版本，或用 --binary 安装本地文件"
+        VERSION=$(latest_tag) || error_exit "无法获取最新版本号；用 --version vX.Y.Z 指定版本，或用 --binary 安装本地文件"
         log_info "最新版本: $VERSION"
     fi
 
-    DOWNLOAD_URL="https://github.com/${ACORNFOX_REPO}/releases/download/${VERSION}/acornfox_linux_${ARCH}"
-    log_info "下载地址: $DOWNLOAD_URL"
+    log_info "下载 AcornFox ${VERSION}（acornfox_linux_${ARCH}）"
 
-    if github_download "$DOWNLOAD_URL" /tmp/acornfox; then
+    if release_download "$VERSION" "acornfox_linux_${ARCH}" /tmp/acornfox; then
         log_success "下载完成"
     else
         error_exit "下载 AcornFox 失败，请检查网络或版本号；也可设置 ACORNFOX_GITHUB_PROXY 或使用 --binary"
@@ -956,6 +991,9 @@ main() {
     # 解析参数
     parse_args "$@"
     setup_github_proxies
+    # 记下网络环境判断，upgrade.sh 直接沿用，不必再依赖外部 IP 查询
+    mkdir -p /etc/acornfox
+    echo "ACORNFOX_IN_CHINA=${IN_CHINA}" > /etc/acornfox/install.env
 
     # 安装流程
     update_apt
