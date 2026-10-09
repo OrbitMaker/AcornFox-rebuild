@@ -63,9 +63,15 @@ v0.2.0 发布到 GitHub 后，张家口测试机直连 GitHub 下载约 10 KB/s�
 
 随后 Caddy 也改为随发行版附在 Gitee（官方安装包与许可证；校验文件优先取 Caddy 官方 GitHub）。国内镜像站无 Caddy 官方 apt 仓库，Ubuntu 仓库的 2.6.2 实测不支持 `persist_config`。全新实例 `i-REDACTED` 原样执行 README 国内命令：**90 秒**。apt update 23 秒、基础依赖 7 秒、Docker 31 秒、Caddy 11 秒、AcornFox 8 秒，四个服务 active。
 
+## 境外路径（新加坡，同日）
+
+阿里云 ap-southeast-1a 全新抢占式实例（ecs.c7.large，Ubuntu 24.04，临时 VPC/安全组）原样执行 GitHub 安装命令（v0.2.1）：**失败**。Docker 经 download.docker.com 19 秒装好，随后 Caddy 官方 apt 仓库 `dl.cloudsmith.io` 返回 `402 Payment Required`，apt update 失败，脚本退出。该代码自 N5 起存在，v0.2.0、v0.2.1 境外全新安装均受影响。
+
+修复：所有地区都下载 Caddy 官方二进制（大陆先 Gitee），去掉 cloudsmith 源；重装时清理旧版本留下的 `caddy-stable.list`。在同一台失败过的机器上重跑修复后的脚本：15 秒，已清理失效源，四个服务 active；发布版 v0.2.1 CLI 部署 9 秒上线，公网访问正常。
+
 ## 仍待完成
 
-- GitHub 正式路径（`releases/latest/download/install.sh`）在境外服务器上的全新安装未测；v0.2.0 附件里的脚本不含 Gitee 与低速换源，需发布 v0.2.1 才对 GitHub 路径生效。
+- 境外修复需发布 v0.2.2 后，用 GitHub 正式路径在全新境外实例上复测。
 - 第 5 项域名 HTTPS / 未备案提示：需要一个解析到测试机的域名。
 - 第 2、7 项 Skill 与 AI 工作台；由未参与开发的人完成独立验收。
 - 小问题：`stop` 在容器实际停止前就打印"已停止"；`upgrade.sh` 摘要打印原始颜色转义码；国内 GitHub 直连下载 Caddy 很慢（前两台约 10 分钟，第三台走 ghfast 代理较快）。

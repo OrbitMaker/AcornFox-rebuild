@@ -346,6 +346,13 @@ EOF
 update_apt() {
     log_info "更新软件包列表..."
 
+    # v0.2.1 及更早版本在境外会添加 Caddy 的 cloudsmith 源，该源现在返回 402，留着会让
+    # apt update 一直失败；重新安装时先移除
+    if [ -f /etc/apt/sources.list.d/caddy-stable.list ] && grep -q 'dl.cloudsmith.io' /etc/apt/sources.list.d/caddy-stable.list; then
+        rm -f /etc/apt/sources.list.d/caddy-stable.list
+        log_info "已移除失效的 Caddy cloudsmith 软件源"
+    fi
+
     # 中国大陆只在软件源指向境外官方地址时才替换。云厂商镜像自带的内网源（如阿里云
     # mirrors.cloud.aliyuncs.com）走内网，冷启动 apt update 实测 17 秒，换成公网
     # mirrors.aliyun.com 要 251 秒，所以其他任何源都原样保留。
@@ -541,61 +548,61 @@ install_caddy() {
 
     log_info "安装 Caddy..."
 
-    if $IN_CHINA; then
-        # apt 源 dl.cloudsmith.io 在大陆不稳定，国内镜像站也没有同步它；Ubuntu/Debian 仓库里的
-        # caddy 2.6.2 不支持 persist_config。所以下载官方二进制：AcornFox 发行版在 Gitee 上附带
-        # 同一份 Caddy 安装包与官方校验文件，先从 Gitee 取，失败再走 GitHub 直连和代理。
-        ARCH=$(dpkg --print-architecture)
-        CADDY_VERSION="2.8.4"
-        local caddy_tag="" name
-        if [ -n "$ACORNFOX_GITEE_REPO" ]; then
-            caddy_tag="$ACORNFOX_VERSION"
-            [ "$caddy_tag" = "latest" ] && caddy_tag=$(latest_tag 2>/dev/null || true)
-        fi
-        local official="https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}"
-        local mirror="https://gitee.com/${ACORNFOX_GITEE_REPO}/releases/download/${caddy_tag}"
-        name="caddy_${CADDY_VERSION}_linux_${ARCH}.tar.gz"
-        if [ -n "$caddy_tag" ] && curl -fL --connect-timeout 10 --max-time 600 --speed-limit 51200 --speed-time 15 \
-            -o "/tmp/${name}" "${mirror}/${name}"; then
-            log_info "已从 Gitee 镜像下载 ${name}"
+    # 所有地区都下载 Caddy 官方二进制：官方 apt 仓库 dl.cloudsmith.io 2026-10 实测对匿名请求
+    # 返回 402 Payment Required，大陆也不稳定且国内镜像站没有同步；Ubuntu/Debian 仓库的
+    # caddy 2.6.2 不支持 persist_config。中国大陆先从 Gitee 发行版取同一份安装包（随 AcornFox
+    # 发行版附带），失败再走 GitHub 直连和代理。
+    ARCH=$(dpkg --print-architecture)
+    CADDY_VERSION="2.8.4"
+    local caddy_tag="" name
+    if $IN_CHINA && [ -n "$ACORNFOX_GITEE_REPO" ]; then
+        caddy_tag="$ACORNFOX_VERSION"
+        [ "$caddy_tag" = "latest" ] && caddy_tag=$(latest_tag 2>/dev/null || true)
+    fi
+    local official="https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}"
+    local mirror="https://gitee.com/${ACORNFOX_GITEE_REPO}/releases/download/${caddy_tag}"
+    name="caddy_${CADDY_VERSION}_linux_${ARCH}.tar.gz"
+    if [ -n "$caddy_tag" ] && curl -fL --connect-timeout 10 --max-time 600 --speed-limit 51200 --speed-time 15 \
+        -o "/tmp/${name}" "${mirror}/${name}"; then
+        log_info "已从 Gitee 镜像下载 ${name}"
+    else
+        log_info "从 GitHub 下载 ${name}..."
+        github_download "${official}/${name}" "/tmp/${name}" \
+            || error_exit "下载 Caddy 失败；可设置 ACORNFOX_GITHUB_PROXY 指定可用的 GitHub 加速地址后重试"
+    fi
+    # 校验文件只有几 KB，优先取 Caddy 官方的，与镜像上的安装包互相独立；取不到再用镜像副本
+    name="caddy_${CADDY_VERSION}_checksums.txt"
+    if ! curl -fsSL --connect-timeout 10 --max-time 30 -o "/tmp/${name}" "${official}/${name}"; then
+        if [ -n "$caddy_tag" ] && curl -fsSL --connect-timeout 10 --max-time 60 -o "/tmp/${name}" "${mirror}/${name}"; then
+            log_warn "Caddy 官方校验文件取不到，改用 Gitee 镜像上的副本"
         else
-            log_info "从 GitHub 下载 ${name}..."
-            github_download "${official}/${name}" "/tmp/${name}" \
-                || error_exit "下载 Caddy 失败；可设置 ACORNFOX_GITHUB_PROXY 指定可用的 GitHub 加速地址后重试"
+            github_download "${official}/${name}" "/tmp/${name}" || error_exit "下载 Caddy 校验文件失败"
         fi
-        # 校验文件只有几 KB，优先取 Caddy 官方的，与镜像上的安装包互相独立；取不到再用镜像副本
-        name="caddy_${CADDY_VERSION}_checksums.txt"
-        if ! curl -fsSL --connect-timeout 10 --max-time 30 -o "/tmp/${name}" "${official}/${name}"; then
-            if [ -n "$caddy_tag" ] && curl -fsSL --connect-timeout 10 --max-time 60 -o "/tmp/${name}" "${mirror}/${name}"; then
-                log_warn "Caddy 官方校验文件取不到，改用 Gitee 镜像上的副本"
-            else
-                github_download "${official}/${name}" "/tmp/${name}" || error_exit "下载 Caddy 校验文件失败"
-            fi
-        fi
-        mv "/tmp/caddy_${CADDY_VERSION}_linux_${ARCH}.tar.gz" /tmp/caddy.tar.gz
-        mv "/tmp/caddy_${CADDY_VERSION}_checksums.txt" /tmp/caddy_checksums.txt
+    fi
+    mv "/tmp/caddy_${CADDY_VERSION}_linux_${ARCH}.tar.gz" /tmp/caddy.tar.gz
+    mv "/tmp/caddy_${CADDY_VERSION}_checksums.txt" /tmp/caddy_checksums.txt
 
-        # 无论从哪里下载，都按 Caddy 官方发布的 SHA-512 校验
-        CADDY_WANT=$(awk -v a="caddy_${CADDY_VERSION}_linux_${ARCH}.tar.gz" '$2 == a {print $1; exit}' /tmp/caddy_checksums.txt)
-        rm -f /tmp/caddy_checksums.txt
-        if [ -z "$CADDY_WANT" ] || [ "$(sha512sum /tmp/caddy.tar.gz | awk '{print $1}')" != "$CADDY_WANT" ]; then
-            rm -f /tmp/caddy.tar.gz
-            error_exit "Caddy 安装包 SHA-512 校验失败"
-        fi
+    # 无论从哪里下载，都按 Caddy 官方发布的 SHA-512 校验
+    CADDY_WANT=$(awk -v a="caddy_${CADDY_VERSION}_linux_${ARCH}.tar.gz" '$2 == a {print $1; exit}' /tmp/caddy_checksums.txt)
+    rm -f /tmp/caddy_checksums.txt
+    if [ -z "$CADDY_WANT" ] || [ "$(sha512sum /tmp/caddy.tar.gz | awk '{print $1}')" != "$CADDY_WANT" ]; then
+        rm -f /tmp/caddy.tar.gz
+        error_exit "Caddy 安装包 SHA-512 校验失败"
+    fi
 
-        tar -xzf /tmp/caddy.tar.gz -C /tmp caddy
-        install -m 0755 /tmp/caddy /usr/bin/caddy
-        rm -f /tmp/caddy.tar.gz /tmp/caddy
+    tar -xzf /tmp/caddy.tar.gz -C /tmp caddy
+    install -m 0755 /tmp/caddy /usr/bin/caddy
+    rm -f /tmp/caddy.tar.gz /tmp/caddy
 
-        # 二进制安装没有 deb 包自带的账号和 systemd 服务，这里补齐
-        if ! getent group caddy >/dev/null; then
-            groupadd --system caddy
-        fi
-        if ! id caddy >/dev/null 2>&1; then
-            useradd --system --gid caddy --create-home --home-dir /var/lib/caddy \
-                --shell /usr/sbin/nologin --comment "Caddy web server" caddy
-        fi
-        cat > /etc/systemd/system/caddy.service << 'EOF'
+    # 二进制安装没有 deb 包自带的账号和 systemd 服务，这里补齐
+    if ! getent group caddy >/dev/null; then
+        groupadd --system caddy
+    fi
+    if ! id caddy >/dev/null 2>&1; then
+        useradd --system --gid caddy --create-home --home-dir /var/lib/caddy \
+            --shell /usr/sbin/nologin --comment "Caddy web server" caddy
+    fi
+    cat > /etc/systemd/system/caddy.service << 'EOF'
 [Unit]
 Description=Caddy
 Documentation=https://caddyserver.com/docs/
@@ -617,28 +624,14 @@ AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 [Install]
 WantedBy=multi-user.target
 EOF
-        systemctl daemon-reload
-        systemctl enable caddy
-    else
-        # 使用官方 apt 仓库安装
-        log_info "使用官方仓库安装 Caddy..."
-
-        # 添加 Caddy GPG 密钥
-        curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-
-        # 添加 Caddy 仓库
-        echo "deb [signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.gpg] https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main" | tee /etc/apt/sources.list.d/caddy-stable.list
-
-        # 安装 Caddy
-        apt_get update -qq
-        apt_get install -y -qq caddy || error_exit "Caddy 安装失败"
-    fi
+    systemctl daemon-reload
+    systemctl enable caddy
 
     # 验证安装
     if caddy version >/dev/null 2>&1; then
-        log_success "Caddy 安装成功: $(caddy version)"
+    log_success "Caddy 安装成功: $(caddy version)"
     else
-        error_exit "Caddy 安装验证失败"
+    error_exit "Caddy 安装验证失败"
     fi
 }
 
