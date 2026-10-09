@@ -1,6 +1,6 @@
 # AcornFox 协作规则
 
-Codex、Claude Code、Kiro 共用本文件：Codex 直接读取，Claude Code 通过 `CLAUDE.md` 导入，Kiro 通过 `.kiro/steering/agents.md` 引用。规则只改这一处。
+Codex、Claude Code 共用本文件：Codex 直接读取，Claude Code 通过 `CLAUDE.md` 导入。规则只改这一处。
 
 ## 共享进度
 
@@ -16,7 +16,7 @@ Codex、Claude Code、Kiro 共用本文件：Codex 直接读取，Claude Code �
 
 ## 身份标识
 
-提交信息和文档中用 `[codex]`、`[cc]`（Claude Code）、`[kiro]` 标明作者。
+提交信息和文档中用 `[codex]`、`[cc]`（Claude Code）标明作者。
 
 ## 避免冲突
 
