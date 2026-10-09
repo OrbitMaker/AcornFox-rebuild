@@ -40,16 +40,61 @@ fi
 
 echo "3️⃣ 检查并安装 Caddy..."
 if ! command -v caddy &> /dev/null; then
-    echo "   安装 Caddy 依赖..."
-    apt install -y debian-keyring debian-archive-keyring apt-transport-https curl
+    # Caddy 官方 apt 仓库 dl.cloudsmith.io 现对匿名请求返回 402，改为下载官方二进制并按官方
+    # SHA-512 校验；安装包先从 Gitee 镜像取（服务器在中国大陆），与 scripts/install/install.sh 一致。
+    CADDY_VERSION=2.8.4
+    ARCH=$(dpkg --print-architecture)
+    NAME=caddy_${CADDY_VERSION}_linux_${ARCH}.tar.gz
+    OFFICIAL=https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}
+    MIRROR=https://gitee.com/VIP13390/AcornFox-rebuild/releases/download
+    TAG=$(curl -fsS -m 15 https://gitee.com/api/v5/repos/VIP13390/AcornFox-rebuild/releases/latest 2>/dev/null \
+        | grep -o '"tag_name":"[^"]*"' | head -1 | cut -d'"' -f4 || true)
+    echo "   下载 Caddy ${CADDY_VERSION}..."
+    if ! { [ -n "$TAG" ] && curl -fL --connect-timeout 10 --max-time 300 --speed-limit 51200 --speed-time 15 \
+            -o "/tmp/${NAME}" "${MIRROR}/${TAG}/${NAME}"; }; then
+        curl -fL --connect-timeout 10 --max-time 900 -o "/tmp/${NAME}" "${OFFICIAL}/${NAME}"
+    fi
+    curl -fsSL --max-time 60 -o /tmp/caddy_checksums.txt "${OFFICIAL}/caddy_${CADDY_VERSION}_checksums.txt" \
+        || curl -fsSL --max-time 60 -o /tmp/caddy_checksums.txt "${MIRROR}/${TAG}/caddy_${CADDY_VERSION}_checksums.txt"
+    WANT=$(awk -v a="$NAME" '$2 == a {print $1; exit}' /tmp/caddy_checksums.txt)
+    if [ -z "$WANT" ] || [ "$(sha512sum "/tmp/${NAME}" | awk '{print $1}')" != "$WANT" ]; then
+        echo "   ❌ Caddy 安装包 SHA-512 校验失败"
+        exit 1
+    fi
+    tar -xzf "/tmp/${NAME}" -C /tmp caddy
+    install -m 0755 /tmp/caddy /usr/bin/caddy
+    rm -f "/tmp/${NAME}" /tmp/caddy /tmp/caddy_checksums.txt
 
-    echo "   添加 Caddy 仓库..."
-    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | tee /etc/apt/sources.list.d/caddy-stable.list
+    # 二进制安装没有 deb 包自带的账号、目录和 systemd 服务，这里补齐
+    getent group caddy >/dev/null || groupadd --system caddy
+    id caddy >/dev/null 2>&1 || useradd --system --gid caddy --create-home --home-dir /var/lib/caddy \
+        --shell /usr/sbin/nologin --comment "Caddy web server" caddy
+    mkdir -p /etc/caddy /var/log/caddy
+    chown caddy:caddy /var/log/caddy
+    cat > /etc/systemd/system/caddy.service << 'UNIT'
+[Unit]
+Description=Caddy
+Documentation=https://caddyserver.com/docs/
+After=network.target network-online.target
+Requires=network-online.target
 
-    echo "   安装 Caddy..."
-    apt update -qq
-    apt install -y caddy
+[Service]
+Type=notify
+User=caddy
+Group=caddy
+ExecStart=/usr/bin/caddy run --environ --config /etc/caddy/Caddyfile
+ExecReload=/usr/bin/caddy reload --config /etc/caddy/Caddyfile --force
+TimeoutStopSec=5s
+LimitNOFILE=1048576
+PrivateTmp=true
+ProtectSystem=full
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    systemctl daemon-reload
+    echo "   ✓ Caddy $(caddy version | awk '{print $1}') 已安装"
 fi
 
 echo "4️⃣ 克隆 GitHub 仓库..."

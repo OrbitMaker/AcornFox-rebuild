@@ -629,9 +629,9 @@ EOF
 
     # 验证安装
     if caddy version >/dev/null 2>&1; then
-    log_success "Caddy 安装成功: $(caddy version)"
+        log_success "Caddy 安装成功: $(caddy version)"
     else
-    error_exit "Caddy 安装验证失败"
+        error_exit "Caddy 安装验证失败"
     fi
 }
 
