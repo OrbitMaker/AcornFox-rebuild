@@ -212,32 +212,48 @@ install_cli() {
         log_info "请将以下路径添加到 PATH 环境变量:"
         echo "  $INSTALL_DIR"
     else
-        # Linux/macOS
-        if [ -w "/usr/local/bin" ]; then
-            mv "$TMP_FILE" "/usr/local/bin/acornfox"
-            log_success "已安装到: /usr/local/bin/acornfox"
+        # Linux/macOS：不使用 sudo。AI 工作台在后台执行时无法输入密码，Apple 芯片的 Mac 上
+        # /usr/local/bin 默认也需要 sudo。依次选择：ACORNFOX_INSTALL_DIR、已安装位置（就地升级，
+        # 避免新旧两份并存）、可写的 /usr/local/bin、~/.local/bin。
+        local existing=""
+        existing=$(command -v acornfox 2>/dev/null || true)
+        if [ -n "${ACORNFOX_INSTALL_DIR:-}" ]; then
+            INSTALL_DIR="$ACORNFOX_INSTALL_DIR"
+        elif [ -n "$existing" ] && [ -w "$(dirname "$existing")" ]; then
+            INSTALL_DIR=$(dirname "$existing")
+        elif [ -w "/usr/local/bin" ]; then
+            INSTALL_DIR="/usr/local/bin"
         else
-            sudo mv "$TMP_FILE" "/usr/local/bin/acornfox"
-            log_success "已安装到: /usr/local/bin/acornfox (需要 sudo)"
+            INSTALL_DIR="${HOME}/.local/bin"
         fi
+        mkdir -p "$INSTALL_DIR" || error_exit "无法创建安装目录 ${INSTALL_DIR}；可用 ACORNFOX_INSTALL_DIR 指定可写目录"
+        [ -w "$INSTALL_DIR" ] || error_exit "安装目录 ${INSTALL_DIR} 不可写；可用 ACORNFOX_INSTALL_DIR 指定可写目录"
+        mv "$TMP_FILE" "${INSTALL_DIR}/acornfox"
         # macOS 会给下载的文件加隔离属性，去掉以免首次运行被拦截
         if [ "$OS" = "darwin" ]; then
-            xattr -d com.apple.quarantine /usr/local/bin/acornfox 2>/dev/null || true
+            xattr -d com.apple.quarantine "${INSTALL_DIR}/acornfox" 2>/dev/null || true
         fi
+        log_success "已安装到: ${INSTALL_DIR}/acornfox"
     fi
     rmdir "$TMP_DIR" 2>/dev/null || true
 }
 
 # 验证安装
 verify_installation() {
-    if command -v acornfox >/dev/null 2>&1; then
-        VERSION=$(acornfox version 2>/dev/null || echo "unknown")
-        log_success "安装成功！版本: $VERSION"
-        return 0
-    else
-        log_error "安装验证失败"
-        return 1
+    local bin="${INSTALL_DIR}/acornfox"
+    [ "$OS" = "windows" ] && bin="${INSTALL_DIR}/acornfox.exe"
+    VERSION=$("$bin" version 2>/dev/null) || { log_error "安装验证失败: ${bin} 无法运行"; return 1; }
+    log_success "安装成功！版本: ${VERSION}"
+    [ "$OS" = "windows" ] && return 0
+    local found
+    found=$(command -v acornfox 2>/dev/null || true)
+    if [ -z "$found" ]; then
+        log_warn "${INSTALL_DIR} 不在 PATH 中。把下面这行加入 ~/.zshrc 或 ~/.bashrc 后重新打开终端，或直接用完整路径 ${bin}："
+        echo "  export PATH=\"${INSTALL_DIR}:\$PATH\""
+    elif [ "$found" != "$bin" ]; then
+        log_warn "PATH 中优先找到的是另一个 acornfox：${found}（$("$found" version 2>/dev/null || echo 未知版本)），请删除它或调整 PATH 顺序"
     fi
+    return 0
 }
 
 # 显示使用说明

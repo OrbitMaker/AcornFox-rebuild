@@ -27,7 +27,7 @@ if [ "$cc" = CN ] || { [ -z "$cc" ] && ! curl -s -m 6 -o /dev/null https://githu
 
 ### 2. 安装 CLI（用户电脑）
 
-`acornfox version --json` 失败时，按本机判断结果执行 `curl -fsSL <前缀>install-cli.sh | bash`。Windows 需在 Git Bash 中执行。脚本需要 sudo 密码而你无法输入时，把命令交给用户自己执行（Claude Code 中可让用户输入 `! 命令`）。
+`acornfox version --json` 失败时，按本机判断结果执行 `curl -fsSL <前缀>install-cli.sh | bash`（Windows 在 Git Bash 中执行）。脚本不需要 sudo：`/usr/local/bin` 不可写时装到 `~/.local/bin`。输出提示安装目录不在 PATH 中时，本次对话里用输出给出的完整路径调用 acornfox（如 `~/.local/bin/acornfox`），并告诉用户把提示的那行加入 shell 配置。
 
 ### 3. 连接服务器
 
