@@ -195,11 +195,13 @@ detect_location() {
     log_info "检测服务器地理位置..."
 
     IN_CHINA=false
+    CLOUD=""
 
-    # 方法 1: 检查云厂商元数据
+    # 方法 1: 检查云厂商元数据（同时记下云厂商，用来优先选它的内网软件源）
     # 阿里云
     if curl -s -m 2 http://100.100.100.200/latest/meta-data/region-id 2>/dev/null | grep -q "cn-"; then
         IN_CHINA=true
+        CLOUD=aliyun
         log_info "检测到阿里云中国区域"
         return
     fi
@@ -208,6 +210,7 @@ detect_location() {
     if curl -s -m 2 http://metadata.tencentyun.com/latest/meta-data/placement/region 2>/dev/null | grep -q "ap-"; then
         if curl -s -m 2 http://metadata.tencentyun.com/latest/meta-data/placement/region 2>/dev/null | grep -qE "ap-beijing|ap-shanghai|ap-guangzhou|ap-chengdu|ap-chongqing"; then
             IN_CHINA=true
+            CLOUD=tencent
             log_info "检测到腾讯云中国区域"
             return
         fi
@@ -343,17 +346,15 @@ EOF
 update_apt() {
     log_info "更新软件包列表..."
 
-    # 如果在中国，配置 APT 使用国内镜像（云厂商镜像已自带国内源时不改动）
-    if $IN_CHINA && grep -rqsE 'mirrors\.(aliyun|tencent|cloud\.tencent|huaweicloud|tuna\.tsinghua|ustc)|mirrors\.[a-z]+\.com' /etc/apt/sources.list /etc/apt/sources.list.d/; then
-        log_info "APT 已使用国内镜像，保持不变"
-    elif $IN_CHINA; then
+    # 中国大陆只在软件源指向境外官方地址时才替换。云厂商镜像自带的内网源（如阿里云
+    # mirrors.cloud.aliyuncs.com）走内网，冷启动 apt update 实测 17 秒，换成公网
+    # mirrors.aliyun.com 要 251 秒，所以其他任何源都原样保留。
+    local official='//(archive|security|ports)\.ubuntu\.com|//(deb|security)\.debian\.org'
+    if $IN_CHINA && grep -rqsE "$official" /etc/apt/sources.list /etc/apt/sources.list.d/; then
         log_info "配置 APT 使用国内镜像..."
         case "$OS" in
             ubuntu)
-                # 备份原始源
-                cp /etc/apt/sources.list /etc/apt/sources.list.bak || true
-
-                # 使用阿里云镜像
+                cp /etc/apt/sources.list /etc/apt/sources.list.bak 2>/dev/null || true
                 cat > /etc/apt/sources.list << EOF
 deb http://mirrors.aliyun.com/ubuntu/ ${OS_CODENAME} main restricted universe multiverse
 deb http://mirrors.aliyun.com/ubuntu/ ${OS_CODENAME}-updates main restricted universe multiverse
@@ -362,8 +363,7 @@ deb http://mirrors.aliyun.com/ubuntu/ ${OS_CODENAME}-security main restricted un
 EOF
                 ;;
             debian)
-                cp /etc/apt/sources.list /etc/apt/sources.list.bak || true
-
+                cp /etc/apt/sources.list /etc/apt/sources.list.bak 2>/dev/null || true
                 cat > /etc/apt/sources.list << EOF
 deb http://mirrors.aliyun.com/debian/ ${OS_CODENAME} main contrib non-free
 deb http://mirrors.aliyun.com/debian/ ${OS_CODENAME}-updates main contrib non-free
@@ -371,6 +371,18 @@ deb http://mirrors.aliyun.com/debian-security ${OS_CODENAME}-security main contr
 EOF
                 ;;
         esac
+        # Ubuntu 24.04 / Debian 12 的默认源在 deb822 格式的 *.sources 里，指向官方地址的
+        # 一并停用，否则境外源仍会参与 update
+        local f
+        for f in /etc/apt/sources.list.d/*.sources; do
+            [ -f "$f" ] || continue
+            if grep -qE "$official" "$f"; then
+                mv "$f" "$f.bak"
+                log_info "已停用境外官方源 $f（备份为 $f.bak）"
+            fi
+        done
+    elif $IN_CHINA; then
+        log_info "APT 已使用非官方境外源（云厂商内网源或国内镜像），保持不变"
     fi
 
     apt_get update -qq || error_exit "更新软件包列表失败"
@@ -406,29 +418,45 @@ install_docker() {
     log_info "安装 Docker..."
 
     # 国内镜像站在 Docker 新版本发布后会有一段时间不一致（索引大小不符、包 404、读超时），
-    # 每个源试两次，都不行再换下一个；全部失败时退回发行版仓库自带的 docker.io。
-    local sources=() src attempt installed=false
+    # 依次换源；全部失败时退回发行版仓库自带的 docker.io。
+    # 每项是 "软件包地址|GPG 密钥地址"。云厂商内网源只有 http，签名密钥仍从 https 获取，
+    # 包的真实性由签名保证。
+    local sources=() entry src gpg attempt installed=false
     if $IN_CHINA; then
-        sources=("https://mirrors.aliyun.com/docker-ce" "https://mirrors.cloud.tencent.com/docker-ce" "https://mirrors.tuna.tsinghua.edu.cn/docker-ce")
+        case "${CLOUD:-}" in
+            aliyun) sources+=("http://mirrors.cloud.aliyuncs.com/docker-ce|https://mirrors.aliyun.com/docker-ce") ;;
+            tencent) sources+=("http://mirrors.tencentyun.com/docker-ce|https://mirrors.cloud.tencent.com/docker-ce") ;;
+        esac
+        sources+=("https://mirrors.aliyun.com/docker-ce|https://mirrors.aliyun.com/docker-ce"
+                  "https://mirrors.cloud.tencent.com/docker-ce|https://mirrors.cloud.tencent.com/docker-ce"
+                  "https://mirrors.tuna.tsinghua.edu.cn/docker-ce|https://mirrors.tuna.tsinghua.edu.cn/docker-ce")
     else
-        sources=("https://download.docker.com")
+        sources=("https://download.docker.com|https://download.docker.com")
     fi
 
-    for src in "${sources[@]}"; do
+    for entry in "${sources[@]}"; do
+        src="${entry%%|*}"
+        gpg="${entry##*|}"
         log_info "使用 Docker 源: ${src}"
-        if ! curl -fsSL --connect-timeout 10 --max-time 60 "${src}/linux/${OS}/gpg" \
+        if ! curl -fsSL --connect-timeout 10 --max-time 60 "${gpg}/linux/${OS}/gpg" \
             | gpg --batch --yes --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg; then
-            log_warn "无法从 ${src} 获取 GPG 密钥，换下一个源"
+            log_warn "无法从 ${gpg} 获取 GPG 密钥，换下一个源"
             continue
         fi
         echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] ${src}/linux/${OS} ${OS_CODENAME} stable" > /etc/apt/sources.list.d/docker.list
+        # 索引不一致（镜像站同步中）时 update 就会失败，重试同一个源也没用，直接换源；
+        # update 成功但下载包失败多半是偶发，再试一次
+        if ! apt_get update -qq; then
+            log_warn "Docker 源 ${src} 索引不可用（镜像站可能正在同步），换下一个源"
+            continue
+        fi
         for attempt in 1 2; do
-            if apt_get update -qq && apt_get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin; then
+            if apt_get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin; then
                 installed=true
                 break 2
             fi
-            log_warn "Docker 源 ${src} 第 ${attempt} 次安装失败（镜像站可能正在同步）"
-            sleep 5
+            log_warn "从 ${src} 安装 Docker 第 ${attempt} 次失败"
+            sleep 3
         done
     done
 

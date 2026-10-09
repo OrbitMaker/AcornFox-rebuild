@@ -55,6 +55,12 @@ v0.2.0 发布到 GitHub 后，张家口测试机直连 GitHub 下载约 10 KB/s�
 | 全新实例 `i-REDACTED` 原样执行 README 国内命令 `curl -fsSL https://gitee.com/VIP13390/AcornFox-rebuild/raw/main/scripts/install/install.sh \| sudo bash` | exit 0，355 秒；其中 Docker 约 5 分钟（阿里云 Docker 源仍不一致，重试后换腾讯源），Caddy 经 ghfast 约 40 秒，AcornFox 从 Gitee 约 8 秒 |
 | 发布版 macOS CLI（`dist/acornfox_darwin_arm64`，v0.2.0） | 首次连接按设计要求先确认主机指纹；`deploy` 11.6 秒上线，公网访问正常 |
 
+### 安装耗时优化（同日）
+
+上面 355 秒的分解：原以为慢在 Docker，按 apt 日志实测是 `install.sh` 把阿里云镜像自带的内网源 `mirrors.cloud.aliyuncs.com` 当成"非国内源"替换成公网 `mirrors.aliyun.com`（正则 `mirrors\.[a-z]+\.com` 匹配不到两级子域），冷启动 `apt-get update` 由 17 秒变为 251 秒（同为 203 MB 索引）。修复：只在源指向境外官方地址时替换，并停用指向官方地址的 deb822 `*.sources`；Docker 在阿里云/腾讯云先用内网源（GPG 密钥仍经 https 获取），索引不一致直接换源不重试。
+
+全新实例 `i-REDACTED` 管道执行：**110 秒**（原 355 秒）。apt update 18 秒、基础依赖 5 秒、Docker 22 秒（阿里云内网源首次成功）、Caddy 50 秒（GitHub 直连低速中止后经代理）、AcornFox 8 秒（Gitee）。腾讯云内网 Docker 源未实测。
+
 ## 仍待完成
 
 - GitHub 正式路径（`releases/latest/download/install.sh`）在境外服务器上的全新安装未测；v0.2.0 附件里的脚本不含 Gitee 与低速换源，需发布 v0.2.1 才对 GitHub 路径生效。
