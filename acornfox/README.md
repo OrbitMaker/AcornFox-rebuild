@@ -1,6 +1,6 @@
 # AcornFox 单机版
 
-让 AI 工作台里的一句“帮我部署”变成一个可访问的网址。本目录是单机版代码基线，只保留符合[战略与阶段路线图](../docs/acornfox-strategy-roadmap.md)的代码；旧代码保存在分支 `archive/acornfox-thin-core-20260929`。
+让 AI 工作台里的一句“帮我部署”变成一个可访问的网址。本目录是单机版代码基线；旧代码保存在分支 `archive/acornfox-thin-core-20260929`。
 
 ## 当前状态
 
@@ -39,12 +39,11 @@ internal/
   importers/dockerfile     Dockerfile 安全检查规则（待接入）
   hostmetrics containermetrics dockermetrics   主机与容器指标（N4 接入）
   contracts domain foundation application/contracts compatibility   旧 CLI 与指标仍依赖的类型，N2 后按需精简
-prototype/                 N0 原型与控制台设计稿（只作参考）
 ```
 
 ## 构建与测试
 
-项目约定不在开发者 Mac 上执行 Go 构建，统一在开发机（`yanyan-devbox`）上进行：
+在 Linux 上构建与测试（`internal/runner` 的部分测试依赖 Linux）：
 
 ```bash
 GOTOOLCHAIN=go1.25.13 go build ./...

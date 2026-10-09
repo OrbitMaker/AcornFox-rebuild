@@ -1,6 +1,6 @@
 # ADR-0004: PostgreSQL 16 control-plane database
 
-> 2026-09-26 scope update: the user selected SQLite for the new AcornFox single-machine thin core. The PostgreSQL choice below is historical and remains relevant to existing installations and migration evidence. See the [thin-core migration plan](../acornfox-thin-core-migration-plan.md). SQLite implementation and migration acceptance are pending; this does not change the commercial-cloud database choice or authorize deleting old data.
+> 2026-09-26 scope update: the user selected SQLite for the new AcornFox single-machine thin core. The PostgreSQL choice below is historical and remains relevant to existing installations and migration evidence. See the [migration plan](../acornfox-rebuild-migration-plan.md). SQLite implementation and migration acceptance are pending; this does not authorize deleting old data.
 
 - Status: Accepted; G4 Spike passed
 - Gate: G4 / S1

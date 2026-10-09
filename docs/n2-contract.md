@@ -81,7 +81,7 @@ CLI ──exec──> ssh [-p port] [-i key] user@host acornfox proxy
 
 ## 5. 验收（开发机 + Mac）
 
-1. Mac 上 `target add devbox --ssh yanyan-devbox`（server 在开发机以 unix socket 运行）→ 在样例项目目录 `acornfox deploy` → 拿到网址并能访问；目录里生成 `.acornfox`；再次 `acornfox deploy` 不需要任何参数。
+1. Mac 上 `target add devbox --ssh 开发机`（server 在开发机以 unix socket 运行）→ 在样例项目目录 `acornfox deploy` → 拿到网址并能访问；目录里生成 `.acornfox`；再次 `acornfox deploy` 不需要任何参数。
 2. `--json` 下成功、构建失败、连接失败三种输出都能被 `python3 -c 'json.load'` 解析且形状符合第 3 节。
 3. `deploy --image nginx:1.27-alpine`（或开发机上已有的镜像）成功；`deploy --git` 分别对 GitHub、Gitee、CNB 上的一个公开小仓库各测一次（记录结果，GitHub 超时属于预期诊断）。
 4. `env set --secret` 后，`status`、`env list`、`logs`、`--json` 输出中都不出现密钥值。

@@ -35,7 +35,7 @@ const buildMemoryBytes = 2 << 30
 // ansiPattern strips terminal color/cursor escape codes from log lines.
 var ansiPattern = regexp.MustCompile(`\x1b\[[0-9;]*[A-Za-z]`)
 
-// Build classification heuristics mirror the N0 prototype.
+// Build classification heuristics.
 var (
 	missingModulePattern = regexp.MustCompile(`(?i)(ModuleNotFoundError|Cannot find module|no required module|not found: )`)
 	pullFailurePattern   = regexp.MustCompile(`(?i)(TLS handshake timeout|i/o timeout|dial tcp|context deadline exceeded|no such host|connection reset|connection refused|EOF)`)

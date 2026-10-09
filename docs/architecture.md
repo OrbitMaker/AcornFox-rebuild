@@ -2,7 +2,7 @@
 
 ## 文档边界
 
-本文只描述并约束已经验证的 k3s/Open-Local/Higress/CloudNativePG/Prometheus 基础设施 PoC，不是 Open Card MVP 产品架构，也不包含 AI 产品架构。MVP 产品决策与菜单见 [MVP 产品说明](mvp-product-spec.md)，受控 AI 介入、介入账本和规则固化架构见 [MVP AI 能力架构](mvp-ai-architecture.md)。两份派生文档均不构成当前实现证明。
+本文只描述并约束已经验证的 k3s/Open-Local/Higress/CloudNativePG/Prometheus 基础设施 PoC，不是 Open Card MVP 产品架构，也不包含 AI 产品架构。
 
 ## 决策
 

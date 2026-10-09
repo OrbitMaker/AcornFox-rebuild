@@ -1,7 +1,6 @@
 # AcornFox 单机版：v2 设计与迁移清单
 
 > 日期：2026-09-29。状态：负责人已确认 v2 设计方向（第 1～3 节）；N0 原型通过后再正式切换（第 5 节）。
-> 上位文档：[AcornFox 战略与阶段路线图](acornfox-strategy-roadmap.md) 阶段 0～1。
 > 代码位置：分支 `acornfox-rebuild-20260929`，目录 `acornfox/`。旧代码在分支 `archive/acornfox-thin-core-20260929`。
 > 本文取代本文件此前的“保留核心能力、重建外壳”清单中尚未执行的部分（原 M3～M5）；已完成的 M0～M2 见第 8 节。
 
@@ -101,7 +100,7 @@
 
 ### 3.8 控制台界面规范
 
-以设计稿 `acornfox/prototype/ui-workbench/index.html` 的“推荐”方案为准：工作台形式，桌面只放用户的应用图标（带状态点），底部 Dock 放工具（部署、服务器、日志、让 AI 部署、设置），应用详情以窗口打开；有应用失败时图标上方出现“需要处理”提醒条（最多 3 条，每条可“查看”“复制给 AI”），没有问题时不显示；图标下方一行灰字显示运行数与主机资源。规则：桌面只放应用；问题主动浮现、无问题不打扰；每个问题可一键交给 AI；细节放窗口里。待补：图标体系、多应用排列与 ⌘K、部署中 / 已停止 / 执行器断开等状态、危险操作确认、浅色与移动端、无障碍、用词表。
+工作台形式，桌面只放用户的应用图标（带状态点），底部 Dock 放工具（部署、服务器、日志、让 AI 部署、设置），应用详情以窗口打开；有应用失败时图标上方出现“需要处理”提醒条（最多 3 条，每条可“查看”“复制给 AI”），没有问题时不显示；图标下方一行灰字显示运行数与主机资源。规则：桌面只放应用；问题主动浮现、无问题不打扰；每个问题可一键交给 AI；细节放窗口里。待补：图标体系、多应用排列与 ⌘K、部署中 / 已停止 / 执行器断开等状态、危险操作确认、浅色与移动端、无障碍、用词表。
 
 ### 3.9 附加服务（2026-09-29 确认）
 
@@ -110,7 +109,7 @@
 - `acornfox add postgres|mysql|redis --app NAME`：在该应用的专用 Docker 网络中启动数据库容器，使用固定版本的官方镜像，自动生成凭据（存为密钥引用、不回显），并把连接地址作为环境变量（如 `DATABASE_URL`、`REDIS_URL`）注入应用，随后重新部署应用。
 - 数据库端口只在应用网络内可见，不对外发布；数据卷默认保留，删除应用或附加服务时须明确选择是否删除数据。
 - 附加服务是 `apps` 下的一类资源，由同一个调和器管理（N1 表结构中体现），不引入 Compose。
-- 不含备份、主从与升级迁移；这些是云版托管数据库的范围。首发只保证“能用、数据不丢于重新部署”。
+- 不含备份、主从与升级迁移；首发不做。首发只保证“能用、数据不丢于重新部署”。
 - 诊断：应用缺少数据库连接变量时，提示可用 `acornfox add` 补上。
 
 ### 3.10 N1 数据约定（2026-09-29 确认）
@@ -137,16 +136,15 @@
 | N3 访问 | `acornfox open`（SSH 隧道打开控制台）；Caddy 应用路由；IP:端口默认；已备案域名自动 HTTPS；未备案提示；控制台界面按第 3.8 节 | 从用户电脑一条命令打开控制台；应用可访问；控制台对公网不可见 |
 | N4 生命周期与观测 | 停止、启动、重启、重新部署、删除（默认保留数据卷）；附加服务 `add` / 删除；日志、主机与容器指标 | 操作后数据卷内容保留；网页与 CLI 显示状态、日志、指标。**进行中**：[最终候选与待复验](evidence/n4-final-candidate-2026-10-01.md)，原服务端真实验收通过；网络回收与 CLI 中断收口代码已补，最终候选 Linux 完整复验受工具权限状态阻塞 |
 | N5 安装与升级 | `install.sh`、两个 systemd 服务、国内软件源与镜像加速、升级与回退 | 干净的国内云主机上一条命令安装；一次升级成功且应用不中断；故意让升级失败能回退 |
-| N6 Skill 与验收 | Skill 与 `acornfox skill install`；路线图第 6.2 节首发验收 | 由未参与开发的人完成首发 7 项检查 |
+| N6 Skill 与验收 | Skill 与 `acornfox skill install`；首发验收 | 由未参与开发的人完成首发 7 项检查 |
 
-与路线图的对应：阶段 0 退出 = N1～N3、N5 覆盖“干净安装 → 登录 → 部署现成镜像 → 浏览器访问”；阶段 1 退出 = N0～N6 全部完成。
 
 ## 6. 风险与应对
 
 - **放弃构建出站控制：** 用户构建的是自己的代码，接受该风险；在文档中说明，后续如需可作为可选项加回。
 - **放弃自写镜像校验：** 依赖 Docker 的内容寻址校验，只记录实际得到的镜像 digest。
 - **Docker 访问等同 root：** 只有 runner 有权限，runner 只接受有类型的请求并拒绝危险容器参数；server 被攻破不直接获得 root。
-- **重复推倒：** N0 设了明确的通过条件；N1 起不再接受架构层面的变更，新想法进入路线图待定池。
+- **重复推倒：** N0 设了明确的通过条件；N1 起不再接受架构层面的变更，新想法记入待定池。
 
 ## 7. 待定
 
@@ -162,9 +160,8 @@
 
 - **N0**（提交 `856bdbbf`，2026-09-29 通过）：开发机上从 Linux 与 macOS CLI 各完成一次“上传目录 → Docker 构建 → 运行 → Caddy 路由 → 网址”（约 3～4 秒）；重新部署期间 25 次探测全部 200；构建失败、启动崩溃、缺少 Dockerfile 均返回结构化诊断。发现并修正：自动重启会把崩溃误判为端口无响应（改为检查期间有重启即判定退出）；构建日志需去掉颜色码和步骤噪音。确认 Docker 29 可通过 API 使用传统构建器。结论：v2 方向成立，进入 N1。原型代码只作参考，不直接进入正式实现。
 - **N1**（提交 `3cd22119`、`84e8f390`、`ea5e889e`，2026-09-29 通过）：`internal/state`、`runner`、`reconcile`、`caddyroute`、`apiserver` 与 `acornfox server` / `runner` 子命令。开发机实测：部署约 4 秒；重新部署期间 223 与 368 次探测全部 200；在排队、构建、健康检查、切换流量各时间点 `kill -9` server 或 runner，重启后都自动上线且无残留；同键与同内容重复提交只产生 1 个部署，连续 3 次提交只构建最后一个；`VOLUME /data` 自动保存，十余次重新部署、强杀与回退后数据不丢；写入容器内的 SQLite 触发 `data/unpersisted_database`；512 MB / 1 CPU / 日志轮转生效，超内存报 `health/out_of_memory`；无标签的同名前缀容器全程未被触碰，带标签的孤儿容器被清理；镜像按“当前 + 3 个旧版”回收。实测发现并修正 7 个问题：runner 构建目录错指 `/tmp`；每 30 秒只推进一个阶段（82 秒 → 4 秒）；Caddy 更新误用 PUT（只能新建）且失败原因未记录；runner 短暂断开被计为构建中断；未关 swap 导致内存上限无效；端口提示给出宿主端口。遗留：停止最多延迟一轮巡检（N4）、`acornfox app set` 命令（N2）、两账号下上传目录权限（N5）。
-- **N2**（提交 `96106a61`、`cf69044c`、`f1586cee`，2026-09-29 通过；契约 `docs/n2-contract.md`）：CLI 调用系统 `ssh` 执行服务器上的 `acornfox proxy`，一条命令只建一次 SSH；server 改为监听 Unix socket（组 `acornfox-users`）。实测：Mac 上 `target add devbox --ssh yanyan-devbox` 后在项目目录 `acornfox deploy` 约 4 秒拿到网址并写入 `.acornfox`，之后不带参数即可重新部署；`--json` 在成功、构建失败、连接失败时都输出统一形状；现成镜像部署约 2 秒；`env set --secret` 后 `status`、`env list`、`--json` 均不含密钥；`app set`、`volume add`、`rollback`、`stop`/`start`、`logs`、`apps` 正常；Linux 上用直连方式部署成功。连接诊断：主机不存在、端口不通 → `host_unreachable`，服务器未装 acornfox → `acornfox_missing`，服务未运行 → `server_down`，退出码 3。六个平台（Windows/macOS/Linux × amd64/arm64）编译通过，Windows 下 CLI 相关包 vet 通过、测试可编译（未在 Windows 上实际运行）。Git 来源实测：**CNB 可匿名克隆**；**Gitee 拒绝匿名 HTTPS 克隆**（多个知名公开仓库均要求登录）→ 新增诊断 `source/auth_required`；GitHub 从开发机克隆超时 → `source/clone_timeout`，提示改用国内平台或直接上传。实测修正 4 处：中文系统下“未找到命令”未识别；缺少分阶段进度事件；镜像加速源对不存在镜像返回 403 被误判为超时；需要登录的仓库未单独诊断。遗留：首次部署失败的应用仍会保留（占用一个公共端口），`apps` 中显示为 missing；Windows 实机测试待有 Windows 环境时补。
-- **开发机清理**（2026-09-29）：删除 N0 原型、旧 AcornFox 运行环境（tp06a 进程、容器、数据卷、网络、账号、目录）、旧 MVP 的 Caddy/PostgreSQL/BuildKit 容器、预览容器、10 台 acornfox 桌面测试虚拟机及磁盘、约 28 GB 旧构建缓存（磁盘空闲 40 GB → 91 GB）。清理前备份旧 MVP 数据库导出、tp06a 的 SQLite 数据与受保护证据到 `战略项目/devbox-archive-20260929/`（含校验和）。Agent Ops（aiops）只停止并禁用服务、容器和测试虚拟机，数据与磁盘保留，80 端口已释放。k3s PoC 节点 `opencard-dev-01` 保留未动。
+- **N2**（提交 `96106a61`、`cf69044c`、`f1586cee`，2026-09-29 通过；契约 `docs/n2-contract.md`）：CLI 调用系统 `ssh` 执行服务器上的 `acornfox proxy`，一条命令只建一次 SSH；server 改为监听 Unix socket（组 `acornfox-users`）。实测：Mac 上 `target add devbox --ssh 开发机` 后在项目目录 `acornfox deploy` 约 4 秒拿到网址并写入 `.acornfox`，之后不带参数即可重新部署；`--json` 在成功、构建失败、连接失败时都输出统一形状；现成镜像部署约 2 秒；`env set --secret` 后 `status`、`env list`、`--json` 均不含密钥；`app set`、`volume add`、`rollback`、`stop`/`start`、`logs`、`apps` 正常；Linux 上用直连方式部署成功。连接诊断：主机不存在、端口不通 → `host_unreachable`，服务器未装 acornfox → `acornfox_missing`，服务未运行 → `server_down`，退出码 3。六个平台（Windows/macOS/Linux × amd64/arm64）编译通过，Windows 下 CLI 相关包 vet 通过、测试可编译（未在 Windows 上实际运行）。Git 来源实测：**CNB 可匿名克隆**；**Gitee 拒绝匿名 HTTPS 克隆**（多个知名公开仓库均要求登录）→ 新增诊断 `source/auth_required`；GitHub 从开发机克隆超时 → `source/clone_timeout`，提示改用国内平台或直接上传。实测修正 4 处：中文系统下“未找到命令”未识别；缺少分阶段进度事件；镜像加速源对不存在镜像返回 403 被误判为超时；需要登录的仓库未单独诊断。遗留：首次部署失败的应用仍会保留（占用一个公共端口），`apps` 中显示为 missing；Windows 实机测试待有 Windows 环境时补。
 
 - **M0**：存档分支 `archive/acornfox-thin-core-20260929`（提交 `577b5605`）；测试机已销毁。
-- **M1**（提交 `ef2ba9ba`）：新目录 `acornfox/`、模块 `github.com/acornfox/acornfox`，只迁入符合战略的代码；Go 产品代码 22.2 万行 → 6.8 万行。
+- **M1**（提交 `ef2ba9ba`）：新目录 `acornfox/`、模块 `github.com/acornfox/acornfox`，只迁入单机版需要的代码；Go 产品代码 22.2 万行 → 6.8 万行。
 - **M2**（提交 `65a87e2e`）：核心与执行器分离、`internal/peer` 按 UID 校验、删除功能包与 root 辅助进程、SQLite 迁移重排；Go 产品代码 → 5.1 万行。开发机上 `go test ./...` 29 个包通过。M2 的 `peer`、认证和存储写法是 v2 的起点，其余执行层由 N1 取代。

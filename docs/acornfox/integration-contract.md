@@ -22,7 +22,7 @@ requested operation and require independent execution evidence for verification.
 
 ## External AI and retired built-in assistant
 
-In accordance with `docs/acornfox-external-ai-only-plan.md`, the single-machine AcornFox product retires the built-in AI assistant, chat interface, model runtime configuration, and assistant action endpoints. Instead, users interact via external AI clients driving the AcornFox CLI.
+The single-machine AcornFox product retires the built-in AI assistant, chat interface, model runtime configuration, and assistant action endpoints. Instead, users interact via external AI clients driving the AcornFox CLI.
 
 All built-in assistant HTTP endpoints (`/api/v1/acornfox/assistant/...`) and legacy M6 AI routes are retired and return 404/410. Dedicated assistant chat components, types, and client libraries have been removed from the server and console web app. Deterministic verification engines—including fix candidate validation (`fix-candidate`) and external access observation—remain fully operational and accessible via the API and CLI.
 

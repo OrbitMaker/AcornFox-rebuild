@@ -1,6 +1,6 @@
 # Open Card MVP engineering ADRs
 
-> 2026-09-26: the AcornFox single-machine target is now a thin core with SQLite and on-demand capability packages. See the [migration plan](../acornfox-thin-core-migration-plan.md) and the scope updates in ADRs 0004, 0005 and 0009. The historical gate results below are preserved; SQLite and package migration acceptance are still pending.
+> 2026-09-26: the AcornFox single-machine target is now a thin core with SQLite and on-demand capability packages. See the [migration plan](../acornfox-rebuild-migration-plan.md) and the scope updates in ADRs 0004, 0005 and 0009. The historical gate results below are preserved; SQLite and package migration acceptance are still pending.
 
 These records resolve the engineering defaults required by G1-G9. Their
 status is deliberately independent from milestone acceptance: an ADR can pick

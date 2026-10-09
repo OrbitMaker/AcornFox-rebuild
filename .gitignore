@@ -32,3 +32,6 @@ dist-core-stub/
 
 # 服务器、IP、DNS 等运维信息只放本地，不进仓库（仓库公开）。
 /ops-private/
+
+# 内部规划、战略与询价资料，只留本地
+/docs-private/
