@@ -64,4 +64,4 @@ for f in "$DIST"/*; do
 done
 
 echo "完成：https://gitee.com/${GITEE_REPO}/releases/tag/${VERSION}"
-echo "提醒：Gitee 社区版单仓库附件总量 1GB，旧版本附件需定期删除。"
+echo "下一步：运行 scripts/prune-releases.sh，两边只保留最新 2 个发行版（Gitee 单仓库附件上限 1GB）。"
