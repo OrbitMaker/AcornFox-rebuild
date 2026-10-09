@@ -69,9 +69,10 @@ v0.2.0 发布到 GitHub 后，张家口测试机直连 GitHub 下载约 10 KB/s�
 
 修复：所有地区都下载 Caddy 官方二进制（大陆先 Gitee），去掉 cloudsmith 源；重装时清理旧版本留下的 `caddy-stable.list`。在同一台失败过的机器上重跑修复后的脚本：15 秒，已清理失效源，四个服务 active；发布版 v0.2.1 CLI 部署 9 秒上线，公网访问正常。
 
+v0.2.2 发布后，新加坡另开全新实例（ecs.c7.large）原样执行 GitHub 安装命令：**52 秒**，Docker 经 download.docker.com、Caddy 经 GitHub 官方二进制，四个服务 active；v0.2.2 CLI 部署上线、公网可访问。新加坡临时资源（实例、VPC、交换机、安全组、密钥对）已全部删除。
+
 ## 仍待完成
 
-- 境外修复需发布 v0.2.2 后，用 GitHub 正式路径在全新境外实例上复测。
 - 第 5 项域名 HTTPS / 未备案提示：需要一个解析到测试机的域名。
 - 第 2、7 项 Skill 与 AI 工作台；由未参与开发的人完成独立验收。
 - 小问题：`stop` 在容器实际停止前就打印"已停止"；`upgrade.sh` 摘要打印原始颜色转义码；国内 GitHub 直连下载 Caddy 很慢（前两台约 10 分钟，第三台走 ghfast 代理较快）。
