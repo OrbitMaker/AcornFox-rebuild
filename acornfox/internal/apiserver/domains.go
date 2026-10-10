@@ -62,6 +62,10 @@ func (s *server) addDomain(w http.ResponseWriter, r *http.Request) {
 		s.mapStoreError(w, err)
 		return
 	}
+	if body.Name == s.publicConsoleDomain(ctx) {
+		writeError(w, http.StatusConflict, "domain_taken", "该域名已用于公网控制台")
+		return
+	}
 	dom, _, err := s.store.AddDomain(ctx, app, body.Name)
 	if err != nil {
 		if errors.Is(err, state.ErrConflict) {

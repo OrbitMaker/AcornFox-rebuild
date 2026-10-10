@@ -20,7 +20,7 @@ type Target struct {
 	Port          int    `json:"port,omitempty"`           // 0 = ssh default
 	Identity      string `json:"identity,omitempty"`       // private key path, optional
 	RemoteCommand string `json:"remote_command,omitempty"` // default "acornfox proxy"
-	URL           string `json:"url,omitempty"`            // direct http://127.0.0.1:port, bypasses SSH
+	URL           string `json:"url,omitempty"`            // direct http://127.0.0.1:port or unix:///run/acornfox/api.sock, bypasses SSH
 }
 
 // Diagnosis mirrors state.Diagnosis on the wire.
@@ -155,6 +155,45 @@ type API interface {
 	Addons(ctx context.Context, app string) ([]Addon, error)                                    // GET    /v1/apps/{app}/addons
 	AddAddon(ctx context.Context, app, kind string) (AddonResult, error)                        // POST   /v1/apps/{app}/addons {"kind"}
 	RemoveAddon(ctx context.Context, app, kind string, deleteVolume bool) (AddonRemoval, error) // DELETE /v1/apps/{app}/addons/{kind}[?volumes=true]
+
+	// ADR-0016 public console (trusted socket only)
+	PublicConsoleStatus(ctx context.Context) (PublicConsoleStatus, error)                                           // GET    /v1/public-console
+	PublicConsoleVerify(ctx context.Context, domain string) (PublicConsoleVerify, error)                            // POST   /v1/public-console/verify
+	PublicConsoleEnable(ctx context.Context, domain, verifyID string, reset bool) (PublicConsoleEnabled, error)     // POST   /v1/public-console/enable
+	PublicConsoleDisable(ctx context.Context) (bool, error)                                                         // DELETE /v1/public-console
+}
+
+// PublicConsoleStatus mirrors GET /v1/public-console.
+type PublicConsoleStatus struct {
+	Enabled   bool       `json:"enabled"`
+	Domain    string     `json:"domain,omitempty"`
+	URL       string     `json:"url,omitempty"`
+	EnabledAt *time.Time `json:"enabled_at,omitempty"`
+	Verifying string     `json:"verifying,omitempty"`
+}
+
+// PublicConsoleVerify mirrors POST /v1/public-console/verify: the challenge to
+// fetch over HTTP and this server's public addresses.
+type PublicConsoleVerify struct {
+	Domain   string `json:"domain"`
+	VerifyID string `json:"verify_id"`
+	Path     string `json:"path"`
+	Token    string `json:"token"`
+	IPs      struct {
+		V4     []string `json:"ipv4,omitempty"`
+		V6     []string `json:"ipv6,omitempty"`
+		Source string   `json:"source,omitempty"`
+	} `json:"ips"`
+	ExpiresIn int `json:"expires_in"`
+}
+
+// PublicConsoleEnabled mirrors POST /v1/public-console/enable. Password is set
+// only when a new one was generated, and only in this one reply.
+type PublicConsoleEnabled struct {
+	Domain         string `json:"domain"`
+	URL            string `json:"url"`
+	Password       string `json:"password,omitempty"`
+	AlreadyEnabled bool   `json:"already_enabled,omitempty"`
 }
 
 // Addon mirrors the server's add-on view. Credentials are never sent.

@@ -35,6 +35,19 @@ func Connect(ctx context.Context, t Target) (*Client, error) {
 		if err != nil {
 			return nil, connectError(codeConnectFailed, err.Error())
 		}
+		if u.Scheme == "unix" {
+			// Local trusted socket on the server itself (`--local`).
+			socket := u.Path
+			return &Client{
+				http: &http.Client{Transport: &http.Transport{
+					DialContext: func(dctx context.Context, _, _ string) (net.Conn, error) {
+						var d net.Dialer
+						return d.DialContext(dctx, "unix", socket)
+					},
+				}},
+				baseURL: "http://acornfox",
+			}, nil
+		}
 		return &Client{
 			http:    &http.Client{},
 			baseURL: strings.TrimRight(u.Scheme+"://"+u.Host, "/"),
@@ -420,6 +433,40 @@ func (c *Client) ConsoleToken(ctx context.Context) (string, error) {
 		return "", err
 	}
 	return wire.Token, nil
+}
+
+// ---- ADR-0016 public console ----
+
+// PublicConsoleStatus calls GET /v1/public-console.
+func (c *Client) PublicConsoleStatus(ctx context.Context) (PublicConsoleStatus, error) {
+	var st PublicConsoleStatus
+	_, err := c.doJSON(ctx, http.MethodGet, "/v1/public-console", nil, &st)
+	return st, err
+}
+
+// PublicConsoleVerify calls POST /v1/public-console/verify.
+func (c *Client) PublicConsoleVerify(ctx context.Context, domain string) (PublicConsoleVerify, error) {
+	var v PublicConsoleVerify
+	_, err := c.doJSON(ctx, http.MethodPost, "/v1/public-console/verify", map[string]string{"domain": domain}, &v)
+	return v, err
+}
+
+// PublicConsoleEnable calls POST /v1/public-console/enable.
+func (c *Client) PublicConsoleEnable(ctx context.Context, domain, verifyID string, reset bool) (PublicConsoleEnabled, error) {
+	var res PublicConsoleEnabled
+	body := map[string]any{"domain": domain, "verify_id": verifyID, "reset_password": reset}
+	_, err := c.doJSON(ctx, http.MethodPost, "/v1/public-console/enable", body, &res)
+	return res, err
+}
+
+// PublicConsoleDisable calls DELETE /v1/public-console and reports whether it
+// was on.
+func (c *Client) PublicConsoleDisable(ctx context.Context) (bool, error) {
+	var res struct {
+		WasEnabled bool `json:"was_enabled"`
+	}
+	_, err := c.doJSON(ctx, http.MethodDelete, "/v1/public-console", nil, &res)
+	return res.WasEnabled, err
 }
 
 // HostMetrics calls GET /v1/metrics/host.

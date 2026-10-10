@@ -1157,6 +1157,17 @@ func (r *Reconciler) desiredRoutes(ctx context.Context, thisApp string, override
 	return routes, nil
 }
 
+// RefreshRoutes syncs Caddy routes when they differ from the observed live
+// containers. The public console (ADR-0016) uses it because its route has no
+// app worker to trigger a round. Like a round it is skipped while the runner is
+// unreachable, so missing container observations never delete app routes.
+func (r *Reconciler) RefreshRoutes(ctx context.Context) {
+	if _, err := r.cfg.Runner.Ping(ctx); err != nil {
+		return
+	}
+	r.syncRoutesIfChanged(ctx)
+}
+
 // syncRoutesIfChanged computes routes from observed live containers and syncs
 // only when different from Caddy's current view (or always on the first round).
 func (r *Reconciler) syncRoutesIfChanged(ctx context.Context) {

@@ -184,6 +184,18 @@ func (s *Store) RevokeConsoleSession(ctx context.Context, sessionSecret string) 
 	return nil
 }
 
+// RevokeConsoleSessionDigest revokes the session whose secret has the given
+// SHA-256 hex digest. The public console gateway (ADR-0016) keeps only digests
+// of the sessions it issued and revokes them all when it is disabled.
+func (s *Store) RevokeConsoleSessionDigest(ctx context.Context, digest string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE console_sessions SET revoked_at=?
+		WHERE session_digest=? AND revoked_at IS NULL`, formatTime(s.nowUTC()), digest)
+	if err != nil {
+		return fmt.Errorf("revoke console session: %w", err)
+	}
+	return nil
+}
+
 // PruneConsole deletes expired tokens and sessions (revoked or past their
 // absolute expiry). It is safe to call periodically.
 func (s *Store) PruneConsole(ctx context.Context) error {

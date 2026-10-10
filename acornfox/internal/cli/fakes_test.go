@@ -47,6 +47,12 @@ type fakeAPI struct {
 	addAddonFn    func(ctx context.Context, app, kind string) (client.AddonResult, error)
 	removeAddonFn func(ctx context.Context, app, kind string, deleteVolume bool) (client.AddonRemoval, error)
 
+	// ADR-0016 public console
+	pcStatusFn  func(ctx context.Context) (client.PublicConsoleStatus, error)
+	pcVerifyFn  func(ctx context.Context, domain string) (client.PublicConsoleVerify, error)
+	pcEnableFn  func(ctx context.Context, domain, verifyID string, reset bool) (client.PublicConsoleEnabled, error)
+	pcDisableFn func(ctx context.Context) (bool, error)
+
 	closed bool
 
 	// captured inputs for assertions
@@ -237,6 +243,34 @@ func (f *fakeAPI) RemoveAddon(ctx context.Context, app, kind string, deleteVolum
 		return f.removeAddonFn(ctx, app, kind, deleteVolume)
 	}
 	return client.AddonRemoval{Kind: kind, Removed: true, VolumeDeleted: deleteVolume}, nil
+}
+
+func (f *fakeAPI) PublicConsoleStatus(ctx context.Context) (client.PublicConsoleStatus, error) {
+	if f.pcStatusFn != nil {
+		return f.pcStatusFn(ctx)
+	}
+	return client.PublicConsoleStatus{}, nil
+}
+
+func (f *fakeAPI) PublicConsoleVerify(ctx context.Context, domain string) (client.PublicConsoleVerify, error) {
+	if f.pcVerifyFn != nil {
+		return f.pcVerifyFn(ctx, domain)
+	}
+	return client.PublicConsoleVerify{Domain: domain}, nil
+}
+
+func (f *fakeAPI) PublicConsoleEnable(ctx context.Context, domain, verifyID string, reset bool) (client.PublicConsoleEnabled, error) {
+	if f.pcEnableFn != nil {
+		return f.pcEnableFn(ctx, domain, verifyID, reset)
+	}
+	return client.PublicConsoleEnabled{Domain: domain, URL: "https://" + domain}, nil
+}
+
+func (f *fakeAPI) PublicConsoleDisable(ctx context.Context) (bool, error) {
+	if f.pcDisableFn != nil {
+		return f.pcDisableFn(ctx)
+	}
+	return false, nil
 }
 
 // harness wires a test invocation with an injected fake API, config dir and

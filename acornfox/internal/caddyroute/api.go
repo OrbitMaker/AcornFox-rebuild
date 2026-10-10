@@ -8,6 +8,10 @@ import "context"
 // Route exposes one app: Caddy listens on ":PublicPort" and reverse-proxies to
 // Upstream ("127.0.0.1:<host port of the live container>"). Automatic HTTPS is
 // disabled for these servers in N1 (domains and certificates arrive in N3).
+//
+// A route with PublicPort 0 is domain-only: it gets no per-app server and is
+// served solely through the shared "af-domains" server (used for the public
+// console, ADR-0016).
 type Route struct {
 	App        string   `json:"app"`
 	PublicPort int      `json:"public_port"`

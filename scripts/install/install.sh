@@ -246,9 +246,15 @@ parse_args() {
     LOCAL_BINARY=""
     REGISTRY_MIRRORS=()
     PUBLIC_HOST=""
+    PUBLIC_CONSOLE_DOMAIN=""
 
     while [[ $# -gt 0 ]]; do
         case $1 in
+            --public-console)
+                [[ $# -ge 2 ]] || error_exit "--public-console 需要一个域名，例如 panel.example.com"
+                PUBLIC_CONSOLE_DOMAIN="$2"
+                shift 2
+                ;;
             --version)
                 [[ $# -ge 2 ]] || error_exit "--version 需要一个版本号，例如 v0.2.0"
                 ACORNFOX_VERSION="$2"
@@ -323,6 +329,10 @@ AcornFox 安装脚本
     --global               强制使用国际源
     --skip-docker          跳过 Docker 安装（如已安装）
     --skip-caddy           跳过 Caddy 安装（如已安装）
+    --public-console 域名   开通公网访问控制台（默认不开通）：先在域名后台把该域名
+                           解析到本服务器，并在安全组放行 80、443；安装最后自动验证
+                           域名、申请 HTTPS 证书并生成登录密码。也可以以后再用
+                           acornfox public-console enable 域名 开通
     -h, --help             显示此帮助信息
 
 环境变量:
@@ -969,6 +979,25 @@ start_services() {
     fi
 }
 
+# 开通公网访问控制台（--public-console，ADR-0016）。失败不影响安装结果。
+enable_public_console() {
+    [ -n "$PUBLIC_CONSOLE_DOMAIN" ] || return 0
+    log_info "开通公网访问控制台: ${PUBLIC_CONSOLE_DOMAIN}"
+    log_warn "拿到登录密码就能管理整台服务器，请妥善保管"
+    local i
+    for i in $(seq 1 30); do
+        [ -S /run/acornfox/api.sock ] && break
+        sleep 1
+    done
+    # 在服务器本机验证：解析是否指向本机、80 端口能否取回验证令牌，然后申请证书、生成密码
+    if /usr/local/bin/acornfox public-console enable "$PUBLIC_CONSOLE_DOMAIN" --local --wait 10m; then
+        PUBLIC_CONSOLE_RESULT="已开通：https://${PUBLIC_CONSOLE_DOMAIN}"
+    else
+        PUBLIC_CONSOLE_RESULT="未开通（按上面的提示处理后执行 acornfox public-console enable ${PUBLIC_CONSOLE_DOMAIN} --local）"
+        log_warn "公网访问控制台没有开通，安装本身不受影响"
+    fi
+}
+
 # 显示安装摘要
 show_summary() {
     cat << EOF
@@ -999,7 +1028,11 @@ ${BLUE}下一步:${NC}
 
   3. 打开网页控制台:
      ${YELLOW}acornfox open${NC}
-
+${PUBLIC_CONSOLE_RESULT:+
+${BLUE}公网访问控制台:${NC}
+  ${PUBLIC_CONSOLE_RESULT}
+  关闭: ${YELLOW}acornfox public-console disable${NC}
+}
 ${BLUE}文档:${NC}
   https://github.com/OrbitMaker/AcornFox-rebuild/tree/main/docs
 
@@ -1055,6 +1088,7 @@ main() {
     detect_public_host
     create_systemd_services
     start_services
+    enable_public_console
 
     # 显示摘要
     show_summary

@@ -20,12 +20,14 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/moby/moby/client"
 
 	"github.com/acornfox/acornfox/internal/apiserver"
 	"github.com/acornfox/acornfox/internal/caddyroute"
 	"github.com/acornfox/acornfox/internal/peer"
+	"github.com/acornfox/acornfox/internal/publicconsole"
 	"github.com/acornfox/acornfox/internal/reconcile"
 	"github.com/acornfox/acornfox/internal/runner"
 	"github.com/acornfox/acornfox/internal/state"
@@ -66,6 +68,7 @@ func runServer(args []string, stdout, stderr io.Writer) int {
 		httpsIssuer   = fs_.String("https-issuer", "", "certificate issuer: \"\"/acme = public ACME, internal = Caddy local CA (dev)")
 		httpsCAFile   = fs_.String("https-ca-file", "", "path to the CA root used to verify domain certificates (internal issuer)")
 		acmeEmail     = fs_.String("acme-email", "", "optional ACME account email")
+		publicListen  = fs_.String("public-console-listen", "127.0.0.1:18801", "public console gateway behind Caddy (loopback TCP only; empty disables it)")
 	)
 	if err := fs_.Parse(args); err != nil {
 		return 2
@@ -85,6 +88,10 @@ func runServer(args []string, stdout, stderr io.Writer) int {
 	}
 	if err := validateConsoleListen(*consoleListen); err != nil {
 		fmt.Fprintln(stderr, "invalid -console-listen:", err)
+		return 2
+	}
+	if err := validateConsoleListen(*publicListen); err != nil {
+		fmt.Fprintln(stderr, "invalid -public-console-listen:", err)
 		return 2
 	}
 
@@ -125,6 +132,13 @@ func runServer(args []string, stdout, stderr io.Writer) int {
 	runnerClient := runner.NewClient(*runnerSocket, uint32(*runnerUID))
 	router := caddyroute.New(*caddyAdmin, httpsCfg)
 
+	// ADR-0016: the public console's domain route rides along every route
+	// sync; its configuration lives in the data directory.
+	pcStore := publicconsole.NewFileStore(filepath.Join(*dataDir, "public-console.json"))
+	if *publicListen != "" {
+		router = publicconsole.WrapRouter(router, pcStore, *publicListen)
+	}
+
 	rec := reconcile.New(reconcile.Config{
 		Store:       st,
 		Runner:      runnerClient,
@@ -143,6 +157,24 @@ func runServer(args []string, stdout, stderr io.Writer) int {
 		PublicHost: *publicHost,
 		DataDir:    *dataDir,
 	}
+	var pcManager *publicconsole.Manager
+	if *publicListen != "" {
+		pcManager = publicconsole.NewManager(publicconsole.ManagerConfig{
+			Store:    pcStore,
+			Verifier: caddyroute.NewVerifier(*caddyAdmin, httpsCfg),
+			Sessions: st,
+			Routes:   rec,
+			Domains: func(ctx context.Context) ([]string, error) {
+				ds, err := st.ListDomains(ctx, "")
+				names := make([]string, 0, len(ds))
+				for _, d := range ds {
+					names = append(names, d.Name)
+				}
+				return names, err
+			},
+		})
+		apiCfg.PublicConsole = pcManager
+	}
 	trustedHandler := apiserver.New(apiCfg)
 
 	// The console handler shares the same dependencies plus the embedded assets.
@@ -152,6 +184,26 @@ func runServer(args []string, stdout, stderr io.Writer) int {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
+
+	if pcManager != nil {
+		pcManager.Cleanup(ctx)
+		// Caddy keeps no config across restarts (persist_config off); while the
+		// public console is on, put its route back even when no app has a round.
+		go func() {
+			t := time.NewTicker(30 * time.Second)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					if cfg, err := pcStore.Load(); err == nil && cfg != nil {
+						rec.RefreshRoutes(ctx)
+					}
+				}
+			}
+		}()
+	}
 
 	// Run the reconciler.
 	recDone := make(chan struct{})
@@ -207,6 +259,27 @@ func runServer(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stdout, "acornfox server (console) listening on", *consoleListen)
 	}
 
+	// The public console gateway (loopback; Caddy terminates TLS in front).
+	var publicSrv *http.Server
+	if pcManager != nil {
+		pln, err := net.Listen("tcp", *publicListen)
+		if err != nil {
+			fmt.Fprintln(stderr, "public console listen:", err)
+			cleanup()
+			stop()
+			<-recDone
+			return 1
+		}
+		listeners = append(listeners, pln)
+		publicSrv = &http.Server{
+			Handler:           publicconsole.NewGateway(publicconsole.GatewayConfig{Store: pcStore, Sessions: st, Console: consoleHandler}),
+			ReadHeaderTimeout: 10 * time.Second,
+			MaxHeaderBytes:    64 << 10,
+		}
+		go func() { serveErr <- publicSrv.Serve(pln) }()
+		fmt.Fprintln(stdout, "acornfox server (public console gateway) listening on", *publicListen)
+	}
+
 	select {
 	case <-ctx.Done():
 	case err := <-serveErr:
@@ -221,6 +294,9 @@ func runServer(args []string, stdout, stderr io.Writer) int {
 	_ = trustedSrv.Shutdown(shCtx)
 	if consoleSrv != nil {
 		_ = consoleSrv.Shutdown(shCtx)
+	}
+	if publicSrv != nil {
+		_ = publicSrv.Shutdown(shCtx)
 	}
 	stop()
 	<-recDone

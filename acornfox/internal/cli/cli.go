@@ -79,7 +79,7 @@ func mainWith(ctx context.Context, args []string, stdin io.Reader, stdout, stder
 		return a.out.usageError("%s", err.Error())
 	}
 	if len(rest) == 0 {
-		return a.out.usageError("需要一个子命令；可用：target deploy status diagnose apps logs stats env volume app set rollback redeploy stop start restart delete open domain add remove addons skill version")
+		return a.out.usageError("需要一个子命令；可用：target deploy status diagnose apps logs stats env volume app set rollback redeploy stop start restart delete open domain add remove addons public-console skill version")
 	}
 
 	cmd, cmdArgs := rest[0], rest[1:]
@@ -130,6 +130,8 @@ func mainWith(ctx context.Context, args []string, stdin io.Reader, stdout, stder
 		return a.cmdRemove(ctx, cmdArgs)
 	case "addons": // N4.2
 		return a.cmdAddons(ctx, cmdArgs)
+	case "public-console": // ADR-0016
+		return a.cmdPublicConsole(ctx, cmdArgs)
 	default:
 		return a.out.usageError("未知命令：%s", cmd)
 	}

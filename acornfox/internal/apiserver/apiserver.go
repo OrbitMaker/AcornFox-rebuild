@@ -116,6 +116,9 @@ type Config struct {
 	HostMetrics HostProvider // host resource snapshot; nil => reads /proc + statfs of DataDir
 	Resolver    Resolver     // DNS lookups for domain warnings; nil => net.DefaultResolver
 	DataDir     string       // data directory whose filesystem is reported by GET /v1/host
+
+	// ADR-0016: public console management, trusted entry only; nil => 404.
+	PublicConsole PublicConsole
 }
 
 // HostProvider returns a point-in-time host resource snapshot. It must return
@@ -143,6 +146,8 @@ type server struct {
 	hostMetrics HostProvider
 	resolver    Resolver
 	dataDir     string
+
+	publicConsole PublicConsole
 }
 
 // newServer validates the shared dependencies and builds the server value used
@@ -188,6 +193,7 @@ func newServer(cfg Config) *server {
 		hostMetrics:    hostMetrics,
 		resolver:       resolver,
 		dataDir:        cfg.DataDir,
+		publicConsole:  cfg.PublicConsole,
 	}
 }
 
@@ -232,6 +238,11 @@ func New(cfg Config) http.Handler {
 	s.registerV1(mux)
 	// The trusted entry mints console login tokens; the console entry must not.
 	mux.HandleFunc("POST /v1/console/tokens", s.createConsoleToken)
+	// Opening the console to the internet is trusted-entry only (ADR-0016).
+	mux.HandleFunc("GET /v1/public-console", s.publicConsoleStatus)
+	mux.HandleFunc("POST /v1/public-console/verify", s.publicConsoleVerify)
+	mux.HandleFunc("POST /v1/public-console/enable", s.publicConsoleEnable)
+	mux.HandleFunc("DELETE /v1/public-console", s.publicConsoleDisable)
 	return mux
 }
 

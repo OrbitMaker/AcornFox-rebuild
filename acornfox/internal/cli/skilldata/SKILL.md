@@ -127,6 +127,43 @@ acornfox domain add example.com --json
 
 `acornfox delete [--volumes]` 和 `remove ... --volumes` 会删除应用或数据，执行前必须得到用户明确同意。
 
+## 网页控制台与公网访问（可选）
+
+`acornfox open` 经 SSH 隧道在本机浏览器里打开控制台。这是默认方式，不需要任何额外配置。
+
+只有用户想在手机或别的电脑上直接用网址打开控制台时，才提公网访问。默认不开放：用户没有明确说要，就不要开。开之前先说清楚：
+
+- 拿到登录密码，就等于拿到这台服务器的 root 权限，因为控制台可以部署任意程序。
+- 需要一个用户自己的域名（例如 `panel.example.com`），而且不能是已经给应用用的域名。中国大陆服务器的域名必须已经 ICP 备案。
+- 需要在云厂商安全组放行 TCP 80 和 443。
+
+用户确认后执行（先只检查一次，看用户还需要做什么）：
+
+```bash
+acornfox public-console enable panel.example.com --json --wait 0
+```
+
+- `ok:true`：已开通。把 `url` 告诉用户；密码在 `password_file` 指向的文件里（只有用户本人可读），请用户自己打开文件，把密码存进密码管理器后删除该文件。**不要读取或在对话里复述密码。** 如果 `https.code` 不是 `ok`，把 `https.message` 和 `https.hint` 转述给用户。
+- `ok:false`：按 `diagnosis.code` 用大白话告诉用户怎么做。处理完后用 `--wait 10m` 再执行，命令会每 15 秒自动重查，通过后自动开通：
+
+| code | 告诉用户 |
+| --- | --- |
+| `dns_unresolved` | 去域名服务商后台添加解析记录，原样转述 `hint` 里的“主机记录”和“记录值” |
+| `dns_mismatch` | 域名指到了别的地址：改成 `hint` 里的记录值，删掉其他记录，关掉 CDN/代理 |
+| `port_closed` / `port_unreachable` | 去云厂商控制台的安全组放行 TCP 80 和 443 |
+| `icp_blocked` / `connection_reset` | 该域名未备案，国内服务器无法使用；先备案或换一个已备案的域名 |
+| `wrong_target` | 域名经过了 CDN/代理，或指向了另一台服务器；关掉 CDN/代理 |
+| `dns_error` | 本机查不了 DNS，检查网络后重试 |
+| `invalid_domain` / `domain_in_use` / `public_ip_unknown` | 转述 `message` |
+
+其他命令：
+
+```bash
+acornfox public-console status --json                         # 是否开启、地址、HTTPS 是否正常
+acornfox public-console enable 域名 --reset-password --json    # 忘记密码时重新生成，旧密码和登录会话立即失效
+acornfox public-console disable --json                        # 关闭：移除路由，公网登录的会话全部失效
+```
+
 ## Dockerfile 要点
 
 - 服务器在中国大陆时，安装依赖一开始就用国内镜像源，否则 npm / pip / Go 下载常会超时：npm 加 `--registry=https://registry.npmmirror.com`，pip 加 `-i https://mirrors.aliyun.com/pypi/simple`，Go 设 `ENV GOPROXY=https://goproxy.cn,direct`。

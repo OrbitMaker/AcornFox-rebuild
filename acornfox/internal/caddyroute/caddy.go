@@ -77,9 +77,15 @@ type automaticHTTPS struct {
 }
 
 type caddyRoute struct {
+	// ID tags domain-only routes ("af-route-<app>") so Current can report them
+	// without a per-app server to match the upstream against.
+	ID     string         `json:"@id,omitempty"`
 	Match  []caddyMatch   `json:"match,omitempty"`
 	Handle []caddyHandler `json:"handle"`
 }
+
+// domainRouteIDPrefix prefixes the @id of every domain-only route.
+const domainRouteIDPrefix = "af-route-"
 
 // caddyMatch is a route matcher set; we only use host matching.
 type caddyMatch struct {
@@ -144,6 +150,11 @@ func (c *caddyRouter) Current(ctx context.Context) (map[string]Route, error) {
 			if len(hosts) == 0 || up == "" {
 				continue
 			}
+			if strings.HasPrefix(rt.ID, domainRouteIDPrefix) {
+				app := strings.TrimPrefix(rt.ID, domainRouteIDPrefix)
+				out[app] = Route{App: app, Upstream: up, Domains: append([]string(nil), hosts...)}
+				continue
+			}
 			app, ok := byUpstream[up]
 			if !ok {
 				continue
@@ -175,6 +186,9 @@ func (c *caddyRouter) Sync(ctx context.Context, routes []Route) error {
 	// derived from every route that carries Domains and is handled separately.
 	desired := make(map[string]caddyServer, len(routes)+1)
 	for _, r := range routes {
+		if r.PublicPort == 0 {
+			continue // domain-only route: lives on the shared domains server only
+		}
 		desired[serverPrefix+r.App] = desiredServer(r)
 	}
 	allDomains := collectDomains(routes)
@@ -319,7 +333,12 @@ func (c *caddyRouter) desiredDomainsServer(routes []Route) caddyServer {
 	for _, r := range withDomains {
 		hosts := append([]string(nil), r.Domains...)
 		sort.Strings(hosts)
+		id := ""
+		if r.PublicPort == 0 {
+			id = domainRouteIDPrefix + r.App
+		}
 		croutes = append(croutes, caddyRoute{
+			ID:    id,
 			Match: []caddyMatch{{Host: hosts}},
 			Handle: []caddyHandler{{
 				Handler:   "reverse_proxy",
