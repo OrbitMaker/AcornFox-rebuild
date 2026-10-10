@@ -610,3 +610,11 @@ Complete, unmodified notice texts and their digests are in `licenses-manifest.js
 | runtime:stdlib | go1.26.5 | LicenseRef-1b0371fdb6845aa9e5c5b3cd5a0688452826f02630ed73f47018a57a2e398771 | https://raw.githubusercontent.com/golang/go/go1.26.5/LICENSE |
 | runtime:tags.cncf.io/container-device-interface/specs-go | v1.1.0 | LicenseRef-cb33d2fc648192dd3f7a91aa7b5ae1b3d57ea2f7dd731ab4fef94c7da11fa132 | https://raw.githubusercontent.com/moby/buildkit/v0.32.2/vendor/tags.cncf.io/container-device-interface/specs-go/LICENSE |
 | runtime:tags.cncf.io/container-device-interface | v1.1.0 | LicenseRef-49ae4bac39ff66630955dd46adef9cbf35ff66bb5c67bcdfd6ffc15541bf0414 | https://raw.githubusercontent.com/moby/buildkit/v0.32.2/vendor/tags.cncf.io/container-device-interface/LICENSE |
+
+## Fonts
+
+| Component | Version | License | Source |
+| --- | --- | --- | --- |
+| IBM Plex Sans / IBM Plex Mono (Latin-1 subset, woff2) | IBM/plex@763c36e | OFL-1.1 (Reserved Font Name "Plex") | https://github.com/IBM/plex |
+
+Bundled in `acornfox/internal/console/static/fonts/` and `website/assets/fonts/`; the full license text is `OFL.txt` next to the font files. Added 2026-10-10 [cc]; `licenses-manifest.json` has not been regenerated yet.
