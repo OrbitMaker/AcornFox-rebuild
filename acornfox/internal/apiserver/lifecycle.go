@@ -66,3 +66,29 @@ func (s *server) redeployLive(ctx context.Context, app, key, reason string) (str
 	s.kicker.Kick(app)
 	return dep.ID, nil
 }
+
+// redeployForAddon re-runs the deployment an added add-on is meant to fix. When
+// the newest deployment failed after its image was built (typically because the
+// connection variable was missing), that image is deployed again, so the
+// version the user just shipped goes live, also for an app that has never been
+// live. Otherwise the live version is recreated as redeployLive does.
+func (s *server) redeployForAddon(ctx context.Context, app, key, reason string) (string, error) {
+	latest, err := s.store.ListDeployments(ctx, app, 1)
+	if err != nil {
+		return "", err
+	}
+	if len(latest) == 0 || latest[0].Status != state.StatusFailed || latest[0].ImageID == "" {
+		return s.redeployLive(ctx, app, key, reason)
+	}
+	failed := latest[0]
+	dep, _, err := s.store.CreateDeployment(ctx, state.NewDeployment{
+		App: app, SourceKind: state.SourceImage, SourceRef: failed.ImageID,
+		SourceDigest: failed.ImageID, BypassDedup: true, RequestKey: key,
+		BasedOnSeq: failed.Seq, OriginKind: originKind(failed), Reason: reason,
+	})
+	if err != nil {
+		return "", err
+	}
+	s.kicker.Kick(app)
+	return dep.ID, nil
+}

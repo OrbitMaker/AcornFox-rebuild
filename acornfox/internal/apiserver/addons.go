@@ -207,7 +207,7 @@ func (s *server) addAddonLocked(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	deploymentID, err := s.redeployLive(ctx, app, r.Header.Get("Idempotency-Key"), state.ReasonAddonAdd+":"+body.Kind)
+	deploymentID, err := s.redeployForAddon(ctx, app, r.Header.Get("Idempotency-Key"), state.ReasonAddonAdd+":"+body.Kind)
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, "redeploy_failed", "附加服务已添加，但重新部署未提交；请运行 acornfox redeploy，勿重复添加附加服务")
 		return

@@ -141,6 +141,46 @@ func TestAddonAutomaticallyRedeploysLiveVersion(t *testing.T) {
 	}
 }
 
+// The diagnosis button "添加 PostgreSQL 并重新部署" adds the database for a
+// version that failed for lack of it. That failed image is what must be
+// redeployed: for an app that has never been live, and for an app whose live
+// version is older than the failed one.
+func TestAddonRedeploysNewestFailedImage(t *testing.T) {
+	for _, withLive := range []bool{false, true} {
+		h, st, _, _ := addonTestServer(t)
+		ctx := context.Background()
+		var live state.Deployment
+		if withLive {
+			var err error
+			live, _, err = st.CreateDeployment(ctx, state.NewDeployment{App: "shop", SourceKind: state.SourceUpload, SourceRef: "/u/1", SourceDigest: "old"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			st.deployments[live.ID].ImageID, st.deployments[live.ID].Status = "sha256:old", state.StatusLive
+			a := st.apps["shop"]
+			a.CurrentDeployment = live.ID
+			st.apps["shop"] = a
+		}
+		failed, _, err := st.CreateDeployment(ctx, state.NewDeployment{App: "shop", SourceKind: state.SourceUpload, SourceRef: "/u/2", SourceDigest: "new"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		st.deployments[failed.ID].ImageID, st.deployments[failed.ID].Status = "sha256:new", state.StatusFailed
+
+		w := do(t, h, http.MethodPost, "/v1/apps/shop/addons", []byte(`{"kind":"postgres"}`), nil)
+		var result struct {
+			DeploymentID string `json:"deployment_id"`
+		}
+		if w.Code != http.StatusCreated || json.Unmarshal(w.Body.Bytes(), &result) != nil || result.DeploymentID == "" {
+			t.Fatalf("live=%v: add must redeploy the failed version: %d %s", withLive, w.Code, w.Body)
+		}
+		d := st.deployments[result.DeploymentID]
+		if d.SourceRef != "sha256:new" || d.BasedOnSeq != failed.Seq || d.OriginKind != state.SourceUpload || d.Reason != "addon_add:postgres" {
+			t.Fatalf("live=%v: deployment = ref %q based_on %d origin %q reason %q", withLive, d.SourceRef, d.BasedOnSeq, d.OriginKind, d.Reason)
+		}
+	}
+}
+
 func TestRedeployKeepsOriginalSource(t *testing.T) {
 	h, st, _, _ := addonTestServer(t)
 	ctx := context.Background()
