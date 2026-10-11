@@ -367,6 +367,9 @@ type fakeRunner struct {
 	addonHealth map[string]string
 	// Called on every ListContainers (tests use it to advance the clock).
 	onList func()
+	// Called on every EnsureContainer before the container is created (tests
+	// use it to simulate a slow image pull).
+	onEnsure func(req runner.EnsureContainerRequest)
 }
 
 func newRunner() *fakeRunner {
@@ -497,6 +500,9 @@ func (f *fakeRunner) EnsureContainer(_ context.Context, req runner.EnsureContain
 	defer f.mu.Unlock()
 	name := runner.ContainerName(req.App, req.DeploymentID)
 	f.ensureReqs = append(f.ensureReqs, req)
+	if f.onEnsure != nil {
+		f.onEnsure(req)
+	}
 	if err := f.ensureErr[req.DeploymentID]; err != nil {
 		return runner.ContainerInfo{}, err
 	}

@@ -2,6 +2,7 @@ package reconcile
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -215,6 +216,36 @@ func TestAddonNotReadyFailsDeploymentAtAddonStage(t *testing.T) {
 		t.Fatal("the app container must not be created while the add-on is not ready")
 	}
 }
+
+// A slow image pull must not use up the readiness window: the 120 seconds
+// start once the add-on container exists.
+func TestSlowAddonPullDoesNotCountTowardReadiness(t *testing.T) {
+	h := newHarness(t)
+	h.rec.addonPoll = time.Millisecond
+	h.store.putApp(baseApp("shop"))
+	seedAddon(t, h.store, "shop", state.AddonRedis)
+	// The first pull (while converging add-ons) breaks off; the retry inside
+	// the readiness gate succeeds after 200 seconds on a slow mirror.
+	pulls := 0
+	h.runner.onEnsure = func(req runner.EnsureContainerRequest) {
+		if req.Role != runner.RoleAddon {
+			return
+		}
+		pulls++
+		if pulls == 1 {
+			h.runner.ensureErr[req.DeploymentID] = errors.New("pull interrupted")
+			return
+		}
+		delete(h.runner.ensureErr, req.DeploymentID)
+		h.clock.Advance(200 * time.Second)
+	}
+	h.store.putDeployment(queued("shop", "aaaaaaaaaaaa", 1))
+
+	if d := h.driveToTerminal(t, "shop", "aaaaaaaaaaaa", 5); d.Status != state.StatusLive {
+		t.Fatalf("want live after a slow pull, got %s %+v", d.Status, d.Diagnosis)
+	}
+}
+
 func TestAddonPullFailureFailsDeployment(t *testing.T) {
 	h := newHarness(t)
 	h.rec.addonPoll = time.Millisecond

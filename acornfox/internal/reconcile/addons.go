@@ -181,7 +181,8 @@ func classifyEnsure(kind string, err error) *addonProblem {
 }
 
 // waitAddonsReady blocks until every add-on of app reports Docker-healthy
-// (accepting TCP connections), for at most addonReadyTimeout. ok=false with a
+// (accepting TCP connections), for at most addonReadyTimeout after its
+// container was last created or started (image pulls do not count). ok=false with a
 // nil problem means "not decided": the runner is unavailable or ctx ended, so
 // the deployment stays in starting and is retried next round.
 func (r *Reconciler) waitAddonsReady(ctx context.Context, app state.App, addons []state.Addon) (bool, *addonProblem) {
@@ -208,6 +209,12 @@ func (r *Reconciler) waitAddonsReady(ctx context.Context, app state.App, addons 
 						return false, p
 					}
 					return false, nil
+				}
+				// Creating the container includes pulling its image, which on a
+				// slow registry mirror can take minutes. The readiness window
+				// starts once the container exists, not before the pull.
+				if fresh := r.cfg.Now().Add(addonReadyTimeout); fresh.After(deadline) {
+					deadline = fresh
 				}
 				if notReady == "" {
 					notReady = a.Kind
