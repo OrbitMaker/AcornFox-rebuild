@@ -322,6 +322,30 @@ CLI 用户单独用 `acornfox-users` 组：若让 SSH 用户加入 acornfox-ipc�
 
 ---
 
+### ADR-0009: 张家口测试控制台的公网 HTTPS 接入
+
+**日期**: 2026-10-04
+
+**状态**: 接受，当前测试机实测通过
+
+**提出者**: [codex]
+
+#### 背景与决定
+
+用户明确要求当前张家口测试机控制面板可通过公网浏览器访问。原生控制台在 loopback 提供页面，登录通过 SSH 取得一次性令牌；直接对外反代页面不能完成浏览器登录。
+
+以 `https://panel.acornfox.com` 提供独立公网入口：Caddy bcrypt 认证后，将已认证管理员标记传入私有 Unix socket 网关；网关仅在首页为用户内部签发、兑换原生令牌，返回 Secure、HttpOnly、SameSite=Strict 的原生会话 Cookie。公网不接触令牌签发接口，继续使用原生会话和 CSRF；写请求额外要求精确 HTTPS Origin。令牌不出现在公网地址、响应正文或日志。
+
+可信 API 保持 Unix socket，控制台 18800 保持 loopback。网关使用标准库独立命令和独立 systemd 服务，不调整核心接口、数据库迁移或依赖。Caddy 服务器命名 `public-console`，与调和器管理的 `af-*` 服务器分离；配置保存在 Caddyfile，reload 后入口保留。
+
+#### 代价、边界与回退
+
+增加一个私有网关服务。浏览器缓存 Basic 认证；界面退出仅撤销原生会话，关闭浏览器会话才能结束其缓存的 Basic 认证。网关仅适配当前测试域名；改变域名需要同步配置并重新构建。该操作不构成 N6 首发验收，也没有修复历史业务应用部署失败。
+
+原 Caddyfile 和运行 JSON 已备份；可恢复原配置、停用本次网关、仅按本次 DNS RecordId 删除新记录。凭据保存在仓库外的 0600 文件，运行 Caddyfile 为 root:caddy 0640。实测见 [公网控制台证据](evidence/public-console-2026-10-04.md)。
+
+---
+
 ### ADR-0010: 幂等键只对进行中或已上线的部署生效
 
 **日期**: 2026-10-09  
@@ -411,6 +435,151 @@ CLI 每次执行生成随机键：要改 N2 契约，且服务端仍会对其他
 
 ---
 
+### ADR-0014: 控制台改为顶栏 + 页面，采用“一拨即开”规范
+
+**日期**: 2026-10-10  
+**状态**: 接受（负责人确认）  
+**提出者**: [cc]
+
+#### 决策
+
+- 控制台去掉“桌面 + 底部 Dock + 弹出窗口”，改为顶栏 + 四个页面（我的应用、应用中心、服务器、设置），应用详情为独立页面，六个标签（概览、日志、版本记录、配置、数据库、域名）；地址用 `#/…` 片段，刷新不丢位置。手机宽度改为底部标签栏。
+- 视觉按 `docs/brand.md`：开关标志、运行青、IBM Plex 字体。字体文件随控制台嵌入（安全策略禁止外部资源），约 160 KB。
+- 应用启停用卡片上的开关；数据库标签可直接添加 / 移除附加服务（移除默认保留数据卷）。
+- 应用中心页在目录服务上线前只显示“即将开放”和首批应用预告，不做假的安装按钮。
+- 继续不依赖框架、不用 `innerHTML`、不内联样式；轮询只替换有变化的节点。
+
+#### 后果
+
+`console/static` 增加 `fonts/` 与 `brand/` 资源；Go 侧只嵌入目录，无需改代码。新增了从控制台添加 / 移除附加服务的入口（接口早已存在，原控制台只读）。
+
+---
+
+### ADR-0015: 应用目录分发走 Gitee + 官网服务器，镜像仓库自建
+
+**日期**: 2026-10-10  
+**状态**: 接受（负责人确认），实现待 N8  
+**提出者**: [cc]
+
+#### 决策
+
+- 应用目录索引与图标包发布到 Gitee 发行版和官网服务器（已备案），客户端先取官网、失败换 Gitee，与 ADR-0011 换源规则一致。
+- 应用镜像放自建镜像仓库：开源镜像仓库服务 + 自建对象存储 + 自建 CDN 节点，不使用阿里云容器镜像服务；云上操作可用主账号。
+- 详见 `docs-private/app-center-and-ops-system-plan.md` 第 1.2 节。
+
+#### 后果
+
+不增加对象存储 / CDN 产品费用；镜像仓库需要单独的服务器或数据盘（不放官网服务器），公网流量按量计费。
+
+---
+
+### ADR-0016: 控制台公网访问作为可选项（默认不开放）
+
+**日期**: 2026-10-11  
+**状态**: 接受（2026-10-11 负责人确定：首发前做，原则是“用户省心、尽快可用”），实现见下文  
+**提出者**: [cc]
+
+#### 决定（2026-10-11 修订，取代下方“原方案”）
+
+用户唯一需要手动做的事，是在域名服务商那里加一条解析记录，其余全部自动完成。
+
+**用户流程**
+
+1. Skill 询问是否开放公网访问控制台，默认不开放。用户选择开放时，先讲清风险：拿到密码就等于拿到服务器的 root 权限，因为控制台能部署任意容器。
+2. 用户只填一个域名，例如 `panel.example.com`。
+3. 自动验证域名（`acornfox public-console enable DOMAIN`）：
+   - 服务端取本机公网 IP：先查云厂商元数据，依次是阿里云 `100.100.100.200/latest/meta-data/eipv4`、`public-ipv4`，腾讯云 `metadata.tencentyun.com/latest/meta-data/public-ipv4`，火山引擎 `100.96.0.96/latest/eip_address`；都取不到再用国内可达的公共接口。IPv4、IPv6 都取。
+   - 命令行（用户电脑）通过公共 DNS 查询域名的 A/AAAA 记录，国内用 223.5.5.5、119.29.29.29，海外用 1.1.1.1、8.8.8.8，判断是否指向本机。
+   - 未指向时，输出“请在域名后台添加 A 记录：主机记录 panel，记录值 <IP>”，然后每 15 秒重查一次。总等待时间由 `--wait` 指定，默认 10 分钟；按 Ctrl+C 中断后重跑即可继续。
+   - 已指向时做一次 HTTP 实测：服务端临时在 80 端口提供一个随机令牌（Caddy 里一个非 `af-` 前缀的临时服务器 `acornfox-verify`，30 分钟后失效），命令行用域名去取。取到令牌，才证明域名确实通到本机；取到别的内容说明经过了 CDN、代理，或者指向了别的服务器。
+4. 验证通过后由服务端开通：
+   - 生成约 138 位熵的随机密码（24 位，字符集 55 个），配置里只存 SHA-256；密码随机且熵足够高，不需要慢哈希。
+   - 把域名加入 Caddy 的 `af-domains` HTTPS 服务器，Caddy 自动申请证书。
+   - 命令行把密码写进用户电脑上的 0600 文件，只显示这一次，然后等待 HTTPS 就绪，最后给出能直接打开的 https 地址。
+5. 常见卡点给出直白的诊断，代码在 `internal/publicconsole`：
+   - `dns_unresolved`：域名未解析。
+   - `dns_mismatch`：解析到了别处。
+   - `port_closed` / `port_unreachable`：80 或 443 不通，提示去云厂商安全组放行。
+   - `icp_blocked`：识别拦截页特征，提示“该域名未备案，国内服务器无法使用”。
+   - `wrong_target`：经过 CDN 或代理。
+   - `cert_pending` / `cert_failed`：证书在申请或申请失败，附常见原因。
+   - `dns_error`：DNS 服务器都不可达。
+6. 安全底线：
+   - 登录由网关自己实现表单登录，不用 Basic 认证。
+   - 失败限速：同一 IP 连续失败 5 次后锁定 1 分钟，之后每次加倍，最长 1 小时；全局 10 分钟内失败超过 50 次，暂停所有登录 10 分钟。
+   - 会话沿用原生控制台的会话与 CSRF，Cookie 设为 Secure、HttpOnly、SameSite=Strict；写请求要求 Origin 与域名完全一致，并加 HSTS。
+   - 网关只接受自己签发的会话。关闭时删除配置、撤销这些会话、移除 Caddy 路由，重新开启后旧会话全部失效。
+   - 配置存在数据目录（`/var/lib/acornfox/public-console.json`，0600），升级不动数据目录，配置自然保留。
+7. 开启、关闭、查看都有独立命令，风格与 `domain add`、`target add` 一致：
+   - `acornfox public-console enable DOMAIN [--wait 10m] [--reset-password]`、`disable`、`status`。
+   - 加 `--local` 在服务器本机经 `/run/acornfox/api.sock` 执行。`install.sh --public-console DOMAIN` 就是在安装最后调用这一条。
+   - Skill 可以在任何时候帮用户开启。
+
+**结构**
+
+- 网关并入 `acornfox server`：新监听 `127.0.0.1:18801`（`-public-console-listen`，只允许回环地址）。Caddy 反代到这里，网关在进程内转交原生控制台处理。可信 API 仍只走 Unix socket，原生控制台 18800 不变。
+- Caddy 路由：给 `Router` 包一层，把控制台域名作为“只有域名、没有端口”的路由并入 `af-domains`，路由带 `@id: af-route-_public-console`。调和器只新增一个 `RefreshRoutes`，先 ping 执行器再同步路由，这样没有应用时也能加上控制台路由。开启期间服务端每 30 秒调用一次，Caddy 重启后丢失的路由会自动补上。
+- 开通相关的 API 只在可信 socket 上：`GET /v1/public-console`，`POST /v1/public-console/verify`、`/enable`，`DELETE /v1/public-console`。
+
+**首发不做**
+
+- 由我们分配 `xxx.acornfox.com` 子域名。这涉及备案主体和合规责任，另行评估。
+- 账号体系与二次验证。
+
+**与第 9 项、旧网关的关系**
+
+- 张家口测试机的 `panel.acornfox.com`（ADR-0009）改用本功能开通：先停掉 `acornfox-public-console` 服务，并删除 Caddyfile 里的 `public-console` 站点块，因为它独占 443，与 `af-domains` 冲突；然后执行 `acornfox public-console enable panel.acornfox.com`。
+- 首发后是否保留这个入口，仍由第 9 项决定。
+- `acornfox/cmd/acornfox-public-console/` 与 `scripts/ops/public-console/` 被本功能取代。它们目前未提交，测试机还在使用，所以这次不删，等测试机迁移后再删除。
+
+#### 已决定（2026-10-11，负责人确认）
+
+实现后提出的三个待确认事项，负责人全部同意：
+
+1. **只用密码登录，不设用户名**。忘记密码时用 `acornfox public-console enable DOMAIN --reset-password` 重新生成，旧密码和旧会话随之失效。
+2. **密码交付**：密码写入用户电脑上仅本人可读（0600）的文件，只显示这一次。Skill 不读取这个文件，也不在对话里复述密码，由用户自己打开后存进密码管理器。
+3. **测试机迁移与旧网关删除**：张家口测试机的 `panel.acornfox.com` 迁移到本功能，步骤见上一节，需要先停掉旧网关。迁移完成后删除 `acornfox/cmd/acornfox-public-console/` 和 `scripts/ops/public-console/`。迁移涉及测试机，需负责人另行批准后执行，删除放在迁移之后，见 `current-milestone.md` 第 12 项的待办。
+
+#### 原方案（2026-10-11 第一版，已被上面的决定取代）
+
+负责人决定在 Skill 里加一个“是否开放公网访问控制台”的选项，默认不开放。调研现状：
+
+- 已发布的产品只支持本机访问：控制台监听 `127.0.0.1:18800`，`acornfox open` 经 SSH 隧道打开（N3）。
+- ADR-0009 的公网入口是张家口测试机的运维特例，不能直接给用户用：
+  - 网关 `cmd/acornfox-public-console` 把域名 `panel.acornfox.com`、Origin 和各个 socket 路径都写成常量，换域名要改代码重新编译，而且没有测试。
+  - `build-release.sh` 不构建网关，`install.sh` / `upgrade.sh` 没有相关参数，Skill 也没有提到。
+  - Caddy 配置靠手工合并。`scripts/ops/public-console/Caddyfile.example` 里写的是 `origins *`，`install.sh` 注释写明这会让管理接口拒绝所有请求，示例与产品的 Caddyfile 不一致。
+  - 认证只有 Caddy Basic 认证（bcrypt），没有失败次数限制；浏览器会缓存凭据，控制台里退出也清不掉。
+
+因此 Skill 现在没有可用的参数可以照着配置，这次只记录方案，不改 Skill。
+
+#### 方案（第一版，已取代）
+
+1. **网关可配置并补测试**：把 `acornfox-public-console` 改为 `acornfox public-console` 子命令，域名由参数传入，Origin 由域名推出；补充单元测试，覆盖认证标记、Host、Origin、令牌接口 404、Cookie 的 Secure 属性。改动文件：`acornfox/cmd/acornfox/`，原 `cmd/acornfox-public-console/` 删除或迁入。随主程序一起发布，不增加单独的发行附件。
+2. **安装参数**：`install.sh` 增加 `--public-console DOMAIN`（默认关闭）和 `--disable-public-console`：
+   - 安装 systemd 单元。
+   - 生成至少 24 位随机密码，保存为 0600 文件，只显示一次，与管理员令牌的处理方式一致；Caddyfile 里只写 `caddy hash-password` 生成的哈希。
+   - 在保留现有 `admin … { origins caddy }` 全局块的前提下追加站点块，再 reload。
+   - `upgrade.sh` 保留该站点块，并重启网关。
+3. **Skill**：在 `skills/acornfox/SKILL.md` 增加“控制台公网访问（可选）”一节：
+   - 默认不开放，用户主动要求时才询问。
+   - 先讲风险：拿到密码就等于拿到整台服务器的部署权限。
+   - 核对前置条件：域名 A 记录已指向服务器，安全组已放行 80/443，中国大陆服务器的域名须已 ICP 备案，HTTPS 由 Caddy 自动申请。
+   - 然后执行 `install.sh --public-console DOMAIN`；不在对话里复述密码，并说明如何关闭。
+4. **文档**：更新 README、官网和本 ADR；ADR-0009 的测试入口改为按新方式部署，或者按第 9 项的决定下线。
+
+#### 风险
+
+- 控制台能部署任意容器，相当于服务器的 root 权限，公网暴露后只靠一个密码保护；Caddy 核心不带限速，需要接受这一点，或另外加限速。
+- `persist_config off` 下 reload Caddy 后，动态添加的 `af-*` 路由要等调和器重新同步，实现时需要实测应用访问是否会短暂中断。
+- 证书申请失败（DNS 未生效、未备案、80 端口不通）时要给出明确诊断，不能让入口静默不可用。
+
+#### 当前表述
+
+官网写作“控制台默认只在服务器本机监听，`acornfox open` 经 SSH 隧道打开”，与已发布的行为一致，实现公网选项后依然成立。
+
+---
+
 ## 如何使用本文档
 
 1. **做重要决策前**: 先在此文档提议,征求其他 Agent 意见
@@ -429,4 +598,4 @@ CLI 每次执行生成随机键：要改 N2 契约，且服务端仍会对其他
 
 ---
 
-最后更新: 2026-09-30 by [cc]
+最后更新: 2026-10-10 by [cc]
