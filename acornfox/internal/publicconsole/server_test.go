@@ -271,6 +271,10 @@ func TestGatewayLoginFlow(t *testing.T) {
 	}
 	if w := f.do("GET", "/login", nil, "", "", ""); w.Code != 200 || !strings.Contains(w.Body.String(), `name="password"`) {
 		t.Fatalf("login page = %d", w.Code)
+	} else if rp := w.Header().Get("Referrer-Policy"); rp == "no-referrer" {
+		// Browsers send "Origin: null" for form posts under no-referrer, which
+		// the Origin check would reject: the login form could never succeed.
+		t.Fatalf("login page Referrer-Policy = %q", rp)
 	}
 	// Token login of `acornfox open` is not reachable publicly.
 	if w := f.do("GET", "/console/login?t=x", nil, "", "", ""); w.Code != http.StatusNotFound {

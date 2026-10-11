@@ -49,7 +49,10 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h := w.Header()
 	h.Set("Cache-Control", "no-store")
 	h.Set("X-Content-Type-Options", "nosniff")
-	h.Set("Referrer-Policy", "no-referrer")
+	// same-origin, not no-referrer: under no-referrer browsers send
+	// "Origin: null" with form posts, and the login form would be refused by
+	// the Origin check below. Cross-site requests still get no referrer.
+	h.Set("Referrer-Policy", "same-origin")
 
 	cfg, err := g.cfg.Store.Load()
 	if err != nil {
