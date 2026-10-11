@@ -1583,10 +1583,13 @@ async function poll() {
     state.connectionLost = false;
     if (state.fatal && state.fatal.code === "connection") state.fatal = null;
     render();
-    if (state.openApp) {
-      await loadDetail(state.openApp);
-      if (state.detailTab === "overview" || state.detailTab === "versions") loadDeployments(state.openApp);
-      if (state.detailTab === "logs" && state.logFollow) await refreshLogs(state.openApp);
+    // 记下应用名：等待详情返回期间用户可能已离开详情页，state.openApp 会变成 null。
+    const name = state.openApp;
+    if (name) {
+      await loadDetail(name);
+      if (state.openApp !== name) return;
+      if (state.detailTab === "overview" || state.detailTab === "versions") loadDeployments(name);
+      if (state.detailTab === "logs" && state.logFollow) await refreshLogs(name);
     }
   } catch (e) { handleError(e); }
   finally { pollInFlight = false; }
