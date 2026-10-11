@@ -1,6 +1,11 @@
-# AcornFox
+<h1>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="website/assets/brand/lockup-horizontal-dark.svg">
+    <img src="website/assets/brand/lockup-horizontal.svg" alt="AcornFox" height="48">
+  </picture>
+</h1>
 
-**让 AI 一句话部署你的应用**
+**一拨即开** —— 让 AI 一句话部署你的应用
 
 AcornFox 是一个开源的应用部署平台，让你在自己的 Linux 服务器上轻松部署和管理应用。
 
