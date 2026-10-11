@@ -1,158 +1,67 @@
-# 从对应源码构建 AcornFox 发布包
+# 构建与发布
 
-构建入口是 `cmd/acornfox-release`。它从一个干净、detached HEAD 的 Git checkout 读取源码，分别核对工具链、运行时二进制和许可全文输入，再导出供安装器验证的六文件候选包。
+[cc] 2026-10-11 重写。本文说明怎样从源码构建 AcornFox、怎样发布一个新版本。服务器端依赖的 Docker 与 Caddy 从哪里来，见 [runtime-build.md](runtime-build.md)。
 
-构建成功不代表已经通过全新宿主、升级恢复或公网访问验收，也不会创建 GitHub Release。本指南构建 Linux amd64 包；安装步骤见 [install.md](install.md)。
+## 产物是什么
 
-## 工具和目录
+AcornFox 只有一个程序 `acornfox`，服务端（`acornfox server`、`acornfox runner`）和用户电脑上的 CLI 是同一个文件。网页控制台的页面、字体、图标通过 `go:embed` 编进程序（`acornfox/internal/console/static/`），没有单独的前端构建步骤。
 
-在 Linux amd64 构建宿主上准备 Python 3.11 或更高版本、Git，以及：
+程序纯 Go 编写，`CGO_ENABLED=0` 构建；SQLite 用的是纯 Go 实现 `modernc.org/sqlite`，不依赖系统库。
 
-| 工具 | 首版构建基线 |
+## 本地构建
+
+需要 Go，版本与 `acornfox/go.mod` 中的 `go` 一行一致（目前是 1.25.13）。
+
+    cd acornfox
+    go build ./...
+    go vet ./...
+    TMPDIR=/tmp go test ./...           # macOS 需要 TMPDIR=/tmp，原因见 AGENTS.md
+    node --test internal/console/*.cjs  # 控制台脚本的测试
+
+`internal/runner` 的 socket 测试依赖 Linux 的对端凭据校验，只能在 Linux 上通过；发版前要在 Linux 上跑一次全量测试。
+
+只想得到当前平台的程序：
+
+    go build -o acornfox ./cmd/acornfox
+
+## 发布产物
+
+    scripts/build-release.sh v0.3.0
+
+脚本在仓库根目录的 `dist/` 下生成：
+
+| 文件 | 说明 |
 | --- | --- |
-| Go | `1.25.13`，与 `go.mod` 一致 |
-| Node.js | `v22.22.0` Linux x64 |
-| npm | 上述官方 Node.js 归档捆绑的 `10.9.4` |
-| Git | 记录实际三段版本号和可执行文件 SHA-256 |
-| BuildKit | `0.32.2` |
-| RootlessKit | `3.1.0` |
-| Caddy | `2.11.4` |
-| `buildkit-runc` | 按 [runtime-build.md](runtime-build.md) 构建并校验 |
+| `acornfox_<os>_<arch>[.exe]` | linux、darwin、windows 各 amd64 与 arm64，共 6 个；`-trimpath -s -w`，版本号经 `-ldflags` 写入 `internal/cli.Version` |
+| `SHA256SUMS` | 上面 6 个程序的 SHA-256，安装脚本下载后据此校验 |
+| `install.sh`、`upgrade.sh`、`install-cli.sh` | 从 `scripts/install/` 原样复制 |
+| `caddy_<版本>_linux_{amd64,arm64}.tar.gz`、`caddy_<版本>_checksums.txt`、`caddy_LICENSE` | 随附的 Caddy 官方安装包，见 [runtime-build.md](runtime-build.md) |
 
-Node.js 和运行时上游输入的固定版本、地址与校验值见对应提交的 `internal/acornfoxrelease/product_build_inputs.go`、`release/runtime-inputs.json` 及运行时构建说明。不要直接混用不同发行版的 `buildkit-runc`；其本地库依赖及构建方法单独记录在 `runtime-build.md`。
+## 发布一个版本
 
-以下示例在独立的 **root Bash** 终端执行，使用一个尚不存在的 `/root/acornfox-build` 目录。root 用于最后创建隔离网络命名空间；构建程序不会在 `/opt/acornfox` 安装服务。
+按顺序执行。
 
-先把已核对的 Go、Node.js 工具目录加入 PATH。务必指向实际使用的 Go 工具链，不能让一个旧 `go` 启动器在背后自动切换版本。
+1. **确认可以发版**：工作区干净，`main` 已推送到 GitHub；Linux 上 `go test ./...` 全部通过；需要实机验证的改动已在测试机验证。
+2. **更新许可材料**（依赖、Caddy 版本或自带字体有变化时）：`python3 scripts/gen-licenses.py`，提交 `docs/licenses/` 的变化。
+3. **打标签并推送**：
 
-```bash
-sudo -i
-bash
-set -euo pipefail
-read -r -p '已安装的 Go 1.25.13 bin 绝对目录: ' go_bin
-read -r -p '已安装的 Node.js v22.22.0 bin 绝对目录: ' node_bin
-export PATH="$go_bin:$node_bin:/usr/sbin:/usr/bin:/sbin:/bin"
-export GOTOOLCHAIN=local GOWORK=off GOENV=off
-export GOOS=linux GOARCH=amd64 CGO_ENABLED=0
-[ "$(go env GOVERSION)" = go1.25.13 ]
-[ "$(node --version)" = v22.22.0 ]
-[ "$(npm --version)" = 10.9.4 ]
-git --version
-python3 --version
+        git tag -a v0.3.0 -m "v0.3.0"
+        git push origin-acornfox v0.3.0
 
-build_root=/root/acornfox-build
-[ ! -e "$build_root" ] && [ ! -L "$build_root" ]
-install -d -m 0700 "$build_root"
-for name in inputs cache npm-cache npm-seed scratch output tools tmp; do
-  install -d -m 0700 "$build_root/$name"
-done
-install -d -m 0700 "$build_root/cache/go-cache" "$build_root/cache/go-mod-cache"
-export GOCACHE="$build_root/cache/go-cache"
-export GOMODCACHE="$build_root/cache/go-mod-cache"
-export TMPDIR="$build_root/tmp"
-```
+4. **构建**：`scripts/build-release.sh v0.3.0`。
+5. **GitHub Release**：上传 `dist/` 下全部文件。
 
-## 固定对应的源码提交
+        gh release create v0.3.0 dist/* --repo OrbitMaker/AcornFox-rebuild --title v0.3.0 --notes-file <说明文件>
 
-从该版本发布说明取得完整的 40 位源码提交 SHA；标签名称本身不是这个校验值。下面以官方仓库为例。构建自己的修改时，应先提交到自己的分支，然后切换到该提交；`origin` 可使用自己的 HTTPS GitHub fork 地址，输入冻结脚本会记录实际地址，不会把本地构建当作官方发布。
+6. **同步 Gitee**（中国大陆用户从这里下载，见 ADR-0011）：`scripts/publish-gitee.sh v0.3.0`。脚本推送 `main` 与标签，创建同名发行版并上传 `dist/` 下的文件。需要 Gitee 令牌：环境变量 `GITEE_TOKEN` 或文件 `~/.config/acornfox/gitee-token`。
+7. **清理旧发行版**：`scripts/prune-releases.sh`，GitHub 与 Gitee 都只保留最新两个（Gitee 单仓库附件总量限 1GB）。git 标签保留。
+8. **验证**：在一台已安装旧版本的服务器上执行升级，确认服务正常、应用没有中断；国内服务器走 Gitee 路径，境外服务器走 GitHub 路径。
+9. **记录**：在 `docs/current-milestone.md` 的“发布记录”中写一行。
 
-```bash
-read -r -p '发布说明中的完整源码提交 SHA: ' source_commit
-[[ $source_commit =~ ^[0-9a-f]{40}$ ]]
-source_root="$build_root/source"
-# 普通 checkout 文件使用 0644，Git 可执行文件使用 0755。
-umask 022
-git clone --no-checkout https://github.com/EleJiuDeiChi/acornfox "$source_root"
-git -C "$source_root" checkout --detach "$source_commit"
-[ "$(git -C "$source_root" rev-parse HEAD)" = "$source_commit" ]
-[ -z "$(git -C "$source_root" status --porcelain=v1 --untracked-files=all)" ]
-```
+## 安装脚本怎样找到版本
 
-不要在这份 checkout 中安装 `node_modules`、生成 `dist`、写缓存或保存构建输出。发布器会检查 Git 索引与提交树、全部文件摘要、权限及额外文件，而不只检查 `git status`。
+`install.sh`、`upgrade.sh`、`install-cli.sh` 不指定 `--version` 时取最新发行版：中国大陆查 Gitee 的 `releases/latest`，其他地区查 GitHub。下载地址固定为 `<发行版>/acornfox_<os>_<arch>`，所以 `dist/` 中的文件名不能改。
 
-## 准备运行时与许可输入
+## 官网
 
-所有输入必须位于源码目录之外，各自使用独立目录。
-
-按 [runtime-build.md](runtime-build.md) 取得并校验以下五个普通可执行文件，权限均为 `0755`。其中 `buildkit-runc` 使用该说明中的构建结果；不要从旧静态归档直接替换回来，也不要在目录内额外放 Buildx、归档或源码。
-
-```text
-/root/acornfox-build/inputs/runtime/
-└── bin/
-    ├── buildkitd
-    ├── buildctl
-    ├── buildkit-runc
-    ├── rootlesskit
-    └── caddy
-```
-
-许可输入是四个普通 `0644` 文件，保留 `docs/licenses/` 相对路径：
-
-```bash
-license_root="$build_root/inputs/licenses"
-install -d -m 0755 "$license_root/docs/licenses"
-for name in README.md THIRD_PARTY_NOTICES.md AGPL-3.0-only.txt licenses-manifest.json; do
-  install -m 0644 "$source_root/docs/licenses/$name" "$license_root/docs/licenses/$name"
-done
-runtime_root="$build_root/inputs/runtime"
-```
-
-首版许可材料整理了 605 条组件全文记录。`licenses-manifest.json` 保存组件名称、版本、上游来源、完整 notice 及其 SHA-256；混合材料以对应全文摘要的 `LicenseRef-…` 记录，不能用 `NOASSERTION` 或一个许可名称替代全文。保持所构建提交中的时间戳、排序和原始字节；更改依赖时也要更新相应许可材料。候选构建器会据此生成 SBOM，并核对 AGPL 全文和许可输入。
-
-## 联网填充依赖缓存
-
-依赖下载在输入冻结与离线构建之前进行。Go 使用专用模块缓存；npm 在单独的临时目录安装，以避免污染冻结源码。
-
-```bash
-(cd "$source_root" && go mod download && go mod verify)
-install -m 0644 "$source_root/web/package.json" "$build_root/npm-seed/package.json"
-install -m 0644 "$source_root/web/package-lock.json" "$build_root/npm-seed/package-lock.json"
-npm ci --prefix "$build_root/npm-seed" --cache "$build_root/npm-cache" \
-  --ignore-scripts --no-audit --no-fund
-npm cache verify --cache "$build_root/npm-cache"
-(cd "$source_root" && go build -trimpath -buildvcs=false \
-  -o "$build_root/tools/acornfox-release" ./cmd/acornfox-release)
-```
-
-不要在这之后清空或重建这些缓存目录。构建器会固定目录身份，并在整个构建阶段复核它们。缓存必须来自同一 Linux amd64 工具环境；缓存不完整时，离线构建会明确失败，应回到这一步补齐。
-
-## 冻结输入
-
-冻结脚本的五个位置参数依次为：源码目录、运行时目录、许可目录、尚不存在的控制输入输出目录、版本号。当前 binding schema 2 候选不包含内置 AI，无需 Pi 归档；运行时目录只准备容器运行工具。脚本冻结各输入摘要，不下载依赖，也不授予发布或安装权限。
-
-```bash
-release_version=0.1.0-dev.1  # 示例开发版本，不代表已发布版本
-control="$build_root/inputs/control-$release_version"
-python3 "$source_root/scripts/acornfox/prepare-release-inputs.py" \
-  "$source_root" "$runtime_root" "$license_root" "$control" "$release_version"
-```
-
-脚本按 Linux amd64、禁用 CGO 的设置，对十个产品命令执行 `go list -deps`，记录项目模块的完整 Go 包闭包。它还记录源码、运行时和许可树的文件摘要与权限，以及实际 Go、Git、Node.js 二进制和 npm JavaScript 入口的摘要。
-
-控制目录包含 `source-policy.json`、`toolchain.json`、`runtime-inputs.json`、`license-inputs.json`、`decision.json` 和 `decision.sha256`。JSON 字段顺序与 Go 类型一致，并保留 Go 的 HTML、U+2028/U+2029 转义规则；不要用其他格式化器改写后继续使用旧摘要。这里的 `decision.sha256` 是自己刚冻结输入的本地依据，不是官方发布的 binding 摘要。
-
-## 在断网环境构建候选包
-
-`--cache`、`--npm-cache`、`--scratch` 及输出父目录必须预先存在、由当前用户所有且权限为 `0700`。最终 `--output` 目录必须不存在。实际构建使用 `GOPROXY=off`、`GOSUMDB=off`、`GOVCS=*:off`、`GOTOOLCHAIN=local`，前端使用 `npm ci --offline --ignore-scripts`。
-
-```bash
-read -r decision_sha256 < "$control/decision.sha256"
-unshare --net -- "$build_root/tools/acornfox-release" build \
-  --source "$source_root" \
-  --decision "$control/decision.json" \
-  --decision-sha256 "$decision_sha256" \
-  --source-policy "$control/source-policy.json" \
-  --toolchain "$control/toolchain.json" \
-  --runtime-inputs "$control/runtime-inputs.json" \
-  --license-inputs "$control/license-inputs.json" \
-  --runtime-root "$runtime_root" \
-  --license-root "$license_root" \
-  --cache "$build_root/cache" \
-  --npm-cache "$build_root/npm-cache" \
-  --scratch "$build_root/scratch" \
-  --output "$build_root/output/v0.1.0-beta.1"
-```
-
-成功后输出目录只有六个候选文件，格式见 [安装指南](install.md#2-下载并核对发布文件)。发布器已经将归档重新交给安装器校验，但这仍是未验收的候选。自己的工具版本、输入或源码变化会产生新的摘要，不能因此宣称与官方资产逐字节相同。
-
-构建后继升级包时，必须使用符合升级兼容条件的下一版本源码与新的控制目录，并额外传入 `--predecessor-binding ABSOLUTE_PATH` 和 `--predecessor-sha256 TRUSTED_SHA256`；两个参数必须一起提供。保留前驱原始 binding 文件及独立可信摘要，不能仅凭版本号重建前驱身份。首次安装包与后继升级包的 binding 不同，应分别验收和保留。
+官网是 `website/` 下的静态页面，与程序版本无关，单独部署：先提交 `website/` 的修改，再运行 `scripts/deploy-website.sh`。服务器参数不写在仓库里。
