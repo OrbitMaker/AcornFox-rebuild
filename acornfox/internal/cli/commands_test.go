@@ -56,3 +56,13 @@ func TestStopTimeoutSaysStillStopping(t *testing.T) {
 		t.Fatalf("unexpected output %q", out)
 	}
 }
+
+func TestHelpPrintsUsage(t *testing.T) {
+	for _, arg := range []string{"help", "-h", "--help"} {
+		h := newHarness(t)
+		code, out, _ := h.run(arg)
+		if code != exitOK || !strings.Contains(out, "用法：acornfox") || !strings.Contains(out, "public-console") {
+			t.Fatalf("%s: exit %d, output %q", arg, code, out)
+		}
+	}
+}

@@ -84,6 +84,9 @@ func mainWith(ctx context.Context, args []string, stdin io.Reader, stdout, stder
 
 	cmd, cmdArgs := rest[0], rest[1:]
 	switch cmd {
+	case "help", "-h", "--help":
+		_, _ = io.WriteString(stdout, usageText)
+		return exitOK
 	case "version":
 		return a.cmdVersion()
 	case "skill":
@@ -136,6 +139,42 @@ func mainWith(ctx context.Context, args []string, stdin io.Reader, stdout, stder
 		return a.out.usageError("未知命令：%s", cmd)
 	}
 }
+
+// usageText is printed by `acornfox help`. Each command also takes -h for its
+// own flags.
+const usageText = `用法：acornfox [--target 服务器] [--app 应用] [--json] 命令 [参数]
+
+服务器
+  target add 名称 --ssh 用户@主机   添加服务器（list、use、remove 管理已有的）
+  open                             打开网页控制台
+  public-console enable 域名        开放控制台公网访问（disable、status）
+
+部署
+  deploy                           部署当前目录（--image 镜像、--git 仓库）
+  redeploy                         用当前镜像重新部署，让配置生效
+  rollback                         回到上一个成功版本
+  status / apps                    查看应用状态 / 列出所有应用
+  diagnose                         查看最近一次部署的诊断
+
+运行
+  stop / start / restart           停止、启动、重启应用
+  delete [--volumes]               删除应用（默认保留数据）
+  logs [-f]                        查看日志
+  stats [应用]                     资源使用（不带应用名则是整台服务器）
+
+配置
+  env set|unset|list               环境变量
+  volume add 路径                  数据目录
+  app set                          端口、内存、健康检查路径
+  domain add|remove|list           域名与 HTTPS
+  add|remove postgres|mysql|redis  数据库与缓存；addons 查看已添加的
+
+其他
+  skill install                    把 AcornFox Skill 装到 AI 工作台
+  version                          版本号
+
+每个命令加 -h 查看它的参数。
+`
 
 // parseGlobal extracts the global flags (--json, --target, --app) from args.
 // Global flags may appear before or after the subcommand and its arguments.

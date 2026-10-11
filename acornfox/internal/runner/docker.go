@@ -38,7 +38,7 @@ var ansiPattern = regexp.MustCompile(`\x1b\[[0-9;]*[A-Za-z]`)
 // Build classification heuristics.
 var (
 	missingModulePattern = regexp.MustCompile(`(?i)(ModuleNotFoundError|Cannot find module|no required module|not found: )`)
-	pullFailurePattern   = regexp.MustCompile(`(?i)(TLS handshake timeout|i/o timeout|dial tcp|context deadline exceeded|no such host|connection reset|connection refused|EOF)`)
+	pullFailurePattern   = regexp.MustCompile(`(?i)(TLS handshake timeout|i/o timeout|dial tcp|context deadline exceeded|no such host|connection reset|connection refused|EOF|unexpected status from (GET|HEAD) request|httpReadSeeker: failed open|toomanyrequests)`)
 	// Package-manager downloads during the build (npm / yarn / pnpm, pip, Go
 	// modules, apk, apt). Checked before pullFailurePattern, whose generic
 	// network errors would otherwise blame the base image.
@@ -259,7 +259,7 @@ func classifyBuild(err error, lines []string) *Failure {
 		f.Hint = "构建时访问软件包源超时。服务器在中国大陆时，在 Dockerfile 中改用国内镜像源后重新部署：npm 加 --registry=https://registry.npmmirror.com；pip 加 -i https://mirrors.aliyun.com/pypi/simple；Go 设 ENV GOPROXY=https://goproxy.cn,direct；Alpine 用 sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories"
 	case pullFailurePattern.MatchString(all):
 		f.Code = "base_image_not_found"
-		f.Hint = "基础镜像拉取失败：检查镜像名，或为服务器配置镜像加速后重试"
+		f.Hint = "基础镜像拉取失败：先检查 FROM 里的镜像名；日志里是网络错误或 502、503 时，多半是镜像加速地址暂时不可用，稍后直接重新部署即可，反复失败就在 /etc/docker/daemon.json 换用可用的加速地址（阿里云服务器用控制台“容器镜像服务 → 镜像加速器”里的专属地址）"
 	case missingModulePattern.MatchString(all):
 		f.Code = "dependency_missing"
 		f.Hint = "构建缺少依赖：把依赖写进依赖清单（如 requirements.txt / package.json）并在 Dockerfile 中安装"

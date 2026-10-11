@@ -15,6 +15,7 @@ func TestClassifyBuildRegistryTimeout(t *testing.T) {
 		{"go", "go: github.com/x/y@v1.0.0: Get \"https://proxy.golang.org/github.com/x/y/@v/v1.0.0.mod\": dial tcp 142.250.1.1:443: i/o timeout", "registry_timeout"},
 		{"apk", "WARNING: fetching https://dl-cdn.alpinelinux.org/alpine/v3.20/main: temporary error (try again later)", "registry_timeout"},
 		{"base image", "Get \"https://registry-1.docker.io/v2/\": dial tcp: lookup registry-1.docker.io: i/o timeout", "base_image_not_found"},
+		{"mirror 502", "unknown: failed to copy: httpReadSeeker: failed open: unexpected status from GET request to https://docker.m.daocloud.io/v2/library/python/blobs/sha256:c1d4: 502 Bad Gateway", "base_image_not_found"},
 		{"missing module", "Error: Cannot find module 'express'", "dependency_missing"},
 		{"other", "Step 5/8 : RUN make\nmake: *** No rule to make target 'all'.", "build_failed"},
 	}
