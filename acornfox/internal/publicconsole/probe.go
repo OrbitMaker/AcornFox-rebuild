@@ -78,7 +78,7 @@ func classifyNetErr(err error, domain string, port int) Diagnosis {
 		return Diagnosis{
 			Code:    CodeConnReset,
 			Message: fmt.Sprintf("连接 %s 的 %d 端口时被对方断开", domain, port),
-			Hint:    "国内服务器的域名未备案时，云厂商会直接断开连接；" + icpHint + "也可能是防火墙拦截。",
+			Hint:    "国内服务器的域名未备案时，云厂商会直接断开连接；" + icpHint + "域名已备案的话，多半是安全组没有放行 80 和 443（电脑上开着代理软件时，端口不通也会显示为连接被断开），放行后重试。",
 		}
 	case isTimeout(err):
 		return Diagnosis{Code: CodePortUnreachable, Message: fmt.Sprintf("连接 %s 的 %d 端口超时", domain, port), Hint: portHint(port)}
