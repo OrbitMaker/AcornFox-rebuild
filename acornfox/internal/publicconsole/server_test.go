@@ -1,3 +1,5 @@
+//go:build !windows
+
 package publicconsole
 
 import (
@@ -390,7 +392,7 @@ func TestLimiterBackoffAndGlobal(t *testing.T) {
 	// Distributed failures trip the global pause.
 	l2 := NewLimiter(func() time.Time { return now })
 	for i := 0; i <= globalMax; i++ {
-		l2.Fail(string(rune('A' + i%26)) + string(rune('a'+i/26)))
+		l2.Fail(string(rune('A'+i%26)) + string(rune('a'+i/26)))
 	}
 	if ok, _ := l2.Allow("fresh-client"); ok {
 		t.Fatal("global pause not applied")

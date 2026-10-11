@@ -11,7 +11,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/acornfox/acornfox/internal/state"
+	"github.com/acornfox/acornfox/internal/domainname"
 )
 
 // Diagnosis is a plain-language verdict for one step of enabling the public
@@ -70,7 +70,7 @@ func HostRecord(domain string) string {
 // a hostname (no IP literals, no scheme, no port).
 func NormalizeDomain(domain string) (string, bool) {
 	d := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(domain)), ".")
-	if !strings.Contains(d, ".") || !state.ValidDomainName(d) {
+	if !strings.Contains(d, ".") || !domainname.Valid(d) {
 		return "", false
 	}
 	return d, true

@@ -8,14 +8,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"regexp"
-	"strings"
-)
 
-// domainNamePattern accepts a lowercase DNS hostname with at least one dot and
-// no trailing dot. Each label is 1..63 chars of [a-z0-9-] not starting or
-// ending with '-'; total length is bounded to <= 253 by AddDomain.
-var domainNamePattern = regexp.MustCompile(`^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$`)
+	"github.com/acornfox/acornfox/internal/domainname"
+)
 
 // sha256Hex returns the lowercase hex SHA-256 digest of s.
 func sha256Hex(s string) string {
@@ -254,30 +249,9 @@ func scanConsoleSessionTx(ctx context.Context, tx *sql.Tx, digest string) (Conso
 
 // -------- Domains --------
 
-// ValidDomainName reports whether name is an acceptable custom domain: lowercase,
-// a valid hostname with at least one dot, not a trailing dot, not an IP literal,
-// and at most 253 characters.
-func ValidDomainName(name string) bool {
-	if len(name) == 0 || len(name) > 253 {
-		return false
-	}
-	if name != strings.ToLower(name) {
-		return false
-	}
-	if !domainNamePattern.MatchString(name) {
-		return false
-	}
-	// Reject dotted-decimal IPv4 literals (all-numeric labels).
-	labels := strings.Split(name, ".")
-	allNumeric := true
-	for _, l := range labels {
-		if strings.TrimFunc(l, func(r rune) bool { return r >= '0' && r <= '9' }) != "" {
-			allNumeric = false
-			break
-		}
-	}
-	return !allNumeric
-}
+// ValidDomainName reports whether name is an acceptable custom domain; see
+// domainname.Valid.
+func ValidDomainName(name string) bool { return domainname.Valid(name) }
 
 // AddDomain records a custom domain for an app. It is idempotent for the same
 // app (returns the existing row with bool=false). If another app already owns
