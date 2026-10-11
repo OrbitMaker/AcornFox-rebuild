@@ -53,7 +53,11 @@ func (s *server) getAppMetrics(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		writeError(w, 503, "runner_unavailable", "无法读取容器指标，请稍后重试")
+		// The runner answered ListContainers just above, so this is the one
+		// container going away mid-read (typically being replaced by a
+		// redeploy), not a runner outage: report "no data right now".
+		s.log.Debug("container stats", "app", app, "name", name, "err", err)
+		writeJSON(w, 200, map[string]any{"app": app, "available": false, "observed_state": "unavailable"})
 		return
 	}
 	writeJSON(w, 200, map[string]any{

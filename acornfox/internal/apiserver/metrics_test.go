@@ -74,3 +74,15 @@ func TestMetricsStopRaceDoesNotReturnMadeUpValues(t *testing.T) {
 		t.Fatalf("race=%d %s", w.Code, w.Body)
 	}
 }
+
+// A container being replaced by a redeploy can fail its stats read while the
+// runner itself is fine: that is "no data right now", not a 503 the browser
+// would log as an error.
+func TestMetricsStatsErrorDuringRedeployIsNotAnOutage(t *testing.T) {
+	h, _, run := metricServer(t)
+	run.statsErr = errors.New("container is being removed")
+	w := do(t, h, "GET", "/v1/metrics/apps/shop", nil, nil)
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"observed_state":"unavailable"`) || strings.Contains(w.Body.String(), "cpu_percent") {
+		t.Fatalf("stats error=%d %s", w.Code, w.Body)
+	}
+}
