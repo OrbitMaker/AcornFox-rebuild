@@ -15,11 +15,17 @@ apt_get() {
 }
 
 # 颜色输出
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+# 用 $'...' 存真实的转义字符，摘要里的 cat << EOF 才不会原样打印 \033；
+# 输出不是终端（管道、日志文件）时不加颜色。
+if [ -t 1 ]; then
+    RED=$'\033[0;31m'
+    GREEN=$'\033[0;32m'
+    YELLOW=$'\033[1;33m'
+    BLUE=$'\033[0;34m'
+    NC=$'\033[0m'
+else
+    RED='' GREEN='' YELLOW='' BLUE='' NC=''
+fi
 
 # 日志函数
 log_info() {
