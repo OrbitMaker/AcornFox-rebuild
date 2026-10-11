@@ -525,8 +525,9 @@ func (s *Store) UpdateDeployment(ctx context.Context, id string, fn func(*Deploy
 }
 
 // KeptImageDeployments returns the deployments whose images must be kept: the
-// current live deployment plus the newest KeepVersions retired deployments that
-// have an ImageID. Everything else may be garbage collected.
+// current live deployment, the newest KeepVersions retired deployments that
+// have an ImageID, and the newest deployment if it failed with a built image.
+// Everything else may be garbage collected.
 func (s *Store) KeptImageDeployments(ctx context.Context, app string) ([]Deployment, error) {
 	var out []Deployment
 	err := s.inTx(ctx, func(tx *sql.Tx) error {
@@ -562,6 +563,25 @@ func (s *Store) KeptImageDeployments(ctx context.Context, app string) ([]Deploym
 				out = append(out, d)
 				seen[d.ID] = true
 			}
+		}
+		// The newest deployment, when it failed after its image was built, is
+		// kept too: adding the missing database from its diagnosis redeploys
+		// exactly that image. Older failed images are still collected.
+		rows, err = tx.QueryContext(ctx, deploymentSelect+`
+			FROM deployments
+			WHERE app=?
+			ORDER BY seq DESC
+			LIMIT 1`, app)
+		if err != nil {
+			return fmt.Errorf("newest deployment: %w", err)
+		}
+		defer rows.Close()
+		newest, err := scanDeploymentRows(rows)
+		if err != nil {
+			return err
+		}
+		if len(newest) == 1 && newest[0].Status == StatusFailed && newest[0].ImageID != "" && !seen[newest[0].ID] {
+			out = append(out, newest[0])
 		}
 		return nil
 	})

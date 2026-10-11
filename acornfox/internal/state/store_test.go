@@ -722,3 +722,46 @@ func TestCreateDeploymentRejectsUnknownSourceKind(t *testing.T) {
 		t.Fatalf("want ErrInvalid, got %v", err)
 	}
 }
+
+// The newest deployment's image is kept when it failed after the build, so the
+// diagnosis action "add the database and redeploy" can reuse it; once a newer
+// deployment exists, that failed image is collectable again.
+func TestKeptImageDeploymentsKeepsNewestFailedImage(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	s.EnsureApp(ctx, "web")
+	create := func(digest, status, image string) Deployment {
+		d, _, err := s.CreateDeployment(ctx, NewDeployment{App: "web", SourceKind: SourceUpload, SourceRef: "/u", SourceDigest: digest})
+		if err != nil {
+			t.Fatal(err)
+		}
+		d, err = s.UpdateDeployment(ctx, d.ID, func(dep *Deployment) error {
+			dep.Status, dep.ImageID = status, image
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return d
+	}
+	keptIDs := func() map[string]bool {
+		kept, err := s.KeptImageDeployments(ctx, "web")
+		if err != nil {
+			t.Fatal(err)
+		}
+		set := map[string]bool{}
+		for _, d := range kept {
+			set[d.ID] = true
+		}
+		return set
+	}
+
+	failed := create("a", StatusFailed, "img-a")
+	if !keptIDs()[failed.ID] {
+		t.Fatal("newest failed deployment with an image must be kept")
+	}
+	buildFailed := create("b", StatusFailed, "")
+	if keptIDs()[failed.ID] || keptIDs()[buildFailed.ID] {
+		t.Fatal("an older failed image, or a failed build without image, must not be kept")
+	}
+}
