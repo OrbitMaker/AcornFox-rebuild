@@ -592,14 +592,58 @@ func (a *app) simpleAppAction(ctx context.Context, args []string, action string)
 	if serr != nil {
 		return a.out.fail(serr)
 	}
+	if action == "stop" {
+		// The server only records the desired state; the container stops on
+		// the next reconcile. Report success once it is actually down.
+		observed, stopped, werr := waitStopped(ctx, api, res.app)
+		if werr != nil {
+			return a.out.fail(werr)
+		}
+		if a.out.json {
+			a.out.emitJSON(map[string]any{"app": res.app, "action": action, "stopped": stopped, "observed_state": observed})
+			return exitOK
+		}
+		if stopped {
+			a.out.human("已停止应用 %s。", res.app)
+		} else {
+			a.out.human("已提交停止请求，应用 %s 仍在停止中（当前状态：%s）。稍后用 acornfox status 查看。", res.app, observed)
+		}
+		return exitOK
+	}
 	if a.out.json {
 		a.out.emitJSON(map[string]any{"app": res.app, "action": action})
 		return exitOK
 	}
-	if action == "stop" {
-		a.out.human("已停止应用 %s。", res.app)
-	} else {
-		a.out.human("已启动应用 %s。", res.app)
-	}
+	a.out.human("已启动应用 %s。", res.app)
 	return exitOK
+}
+
+// stopPollInterval and stopWaitTimeout bound how long `stop` waits for the
+// container to go down; variables so tests can shorten them.
+var (
+	stopPollInterval = 500 * time.Millisecond
+	stopWaitTimeout  = 30 * time.Second
+)
+
+// waitStopped polls the app until its observed state is stopped or missing.
+// It returns the last observed state and whether the app stopped in time.
+func waitStopped(ctx context.Context, api client.API, appName string) (string, bool, error) {
+	deadline := time.Now().Add(stopWaitTimeout)
+	for {
+		app, err := api.App(ctx, appName)
+		if err != nil {
+			return "", false, err
+		}
+		if app.ObservedState == "stopped" || app.ObservedState == "missing" {
+			return app.ObservedState, true, nil
+		}
+		if time.Now().After(deadline) {
+			return app.ObservedState, false, nil
+		}
+		select {
+		case <-ctx.Done():
+			return app.ObservedState, false, nil
+		case <-time.After(stopPollInterval):
+		}
+	}
 }
