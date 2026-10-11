@@ -117,7 +117,7 @@
 
 ## N7.3 发版与官网部署
 
-- 状态：`available`
+- 状态：`completed`（2026-10-11 [cc]：测试机实机检查、v0.3.0 与 v0.3.1 发版并同步 Gitee、官网部署，见 `evidence/n7-acceptance-2026-10-11.md`）
 - 内容：测试机实机检查 → 发版并同步 Gitee → 部署官网
 - 官网部署后的实机查看（截图要求见 `current-milestone.md` 第 6 项）与测试机控制台检查（第 4 项）分开进行（2026-10-11 [cc]）
 - 测试机实机检查另含 N7.1 转来的两项（2026-10-11 [cc]）：控制台截图（桌面与手机、深浅色，并查看浏览器控制台报错与布局），以及在 Linux 上跑 `go test ./...` 并全量通过（含 `internal/runner`）
@@ -126,7 +126,7 @@
 ## N7.4 控制台公网访问（里程碑第 12 项，ADR-0016）
 
 - 状态：`completed`（2026-10-11 [cc] 代码与单元测试已完成，见 `evidence/public-console-option-2026-10-11.md`；真实环境验证属于 N7.3 的测试机实机检查）。2026-10-11 负责人确认 ADR-0016 的三个待定事项，见 ADR“已决定”一节
-- 待办：测试机 `panel.acornfox.com` 迁移到本功能（先停旧网关，需负责人另行批准）；迁移后删除 `acornfox/cmd/acornfox-public-console/`、`scripts/ops/public-console/`
+- 待办：已完成（2026-10-11 [cc]）。原测试机已被释放，新测试机直接用本功能开通 `panel.acornfox.com`；旧网关的两个目录已删除。真实环境验证见 `evidence/n7-acceptance-2026-10-11.md`
 - 负责：[cc]
 - 相关代码：`acornfox/internal/publicconsole/`、`internal/caddyroute/verify.go`、`internal/cli/public_console.go`、`internal/apiserver/public_console.go`、`scripts/install/install.sh`、`skills/acornfox/SKILL.md`
 

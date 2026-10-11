@@ -17,18 +17,18 @@ N6 首发验收：✅ **已完成**（2026-10-10 负责人确认：3 项测试�
 
 | # | 事项 | 负责 | 状态 |
 |---|---|---|---|
-| 1 | 控制台重做（`acornfox/internal/console/static`） | [cc] | ✅ 代码与构建测试已完成：2026-10-11 Mac 上 build / vet 通过，test 中只有 `internal/runner` 失败（macOS 已知限制），配色、字体、标志、结构已对照规范静态核对（[证据](evidence/console-redesign-2026-10-10.md)）。实机查看与截图、Linux 全量测试按负责人决定（2026-10-11）并入第 4 项 [cc] |
+| 1 | 控制台重做（`acornfox/internal/console/static`） | [cc] | ✅ 2026-10-11 [cc]：代码、构建测试与实机检查全部完成。实机截图与 Linux 全量测试已在第 4 项完成（[证据](evidence/n7-acceptance-2026-10-11.md)） |
 | 2 | 官网重做（`website/`） | [cc] | ✅ 代码已完成（2026-10-11 [cc]）：已对照规范核对，修了安装页卡片空白、连线被遮挡、小字对比度等 5 处样式问题；安装命令与 README、ADR-0011 一致；静态检查全部通过（[证据](evidence/website-redesign-2026-10-11.md)）。2026-10-11 [cc] 按负责人决定删掉了“90 秒”的说法，示例版本改为 v0.2.5，控制台访问改为与实际一致的表述，清除了图标里的 C2PA 元数据。标志组合与分享图的文字已按负责人决定改为 AcornFox（2026-10-11 [cc]，见证据第 7 节）。下一步提交，按第 6 项部署；官网的实机查看在第 6 项部署后进行（官网不在测试机上，不并入第 4 项） |
 | 3 | 字体许可：控制台与官网自带 IBM Plex 字体（SIL OFL 1.1），需写入 `docs/licenses` 清单与第三方声明 | [cc] | ✅ 2026-10-11 [cc]：新增 `scripts/gen-licenses.py`，重新生成 `licenses-manifest.json` 与 `THIRD_PARTY_NOTICES.md`，共 31 条：实际编进程序的 28 个 Go 模块、Go 标准库、随发行版附带的 Caddy、IBM Plex 字体。原清单是旧 Open Card 项目的（pgx、npm、BuildKit、runc 等 606 条），与现在的程序不符，已整体替换。`docs/acornfox/build.md`（构建与发布流程）、`runtime-build.md`（服务器端依赖 Docker 与 Caddy 的来源与校验）已按现在的项目重写（2026-10-11 [cc]） |
-| 4 | 在张家口测试机升级到新版本，实机检查控制台：桌面与手机、深浅色、启停 / 重新部署 / 添加数据库 / 日志跟随。验收另含第 1 项转来的两项检查（2026-10-11 [cc] 补充）：① 主要页面截图，桌面与手机宽度、深浅色各一组，确认浏览器控制台没有报错、资源没有缺失、布局没有错乱，截图存入 `docs/evidence/console-redesign-2026-10-10/`；② 在测试机（Linux）的 `acornfox/` 下跑 `go test ./...` 并全量通过，其中包括 `internal/runner`；③ 第 12 项公网访问控制台的真实开通（2026-10-11 [cc] 补充），先按 ADR-0016 停掉测试机上的旧网关 `acornfox-public-console`，并删除 Caddyfile 里的 `public-console` 站点块（它独占 443），然后在用户电脑上执行 `acornfox public-console enable 域名`，覆盖三种情形：a. 已备案域名，能开通，https 地址可打开，用生成的密码登录、退出，`disable` 后入口失效；b. 未备案域名，诊断为 `icp_blocked` 或 `connection_reset`，提示“该域名未备案，国内服务器无法使用”；c. 安全组未放行 80/443，诊断为 `port_closed` 或 `port_unreachable`，并提示放行安全组。另外核对：连续输错 5 次密码后被锁定；重启 Caddy 后约 30 秒内路由自动恢复；升级后配置保留；`install.sh --public-console 域名` 能完成开通。证据写入 `docs/evidence/` | 待认领 | 未开始 |
-| 5 | 发版：打标签、`scripts/build-release.sh`、GitHub Release、`scripts/publish-gitee.sh` 同步 | 待认领 | 未开始 |
-| 6 | 部署官网：`scripts/deploy-website.sh`（需先提交 `website/`）。部署后实机查看首页与安装页：桌面与手机宽度、深浅色各一组截图，确认浏览器控制台没有报错、资源没有缺失、布局没有错乱，截图存入 `docs/evidence/`（2026-10-11 [cc] 补充） | 待认领 | 未开始 |
+| 4 | 在张家口测试机升级到新版本，实机检查控制台：桌面与手机、深浅色、启停 / 重新部署 / 添加数据库 / 日志跟随。验收另含第 1 项转来的两项检查（2026-10-11 [cc] 补充）：① 主要页面截图，桌面与手机宽度、深浅色各一组，确认浏览器控制台没有报错、资源没有缺失、布局没有错乱，截图存入 `docs/evidence/console-redesign-2026-10-10/`；② 在测试机（Linux）的 `acornfox/` 下跑 `go test ./...` 并全量通过，其中包括 `internal/runner`；③ 第 12 项公网访问控制台的真实开通（2026-10-11 [cc] 补充），先按 ADR-0016 停掉测试机上的旧网关 `acornfox-public-console`，并删除 Caddyfile 里的 `public-console` 站点块（它独占 443），然后在用户电脑上执行 `acornfox public-console enable 域名`，覆盖三种情形：a. 已备案域名，能开通，https 地址可打开，用生成的密码登录、退出，`disable` 后入口失效；b. 未备案域名，诊断为 `icp_blocked` 或 `connection_reset`，提示“该域名未备案，国内服务器无法使用”；c. 安全组未放行 80/443，诊断为 `port_closed` 或 `port_unreachable`，并提示放行安全组。另外核对：连续输错 5 次密码后被锁定；重启 Caddy 后约 30 秒内路由自动恢复；升级后配置保留；`install.sh --public-console 域名` 能完成开通。证据写入 `docs/evidence/` | [cc] | ✅ 2026-10-11 [cc]：原测试机已被释放，新建同规格抢占式实例实测。40 张页面截图与 15 项交互检查通过，浏览器控制台无报错；Linux 全量测试通过（含 `internal/runner`）；公网控制台三种情形、登录退出、5 次锁定、Caddy 重启 30 秒恢复、升级后保留、`install.sh --public-console` 均通过。实测发现并修复 10 个问题，其中公网控制台无法登录、Windows 版 CLI 无法构建为阻塞级（[证据](evidence/n7-acceptance-2026-10-11.md)） |
+| 5 | 发版：打标签、`scripts/build-release.sh`、GitHub Release、`scripts/publish-gitee.sh` 同步 | [cc] | ✅ 2026-10-11 [cc]：v0.3.0、v0.3.1 已发布到 GitHub 并同步 Gitee，两边只保留这两个发行版；测试机经 Gitee 正式路径升级通过（[证据](evidence/n7-acceptance-2026-10-11.md)） |
+| 6 | 部署官网：`scripts/deploy-website.sh`（需先提交 `website/`）。部署后实机查看首页与安装页：桌面与手机宽度、深浅色各一组截图，确认浏览器控制台没有报错、资源没有缺失、布局没有错乱，截图存入 `docs/evidence/`（2026-10-11 [cc] 补充） | [cc] | ✅ 2026-10-11 [cc]：已部署（版本 `423c88aa`），首页与安装页 8 张截图无报错、无资源缺失、无横向溢出，`/skill/SKILL.md` 可下载（[证据](evidence/n7-acceptance-2026-10-11.md)） |
 | 7 | README 与文档换新品牌（标志、口号）；快速开始里的截图如有需要重拍 | [cc] | ✅ 2026-10-11 [cc]：README 改用横版标志组合（深色模式用 `-dark`），加口号“一拨即开”；README 与快速开始里没有截图，无需重拍 |
 | 8 | 小问题：`stop` 在容器实际停止前就打印“已停止”；`upgrade.sh` 摘要打印原始颜色转义码 | [cc] | ✅ 2026-10-11 [cc]：`stop` 改为等观察状态变为 stopped / missing 再打印（最多 30 秒，超时提示仍在停止中），补两个单元测试；`upgrade.sh` 与 `install.sh` 颜色改用 `$'…'` 存真实转义字符，输出不是终端时不加颜色 |
 | 9 | 决定 `panel.acornfox.com`（张家口测试机公网控制台，ADR-0009 测试例外）首发后是否保留 | 负责人 | 待定 |
 | 10 | 开源公告 | 负责人 | 未开始 |
 | 11 | 商标检索（第 9 类、第 42 类） | 负责人 | 未开始 |
-| 12 | **首发前**：控制台公网访问作为可选项，默认不开放（ADR-0016，2026-10-11 负责人确定）。用户只需加一条解析记录，其余自动完成：自动验证域名、自动申请 HTTPS、生成密码、登录限速。命令为 `acornfox public-console enable/disable/status`、`install.sh --public-console`，Skill 已加对应一节。与第 9 项相关 | [cc] | ✅ 代码与单元测试已完成（2026-10-11 [cc]，[证据](evidence/public-console-option-2026-10-11.md)）；真实环境验证在第 4 项第 ③ 条。负责人已确认（2026-10-11）：只用密码登录、不设用户名，忘记密码就重新生成；密码写入用户电脑上仅本人可读的文件，Skill 不读取、不复述；测试机 `panel.acornfox.com` 迁移到本功能。**待办**：① 测试机迁移，先停旧网关（与第 4 项第 ③ 条一起做），涉及测试机，需负责人另行批准后执行；② 迁移完成后删除 `acornfox/cmd/acornfox-public-console/` 和 `scripts/ops/public-console/` |
+| 12 | **首发前**：控制台公网访问作为可选项，默认不开放（ADR-0016，2026-10-11 负责人确定）。用户只需加一条解析记录，其余自动完成：自动验证域名、自动申请 HTTPS、生成密码、登录限速。命令为 `acornfox public-console enable/disable/status`、`install.sh --public-console`，Skill 已加对应一节。与第 9 项相关 | [cc] | ✅ 2026-10-11 [cc]：代码、单元测试与真实环境验证全部完成（[证据](evidence/n7-acceptance-2026-10-11.md)）。原测试机已被释放，新测试机直接用本功能开通 `panel.acornfox.com`，旧网关的两个目录已删除 |
 
 不属于首发、已排期到之后：应用中心与经营系统（N8，见 `docs-private/app-center-and-ops-system-plan.md`）；附加服务版本白名单与外部数据库界面；回退到指定版本（控制台评审第 14 条）；旧版本日志保存。
 
@@ -292,6 +292,8 @@ acornfox skill install
 - 2026-10-09 [cc] v0.2.2：修复境外全新安装失败（Caddy cloudsmith apt 源返回 402，v0.2.0/v0.2.1 受影响），改为下载 Caddy 官方二进制；官网部署脚本同步修改。境外全新实例 GitHub 路径 52 秒安装、部署上线
 
 - 2026-10-09 [cc] v0.2.3：网页控制台黑白品牌与体验修复（轮询不再打断选择、手机布局、确认框默认取消等）；版本记录原始来源与原因（迁移 0006、0007）；CLI 内置 Skill 改为「先装 Skill」流程。国内测试机经 Gitee 从 rc 升级到正式版通过；Linux 全部测试通过
+- 2026-10-11 [cc] v0.3.0：新品牌“一拨即开”、控制台重做、控制台公网访问（ADR-0016）、`acornfox help`；修复实测发现的附加服务就绪计时、诊断卡重新部署、Windows 构建、公网控制台登录等问题。v0.2.5 → v0.3.0 国内升级 17 秒，应用不中断
+- 2026-10-11 [cc] v0.3.1：重新部署切换容器时应用指标不再返回 503
 注意：v0.2.x 为开发者自测后发布，N6 独立验收仍未完成。
 
 ## N6 完成后的下一步
